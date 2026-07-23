@@ -2418,8 +2418,8 @@ ordinary tests pass. The retained-layout and conversion-overlap gates are requir
 
 - [Q2 A4 capture authority preflight](../superpowers/plans/2026-07-17-q2-a4-capture-authority-preflight.md)
 - [Q2 checkpoint review](../reports/q2-checkpoint-review.md)
-- [Current architecture](../architecture/current-state.md)
-- [Target architecture](../architecture/target-state.md)
+- [Historical current-state audit](../audits/architecture/2026-07-15-current-state-anchor.md)
+- [Historical target-state baseline](../audits/architecture/2026-07-16-target-state-baseline.md)
 - [Gap analysis](../plans/gap-analysis.md)
 - [Project memory](../project-memory.md)
 - [Hosted Actions account-gate audit](../audits/2026-07-17-hosted-actions-account-gate.md)

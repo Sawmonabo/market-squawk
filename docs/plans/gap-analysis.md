@@ -19,8 +19,10 @@ active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,
 ## Document control
 
 - Analysis date: 2026-07-16
-- Evidence baseline: [`current-state.md`](../architecture/current-state.md)
-- Target contract: [`target-state.md`](../architecture/target-state.md)
+- Evidence baseline:
+  [`2026-07-15-current-state-anchor.md`](../audits/architecture/2026-07-15-current-state-anchor.md)
+- Target contract:
+  [`2026-07-16-target-state-baseline.md`](../audits/architecture/2026-07-16-target-state-baseline.md)
 - Research evidence: [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
 - Latest live-runtime evidence:
   [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md)
@@ -336,8 +338,8 @@ below describe the audit anchor; in-flight remediation is not counted as impleme
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| G-01 | Current-state architecture document | Implemented | `docs/architecture/current-state.md`. | Planning |
-| G-02 | Target-state architecture document | Implemented | `docs/architecture/target-state.md`. | Planning |
+| G-01 | Current-state architecture document | Implemented | Archived at `docs/audits/architecture/2026-07-15-current-state-anchor.md`. | Planning |
+| G-02 | Target-state architecture document | Implemented | Archived at `docs/audits/architecture/2026-07-16-target-state-baseline.md`. | Planning |
 | G-03 | Gap analysis with required classifications | Implemented | This document. | Planning |
 | G-04 | Concrete implementation plan | Implemented | Seven-stage controlling plan plus an executable TDD Stage 1 plan are linked from `docs/plans/implementation-plan.md`. | Planning |
 | G-05 | Repository runnable after every stage | Implemented | Diagnostic CLI compatibility and production live/app packages build and test after Task 8; each remaining checkpoint must preserve this gate. | All |

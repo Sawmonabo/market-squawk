@@ -20,8 +20,8 @@ Trybuild, Cargo Deny, Gitleaks, and Python 3 verification scripts.
 
 **Controlling documents:**
 
-- [`current-state.md`](../../architecture/current-state.md)
-- [`target-state.md`](../../architecture/target-state.md)
+- [`2026-07-15-current-state-anchor.md`](../../audits/architecture/2026-07-15-current-state-anchor.md)
+- [`2026-07-16-target-state-baseline.md`](../../audits/architecture/2026-07-16-target-state-baseline.md)
 - [`gap-analysis.md`](../../plans/gap-analysis.md)
 - [`implementation-plan.md`](../../plans/implementation-plan.md)
 

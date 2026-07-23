@@ -10,7 +10,7 @@ historical datasets to originate from or reproduce the live feed.
 
 `v0.1.0` is a runnable local product foundation under final release construction. It is not yet the
 usable complete Market Squawk release and it is not a production brokerage system. The linked
-[historical state audit](docs/architecture/current-state.md) records its own rejected audit anchor;
+[historical state audit](docs/audits/architecture/2026-07-15-current-state-anchor.md) records its own rejected audit anchor;
 it is not an exact-head inventory. The dated
 [release baseline](docs/verification/usable-release-baseline.md) is also historical audit evidence.
 The sections below are the current product inventory and user-facing truth. All mandatory remaining

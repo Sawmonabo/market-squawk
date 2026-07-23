@@ -1,4 +1,10 @@
-# Market Squawk Target State
+# Market Squawk Target-State Baseline (Historical)
+
+> **Status: Historical architecture baseline.** This document preserves the target-state contract
+> dated 2026-07-16 for audit traceability. The maintained current architecture is indexed from
+> [Architecture overview](../../architecture/overview.md); current delivery state remains in the
+> [delivery ledger](../../plans/delivery-ledger.md). This archive is not an operator runbook,
+> exact-head capability inventory, or release-approval record.
 
 ## Document control
 
@@ -7,9 +13,9 @@
 - Rust baseline: 1.97.1, Edition 2024, resolver 3
 - Cost boundary: no mandatory paid software, API, cloud, database service, container runtime, or
   telemetry infrastructure
-- Research basis: [Market Squawk deep research](../research/2026-07-15-market-squawk/final-report.md)
+- Research basis: [Market Squawk deep research](../../research/2026-07-15-market-squawk/final-report.md)
 - Latest realized live boundary:
-  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md)
+  [Q2 Task 8 implementation report](../../reports/q2-task8-implementation.md)
 
 ## Architectural principles
 
@@ -175,7 +181,7 @@ Futures identities preserve the rendered FIX Latest EP307 tag 200 `MonthYear` fo
 leg-scoped tag 610 and 611 claims, and independently supplied lifecycle dates remain separate.
 Lifecycle data includes first/last trade, expiration, notice, delivery, and settlement dates; no
 field is synthesized from another. The dated official-source evidence and response-body hashes are
-retained in the [Quarter 1 contract decisions](../research/2026-07-16-q1-contract-decisions.md).
+retained in the [Quarter 1 contract decisions](../../research/2026-07-16-q1-contract-decisions.md).
 
 Provider identity records bind the namespace/native ID and stable instrument to content evidence,
 timestamps, effective interval, and caller/source-supplied revision and predecessor claims. Those
@@ -495,7 +501,7 @@ they do not remap live state dynamically.
 Task 8 realizes this boundary with pre-feed exact-generation binding, nonblocking count-and-byte
 admission, a checked peak-memory model, one writer per route, complete readiness before ingress,
 and invalidation-before-return on every admission failure. The persisted implementation evidence is
-the [Q2 Task 8 report](../reports/q2-task8-implementation.md).
+the [Q2 Task 8 report](../../reports/q2-task8-implementation.md).
 
 ### Audit assessment and current execution authority
 

@@ -3,10 +3,10 @@
 > **Status: Historical audit. No current execution authority.** This document is frozen to the
 > rejected `651a01e120dfe27a598b9475296733d238d870b7` audit anchor for traceability. It is not an
 > exact-head inventory and must not be used to approve, schedule, or stop current delivery. Current
-> user-facing capability truth lives in the [README](../../README.md) and
-> [release baseline](../verification/usable-release-baseline.md); current execution authority lives
+> user-facing capability truth lives in the [README](../../../README.md) and
+> [release baseline](../../verification/usable-release-baseline.md); current execution authority lives
 > only in the
-> [canonical complete-release plan](../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
+> [canonical complete-release plan](../../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
 > The detailed audit is refreshed after the active Q2 closure is independently approved at
 > one clean exact commit.
 
@@ -26,12 +26,12 @@ active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,
 - Current implementation audit anchor: `651a01e120dfe27a598b9475296733d238d870b7`
 - Checkpoint disposition: rejected; integrated remediation and exact-head re-review required
 - Evidence: repository inspection, locked local verification,
-  [Q2 live-readiness audit](../plans/q2-live-readiness-audit.md),
-  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md),
-  [Q2 checkpoint rejection ledger](../reports/q2-checkpoint-review.md),
-  [integrated Q2 remediation plan](../superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md),
+  [Q2 live-readiness audit](../../plans/q2-live-readiness-audit.md),
+  [Q2 Task 8 implementation report](../../reports/q2-task8-implementation.md),
+  [Q2 checkpoint rejection ledger](../../reports/q2-checkpoint-review.md),
+  [integrated Q2 remediation plan](../../superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md),
   and
-  [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
+  [deep-research report](../../research/2026-07-15-market-squawk/final-report.md)
 
 This document describes working software at the stated baseline. Interfaces, synthetic fixtures,
 diagnostic compatibility code, and roadmap text are not counted as production capability.

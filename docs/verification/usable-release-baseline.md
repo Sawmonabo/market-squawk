@@ -26,8 +26,10 @@ performance result, historical Q2/A4 performance approval, active quarter approv
 complete-release claim exists.
 Stage 0 documentation and research commits after this audit base do not change product capability.
 
-The previously named `docs/architecture/current-state.md` and `docs/plans/gap-analysis.md` remain
-historical audits frozen at rejected commit `651a01e120dfe27a598b9475296733d238d870b7`.
+The current-state audit, now archived at
+`docs/audits/architecture/2026-07-15-current-state-anchor.md`, and
+`docs/plans/gap-analysis.md` remain historical audits frozen at rejected commit
+`651a01e120dfe27a598b9475296733d238d870b7`.
 They are not current approval evidence. This inventory, the README capability table, and the
 canonical complete-release plan replace them as current delivery truth until the detailed audit is
 refreshed after the approved live/capture prerequisite closure.
