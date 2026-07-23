@@ -2,7 +2,6 @@
 
 use std::{
     collections::BTreeSet,
-    mem::size_of,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     str::FromStr,
     time::Duration,
@@ -14,21 +13,24 @@ use market_squawk_adapter_paper::{
     PaperExecutionConfigInput, PaperExposureValuation, PaperVenueSession,
     PaperVenueSessionCalendar,
 };
+use market_squawk_analytics::{ExactFeatureRatio, RequiredLiveFeature};
 #[cfg(test)]
 use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
 #[cfg(test)]
 use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
-    AccountId, BasisPoints, Currency, InstrumentDefinition, MarketEvent, Money, RuleVersion,
-    SourceIdentifier, Timestamp,
+    AccountId, BasisPoints, ClientOrderId, Currency, InstrumentDefinition, Money, OrderId,
+    OrderReasonCode, PriceTicks, RuleVersion, SourceIdentifier, StrategyId, Timestamp,
 };
 #[cfg(test)]
 use market_squawk_execution::portfolio_execution_state;
 use market_squawk_execution::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap, BoundedOrderIntents,
-    ExecutionAuditConfig, ExecutionDispatcherConfig, ExecutionLiveActionHook,
-    PortfolioReadCapability, PortfolioReadLimits, RiskLimits, RiskLimitsInput, RiskPolicyIdentity,
-    RiskServiceConfig, Strategy, StrategyContext, StrategyError,
+    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+    BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
+    BookImbalancePaperStrategyConfigInput, ExecutionAuditConfig, ExecutionDispatcherConfig,
+    ExecutionLiveActionHook, MAX_PAPER_FEE_BASIS_POINTS, PortfolioReadCapability,
+    PortfolioReadLimits, RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskServiceConfig,
+    Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, DepthLimit, LiveRouteConfig, LiveRouteConfigInput,
@@ -45,6 +47,7 @@ use market_squawk_portfolio::{
 use rust_decimal::Decimal;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
@@ -52,6 +55,15 @@ use super::{
 use crate::{AppConfig, ProductionLiveSourceComposition, ProductionSourceProvider};
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
+const LOCAL_PAPER_STRATEGY_ID: &str = "454b500a-22ce-4a6d-a174-7320c724f78f";
+const LOCAL_PAPER_REASON_CODE: &str = "paper.book-imbalance.buy";
+const LOCAL_PAPER_MAXIMUM_SPREAD_TICKS: i64 = 5;
+const LOCAL_PAPER_MINIMUM_IMBALANCE_NUMERATOR: i128 = 1;
+const LOCAL_PAPER_MINIMUM_IMBALANCE_DENOMINATOR: u128 = 5;
+const LOCAL_PAPER_REQUIRED_FEATURES: [RequiredLiveFeature; 2] = [
+    RequiredLiveFeature::Spread,
+    RequiredLiveFeature::BookImbalance,
+];
 const COINBASE_RETAINED_DEPTH: usize = 32;
 const MAILBOX_COMMANDS_PER_ROUTE: usize = 4_096;
 const MAILBOX_BYTES_PER_ROUTE: u32 = 16 * 1024 * 1024;
@@ -73,8 +85,9 @@ const LOCAL_PAPER_MATCHING_WORK_QUANTUM: usize = 256;
 ///
 /// The currently selectable sealed public-source profiles remain `DirectUnverified`, so this
 /// composition installs the full execution graph but cannot issue live authority or mutate paper
-/// state. The no-intent strategy is a second fail-closed barrier; enabling an order-producing
-/// strategy remains an explicit application configuration change.
+/// state. If a future officially qualified source supplies authority, the built-in transparent
+/// strategy can produce at most one short-lived paper intent per route; unavailable canonical
+/// portfolio state remains a separate central-risk barrier.
 pub fn local_paper_bot(
     config: AppConfig,
     provider: ProductionSourceProvider,
@@ -88,7 +101,7 @@ pub fn local_paper_bot(
         source,
         initial_cash,
         fee_basis_points,
-        |_route| Ok(Box::new(NoIntentStrategy)),
+        controlled_paper_strategy,
     )
 }
 
@@ -168,8 +181,8 @@ where
     if initial_cash <= Decimal::ZERO {
         bail!("paper initial cash must be positive");
     }
-    if fee_basis_points > 10_000 {
-        bail!("paper fee basis points must not exceed 10000");
+    if u64::from(fee_basis_points) > MAX_PAPER_FEE_BASIS_POINTS {
+        bail!("paper fee basis points must not exceed {MAX_PAPER_FEE_BASIS_POINTS}");
     }
     let first = definitions
         .first()
@@ -235,8 +248,9 @@ where
     };
     let portfolio_results = nonzero_usize(routes.len().max(1))?;
     let portfolio_retained_bytes = nonzero_usize(4 * 1024 * 1024)?;
-    // This no-intent profile has no published portfolio dataset. Fail closed instead of
-    // manufacturing provenance; an order-producing composition must inject real revision state.
+    // This local profile has no published portfolio dataset. Keep central risk fail-closed instead
+    // of manufacturing provenance; the bounded strategy can emit an authority-free intent, but it
+    // cannot approve or dispatch that intent until real current portfolio revision state exists.
     let portfolio = PortfolioReadCapability::unavailable(PortfolioReadLimits::new(
         portfolio_results,
         portfolio_retained_bytes,
@@ -291,14 +305,17 @@ where
             dispatcher,
             market_sink_retained_bytes,
         )?;
-        let route_retained_bytes =
-            RouteActionHook::retained_bytes_for_composition(route.route(), 0, hook_retained_bytes)?;
+        let route_retained_bytes = RouteActionHook::retained_bytes_for_composition(
+            route.route(),
+            LOCAL_PAPER_REQUIRED_FEATURES.len(),
+            hook_retained_bytes,
+        )?;
         maximum_action_hook_bytes_per_route =
             maximum_action_hook_bytes_per_route.max(route_retained_bytes);
         strategies.push(ProductionPaperBotRoute::new(
             route.route().clone(),
             strategy,
-            Vec::new(),
+            LOCAL_PAPER_REQUIRED_FEATURES.to_vec(),
             ActionAuthorityIssueLimit::MIN,
         ));
     }
@@ -622,21 +639,23 @@ fn paper_config(
     })?)
 }
 
-#[derive(Debug)]
-struct NoIntentStrategy;
-
-impl Strategy for NoIntentStrategy {
-    fn on_market_event(
-        &mut self,
-        _context: &StrategyContext<'_>,
-        _event: &MarketEvent,
-    ) -> Result<BoundedOrderIntents, StrategyError> {
-        Ok(BoundedOrderIntents::new())
-    }
-
-    fn retained_bytes(&self) -> Result<usize, StrategyError> {
-        Ok(size_of::<Self>())
-    }
+fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<dyn Strategy>> {
+    let order_uuid = Uuid::new_v4();
+    let config =
+        BookImbalancePaperStrategyConfig::try_new(BookImbalancePaperStrategyConfigInput {
+            route: route.route().clone(),
+            account_id: AccountId::from_str(LOCAL_PAPER_ACCOUNT_ID)?,
+            order_id: OrderId::try_from(order_uuid)?,
+            client_order_id: ClientOrderId::try_from(format!("paper-book-imbalance-{order_uuid}"))?,
+            strategy_id: StrategyId::from_str(LOCAL_PAPER_STRATEGY_ID)?,
+            reason_code: OrderReasonCode::try_from(LOCAL_PAPER_REASON_CODE)?,
+            maximum_spread: PriceTicks::new(LOCAL_PAPER_MAXIMUM_SPREAD_TICKS),
+            minimum_book_imbalance: ExactFeatureRatio::try_new(
+                LOCAL_PAPER_MINIMUM_IMBALANCE_NUMERATOR,
+                LOCAL_PAPER_MINIMUM_IMBALANCE_DENOMINATOR,
+            )?,
+        })?;
+    Ok(Box::new(BookImbalancePaperStrategy::try_new(config)?))
 }
 
 fn nonzero_usize(value: usize) -> Result<NonZeroUsize> {

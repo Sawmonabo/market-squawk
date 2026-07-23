@@ -15,6 +15,15 @@ use thiserror::Error;
 
 use crate::{ExecutionMarketReference, OrderIntent};
 
+mod book_imbalance;
+
+pub use book_imbalance::{
+    BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
+    BookImbalancePaperStrategyConfigError, BookImbalancePaperStrategyConfigInput,
+    PAPER_BOOK_IMBALANCE_INTENT_LIFETIME_NANOS, PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS,
+    PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS,
+};
+
 /// Hard output bound kept equal to live's per-observation authority ceiling.
 pub const MAX_STRATEGY_ORDER_INTENTS: usize =
     market_squawk_live::MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION;

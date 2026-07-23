@@ -1,6 +1,7 @@
 //! Exact configurable paper fee calculation.
 
 use market_squawk_domain::{Currency, Money, RoundingPolicy};
+use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -37,8 +38,8 @@ impl FeeSchedule {
         maximum_fee: Option<Money>,
         money_scale: u32,
     ) -> Result<Self, FeeError> {
-        if maker_basis_points > 10_000
-            || taker_basis_points > 10_000
+        if u64::from(maker_basis_points) > MAX_PAPER_FEE_BASIS_POINTS
+            || u64::from(taker_basis_points) > MAX_PAPER_FEE_BASIS_POINTS
             || money_scale > Decimal::MAX_SCALE
             || minimum_fee.amount().is_sign_negative()
         {

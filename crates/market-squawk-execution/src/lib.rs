@@ -51,7 +51,8 @@ pub use intent::{
     OrderIntentError, OrderIntentInput,
 };
 pub use limits::{
-    AccountRiskViolation, MAX_RISK_INSTRUMENTS, RiskLimits, RiskLimitsError, RiskLimitsInput,
+    AccountRiskViolation, MAX_PAPER_FEE_BASIS_POINTS, MAX_RISK_INSTRUMENTS, RiskLimits,
+    RiskLimitsError, RiskLimitsInput,
 };
 pub use live_hook::{ExecutionLiveActionHook, ExecutionLiveActionHookError};
 pub use portfolio::{
@@ -63,10 +64,13 @@ pub use risk::{
     RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,
 };
 pub use strategy::{
+    BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
+    BookImbalancePaperStrategyConfigError, BookImbalancePaperStrategyConfigInput,
     BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS,
-    ModelDecisionMapper, ModelInferencePath, ModelStrategy, NativeModelInferencePath, Strategy,
-    StrategyContext, StrategyError, StrategyNoAction, StrategyNoActionDomain,
-    StrategyNoActionPhase,
+    ModelDecisionMapper, ModelInferencePath, ModelStrategy, NativeModelInferencePath,
+    PAPER_BOOK_IMBALANCE_INTENT_LIFETIME_NANOS, PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS,
+    PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS, Strategy, StrategyContext, StrategyError,
+    StrategyNoAction, StrategyNoActionDomain, StrategyNoActionPhase,
 };
 pub use task_reaper::{
     ExecutionTask, ExecutionTaskDrain, ExecutionTaskPermit, ExecutionTaskReaper,

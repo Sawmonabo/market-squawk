@@ -4,6 +4,7 @@ use market_squawk::{
     AppConfig, ProductionLiveSourceComposition, paper_bot::local_coinbase_paper_bot,
 };
 use market_squawk_domain::{DataQuality, VenueId};
+use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use market_squawk_live::{DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use rust_decimal::Decimal;
@@ -47,15 +48,28 @@ fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> Test
 #[test]
 fn controlled_local_paper_service_composes_without_network_access() -> TestResult {
     let temporary = tempfile::tempdir()?;
+    let maximum_fee = u32::try_from(MAX_PAPER_FEE_BASIS_POINTS)?;
     let composition = local_coinbase_paper_bot(
         app_config_with_overrides(ConfigOverrides {
             data_dir: Some(temporary.path().join("data")),
             ..ConfigOverrides::default()
         })?,
         Decimal::new(100_000, 0),
-        100,
+        maximum_fee,
     )?;
     drop(composition);
+
+    let excessive = local_coinbase_paper_bot(
+        app_config_with_overrides(ConfigOverrides {
+            data_dir: Some(temporary.path().join("excessive-fee-data")),
+            ..ConfigOverrides::default()
+        })?,
+        Decimal::new(100_000, 0),
+        maximum_fee
+            .checked_add(1)
+            .ok_or("paper fee fixture overflow")?,
+    );
+    assert!(excessive.is_err());
     Ok(())
 }
 
