@@ -1,4 +1,4 @@
-//! Bounded ownership for blocking diagnostic-journal scans.
+//! Test-only bounded ownership for retired diagnostic-journal scans.
 
 use std::{
     sync::{LazyLock, Mutex, MutexGuard, mpsc},
@@ -28,7 +28,7 @@ static TERMINAL_SLOTS: [Mutex<TerminalSlot>; MAXIMUM_TERMINAL_JOURNAL_WORKERS] =
 
 /// Failure to establish bounded ownership before the journal worker starts.
 #[derive(Debug, Error)]
-pub enum JournalWorkerStartError {
+pub(super) enum JournalWorkerStartError {
     /// Every fixed process-lifetime terminal-reaper slot is already owned.
     #[error("journal worker terminal-reaper capacity is exhausted")]
     Capacity,

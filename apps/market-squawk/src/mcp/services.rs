@@ -1,4 +1,4 @@
-//! Transport-neutral ownership for the current local diagnostic state.
+//! Test-only transport-neutral ownership for the retired local diagnostic MCP surface.
 
 use std::time::Instant;
 
@@ -335,11 +335,21 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::LocalToolServices;
-    use crate::{AppPaths, diagnostic_engine::DiagnosticEngine};
+    use crate::{
+        AppPaths,
+        application::Application,
+        diagnostic_engine::DiagnosticEngine,
+        mcp::{LocalMcpComposition, LocalMcpCompositionError},
+    };
 
     #[tokio::test]
     async fn capabilities_and_journal_summary_preserve_the_five_diagnostic_contracts()
     -> Result<(), Box<dyn Error>> {
+        let _shipping_constructor: fn(
+            &AppPaths,
+            Arc<Application>,
+        )
+            -> Result<LocalMcpComposition, LocalMcpCompositionError> = LocalMcpComposition::try_new;
         let temporary = tempfile::tempdir()?;
         let paths = AppPaths::prepare(temporary.path())?;
         paths.open_journal_writer("services")?.flush()?;
