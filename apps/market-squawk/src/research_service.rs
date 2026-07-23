@@ -85,6 +85,26 @@ pub struct ResearchService {
 }
 
 impl ResearchService {
+    /// Opens the existing analytical authority or initializes a genuinely fresh local root.
+    ///
+    /// This method never treats corruption, composition drift, or incomplete recovery as a fresh
+    /// installation. Initialization is attempted only when the catalog explicitly reports that
+    /// the artifact-root authority has never been established.
+    pub fn open_or_initialize(
+        paths: &LocalPaths,
+        catalog: CatalogConfig,
+        max_generations: usize,
+        objects: ObjectStoreConfig,
+    ) -> Result<Self, ResearchServiceError> {
+        match Self::open(paths, catalog.clone(), max_generations, objects) {
+            Ok(service) => Ok(service),
+            Err(ResearchServiceError::Ingest(IngestError::Catalog(
+                market_squawk_data::CatalogError::ArtifactRootAuthorityInitializationRequired,
+            ))) => Self::initialize(paths, catalog, max_generations, objects),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Creates and durably binds a fresh catalog and controlled artifact root.
     pub fn initialize(
         paths: &LocalPaths,
