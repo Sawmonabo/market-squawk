@@ -356,6 +356,11 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
         + VenueId::MAX_LENGTH
         + SourceIdentifier::MAX_LENGTH * 2
         + crate::snapshot::last_trade_maximum_dynamic_bytes()
+        + stream
+            .runtime_evidence()
+            .ok_or("missing runtime evidence allocation")?
+            .dynamic_retained_bytes()
+            .ok_or("runtime evidence allocation overflow")?
         + std::mem::size_of::<StatusSnapshotSeed>()
         + SourceId::MAX_LENGTH
         + VenueId::MAX_LENGTH;
@@ -480,6 +485,13 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
     assert_eq!(stream.trading_status, Some(TradingStatus::Halted));
     assert_eq!(stream.trading_status_revision, Some(2));
     assert_eq!(stream.state_revision, 3);
+    assert_eq!(
+        stream
+            .runtime_evidence()
+            .ok_or("missing genuine source runtime evidence")?
+            .assessment_id(),
+        halt.assessment.assessment_id()
+    );
     let last_trade = stream.last_trade().ok_or("missing retained trade")?;
     assert_eq!(last_trade.source_identifier().as_str(), "trade-2");
     assert_eq!(last_trade.stable_trade_id().as_str(), "trade");

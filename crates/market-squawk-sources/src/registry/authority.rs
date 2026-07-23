@@ -715,6 +715,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         let lease = CurrentSourceAuthorityLease {
             registry_id: self.validated.session.registry_id,
             binding: self.validated.session.binding.clone(),
+            runtime_health: Arc::clone(&self.health.snapshot),
             health_epoch: self.health.epoch,
             valid_from: self.health.valid_from,
             valid_until: self.health.valid_until,
@@ -816,6 +817,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         Ok(ValidatedLiveScope {
             registry_id: self.validated.session.registry_id,
             binding: self.validated.session.binding.clone(),
+            health: Arc::clone(&self.health.snapshot),
             venue: venue.clone(),
             instrument,
             rule: rule.clone(),

@@ -435,6 +435,29 @@ impl SourceHealthSnapshot {
     pub(crate) const fn authority_binding(&self) -> Option<&FrameSessionBinding> {
         self.authority_binding.as_ref()
     }
+
+    pub(crate) fn conservative_arc_allocation_charge(&self) -> Option<usize> {
+        let binding = self.authority_binding.as_ref().map_or(Some(0), |binding| {
+            binding.checked_shared_allocation_bytes().ok()
+        })?;
+        let limitations = self.coverage_limitations.as_slice().iter().try_fold(
+            self.coverage_limitations.checked_allocation_bytes()?,
+            |bytes, limitation| bytes.checked_add(limitation.retained_bytes()),
+        )?;
+        std::mem::size_of::<Self>()
+            .checked_add(crate::conservative_arc_control_block_charge::<Self>())?
+            .checked_add(binding)?
+            .checked_add(self.source_id.retained_bytes())?
+            .checked_add(
+                self.metadata_revision
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )?
+            .checked_add(self.session_id.as_source_identifier().retained_bytes())?
+            .checked_add(self.authorization.dynamic_retained_bytes()?)?
+            .checked_add(self.coverage.dynamic_retained_bytes()?)?
+            .checked_add(limitations)
+    }
 }
 
 #[derive(Deserialize)]

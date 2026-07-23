@@ -31,6 +31,7 @@ pub(super) struct StreamState {
     snapshot_origin: Option<SnapshotOrigin>,
     revision: StreamRevisionOwner,
     health_epoch: u64,
+    runtime_evidence: Option<crate::SourceRuntimeEvidenceSnapshot>,
     source_valid_until: Option<Timestamp>,
     source_timestamp: Option<Timestamp>,
     received_at: Option<Timestamp>,
@@ -64,6 +65,7 @@ impl StreamState {
             snapshot_origin: None,
             revision: StreamRevisionOwner::new(),
             health_epoch: 0,
+            runtime_evidence: None,
             source_valid_until: None,
             source_timestamp: None,
             received_at: None,
@@ -97,6 +99,9 @@ impl StreamState {
     pub(super) const fn health_epoch(&self) -> u64 {
         self.health_epoch
     }
+    pub(super) const fn runtime_evidence(&self) -> Option<&crate::SourceRuntimeEvidenceSnapshot> {
+        self.runtime_evidence.as_ref()
+    }
     pub(super) const fn source_valid_until(&self) -> Option<Timestamp> {
         self.source_valid_until
     }
@@ -120,6 +125,13 @@ impl StreamState {
         if let Some(trade) = trade {
             self.last_trade = Some(trade);
         }
+    }
+
+    pub(super) fn retain_runtime_evidence(
+        &mut self,
+        evidence: crate::SourceRuntimeEvidenceSnapshot,
+    ) {
+        self.runtime_evidence = Some(evidence);
     }
 
     pub(super) fn quarantine(&mut self) {

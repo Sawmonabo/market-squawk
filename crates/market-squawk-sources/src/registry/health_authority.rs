@@ -132,6 +132,7 @@ impl AuthoritativeSourceRegistry {
         };
         let next_authority = if qualified {
             Some(CurrentHealthAuthority {
+                snapshot: Arc::new(health.clone()),
                 epoch,
                 observed_at: health.observed_at(),
                 trusted_reported_at: update.trusted_reported_at,

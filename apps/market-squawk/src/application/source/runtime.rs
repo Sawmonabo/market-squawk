@@ -4,13 +4,12 @@ use std::{fmt, time::Instant};
 
 use async_trait::async_trait;
 use market_squawk_domain::{
-    AssessmentStatus, CaptureIntegrityState, ConnectionGeneration, CoverageScope, CoverageStatus,
-    DataQuality, InstrumentId, QualificationAssessment, SourceId, SourceIdentifier,
-    StreamIntegrityState, Timestamp,
+    CaptureIntegrityState, ConnectionGeneration, CoverageScope, CoverageStatus, DataQuality,
+    InstrumentId, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
 };
+use market_squawk_live::{SourceRuntimeEvidenceSnapshot, StreamSnapshot};
 use market_squawk_sources::{
-    ConnectionLiveness, MarketFreshness, SourceHealthSnapshot, SourceTimestampFreshness,
-    TransportFreshness,
+    ConnectionLiveness, MarketFreshness, SourceTimestampFreshness, TransportFreshness,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +78,11 @@ pub struct SourceRuntimeSnapshot {
     pub(super) source_id: SourceId,
     pub(super) instrument_id: InstrumentId,
     pub(super) connection_generation: ConnectionGeneration,
+    pub(super) session_id: SourceIdentifier,
+    pub(super) health_epoch: u64,
+    pub(super) state_revision: u64,
+    pub(super) assessment_id: SourceIdentifier,
+    pub(super) binding_digest: [u8; 32],
     pub(super) connection: ConnectionLiveness,
     pub(super) transport_freshness: TransportFreshness,
     pub(super) market_freshness: MarketFreshness,
@@ -89,54 +93,41 @@ pub struct SourceRuntimeSnapshot {
     pub(super) coverage_status: CoverageStatus,
     pub(super) quality: DataQuality,
     pub(super) observed_at: Timestamp,
+    pub(super) qualification_evaluated_at: Timestamp,
     pub(super) qualification_valid_until: Timestamp,
 }
 
 impl SourceRuntimeSnapshot {
-    /// Strips authority from one relationally matching health/qualification evidence pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SourceRuntimeSnapshotError::EvidenceMismatch`] when source, session, metadata,
-    /// generation, integrity, or executable-quality facts do not describe one exact runtime.
-    pub fn try_from_evidence(
+    pub(crate) fn try_from_live_evidence(
         surface_id: SourceIdentifier,
-        health: &SourceHealthSnapshot,
-        assessment: &QualificationAssessment,
+        stream: &StreamSnapshot,
+        evidence: &SourceRuntimeEvidenceSnapshot,
     ) -> Result<Self, SourceRuntimeSnapshotError> {
-        let binding = assessment.binding();
-        let coverage = assessment.market().coverage().result();
-        if health.source_id() != binding.source_id()
-            || health.metadata_revision() != binding.metadata_revision()
-            || health.session_id().as_source_identifier() != binding.session_id()
-            || health.connection_generation() != binding.connection_generation()
-            || health.stream_integrity() != *assessment.market().stream().result()
-            || health.capture_integrity() != *assessment.market().capture().result()
-            || coverage.scope().source_id() != health.source_id()
-            || coverage.scope().metadata_revision() != health.metadata_revision()
-            || (assessment.recorded_quality() == DataQuality::DirectVerified
-                && (health.live_valid_until().is_none()
-                    || assessment.assessment_status_at(health.observed_at())
-                        != AssessmentStatus::Satisfied))
-        {
+        if !evidence.matches_stream(stream) {
             return Err(SourceRuntimeSnapshotError::EvidenceMismatch);
         }
         Ok(Self {
             surface_id,
-            source_id: health.source_id().clone(),
-            instrument_id: binding.instrument_id(),
-            connection_generation: binding.connection_generation(),
-            connection: health.connection(),
-            transport_freshness: health.transport_freshness(),
-            market_freshness: health.market_freshness(),
-            source_freshness: health.source_freshness(),
-            stream_integrity: health.stream_integrity(),
-            capture_integrity: health.capture_integrity(),
-            coverage_scope: coverage.scope().clone(),
-            coverage_status: coverage.status_at(health.observed_at()),
-            quality: assessment.recorded_quality(),
-            observed_at: health.observed_at(),
-            qualification_valid_until: assessment.valid_until(),
+            source_id: stream.source().clone(),
+            instrument_id: stream.instrument(),
+            connection_generation: stream.connection_generation(),
+            session_id: evidence.session_id().clone(),
+            health_epoch: evidence.health_epoch(),
+            state_revision: evidence.state_revision(),
+            assessment_id: evidence.assessment_id().as_source_identifier().clone(),
+            binding_digest: evidence.binding_digest(),
+            connection: evidence.connection(),
+            transport_freshness: evidence.transport_freshness(),
+            market_freshness: evidence.market_freshness(),
+            source_freshness: evidence.source_freshness(),
+            stream_integrity: evidence.stream_integrity(),
+            capture_integrity: evidence.capture_integrity(),
+            coverage_scope: evidence.coverage_scope().clone(),
+            coverage_status: evidence.coverage_status(),
+            quality: evidence.quality(),
+            observed_at: evidence.health_observed_at(),
+            qualification_evaluated_at: evidence.qualification_evaluated_at(),
+            qualification_valid_until: evidence.qualification_valid_until(),
         })
     }
 
@@ -150,7 +141,7 @@ impl SourceRuntimeSnapshot {
         &self.source_id
     }
 
-    pub(super) fn sort_key(&self) -> (&str, &str, &str, InstrumentId, &str, &str) {
+    pub(crate) fn sort_key(&self) -> (&str, &str, &str, InstrumentId, &str, &str) {
         (
             self.surface_id.as_str(),
             self.source_id.as_str(),

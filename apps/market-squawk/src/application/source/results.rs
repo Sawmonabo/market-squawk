@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::{SourceRuntimeSnapshot, SourceRuntimeViewError};
 use crate::{
     ProviderOnboardingError, ProviderPortalError, ProviderProfileRegistrationOutcome,
-    ProviderProfileView,
+    ProviderProfileView, application::domain_support::encode_hex,
 };
 
 #[derive(Clone, Copy)]
@@ -101,10 +101,17 @@ fn runtime_status_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
             .as_source_identifier()
             .as_str(),
         "connectionGeneration": runtime.connection_generation.get(),
+        "sessionId": runtime.session_id.as_str(),
+        "healthEpoch": runtime.health_epoch,
+        "stateRevision": runtime.state_revision,
+        "assessmentId": runtime.assessment_id.as_str(),
+        "bindingDigest": encode_hex(runtime.binding_digest),
         "connection": to_json(&runtime.connection)?,
         "integrity": to_json(&runtime.stream_integrity)?,
         "quality": to_json(&runtime.quality)?,
         "observedAtUnixNanos": runtime.observed_at.unix_nanos(),
+        "qualificationEvaluatedAtUnixNanos":
+            runtime.qualification_evaluated_at.unix_nanos(),
         "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos(),
     }))
 }
@@ -136,6 +143,11 @@ fn runtime_health_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
         "venueId": runtime.coverage_scope.venue_id().as_str(),
         "instrumentId": runtime.instrument_id.to_string(),
         "connectionGeneration": runtime.connection_generation.get(),
+        "sessionId": runtime.session_id.as_str(),
+        "healthEpoch": runtime.health_epoch,
+        "stateRevision": runtime.state_revision,
+        "assessmentId": runtime.assessment_id.as_str(),
+        "bindingDigest": encode_hex(runtime.binding_digest),
         "connection": to_json(&runtime.connection)?,
         "transportFreshness": to_json(&runtime.transport_freshness)?,
         "marketFreshness": to_json(&runtime.market_freshness)?,
@@ -145,6 +157,8 @@ fn runtime_health_value(runtime: &SourceRuntimeSnapshot) -> Result<Value, Servic
         "coverageStatus": to_json(&runtime.coverage_status)?,
         "quality": to_json(&runtime.quality)?,
         "observedAtUnixNanos": runtime.observed_at.unix_nanos(),
+        "qualificationEvaluatedAtUnixNanos":
+            runtime.qualification_evaluated_at.unix_nanos(),
         "qualificationValidUntilUnixNanos": runtime.qualification_valid_until.unix_nanos(),
     }))
 }

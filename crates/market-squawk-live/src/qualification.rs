@@ -53,6 +53,7 @@ pub(crate) struct CommittedQualificationEvidence {
 pub(crate) struct QualifiedEvent {
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
+    pub(crate) runtime_evidence: crate::SourceRuntimeEvidenceSnapshot,
     pub(crate) binding_digest: [u8; 32],
     pub(crate) stable_trade_id: Option<SourceIdentifier>,
     pub(crate) valid_until: Timestamp,
@@ -400,6 +401,13 @@ where
         ),
     );
     let assessment = QualificationAssessment::try_from(input)?;
+    let runtime_evidence = crate::SourceRuntimeEvidenceSnapshot::try_from_evidence(
+        current.current_lease().runtime_health(),
+        &assessment,
+        current.current_lease().health_epoch(),
+        evidence.state_revision,
+        binding_digest,
+    )?;
     let recorded_coverage = assessment
         .market()
         .coverage()
@@ -424,6 +432,7 @@ where
     Ok(QualifiedEvent {
         event,
         assessment,
+        runtime_evidence,
         binding_digest,
         stable_trade_id,
         valid_until,
@@ -697,6 +706,8 @@ pub(crate) enum QualificationBuildError {
     Market(#[from] MarketEventError),
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
+    #[error(transparent)]
+    RuntimeEvidence(#[from] crate::snapshot::SourceRuntimeEvidenceError),
     #[error("qualification validity window expired before evaluation")]
     ExpiredWindow,
 }

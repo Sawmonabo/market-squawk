@@ -1,6 +1,7 @@
 //! Lifecycle-owned paper bot and execution application services.
 
 mod market;
+mod source_runtime;
 
 use std::{
     fmt,
@@ -27,6 +28,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::source::SourceRuntimeView;
 use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
     AppConfig, ProductionSourceProvider,
@@ -73,6 +75,13 @@ impl PaperApplicationServices {
     /// Returns the Market-domain implementation sharing this sole runtime owner.
     pub fn market(&self) -> Arc<dyn ApplicationDomainService> {
         Arc::new(market::MarketDomainService::new(Arc::clone(
+            &self.controller,
+        )))
+    }
+
+    /// Returns an authority-free Source-domain view sharing this sole live-runtime owner.
+    pub fn source_runtime_view(&self) -> Arc<dyn SourceRuntimeView> {
+        Arc::new(source_runtime::PaperSourceRuntimeView::new(Arc::clone(
             &self.controller,
         )))
     }
@@ -236,7 +245,7 @@ impl PaperController {
             })),
             PaperState::Starting => Ok(json!({"state": "starting"})),
             PaperState::Stopping => Ok(json!({"state": "stopping"})),
-            PaperState::Running(runtime) => {
+            PaperState::Running { runtime, .. } => {
                 let financial_reconciliation_current = runtime.financial_reconciliation_current();
                 let snapshot = runtime
                     .paper_snapshot(context.deadline(), context.cancellation())
@@ -318,7 +327,10 @@ impl PaperController {
         let mut state = self.state.lock().await;
         match result {
             Ok(runtime) if self.accepting.load(Ordering::Acquire) => {
-                *state = PaperState::Running(Box::new(runtime));
+                *state = PaperState::Running {
+                    provider,
+                    runtime: Box::new(runtime),
+                };
                 self.signal_change();
                 Ok(json!({
                     "state": "running",
@@ -404,7 +416,7 @@ impl PaperController {
     ) -> Result<PaperExecutionSnapshot, ServiceError> {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-        let PaperState::Running(runtime) = &*state else {
+        let PaperState::Running { runtime, .. } = &*state else {
             return Err(ServiceError::Unavailable);
         };
         runtime
@@ -420,7 +432,7 @@ impl PaperController {
     ) -> Result<CancelReceipt, ServiceError> {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-        let PaperState::Running(runtime) = &*state else {
+        let PaperState::Running { runtime, .. } = &*state else {
             return Err(ServiceError::Unavailable);
         };
         runtime
@@ -432,7 +444,7 @@ impl PaperController {
     async fn reconcile(&self, context: &RequestContext) -> Result<ExecutionState, ServiceError> {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-        let PaperState::Running(runtime) = &*state else {
+        let PaperState::Running { runtime, .. } = &*state else {
             return Err(ServiceError::Unavailable);
         };
         runtime
@@ -469,7 +481,7 @@ impl PaperController {
                     *state = PaperState::Stopped { last_complete };
                     return Ok(last_complete.unwrap_or(true));
                 }
-                PaperState::Running(runtime) => {
+                PaperState::Running { runtime, .. } => {
                     drop(state);
                     let complete = bounded_runtime_shutdown(*runtime, deadline, cancellation).await;
                     self.set_stopped(Some(complete.as_ref().copied().unwrap_or(false)))
@@ -521,9 +533,14 @@ impl Drop for PaperController {
 }
 
 enum PaperState {
-    Stopped { last_complete: Option<bool> },
+    Stopped {
+        last_complete: Option<bool>,
+    },
     Starting,
-    Running(Box<ProductionPaperBotRuntime>),
+    Running {
+        provider: ProductionSourceProvider,
+        runtime: Box<ProductionPaperBotRuntime>,
+    },
     Stopping,
 }
 

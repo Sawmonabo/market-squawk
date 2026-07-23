@@ -3,6 +3,7 @@
 pub struct ValidatedLiveScope {
     registry_id: u64,
     binding: FrameSessionBinding,
+    health: Arc<crate::SourceHealthSnapshot>,
     venue: VenueId,
     instrument: InstrumentId,
     rule: crate::LiveCoverageRule,
@@ -34,6 +35,7 @@ impl ValidatedLiveScope {
         CurrentSourceAuthorityLease {
             registry_id: self.registry_id,
             binding: self.binding.clone(),
+            runtime_health: Arc::clone(&self.health),
             health_epoch: self.health_epoch,
             valid_from: self.valid_from,
             valid_until: self.valid_until,
@@ -169,6 +171,7 @@ impl ValidatedLiveScope {
         let authority = CurrentSourceAuthorityLease {
             registry_id: self.registry_id,
             binding: self.binding,
+            runtime_health: self.health,
             health_epoch: self.health_epoch,
             valid_from: self.valid_from,
             trusted_valid_from: self.trusted_valid_from,

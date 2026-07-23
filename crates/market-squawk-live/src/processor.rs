@@ -324,6 +324,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             }
         };
         state.retain_committed_trade(retained_trade);
+        state.retain_runtime_evidence(qualified.runtime_evidence);
         self.streams.insert(key.clone(), state);
         let status = self.statuses.commit(staged_status);
         let authority = if qualified.assessment.recorded_quality() == DataQuality::DirectVerified

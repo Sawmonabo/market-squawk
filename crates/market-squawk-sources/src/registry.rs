@@ -185,6 +185,7 @@ impl SessionLeaseState {
 
 #[derive(Clone, Debug)]
 struct CurrentHealthAuthority {
+    snapshot: Arc<crate::SourceHealthSnapshot>,
     epoch: u64,
     observed_at: Timestamp,
     trusted_reported_at: TrustedRegistryTime,

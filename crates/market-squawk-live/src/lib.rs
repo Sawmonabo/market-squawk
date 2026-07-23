@@ -59,6 +59,7 @@ pub use snapshot::{
     LiveFeatureSnapshot, LiveFeatureValueSnapshot, LiveRuntimeSnapshotLease, LiveSnapshotLease,
     LiveSnapshotReader, RouteSnapshot, ShardLifecycleSnapshot, ShardSnapshot,
     ShardSnapshotRevision, SnapshotCompleteness, SnapshotDimension, SnapshotLimits,
-    SnapshotLimitsError, SnapshotReadError, StatusSnapshot, StreamPhaseSnapshot, StreamSnapshot,
+    SnapshotLimitsError, SnapshotReadError, SourceRuntimeEvidenceSnapshot, StatusSnapshot,
+    StreamPhaseSnapshot, StreamSnapshot,
 };
 pub use state::{GenerationPhase, GenerationStateError, GenerationStateMachine};

@@ -18,6 +18,8 @@ use crate::{ShardCount, ShardId, ShardRoutingVersion};
 mod features;
 #[path = "snapshot/route.rs"]
 mod route;
+#[path = "snapshot/source_runtime.rs"]
+mod source_runtime;
 #[path = "snapshot/store.rs"]
 mod store;
 
@@ -26,6 +28,10 @@ pub use features::{
     LiveFeatureValueSnapshot,
 };
 pub use route::RouteSnapshot;
+pub use source_runtime::SourceRuntimeEvidenceSnapshot;
+pub(crate) use source_runtime::{
+    SourceRuntimeEvidenceError, source_runtime_evidence_maximum_dynamic_bytes,
+};
 pub(crate) use store::{
     SnapshotPlaneBundle, SnapshotPublishError, SnapshotPublisher, create_snapshot_plane,
 };
@@ -338,6 +344,7 @@ pub struct StreamSnapshot {
     pub(crate) snapshot_initialized: bool,
     pub(crate) generation_current: bool,
     pub(crate) health_epoch: u64,
+    pub(crate) runtime_evidence: Option<SourceRuntimeEvidenceSnapshot>,
     pub(crate) source_valid_until: Timestamp,
     pub(crate) source_timestamp: Option<Timestamp>,
     pub(crate) received_at: Timestamp,
@@ -394,6 +401,10 @@ impl StreamSnapshot {
     }
     pub const fn health_epoch(&self) -> u64 {
         self.health_epoch
+    }
+    /// Returns the genuine health/qualification pair retained at this stream revision.
+    pub const fn runtime_evidence(&self) -> Option<&SourceRuntimeEvidenceSnapshot> {
+        self.runtime_evidence.as_ref()
     }
     pub const fn source_valid_until(&self) -> Timestamp {
         self.source_valid_until

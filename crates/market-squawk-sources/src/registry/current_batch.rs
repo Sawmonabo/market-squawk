@@ -74,6 +74,7 @@ impl CurrentBatchKey {
 pub struct CurrentSourceAuthorityLease {
     registry_id: u64,
     binding: FrameSessionBinding,
+    runtime_health: Arc<crate::SourceHealthSnapshot>,
     health_epoch: u64,
     valid_from: Timestamp,
     valid_until: Timestamp,
@@ -121,6 +122,11 @@ impl CurrentSourceAuthorityLease {
         &self.binding
     }
 
+    /// Returns the registry-recorded health snapshot bound to this authority epoch.
+    pub fn runtime_health(&self) -> &crate::SourceHealthSnapshot {
+        &self.runtime_health
+    }
+
     /// Returns the exact registry health epoch bound into this lease.
     pub const fn health_epoch(&self) -> u64 {
         self.health_epoch
@@ -142,6 +148,10 @@ impl CurrentSourceAuthorityLease {
     }
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        let health = self
+            .runtime_health
+            .conservative_arc_allocation_charge()
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
         let budget = self.budget.shared_allocation_charge()?;
         let clock = self
             .clock
@@ -156,7 +166,9 @@ impl CurrentSourceAuthorityLease {
             .capture
             .shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
-        current_authority_shared_allocation_charge(session, capture, budget, clock)
+        current_authority_shared_allocation_charge(session, capture, budget, clock)?
+            .checked_add(health)
+            .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
 
