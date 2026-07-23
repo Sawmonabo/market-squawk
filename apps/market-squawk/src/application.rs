@@ -44,6 +44,7 @@ pub use research::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
     ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
     ResearchIngestCoordinator, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryRights,
 };
 pub use source::{
     SourceApplicationError, SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshot,

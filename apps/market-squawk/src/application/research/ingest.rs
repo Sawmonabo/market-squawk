@@ -20,17 +20,20 @@ use market_squawk_services::{
     TypedToolResult,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, DiscoveryRequest, ExtractionBatch, ExtractionRequest,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, MAX_DISCOVERY_OBJECTS,
-    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, RegisteredSource, RegistryError,
-    SourceError, SourceMetadata,
+    AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
+    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
+    RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
 };
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{ResearchIngestCoordinator, encode_hex, manifest_value};
+use super::{
+    ResearchIngestCoordinator, ResearchSourceDiscoveryCoordinator, encode_hex, manifest_value,
+};
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
 use super::super::domain_support::DomainLifecycle;
@@ -128,12 +131,7 @@ impl ResearchRightsAuthority {
         payload_digest: EvidenceDigest,
         retrieved_at: Timestamp,
     ) -> Result<RightsDecisionInput, ServiceError> {
-        if self
-            .authorization_expires_at
-            .is_some_and(|expiry| expiry <= retrieved_at)
-        {
-            return Err(ServiceError::Unauthorized);
-        }
+        self.validate_at(retrieved_at)?;
         Ok(RightsDecisionInput {
             source_id: self.source_id.clone(),
             payload_digest,
@@ -143,6 +141,121 @@ impl ResearchRightsAuthority {
             authorization_expires_at: self.authorization_expires_at,
             permitted_operations: vec![SourceOperation::Persist],
         })
+    }
+
+    fn discovery_evidence(
+        &self,
+        observed_at: Timestamp,
+    ) -> Result<ResearchSourceDiscoveryRights, ServiceError> {
+        self.validate_at(observed_at)?;
+        Ok(ResearchSourceDiscoveryRights {
+            basis_reference: self.basis.reference().to_owned(),
+            basis_digest: self.basis.digest(),
+            root_identity_digest: self.basis.root_identity_digest(),
+            authorization_evidence: self.authorization_evidence,
+            authorization_expires_at: self.authorization_expires_at,
+            persistence_operation_admitted: true,
+        })
+    }
+
+    fn validate_at(&self, observed_at: Timestamp) -> Result<(), ServiceError> {
+        if self
+            .authorization_expires_at
+            .is_some_and(|expiry| expiry <= observed_at)
+        {
+            return Err(ServiceError::Unauthorized);
+        }
+        Ok(())
+    }
+}
+
+/// Retained persistence-rights evidence for one provider discovery result.
+///
+/// Discovery does not manufacture a payload-specific rights decision. The existing ingestion
+/// consumer rebinds this authority to the exact extracted payload digest before publication.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchSourceDiscoveryRights {
+    basis_reference: String,
+    basis_digest: EvidenceDigest,
+    root_identity_digest: Option<EvidenceDigest>,
+    authorization_evidence: EvidenceDigest,
+    authorization_expires_at: Option<Timestamp>,
+    persistence_operation_admitted: bool,
+}
+
+impl ResearchSourceDiscoveryRights {
+    /// Returns the canonical terms URL or path-free local ownership reference.
+    pub fn basis_reference(&self) -> &str {
+        &self.basis_reference
+    }
+
+    /// Returns the exact terms or owned-manifest content digest.
+    pub const fn basis_digest(&self) -> EvidenceDigest {
+        self.basis_digest
+    }
+
+    /// Returns the path-free local input-root identity when the basis is user-owned.
+    pub const fn root_identity_digest(&self) -> Option<EvidenceDigest> {
+        self.root_identity_digest
+    }
+
+    /// Returns the exact activation or owner-authorization evidence.
+    pub const fn authorization_evidence(&self) -> EvidenceDigest {
+        self.authorization_evidence
+    }
+
+    /// Returns the retained authorization expiry, when one exists.
+    pub const fn authorization_expires_at(&self) -> Option<Timestamp> {
+        self.authorization_expires_at
+    }
+
+    /// Returns whether the source-level persistence operation was admitted.
+    ///
+    /// The existing ingest gate still binds that authority to the exact extracted payload.
+    pub const fn persistence_operation_admitted(&self) -> bool {
+        self.persistence_operation_admitted
+    }
+}
+
+/// Bounded, authority-preserving producer contract for one registered research source.
+///
+/// Every object remains bound to the exact discovery request, source identity, metadata revision,
+/// dataset, effective interval, and payload evidence produced by the registered adapter.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchSourceDiscovery {
+    profile: SourceIdentifier,
+    metadata: SourceMetadata,
+    rights: ResearchSourceDiscoveryRights,
+    #[serde(flatten)]
+    discovery: DiscoveryBatch,
+}
+
+impl ResearchSourceDiscovery {
+    /// Returns the active provider profile that owns these objects.
+    pub const fn profile(&self) -> &SourceIdentifier {
+        &self.profile
+    }
+
+    /// Returns exact registered metadata, including coverage and quality ceilings.
+    pub const fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
+
+    /// Returns retained persistence-rights evidence.
+    pub const fn rights(&self) -> &ResearchSourceDiscoveryRights {
+        &self.rights
+    }
+
+    /// Returns the exact bounded request used by the adapter.
+    pub const fn request(&self) -> &DiscoveryRequest {
+        self.discovery.request()
+    }
+
+    /// Returns request-bound exact objects suitable for the existing ingestion consumer.
+    pub fn objects(&self) -> &[SourceObject] {
+        self.discovery.objects()
     }
 }
 
@@ -335,6 +448,62 @@ impl ProductionResearchIngestCoordinator {
         Ok(authority.sources.contains_key(profile))
     }
 
+    /// Discovers exact source objects from one already registered provider profile.
+    ///
+    /// This is the public producer for [`Self::extract_registered_batch`] and
+    /// [`ResearchIngestCoordinator::ingest`]. It uses the same registry-minted authority and
+    /// returns only bounded, request-bound object identities plus exact metadata and retained
+    /// persistence-rights evidence. The adapter response body and any credential material remain
+    /// behind their owning boundaries. Point-in-time discovery remains closed until the ingestion
+    /// consumer can bind the same effective-time coordinate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed service error when the profile is inactive, a point-in-time coordinate is
+    /// supplied, the requested limit exceeds configured coordinator authority, retained rights
+    /// expired, adapter lineage does not match registration, or cancellation, shutdown, or the
+    /// deadline wins.
+    pub async fn discover_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceDiscovery, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        if effective_at.is_some() || max_results.get() > self.limits.discovery_objects.get() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let operation = self.lifecycle.shutdown_token().child_token();
+        let prepared = self.prepare(profile)?;
+        prepared.rights.validate_at(system_timestamp()?)?;
+        let deadline = wall_deadline(context, self.limits.duration)?;
+        let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        let discovery = await_extraction(
+            prepared
+                .source
+                .discover(prepared.authority, request, operation.clone()),
+            context,
+            &operation,
+        )
+        .await?;
+        if discovery.objects().iter().any(|object| {
+            object.source_id() != prepared.metadata.source_id()
+                || object.metadata_revision() != prepared.metadata.revision()
+        }) {
+            return Err(ServiceError::InvalidResult);
+        }
+        let rights = prepared.rights.discovery_evidence(system_timestamp()?)?;
+        Ok(ResearchSourceDiscovery {
+            profile: profile.clone(),
+            metadata: prepared.metadata,
+            rights,
+            discovery,
+        })
+    }
+
     /// Extracts one exact object from an already registered profile without analytical
     /// publication.
     ///
@@ -480,6 +649,28 @@ impl std::fmt::Debug for ProductionResearchIngestCoordinator {
             .field("lifecycle", &self.lifecycle)
             .field("configured_sources", &configured_sources)
             .finish()
+    }
+}
+
+#[async_trait]
+impl ResearchSourceDiscoveryCoordinator for ProductionResearchIngestCoordinator {
+    async fn discover_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceDiscovery, ServiceError> {
+        ProductionResearchIngestCoordinator::discover_registered_objects(
+            self,
+            profile,
+            dataset,
+            effective_at,
+            max_results,
+            context,
+        )
+        .await
     }
 }
 

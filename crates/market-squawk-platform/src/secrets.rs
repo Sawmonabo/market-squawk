@@ -22,7 +22,8 @@ pub use self::managed::{
     SecretStoreCapabilities,
 };
 pub use self::preferred::{
-    EncryptedFileSecretFallback, EncryptedFileUnlockCapability, PreferredSecretStore,
+    EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileUnlockCapability,
+    PreferredSecretStore,
 };
 
 const MAX_SCOPE_BYTES: usize = 64;
@@ -86,6 +87,30 @@ impl fmt::Debug for SecretKey {
 
 /// Replaceable storage contract for local credential material.
 pub trait SecretStore: fmt::Debug + Send + Sync {
+    /// Returns the non-secret readiness of an optional encrypted-file fallback.
+    fn encrypted_file_fallback_status(
+        &self,
+    ) -> Result<EncryptedFileFallbackStatus, LocalSecretStoreError> {
+        Ok(EncryptedFileFallbackStatus::Disabled)
+    }
+
+    /// Consumes explicit foreground unlock authority into process memory.
+    fn unlock_encrypted_file_fallback(
+        &self,
+        _unlock: EncryptedFileUnlockCapability,
+        _control: &SecretOperationControl,
+    ) -> Result<EncryptedFileFallbackStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
+    /// Drops process-held encrypted-file unlock authority.
+    fn lock_encrypted_file_fallback(
+        &self,
+        _control: &SecretOperationControl,
+    ) -> Result<EncryptedFileFallbackStatus, LocalSecretStoreError> {
+        Err(LocalSecretStoreError::UnsupportedOperation)
+    }
+
     /// Probes non-secret backend capabilities without storing credential material.
     fn probe(
         &self,

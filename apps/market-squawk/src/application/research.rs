@@ -3,6 +3,7 @@
 use std::{
     fmt,
     io::{self, Write},
+    num::NonZeroU16,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,7 +18,7 @@ use market_squawk_data::{
     AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind, GenerationParentRelation,
     ManifestCatalogError, QueryError, QueryLimits, QueryResult,
 };
-use market_squawk_domain::{InstrumentId, Timestamp};
+use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
@@ -32,6 +33,7 @@ mod ingest;
 pub use ingest::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryRights,
 };
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
@@ -73,6 +75,23 @@ pub trait ResearchIngestCoordinator: Send + Sync + 'static {
 
     /// Completes bounded adapter and persistence shutdown.
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
+}
+
+/// Read-only discovery authority shared with the Source domain.
+///
+/// This narrow trait exposes registered adapter discovery without granting source registration,
+/// raw adapter access, credential access, extraction, or analytical publication authority.
+#[async_trait]
+pub trait ResearchSourceDiscoveryCoordinator: Send + Sync + 'static {
+    /// Discovers bounded exact objects for one active registered provider profile.
+    async fn discover_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceDiscovery, ServiceError>;
 }
 
 /// Shared analytical authority exposed as separate Research, Fundamental, and Macro services.

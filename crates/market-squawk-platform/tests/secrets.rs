@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use market_squawk_platform::{
-    EncryptedFileSecretStore, LocalSecretStoreError, SecretBackend, SecretCancellation,
+    EncryptedFileFallbackStatus, EncryptedFileSecretStore, EncryptedFileUnlockCapability,
+    LocalSecretStoreError, PreferredSecretStore, SecretBackend, SecretCancellation,
     SecretGeneration, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
     SecretValue,
 };
@@ -113,6 +114,81 @@ fn managed_secret_lifecycle_is_generation_exact_and_fail_closed() -> TestResult 
     assert!(matches!(
         store.read(&reference_two, &expired),
         Err(LocalSecretStoreError::DeadlineExceeded)
+    ));
+    Ok(())
+}
+
+#[test]
+fn preferred_store_requires_explicit_memory_only_fallback_unlock() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("preferred-secrets");
+    let key = SecretKey::try_new("provider", "fallback-readiness")?;
+    let control = SecretOperationControl::try_new(
+        "provider-onboarding",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let reference = {
+        let seeded = EncryptedFileSecretStore::try_open(
+            &root,
+            SecretValue::new("correct unlock phrase".to_owned())?,
+        )?;
+        seeded.create(
+            &key,
+            SecretGeneration::new(1)?,
+            SecretValue::new("fallback-only credential".to_owned())?,
+            &control,
+        )?
+    };
+    let preferred = PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
+        "market-squawk-test",
+        &root,
+    )?;
+
+    assert_eq!(
+        preferred.encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Locked
+    );
+    assert!(matches!(
+        preferred.read(&reference, &control),
+        Err(LocalSecretStoreError::Locked)
+    ));
+    assert!(matches!(
+        preferred.unlock_encrypted_file_fallback(
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "incorrect unlock phrase".to_owned()
+            )?),
+            &control,
+        ),
+        Err(LocalSecretStoreError::AuthenticationFailed)
+    ));
+    assert_eq!(
+        preferred.encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Locked
+    );
+
+    assert_eq!(
+        preferred.unlock_encrypted_file_fallback(
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "correct unlock phrase".to_owned()
+            )?),
+            &control,
+        )?,
+        EncryptedFileFallbackStatus::Ready
+    );
+    assert_eq!(
+        preferred.read(&reference, &control)?.expose_secret(),
+        "fallback-only credential"
+    );
+    assert_eq!(
+        preferred.lock_encrypted_file_fallback(&control)?,
+        EncryptedFileFallbackStatus::Locked
+    );
+    assert!(matches!(
+        preferred.read(&reference, &control),
+        Err(LocalSecretStoreError::Locked)
     ));
     Ok(())
 }

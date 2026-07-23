@@ -12,8 +12,9 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
-    LocalSecretStoreError, SecretCancellation, SecretInteractionPolicy, SecretKey,
-    SecretOperationControl, SecretStore, SecretValue,
+    EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
+    SecretCancellation, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
+    SecretValue,
 };
 use market_squawk_sources::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, OnboardingEvent,
@@ -130,6 +131,57 @@ impl ProviderOnboardingService {
     /// Returns every built-in profile in stable identity order.
     pub fn profiles(&self) -> Vec<ProviderProfileView> {
         self.profiles.iter().map(Into::into).collect()
+    }
+
+    /// Returns non-secret encrypted-fallback readiness without probing or mutating a backend.
+    pub fn encrypted_file_fallback_status(
+        &self,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        self.secrets
+            .encrypted_file_fallback_status()
+            .map_err(Into::into)
+    }
+
+    /// Consumes an explicit foreground unlock through the single-flight secret executor.
+    pub async fn unlock_encrypted_file_fallback(
+        &self,
+        unlock: SecretValue,
+        cancellation: CancellationToken,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        let secrets = Arc::clone(&self.secrets);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| {
+                let control = secret_fallback_control("provider-fallback-unlock", operation)?;
+                secrets
+                    .unlock_encrypted_file_fallback(
+                        EncryptedFileUnlockCapability::new(unlock),
+                        &control,
+                    )
+                    .map_err(Into::into)
+            },
+        )
+        .await
+    }
+
+    /// Drops the process-held fallback unlock through the single-flight secret executor.
+    pub async fn lock_encrypted_file_fallback(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        let secrets = Arc::clone(&self.secrets);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| {
+                let control = secret_fallback_control("provider-fallback-lock", operation)?;
+                secrets
+                    .lock_encrypted_file_fallback(&control)
+                    .map_err(Into::into)
+            },
+        )
+        .await
     }
 
     /// Idempotently registers one exact code-owned capability without starting setup.
@@ -1042,6 +1094,23 @@ fn read_secret_reference(
         cancellation,
     )?;
     secrets.read(reference, &control).map_err(Into::into)
+}
+
+fn secret_fallback_control(
+    owner: &'static str,
+    cancellation: SecretCancellation,
+) -> Result<SecretOperationControl, ProviderOnboardingError> {
+    let deadline = Instant::now()
+        .checked_add(SECRET_OPERATION_DURATION)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    SecretOperationControl::try_new(
+        owner,
+        deadline,
+        0,
+        SecretInteractionPolicy::Forbid,
+        cancellation,
+    )
+    .map_err(Into::into)
 }
 
 fn require_same_active_lease(

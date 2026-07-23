@@ -16,7 +16,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use market_squawk_platform::SecretValue;
+use market_squawk_platform::{EncryptedFileFallbackStatus, LocalSecretStoreError, SecretValue};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
@@ -392,9 +392,37 @@ async fn dispatch(
     if method == Method::GET && path == "/api/v1/bootstrap" {
         let response = BootstrapResponse {
             csrf_token: &security.csrf_token,
+            encrypted_file_fallback: service.encrypted_file_fallback_status()?,
             profiles: service.profiles(),
         };
         return with_session_cookie(json_response(StatusCode::OK, &response), &security);
+    }
+    if method == Method::POST && path == "/api/v1/secrets/fallback/unlock" {
+        validate_mutation(&request, &security, "application/octet-stream")?;
+        let unlock = collect_secret_body(request.into_body()).await?;
+        let status = service
+            .unlock_encrypted_file_fallback(unlock, cancellation)
+            .await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            &SecretFallbackResponse {
+                encrypted_file_fallback: status,
+            },
+        ));
+    }
+    if method == Method::POST && path == "/api/v1/secrets/fallback/lock" {
+        validate_mutation(&request, &security, "application/json")?;
+        let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+        if !body.is_empty() && body != b"{}" {
+            return Err(PortalRequestError::InvalidBody);
+        }
+        let status = service.lock_encrypted_file_fallback(cancellation).await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            &SecretFallbackResponse {
+                encrypted_file_fallback: status,
+            },
+        ));
     }
     if method == Method::POST && path == "/api/v1/sessions" {
         validate_mutation(&request, &security, "application/json")?;
@@ -416,11 +444,7 @@ async fn dispatch(
         }
         if method == Method::POST && action == Some("secret") {
             validate_mutation(&request, &security, "application/octet-stream")?;
-            let body = collect_body(request.into_body(), MAX_SECRET_BODY_BYTES).await?;
-            let value =
-                String::from_utf8(body).map_err(|_| PortalRequestError::InvalidSecretBody)?;
-            let secret =
-                SecretValue::new(value).map_err(|_| PortalRequestError::InvalidSecretBody)?;
+            let secret = collect_secret_body(request.into_body()).await?;
             let status = service
                 .submit_secret(session_id, secret, cancellation)
                 .await?;
@@ -548,6 +572,38 @@ async fn collect_body(mut body: Incoming, max_bytes: usize) -> Result<Vec<u8>, P
     Ok(retained)
 }
 
+async fn collect_secret_body(mut body: Incoming) -> Result<SecretValue, PortalRequestError> {
+    let mut retained = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => {
+                discard_secret_bytes(retained);
+                return Err(PortalRequestError::InvalidSecretBody);
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let Some(next) = retained.len().checked_add(data.len()) else {
+            discard_secret_bytes(retained);
+            return Err(PortalRequestError::BodyTooLarge);
+        };
+        if next > MAX_SECRET_BODY_BYTES {
+            discard_secret_bytes(retained);
+            return Err(PortalRequestError::BodyTooLarge);
+        }
+        retained.extend_from_slice(&data);
+    }
+    SecretValue::from_utf8_bytes(retained).map_err(|_| PortalRequestError::InvalidSecretBody)
+}
+
+fn discard_secret_bytes(bytes: Vec<u8>) {
+    if let Ok(secret) = SecretValue::from_utf8_bytes(bytes) {
+        drop(secret);
+    }
+}
+
 fn parse_session_path(path: &str) -> Option<(Uuid, Option<&str>)> {
     let remainder = path.strip_prefix("/api/v1/sessions/")?;
     let mut segments = remainder.split('/');
@@ -656,6 +712,17 @@ fn map_error(error: PortalRequestError) -> Response<Full<Bytes>> {
         | PortalRequestError::Application(ProviderOnboardingError::RightsBlocked) => {
             error_response(StatusCode::CONFLICT, "invalid_session_state")
         }
+        PortalRequestError::Application(ProviderOnboardingError::SecretStore(
+            LocalSecretStoreError::AuthenticationFailed
+            | LocalSecretStoreError::CandidateUnlockNotAuthoritative
+            | LocalSecretStoreError::SupersededUnlock,
+        )) => error_response(StatusCode::FORBIDDEN, "invalid_unlock"),
+        PortalRequestError::Application(ProviderOnboardingError::SecretStore(
+            LocalSecretStoreError::UnsupportedOperation | LocalSecretStoreError::Locked,
+        )) => error_response(StatusCode::CONFLICT, "fallback_unavailable"),
+        PortalRequestError::Application(ProviderOnboardingError::OperationCancelled) => {
+            error_response(StatusCode::REQUEST_TIMEOUT, "operation_cancelled")
+        }
         PortalRequestError::Activation(ProviderPortalActivationError::InvalidRequest) => {
             error_response(StatusCode::BAD_REQUEST, "invalid_adapter_request")
         }
@@ -694,7 +761,13 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[derive(Serialize)]
 struct BootstrapResponse<'a> {
     csrf_token: &'a str,
+    encrypted_file_fallback: EncryptedFileFallbackStatus,
     profiles: Vec<ProviderProfileView>,
+}
+
+#[derive(Serialize)]
+struct SecretFallbackResponse {
+    encrypted_file_fallback: EncryptedFileFallbackStatus,
 }
 
 #[derive(Deserialize)]
@@ -765,6 +838,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <main>
 <h1>Market Squawk provider setup</h1>
 <p>This local page lists exact provider requirements, release gates, and official handoffs.</p>
+<section id="fallback"></section>
 <div id="profiles">Loading code-owned provider profiles…</div>
 <pre id="status" aria-live="polite"></pre>
 </main>
@@ -799,6 +873,43 @@ function requiredValue(node) {
 function dateValue(node) {
   const parts = requiredValue(node).split('-').map(Number);
   return {year: parts[0], month: parts[1], day: parts[2]};
+}
+function renderFallback(state) {
+  const section = document.getElementById('fallback'); section.textContent = '';
+  const title = document.createElement('h2'); title.textContent = 'Encrypted credential fallback';
+  const detail = document.createElement('p');
+  if (state === 'disabled') {
+    detail.textContent = 'No encrypted fallback is configured; the operating-system credential store is required.';
+    section.append(title, detail); return;
+  }
+  if (state === 'locked') {
+    detail.textContent = 'The encrypted fallback is locked. Its unlock is submitted only to this process.';
+    const unlock = input('password', 'Encrypted fallback unlock', 8192);
+    unlock.autocomplete = 'new-password';
+    const button = document.createElement('button'); button.textContent = 'Unlock fallback';
+    button.addEventListener('click', async () => {
+      const value = requiredValue(unlock); unlock.value = '';
+      try {
+        const result = await mutate('/api/v1/secrets/fallback/unlock',
+          value, 'application/octet-stream');
+        renderFallback(result.encrypted_file_fallback);
+      } catch (error) {
+        document.getElementById('status').textContent = String(error);
+      }
+    });
+    section.append(title, detail, unlock, button); return;
+  }
+  detail.textContent = 'The encrypted fallback is ready in this process.';
+  const button = document.createElement('button'); button.textContent = 'Lock fallback';
+  button.addEventListener('click', async () => {
+    try {
+      const result = await mutate('/api/v1/secrets/fallback/lock', '{}', 'application/json');
+      renderFallback(result.encrypted_file_fallback);
+    } catch (error) {
+      document.getElementById('status').textContent = String(error);
+    }
+  });
+  section.append(title, detail, button);
 }
 function blsConfiguration(section) {
   const start = input('number', 'Start year');
@@ -879,6 +990,7 @@ async function start(profile, organization, email, adapterRequest) {
 }
 fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
   csrf = data.csrf_token;
+  renderFallback(data.encrypted_file_fallback);
   const root = document.getElementById('profiles'); root.textContent = '';
   for (const profile of data.profiles) {
     const section = document.createElement('section');
