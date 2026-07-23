@@ -65,7 +65,7 @@ for documentation writers:
   `doctor`, with portfolio import/analytics and fair-value workflows routed through the production
   `LocalProduct` and shared application services.
 - The shipping stdio MCP surface is the sole production composition over all 11 required domains
-  and 55 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
+  and 59 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
   capability nor a reference source.
 - Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
   analytics/training, immutable model bundles, native and tract ONNX inference, governed

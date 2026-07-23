@@ -165,7 +165,7 @@ remains design history and has no factual authority over current pages.
 | Runnable claim | Producer authority | Terminal consumer or proof |
 | --- | --- | --- |
 | Complete local CLI hierarchy | Clap contracts in `cli.rs`; shared operation mapping in `local_product/cli_transport.rs` | Release binary help plus `main.rs` dispatch into the production `LocalProduct` composition |
-| Complete typed local MCP surface | The 55 code-owned descriptors returned by `application_capabilities()` | `LocalMcpComposition` and the hardened MCP server over the same `Application`; exact served-list and governed-mutation composition test |
+| Complete typed local MCP surface | The 59 code-owned descriptors returned by `application_capabilities()` | `LocalMcpComposition` and the hardened MCP server over the same `Application`; exact served-list and governed-mutation composition test |
 | Research ingestion and analytical storage | File, SEC, FRED/ALFRED, BLS, Treasury, and portfolio extraction adapters | Application research coordinator, catalog authority, Arrow/Parquet publication, bounded DataFusion reads, and point-in-time dataset construction |
 | Live market processing | Coinbase and Kraken adapters plus source registry and live qualification evidence | Instrument-owned runtime, book/feature state, risk, dispatcher, and paper engine; both current provider ceilings remain execution-ineligible |
 | Models and backtests | Catalog-authorized datasets, feature registry, immutable model bundles, native/tract inference, and backtest input authority | Model application service, no-action execution boundary, immutable experiment repository, and CLI/MCP analysis operations |

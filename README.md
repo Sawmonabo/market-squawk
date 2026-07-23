@@ -154,7 +154,7 @@ work is bound by the single canonical
   sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
   paper execution, fair value, MCP, and readiness diagnosis. Mutating operations retain explicit
   confirmation, typed request admission, shared application-service authority, and bounded output.
-- A sole production local stdio MCP composition spanning all 11 required domains and 55 code-owned
+- A sole production local stdio MCP composition spanning all 11 required domains and 59 code-owned
   typed tools. The shared application descriptors enforce schemas, authorization, evidence and
   artifact policy, bounds, deadlines, cancellation, durable audit, controlled artifacts, and
   lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services.
