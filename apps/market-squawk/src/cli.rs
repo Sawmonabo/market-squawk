@@ -1,0 +1,610 @@
+//! Typed command-line contract for the local control plane.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use market_squawk_platform::JournalFileFormat;
+use rust_decimal::Decimal;
+
+use crate::ProductionSourceProvider;
+
+/// Market Squawk's complete local command-line surface.
+#[derive(Debug, Parser)]
+#[command(name = "market-squawk")]
+#[command(about = "Local-first market data, research, analytics, and paper execution")]
+#[command(version)]
+pub struct Cli {
+    /// Local Market Squawk data root.
+    #[arg(long, global = true)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Explicit local configuration file.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Local tracing filter.
+    #[arg(long, env = "MARKET_SQUAWK_LOG", default_value = "info", global = true)]
+    pub log: String,
+
+    /// Render local tracing as JSON.
+    #[arg(long, global = true)]
+    pub json_logs: bool,
+
+    /// Render command results for people or structured consumers.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human, global = true)]
+    pub output: OutputFormat,
+
+    /// Source-task cancellation deadline in milliseconds.
+    #[arg(long, global = true)]
+    pub source_shutdown_ms: Option<u64>,
+
+    /// Fixed raw-capture queue depth.
+    #[arg(long, global = true)]
+    pub capture_queue_capacity: Option<usize>,
+
+    /// Unified per-channel capture memory ceiling in bytes.
+    #[arg(long, global = true)]
+    pub capture_memory_ceiling_bytes: Option<usize>,
+
+    /// Process-wide capture destination-registry memory ceiling in bytes.
+    #[arg(long, global = true)]
+    pub capture_destination_registry_memory_ceiling_bytes: Option<usize>,
+
+    /// Selected operation.
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Result rendering mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    /// Concise operator-oriented output.
+    Human,
+    /// Stable structured JSON output.
+    Json,
+}
+
+/// Top-level local control-plane command.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Initialize controlled local state.
+    Init,
+
+    /// Inspect and validate effective configuration.
+    Config {
+        /// Configuration operation.
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
+    /// Register, inspect, and configure provider sources.
+    Source {
+        /// Source operation.
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+
+    /// Capture direct Coinbase Exchange data into the local journal.
+    Capture(CaptureArguments),
+
+    /// Ingest user-authorized local or provider data.
+    Ingest {
+        /// Ingestion operation.
+        #[command(subcommand)]
+        command: IngestCommand,
+    },
+
+    /// Build and inspect immutable analytical datasets.
+    Dataset {
+        /// Dataset operation.
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+
+    /// Query controlled analytical datasets.
+    Query {
+        /// Query operation.
+        #[command(subcommand)]
+        command: QueryCommand,
+    },
+
+    /// Inspect and build registered features.
+    Feature {
+        /// Feature operation.
+        #[command(subcommand)]
+        command: FeatureCommand,
+    },
+
+    /// Inspect, evaluate, and run admitted local models.
+    Model {
+        /// Model operation.
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+
+    /// Import, inspect, and analyze portfolios.
+    Portfolio {
+        /// Portfolio operation.
+        #[command(subcommand)]
+        command: PortfolioCommand,
+    },
+
+    /// Run and inspect governed research backtests.
+    Backtest {
+        /// Backtest operation.
+        #[command(subcommand)]
+        command: BacktestCommand,
+    },
+
+    /// Control local paper-operation lifecycle.
+    Bot {
+        /// Bot operation.
+        #[command(subcommand)]
+        command: BotCommand,
+    },
+
+    /// Inspect and control risk-approved paper execution.
+    Execution {
+        /// Execution operation.
+        #[command(subcommand)]
+        command: ExecutionCommand,
+    },
+
+    /// Create and inspect evidence-bound fair-value measurements.
+    FairValue {
+        /// Fair-value operation.
+        #[command(subcommand)]
+        command: FairValueCommand,
+    },
+
+    /// Run the local stdio MCP server.
+    Mcp {
+        /// MCP operation. Omitting it retains the v0.1 `mcp` compatibility form.
+        #[command(subcommand)]
+        command: Option<McpCommand>,
+
+        /// MCP server arguments.
+        #[command(flatten)]
+        serve: McpServeArguments,
+    },
+
+    /// Report bounded local readiness, configuration provenance, and release blockers.
+    Doctor,
+
+    /// Run a deterministic diagnostic feed.
+    #[command(hide = true)]
+    Mock(MockArguments),
+
+    /// Run the v0.1 paper-bot compatibility command.
+    #[command(hide = true)]
+    PaperBot(PaperBotArguments),
+
+    /// Validate the v0.1 immutable diagnostic journal.
+    #[command(hide = true)]
+    Replay(ReplayArguments),
+}
+
+/// Effective-configuration operation.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Show the effective redacted configuration and value provenance.
+    Show,
+    /// Validate configuration, paths, endpoint policy, and artifact confinement.
+    Validate,
+}
+
+/// Provider-source operation.
+#[derive(Debug, Subcommand)]
+pub enum SourceCommand {
+    /// Register a code-supported provider profile in the local catalog.
+    Register {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Report configured source state.
+    Status {
+        /// Optional provider filter.
+        provider: Option<String>,
+    },
+    /// Report explicit provider and instrument coverage.
+    Coverage {
+        /// Optional provider filter.
+        provider: Option<String>,
+    },
+    /// Report bounded source connection and data health.
+    Health {
+        /// Optional provider filter.
+        provider: Option<String>,
+    },
+    /// Start or resume evidence-bound local provider onboarding.
+    Setup {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Direct capture arguments.
+#[derive(Debug, Args)]
+pub struct CaptureArguments {
+    /// Coinbase products to capture.
+    #[arg(long, value_delimiter = ',', default_value = "BTC-USD")]
+    pub products: Vec<String>,
+    /// Stop after this many seconds; omit to run until interrupted.
+    #[arg(long)]
+    pub seconds: Option<u64>,
+    /// Enable local paper simulation.
+    #[arg(long)]
+    pub paper_bot: bool,
+}
+
+/// Research-ingestion operation.
+#[derive(Debug, Subcommand)]
+pub enum IngestCommand {
+    /// Ingest a confined user-authorized local file.
+    File {
+        /// Input path admitted beneath a user-authorized root.
+        path: PathBuf,
+        /// Explicit format when it cannot be inferred safely.
+        #[arg(long)]
+        format: Option<String>,
+        /// Destination dataset identity.
+        #[arg(long)]
+        dataset: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Extract and ingest one object from a configured provider.
+    Source {
+        /// Configured provider identifier.
+        provider: String,
+        /// Provider object or series identifier.
+        object: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Analytical-dataset operation.
+#[derive(Debug, Subcommand)]
+pub enum DatasetCommand {
+    /// List bounded immutable datasets.
+    List,
+    /// Inspect one exact dataset manifest.
+    Manifest {
+        /// Dataset identity.
+        dataset: String,
+    },
+    /// Build a point-in-time feature/label generation from a typed request file.
+    Build {
+        /// Confined JSON request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Analytical-query operation.
+#[derive(Debug, Subcommand)]
+pub enum QueryCommand {
+    /// Run bounded read-only DataFusion SQL. This operation is CLI-only.
+    Sql {
+        /// Read-only SQL statement.
+        statement: String,
+        /// Maximum returned rows.
+        #[arg(long, default_value_t = 1_000)]
+        maximum_rows: usize,
+    },
+    /// Read one dataset through its immutable manifest authority.
+    Dataset {
+        /// Dataset identity.
+        dataset: String,
+        /// Maximum returned rows.
+        #[arg(long, default_value_t = 1_000)]
+        maximum_rows: usize,
+    },
+}
+
+/// Feature-registry operation.
+#[derive(Debug, Subcommand)]
+pub enum FeatureCommand {
+    /// List registered versioned feature definitions.
+    List,
+    /// Build features from a confined typed request file.
+    Build {
+        /// Confined JSON request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Model-registry and inference operation.
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// List admitted immutable model bundles.
+    List,
+    /// Inspect one bundle's complete metadata and admission state.
+    Metadata {
+        /// Model bundle identity.
+        model: String,
+    },
+    /// Evaluate a model through a confined typed request file.
+    Evaluate {
+        /// Confined JSON request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Run bounded local prediction through a confined typed request file.
+    Predict {
+        /// Confined JSON request file.
+        request: PathBuf,
+    },
+}
+
+/// Portfolio operation.
+#[derive(Debug, Subcommand)]
+pub enum PortfolioCommand {
+    /// Import and reconcile a confined holdings or transactions export.
+    Import {
+        /// Confined provider export.
+        path: PathBuf,
+        /// Destination account identity.
+        #[arg(long)]
+        account: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Report current holdings.
+    Holdings {
+        /// Optional account filter.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Report normalized transactions.
+    Transactions {
+        /// Optional account filter.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Measure point-in-time portfolio performance.
+    Performance {
+        /// Confined JSON request file.
+        request: PathBuf,
+    },
+    /// Measure point-in-time portfolio exposure.
+    Exposure {
+        /// Confined JSON request file.
+        request: PathBuf,
+    },
+    /// Measure point-in-time portfolio risk.
+    Risk {
+        /// Confined JSON request file.
+        request: PathBuf,
+    },
+}
+
+/// Governed-backtest operation.
+#[derive(Debug, Subcommand)]
+pub enum BacktestCommand {
+    /// Run one admitted point-in-time experiment.
+    Run {
+        /// Confined JSON request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Inspect one immutable experiment result.
+    Show {
+        /// Experiment or run identity.
+        run: String,
+    },
+}
+
+/// Paper-bot lifecycle operation.
+#[derive(Debug, Subcommand)]
+pub enum BotCommand {
+    /// Report lifecycle, source qualification, risk, and paper state.
+    Status,
+    /// Start controlled local paper operation.
+    Start {
+        /// Controlled paper-run parameters.
+        #[command(flatten)]
+        paper: PaperBotArguments,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Stop controlled local paper operation.
+    Stop {
+        /// Required audit reason.
+        #[arg(long)]
+        reason: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Paper execution operation.
+#[derive(Debug, Subcommand)]
+pub enum ExecutionCommand {
+    /// List bounded paper orders and transitions.
+    Orders,
+    /// List bounded paper fills.
+    Fills,
+    /// Cancel one existing paper order through risk-controlled dispatch.
+    Cancel {
+        /// Paper order identity.
+        order: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Reconcile paper orders, fills, balances, and positions.
+    Reconcile {
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Fair-value operation.
+#[derive(Debug, Subcommand)]
+pub enum FairValueCommand {
+    /// Create an immutable evidence-bound measurement.
+    Measure {
+        /// Confined JSON request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Classify an existing immutable measurement.
+    Classify {
+        /// Measurement identity.
+        measurement: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Explain the complete classification decision table.
+    Explain {
+        /// Measurement identity.
+        measurement: String,
+    },
+    /// Return bounded measurement evidence.
+    Evidence {
+        /// Measurement identity.
+        measurement: String,
+    },
+    /// Approve an eligible measurement through the controlled workflow.
+    Approve {
+        /// Measurement identity.
+        measurement: String,
+        /// Distinct reviewer identity.
+        #[arg(long)]
+        reviewer: String,
+        /// Required approval reason.
+        #[arg(long)]
+        reason: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// MCP operation.
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Serve the bounded local stdio protocol.
+    Serve,
+}
+
+/// Local MCP server arguments shared by the current and compatibility forms.
+#[derive(Debug, Args)]
+pub struct McpServeArguments {
+    /// Products observed by the optional online diagnostic source.
+    #[arg(long, value_delimiter = ',', default_value = "BTC-USD", global = true)]
+    pub products: Vec<String>,
+    /// Avoid opening a provider connection.
+    #[arg(long, global = true)]
+    pub offline: bool,
+    /// Select an immutable journal format when both formats exist.
+    #[arg(long, value_enum, requires = "offline", global = true)]
+    pub journal_format: Option<JournalFormatArgument>,
+    /// Enable local paper simulation.
+    #[arg(long, global = true)]
+    pub paper_bot: bool,
+}
+
+/// Diagnostic mock-feed arguments.
+#[derive(Debug, Args)]
+pub struct MockArguments {
+    /// Diagnostic product.
+    #[arg(long, default_value = "TEST-USD")]
+    pub product: String,
+    /// Number of deterministic events.
+    #[arg(long, default_value_t = 100)]
+    pub events: usize,
+    /// Enable local paper simulation.
+    #[arg(long)]
+    pub paper_bot: bool,
+}
+
+/// Production paper-composition arguments.
+#[derive(Debug, Args)]
+pub struct PaperBotArguments {
+    /// Configured direct source.
+    #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
+    pub provider: ProductionSourceArgument,
+    /// Stop after this many seconds; omit to run until interrupted.
+    #[arg(long)]
+    pub seconds: Option<u64>,
+    /// Virtual starting cash in the configured common quote currency.
+    #[arg(long, default_value = "100000")]
+    pub initial_cash: Decimal,
+    /// Maker and taker fee assumption for local paper execution.
+    #[arg(long, default_value_t = 100)]
+    pub fee_basis_points: u32,
+}
+
+/// Diagnostic replay arguments.
+#[derive(Debug, Args)]
+pub struct ReplayArguments {
+    /// Captured source identity.
+    #[arg(long, default_value = "coinbase-exchange")]
+    pub source: String,
+    /// Select a journal when current and legacy formats both exist.
+    #[arg(long, value_enum)]
+    pub journal_format: Option<JournalFormatArgument>,
+}
+
+/// Supported immutable journal format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum JournalFormatArgument {
+    /// Current checksummed raw-record format.
+    Current,
+    /// Read-only legacy journal format.
+    Legacy,
+}
+
+impl From<JournalFormatArgument> for JournalFileFormat {
+    fn from(value: JournalFormatArgument) -> Self {
+        match value {
+            JournalFormatArgument::Current => Self::Current,
+            JournalFormatArgument::Legacy => Self::Legacy,
+        }
+    }
+}
+
+/// Direct source selectable by controlled local paper operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProductionSourceArgument {
+    /// Coinbase Exchange.
+    Coinbase,
+    /// Kraken book-v2.
+    Kraken,
+}
+
+impl From<ProductionSourceArgument> for ProductionSourceProvider {
+    fn from(value: ProductionSourceArgument) -> Self {
+        match value {
+            ProductionSourceArgument::Coinbase => Self::Coinbase,
+            ProductionSourceArgument::Kraken => Self::Kraken,
+        }
+    }
+}

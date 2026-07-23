@@ -6,6 +6,7 @@
 pub mod application;
 pub mod backtest_service;
 pub mod bot;
+pub mod cli;
 pub mod diagnostic_engine;
 mod domain;
 pub mod features;
