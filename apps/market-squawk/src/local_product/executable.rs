@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
-const MAXIMUM_APPLICATION_BYTES: u64 = 512 * 1024 * 1024;
+const MAXIMUM_APPLICATION_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_ONNX_WORKER_BYTES: u64 = 256 * 1024 * 1024;
 const ONNX_WORKER_BASENAME: &str = "market-squawk-onnx-worker";
 

@@ -2,7 +2,7 @@
 
 **As of:** 2026-07-21
 
-**Last measured update:** 2026-07-22
+**Last measured update:** 2026-07-23
 
 ## Decision
 
@@ -24,11 +24,17 @@ The clean gate ran on macOS 26.5.1 arm64 with Apple `ld` 1267 and Rust 1.97.1 / 
 | `market_squawk_data` lib test | 323,676,176 bytes | 19.94 MiB |
 | `publication_recovery` | 322,018,376 bytes | 19.68 MiB |
 | `control_plane` | 354,986,784 bytes | 21.96 MiB |
+| Debug `market-squawk` binary | 538,619,984 bytes | 33.63 MiB |
 | Release `market-squawk` | 8,804,400 bytes | 42,024 bytes |
 
 The `control_plane` measurement was added after its existing consolidated harness gained the real
 research-dataset-to-backtest authority vertical. Its measured `__eh_frame` is 23,027,100 bytes;
 the allowance remains scoped to that test crate root.
+
+The debug application-binary measurement was added after the complete local product composition
+linked the analytical and inference dependency graph into the executable built alongside
+integration tests. Its measured `__eh_frame` is 35,259,372 bytes. The allowance is restricted to
+macOS builds with debug assertions, so release builds continue to surface every linker diagnostic.
 
 The LLVM arm64 Mach-O definition assigns only the low 24 bits of a compact-unwind entry to the
 DWARF FDE offset and defines the mask as `0x00FF_FFFF`, or 16 MiB minus one byte. Each affected
@@ -48,7 +54,7 @@ the underlying large test-binary condition was already possible.
   under that configuration.
 - `-Wl,-no_compact_unwind` is not an acceptable workspace fix. It changes macOS unwind behavior,
   can break mixed Rust/C++ exception propagation and crash reporting, and would affect more than
-  the three test binaries unless introduced through additional build machinery.
+  the measured oversized targets unless introduced through additional build machinery.
 - A workspace-wide `linker_messages = "allow"` would hide unrelated future linker warnings.
 - Changing optimization or dependency topology solely to silence this diagnostic would alter the
   entire test build and require a separate performance and semantic evaluation.
@@ -60,10 +66,11 @@ Add `#![allow(linker_messages)]` only to the currently measured affected roots:
 1. the `publication_recovery` integration-test root;
 2. the `ingest_vertical` integration-test root; and
 3. the `market-squawk-data` library only under `cfg(test)`; and
-4. the consolidated application `control_plane` integration-test root.
+4. the consolidated application `control_plane` integration-test root; and
+5. the application binary only for macOS debug-assertion builds.
 
 This does not change generated code, unwind behavior, product behavior, or test coverage. It
-classifies four measured diagnostics while every other linker message remains visible.
+classifies five measured diagnostics while every other linker message remains visible.
 
 ## Sources
 

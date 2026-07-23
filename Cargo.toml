@@ -180,6 +180,10 @@ debug = false
 debug = false
 opt-level = 3
 
+[profile.dev.package.sha2]
+debug = false
+opt-level = 3
+
 [profile.test]
 debug = "line-tables-only"
 incremental = true
@@ -188,6 +192,10 @@ incremental = true
 debug = false
 
 [profile.test.package.argon2]
+debug = false
+opt-level = 3
+
+[profile.test.package.sha2]
 debug = false
 opt-level = 3
 

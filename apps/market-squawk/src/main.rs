@@ -1,3 +1,8 @@
+// Rust #159105: this macOS-only dev/test-link diagnostic is caused by the measured
+// `__eh_frame` exceeding arm64 compact-unwind's 24-bit offset range. Release diagnostics remain
+// enabled because this allowance is restricted to debug-assertion builds.
+#![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
+
 use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
