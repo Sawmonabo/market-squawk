@@ -197,12 +197,12 @@ Choose an absolute directory owned by the runtime operator. Keep the version in 
 upgrade never overwrites executables underneath a running process:
 
 ```bash
+INSTALL_PARENT=/absolute/operator-owned/market-squawk
+INSTALL_ROOT="$INSTALL_PARENT/0.1.0-836aae6"
+
 (
   set -eu
   umask 022
-
-  INSTALL_PARENT=/absolute/operator-owned/market-squawk
-  INSTALL_ROOT="$INSTALL_PARENT/0.1.0-836aae6"
 
   test -d "$INSTALL_PARENT"
   test ! -e "$INSTALL_ROOT"

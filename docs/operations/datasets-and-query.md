@@ -574,21 +574,18 @@ does not expose the typed service's instrument or knowledge-time filters, so red
 `--maximum-rows` when inspecting an unfamiliar dataset.
 
 The bounded engine uses a 60-second deadline, a 256 KiB inline Arrow result target, four
-partitions, and bounded planning/memory. A result is either:
+partitions, and bounded planning/memory. The reviewed public composition returns only inline `rows`
+plus `arrowIpcBytes`. Although the engine has an authority-gated controlled-artifact mode, this
+application path does not compose its publication and reservation authorities. A result that
+cannot fit inline therefore fails closed; narrow the requested row count and retry. The missing
+public artifact workflow is tracked in the [delivery ledger](../plans/delivery-ledger.md).
 
-- inline `rows` plus `arrowIpcBytes`; or
-- a controlled `artifact` receipt containing `artifactId`, `contentDigest`, `sizeBytes`,
-  `rowCount`, `owner`, and `expiresAt`.
-
-In both cases retain:
+For a successful inline result retain:
 
 - the returned manifest;
 - source ID;
 - object-graph, query-identity, and result digests from `metadata.sourceCoverage`; and
 - `metadata.dataQuality`, including `executionEligible: false`.
-
-A controlled artifact is catalog-owned evidence with an expiry. Its ID is not a filesystem path
-or permission to open the content-addressed object directly.
 
 ## Run bounded read-only SQL
 
@@ -618,9 +615,10 @@ The caller's `--maximum-rows` defaults to 1,000. Execution is additionally bound
 Arrow IPC result, 64 MiB memory, four partitions, 2,048 AST nodes, 4,096 plan nodes, 60 seconds,
 and the CLI's 16 MiB JSON output ceiling.
 
-Unlike `query dataset`, SQL has no controlled-artifact fallback. If the result cannot be returned
-inline, it fails with artifact authority required. Narrow the projection, predicate, grouping, or
-row ceiling and retry. The success output includes the pinned manifest, `relation: "dataset"`,
+Like `query dataset`, SQL has no controlled-artifact fallback in the current public composition. If
+the result cannot be returned inline, it fails because artifact publication authority is
+unavailable. Narrow the projection, predicate, grouping, or row ceiling and retry. The success
+output includes the pinned manifest, `relation: "dataset"`,
 `arrowIpcBytes`, rows, source coverage, and `executionEligible: false`.
 
 ## Success evidence
@@ -662,9 +660,9 @@ operation:
 - If the catalog/object store is damaged or displaced, stop writers and follow
   [Backup and recovery](backup-and-recovery.md). Do not copy only `catalog.sqlite3` or only the
   Parquet objects.
-- If a query artifact expires, rerun the same bounded read against the same still-current
-  generation. If latest has changed, the new result is not the same reproduction; compare the
-  returned manifest first.
+- If a query exceeds the inline result boundary, narrow the projection, predicate, grouping, or
+  row ceiling and rerun against the same still-current generation. If latest has changed, the new
+  result is not the same reproduction; compare the returned manifest first.
 
 ## Failure modes
 
@@ -680,7 +678,7 @@ operation:
 | Built dataset absent from `feature list` | The current analysis registry is not dynamically populated | Verify through the build receipt and dataset commands |
 | Query limit/resource exhausted | Row, byte, memory, AST, plan, or deadline ceiling was reached | Narrow the read or SQL; do not increase beyond fixed ceilings |
 | SQL statement/relation/function rejected | It is outside the read-only allowlist | Rewrite it as one bounded query over `dataset` using admitted functions |
-| SQL reports artifact authority required | Result exceeded the inline boundary and SQL has no artifact path | Reduce projection/rows or use typed `query dataset` when its semantics fit |
+| Dataset or SQL query reports resource exhaustion or required artifact authority | Result exceeded an inline boundary and the current public path has no artifact publication authority | Reduce projection, predicates, grouping, or rows; both public query paths are inline-only |
 | Python training cannot start from build output alone | Exact `exportSha256` is not exposed by the CLI | Stop; obtain accepted producer evidence for that exact descriptor rather than substituting another digest |
 
 ## Local state locations
@@ -689,12 +687,13 @@ All paths are relative to the selected data root:
 
 | Path | Purpose | Operator rule |
 | --- | --- | --- |
-| `catalog.sqlite3` and active `catalog.sqlite3-wal`/`catalog.sqlite3-shm` | Manifests, lineage, build admissions, query-artifact ownership, and Python dataset admissions | Treat as one SQLite consistency domain; never edit manually |
-| `artifacts/objects/sha256/<first-two-hex>/<sha256>.parquet` | Immutable ingested, derived, and controlled query objects | Content addressed; never rename, edit, or delete manually |
+| `catalog.sqlite3` and active `catalog.sqlite3-wal`/`catalog.sqlite3-shm` | Manifests, lineage, build admissions, and Python dataset admissions | Treat as one SQLite consistency domain; never edit manually |
+| `artifacts/objects/sha256/<first-two-hex>/<sha256>.parquet` | Immutable ingested and derived dataset objects | Content addressed; never rename, edit, or delete manually |
 | The retained build request outside the data root | User-owned authority and exact build specification input | Keep with the success receipt and source evidence |
 
-Controlled query artifacts use the same content-addressed object store but remain governed by their
-catalog reservation, owner, and expiry. A digest does not grant standalone access.
+The data library's controlled query-artifact mode uses the same content-addressed object store when
+a caller supplies publication and reservation authority. The reviewed public product paths do not,
+so the entries above do not imply a runnable public query-artifact workflow.
 
 ## Related documentation, code, and evidence
 

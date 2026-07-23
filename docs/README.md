@@ -90,7 +90,7 @@ Use only these release-status labels in maintained product summaries:
 
 | Area | Purpose | Maintenance rule |
 | --- | --- | --- |
-| [`audits/`](audits/) | Dated current-state and target-state baselines | Preserve historical wording and file history; correct only broken maintained navigation |
+| [`audits/`](audits/) | Dated current-state and target-state baselines | Preserve historical wording and file history; limit changes to maintained navigation or an explicitly recorded repository-wide editorial instruction whose prior bytes remain in Git history |
 | [`reports/`](reports/) | Generated or authored review outcomes and measurements | Bind claims to an exact commit/tree and measurement context |
 | [`research/`](research/) | Source-backed technical, provider, standards, and ecosystem research | Record dates, direct sources, and inference boundaries |
 | [`testing/`](testing/) | Explanatory testing strategy and formal-model guidance | Keep focused on high-value behavior and acceptance risk |

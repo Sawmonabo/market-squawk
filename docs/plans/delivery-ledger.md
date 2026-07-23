@@ -59,8 +59,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   tree against product head `836aae6`. Documentation-migration Tasks 1–6 are complete. Task 7's
   first frozen candidate `b0ed3e9` completed content, navigation, GitHub Mermaid, and grouped review
   gates but was rejected on substantiated documentation findings. The current correction candidate
-  still requires exact-head re-review, release fast-forward, evidence publication, and branch
-  cleanup before the documentation blocker closes.
+  follows correction head `e063419`, whose architecture and reference findings closed but whose
+  operations re-review exposed three remaining runbook ripples. It still requires exact-head
+  re-review, release fast-forward, evidence publication, and branch cleanup before the
+  documentation blocker closes.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
   workflows and clean-machine evidence, provider discovery-to-ingestion, the public

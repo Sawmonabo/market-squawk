@@ -4,7 +4,9 @@
 > dated 2026-07-16 for audit traceability. The maintained current architecture is indexed from
 > [Architecture overview](../../architecture/overview.md); current delivery state remains in the
 > [delivery ledger](../../plans/delivery-ledger.md). This archive is not an operator runbook,
-> exact-head capability inventory, or release-approval record.
+> exact-head capability inventory, or release-approval record. Its substantive body is preserved
+> except for the repository-wide editorial correction recorded at `e063419`; the exact prior bytes
+> remain available in Git history.
 
 ## Document control
 

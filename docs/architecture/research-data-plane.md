@@ -201,7 +201,7 @@ operations with closed schemas and bounded results; it does not expose a general
 The query engine has an authority-gated artifact-publication mode for large results. The reviewed
 public CLI and fixed-template application/MCP query compositions do not supply that authority:
 they return inline results within their configured bounds and reject a result that would require
-artifact publication with `ArtifactAuthorityRequired`.
+artifact publication.
 
 ### Python
 

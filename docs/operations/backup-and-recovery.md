@@ -187,14 +187,35 @@ new empty parent, validate it, then explicitly point configuration at that resto
 ### 1. Verify before extraction
 
 ```bash
-BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
-BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
-shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
-tar -tf "$BACKUP_ARCHIVE" >/dev/null
+(
+  set -eu
+
+  BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
+  BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
+  BACKUP_DIGEST="$BACKUP_DIR/data-root.tar.sha256"
+
+  test -f "$BACKUP_ARCHIVE"
+  test -f "$BACKUP_DIGEST"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "$BACKUP_DIGEST"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$BACKUP_DIGEST"
+  else
+    exit 1
+  fi
+
+  # First prove the complete archive table is readable, then display a bounded preview.
+  tar -tf "$BACKUP_ARCHIVE" >/dev/null
+  tar -tf "$BACKUP_ARCHIVE" | sed -n '1,200p'
+)
 ```
 
-Confirm the archive has one expected top-level data-root directory and no absolute or parent (`..`)
-paths before extracting data received from another trust boundary.
+The subshell must exit successfully. Confirm the preview begins with the one expected top-level
+data-root directory. For an archive received from another trust boundary, the 200-entry preview is
+not a complete path audit: inspect every archive entry and link target with trusted platform archive
+tooling, and reject any absolute path, parent (`..`) component, extra top-level root, or escaping
+link before extraction. Proceed only after both digest verification and the applicable name audit
+succeed.
 
 ### 2. Extract into an empty private parent
 

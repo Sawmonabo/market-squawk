@@ -659,9 +659,12 @@ content commits are recorded in the delivery ledger and pushed to
 `origin/docs/product-documentation`.
 
 The first frozen candidate `b0ed3e9` completed its bounded content, navigation, GitHub Mermaid, and
-three-scope grouped review gates but was rejected on substantiated findings. The correction pass
-repairs authority diagrams, fail-fast no-overwrite installation and recovery procedures, explicit
-restore coordinates, historical/current navigation, and public product truth. It also records
+three-scope grouped review gates but was rejected on substantiated findings. Correction head
+`e063419` closed the architecture and reference findings; operations re-review rejected three
+remaining copy/paste and public-query ripples, which the current candidate corrects. The complete
+correction set repairs authority diagrams, fail-fast no-overwrite installation and recovery
+procedures, explicit restore coordinates, historical/current navigation, and public product truth.
+It also records
 mandatory product gaps that remain release blockers: provider discovery object IDs are not publicly
 returned for FRED/BLS/Treasury first-use ingestion; `dataset list` cannot consume its cursor; the
 dataset export digest needed by Python is not exposed; feature builds do not populate the public
