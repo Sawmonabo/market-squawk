@@ -16,11 +16,11 @@ use crate::{
     BacktestOutcome, BacktestRequest, BacktestService, BacktestServiceError, BacktestStrategy,
     BacktestStrategyClass, BacktestStrategyFactory, BacktestStrategyInstance,
     BacktestStrategyRegistry, BacktestTrialPlan, ExperimentError, ExperimentInventory,
-    ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus, PortfolioSeed,
-    RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
-    ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialComponentBinding,
-    TrialDatasetPartition, TrialId, TrialMetric, TrialParameter, TrialSearchDimension, TrialSpec,
-    TrialSpecInput, TrialStatus,
+    ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus,
+    MAX_COHORT_CANDIDATES_PER_FOLD, PortfolioSeed, RESEARCH_EXECUTION_POLICY_VERSION,
+    ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, ResearchLiquidityPriority,
+    TrialComponentBinding, TrialDatasetPartition, TrialId, TrialMetric, TrialParameter,
+    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
@@ -518,6 +518,35 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
 
 #[test]
 fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record() -> TestResult {
+    let oversized_fold = (0_u64..=u64::try_from(MAX_COHORT_CANDIDATES_PER_FOLD)?)
+        .map(|index| {
+            let mut in_sample = [0_u8; 32];
+            in_sample[..8].copy_from_slice(
+                &index
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or("candidate identity overflow")?
+                    .to_be_bytes(),
+            );
+            let mut out_of_sample = [0_u8; 32];
+            out_of_sample[..8].copy_from_slice(
+                &index
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(2))
+                    .ok_or("candidate identity overflow")?
+                    .to_be_bytes(),
+            );
+            Ok(BacktestCohortCandidate::new(
+                TrialId::from_digest(Sha256Digest::new(in_sample)),
+                TrialId::from_digest(Sha256Digest::new(out_of_sample)),
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    assert!(matches!(
+        BacktestCohortFold::try_new(oversized_fold),
+        Err(ExperimentError::InvalidDiagnostic)
+    ));
+
     let temporary = tempfile::tempdir()?;
     let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
         max_trials: 16,
@@ -532,24 +561,82 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     let (registry, build_id) = strategy_registry(account_id)?;
     let parameters = &["fast", "medium", "slow"];
     let universe = cohort_universe(&[(10, 40), (70, 100)], 40)?;
+    let differently_bounded_universe = BacktestCohortUniverse::try_new(
+        universe.generator_version().clone(),
+        universe.generation_parameters().to_vec(),
+        2,
+        universe.folds().to_vec(),
+        universe.selection_partition(),
+    )?;
+    assert_ne!(universe.digest(), differently_bounded_universe.digest());
+    let aggregate_overflow_folds = [(10, 35), (55, 80), (100, 125), (145, 170), (190, 215)]
+        .into_iter()
+        .map(|(in_sample, out_of_sample)| {
+            BacktestCohortFoldPartition::try_new(
+                cohort_partition(in_sample)?,
+                cohort_partition(out_of_sample)?,
+            )
+        })
+        .collect::<Result<Vec<_>, ExperimentError>>()?;
+    assert!(matches!(
+        BacktestCohortUniverse::try_new(
+            SourceIdentifier::try_from("walk-forward-generator-v1")?,
+            vec![TrialParameter::new(
+                SourceIdentifier::try_from("fold-count")?,
+                SourceIdentifier::try_from("five-folds")?,
+            )],
+            MAX_COHORT_CANDIDATES_PER_FOLD,
+            aggregate_overflow_folds,
+            cohort_partition(35)?,
+        ),
+        Err(ExperimentError::InvalidDiagnostic)
+    ));
+    let mut mismatched_strategy = registry.admit(&build_id)?;
+    let parameter_name = SourceIdentifier::try_from("speed")?;
+    assert!(matches!(
+        service.run(
+            request(account_id, dataset_at(execution_terms()?, 10)?, None)?,
+            &mut mismatched_strategy,
+            BacktestTrialPlan::new(
+                vec![TrialParameter::new(
+                    parameter_name.clone(),
+                    SourceIdentifier::try_from("fast")?,
+                )],
+                vec![TrialSearchDimension::try_new(
+                    parameter_name,
+                    vec![
+                        SourceIdentifier::try_from("fast")?,
+                        SourceIdentifier::try_from("slow")?,
+                    ],
+                )?],
+                SourceIdentifier::try_from("total-return")?,
+            )
+            .with_cohort_universe(universe.clone()),
+            &CancellationToken::new(),
+        ),
+        Err(BacktestServiceError::InvalidCohort)
+    ));
+    assert_eq!(
+        std::fs::read_dir(temporary.path().join("backtesting/v1/reservations"))?.count(),
+        0
+    );
     let (first_fold, selection_candidates, first_candidates) = completed_cohort_fold(
         &service, &registry, &build_id, account_id, 10, 40, parameters, &universe,
     )?;
     let (second_fold, second_selection, second_candidates) = completed_cohort_fold(
         &service, &registry, &build_id, account_id, 70, 100, parameters, &universe,
     )?;
-    let incomplete_plan = BacktestCohortPlan::try_new(
-        universe.clone(),
-        vec![
-            BacktestCohortFold::try_new(first_candidates[..2].to_vec())?,
-            BacktestCohortFold::try_new(second_candidates[..2].to_vec())?,
-        ],
-        selection_candidates[..2].to_vec(),
-        SourceIdentifier::try_from("total-return")?,
-    )?;
     assert!(matches!(
-        service.evaluate_cohort(incomplete_plan),
-        Err(BacktestServiceError::InvalidCohort)
+        BacktestCohortPlan::try_new(
+            universe.clone(),
+            vec![
+                BacktestCohortFold::try_new(first_candidates[..2].to_vec())?,
+                BacktestCohortFold::try_new(second_candidates[..2].to_vec())?,
+            ],
+            selection_candidates[..2].to_vec(),
+            SourceIdentifier::try_from("total-return")?,
+        ),
+        Err(ExperimentError::InvalidDiagnostic)
     ));
     assert!(matches!(
         BacktestCohortPlan::try_new(
@@ -560,19 +647,18 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
-    let invalid_plan = BacktestCohortPlan::try_new(
-        universe.clone(),
-        vec![first_fold.clone(), second_fold.clone()],
-        selection_candidates
-            .iter()
-            .chain(&second_selection)
-            .copied()
-            .collect(),
-        SourceIdentifier::try_from("total-return")?,
-    )?;
     assert!(matches!(
-        service.evaluate_cohort(invalid_plan),
-        Err(BacktestServiceError::InvalidCohort)
+        BacktestCohortPlan::try_new(
+            universe.clone(),
+            vec![first_fold.clone(), second_fold.clone()],
+            selection_candidates
+                .iter()
+                .chain(&second_selection)
+                .copied()
+                .collect(),
+            SourceIdentifier::try_from("total-return")?,
+        ),
+        Err(ExperimentError::InvalidDiagnostic)
     ));
     let mut changed_request = request(account_id, dataset_at(execution_terms()?, 40)?, None)?;
     changed_request.limits = BacktestLimits::try_new(BacktestLimitsInput {
@@ -617,6 +703,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         selection_candidates.clone(),
         SourceIdentifier::try_from("total-return")?,
     )?;
+    let constrained_plan = plan.clone();
 
     let evaluation = service.evaluate_cohort(plan.clone())?;
     let repeated = service.evaluate_cohort(plan)?;
@@ -638,6 +725,23 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     );
     let evaluation_id = evaluation.id();
     drop(service);
+    let constrained_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let constrained = BacktestService::new(ExperimentInventory::try_new(
+        constrained_root,
+        ExperimentLimits::try_new(ExperimentLimitsInput {
+            max_trials: 8,
+            max_record_bytes: 64 * 1024,
+            max_artifact_bytes: 64 * 1024,
+            max_metrics: 8,
+        })?,
+    )?);
+    assert!(matches!(
+        constrained.evaluate_cohort(constrained_plan),
+        Err(BacktestServiceError::Experiment(
+            ExperimentError::LimitExceeded
+        ))
+    ));
+    drop(constrained);
     let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
     let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
     assert_eq!(reopened.cohort_evaluation(evaluation_id)?, evaluation);
@@ -675,6 +779,92 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     let legacy_id = TrialId::from_digest(Sha256Digest::new(V1_TRIAL_ID));
     assert_eq!(inventory.trial(legacy_id)?.spec().id(), legacy_id);
 
+    let legacy_artifact = br#"{"legacy":true}"#;
+    let legacy_artifact_reference = "backtesting/v1/artifacts/sha256/60/600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725.json";
+    let legacy_terminal_path = temporary
+        .path()
+        .join("backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json");
+    std::fs::write(
+        &legacy_terminal_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "trial_id": "ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
+            "status": "completed",
+            "completed": {
+                "result_digest": "0909090909090909090909090909090909090909090909090909090909090909",
+                "artifact_reference": legacy_artifact_reference,
+                "artifact_digest": "600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725",
+                "artifact_bytes": legacy_artifact.len(),
+                "metrics": [],
+                "probability_of_backtest_overfitting": 0.25,
+                "probability_fold_count": 2,
+                "deflated_performance_probability": 0.75,
+                "expected_maximum_sharpe": 0.5,
+                "selected": true
+            },
+            "failed": null
+        }))?,
+    )?;
+    assert!(matches!(
+        inventory.trial(legacy_id),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    let legacy_artifact_path = temporary.path().join(legacy_artifact_reference);
+    std::fs::create_dir_all(
+        legacy_artifact_path
+            .parent()
+            .ok_or("missing legacy artifact parent")?,
+    )?;
+    std::fs::write(&legacy_artifact_path, legacy_artifact)?;
+    assert!(matches!(
+        inventory.trial(legacy_id)?.status(),
+        TrialStatus::Completed(_)
+    ));
+    std::fs::write(&legacy_artifact_path, b"xxxxxxxxxxxxxxx")?;
+    assert!(matches!(
+        inventory.trial(legacy_id),
+        Err(ExperimentError::CorruptRecord)
+    ));
+
+    const V2_TRIAL_ID: [u8; 32] = [
+        62, 253, 167, 147, 117, 60, 225, 151, 9, 248, 210, 184, 142, 210, 23, 180, 136, 19, 17,
+        215, 191, 201, 233, 214, 201, 33, 9, 47, 49, 121, 83, 50,
+    ];
+    const V2_TRIAL_HEX: &str = "3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332";
+    const V2_RESERVATION: &str = r#"{"schema_version":2,"trial_id":"3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","run_input_digest":"0404040404040404040404040404040404040404040404040404040404040404","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
+    std::fs::write(
+        temporary
+            .path()
+            .join(format!("backtesting/v1/reservations/{V2_TRIAL_HEX}.json")),
+        V2_RESERVATION,
+    )?;
+    let v2_terminal_path = temporary
+        .path()
+        .join(format!("backtesting/v1/terminals/{V2_TRIAL_HEX}.json"));
+    let failed_terminal = |schema_version| {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": schema_version,
+            "trial_id": V2_TRIAL_HEX,
+            "status": "failed",
+            "completed": null,
+            "failed": {
+                "code": "legacy-failure",
+                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
+            }
+        }))
+    };
+    std::fs::write(&v2_terminal_path, failed_terminal(1)?)?;
+    let v2_id = TrialId::from_digest(Sha256Digest::new(V2_TRIAL_ID));
+    assert!(matches!(
+        inventory.trial(v2_id),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    std::fs::write(&v2_terminal_path, failed_terminal(2)?)?;
+    assert!(matches!(
+        inventory.trial(v2_id)?.status(),
+        TrialStatus::Failed(_)
+    ));
+
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
     let spec = TrialSpec::try_new(TrialSpecInput {
@@ -695,6 +885,34 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     })?;
 
     let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
+    let current_trial_hex = spec
+        .id()
+        .digest()
+        .bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let current_legacy_terminal = temporary
+        .path()
+        .join(format!("backtesting/v1/terminals/{current_trial_hex}.json"));
+    std::fs::write(
+        &current_legacy_terminal,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "trial_id": current_trial_hex,
+            "status": "failed",
+            "completed": null,
+            "failed": {
+                "code": "wrong-path",
+                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
+            }
+        }))?,
+    )?;
+    assert!(matches!(
+        inventory.trial(spec.id()),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    std::fs::remove_file(current_legacy_terminal)?;
     assert!(matches!(
         inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10),
         Err(ExperimentError::TrialInProgress)
@@ -721,17 +939,10 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     inventory.complete(recovered, completion, artifact_bytes)?;
 
     let final_path = temporary.path().join(artifact.reference());
-    let trial_hex = spec
-        .id()
-        .digest()
-        .bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     let pending_path = temporary
         .path()
         .join("backtesting/v1/pending")
-        .join(trial_hex)
+        .join(current_trial_hex)
         .join("00000000000000000002.json");
     std::fs::create_dir_all(pending_path.parent().ok_or("missing pending parent")?)?;
     std::fs::copy(&final_path, &pending_path)?;
@@ -949,6 +1160,7 @@ fn cohort_universe(
             SourceIdentifier::try_from("fold-count")?,
             SourceIdentifier::try_from(format!("{}-folds", fold_starts.len()))?,
         )],
+        3,
         folds,
         cohort_partition(selection_start)?,
     )?)

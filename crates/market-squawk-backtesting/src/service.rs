@@ -13,8 +13,9 @@ use crate::experiments::{
     BacktestOverfittingDiagnostic, BacktestOverfittingFold, BacktestOverfittingInput,
     BacktestOverfittingScore, CohortEvaluationInput, CohortMemberBinding,
     DeflatedPerformanceDiagnostic, DeflatedPerformanceInput, ExperimentError, ExperimentInventory,
-    TrialCompletionInput, TrialDatasetPartition, TrialFailure, TrialId, TrialMetric,
-    TrialParameter, TrialRecord, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    MAX_COHORT_MEMBER_REFERENCES, TrialCompletionInput, TrialDatasetPartition, TrialFailure,
+    TrialId, TrialMetric, TrialParameter, TrialRecord, TrialSearchDimension, TrialSpec,
+    TrialSpecInput, TrialStatus,
 };
 use crate::{
     AdmittedBacktestStrategy, BacktestEngine, BacktestError, BacktestRequest, BacktestRun,
@@ -142,16 +143,26 @@ impl BacktestService {
                 .decision_at,
         )?;
         let executable = strategy.identity();
+        let cohort_universe_digest = plan
+            .cohort_universe
+            .as_ref()
+            .map(BacktestCohortUniverse::digest);
+        let expected_cohort_candidates = plan
+            .cohort_universe
+            .as_ref()
+            .map(BacktestCohortUniverse::expected_candidate_count);
+        if expected_cohort_candidates
+            .is_some_and(|expected| expected > self.inventory.limits().max_trials())
+        {
+            return Err(ExperimentError::LimitExceeded.into());
+        }
         let spec = TrialSpec::try_new(TrialSpecInput {
             dataset_identity: request.dataset_identity(),
             object_graph_digest: request.object_graph_digest(),
             execution_assumption_digest: request.assumption_digest(),
             run_input_digest: request.run_input_digest(),
             cohort_authority_digest: request.cohort_authority_digest(),
-            cohort_universe_digest: plan
-                .cohort_universe
-                .as_ref()
-                .map(BacktestCohortUniverse::digest),
+            cohort_universe_digest,
             model: executable.model().cloned(),
             strategy: executable.strategy().clone(),
             code: executable.code().clone(),
@@ -161,6 +172,11 @@ impl BacktestService {
             search_space: plan.search_space,
             selection_criterion: plan.selection_criterion,
         })?;
+        if let Some(expected) = expected_cohort_candidates
+            && spec.search_space_cardinality()? != expected
+        {
+            return Err(BacktestServiceError::InvalidCohort);
+        }
         let reservation = self.inventory.reserve(spec)?;
         let run = match BacktestEngine::run(&request, strategy, cancellation) {
             Ok(run) => run,
@@ -236,19 +252,18 @@ impl BacktestService {
         &self,
         plan: BacktestCohortPlan,
     ) -> Result<BacktestCohortEvaluation, BacktestServiceError> {
-        let member_ids = plan
-            .folds()
-            .iter()
-            .flat_map(|fold| fold.candidates())
-            .flat_map(|candidate| [candidate.in_sample(), candidate.out_of_sample()])
-            .chain(plan.selection_candidates().iter().copied())
-            .collect::<BTreeSet<_>>();
+        let expected_candidates = plan.universe().expected_candidate_count();
+        if plan.member_ids().len() > self.inventory.limits().max_trials()
+            || expected_candidates > self.inventory.limits().max_trials()
+            || plan.member_reference_count() > MAX_COHORT_MEMBER_REFERENCES
+        {
+            return Err(ExperimentError::LimitExceeded.into());
+        }
         let mut records = BTreeMap::new();
         let mut design = None;
-        let mut design_cardinality = None;
         let mut cohort_authority = None;
-        for id in member_ids {
-            let record = self.inventory.trial(id)?;
+        for id in plan.member_ids() {
+            let record = self.inventory.trial(*id)?;
             if record.spec().selection_criterion() != plan.selection_criterion()
                 || record.spec().cohort_universe_digest() != Some(plan.universe().digest())
                 || !matches!(record.status(), TrialStatus::Completed(_))
@@ -268,56 +283,55 @@ impl BacktestService {
                 return Err(BacktestServiceError::InvalidCohort);
             }
             let candidate_cardinality = record.spec().search_space_cardinality()?;
-            if design_cardinality.is_some_and(|expected| expected != candidate_cardinality) {
+            if candidate_cardinality != expected_candidates {
                 return Err(BacktestServiceError::InvalidCohort);
             }
             design = Some(candidate_design);
-            design_cardinality = Some(candidate_cardinality);
-            records.insert(id, record);
+            records.insert(*id, record);
         }
-        let independent_trials = design_cardinality.ok_or(BacktestServiceError::InvalidCohort)?;
+        let independent_trials = expected_candidates;
         validate_cohort_folds(&plan, &records, independent_trials)?;
         validate_selection_candidates(&plan, &records, independent_trials)?;
+        let mut diagnostic_folds = Vec::new();
+        diagnostic_folds
+            .try_reserve_exact(plan.folds().len())
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for fold in plan.folds() {
+            let mut candidates = Vec::new();
+            candidates
+                .try_reserve_exact(expected_candidates)
+                .map_err(|_| ExperimentError::LimitExceeded)?;
+            for candidate in fold.candidates() {
+                candidates.push(BacktestOverfittingScore {
+                    in_sample: trial_metric(
+                        &records,
+                        candidate.in_sample(),
+                        plan.selection_criterion(),
+                    )?,
+                    out_of_sample: trial_metric(
+                        &records,
+                        candidate.out_of_sample(),
+                        plan.selection_criterion(),
+                    )?,
+                });
+            }
+            diagnostic_folds.push(BacktestOverfittingFold { candidates });
+        }
         let overfitting_input = BacktestOverfittingInput {
-            folds: plan
-                .folds()
-                .iter()
-                .map(|fold| {
-                    Ok(BacktestOverfittingFold {
-                        candidates: fold
-                            .candidates()
-                            .iter()
-                            .map(|candidate| {
-                                Ok(BacktestOverfittingScore {
-                                    in_sample: trial_metric(
-                                        &records,
-                                        candidate.in_sample(),
-                                        plan.selection_criterion(),
-                                    )?,
-                                    out_of_sample: trial_metric(
-                                        &records,
-                                        candidate.out_of_sample(),
-                                        plan.selection_criterion(),
-                                    )?,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, BacktestServiceError>>()?,
-                    })
-                })
-                .collect::<Result<Vec<_>, BacktestServiceError>>()?,
+            folds: diagnostic_folds,
         };
         let probability_of_backtest_overfitting =
             BacktestOverfittingDiagnostic::try_compute(&overfitting_input)?;
-        let selection_scores = plan
-            .selection_candidates()
-            .iter()
-            .map(|id| {
-                Ok((
-                    *id,
-                    trial_metric(&records, *id, plan.selection_criterion())?,
-                ))
-            })
-            .collect::<Result<Vec<_>, BacktestServiceError>>()?;
+        let mut selection_scores = Vec::new();
+        selection_scores
+            .try_reserve_exact(expected_candidates)
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for id in plan.selection_candidates() {
+            selection_scores.push((
+                *id,
+                trial_metric(&records, *id, plan.selection_criterion())?,
+            ));
+        }
         let selected_id = selection_scores
             .iter()
             .max_by(|(left_id, left_score), (right_id, right_score)| {
@@ -328,11 +342,14 @@ impl BacktestService {
             .map(|(id, _)| *id)
             .ok_or(BacktestServiceError::InvalidCohort)?;
         let selected = member_binding(&records, selected_id)?;
-        let sharpes = plan
-            .selection_candidates()
-            .iter()
-            .map(|id| trial_metric(&records, *id, &SourceIdentifier::try_from("sharpe")?))
-            .collect::<Result<Vec<_>, BacktestServiceError>>()?;
+        let sharpe_metric = SourceIdentifier::try_from("sharpe")?;
+        let mut sharpes = Vec::new();
+        sharpes
+            .try_reserve_exact(expected_candidates)
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for id in plan.selection_candidates() {
+            sharpes.push(trial_metric(&records, *id, &sharpe_metric)?);
+        }
         let sharpe_count = sharpes.len() as f64;
         let sharpe_mean = sharpes.iter().sum::<f64>() / sharpe_count;
         let trial_sharpe_variance = sharpes
@@ -373,15 +390,19 @@ impl BacktestService {
                 )?,
             })?;
         let evaluator = cohort_evaluator_binding()?;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(plan.member_ids().len())
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for id in plan.member_ids() {
+            members.push(member_binding(&records, *id)?);
+        }
         let evaluation = BacktestCohortEvaluation::try_new(CohortEvaluationInput {
             evaluator,
             experiment_design_digest: design.ok_or(BacktestServiceError::InvalidCohort)?,
             cohort_universe_digest: plan.universe().digest(),
             selection_criterion: plan.selection_criterion().clone(),
-            members: records
-                .keys()
-                .map(|id| member_binding(&records, *id))
-                .collect::<Result<Vec<_>, _>>()?,
+            members,
             folds: plan.folds().to_vec(),
             selection_candidates: plan.selection_candidates().to_vec(),
             probability_of_backtest_overfitting,

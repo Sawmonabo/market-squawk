@@ -151,7 +151,6 @@ pub(super) fn decode_reservation(bytes: &[u8]) -> Result<TrialSpec, ExperimentEr
 }
 
 pub(super) struct DecodedTerminal {
-    pub schema_version: u16,
     pub status: TrialStatus,
 }
 
@@ -209,12 +208,18 @@ pub(super) fn encode_terminal(
 pub(super) fn decode_terminal(
     bytes: &[u8],
     expected_id: TrialId,
+    expected_schema_version: u16,
     limits: ExperimentLimits,
 ) -> Result<DecodedTerminal, ExperimentError> {
     let wire: TerminalWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
     let schema_version = wire.schema_version;
-    require_terminal_header(schema_version, &wire.trial_id, expected_id)?;
+    require_terminal_header(
+        schema_version,
+        &wire.trial_id,
+        expected_id,
+        expected_schema_version,
+    )?;
     match (wire.status, wire.completed, wire.failed) {
         (
             TerminalStatusWire::Completed,
@@ -293,7 +298,6 @@ pub(super) fn decode_terminal(
             )
             .map_err(|_| ExperimentError::CorruptRecord)?;
             Ok(DecodedTerminal {
-                schema_version,
                 status: TrialStatus::Completed(completion),
             })
         }
@@ -305,7 +309,6 @@ pub(super) fn decode_terminal(
                 evidence_digest,
             }),
         ) => Ok(DecodedTerminal {
-            schema_version,
             status: TrialStatus::Failed(
                 TrialFailure::try_new(parse_identifier(code)?, decode_hex(&evidence_digest)?)
                     .map_err(|_| ExperimentError::CorruptRecord)?,
@@ -319,8 +322,10 @@ fn require_terminal_header(
     schema_version: u16,
     trial_id: &str,
     expected_id: TrialId,
+    expected_schema_version: u16,
 ) -> Result<(), ExperimentError> {
-    if !matches!(schema_version, 1 | 2 | TERMINAL_SCHEMA_VERSION)
+    if schema_version != expected_schema_version
+        || !matches!(schema_version, 1 | 2 | TERMINAL_SCHEMA_VERSION)
         || TrialId(decode_hex(trial_id)?) != expected_id
     {
         return Err(ExperimentError::CorruptRecord);

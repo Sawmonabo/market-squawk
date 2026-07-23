@@ -28,9 +28,11 @@ pub use experiments::{
     BacktestExecutableIdentity, BacktestOverfittingDiagnostic, BacktestOverfittingFold,
     BacktestOverfittingInput, BacktestOverfittingScore, CohortMemberBinding,
     DeflatedPerformanceDiagnostic, DeflatedPerformanceInput, ExperimentError, ExperimentInventory,
-    ExperimentLimits, ExperimentLimitsInput, TrialCompletion, TrialComponentBinding,
-    TrialDatasetPartition, TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord,
-    TrialReservation, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    ExperimentLimits, ExperimentLimitsInput, MAX_COHORT_CANDIDATES_PER_FOLD,
+    MAX_COHORT_MEMBER_REFERENCES, MAX_COHORT_SELECTION_CANDIDATES, MAX_COHORT_UNIQUE_MEMBERS,
+    TrialCompletion, TrialComponentBinding, TrialDatasetPartition, TrialFailure, TrialId,
+    TrialMetric, TrialParameter, TrialRecord, TrialReservation, TrialSearchDimension, TrialSpec,
+    TrialSpecInput, TrialStatus,
 };
 pub use fills::{
     RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,

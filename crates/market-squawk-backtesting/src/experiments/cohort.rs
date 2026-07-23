@@ -16,6 +16,15 @@ use super::wire::{decode_hex, encode_hex};
 
 const HARD_MAX_COHORT_FOLDS: usize = 1_024;
 const HARD_MAX_GENERATOR_PARAMETERS: usize = 1_024;
+/// Maximum candidates admitted in one cohort fold.
+pub const MAX_COHORT_CANDIDATES_PER_FOLD: usize = 16_384;
+/// Maximum candidates admitted for final selection.
+pub const MAX_COHORT_SELECTION_CANDIDATES: usize = 16_384;
+/// Maximum distinct trial records materialized for one cohort evaluation.
+pub const MAX_COHORT_UNIQUE_MEMBERS: usize = 131_072;
+/// Maximum fold-pair and selection trial references admitted by one cohort plan.
+pub const MAX_COHORT_MEMBER_REFERENCES: usize = 147_456;
+const MAX_COHORT_FOLD_CANDIDATES: usize = 65_536;
 type PartitionSortKey = ([u8; 32], [u8; 32], i64, i64);
 type FoldPartitionSortKey = (PartitionSortKey, PartitionSortKey);
 
@@ -134,6 +143,7 @@ impl BacktestCohortFoldPartition {
 pub struct BacktestCohortUniverse {
     generator_version: SourceIdentifier,
     generation_parameters: Box<[TrialParameter]>,
+    expected_candidate_count: usize,
     folds: Box<[BacktestCohortFoldPartition]>,
     selection_partition: BacktestCohortPartition,
     digest: Sha256Digest,
@@ -144,17 +154,24 @@ impl BacktestCohortUniverse {
     pub fn try_new(
         generator_version: SourceIdentifier,
         mut generation_parameters: Vec<TrialParameter>,
+        expected_candidate_count: usize,
         mut folds: Vec<BacktestCohortFoldPartition>,
         selection_partition: BacktestCohortPartition,
     ) -> Result<Self, ExperimentError> {
-        generation_parameters.sort_unstable();
         if generation_parameters.is_empty()
             || generation_parameters.len() > HARD_MAX_GENERATOR_PARAMETERS
-            || generation_parameters
-                .windows(2)
-                .any(|pair| pair[0].name() == pair[1].name())
             || folds.len() < 2
             || folds.len() > HARD_MAX_COHORT_FOLDS
+            || !(2..=MAX_COHORT_CANDIDATES_PER_FOLD).contains(&expected_candidate_count)
+            || expected_candidate_count > MAX_COHORT_SELECTION_CANDIDATES
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        cohort_member_reference_count(folds.len(), expected_candidate_count)?;
+        generation_parameters.sort_unstable();
+        if generation_parameters
+            .windows(2)
+            .any(|pair| pair[0].name() == pair[1].name())
         {
             return Err(ExperimentError::InvalidDiagnostic);
         }
@@ -169,6 +186,7 @@ impl BacktestCohortUniverse {
         let mut value = Self {
             generator_version,
             generation_parameters: generation_parameters.into_boxed_slice(),
+            expected_candidate_count,
             folds: folds.into_boxed_slice(),
             selection_partition,
             digest: Sha256Digest::new([0; 32]),
@@ -193,6 +211,12 @@ impl BacktestCohortUniverse {
     #[must_use]
     pub fn generation_parameters(&self) -> &[TrialParameter] {
         &self.generation_parameters
+    }
+
+    /// Returns the complete search-space cardinality required in every fold and selection set.
+    #[must_use]
+    pub const fn expected_candidate_count(&self) -> usize {
+        self.expected_candidate_count
     }
 
     /// Returns every exact generated fold partition.
@@ -226,13 +250,14 @@ fn partition_sort_key(partition: BacktestCohortPartition) -> PartitionSortKey {
 
 fn universe_digest(value: &BacktestCohortUniverse) -> Result<Sha256Digest, ExperimentError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/backtest-cohort-universe/v1");
+    hash.update(b"market-squawk/backtest-cohort-universe/v2");
     hash_bytes(&mut hash, value.generator_version.as_str().as_bytes())?;
     hash_length(&mut hash, value.generation_parameters.len())?;
     for parameter in &value.generation_parameters {
         hash_bytes(&mut hash, parameter.name().as_str().as_bytes())?;
         hash_bytes(&mut hash, parameter.value().as_str().as_bytes())?;
     }
+    hash_length(&mut hash, value.expected_candidate_count)?;
     hash_length(&mut hash, value.folds.len())?;
     for fold in &value.folds {
         hash_partition(&mut hash, fold.in_sample);
@@ -258,8 +283,11 @@ pub struct BacktestCohortFold {
 impl BacktestCohortFold {
     /// Requires at least two duplicate-free candidate pairs.
     pub fn try_new(mut candidates: Vec<BacktestCohortCandidate>) -> Result<Self, ExperimentError> {
+        if !(2..=MAX_COHORT_CANDIDATES_PER_FOLD).contains(&candidates.len()) {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
         candidates.sort_unstable();
-        if candidates.len() < 2 || candidates.windows(2).any(|pair| pair[0] == pair[1]) {
+        if candidates.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(ExperimentError::InvalidDiagnostic);
         }
         Ok(Self {
@@ -280,6 +308,8 @@ pub struct BacktestCohortPlan {
     universe: BacktestCohortUniverse,
     folds: Box<[BacktestCohortFold]>,
     selection_candidates: Box<[TrialId]>,
+    member_ids: Box<[TrialId]>,
+    member_reference_count: usize,
     selection_criterion: SourceIdentifier,
 }
 
@@ -291,30 +321,57 @@ impl BacktestCohortPlan {
         mut selection_candidates: Vec<TrialId>,
         selection_criterion: SourceIdentifier,
     ) -> Result<Self, ExperimentError> {
-        selection_candidates.sort_unstable();
+        let expected_candidate_count = universe.expected_candidate_count;
         if folds.len() != universe.folds.len()
-            || selection_candidates.len() < 2
-            || selection_candidates
-                .windows(2)
-                .any(|pair| pair[0] == pair[1])
+            || folds.len() > HARD_MAX_COHORT_FOLDS
+            || selection_candidates.len() != expected_candidate_count
+            || selection_candidates.len() > MAX_COHORT_SELECTION_CANDIDATES
         {
             return Err(ExperimentError::InvalidDiagnostic);
         }
-        let members = folds
+        let member_reference_count =
+            cohort_member_reference_count(folds.len(), expected_candidate_count)?;
+        if folds
             .iter()
-            .flat_map(|fold| fold.candidates.iter())
-            .flat_map(|candidate| [candidate.in_sample, candidate.out_of_sample])
-            .collect::<BTreeSet<_>>();
+            .any(|fold| fold.candidates.len() != expected_candidate_count)
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        selection_candidates.sort_unstable();
+        if selection_candidates
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        let mut members = BTreeSet::new();
+        for candidate in folds.iter().flat_map(|fold| fold.candidates.iter()) {
+            members.insert(candidate.in_sample);
+            if members.len() > MAX_COHORT_UNIQUE_MEMBERS {
+                return Err(ExperimentError::InvalidDiagnostic);
+            }
+            members.insert(candidate.out_of_sample);
+            if members.len() > MAX_COHORT_UNIQUE_MEMBERS {
+                return Err(ExperimentError::InvalidDiagnostic);
+            }
+        }
         if selection_candidates
             .iter()
             .any(|candidate| !members.contains(candidate))
         {
             return Err(ExperimentError::InvalidDiagnostic);
         }
+        let mut member_ids = Vec::new();
+        member_ids
+            .try_reserve_exact(members.len())
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        member_ids.extend(members);
         Ok(Self {
             universe,
             folds: folds.into_boxed_slice(),
             selection_candidates: selection_candidates.into_boxed_slice(),
+            member_ids: member_ids.into_boxed_slice(),
+            member_reference_count,
             selection_criterion,
         })
     }
@@ -333,9 +390,32 @@ impl BacktestCohortPlan {
         &self.selection_candidates
     }
 
+    pub(crate) fn member_ids(&self) -> &[TrialId] {
+        &self.member_ids
+    }
+
+    pub(crate) const fn member_reference_count(&self) -> usize {
+        self.member_reference_count
+    }
+
     pub(crate) const fn selection_criterion(&self) -> &SourceIdentifier {
         &self.selection_criterion
     }
+}
+
+fn cohort_member_reference_count(
+    fold_count: usize,
+    expected_candidate_count: usize,
+) -> Result<usize, ExperimentError> {
+    let fold_candidates = fold_count
+        .checked_mul(expected_candidate_count)
+        .filter(|count| *count <= MAX_COHORT_FOLD_CANDIDATES)
+        .ok_or(ExperimentError::InvalidDiagnostic)?;
+    fold_candidates
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(expected_candidate_count))
+        .filter(|count| *count <= MAX_COHORT_MEMBER_REFERENCES)
+        .ok_or(ExperimentError::InvalidDiagnostic)
 }
 
 /// Exact completed result admitted as a cohort member.
@@ -440,6 +520,12 @@ pub(crate) struct CohortEvaluationInput {
 impl BacktestCohortEvaluation {
     pub(crate) fn try_new(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
         require_digest(input.cohort_universe_digest)?;
+        validate_cohort_materialization_counts(
+            input.members.len(),
+            input.folds.len(),
+            input.selection_candidates.len(),
+            input.folds.iter().map(|fold| fold.candidates.len()),
+        )?;
         input.members.sort_unstable_by_key(|member| member.trial_id);
         if input.members.len() < 2
             || input
@@ -451,6 +537,13 @@ impl BacktestCohortEvaluation {
             return Err(ExperimentError::InvalidDiagnostic);
         }
         input.selection_candidates.sort_unstable();
+        if input
+            .selection_candidates
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
         let mut value = Self {
             id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
             evaluator: input.evaluator,
@@ -469,6 +562,12 @@ impl BacktestCohortEvaluation {
     }
 
     fn try_new_legacy(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        validate_cohort_materialization_counts(
+            input.members.len(),
+            input.folds.len(),
+            input.selection_candidates.len(),
+            input.folds.iter().map(|fold| fold.candidates.len()),
+        )?;
         input.members.sort_unstable_by_key(|member| member.trial_id);
         if input.members.len() < 2
             || input
@@ -480,6 +579,13 @@ impl BacktestCohortEvaluation {
             return Err(ExperimentError::InvalidDiagnostic);
         }
         input.selection_candidates.sort_unstable();
+        if input
+            .selection_candidates
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
         let mut value = Self {
             id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
             evaluator: input.evaluator,
@@ -532,6 +638,36 @@ impl BacktestCohortEvaluation {
     pub const fn deflated_performance(&self) -> DeflatedPerformanceDiagnostic {
         self.deflated_performance
     }
+}
+
+fn validate_cohort_materialization_counts(
+    member_count: usize,
+    fold_count: usize,
+    selection_count: usize,
+    fold_candidate_counts: impl IntoIterator<Item = usize>,
+) -> Result<(), ExperimentError> {
+    if !(2..=MAX_COHORT_UNIQUE_MEMBERS).contains(&member_count)
+        || !(2..=HARD_MAX_COHORT_FOLDS).contains(&fold_count)
+        || !(2..=MAX_COHORT_SELECTION_CANDIDATES).contains(&selection_count)
+    {
+        return Err(ExperimentError::InvalidDiagnostic);
+    }
+    let mut candidate_count = 0_usize;
+    for count in fold_candidate_counts {
+        if !(2..=MAX_COHORT_CANDIDATES_PER_FOLD).contains(&count) {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        candidate_count = candidate_count
+            .checked_add(count)
+            .filter(|value| *value <= MAX_COHORT_FOLD_CANDIDATES)
+            .ok_or(ExperimentError::InvalidDiagnostic)?;
+    }
+    candidate_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(selection_count))
+        .filter(|count| *count <= MAX_COHORT_MEMBER_REFERENCES)
+        .ok_or(ExperimentError::InvalidDiagnostic)?;
+    Ok(())
 }
 
 fn evaluation_digest(value: &BacktestCohortEvaluation) -> Result<Sha256Digest, ExperimentError> {
@@ -732,6 +868,13 @@ pub(super) fn decode_evaluation(
     {
         return Err(ExperimentError::CorruptRecord);
     }
+    validate_cohort_materialization_counts(
+        wire.members.len(),
+        wire.folds.len(),
+        wire.selection_candidates.len(),
+        wire.folds.iter().map(Vec::len),
+    )
+    .map_err(|_| ExperimentError::CorruptRecord)?;
     let members = wire
         .members
         .into_iter()

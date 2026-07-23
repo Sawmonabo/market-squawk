@@ -205,6 +205,16 @@ pub(super) enum TrialIdentityVersion {
     V3,
 }
 
+impl TrialIdentityVersion {
+    pub(super) const fn terminal_schema_version(self) -> u16 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+            Self::V3 => 3,
+        }
+    }
+}
+
 pub(super) struct VersionedTrialSpecInput {
     pub dataset_identity: Sha256Digest,
     pub object_graph_digest: Sha256Digest,
@@ -373,6 +383,10 @@ impl TrialSpec {
         self.identity
     }
 
+    pub(super) const fn identity_version(&self) -> TrialIdentityVersion {
+        self.identity_version
+    }
+
     /// Returns the exact PIT dataset identity.
     #[must_use]
     pub const fn dataset_identity(&self) -> Sha256Digest {
@@ -533,6 +547,10 @@ impl ExperimentLimits {
 
     pub(crate) const fn max_artifact_bytes(self) -> usize {
         self.max_artifact_bytes
+    }
+
+    pub(crate) const fn max_trials(self) -> usize {
+        self.max_trials
     }
 }
 
