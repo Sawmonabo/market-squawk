@@ -300,6 +300,9 @@ pub enum DatasetCommand {
 pub enum QueryCommand {
     /// Run bounded read-only DataFusion SQL. This operation is CLI-only.
     Sql {
+        /// Exact immutable dataset generation to expose as the query relation.
+        #[arg(long)]
+        dataset: String,
         /// Read-only SQL statement.
         statement: String,
         /// Maximum returned rows.
