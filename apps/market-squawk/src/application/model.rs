@@ -30,6 +30,8 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
 };
 
+pub mod runtime;
+
 const GET_METADATA: &str = "Model.GetMetadata";
 const LIST_BUNDLES: &str = "Model.ListBundles";
 const EVALUATE: &str = "Model.Evaluate";

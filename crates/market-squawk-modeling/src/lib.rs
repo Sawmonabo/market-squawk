@@ -9,6 +9,7 @@ use std::num::NonZeroU16;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod admission;
 mod bundle;
 mod input;
 mod metadata;
@@ -18,6 +19,11 @@ mod onnx;
 mod registry;
 mod training_environment;
 
+pub use admission::{
+    BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
+    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
+    recover_model_candidate, verify_model_candidate,
+};
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
     MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES,

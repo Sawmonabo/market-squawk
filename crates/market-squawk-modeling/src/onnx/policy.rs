@@ -134,15 +134,39 @@ impl OnnxModelPolicy {
         validate_proto(self, &proto)
     }
 
-    pub(crate) fn input_shape(&self) -> &[usize] {
+    /// Returns the exact admitted model digest.
+    #[must_use]
+    pub const fn model_digest(&self) -> Sha256Digest {
+        self.model_digest
+    }
+
+    /// Returns the exact admitted ONNX operator-set version.
+    #[must_use]
+    pub const fn opset(&self) -> u32 {
+        self.opset
+    }
+
+    /// Returns the exact static input shape.
+    #[must_use]
+    pub fn input_shape(&self) -> &[usize] {
         &self.input_shape
     }
 
-    pub(crate) const fn inference_deadline(&self) -> Duration {
+    /// Returns the exact static scalar-output shape.
+    #[must_use]
+    pub fn output_shape(&self) -> &[usize] {
+        &self.output_shape
+    }
+
+    /// Returns the bounded per-inference deadline.
+    #[must_use]
+    pub const fn inference_deadline(&self) -> Duration {
         self.inference_deadline
     }
 
-    pub(crate) const fn policy_digest(&self) -> [u8; 32] {
+    /// Returns the complete versioned policy identity.
+    #[must_use]
+    pub const fn policy_digest(&self) -> [u8; 32] {
         self.policy_digest
     }
 

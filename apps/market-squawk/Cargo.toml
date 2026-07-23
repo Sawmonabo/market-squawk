@@ -68,7 +68,7 @@ market-squawk-data = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }
 market-squawk-mcp = { workspace = true }
-market-squawk-modeling = { workspace = true }
+market-squawk-modeling = { workspace = true, features = ["onnx-tract"] }
 market-squawk-platform = { workspace = true }
 market-squawk-portfolio = { workspace = true }
 market-squawk-services = { workspace = true }

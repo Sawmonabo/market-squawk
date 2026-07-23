@@ -86,6 +86,12 @@ pub struct ControlledModelRoot {
 }
 
 impl ControlledModelRoot {
+    /// Retains an already capability-confined directory without reopening an ambient path.
+    #[must_use]
+    pub fn from_directory(directory: Dir) -> Self {
+        Self { directory }
+    }
+
     /// Opens one ambient path exactly once to establish a bounded capability root.
     ///
     /// # Errors
