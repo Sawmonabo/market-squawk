@@ -150,6 +150,37 @@ pub struct Application {
 }
 
 impl Application {
+    /// Composes the complete product from its shared domain authorities.
+    ///
+    /// Research expands into Research, Fundamental, and Macro services. Paper expands into
+    /// Market, Bot, and Execution services. Every other authority owns exactly one domain. The
+    /// resulting set still crosses [`ApplicationDomainServices::try_new`], so a misplaced,
+    /// duplicated, or missing implementation fails before either CLI or MCP can receive it.
+    pub fn try_from_product_services(
+        source: Arc<dyn ApplicationDomainService>,
+        research: &ResearchApplicationServices,
+        portfolio: Arc<dyn ApplicationDomainService>,
+        analysis: Arc<dyn ApplicationDomainService>,
+        model: Arc<dyn ApplicationDomainService>,
+        fair_value: Arc<dyn ApplicationDomainService>,
+        paper: &PaperApplicationServices,
+    ) -> Result<Self, ApplicationCompositionError> {
+        let services = vec![
+            source,
+            paper.market(),
+            research.research(),
+            research.fundamental(),
+            research.macroeconomics(),
+            portfolio,
+            analysis,
+            model,
+            fair_value,
+            paper.bot(),
+            paper.execution(),
+        ];
+        Self::try_new(ApplicationDomainServices::try_new(services)?)
+    }
+
     /// Constructs the complete local service surface after every mandatory domain is ready.
     ///
     /// # Errors
