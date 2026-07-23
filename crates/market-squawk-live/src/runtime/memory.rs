@@ -21,6 +21,9 @@ const STREAM_AUTHORITY_ALLOCATION_BYTES: u64 = 4 * 1024;
 /// Maximum owned text behind source, venue, product, and channel identities in a stream key.
 const STREAM_KEY_ALLOCATION_BYTES: u64 =
     (SourceId::MAX_LENGTH + VenueId::MAX_LENGTH + 2 * SourceIdentifier::MAX_LENGTH) as u64;
+/// Maximum source observation, stable trade, and assessment identities retained per stream.
+const STREAM_LAST_TRADE_ALLOCATION_BYTES: u64 =
+    crate::snapshot::last_trade_maximum_dynamic_bytes() as u64;
 /// Hash-table node/slack for a stream entry and its status entry.
 const STREAM_MAP_ALLOCATION_BYTES: u64 = 2 * 128;
 const ACTOR_FIXED_BYTES: u64 = 64 * 1024;
@@ -212,7 +215,13 @@ fn persistent_stream_bytes(depth: usize) -> Result<u64, LiveRuntimeConfigError> 
             add(inline, STREAM_KEY_ALLOCATION_BYTES)?,
             STREAM_MAP_ALLOCATION_BYTES,
         )?,
-        add(STREAM_AUTHORITY_ALLOCATION_BYTES, book_bytes)?,
+        add(
+            add(
+                STREAM_AUTHORITY_ALLOCATION_BYTES,
+                STREAM_LAST_TRADE_ALLOCATION_BYTES,
+            )?,
+            book_bytes,
+        )?,
     )
 }
 

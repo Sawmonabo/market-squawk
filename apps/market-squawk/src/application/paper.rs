@@ -1,5 +1,7 @@
 //! Lifecycle-owned paper bot and execution application services.
 
+mod market;
+
 use std::{
     fmt,
     str::FromStr,
@@ -66,6 +68,13 @@ impl PaperApplicationServices {
         Arc::new(ExecutionDomainService {
             controller: Arc::clone(&self.controller),
         })
+    }
+
+    /// Returns the Market-domain implementation sharing this sole runtime owner.
+    pub fn market(&self) -> Arc<dyn ApplicationDomainService> {
+        Arc::new(market::MarketDomainService::new(Arc::clone(
+            &self.controller,
+        )))
     }
 }
 

@@ -55,10 +55,10 @@ pub use sharding::{
     ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion,
 };
 pub use snapshot::{
-    BookLevelSnapshot, LiveFeatureScalarSnapshot, LiveFeatureSetSnapshot, LiveFeatureSnapshot,
-    LiveFeatureValueSnapshot, LiveRuntimeSnapshotLease, LiveSnapshotLease, LiveSnapshotReader,
-    RouteSnapshot, ShardLifecycleSnapshot, ShardSnapshot, ShardSnapshotRevision,
-    SnapshotCompleteness, SnapshotDimension, SnapshotLimits, SnapshotLimitsError,
-    SnapshotReadError, StatusSnapshot, StreamPhaseSnapshot, StreamSnapshot,
+    BookLevelSnapshot, LastTradeSnapshot, LiveFeatureScalarSnapshot, LiveFeatureSetSnapshot,
+    LiveFeatureSnapshot, LiveFeatureValueSnapshot, LiveRuntimeSnapshotLease, LiveSnapshotLease,
+    LiveSnapshotReader, RouteSnapshot, ShardLifecycleSnapshot, ShardSnapshot,
+    ShardSnapshotRevision, SnapshotCompleteness, SnapshotDimension, SnapshotLimits,
+    SnapshotLimitsError, SnapshotReadError, StatusSnapshot, StreamPhaseSnapshot, StreamSnapshot,
 };
 pub use state::{GenerationPhase, GenerationStateError, GenerationStateMachine};

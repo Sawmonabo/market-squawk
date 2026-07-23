@@ -355,6 +355,7 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
         + SourceId::MAX_LENGTH
         + VenueId::MAX_LENGTH
         + SourceIdentifier::MAX_LENGTH * 2
+        + crate::snapshot::last_trade_maximum_dynamic_bytes()
         + std::mem::size_of::<StatusSnapshotSeed>()
         + SourceId::MAX_LENGTH
         + VenueId::MAX_LENGTH;
@@ -451,6 +452,7 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
     let (_, second_trade) = ready
         .source
         .batch("trade-2", 2, trade()?, non_book_snapshot()?)?;
+    let second_trade_received_at = ready.source.last_frame_received_at()?;
     let next = apply_one(&mut ready.processor, &ready.admission, second_trade)?;
     assert_eq!(
         ready.processor.validate_applied_current(&ready.applied),
@@ -478,6 +480,12 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
     assert_eq!(stream.trading_status, Some(TradingStatus::Halted));
     assert_eq!(stream.trading_status_revision, Some(2));
     assert_eq!(stream.state_revision, 3);
+    let last_trade = stream.last_trade().ok_or("missing retained trade")?;
+    assert_eq!(last_trade.source_identifier().as_str(), "trade-2");
+    assert_eq!(last_trade.stable_trade_id().as_str(), "trade");
+    assert_eq!(last_trade.received_at(), second_trade_received_at);
+    assert_eq!(last_trade.recorded_quality(), DataQuality::DirectVerified);
+    assert_eq!(last_trade.committed_state_revision(), 2);
     assert_eq!(
         halted_seed
             .statuses
@@ -502,6 +510,14 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
         .ok_or("missing resumed stream")?;
     assert_eq!(active_stream.trading_status, Some(TradingStatus::Active));
     assert_eq!(active_stream.trading_status_revision, Some(3));
+    let retained_trade = active_stream.last_trade().ok_or("missing retained trade")?;
+    assert_eq!(retained_trade.source_identifier().as_str(), "trade-2");
+    assert_eq!(retained_trade.received_at(), second_trade_received_at);
+    assert_eq!(
+        retained_trade.recorded_quality(),
+        DataQuality::DirectVerified
+    );
+    assert_eq!(retained_trade.committed_state_revision(), 2);
     assert_eq!(
         active_seed
             .statuses

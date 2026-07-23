@@ -114,7 +114,13 @@ pub(super) fn build_snapshot_seed(
         let total_asks = state.book().ask_level_count();
         let mut bid_count = total_bids.min(limits.max_levels_per_side);
         let mut ask_count = total_asks.min(limits.max_levels_per_side);
-        let base_charge = stream_base_charge(key)?;
+        let base_charge = stream_base_charge(key)?
+            .checked_add(if state.last_trade().is_some() {
+                crate::snapshot::last_trade_maximum_dynamic_bytes()
+            } else {
+                0
+            })
+            .ok_or(LiveApplyError::SnapshotRetainedSizeOverflow)?;
         let Some(available) = limits
             .max_retained_bytes
             .checked_sub(retained_bytes)
@@ -181,6 +187,7 @@ pub(super) fn build_snapshot_seed(
                 .evaluated_at()
                 .ok_or(SnapshotBuildError::IncompleteStreamProvenance)?,
             quality: state.quality(),
+            last_trade: state.last_trade().cloned(),
             trading_status,
             trading_status_revision,
             configured_depth: u32::try_from(configured_depth)

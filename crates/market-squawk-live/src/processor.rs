@@ -48,8 +48,10 @@ use crate::authority::{
     SystemTrustedClock, TrustedClock,
 };
 use crate::provider_book::{BookProcessingScratch, ProviderBook};
-use crate::qualification::build_qualified_event;
-use crate::{AuthorityError, ConsumedLiveAuthority, DepthLimit, LiveExecutionCapability};
+use crate::qualification::{QualifiedEvent, build_qualified_event};
+use crate::{
+    AuthorityError, ConsumedLiveAuthority, DepthLimit, LastTradeSnapshot, LiveExecutionCapability,
+};
 
 /// Hard bound for independently keyed source/product/channel streams per instrument owner.
 pub(crate) const MAX_STREAMS_PER_INSTRUMENT: usize = 64;
@@ -291,6 +293,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 now.wall(),
                 move |provenance| prepared.build(provenance),
             )?;
+            let retained_trade = retained_trade_snapshot(&qualified, candidate.next_revision())?;
             let capability_deadline =
                 monotonic_deadline(now, qualified.valid_until, self.maximum_capability_lifetime)?;
 
@@ -310,9 +313,9 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 .map_err(AuthorityError::from)?;
             self.statuses.validate_staged(&staged_status)?;
             let committed = candidate.commit(qualified.assessment.recorded_quality())?;
-            Ok::<_, LiveApplyError>((qualified, capability_deadline, committed))
+            Ok::<_, LiveApplyError>((qualified, capability_deadline, committed, retained_trade))
         })();
-        let (qualified, capability_deadline, committed) = match outcome {
+        let (qualified, capability_deadline, committed, retained_trade) = match outcome {
             Ok(value) => value,
             Err(error) => {
                 state.quarantine_rejected(&current, now.wall());
@@ -320,6 +323,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 return Err(error);
             }
         };
+        state.retain_committed_trade(retained_trade);
         self.streams.insert(key.clone(), state);
         let status = self.statuses.commit(staged_status);
         let authority = if qualified.assessment.recorded_quality() == DataQuality::DirectVerified
@@ -539,6 +543,69 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             state.quarantine_rejected(current, evaluated_at);
         }
     }
+}
+
+fn retained_trade_snapshot(
+    qualified: &QualifiedEvent,
+    committed_state_revision: u64,
+) -> Result<Option<LastTradeSnapshot>, LiveApplyError> {
+    let MarketEvent::Trade(trade) = &qualified.event else {
+        return Ok(None);
+    };
+    let provenance = trade.provenance();
+    let assessment = &qualified.assessment;
+    let stable_trade_id = qualified
+        .stable_trade_id
+        .as_ref()
+        .ok_or(LiveApplyError::BindingMismatch)?;
+    let recorded_coverage = assessment
+        .market()
+        .coverage()
+        .result()
+        .status_at(assessment.evaluated_at());
+    if provenance.binding() != assessment.binding()
+        || provenance.recorded_quality() != assessment.recorded_quality()
+        || provenance.recorded_coverage() != recorded_coverage
+        || provenance.assessment_reference()
+            != Some(assessment.assessment_id().as_source_identifier())
+        || committed_state_revision == 0
+    {
+        return Err(LiveApplyError::BindingMismatch);
+    }
+    Ok(Some(LastTradeSnapshot {
+        source_identifier: try_clone_source_identifier(provenance.source_identifier())?,
+        stable_trade_id: try_clone_source_identifier(stable_trade_id)?,
+        connection_generation: provenance.connection_generation(),
+        price: trade.price(),
+        quantity: trade.quantity(),
+        aggressor_side: trade.aggressor_side(),
+        source_timestamp: provenance.source_timestamp(),
+        received_at: provenance.received_at(),
+        available_at: provenance.available_at(),
+        ingested_at: provenance.ingested_at(),
+        recorded_quality: assessment.recorded_quality(),
+        recorded_coverage,
+        assessment_id: try_clone_source_identifier(
+            assessment.assessment_id().as_source_identifier(),
+        )?,
+        qualification_evaluated_at: assessment.evaluated_at(),
+        qualification_valid_until: assessment.valid_until(),
+        payload_digest: assessment.binding().payload_digest(),
+        binding_digest: qualified.binding_digest,
+        trading_status: *assessment.market().trading_status().result(),
+        committed_state_revision,
+    }))
+}
+
+fn try_clone_source_identifier(
+    value: &market_squawk_domain::SourceIdentifier,
+) -> Result<market_squawk_domain::SourceIdentifier, LiveApplyError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.as_str().len())
+        .map_err(|_error| LiveApplyError::Allocation)?;
+    cloned.push_str(value.as_str());
+    Ok(market_squawk_domain::SourceIdentifier::try_from(cloned)?)
 }
 
 impl<C: TrustedClock> Drop for InstrumentLiveProcessor<C> {

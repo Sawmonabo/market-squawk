@@ -16,7 +16,8 @@ use crate::authority::{AuthorityError, GenerationLease, StreamRevisionLease, Str
 use crate::provider_book::{BookProcessingScratch, ProviderBook, ProviderBookTransaction};
 use crate::qualification::{CommittedQualificationEvidence, SnapshotOrigin, canonical_digest};
 use crate::{
-    DepthLimit, GenerationPhase, GenerationStateMachine, ResolvedChecksumValidator, SequenceTracker,
+    DepthLimit, GenerationPhase, GenerationStateMachine, LastTradeSnapshot,
+    ResolvedChecksumValidator, SequenceTracker,
 };
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub(super) struct StreamState {
     received_at: Option<Timestamp>,
     evaluated_at: Option<Timestamp>,
     quality: DataQuality,
+    last_trade: Option<LastTradeSnapshot>,
 }
 
 impl StreamState {
@@ -67,6 +69,7 @@ impl StreamState {
             received_at: None,
             evaluated_at: None,
             quality: DataQuality::Quarantined,
+            last_trade: None,
         })
     }
 
@@ -108,6 +111,15 @@ impl StreamState {
     }
     pub(super) const fn quality(&self) -> DataQuality {
         self.quality
+    }
+    pub(super) const fn last_trade(&self) -> Option<&LastTradeSnapshot> {
+        self.last_trade.as_ref()
+    }
+
+    pub(super) fn retain_committed_trade(&mut self, trade: Option<LastTradeSnapshot>) {
+        if let Some(trade) = trade {
+            self.last_trade = Some(trade);
+        }
     }
 
     pub(super) fn quarantine(&mut self) {

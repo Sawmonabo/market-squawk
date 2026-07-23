@@ -4,8 +4,9 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use market_squawk_domain::{
-    ConnectionGeneration, DataQuality, InstrumentId, PriceTicks, ProviderChannel, ProviderProduct,
-    QuantityLots, SequenceNumber, SourceId, Timestamp, TradingStatus, VenueId,
+    AggressorSide, ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
+    PriceTicks, ProviderChannel, ProviderProduct, QuantityLots, SequenceNumber, SourceId,
+    SourceIdentifier, Timestamp, TradingStatus, VenueId,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -157,6 +158,136 @@ impl BookLevelSnapshot {
     }
 }
 
+/// Last successfully committed trade for one exact provider stream.
+///
+/// The trade owns its commit-time quality, provenance, qualification, and revision evidence. A
+/// later quote, book, status event, or quarantine may change the enclosing stream state but cannot
+/// relabel this retained observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LastTradeSnapshot {
+    pub(crate) source_identifier: SourceIdentifier,
+    pub(crate) stable_trade_id: SourceIdentifier,
+    pub(crate) connection_generation: ConnectionGeneration,
+    pub(crate) price: PriceTicks,
+    pub(crate) quantity: QuantityLots,
+    pub(crate) aggressor_side: AggressorSide,
+    pub(crate) source_timestamp: Option<Timestamp>,
+    pub(crate) received_at: Timestamp,
+    pub(crate) available_at: Timestamp,
+    pub(crate) ingested_at: Timestamp,
+    pub(crate) recorded_quality: DataQuality,
+    pub(crate) recorded_coverage: CoverageStatus,
+    pub(crate) assessment_id: SourceIdentifier,
+    pub(crate) qualification_evaluated_at: Timestamp,
+    pub(crate) qualification_valid_until: Timestamp,
+    pub(crate) payload_digest: EvidenceDigest,
+    pub(crate) binding_digest: [u8; 32],
+    pub(crate) trading_status: TradingStatus,
+    pub(crate) committed_state_revision: u64,
+}
+
+impl LastTradeSnapshot {
+    /// Returns the source-native observation identity.
+    pub const fn source_identifier(&self) -> &SourceIdentifier {
+        &self.source_identifier
+    }
+
+    /// Returns the provider's stable economic trade identity.
+    pub const fn stable_trade_id(&self) -> &SourceIdentifier {
+        &self.stable_trade_id
+    }
+
+    /// Returns the exact source connection generation.
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation
+    }
+
+    /// Returns the executed price in instrument-defined ticks.
+    pub const fn price(&self) -> PriceTicks {
+        self.price
+    }
+
+    /// Returns the executed quantity in instrument-defined lots.
+    pub const fn quantity(&self) -> QuantityLots {
+        self.quantity
+    }
+
+    /// Returns the source-supplied or inferred aggressor side.
+    pub const fn aggressor_side(&self) -> AggressorSide {
+        self.aggressor_side
+    }
+
+    /// Returns the provider timestamp when one was supplied.
+    pub const fn source_timestamp(&self) -> Option<Timestamp> {
+        self.source_timestamp
+    }
+
+    /// Returns the trusted local receive time.
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    /// Returns when the observation became available locally.
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+
+    /// Returns when canonical ingestion completed.
+    pub const fn ingested_at(&self) -> Timestamp {
+        self.ingested_at
+    }
+
+    /// Returns the trade's commit-time archival quality.
+    pub const fn recorded_quality(&self) -> DataQuality {
+        self.recorded_quality
+    }
+
+    /// Returns the trade's commit-time coverage result.
+    pub const fn recorded_coverage(&self) -> CoverageStatus {
+        self.recorded_coverage
+    }
+
+    /// Returns the exact qualification assessment identity.
+    pub const fn assessment_id(&self) -> &SourceIdentifier {
+        &self.assessment_id
+    }
+
+    /// Returns when complete qualification was evaluated.
+    pub const fn qualification_evaluated_at(&self) -> Timestamp {
+        self.qualification_evaluated_at
+    }
+
+    /// Returns the inclusive qualification expiry.
+    pub const fn qualification_valid_until(&self) -> Timestamp {
+        self.qualification_valid_until
+    }
+
+    /// Returns the exact source-payload digest.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    /// Returns the digest of the complete live evidence binding.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the trading status committed with this trade.
+    pub const fn trading_status(&self) -> TradingStatus {
+        self.trading_status
+    }
+
+    /// Returns the instrument-owned revision committed with this trade.
+    pub const fn committed_state_revision(&self) -> u64 {
+        self.committed_state_revision
+    }
+}
+
+pub(crate) const fn last_trade_maximum_dynamic_bytes() -> usize {
+    SourceIdentifier::MAX_LENGTH * 3
+}
+
 /// Cross-channel trading status retained separately from stream state.
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +343,7 @@ pub struct StreamSnapshot {
     pub(crate) received_at: Timestamp,
     pub(crate) evaluated_at: Timestamp,
     pub(crate) quality: DataQuality,
+    pub(crate) last_trade: Option<LastTradeSnapshot>,
     pub(crate) trading_status: Option<TradingStatus>,
     pub(crate) trading_status_revision: Option<u64>,
     pub(crate) configured_depth: u32,
@@ -277,6 +409,10 @@ impl StreamSnapshot {
     }
     pub const fn quality(&self) -> DataQuality {
         self.quality
+    }
+    /// Returns the last trade committed for this exact stream generation.
+    pub const fn last_trade(&self) -> Option<&LastTradeSnapshot> {
+        self.last_trade.as_ref()
     }
     pub const fn trading_status(&self) -> Option<TradingStatus> {
         self.trading_status
