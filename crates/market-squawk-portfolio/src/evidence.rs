@@ -133,7 +133,11 @@ impl RevisionEvidence {
         mut features: Vec<FeatureBinding>,
         corporate_action: Option<CorporateActionBinding>,
     ) -> Result<Self, PortfolioError> {
-        if sources.is_empty() {
+        if sources.is_empty()
+            || corporate_action.is_some_and(|binding| {
+                binding.knowledge_cutoff > as_of || binding.valuation_cutoff > as_of
+            })
+        {
             return Err(PortfolioError::EvidenceMismatch);
         }
         sources.sort_unstable();

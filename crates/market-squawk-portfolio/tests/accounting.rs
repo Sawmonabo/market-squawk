@@ -195,6 +195,36 @@ fn action_plan(
 }
 
 #[test]
+fn revision_evidence_rejects_future_corporate_action_knowledge() -> TestResult {
+    let plan = CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(21),
+        Timestamp::from_unix_nanos(20),
+        corporate_action_records(instrument(1)?, Currency::try_from("USD")?)?,
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(16).ok_or("actions")?,
+            NonZeroUsize::new(1024 * 1024).ok_or("bytes")?,
+        )?,
+    )?;
+
+    assert!(matches!(
+        RevisionEvidence::try_new(
+            Timestamp::from_unix_nanos(20),
+            dataset(24)?,
+            market_squawk_data::Sha256Digest::new([24; 32]),
+            market_squawk_data::Sha256Digest::new([25; 32]),
+            vec![source("corporate-actions")?],
+            Vec::new(),
+            Some(market_squawk_portfolio::CorporateActionBinding::from_plan(
+                &plan,
+            )),
+        ),
+        Err(PortfolioError::EvidenceMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
 fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_steps() -> TestResult
 {
     let usd = Currency::try_from("USD")?;

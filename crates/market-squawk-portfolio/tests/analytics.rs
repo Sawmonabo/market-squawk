@@ -16,11 +16,12 @@ use market_squawk_domain::{
     RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_portfolio::{
-    AttributionInput, AttributionReport, CashFlow, CashFlowKind, ExposureReport, FactorLoading,
-    InstrumentClassification, LedgerEntry, LedgerEntryKind, LotSelection, MoneyWeightedMethod,
-    PerformancePeriod, PerformancePolicy, PerformanceReport, PortfolioLedger, PortfolioRiskReport,
-    RebalanceConstraintInput, RebalanceConstraints, RebalanceProposal, RebalanceTarget,
-    ScenarioDefinition, Trade, TradeSide, TransactionRevision,
+    AnalyticsPolicyBinding, AttributionInput, AttributionReport, CashFlow, CashFlowKind,
+    ExposureReport, FactorLoading, InstrumentClassification, LedgerEntry, LedgerEntryKind,
+    LotSelection, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
+    PortfolioAnalyticsEvidence, PortfolioError, PortfolioLedger, PortfolioLimitInput,
+    PortfolioLimits, PortfolioRiskReport, RebalanceConstraintInput, RebalanceConstraints,
+    RebalanceProposal, RebalanceTarget, ScenarioDefinition, Trade, TradeSide, TransactionRevision,
 };
 use rust_decimal::Decimal;
 
@@ -185,9 +186,130 @@ pub(super) fn analytics_revision()
     )?)
 }
 
+fn analytics_evidence(
+    revision: &market_squawk_portfolio::PortfolioRevision,
+    effective_through: i64,
+    available_through: i64,
+) -> Result<PortfolioAnalyticsEvidence, Box<dyn Error>> {
+    Ok(PortfolioAnalyticsEvidence::try_from_revision(
+        revision,
+        Timestamp::from_unix_nanos(effective_through),
+        Timestamp::from_unix_nanos(available_through),
+        AnalyticsPolicyBinding::try_new(source("valuation-policy")?, NonZeroU32::MIN)?,
+        AnalyticsPolicyBinding::try_new(source("fx-policy")?, NonZeroU32::MIN)?,
+        AnalyticsPolicyBinding::try_new(source("as-of-policy")?, NonZeroU32::MIN)?,
+    )?)
+}
+
+fn analytics_limits(
+    max_factors: usize,
+    max_scenarios: usize,
+    max_results: usize,
+    max_retained_bytes: usize,
+) -> Result<PortfolioLimits, PortfolioError> {
+    PortfolioLimits::try_new(PortfolioLimitInput {
+        max_accounts: 4,
+        max_instruments: 16,
+        max_lots: 64,
+        max_transactions: 128,
+        max_factors,
+        max_scenarios,
+        max_history: 16,
+        max_results,
+        max_retained_bytes,
+    })
+}
+
+#[test]
+fn analytics_evidence_rejects_future_horizons() -> TestResult {
+    let revision = analytics_revision()?;
+    let error = match analytics_evidence(&revision, 5, 4) {
+        Ok(_) => return Err("future analytics evidence was accepted".into()),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.downcast_ref::<PortfolioError>(),
+        Some(&PortfolioError::EvidenceMismatch)
+    );
+    Ok(())
+}
+
+#[test]
+fn analytics_work_is_rejected_before_report_allocation() -> TestResult {
+    let revision = analytics_revision()?;
+    let evidence = analytics_evidence(&revision, 4, 4)?;
+    let usd = Currency::try_from("USD")?;
+    let dimension_limits = analytics_limits(1, 1, 128, 1024 * 1024)?;
+
+    assert!(matches!(
+        InstrumentClassification::try_new(
+            instrument(1)?,
+            source("technology")?,
+            source("issuer-a")?,
+            VenueId::try_from("XNAS")?,
+            usd,
+            vec![
+                FactorLoading::try_new(
+                    FeatureKey::try_new("market.beta", NonZeroU32::MIN)?,
+                    ExactRate::try_new(Decimal::ONE, ExactDecimalScale::Unit)?,
+                )?,
+                FactorLoading::try_new(
+                    FeatureKey::try_new("size.beta", NonZeroU32::MIN)?,
+                    ExactRate::try_new(Decimal::ONE, ExactDecimalScale::Unit)?,
+                )?,
+            ],
+            dimension_limits,
+        ),
+        Err(PortfolioError::LimitExceeded { .. })
+    ));
+    assert!(matches!(
+        ScenarioDefinition::try_new(
+            source("two-shock-scenario")?,
+            ShockComposition::Additive,
+            vec![
+                market_squawk_analytics::ScenarioShock::try_new(
+                    &format!("instrument-{}", instrument(1)?),
+                    ExactRate::try_new(Decimal::NEGATIVE_ONE, ExactDecimalScale::Unit)?,
+                )?,
+                market_squawk_analytics::ScenarioShock::try_new(
+                    &format!("instrument-{}", instrument(2)?),
+                    ExactRate::try_new(Decimal::NEGATIVE_ONE, ExactDecimalScale::Unit)?,
+                )?,
+            ],
+            dimension_limits,
+        ),
+        Err(PortfolioError::LimitExceeded { .. })
+    ));
+
+    let retained_limits = analytics_limits(16, 16, 128, 1)?;
+    let periods = [PerformancePeriod::try_new(
+        Timestamp::from_unix_nanos(0),
+        Timestamp::from_unix_nanos(1),
+        money(100, usd),
+        money(101, usd),
+        money(0, usd),
+    )?];
+    assert!(matches!(
+        PerformanceReport::try_calculate(
+            &revision,
+            &evidence,
+            &periods,
+            PerformancePolicy::new(
+                market_squawk_portfolio::CashFlowTiming::EndOfPeriod,
+                MoneyWeightedMethod::ModifiedDietz,
+                NonZeroU32::MIN,
+            ),
+            retained_limits,
+        ),
+        Err(PortfolioError::RetainedBytesExceeded { .. })
+    ));
+    Ok(())
+}
+
 #[test]
 fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestResult {
     let revision = analytics_revision()?;
+    let evidence = analytics_evidence(&revision, 4, 4)?;
     let usd = Currency::try_from("USD")?;
     let periods = vec![
         PerformancePeriod::try_new(
@@ -207,6 +329,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     ];
     let performance = PerformanceReport::try_calculate(
         &revision,
+        &evidence,
         &periods,
         PerformancePolicy::new(
             market_squawk_portfolio::CashFlowTiming::EndOfPeriod,
@@ -226,6 +349,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     );
     let start_weighted = PerformanceReport::try_calculate(
         &revision,
+        &evidence,
         &periods,
         PerformancePolicy::new(
             market_squawk_portfolio::CashFlowTiming::StartOfPeriod,
@@ -252,6 +376,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
                 FeatureKey::try_new("market.beta", NonZeroU32::MIN)?,
                 ExactRate::try_new(Decimal::new(12, 1), ExactDecimalScale::Unit)?,
             )?],
+            super::limits()?,
         )?,
         InstrumentClassification::try_new(
             instrument(2)?,
@@ -263,9 +388,11 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
                 FeatureKey::try_new("market.beta", NonZeroU32::MIN)?,
                 ExactRate::try_new(Decimal::new(8, 1), ExactDecimalScale::Unit)?,
             )?],
+            super::limits()?,
         )?,
     ];
-    let exposure = ExposureReport::try_calculate(&revision, &classifications, super::limits()?)?;
+    let exposure =
+        ExposureReport::try_calculate(&revision, &evidence, &classifications, super::limits()?)?;
     assert_eq!(exposure.revision_id(), revision.id());
     assert_eq!(exposure.instrument().len(), 2);
     assert_eq!(exposure.sector().len(), 2);
@@ -278,6 +405,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
 
     let attribution = AttributionReport::try_calculate(
         &revision,
+        &evidence,
         &[
             AttributionInput::try_new(
                 instrument(1)?,
@@ -375,9 +503,11 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
                 ExactRate::try_new(Decimal::new(-1, 1), ExactDecimalScale::Unit)?,
             )?,
         ],
+        super::limits()?,
     )?];
     let risk = PortfolioRiskReport::try_calculate(
         &revision,
+        &evidence,
         &returns,
         &benchmark,
         &losses,
@@ -391,5 +521,15 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     assert_eq!(risk.expected_shortfall().value(), 9.0);
     assert_eq!(risk.scenarios().len(), 1);
     assert!(risk.scenarios()[0].impact().amount().is_sign_negative());
+    let evidence_digest = evidence.semantic_digest();
+    assert_eq!(
+        [
+            performance.analytics_evidence_digest(),
+            exposure.analytics_evidence_digest(),
+            attribution.analytics_evidence_digest(),
+            risk.analytics_evidence_digest(),
+        ],
+        [evidence_digest; 4]
+    );
     Ok(())
 }

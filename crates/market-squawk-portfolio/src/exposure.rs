@@ -1,16 +1,20 @@
 //! Revision-bound allocation and multi-dimensional exposure.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use market_squawk_analytics::{
-    ExactDecimalScale, ExactRate, FeatureKey, MonetaryBasis, MonetaryValue, PortfolioAllocation,
-    portfolio_exposure,
+    ExactDecimalScale, ExactRate, FeatureKey, MAX_FEATURE_NAME_BYTES, MonetaryBasis, MonetaryValue,
+    PortfolioAllocation, portfolio_exposure,
 };
+use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{Currency, InstrumentId, Money, SourceIdentifier, VenueId};
 use rust_decimal::Decimal;
 
 use crate::{
-    PortfolioError, PortfolioLimits, PortfolioRevision, PortfolioRevisionId, checked_decimal_mul,
+    PortfolioAnalyticsEvidence, PortfolioError, PortfolioLimits, PortfolioRevision,
+    PortfolioRevisionId, admit_retained_bytes, checked_decimal_mul, checked_usize_add,
+    checked_usize_mul,
 };
 
 /// Exact factor loading tied to the Task 12 canonical feature key.
@@ -65,7 +69,26 @@ impl InstrumentClassification {
         venue: VenueId,
         currency: Currency,
         mut factors: Vec<FactorLoading>,
+        limits: PortfolioLimits,
     ) -> Result<Self, PortfolioError> {
+        if factors.len() > limits.max_factors {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "classification factors",
+                observed: factors.len(),
+                limit: limits.max_factors,
+            });
+        }
+        let retained_bytes = [
+            std::mem::size_of::<Self>(),
+            sector.retained_bytes(),
+            issuer.retained_bytes(),
+            venue.retained_bytes(),
+            checked_usize_mul(factors.capacity(), std::mem::size_of::<FactorLoading>())?,
+            checked_usize_mul(factors.len(), MAX_FEATURE_NAME_BYTES)?,
+        ]
+        .into_iter()
+        .try_fold(0_usize, checked_usize_add)?;
+        admit_retained_bytes(retained_bytes, limits)?;
         factors.sort_unstable_by(|left, right| left.key.cmp(&right.key));
         if factors.windows(2).any(|pair| pair[0].key == pair[1].key) {
             return Err(PortfolioError::InvalidDimension);
@@ -134,6 +157,7 @@ impl ExposureLine {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExposureReport {
     revision_id: PortfolioRevisionId,
+    analytics_evidence_digest: Sha256Digest,
     instrument: Vec<ExposureLine>,
     sector: Vec<ExposureLine>,
     factor: Vec<ExposureLine>,
@@ -143,6 +167,7 @@ pub struct ExposureReport {
     allocation_total: Money,
     net: Money,
     gross: Money,
+    retained_bytes: usize,
 }
 
 impl ExposureReport {
@@ -153,45 +178,123 @@ impl ExposureReport {
     /// Rejects absent/duplicate classifications, excessive output, or checked arithmetic failure.
     pub fn try_calculate(
         revision: &PortfolioRevision,
+        analytics_evidence: &PortfolioAnalyticsEvidence,
         classifications: &[InstrumentClassification],
         limits: PortfolioLimits,
     ) -> Result<Self, PortfolioError> {
-        if classifications.len() > limits.max_instruments {
+        let report_through = revision.evidence().as_of();
+        analytics_evidence.validate_report(revision, report_through, report_through)?;
+        let positions = revision.positions().len();
+        if classifications.len() > limits.max_instruments || positions > limits.max_instruments {
             return Err(PortfolioError::LimitExceeded {
                 resource: "classifications",
-                observed: classifications.len(),
+                observed: classifications.len().max(positions),
                 limit: limits.max_instruments,
             });
         }
-        let by_instrument = classifications
-            .iter()
-            .map(|classification| (classification.instrument_id, classification))
-            .collect::<BTreeMap<_, _>>();
-        if by_instrument.len() != classifications.len()
-            || revision
-                .positions()
+        let factor_occurrences =
+            classifications
                 .iter()
-                .any(|position| !by_instrument.contains_key(&position.instrument_id()))
+                .try_fold(0_usize, |total, classification| {
+                    if classification.factors.len() > limits.max_factors {
+                        return Err(PortfolioError::LimitExceeded {
+                            resource: "classification factors",
+                            observed: classification.factors.len(),
+                            limit: limits.max_factors,
+                        });
+                    }
+                    checked_usize_add(total, classification.factors.len())
+                })?;
+        if factor_occurrences > limits.max_results {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "factor occurrences",
+                observed: factor_occurrences,
+                limit: limits.max_results,
+            });
+        }
+        let worst_lines = checked_usize_add(checked_usize_mul(positions, 5)?, factor_occurrences)?;
+        if worst_lines > limits.max_results {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "exposure results",
+                observed: worst_lines,
+                limit: limits.max_results,
+            });
+        }
+        let work_rows = checked_usize_add(
+            checked_usize_add(worst_lines, positions)?,
+            classifications.len(),
+        )?;
+        if work_rows > limits.max_results {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "exposure work",
+                observed: work_rows,
+                limit: limits.max_results,
+            });
+        }
+        admit_retained_bytes(
+            exposure_retained_preflight(positions, factor_occurrences, worst_lines)?,
+            limits,
+        )?;
+        let mut factor_keys = Vec::new();
+        factor_keys
+            .try_reserve_exact(factor_occurrences)
+            .map_err(|_| PortfolioError::AllocationFailed)?;
+        factor_keys.extend(
+            classifications
+                .iter()
+                .flat_map(|classification| classification.factors.iter().map(|factor| &factor.key)),
+        );
+        factor_keys.sort_unstable();
+        factor_keys.dedup();
+        if factor_keys.len() > limits.max_factors {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "factors",
+                observed: factor_keys.len(),
+                limit: limits.max_factors,
+            });
+        }
+        let mut by_instrument = Vec::new();
+        by_instrument
+            .try_reserve_exact(classifications.len())
+            .map_err(|_| PortfolioError::AllocationFailed)?;
+        by_instrument.extend(classifications);
+        by_instrument.sort_unstable_by_key(|classification| classification.instrument_id);
+        if by_instrument
+            .windows(2)
+            .any(|pair| pair[0].instrument_id == pair[1].instrument_id)
+            || revision.positions().iter().any(|position| {
+                by_instrument
+                    .binary_search_by_key(&position.instrument_id(), |classification| {
+                        classification.instrument_id
+                    })
+                    .is_err()
+            })
         {
             return Err(PortfolioError::InvalidDimension);
         }
         let mut instrument = Vec::new();
+        instrument
+            .try_reserve_exact(positions)
+            .map_err(|_| PortfolioError::AllocationFailed)?;
         let mut sector = BTreeMap::new();
         let mut factor = BTreeMap::new();
         let mut currency = BTreeMap::new();
         let mut issuer = BTreeMap::new();
         let mut venue = BTreeMap::new();
         let mut allocations = Vec::new();
+        allocations
+            .try_reserve_exact(positions)
+            .map_err(|_| PortfolioError::AllocationFailed)?;
         for position in revision.positions() {
             let classification = by_instrument
-                .get(&position.instrument_id())
+                .binary_search_by_key(&position.instrument_id(), |classification| {
+                    classification.instrument_id
+                })
+                .ok()
+                .and_then(|index| by_instrument.get(index))
                 .ok_or(PortfolioError::InvalidDimension)?;
             let value = position.market_value();
-            let dimension = instrument_dimension(position.instrument_id());
-            instrument.push(ExposureLine {
-                dimension: dimension.clone(),
-                amount: value,
-            });
+            let dimension = try_instrument_dimension(position.instrument_id())?;
             allocations.push(
                 PortfolioAllocation::try_new(
                     &dimension,
@@ -201,16 +304,20 @@ impl ExposureReport {
                 )
                 .map_err(|_| PortfolioError::Analytics)?,
             );
+            instrument.push(ExposureLine {
+                dimension,
+                amount: value,
+            });
             aggregate(&mut sector, classification.sector.as_str(), value)?;
-            aggregate(
+            aggregate_owned(
                 &mut currency,
-                &classification.currency.as_str().to_ascii_lowercase(),
+                try_ascii_lowercase(classification.currency.as_str())?,
                 value,
             )?;
             aggregate(&mut issuer, classification.issuer.as_str(), value)?;
-            aggregate(
+            aggregate_owned(
                 &mut venue,
-                &classification.venue.as_str().to_ascii_lowercase(),
+                try_ascii_lowercase(classification.venue.as_str())?,
                 value,
             )?;
             for loading in &classification.factors {
@@ -218,31 +325,19 @@ impl ExposureReport {
                     checked_decimal_mul(value.amount(), loading.loading.value())?,
                     value.currency(),
                 );
-                aggregate(
-                    &mut factor,
-                    &format!("{}-{}", loading.key.name(), loading.key.version()),
-                    amount,
-                )?;
+                aggregate_owned(&mut factor, try_factor_dimension(&loading.key)?, amount)?;
             }
         }
-        let factor_keys = classifications
-            .iter()
-            .flat_map(|classification| classification.factors.iter().map(|factor| &factor.key))
-            .collect::<BTreeSet<_>>();
-        if factor_keys.len() > limits.max_factors {
-            return Err(PortfolioError::LimitExceeded {
-                resource: "factors",
-                observed: factor_keys.len(),
-                limit: limits.max_factors,
-            });
-        }
-        let total_lines = instrument
-            .len()
-            .saturating_add(sector.len())
-            .saturating_add(factor.len())
-            .saturating_add(currency.len())
-            .saturating_add(issuer.len())
-            .saturating_add(venue.len());
+        let total_lines = [
+            instrument.len(),
+            sector.len(),
+            factor.len(),
+            currency.len(),
+            issuer.len(),
+            venue.len(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, checked_usize_add)?;
         if total_lines > limits.max_results {
             return Err(PortfolioError::LimitExceeded {
                 resource: "exposure results",
@@ -259,23 +354,44 @@ impl ExposureReport {
                     .map_err(|_| PortfolioError::Arithmetic)
             },
         )?;
+        let sector = lines(sector)?;
+        let factor = lines(factor)?;
+        let currency = lines(currency)?;
+        let issuer = lines(issuer)?;
+        let venue = lines(venue)?;
+        let retained_bytes = exposure_retained_bytes([
+            (&instrument, instrument.capacity()),
+            (&sector, sector.capacity()),
+            (&factor, factor.capacity()),
+            (&currency, currency.capacity()),
+            (&issuer, issuer.capacity()),
+            (&venue, venue.capacity()),
+        ])?;
+        admit_retained_bytes(retained_bytes, limits)?;
         Ok(Self {
             revision_id: revision.id(),
+            analytics_evidence_digest: analytics_evidence.semantic_digest(),
             instrument,
-            sector: lines(sector),
-            factor: lines(factor),
-            currency: lines(currency),
-            issuer: lines(issuer),
-            venue: lines(venue),
+            sector,
+            factor,
+            currency,
+            issuer,
+            venue,
             allocation_total,
             net: kernel.net().money(),
             gross: kernel.gross().money(),
+            retained_bytes,
         })
     }
 
     /// Returns immutable revision identity.
     pub const fn revision_id(&self) -> PortfolioRevisionId {
         self.revision_id
+    }
+
+    /// Returns the exact point-in-time analytics authority digest.
+    pub const fn analytics_evidence_digest(&self) -> Sha256Digest {
+        self.analytics_evidence_digest
     }
 
     /// Returns instrument exposures.
@@ -322,10 +438,23 @@ impl ExposureReport {
     pub const fn gross(&self) -> Money {
         self.gross
     }
+
+    /// Returns exact Rust-visible bytes retained by this report.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
 }
 
-pub(crate) fn instrument_dimension(instrument_id: InstrumentId) -> String {
-    format!("instrument-{instrument_id}")
+pub(crate) fn try_instrument_dimension(
+    instrument_id: InstrumentId,
+) -> Result<String, PortfolioError> {
+    let mut dimension = String::new();
+    dimension
+        .try_reserve_exact("instrument-".len() + 36)
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    write!(&mut dimension, "instrument-{instrument_id}")
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    Ok(dimension)
 }
 
 fn aggregate(
@@ -333,22 +462,110 @@ fn aggregate(
     key: &str,
     amount: Money,
 ) -> Result<(), PortfolioError> {
-    if let Some(current) = values.get(key).copied() {
-        values.insert(
-            key.to_owned(),
-            current
-                .checked_add(amount)
-                .map_err(|_| PortfolioError::Arithmetic)?,
-        );
+    if let Some(current) = values.get_mut(key) {
+        *current = current
+            .checked_add(amount)
+            .map_err(|_| PortfolioError::Arithmetic)?;
     } else {
-        values.insert(key.to_owned(), amount);
+        values.insert(try_owned_string(key)?, amount);
     }
     Ok(())
 }
 
-fn lines(values: BTreeMap<String, Money>) -> Vec<ExposureLine> {
-    values
-        .into_iter()
-        .map(|(dimension, amount)| ExposureLine { dimension, amount })
-        .collect()
+fn aggregate_owned(
+    values: &mut BTreeMap<String, Money>,
+    key: String,
+    amount: Money,
+) -> Result<(), PortfolioError> {
+    if let Some(current) = values.get_mut(key.as_str()) {
+        *current = current
+            .checked_add(amount)
+            .map_err(|_| PortfolioError::Arithmetic)?;
+    } else {
+        values.insert(key, amount);
+    }
+    Ok(())
+}
+
+fn lines(values: BTreeMap<String, Money>) -> Result<Vec<ExposureLine>, PortfolioError> {
+    let mut lines = Vec::new();
+    lines
+        .try_reserve_exact(values.len())
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    lines.extend(
+        values
+            .into_iter()
+            .map(|(dimension, amount)| ExposureLine { dimension, amount }),
+    );
+    Ok(lines)
+}
+
+fn try_owned_string(value: &str) -> Result<String, PortfolioError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn try_ascii_lowercase(value: &str) -> Result<String, PortfolioError> {
+    let mut lowercase = String::new();
+    lowercase
+        .try_reserve_exact(value.len())
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    lowercase.extend(
+        value
+            .bytes()
+            .map(|byte| char::from(byte.to_ascii_lowercase())),
+    );
+    Ok(lowercase)
+}
+
+fn try_factor_dimension(key: &FeatureKey) -> Result<String, PortfolioError> {
+    let capacity = checked_usize_add(key.name().len(), 11)?;
+    let mut dimension = String::new();
+    dimension
+        .try_reserve_exact(capacity)
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    write!(&mut dimension, "{}-{}", key.name(), key.version())
+        .map_err(|_| PortfolioError::AllocationFailed)?;
+    Ok(dimension)
+}
+
+fn exposure_retained_preflight(
+    positions: usize,
+    factor_occurrences: usize,
+    worst_lines: usize,
+) -> Result<usize, PortfolioError> {
+    let fixed_and_lines = checked_usize_add(
+        std::mem::size_of::<ExposureReport>(),
+        checked_usize_mul(worst_lines, std::mem::size_of::<ExposureLine>())?,
+    )?;
+    [
+        fixed_and_lines,
+        checked_usize_mul(positions, "instrument-".len() + 36)?,
+        checked_usize_mul(positions, SourceIdentifier::MAX_LENGTH)?,
+        checked_usize_mul(positions, 3)?,
+        checked_usize_mul(positions, SourceIdentifier::MAX_LENGTH)?,
+        checked_usize_mul(positions, VenueId::MAX_LENGTH)?,
+        checked_usize_mul(factor_occurrences, MAX_FEATURE_NAME_BYTES + 11)?,
+    ]
+    .into_iter()
+    .try_fold(0_usize, checked_usize_add)
+}
+
+fn exposure_retained_bytes(groups: [(&[ExposureLine], usize); 6]) -> Result<usize, PortfolioError> {
+    groups.into_iter().try_fold(
+        std::mem::size_of::<ExposureReport>(),
+        |retained, (lines, capacity)| {
+            let retained = checked_usize_add(
+                retained,
+                checked_usize_mul(capacity, std::mem::size_of::<ExposureLine>())?,
+            )?;
+            lines.iter().try_fold(retained, |retained, line| {
+                checked_usize_add(retained, line.dimension.capacity())
+            })
+        },
+    )
 }

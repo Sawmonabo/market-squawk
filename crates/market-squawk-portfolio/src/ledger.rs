@@ -232,7 +232,10 @@ impl PortfolioLedger {
             || entries.iter().any(|entry| {
                 entry.account_id != self.account_id || entry.occurred_at > evidence.as_of
             })
-            || plan.is_some_and(|candidate| candidate.valuation_cutoff() > evidence.as_of)
+            || plan.is_some_and(|candidate| {
+                candidate.knowledge_cutoff() > evidence.as_of
+                    || candidate.valuation_cutoff() > evidence.as_of
+            })
         {
             return Err(PortfolioError::EvidenceMismatch);
         }

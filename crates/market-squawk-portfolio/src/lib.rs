@@ -5,6 +5,7 @@
 //! order, approval, dispatch, credential, or live-execution authority.
 
 mod accounting;
+mod analytics_evidence;
 mod attribution;
 mod evidence;
 mod exposure;
@@ -26,6 +27,7 @@ use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+pub use analytics_evidence::{AnalyticsPolicyBinding, PortfolioAnalyticsEvidence};
 pub use attribution::{AttributionInput, AttributionLine, AttributionReport};
 pub use evidence::{
     BasisMeasurement, CashBalance, CorporateActionBinding, FeatureBinding, FxRateEvidence,
@@ -634,6 +636,28 @@ fn snapshot_retained_bytes(positions: &[Position]) -> Result<usize, PortfolioSer
             )
         },
     )
+}
+
+pub(crate) fn checked_usize_add(left: usize, right: usize) -> Result<usize, PortfolioError> {
+    left.checked_add(right).ok_or(PortfolioError::Arithmetic)
+}
+
+pub(crate) fn checked_usize_mul(left: usize, right: usize) -> Result<usize, PortfolioError> {
+    left.checked_mul(right).ok_or(PortfolioError::Arithmetic)
+}
+
+pub(crate) fn admit_retained_bytes(
+    observed: usize,
+    limits: PortfolioLimits,
+) -> Result<(), PortfolioError> {
+    if observed > limits.max_retained_bytes {
+        Err(PortfolioError::RetainedBytesExceeded {
+            observed,
+            limit: limits.max_retained_bytes,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn checked_decimal_add(

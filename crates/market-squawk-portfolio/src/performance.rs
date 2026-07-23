@@ -3,12 +3,14 @@
 use std::num::NonZeroU32;
 
 use market_squawk_analytics::{ExactDecimalScale, ExactRate};
+use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{Money, Timestamp};
 use rust_decimal::Decimal;
 
 use crate::{
-    PortfolioError, PortfolioLimits, PortfolioRevision, PortfolioRevisionId, checked_decimal_add,
-    checked_decimal_div, checked_decimal_mul, checked_decimal_sub,
+    PortfolioAnalyticsEvidence, PortfolioError, PortfolioLimits, PortfolioRevision,
+    PortfolioRevisionId, admit_retained_bytes, checked_decimal_add, checked_decimal_div,
+    checked_decimal_mul, checked_decimal_sub,
 };
 
 /// Boundary convention for external cash flows in subperiod returns.
@@ -134,10 +136,12 @@ impl PerformancePeriod {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerformanceReport {
     revision_id: PortfolioRevisionId,
+    analytics_evidence_digest: Sha256Digest,
     policy: PerformancePolicy,
     time_weighted_return: ExactRate,
     money_weighted_return: ExactRate,
     periods: usize,
+    retained_bytes: usize,
 }
 
 impl PerformanceReport {
@@ -148,10 +152,12 @@ impl PerformanceReport {
     /// Rejects empty/excessive, unordered, mixed-currency, or arithmetically invalid periods.
     pub fn try_calculate(
         revision: &PortfolioRevision,
+        analytics_evidence: &PortfolioAnalyticsEvidence,
         periods: &[PerformancePeriod],
         policy: PerformancePolicy,
         limits: PortfolioLimits,
     ) -> Result<Self, PortfolioError> {
+        analytics_evidence.validate_revision(revision)?;
         if periods.is_empty() || periods.len() > limits.max_history {
             return Err(PortfolioError::LimitExceeded {
                 resource: "performance history",
@@ -159,6 +165,12 @@ impl PerformanceReport {
                 limit: limits.max_history,
             });
         }
+        let report_through = periods
+            .last()
+            .map(|period| period.ends_at)
+            .ok_or(PortfolioError::InvalidPolicy)?;
+        analytics_evidence.validate_horizon(report_through, report_through)?;
+        admit_retained_bytes(std::mem::size_of::<Self>(), limits)?;
         if periods
             .windows(2)
             .any(|window| window[0].ends_at != window[1].starts_at)
@@ -235,20 +247,29 @@ impl PerformanceReport {
             checked_decimal_sub(checked_decimal_sub(closing, opening)?, flows)?,
             checked_decimal_add(opening, weighted_flows)?,
         )?;
-        Ok(Self {
+        let report = Self {
             revision_id: revision.id(),
+            analytics_evidence_digest: analytics_evidence.semantic_digest(),
             policy,
             time_weighted_return: ExactRate::try_new(time_weighted, ExactDecimalScale::Unit)
                 .map_err(|_| PortfolioError::Analytics)?,
             money_weighted_return: ExactRate::try_new(money_weighted, ExactDecimalScale::Unit)
                 .map_err(|_| PortfolioError::Analytics)?,
             periods: periods.len(),
-        })
+            retained_bytes: std::mem::size_of::<Self>(),
+        };
+        admit_retained_bytes(report.retained_bytes, limits)?;
+        Ok(report)
     }
 
     /// Returns bound immutable revision identity.
     pub const fn revision_id(self) -> PortfolioRevisionId {
         self.revision_id
+    }
+
+    /// Returns the exact point-in-time analytics authority digest.
+    pub const fn analytics_evidence_digest(self) -> Sha256Digest {
+        self.analytics_evidence_digest
     }
 
     /// Returns calculation policy.
@@ -269,5 +290,10 @@ impl PerformanceReport {
     /// Returns contributing period count.
     pub const fn periods(self) -> usize {
         self.periods
+    }
+
+    /// Returns exact Rust-visible bytes retained by this report.
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
     }
 }
