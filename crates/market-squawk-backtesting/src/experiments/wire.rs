@@ -12,7 +12,7 @@ use super::model::{
     TrialParameter, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 
-const RESERVATION_SCHEMA_VERSION: u16 = 1;
+const RESERVATION_SCHEMA_VERSION: u16 = 2;
 const TERMINAL_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +29,7 @@ struct TrialSpecWire {
     dataset_identity: String,
     object_graph_digest: String,
     execution_assumption_digest: String,
+    run_input_digest: String,
     model: Option<BindingWire>,
     strategy: BindingWire,
     code: BindingWire,
@@ -313,6 +314,7 @@ impl From<&TrialSpec> for TrialSpecWire {
             dataset_identity: encode_hex(value.dataset_identity.bytes()),
             object_graph_digest: encode_hex(value.object_graph_digest.bytes()),
             execution_assumption_digest: encode_hex(value.execution_assumption_digest.bytes()),
+            run_input_digest: encode_hex(value.run_input_digest.bytes()),
             model: value.model.as_ref().map(BindingWire::from),
             strategy: BindingWire::from(&value.strategy),
             code: BindingWire::from(&value.code),
@@ -360,6 +362,7 @@ impl TryFrom<TrialSpecWire> for TrialSpec {
             dataset_identity: decode_hex(&value.dataset_identity)?,
             object_graph_digest: decode_hex(&value.object_graph_digest)?,
             execution_assumption_digest: decode_hex(&value.execution_assumption_digest)?,
+            run_input_digest: decode_hex(&value.run_input_digest)?,
             model: value
                 .model
                 .map(TrialComponentBinding::try_from)

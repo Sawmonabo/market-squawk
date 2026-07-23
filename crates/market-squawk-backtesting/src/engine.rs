@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use market_squawk_domain::{
     AccountId, InstrumentExecutionTerms, InstrumentId, Money, QuantityLots, SourceIdentifier,
-    Timestamp,
+    TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, StrategyError};
 use market_squawk_portfolio::{PortfolioError, PortfolioLimits, PortfolioRevision};
@@ -84,6 +84,7 @@ impl BacktestRequest {
         sources.sort_unstable();
         if sources.is_empty()
             || sources.windows(2).any(|pair| pair[0] == pair[1])
+            || dataset.observations.len() < 2
             || dataset.observations.len() > limits.max_observations
             || dataset.retained_bytes > limits.max_retained_bytes
             || corporate_actions.as_ref().is_some_and(|plan| {
@@ -132,6 +133,59 @@ impl BacktestRequest {
     pub const fn seed(&self) -> u64 {
         self.seed
     }
+
+    /// Returns the canonical identity of every immutable input that can determine or qualify a run.
+    #[must_use]
+    pub(crate) fn run_input_digest(&self) -> Sha256Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/backtest-run-input/v1");
+        hash.update(self.dataset.identity.bytes());
+        hash.update(self.dataset.object_graph_digest().bytes());
+        hash.update(self.assumptions.digest().bytes());
+        hash.update(self.portfolio.account_id.as_uuid().as_bytes());
+        update_decimal(&mut hash, self.portfolio.initial_cash.amount());
+        update_text(&mut hash, self.portfolio.initial_cash.currency().as_str());
+        hash.update(self.portfolio.limits.semantic_digest().bytes());
+        match &self.corporate_actions {
+            Some(plan) => {
+                hash.update([1]);
+                hash.update(plan.content_hash().bytes());
+                hash.update(plan.audit_hash().bytes());
+                hash.update(plan.knowledge_cutoff().unix_nanos().to_be_bytes());
+                hash.update(plan.valuation_cutoff().unix_nanos().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        update_usize(&mut hash, self.sources.len());
+        for source in &self.sources {
+            update_text(&mut hash, source.as_str());
+        }
+        hash.update(self.seed.to_be_bytes());
+        for limit in [
+            self.limits.max_observations,
+            self.limits.max_pending_intents,
+            self.limits.max_fills,
+            self.limits.max_retained_bytes,
+        ] {
+            update_usize(&mut hash, limit);
+        }
+        Sha256Digest::new(hash.finalize().into())
+    }
+}
+
+fn update_decimal(hash: &mut Sha256, value: Decimal) {
+    let normalized = value.normalize();
+    hash.update(normalized.mantissa().to_be_bytes());
+    hash.update(normalized.scale().to_be_bytes());
+}
+
+fn update_text(hash: &mut Sha256, value: &str) {
+    update_usize(hash, value.len());
+    hash.update(value.as_bytes());
+}
+
+fn update_usize(hash: &mut Sha256, value: usize) {
+    hash.update((value as u128).to_be_bytes());
 }
 
 /// Borrowed current point-in-time state exposed to a research strategy.
@@ -394,6 +448,10 @@ impl BacktestEngine {
                         index += 1;
                         continue;
                     }
+                    let immediate = matches!(
+                        pending[index].time_in_force(),
+                        TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
+                    );
                     let outcome = simulator.simulate(
                         &pending[index],
                         observation.decision_at,
@@ -402,7 +460,11 @@ impl BacktestEngine {
                         remaining_capacity,
                     )?;
                     let Some(fill) = outcome else {
-                        index += 1;
+                        if immediate {
+                            pending.remove(index);
+                        } else {
+                            index += 1;
+                        }
                         continue;
                     };
                     shadow.apply(&fill, pending[index].execution_terms())?;
@@ -478,10 +540,8 @@ fn result_digest(
     no_action_count: usize,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/backtest-result/v1");
-    hash.update(request.dataset.identity.bytes());
-    hash.update(request.assumptions.digest().bytes());
-    hash.update(request.seed.to_be_bytes());
+    hash.update(b"market-squawk/backtest-result/v2");
+    hash.update(request.run_input_digest().bytes());
     for fill in fills {
         hash.update(fill.intent_digest().as_bytes());
         hash.update(fill.instrument_id().as_uuid().into_bytes());

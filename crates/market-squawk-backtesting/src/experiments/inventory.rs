@@ -134,28 +134,41 @@ impl ExperimentInventory {
     }
 
     /// Publishes a bounded content-addressed detailed result. Exact retries are idempotent.
-    pub fn publish_artifact(&self, bytes: &[u8]) -> Result<BacktestArtifact, ExperimentError> {
-        if bytes.is_empty() || bytes.len() > self.limits.max_artifact_bytes {
-            return Err(ExperimentError::LimitExceeded);
-        }
+    pub(crate) fn publish_artifact(
+        &self,
+        bytes: &[u8],
+    ) -> Result<BacktestArtifact, ExperimentError> {
+        let artifact = self.prepare_artifact(bytes)?;
+        let reference = artifact.reference().to_owned();
+        let parent = Path::new(&reference)
+            .parent()
+            .ok_or(ExperimentError::Encoding)?;
         let _guard = self
             .writer
             .lock()
             .map_err(|_| ExperimentError::Unavailable)?;
-        let digest = digest_bytes(bytes);
-        let hex = encode_hex(digest.bytes());
-        let prefix = hex.get(..2).ok_or(ExperimentError::Encoding)?;
-        let parent = format!("{ARTIFACTS}/{prefix}");
-        ensure_directory(&self.root, Path::new(&parent))?;
-        let reference = format!("{parent}/{hex}.json");
+        ensure_directory(&self.root, parent)?;
         publish_immutable(
             &self.root,
             Path::new(&reference),
             bytes,
             ExistingPolicy::AcceptExact,
         )?;
+        Ok(artifact)
+    }
+
+    pub(crate) fn prepare_artifact(
+        &self,
+        bytes: &[u8],
+    ) -> Result<BacktestArtifact, ExperimentError> {
+        if bytes.is_empty() || bytes.len() > self.limits.max_artifact_bytes {
+            return Err(ExperimentError::LimitExceeded);
+        }
+        let digest = digest_bytes(bytes);
+        let hex = encode_hex(digest.bytes());
+        let prefix = hex.get(..2).ok_or(ExperimentError::Encoding)?;
         Ok(BacktestArtifact {
-            reference: reference.into_boxed_str(),
+            reference: format!("{ARTIFACTS}/{prefix}/{hex}.json").into_boxed_str(),
             digest,
             byte_count: u64::try_from(bytes.len()).map_err(|_| ExperimentError::LimitExceeded)?,
         })
@@ -198,10 +211,25 @@ impl ExperimentInventory {
     pub(crate) fn complete(
         &self,
         reservation: TrialReservation,
-        input: TrialCompletionInput,
+        completion: TrialCompletion,
     ) -> Result<TrialRecord, ExperimentError> {
-        let completion = TrialCompletion::try_new(input, self.limits)?;
         self.commit_terminal(reservation, TrialStatus::Completed(completion))
+    }
+
+    pub(crate) fn prepare_completion(
+        &self,
+        reservation: &TrialReservation,
+        input: TrialCompletionInput,
+    ) -> Result<TrialCompletion, ExperimentError> {
+        let completion = TrialCompletion::try_new(input, self.limits)?;
+        let terminal = encode_terminal(
+            reservation.spec.id(),
+            &TrialStatus::Completed(completion.clone()),
+        )?;
+        if terminal.len() > self.limits.max_record_bytes {
+            return Err(ExperimentError::LimitExceeded);
+        }
+        Ok(completion)
     }
 
     /// Commits the sole immutable failed terminal for a reserved trial.

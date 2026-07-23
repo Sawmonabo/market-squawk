@@ -13,6 +13,7 @@ struct ArtifactWire {
     dataset_identity: String,
     object_graph_digest: String,
     execution_assumption_digest: String,
+    run_input_digest: String,
     seed: u64,
     result_digest: String,
     accounting_reconciliation: &'static str,
@@ -103,10 +104,11 @@ pub(super) fn encode(
         })
         .collect();
     let wire = ArtifactWire {
-        schema_version: 2,
+        schema_version: 3,
         dataset_identity: hex(request.dataset_identity().bytes()),
         object_graph_digest: hex(request.dataset.object_graph_digest().bytes()),
         execution_assumption_digest: hex(request.assumption_digest().bytes()),
+        run_input_digest: hex(request.run_input_digest().bytes()),
         seed: request.seed(),
         result_digest: hex(run.result_digest().bytes()),
         accounting_reconciliation: match run.accounting_reconciliation() {

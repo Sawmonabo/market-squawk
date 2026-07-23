@@ -118,11 +118,26 @@ impl BacktestService {
         plan: BacktestTrialPlan,
         cancellation: &CancellationToken,
     ) -> Result<BacktestOutcome, BacktestServiceError> {
+        let dataset_partition = TrialDatasetPartition::try_new(
+            request
+                .dataset
+                .observations
+                .first()
+                .ok_or(BacktestServiceError::InvalidCohort)?
+                .decision_at,
+            request
+                .dataset
+                .observations
+                .last()
+                .ok_or(BacktestServiceError::InvalidCohort)?
+                .decision_at,
+        )?;
         let executable = strategy.identity();
         let spec = TrialSpec::try_new(TrialSpecInput {
             dataset_identity: request.dataset_identity(),
             object_graph_digest: request.object_graph_digest(),
             execution_assumption_digest: request.assumption_digest(),
+            run_input_digest: request.run_input_digest(),
             model: executable.model().cloned(),
             strategy: executable.strategy().clone(),
             code: executable.code().clone(),
@@ -156,39 +171,52 @@ impl BacktestService {
                     return Err(error);
                 }
             };
-        let artifact = match self.inventory.publish_artifact(&artifact_bytes) {
+        let metrics = match run_metrics(&request, &run) {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                self.commit_failure(reservation, "backtest-terminal-metrics", &error.to_string())?;
+                return Err(error);
+            }
+        };
+        let artifact = match self.inventory.prepare_artifact(&artifact_bytes) {
             Ok(artifact) => artifact,
             Err(error) => {
                 self.commit_failure(
                     reservation,
-                    "backtest-artifact-publication",
+                    "backtest-artifact-validation",
                     &error.to_string(),
                 )?;
                 return Err(error.into());
             }
         };
-        let trial = self.inventory.complete(
-            reservation,
+        let completion = match self.inventory.prepare_completion(
+            &reservation,
             TrialCompletionInput {
                 result_digest: run.result_digest(),
                 artifact,
-                metrics: run_metrics(&request, &run)?,
-                dataset_partition: Some(TrialDatasetPartition::try_new(
-                    request
-                        .dataset
-                        .observations
-                        .first()
-                        .ok_or(BacktestServiceError::InvalidCohort)?
-                        .decision_at,
-                    request
-                        .dataset
-                        .observations
-                        .last()
-                        .ok_or(BacktestServiceError::InvalidCohort)?
-                        .decision_at,
-                )?),
+                metrics,
+                dataset_partition: Some(dataset_partition),
             },
-        )?;
+        ) {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.commit_failure(
+                    reservation,
+                    "backtest-terminal-validation",
+                    &error.to_string(),
+                )?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.inventory.publish_artifact(&artifact_bytes) {
+            self.commit_failure(
+                reservation,
+                "backtest-artifact-publication",
+                &error.to_string(),
+            )?;
+            return Err(error.into());
+        }
+        let trial = self.inventory.complete(reservation, completion)?;
         Ok(BacktestOutcome::Completed(Box::new(BacktestResult {
             run,
             trial,
@@ -209,6 +237,7 @@ impl BacktestService {
             .collect::<BTreeSet<_>>();
         let mut records = BTreeMap::new();
         let mut design = None;
+        let mut design_cardinality = None;
         for id in member_ids {
             let record = self.inventory.trial(id)?;
             if record.spec().selection_criterion() != plan.selection_criterion()
@@ -220,11 +249,17 @@ impl BacktestService {
             if design.is_some_and(|expected| expected != candidate_design) {
                 return Err(BacktestServiceError::InvalidCohort);
             }
+            let candidate_cardinality = record.spec().search_space_cardinality()?;
+            if design_cardinality.is_some_and(|expected| expected != candidate_cardinality) {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
             design = Some(candidate_design);
+            design_cardinality = Some(candidate_cardinality);
             records.insert(id, record);
         }
-        validate_cohort_folds(&plan, &records)?;
-        validate_selection_candidates(&plan, &records)?;
+        let independent_trials = design_cardinality.ok_or(BacktestServiceError::InvalidCohort)?;
+        validate_cohort_folds(&plan, &records, independent_trials)?;
+        validate_selection_candidates(&plan, &records, independent_trials)?;
         let overfitting_input = BacktestOverfittingInput {
             folds: plan
                 .folds()
@@ -305,7 +340,7 @@ impl BacktestService {
                     selected_id,
                     &SourceIdentifier::try_from("sharpe")?,
                 )?,
-                independent_trials: sharpes.len(),
+                independent_trials,
                 observations: observations as usize,
                 trial_sharpe_variance,
                 return_skewness: trial_metric(
@@ -441,10 +476,14 @@ fn member_binding(
 fn validate_cohort_folds(
     plan: &BacktestCohortPlan,
     records: &BTreeMap<TrialId, TrialRecord>,
+    expected_candidates: usize,
 ) -> Result<(), BacktestServiceError> {
     let mut expected_parameters = None::<BTreeSet<[u8; 32]>>;
     let mut seen_partitions = BTreeSet::new();
     for fold in plan.folds() {
+        if fold.candidates().len() != expected_candidates {
+            return Err(BacktestServiceError::InvalidCohort);
+        }
         let mut fold_parameters = BTreeSet::new();
         let mut fold_identity = None;
         for candidate in fold.candidates() {
@@ -504,7 +543,11 @@ fn validate_cohort_folds(
 fn validate_selection_candidates(
     plan: &BacktestCohortPlan,
     records: &BTreeMap<TrialId, TrialRecord>,
+    expected_candidates: usize,
 ) -> Result<(), BacktestServiceError> {
+    if plan.selection_candidates().len() != expected_candidates {
+        return Err(BacktestServiceError::InvalidCohort);
+    }
     let mut expected_dataset = None;
     let mut parameter_digests = BTreeSet::new();
     for candidate in plan.selection_candidates() {

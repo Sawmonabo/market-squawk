@@ -321,6 +321,25 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
             .all(|trade| !trade.value_change().amount().is_zero())
     );
 
+    let turnover_only = RebalanceProposal::try_calculate(
+        &revision,
+        &targets,
+        RebalanceConstraints::try_new(RebalanceConstraintInput {
+            max_proposals: NonZeroUsize::new(4).ok_or("proposal bound")?,
+            max_turnover: ExactRate::try_new(Decimal::new(5, 1), ExactDecimalScale::Unit)?,
+            minimum_cash: money(0, usd),
+            allow_short: false,
+        })?,
+        super::limits()?,
+    )?;
+    assert!(!turnover_only.constrained());
+    assert_eq!(
+        turnover_only.turnover().value(),
+        Decimal::from(400_u32)
+            .checked_div(Decimal::from(1_010_u32))
+            .ok_or("one-way turnover expectation")?
+    );
+
     let returns = ReturnSeries::try_new(
         vec![
             StatisticalInput::try_new(0.01, StatisticalUnit::Return, StatisticalScale::Unit)?,

@@ -164,6 +164,7 @@ pub struct TrialSpecInput {
     pub dataset_identity: Sha256Digest,
     pub object_graph_digest: Sha256Digest,
     pub execution_assumption_digest: Sha256Digest,
+    pub run_input_digest: Sha256Digest,
     pub model: Option<TrialComponentBinding>,
     pub strategy: TrialComponentBinding,
     pub code: TrialComponentBinding,
@@ -180,6 +181,7 @@ pub struct TrialSpec {
     pub(super) dataset_identity: Sha256Digest,
     pub(super) object_graph_digest: Sha256Digest,
     pub(super) execution_assumption_digest: Sha256Digest,
+    pub(super) run_input_digest: Sha256Digest,
     pub(super) model: Option<TrialComponentBinding>,
     pub(super) strategy: TrialComponentBinding,
     pub(super) code: TrialComponentBinding,
@@ -198,6 +200,7 @@ impl TrialSpec {
             input.dataset_identity,
             input.object_graph_digest,
             input.execution_assumption_digest,
+            input.run_input_digest,
             input.strategy.digest,
             input.code.digest,
             input.configuration_digest,
@@ -209,6 +212,7 @@ impl TrialSpec {
         }
         if input.parameters.len() > HARD_MAX_PARAMETERS
             || input.search_space.len() > HARD_MAX_SEARCH_DIMENSIONS
+            || input.parameters.len() != input.search_space.len()
         {
             return Err(ExperimentError::InvalidSpec);
         }
@@ -230,6 +234,17 @@ impl TrialSpec {
         {
             return Err(ExperimentError::InvalidSpec);
         }
+        let candidate_count = input
+            .search_space
+            .iter()
+            .try_fold(1_usize, |count, dimension| {
+                count
+                    .checked_mul(dimension.candidates.len())
+                    .ok_or(ExperimentError::InvalidSpec)
+            })?;
+        if candidate_count > HARD_MAX_TRIALS {
+            return Err(ExperimentError::InvalidSpec);
+        }
         for parameter in &input.parameters {
             let dimension = input
                 .search_space
@@ -249,6 +264,7 @@ impl TrialSpec {
             dataset_identity: input.dataset_identity,
             object_graph_digest: input.object_graph_digest,
             execution_assumption_digest: input.execution_assumption_digest,
+            run_input_digest: input.run_input_digest,
             model: input.model,
             strategy: input.strategy,
             code: input.code,
@@ -330,6 +346,18 @@ impl TrialSpec {
             update_bytes(&mut hash, parameter.value.as_str().as_bytes())?;
         }
         Ok(Sha256Digest::new(hash.finalize().into()))
+    }
+
+    /// Returns the complete bounded Cartesian cardinality declared by the search dimensions.
+    pub(crate) fn search_space_cardinality(&self) -> Result<usize, ExperimentError> {
+        self.search_space
+            .iter()
+            .try_fold(1_usize, |count, dimension| {
+                count
+                    .checked_mul(dimension.candidates.len())
+                    .filter(|value| *value <= HARD_MAX_TRIALS)
+                    .ok_or(ExperimentError::InvalidSpec)
+            })
     }
 }
 
@@ -606,10 +634,11 @@ pub(super) fn require_digest(digest: Sha256Digest) -> Result<(), ExperimentError
 
 fn spec_identity(spec: &TrialSpec) -> Result<Sha256Digest, ExperimentError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/experiment-trial/v1");
+    hash.update(b"market-squawk/experiment-trial/v2");
     hash.update(spec.dataset_identity.bytes());
     hash.update(spec.object_graph_digest.bytes());
     hash.update(spec.execution_assumption_digest.bytes());
+    hash.update(spec.run_input_digest.bytes());
     update_optional_binding(&mut hash, spec.model.as_ref())?;
     update_binding(&mut hash, &spec.strategy)?;
     update_binding(&mut hash, &spec.code)?;

@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{
     BasisPoints, FinancialError, InstrumentId, Money, OrderId, OrderSide, OrderType, PriceTicks,
-    QuantityLots, RoundingPolicy, Timestamp,
+    QuantityLots, RoundingPolicy, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, OrderIntentDigest};
 use rand_chacha::ChaCha20Rng;
@@ -242,6 +242,11 @@ impl ResearchFillSimulator {
             return Ok(None);
         }
         let requested = intent.quantity();
+        if intent.time_in_force() == TimeInForce::FillOrKill
+            && available_capacity.get() < requested.get()
+        {
+            return Ok(None);
+        }
         let fill_lots = requested.get().min(available_capacity.get());
         if fill_lots < requested.get() && !self.assumptions.allow_partial_fills {
             return Ok(None);

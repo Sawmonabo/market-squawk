@@ -20,8 +20,10 @@ mod transaction;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
+use market_squawk_data::Sha256Digest;
 use market_squawk_domain::{AccountId, Currency, Money};
 use rust_decimal::Decimal;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub use attribution::{AttributionInput, AttributionLine, AttributionReport};
@@ -131,6 +133,30 @@ impl PortfolioLimits {
             max_results: input.max_results,
             max_retained_bytes: input.max_retained_bytes,
         })
+    }
+
+    /// Returns the versioned semantic identity of every named portfolio resource ceiling.
+    ///
+    /// Fields use a fixed order and fixed-width unsigned encoding; the identity is independent of
+    /// debug formatting, serialization libraries, and the host pointer width.
+    #[must_use]
+    pub fn semantic_digest(self) -> Sha256Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/portfolio-limits/v1");
+        for value in [
+            self.max_accounts,
+            self.max_instruments,
+            self.max_lots,
+            self.max_transactions,
+            self.max_factors,
+            self.max_scenarios,
+            self.max_history,
+            self.max_results,
+            self.max_retained_bytes,
+        ] {
+            hash.update((value as u128).to_be_bytes());
+        }
+        Sha256Digest::new(hash.finalize().into())
     }
 }
 
