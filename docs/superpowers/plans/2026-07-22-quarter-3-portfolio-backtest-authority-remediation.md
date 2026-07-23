@@ -90,7 +90,7 @@ canonical reservation before treating any attempt or terminal as authoritative.
 
   ```bash
   CARGO_INCREMENTAL=0 cargo test -p market-squawk-portfolio \
-    --test accounting --test analytics --all-features --locked
+    --test portfolio --all-features --locked
   ```
 
   Expected: compilation or behavioral failure only because the evidence/bound interfaces and
@@ -114,7 +114,7 @@ canonical reservation before treating any attempt or terminal as authoritative.
 
   ```bash
   CARGO_INCREMENTAL=0 cargo test -p market-squawk-portfolio \
-    --test accounting --test analytics --all-features --locked
+    --test portfolio --all-features --locked
   CARGO_INCREMENTAL=0 cargo test -p market-squawk-portfolio --all-features --locked
   CARGO_INCREMENTAL=0 cargo clippy -p market-squawk-portfolio \
     --all-targets --all-features --locked -- -D warnings
