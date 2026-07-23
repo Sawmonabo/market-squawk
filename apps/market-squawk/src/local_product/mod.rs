@@ -1,5 +1,9 @@
 //! Complete local product composition shared by CLI and MCP transports.
 
+mod cli_dataset;
+mod cli_model;
+mod cli_portfolio;
+mod cli_transport;
 mod executable;
 
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -19,6 +23,10 @@ use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
 
+pub use self::cli_dataset::CliDatasetError;
+pub use self::cli_model::CliModelAdmissionError;
+pub use self::cli_portfolio::CliPortfolioImportError;
+pub use self::cli_transport::{CliProductError, CliProductResult, execute_cli_command};
 use self::executable::{
     ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
 };
@@ -66,6 +74,7 @@ pub struct LocalProduct {
     application: Arc<Application>,
     research: Arc<ResearchService>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
+    provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
     portfolio: Arc<PortfolioApplicationService>,
     backtest_inputs: Arc<ProductionGovernedBacktestInputAuthority>,
@@ -109,7 +118,7 @@ impl LocalProduct {
 
         let paper = PaperApplicationServices::new(config.clone());
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
-            onboarding,
+            Arc::clone(&onboarding),
             paper.source_runtime_view(),
         )?);
         let research_domains = ResearchApplicationServices::new(
@@ -178,6 +187,7 @@ impl LocalProduct {
             application,
             research,
             research_ingest,
+            provider_onboarding: onboarding,
             provider_activation,
             portfolio,
             backtest_inputs,
@@ -211,6 +221,11 @@ impl LocalProduct {
         Arc::clone(&self.provider_activation)
     }
 
+    /// Returns provider onboarding authority for explicit CLI adapter activation boundaries.
+    pub fn provider_onboarding(&self) -> Arc<ProviderOnboardingService> {
+        Arc::clone(&self.provider_onboarding)
+    }
+
     /// Returns the durable portfolio service used by direct CLI publication boundaries.
     pub fn portfolio(&self) -> Arc<PortfolioApplicationService> {
         Arc::clone(&self.portfolio)
@@ -239,6 +254,7 @@ impl std::fmt::Debug for LocalProduct {
             .field("paths", &"[LOCAL CAPABILITIES]")
             .field("application", &self.application)
             .field("research", &"[ANALYTICAL AUTHORITY]")
+            .field("provider_onboarding", &"[ONBOARDING AUTHORITY]")
             .field("provider_activation", &"[ADAPTER ACTIVATION AUTHORITY]")
             .field("portfolio", &"[PORTFOLIO AUTHORITY]")
             .field("backtest_inputs", &"[BACKTEST INPUT AUTHORITY]")

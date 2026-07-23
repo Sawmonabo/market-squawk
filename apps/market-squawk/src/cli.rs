@@ -166,10 +166,6 @@ pub enum Command {
         /// MCP operation. Omitting it retains the v0.1 `mcp` compatibility form.
         #[command(subcommand)]
         command: Option<McpCommand>,
-
-        /// MCP server arguments.
-        #[command(flatten)]
-        serve: McpServeArguments,
     },
 
     /// Report bounded local readiness, configuration provenance, and release blockers.
@@ -250,14 +246,14 @@ pub struct CaptureArguments {
 /// Research-ingestion operation.
 #[derive(Debug, Subcommand)]
 pub enum IngestCommand {
-    /// Ingest a confined user-authorized local file.
+    /// Ingest one object from a confined user-authorized local-file manifest.
     File {
-        /// Input path admitted beneath a user-authorized root.
-        path: PathBuf,
-        /// Explicit format when it cannot be inferred safely.
+        /// Versioned file-adapter manifest; its parent is the authorized input root.
+        manifest: PathBuf,
+        /// Exact object identity declared by the manifest.
         #[arg(long)]
-        format: Option<String>,
-        /// Destination dataset identity.
+        object: String,
+        /// Exact dataset identity declared by the manifest.
         #[arg(long)]
         dataset: String,
         /// Explicit local mutation confirmation.
@@ -343,6 +339,14 @@ pub enum FeatureCommand {
 pub enum ModelCommand {
     /// List admitted immutable model bundles.
     List,
+    /// Admit one verified immutable model bundle through a closed request file.
+    Admit {
+        /// Confined JSON admission request file.
+        request: PathBuf,
+        /// Explicit durable-admission confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Inspect one bundle's complete metadata and admission state.
     Metadata {
         /// Model bundle identity.
@@ -538,23 +542,6 @@ pub enum FairValueCommand {
 pub enum McpCommand {
     /// Serve the bounded local stdio protocol.
     Serve,
-}
-
-/// Local MCP server arguments shared by the current and compatibility forms.
-#[derive(Debug, Args)]
-pub struct McpServeArguments {
-    /// Products observed by the optional online diagnostic source.
-    #[arg(long, value_delimiter = ',', default_value = "BTC-USD", global = true)]
-    pub products: Vec<String>,
-    /// Avoid opening a provider connection.
-    #[arg(long, global = true)]
-    pub offline: bool,
-    /// Select an immutable journal format when both formats exist.
-    #[arg(long, value_enum, requires = "offline", global = true)]
-    pub journal_format: Option<JournalFormatArgument>,
-    /// Enable local paper simulation.
-    #[arg(long, global = true)]
-    pub paper_bot: bool,
 }
 
 /// Diagnostic mock-feed arguments.

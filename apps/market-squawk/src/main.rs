@@ -1,10 +1,11 @@
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use market_squawk::{
-    AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, JournalFileFormat,
-    ProductionSourceProvider,
+    AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
+    cli::{Cli, Command, ConfigCommand, McpCommand, OutputFormat},
+    local_product::execute_cli_command,
     mcp::LocalMcpComposition,
     paper_bot::local_paper_bot,
     replay::replay_coinbase_journal,
@@ -23,164 +24,16 @@ use market_squawk_platform::{
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
-use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
-#[command(name = "market-squawk")]
-#[command(
-    about = "Local-first market tools that are diagnostic and authority-free",
-    long_about = "Local-first market tools that are diagnostic and authority-free. Any bot behavior is paper simulation only, with no production order authority."
-)]
-#[command(version)]
-struct Cli {
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
-
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    #[arg(long, env = "MARKET_SQUAWK_LOG", default_value = "info")]
-    log: String,
-
-    #[arg(long)]
-    json_logs: bool,
-
-    /// Source-task cancellation deadline in milliseconds (1..=60000).
-    #[arg(long)]
-    source_shutdown_ms: Option<u64>,
-
-    /// Fixed raw-capture queue depth.
-    #[arg(long)]
-    capture_queue_capacity: Option<usize>,
-
-    /// Unified per-channel capture memory ceiling in bytes.
-    #[arg(long)]
-    capture_memory_ceiling_bytes: Option<usize>,
-
-    /// Process-wide capture destination-registry memory ceiling in bytes.
-    #[arg(long)]
-    capture_destination_registry_memory_ceiling_bytes: Option<usize>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Create the local data directory and an empty Coinbase journal.
-    Init,
-
-    /// Run a deterministic, authority-free mock feed for local diagnostics.
-    Mock {
-        #[arg(long, default_value = "TEST-USD")]
-        product: String,
-        #[arg(long, default_value_t = 100)]
-        events: usize,
-        /// Enable paper simulation only; it has no production order authority.
-        #[arg(long)]
-        paper_bot: bool,
-    },
-
-    /// Capture Coinbase Exchange single-venue, partial coverage for local diagnostics.
-    #[command(
-        long_about = "Capture public Coinbase Exchange single-venue, partial coverage messages for diagnostic and authority-free processing. The app-local diagnostic QualityState can never establish DataQuality::DirectVerified; diagnostic VALID is not canonical DataQuality::DirectVerified. Captured values cannot mint production live authority. The optional bot is paper simulation only, with no production order authority."
-    )]
-    Capture {
-        #[arg(long, value_delimiter = ',', default_value = "BTC-USD")]
-        products: Vec<String>,
-        /// Stop after this many seconds. Omit to run until Ctrl-C.
-        #[arg(long)]
-        seconds: Option<u64>,
-        /// Enable paper simulation only; it has no production order authority.
-        #[arg(long)]
-        paper_bot: bool,
-    },
-
-    /// Run the sealed Coinbase-to-risk-to-paper production composition.
-    #[command(
-        long_about = "Run the bounded production paper-execution service over the configured Coinbase instrument set. Coinbase remains DirectUnverified and cannot issue execution authority; the CLI installs an additional no-intent strategy. This command exercises production ownership and shutdown without permitting orders."
-    )]
-    PaperBot {
-        /// Select the explicitly configured sealed production source.
-        #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
-        provider: ProductionSourceArgument,
-        /// Stop after this many seconds. Omit to run until Ctrl-C.
-        #[arg(long)]
-        seconds: Option<u64>,
-        /// Explicit virtual starting cash in the configured common quote currency.
-        #[arg(long, default_value = "100000")]
-        initial_cash: Decimal,
-        /// Explicit maker and taker fee assumption for the local simulation.
-        #[arg(long, default_value_t = 100)]
-        fee_basis_points: u32,
-    },
-
-    /// Run the local diagnostic, authority-free MCP stdio compatibility server.
-    #[command(
-        long_about = "Run the local MCP stdio compatibility server for diagnostic and authority-free access. Online mode observes Coinbase Exchange single-venue, partial coverage; no diagnostic value can mint production live authority. The optional bot is paper simulation only, with no production order authority."
-    )]
-    Mcp {
-        #[arg(long, value_delimiter = ',', default_value = "BTC-USD")]
-        products: Vec<String>,
-        /// Do not open a network connection; expose only current empty/local state and journal tools.
-        #[arg(long)]
-        offline: bool,
-        /// Select a journal when both the current and legacy formats exist.
-        #[arg(long, value_enum, requires = "offline")]
-        journal_format: Option<JournalFormatArgument>,
-        /// Enable paper simulation only; it has no production order authority.
-        #[arg(long)]
-        paper_bot: bool,
-    },
-
-    /// Validate and summarize an immutable journal.
-    Replay {
-        #[arg(long, default_value = "coinbase-exchange")]
-        source: String,
-        /// Select a journal when both the current and legacy formats exist.
-        #[arg(long, value_enum)]
-        journal_format: Option<JournalFormatArgument>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum JournalFormatArgument {
-    Current,
-    Legacy,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ProductionSourceArgument {
-    Coinbase,
-    Kraken,
-}
-
-impl From<ProductionSourceArgument> for ProductionSourceProvider {
-    fn from(value: ProductionSourceArgument) -> Self {
-        match value {
-            ProductionSourceArgument::Coinbase => Self::Coinbase,
-            ProductionSourceArgument::Kraken => Self::Kraken,
-        }
-    }
-}
-
-impl From<JournalFormatArgument> for JournalFileFormat {
-    fn from(value: JournalFormatArgument) -> Self {
-        match value {
-            JournalFormatArgument::Current => Self::Current,
-            JournalFormatArgument::Legacy => Self::Legacy,
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     initialize_logging(&cli.log, cli.json_logs)?;
+    let output = cli.output;
     let config_file = cli.config.clone();
     let cli_overrides = ConfigOverrides {
         data_dir: cli.data_dir,
@@ -189,6 +42,7 @@ async fn main() -> Result<()> {
         capture_destination_registry_memory_ceiling_bytes: cli
             .capture_destination_registry_memory_ceiling_bytes,
         source_shutdown_ms: cli.source_shutdown_ms,
+        training_release_root: cli.training_release_root,
         ..ConfigOverrides::default()
     };
 
@@ -203,11 +57,32 @@ async fn main() -> Result<()> {
             }
             println!("initialized {}", paths.root().display());
         }
-        Command::Mock {
-            product,
-            events,
-            paper_bot,
-        } => {
+        Command::Config { command } => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            run_config_command(command, &config, output)?;
+        }
+        command @ (Command::Source { .. }
+        | Command::Ingest { .. }
+        | Command::Dataset { .. }
+        | Command::Query { .. }
+        | Command::Feature { .. }
+        | Command::Model { .. }
+        | Command::Portfolio { .. }
+        | Command::Backtest { .. }
+        | Command::Bot { .. }
+        | Command::Execution { .. }
+        | Command::FairValue { .. }) => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            run_product_command(config, command, output).await?;
+        }
+        Command::Doctor => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            run_doctor(config, output).await?;
+        }
+        Command::Mock(arguments) => {
+            let product = arguments.product;
+            let events = arguments.events;
+            let paper_bot = arguments.paper_bot;
             let config = load_config(
                 config_file.as_deref(),
                 ConfigOverrides {
@@ -221,11 +96,10 @@ async fn main() -> Result<()> {
             let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        Command::Capture {
-            products,
-            seconds,
-            paper_bot,
-        } => {
+        Command::Capture(arguments) => {
+            let products = arguments.products;
+            let seconds = arguments.seconds;
+            let paper_bot = arguments.paper_bot;
             let config = load_config(
                 config_file.as_deref(),
                 ConfigOverrides {
@@ -240,12 +114,11 @@ async fn main() -> Result<()> {
             let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        Command::PaperBot {
-            provider,
-            seconds,
-            initial_cash,
-            fee_basis_points,
-        } => {
+        Command::PaperBot(arguments) => {
+            let provider = arguments.provider;
+            let seconds = arguments.seconds;
+            let initial_cash = arguments.initial_cash;
+            let fee_basis_points = arguments.fee_basis_points;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             let composition =
                 local_paper_bot(config, provider.into(), initial_cash, fee_basis_points)?;
@@ -279,32 +152,18 @@ async fn main() -> Result<()> {
                 paper.fills().len()
             );
         }
-        Command::Mcp {
-            products,
-            offline,
-            journal_format,
-            paper_bot,
-        } => {
-            let config = load_config(
-                config_file.as_deref(),
-                ConfigOverrides {
-                    products: Some(products.clone()),
-                    paper_bot_enabled: Some(paper_bot),
-                    ..cli_overrides
-                },
-            )?;
-            if offline {
-                run_offline_mcp(config, journal_format.map(Into::into)).await?;
-            } else {
-                let source: Box<dyn MarketSource> = Box::new(CoinbaseSource::new(products));
-                let disposition = run_source(config, source, RunMode::Mcp).await?;
-                let _snapshot = finish_run_source(disposition).await?;
+        Command::Mcp { command } => {
+            if !matches!(command, None | Some(McpCommand::Serve)) {
+                anyhow::bail!("unsupported MCP operation");
             }
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            let product = LocalProduct::try_new(config)?;
+            let composition = LocalMcpComposition::try_new(product.paths(), product.application())?;
+            let _exit = composition.serve_stdio(CancellationToken::new()).await?;
         }
-        Command::Replay {
-            source,
-            journal_format,
-        } => {
+        Command::Replay(arguments) => {
+            let source = arguments.source;
+            let journal_format = arguments.journal_format;
             if source != "coinbase-exchange" {
                 anyhow::bail!("decoded replay currently supports source=coinbase-exchange");
             }
@@ -360,6 +219,120 @@ fn load_config(
     ))?)
 }
 
+fn run_config_command(
+    command: ConfigCommand,
+    config: &AppConfig,
+    output: OutputFormat,
+) -> Result<()> {
+    let value = serde_json::json!({
+        "data_root_configured": !config.data_dir().as_os_str().is_empty(),
+        "products": config.products(),
+        "stale_after_ms": config.stale_after().as_millis(),
+        "capture_queue_capacity": config.capture_queue_capacity().get(),
+        "capture_memory_ceiling_bytes": config.capture_memory_ceiling_bytes().get(),
+        "capture_destination_registry_memory_ceiling_bytes": config
+            .capture_destination_registry_memory_ceiling_bytes()
+            .get(),
+        "paper_bot_enabled": config.paper_bot_enabled(),
+        "capture_flush_interval_ms": config.capture_flush_interval().as_millis(),
+        "capture_shutdown_ms": config.capture_shutdown().as_millis(),
+        "source_shutdown_ms": config.source_shutdown().as_millis(),
+        "training_release_configured": config.training_release_root().is_some(),
+        "source_secret_configured": config.source_secret().is_some(),
+        "coinbase_configured": config.coinbase().is_some(),
+        "kraken_configured": config.kraken().is_some(),
+    });
+    match command {
+        ConfigCommand::Show => emit_result(output, "effective configuration", &value),
+        ConfigCommand::Validate => {
+            let validated = serde_json::json!({
+                "valid": true,
+                "effective": value,
+            });
+            emit_result(output, "configuration is valid", &validated)
+        }
+    }
+}
+
+async fn run_product_command(
+    config: AppConfig,
+    command: Command,
+    output: OutputFormat,
+) -> Result<()> {
+    let product = LocalProduct::try_new(config)?;
+    let application = product.application();
+    let result = execute_cli_command(&product, command).await;
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
+    let shutdown = application.shutdown(deadline).await;
+    let result = result.map_err(anyhow::Error::from)?;
+    if !shutdown.is_complete() {
+        anyhow::bail!("local application shutdown was incomplete: {shutdown:?}");
+    }
+    emit_result(output, result.summary(), result.value())
+}
+
+async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {
+    let storage_exists = config
+        .data_dir()
+        .try_exists()
+        .context("failed to inspect the configured local storage root")?;
+    let product = LocalProduct::try_new(config.clone());
+    let (application_composed, shutdown_complete, composition_error) = match product {
+        Ok(product) => {
+            let application = product.application();
+            let deadline = std::time::Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
+            let report = application.shutdown(deadline).await;
+            (true, report.is_complete(), None)
+        }
+        Err(error) => (false, false, Some(error.to_string())),
+    };
+    let value = serde_json::json!({
+        "status": "blocked",
+        "local_storage": {
+            "configured": !config.data_dir().as_os_str().is_empty(),
+            "exists": storage_exists,
+        },
+        "tracing": {
+            "local_only": true,
+            "remote_exporter": false,
+        },
+        "providers": {
+            "coinbase_configured": config.coinbase().is_some(),
+            "kraken_configured": config.kraken().is_some(),
+        },
+        "application": {
+            "composed": application_composed,
+            "shutdown_complete": shutdown_complete,
+            "error": composition_error,
+        },
+        "release_blockers": [
+            "typed activation requests for SEC, BLS, Treasury, and permitted FRED/ALFRED research adapters",
+            "governed backtest input registration through CLI and MCP",
+            "automatic research feature/example materialization over persisted point-in-time observations",
+            "producer-issued fair-value input publication and account-specific market-access assessment",
+            "complete MCP coverage for dataset, model-admission, portfolio-import, and fair-value producer workflows",
+            "Python financial analytics and model-training release interface",
+            "release security, fuzz, benchmark, documentation, and full-workspace verification evidence",
+        ],
+    });
+    emit_result(output, "release readiness is blocked", &value)
+}
+
+fn emit_result(output: OutputFormat, human_summary: &str, value: &serde_json::Value) -> Result<()> {
+    match output {
+        OutputFormat::Human => {
+            println!("{human_summary}");
+            println!("{}", serde_json::to_string_pretty(value)?);
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string(value)?),
+    }
+    Ok(())
+}
+
 fn capture_identity(source: &str) -> Result<(CaptureAuthorityIdentity, uuid::Uuid)> {
     let source_id = SourceId::try_from(source)?;
     let revision = MetadataRevision::new(SourceIdentifier::try_from("app-stage1-v1")?);
@@ -401,7 +374,6 @@ enum RunMode {
     UntilSourceStops,
     UntilInterrupted,
     ForDuration(u64),
-    Mcp,
 }
 
 #[derive(Debug)]
@@ -464,7 +436,7 @@ async fn run_source(
     let paths = AppPaths::prepare(config.data_dir())?;
     let source_name = match mode {
         RunMode::UntilSourceStops => "mock",
-        RunMode::UntilInterrupted | RunMode::ForDuration(_) | RunMode::Mcp => "coinbase-exchange",
+        RunMode::UntilInterrupted | RunMode::ForDuration(_) => "coinbase-exchange",
     };
     let (capture_identity, connection_id) = capture_identity(source_name)?;
     let process =
@@ -551,41 +523,6 @@ async fn run_source(
                 signal = tokio::signal::ctrl_c() => {
                     if let Err(error) = signal {
                         primary_error = Some(anyhow!(error).context("failed to listen for Ctrl-C"));
-                    }
-                }
-            }
-        }
-        RunMode::Mcp => {
-            let mcp = LocalMcpComposition::try_new(
-                &paths,
-                Arc::clone(&diagnostic_engine),
-                source_name,
-                None,
-            )?;
-            let mcp_cancellation = CancellationToken::new();
-            let mut mcp_task = tokio::spawn(mcp.serve_stdio(mcp_cancellation.child_token()));
-            let mut mcp_outcome = None;
-            tokio::select! {
-                result = source_task.wait() => source_outcome = Some(result),
-                result = &mut mcp_task => mcp_outcome = Some(result),
-                signal = tokio::signal::ctrl_c() => {
-                    if let Err(error) = signal {
-                        primary_error = Some(anyhow!(error).context("failed to listen for Ctrl-C"));
-                    }
-                }
-            }
-            mcp_cancellation.cancel();
-            if mcp_outcome.is_none() {
-                mcp_outcome = Some(mcp_task.await);
-            }
-            if let Some(result) = mcp_outcome {
-                match result {
-                    Ok(Ok(_exit)) => {}
-                    Ok(Err(error)) => {
-                        primary_error = Some(anyhow!(error).context("MCP stdio server failed"));
-                    }
-                    Err(error) => {
-                        primary_error = Some(anyhow!(error).context("MCP task join failed"));
                     }
                 }
             }
@@ -696,25 +633,6 @@ async fn shutdown_source_then_event(
             event_join_failed,
         },
     }
-}
-
-async fn run_offline_mcp(
-    config: AppConfig,
-    journal_format: Option<JournalFileFormat>,
-) -> Result<()> {
-    let paths = AppPaths::prepare(config.data_dir())?;
-    let diagnostic_engine = Arc::new(RwLock::new(DiagnosticEngine::new(
-        duration_millis_i64(config.stale_after())?,
-        config.paper_bot_enabled(),
-    )));
-    let composition = LocalMcpComposition::try_new(
-        &paths,
-        diagnostic_engine,
-        "coinbase-exchange",
-        journal_format,
-    )?;
-    let _exit = composition.serve_stdio(CancellationToken::new()).await?;
-    Ok(())
 }
 
 #[cfg(test)]

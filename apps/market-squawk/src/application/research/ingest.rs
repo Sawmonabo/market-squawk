@@ -317,6 +317,33 @@ impl ProductionResearchIngestCoordinator {
         Ok(())
     }
 
+    /// Extracts one exact object from an already registered profile without analytical
+    /// publication.
+    ///
+    /// The same registry-minted source authority, bounded discovery, exact object selection,
+    /// extraction limits, revision validation, rights-expiry check, cancellation, and deadline
+    /// handling used by [`ResearchIngestCoordinator::ingest`] are applied before the batch is
+    /// returned. This boundary does not write a research dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed service error when the profile or object is absent, authority or rights are
+    /// invalid, results are ambiguous, a source violates its contract, or cancellation, shutdown,
+    /// or the deadline wins.
+    pub async fn extract_registered_batch(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        object_id: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<ExtractionBatch, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation = self.lifecycle.shutdown_token().child_token();
+        self.extract_exact(profile, dataset, object_id, context, &operation)
+            .await
+            .map(|extracted| extracted.batch)
+    }
+
     fn prepare(&self, profile: &SourceIdentifier) -> Result<PreparedExtraction, ServiceError> {
         let authority = self
             .authority
@@ -338,6 +365,69 @@ impl ProductionResearchIngestCoordinator {
             metadata: registered.metadata.clone(),
             rights: registered.rights.clone(),
             authority: extraction,
+        })
+    }
+
+    async fn extract_exact(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        object_id: &SourceIdentifier,
+        context: &RequestContext,
+        operation: &CancellationToken,
+    ) -> Result<AuthorizedExtraction, ServiceError> {
+        let prepared = self.prepare(profile)?;
+        let deadline = wall_deadline(context, self.limits.duration)?;
+        let discovery_request = DiscoveryRequest::try_new(
+            dataset.clone(),
+            None,
+            self.limits.discovery_objects,
+            deadline,
+        )
+        .map_err(|_error| ServiceError::InvalidRequest)?;
+        let discovery = await_extraction(
+            prepared.source.discover(
+                prepared.authority.clone(),
+                discovery_request,
+                operation.clone(),
+            ),
+            context,
+            operation,
+        )
+        .await?;
+        let mut matches = discovery
+            .objects()
+            .iter()
+            .filter(|object| object.object_id() == object_id);
+        let object = matches.next().cloned().ok_or(ServiceError::NotFound)?;
+        if matches.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+
+        let extraction_request =
+            ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
+                .map_err(|_error| ServiceError::InvalidRequest)?;
+        let batch = await_extraction(
+            prepared
+                .source
+                .extract(prepared.authority, extraction_request, operation.clone()),
+            context,
+            operation,
+        )
+        .await?;
+        let revisions = prepared
+            .source
+            .revision_plan(&batch)
+            .map_err(|_error| ServiceError::InvalidResult)?;
+        let payload_digest = extraction_batch_digest(&batch).map_err(map_ingest_error)?;
+        let retrieved_at = system_timestamp()?;
+        let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
+        Ok(AuthorizedExtraction {
+            metadata: prepared.metadata,
+            batch,
+            revisions,
+            payload_digest,
+            rights,
         })
     }
 
@@ -382,6 +472,14 @@ struct PreparedExtraction {
     authority: market_squawk_sources::ExtractionAuthority,
 }
 
+struct AuthorizedExtraction {
+    metadata: SourceMetadata,
+    batch: ExtractionBatch,
+    revisions: Option<ExtractionRevisionPlan>,
+    payload_digest: EvidenceDigest,
+    rights: RightsDecisionInput,
+}
+
 #[async_trait]
 impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
     async fn ingest(
@@ -394,68 +492,25 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         let profile = required_identifier(request, "provider")?;
         let dataset = required_identifier(request, "dataset")?;
         let object_id = required_identifier(request, "object")?;
-        let prepared = self.prepare(&profile)?;
-        let deadline = wall_deadline(context, self.limits.duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
-
-        let discovery_request = DiscoveryRequest::try_new(
-            dataset.clone(),
-            None,
-            self.limits.discovery_objects,
-            deadline,
-        )
-        .map_err(|_error| ServiceError::InvalidRequest)?;
-        let discovery = await_extraction(
-            prepared.source.discover(
-                prepared.authority.clone(),
-                discovery_request,
-                operation.clone(),
-            ),
-            context,
-            &operation,
-        )
-        .await?;
-        let mut matches = discovery
-            .objects()
-            .iter()
-            .filter(|object| object.object_id() == &object_id);
-        let object = matches.next().cloned().ok_or(ServiceError::NotFound)?;
-        if matches.next().is_some() {
-            return Err(ServiceError::InvalidResult);
-        }
-
-        let extraction_request =
-            ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
-                .map_err(|_error| ServiceError::InvalidRequest)?;
-        let batch = await_extraction(
-            prepared
-                .source
-                .extract(prepared.authority, extraction_request, operation.clone()),
-            context,
-            &operation,
-        )
-        .await?;
-        let revisions = prepared
-            .source
-            .revision_plan(&batch)
-            .map_err(|_error| ServiceError::InvalidResult)?;
-        let payload_digest = extraction_batch_digest(&batch).map_err(map_ingest_error)?;
-        let retrieved_at = system_timestamp()?;
-        let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
-        let idempotency_key = ingest_identity(&profile, &dataset, &object_id, payload_digest);
-        let ingest = match revisions {
+        let extracted = self
+            .extract_exact(&profile, &dataset, &object_id, context, &operation)
+            .await?;
+        let idempotency_key =
+            ingest_identity(&profile, &dataset, &object_id, extracted.payload_digest);
+        let ingest = match extracted.revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
-                prepared.metadata.clone(),
-                rights,
+                extracted.metadata.clone(),
+                extracted.rights,
                 idempotency_key,
-                batch,
+                extracted.batch,
                 revisions,
             ),
             None => ResearchIngestRequest::locally_observed(
-                prepared.metadata.clone(),
-                rights,
+                extracted.metadata.clone(),
+                extracted.rights,
                 idempotency_key,
-                batch,
+                extracted.batch,
             ),
         }
         .map_err(map_research_error)?;
@@ -468,17 +523,17 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         let manifest = committed.manifest();
         let plan = committed.pinned().plan();
         let coverage = json!({
-            "sourceId": prepared.metadata.source_id(),
-            "provider": prepared.metadata.provider(),
+            "sourceId": extracted.metadata.source_id(),
+            "provider": extracted.metadata.provider(),
             "profile": profile,
             "providerDataset": dataset,
             "objectId": object_id,
-            "metadataRevision": prepared.metadata.revision(),
-            "payloadDigest": encode_hex(payload_digest.bytes()),
+            "metadataRevision": extracted.metadata.revision(),
+            "payloadDigest": encode_hex(extracted.payload_digest.bytes()),
             "manifest": manifest_value(manifest),
         });
         let quality = json!({
-            "qualityCeiling": prepared.metadata.quality_ceiling(),
+            "qualityCeiling": extracted.metadata.quality_ceiling(),
             "recordLevelProvenance": true,
             "executionEligible": false,
         });
