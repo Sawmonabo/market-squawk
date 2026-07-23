@@ -299,32 +299,20 @@ cargo build --workspace --all-features --release --locked
 
 All local data defaults to `.market-squawk/`. Override it with `--data-dir` or `MARKET_SQUAWK_DATA_DIR`.
 
-## Hardened diagnostic MCP surface
+## Local MCP server
 
-This is the hardened five-tool diagnostic stdio MCP surface, not the complete typed MCP product.
-It is the application's sole MCP server path and enforces typed schemas, bounded requests and
-results, cancellation and deadlines, durable local audit, controlled artifacts, and bounded worker
-lifecycle. Audit, artifact, capture, and configured-journal authority share one prepared local path
-capability graph; journal tools accept no caller-supplied filesystem path. Source, Research,
-Fundamental, Macro, Portfolio, Analysis, Model, FairValue, Bot, and Execution coverage remains
-release-blocking.
-
-Offline mode is useful for verifying protocol integration without opening a market-data connection:
-
-**Diagnostic only — offline five-tool MCP:**
+Market Squawk ships one typed local stdio MCP server over the same application services used by the
+CLI. It enforces bounded schemas and results, cancellation and deadlines, durable local audit,
+controlled artifacts, and bounded worker lifecycle. Starting the server prepares local product
+state; provider access occurs only through the corresponding configured application operation.
 
 ```bash
-market-squawk mcp --offline
+market-squawk mcp serve
 ```
 
-Diagnostic live-display mode starts the Coinbase Exchange compatibility reader and the sole hardened
-MCP composition in the same process. It does not create `DirectVerified` authority:
-
-**Diagnostic only — single-venue partial-coverage display plus five-tool MCP:**
-
-```bash
-market-squawk mcp --products BTC-USD,ETH-USD
-```
+For compatibility, `market-squawk mcp` starts the same production server. The former diagnostic
+`--offline`, `--products`, `--paper-bot`, and `Journal.GetSummary` MCP surface has been retired;
+immutable capture journals remain available through the local `replay` command.
 
 Generic MCP client configuration:
 
@@ -337,8 +325,7 @@ Generic MCP client configuration:
         "--data-dir",
         "/absolute/path/to/market-data",
         "mcp",
-        "--products",
-        "BTC-USD,ETH-USD"
+        "serve"
       ]
     }
   }
@@ -350,17 +337,13 @@ access inherits the operating-system identity of the process that launches it. T
 schema-validated, rate-limited, deadline- and cancellation-aware, result-bounded, and durably
 audited before accepted mutations are reported complete.
 
-### MCP tools
+### MCP tool domains
 
-| Tool | Access | Purpose |
-|---|---|---|
-| `Market.GetSnapshot` | Read | Authority-free diagnostic snapshot from Coinbase Exchange single-venue partial coverage |
-| `Market.GetQuality` | Read | App-local diagnostic `QualityState`, not canonical `DataQuality` |
-| `Bot.GetStatus` | Read | Diagnostic paper-only account, fills, positions, and calculation state |
-| `Journal.GetSummary` | Read | Validate and summarize the configured journal |
-| `Risk.TriggerKillSwitch` | Restricted mutation | Irreversibly stop paper order approval for the current process |
-
-The MCP server does not accept arbitrary paths, SQL, shell commands, remote code, or unchecked order requests.
+The shipping capability registry exposes typed tools in the `Source`, `Market`, `Research`,
+`Fundamental`, `Macro`, `Portfolio`, `Analysis`, `Model`, `FairValue`, `Bot`, `Execution`, and `Risk`
+domains. The exact server list is generated from the application capability registry so CLI and MCP
+operations share the same service and authority boundaries. Read-only DataFusion SQL remains a local
+CLI operation.
 
 ## Independent data planes
 

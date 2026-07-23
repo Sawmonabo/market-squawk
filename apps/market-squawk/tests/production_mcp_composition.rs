@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, ffi::OsString, sync::Arc};
+use std::{collections::BTreeMap, ffi::OsString};
 
-use market_squawk::{AppPaths, DiagnosticEngine, mcp::LocalMcpComposition};
+use market_squawk::{
+    LocalProduct, application::application_capabilities, mcp::LocalMcpComposition,
+};
 use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
-use parking_lot::RwLock;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -22,13 +23,8 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
             ..ConfigOverrides::default()
         },
     ))?;
-    let paths = AppPaths::prepare(config.data_dir())?;
-    let composition = LocalMcpComposition::try_new(
-        &paths,
-        Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
-        "coinbase-exchange",
-        None,
-    )?;
+    let product = LocalProduct::try_new(config)?;
+    let composition = LocalMcpComposition::try_new(product.paths(), product.application())?;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server);
     let cancellation = CancellationToken::new();
@@ -68,39 +64,52 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         .iter()
         .map(|tool| tool["name"].as_str().ok_or("tool is missing its name"))
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(
-        names,
-        [
-            "Bot.GetStatus",
-            "Journal.GetSummary",
-            "Market.GetQuality",
-            "Market.GetSnapshot",
-            "Risk.TriggerKillSwitch",
-        ]
-    );
+    let expected_capabilities = application_capabilities()?;
+    let expected_names = expected_capabilities
+        .tools()
+        .iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected_names);
     write_message(
         &mut client_writer,
         json!({
             "jsonrpc":"2.0","id":"shipping-read","method":"tools/call",
-            "params":{"name":"Bot.GetStatus","arguments":{}}
+            "params":{"name":"Bot.GetStatus","arguments":{
+                "resultLimits":{"maximumItems":16,"maximumBytes":65536}
+            }}
         }),
     )
     .await?;
     let status = read_message(&mut client_reader).await?;
-    assert_eq!(status["result"]["structuredContent"]["mode"], "paper_only");
+    assert_eq!(
+        status["result"]["structuredContent"]["data"]["state"], "stopped",
+        "unexpected status response: {status}"
+    );
     write_message(
         &mut client_writer,
         json!({
             "jsonrpc":"2.0","id":"shipping-mutation","method":"tools/call",
             "params":{
                 "name":"Risk.TriggerKillSwitch",
-                "arguments":{"confirm":true,"reason":"production composition test"}
+                "arguments":{
+                    "confirm":true,
+                    "reason":"production composition test",
+                    "resultLimits":{"maximumItems":16,"maximumBytes":65536}
+                }
             }
         }),
     )
     .await?;
     let mutation = read_message(&mut client_reader).await?;
-    assert_eq!(mutation["result"]["structuredContent"]["triggered"], true);
+    assert_eq!(
+        mutation["result"]["structuredContent"]["data"]["state"],
+        "stopped"
+    );
+    assert_eq!(
+        mutation["result"]["structuredContent"]["data"]["shutdownComplete"],
+        true
+    );
     client_writer.shutdown().await?;
     let _exit = task.await??;
 

@@ -1,8 +1,7 @@
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
 };
 
 use anyhow::{Context, Result, bail};
@@ -148,99 +147,5 @@ fn replay_rejects_ambiguous_formats_until_the_user_chooses_one() -> Result<()> {
     assert_success(&selected)?;
     let replay: Value = serde_json::from_slice(&selected.stdout)?;
     assert_eq!(replay["summary"]["records"], 1);
-    Ok(())
-}
-
-fn offline_mcp(data_dir: &Path, journal_format: Option<&str>) -> Result<Output> {
-    let mut command = command(data_dir);
-    command.args(["mcp", "--offline"]);
-    if let Some(format) = journal_format {
-        command.args(["--journal-format", format]);
-    }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdin = child.stdin.take().context("MCP stdin was not piped")?;
-    stdin.write_all(
-        br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"market-squawk-tests","version":"1"}}}
-{"jsonrpc":"2.0","method":"notifications/initialized"}
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"Journal.GetSummary","arguments":{}}}
-"#,
-    )?;
-    drop(stdin);
-    Ok(child.wait_with_output()?)
-}
-
-fn mcp_response(output: &Output, id: u64) -> Result<Value> {
-    String::from_utf8(output.stdout.clone())?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .find(|response| response["id"].as_u64() == Some(id))
-        .context("MCP response was missing")
-}
-
-#[test]
-fn offline_mcp_reads_the_sole_legacy_journal_without_creating_current_data() -> Result<()> {
-    let directory = tempdir()?;
-    legacy_fixture(directory.path())?;
-
-    let output = offline_mcp(directory.path(), None)?;
-
-    assert_success(&output)?;
-    let response = mcp_response(&output, 1)?;
-    assert_eq!(response["result"]["structuredContent"]["records"], 1);
-    assert!(
-        !directory
-            .path()
-            .join("journal")
-            .join(format!("{SOURCE}.msj"))
-            .exists()
-    );
-    Ok(())
-}
-
-#[test]
-fn offline_mcp_creates_only_controlled_state_when_no_journal_exists() -> Result<()> {
-    let directory = tempdir()?;
-    let data_dir = directory.path().join("not-created");
-
-    let output = offline_mcp(&data_dir, None)?;
-
-    assert_success(&output)?;
-    let response = mcp_response(&output, 1)?;
-    assert_eq!(response["result"]["structuredContent"]["records"], 0);
-    assert!(data_dir.join("control").join("mcp-audit.jsonl").is_file());
-    assert!(data_dir.join("artifacts").join("mcp").join("v1").is_dir());
-    assert!(
-        !data_dir
-            .join("journal")
-            .join(format!("{SOURCE}.msj"))
-            .exists()
-    );
-    assert!(
-        !data_dir
-            .join("journal")
-            .join(format!("{SOURCE}.mej"))
-            .exists()
-    );
-    Ok(())
-}
-
-#[test]
-fn offline_mcp_rejects_ambiguous_formats_before_serving_requests() -> Result<()> {
-    let directory = tempdir()?;
-    legacy_fixture(directory.path())?;
-    current_fixture(directory.path())?;
-
-    let output = offline_mcp(directory.path(), None)?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ambiguous"), "stderr={stderr}");
-    assert!(stderr.contains("--journal-format"), "stderr={stderr}");
     Ok(())
 }
