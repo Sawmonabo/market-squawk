@@ -1,9 +1,12 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use market_squawk_platform::{
-    EncryptedFileSecretStore, LocalSecretStoreError, SecretKey, SecretStore, SecretValue,
+    EncryptedFileSecretStore, LocalSecretStoreError, SecretBackend, SecretCancellation,
+    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
+    SecretValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -21,6 +24,98 @@ const HEADER_BYTES: usize = ENVELOPE_DIGEST_OFFSET + DIGEST_BYTES;
 const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"market-squawk-authority-envelope-v3\0";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[test]
+fn managed_secret_lifecycle_is_generation_exact_and_fail_closed() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = EncryptedFileSecretStore::try_open(
+        directory.path().join("managed-secrets"),
+        SecretValue::new("managed unlock phrase".to_owned())?,
+    )?;
+    let key = SecretKey::try_new("provider", "account-read")?;
+    let active = SecretOperationControl::try_new(
+        "provider-onboarding",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let generation_one = SecretGeneration::new(1)?;
+    let reference_one = store.create(
+        &key,
+        generation_one,
+        SecretValue::new("credential-generation-one".to_owned())?,
+        &active,
+    )?;
+
+    assert_eq!(reference_one.backend(), SecretBackend::EncryptedFile);
+    assert_eq!(reference_one.generation(), generation_one);
+    assert_eq!(
+        store.read(&reference_one, &active)?.expose_secret(),
+        "credential-generation-one"
+    );
+    assert!(matches!(
+        store.create(
+            &key,
+            generation_one,
+            SecretValue::new("must-not-overwrite".to_owned())?,
+            &active,
+        ),
+        Err(LocalSecretStoreError::Conflict)
+    ));
+
+    let reference_two = store.replace(
+        &key,
+        &reference_one,
+        SecretGeneration::new(2)?,
+        SecretValue::new("credential-generation-two".to_owned())?,
+        &active,
+    )?;
+    assert_eq!(
+        store.read(&reference_one, &active)?.expose_secret(),
+        "credential-generation-one"
+    );
+    assert_eq!(
+        store.read(&reference_two, &active)?.expose_secret(),
+        "credential-generation-two"
+    );
+    store.delete(&reference_one, &active)?;
+    assert!(matches!(
+        store.read(&reference_one, &active),
+        Err(LocalSecretStoreError::NotFound)
+    ));
+
+    let cancelled = SecretCancellation::new();
+    cancelled.cancel();
+    let cancelled_control = SecretOperationControl::try_new(
+        "provider-onboarding",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        cancelled,
+    )?;
+    assert!(matches!(
+        store.delete(&reference_two, &cancelled_control),
+        Err(LocalSecretStoreError::OperationCancelled)
+    ));
+    assert_eq!(
+        store.read(&reference_two, &active)?.expose_secret(),
+        "credential-generation-two"
+    );
+
+    let expired = SecretOperationControl::try_new(
+        "provider-onboarding",
+        Instant::now() - Duration::from_millis(1),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    assert!(matches!(
+        store.read(&reference_two, &expired),
+        Err(LocalSecretStoreError::DeadlineExceeded)
+    ));
+    Ok(())
+}
 
 #[test]
 fn encrypted_store_confines_authenticates_redacts_and_rotates_secrets() -> TestResult {

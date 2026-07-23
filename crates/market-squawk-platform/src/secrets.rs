@@ -3,6 +3,7 @@
 mod crypto;
 mod encrypted;
 mod keyring;
+mod managed;
 
 use std::fmt;
 
@@ -14,6 +15,11 @@ use crate::{LocalAuthorityStateStoreError, SecretValue};
 
 pub use self::encrypted::EncryptedFileSecretStore;
 pub use self::keyring::OsKeyringSecretStore;
+pub use self::managed::{
+    SecretBackend, SecretCancellation, SecretDeadlineCapability, SecretGeneration,
+    SecretInteractionCapability, SecretInteractionPolicy, SecretOperationControl, SecretRef,
+    SecretStoreCapabilities,
+};
 
 const MAX_SCOPE_BYTES: usize = 64;
 const MAX_NAME_BYTES: usize = 128;
@@ -45,6 +51,27 @@ impl SecretKey {
         hasher.update(self.name.as_bytes());
         encode_hex(&hasher.finalize())
     }
+
+    fn generation_token(
+        &self,
+        backend: SecretBackend,
+        generation: SecretGeneration,
+    ) -> Result<String, LocalSecretStoreError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"market-squawk-secret-reference-v1\0");
+        hasher.update([match backend {
+            SecretBackend::EncryptedFile => 1,
+            SecretBackend::AppleKeychain => 2,
+            SecretBackend::WindowsCredentialManager => 3,
+            SecretBackend::SecretService => 4,
+        }]);
+        hasher.update((self.scope.len() as u64).to_be_bytes());
+        hasher.update(self.scope.as_bytes());
+        hasher.update((self.name.len() as u64).to_be_bytes());
+        hasher.update(self.name.as_bytes());
+        hasher.update(generation.get().to_be_bytes());
+        encode_hex(&hasher.finalize())
+    }
 }
 
 impl fmt::Debug for SecretKey {
@@ -55,6 +82,45 @@ impl fmt::Debug for SecretKey {
 
 /// Replaceable storage contract for local credential material.
 pub trait SecretStore: fmt::Debug + Send + Sync {
+    /// Probes non-secret backend capabilities without storing credential material.
+    fn probe(
+        &self,
+        control: &SecretOperationControl,
+    ) -> Result<SecretStoreCapabilities, LocalSecretStoreError>;
+
+    /// Creates one exact generation and rejects an existing locator.
+    fn create(
+        &self,
+        key: &SecretKey,
+        generation: SecretGeneration,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretRef, LocalSecretStoreError>;
+
+    /// Reads one exact opaque generation.
+    fn read(
+        &self,
+        reference: &SecretRef,
+        control: &SecretOperationControl,
+    ) -> Result<SecretValue, LocalSecretStoreError>;
+
+    /// Stores a higher candidate generation while retaining the current generation.
+    fn replace(
+        &self,
+        key: &SecretKey,
+        current: &SecretRef,
+        candidate_generation: SecretGeneration,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretRef, LocalSecretStoreError>;
+
+    /// Deletes only the exact opaque generation.
+    fn delete(
+        &self,
+        reference: &SecretRef,
+        control: &SecretOperationControl,
+    ) -> Result<(), LocalSecretStoreError>;
+
     /// Stores or rotates one secret without retaining the submitted value.
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), LocalSecretStoreError>;
 
@@ -84,12 +150,51 @@ pub enum LocalSecretStoreError {
     /// Secret namespace or name is invalid.
     #[error("secret key is invalid")]
     InvalidKey,
+    /// A credential generation was zero.
+    #[error("secret generation is invalid")]
+    InvalidGeneration,
+    /// An opaque secret reference failed exact validation.
+    #[error("secret reference is invalid")]
+    InvalidReference,
+    /// Operation ownership, deadline, or retry policy was invalid.
+    #[error("secret operation control is invalid")]
+    InvalidOperationControl,
     /// Submitted or decrypted secret material violates the in-memory bound.
     #[error("secret value is invalid")]
     InvalidSecret,
     /// OS credential storage is unavailable or rejected the operation.
     #[error("operating-system secret provider is unavailable")]
     ProviderUnavailable,
+    /// The selected secure-store session or service is not available.
+    #[error("operating-system secret session is unavailable")]
+    SessionUnavailable,
+    /// The store is locked or requires unavailable user interaction.
+    #[error("secret store is locked")]
+    Locked,
+    /// The operation requires a platform prompt forbidden by caller policy.
+    #[error("secret operation requires user interaction")]
+    InteractionRequired,
+    /// The platform reported that the user cancelled its prompt.
+    #[error("secret operation was cancelled by the user")]
+    UserCancelled,
+    /// Cooperative cancellation was observed before a side effect.
+    #[error("secret operation was cancelled")]
+    OperationCancelled,
+    /// The monotonic deadline elapsed before a side effect.
+    #[error("secret operation deadline elapsed")]
+    DeadlineExceeded,
+    /// A mutating operation may have completed and requires exact reconciliation.
+    #[error("secret operation completion is indeterminate")]
+    IndeterminateCompletion,
+    /// The requested operation is not supported by this exact backend.
+    #[error("secret operation is unsupported")]
+    UnsupportedOperation,
+    /// The exact generation already exists or resolves ambiguously.
+    #[error("secret generation conflicts with retained state")]
+    Conflict,
+    /// A durable mutation completed but bounded cleanup remains.
+    #[error("secret operation cleanup is required")]
+    CleanupRequired,
     /// No value exists for the requested secret identity.
     #[error("secret was not found")]
     NotFound,

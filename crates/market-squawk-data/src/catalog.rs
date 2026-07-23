@@ -6,6 +6,7 @@ mod evidence;
 mod fair_value;
 mod migration_preflight;
 mod observed_revisions;
+mod onboarding;
 mod publication;
 mod query_artifacts;
 mod records;
@@ -28,6 +29,10 @@ pub use self::fair_value::{
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogRecord,
     FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
     FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
+};
+pub use self::onboarding::{
+    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
+    ResumedProviderOnboarding,
 };
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,

@@ -64,5 +64,7 @@ pub use paths::{
 pub use raw_record::{RawCaptureRecord, RawCaptureRecordError};
 pub use secrets::{
     EncryptedFileSecretStore, LocalSecretStoreError, OsKeyringSecretStore, RotationAuthority,
-    RotationOutcome, SecretKey, SecretStore,
+    RotationOutcome, SecretBackend, SecretCancellation, SecretDeadlineCapability, SecretGeneration,
+    SecretInteractionCapability, SecretInteractionPolicy, SecretKey, SecretOperationControl,
+    SecretRef, SecretStore, SecretStoreCapabilities,
 };

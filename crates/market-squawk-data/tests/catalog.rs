@@ -4,7 +4,8 @@ use std::time::Duration;
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
     CatalogLimit, CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestIdentity,
-    IngestRunState, RightsBasis, RightsDecisionInput, RightsError, SourceCursor, SourceOperation,
+    IngestRunState, OnboardingAppendOutcome, OnboardingReservationRequest, RightsBasis,
+    RightsDecisionInput, RightsError, SourceCursor, SourceOperation,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, ContractRollMapping, CoverageDelay, DataQuality,
@@ -14,10 +15,15 @@ use market_squawk_domain::{
     SymbolIdentityRecord, Timestamp, VenueId, VenueSymbol,
 };
 use market_squawk_platform::LocalPaths;
+use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, CoverageDomain, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    AuthorityBindings, AuthoritySet, AuthorityVerification, AuthorityVerificationInput,
+    AuthorizationGrant, AuthorizationMode, CapabilityRegistrationOutcome, CoverageDomain,
+    CredentialKind, EvidenceBinding, FreshnessPolicy, HistoricalCapability, HumanBoundary,
+    LifecycleSupport, NetworkAccessPolicy, OnboardingEvent, OnboardingState, ProviderCapability,
+    ProviderCapabilityInput, ProviderCapabilityRevision, RatePolicyDescriptor,
+    RightsAdmissionState, SetupMode, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -55,7 +61,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 11);
+    assert_eq!(health.applied_migrations(), 12);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -74,7 +80,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 11);
+    assert_eq!(catalog.health()?.applied_migrations(), 12);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;
@@ -418,6 +424,143 @@ fn catalog_rejects_tampered_migration_identity() -> TestResult {
         Err(CatalogError::MigrationDigestMismatch { version: 1 })
     ));
     Ok(())
+}
+
+#[test]
+fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("onboarding"))?;
+    let config = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(250),
+        CatalogLimit::new(16)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let capability = onboarding_capability()?;
+    let requested = AuthoritySet::try_new(vec![SourceIdentifier::try_from("account.read")?])?;
+    let catalog = CatalogAuthority::open(config.clone())?;
+    assert_eq!(
+        catalog.register_provider_capability(&capability)?,
+        CapabilityRegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        catalog.register_provider_capability(&capability)?,
+        CapabilityRegistrationOutcome::Replay
+    );
+    let request = OnboardingReservationRequest::try_new(
+        &capability,
+        requested.clone(),
+        SourceIdentifier::try_from("local-user")?,
+        SourceIdentifier::try_from("portal-session")?,
+        Timestamp::from_unix_nanos(i64::MAX),
+        1,
+    )?;
+    let reservation = catalog.reserve_provider_onboarding(&request)?;
+    assert_eq!(
+        reservation.initial_state(),
+        OnboardingState::UserActionRequired
+    );
+
+    let generation = SecretGeneration::new(1)?;
+    let reference: SecretRef = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "backend": "encrypted_file",
+        "locator": "a".repeat(64),
+        "generation": generation.get(),
+    }))?;
+    let events = [
+        OnboardingEvent::CredentialStored {
+            reference: reference.clone(),
+        },
+        OnboardingEvent::AuthorityVerified {
+            verification: Box::new(AuthorityVerification::try_new(
+                &capability,
+                AuthorityVerificationInput {
+                    requested: requested.clone(),
+                    observed: requested,
+                    restrictions_digest: digest(70),
+                    bindings: AuthorityBindings::new(None, None, None, Some(digest(71))),
+                    verified_at: Timestamp::from_unix_nanos(10),
+                    expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                    verifier_revision: SourceIdentifier::try_from("provider-key-info-v1")?,
+                    assurance_limitation: SourceIdentifier::try_from(
+                        "provider-reported-authority",
+                    )?,
+                    evidence_digest: digest(72),
+                },
+            )?),
+        },
+        OnboardingEvent::RightsAdmitted {
+            generation: Some(generation),
+            decision_digest: digest(73),
+        },
+        OnboardingEvent::RatePolicyAdmitted {
+            generation: Some(generation),
+            policy_digest: capability.rate_policy().evidence_digest(),
+        },
+        OnboardingEvent::RuntimeVerified {
+            generation: Some(generation),
+            evidence_digest: digest(74),
+        },
+        OnboardingEvent::Activate {
+            generation: Some(generation),
+        },
+    ];
+    for (offset, event) in events.into_iter().enumerate() {
+        let sequence = u64::try_from(offset)?
+            .checked_add(1)
+            .ok_or(CatalogError::InvalidRecord)?;
+        assert_eq!(
+            catalog.append_provider_onboarding_event(&reservation, sequence, event.clone())?,
+            OnboardingAppendOutcome::Inserted
+        );
+        assert_eq!(
+            catalog.append_provider_onboarding_event(&reservation, sequence, event)?,
+            OnboardingAppendOutcome::Replay
+        );
+    }
+    drop(catalog);
+
+    let reopened = CatalogAuthority::open(config)?;
+    let resumed = reopened.resume_provider_onboarding(reservation.session_id())?;
+    assert_eq!(resumed.lifecycle().state(), OnboardingState::ActiveScoped);
+    assert!(resumed.lifecycle().generation_is_active_scoped(generation));
+    assert_eq!(
+        resumed.lifecycle().generation_reference(generation),
+        Some(&reference)
+    );
+    assert_eq!(resumed.next_sequence(), 7);
+    Ok(())
+}
+
+fn onboarding_capability() -> TestResult<ProviderCapability> {
+    Ok(ProviderCapability::try_new(ProviderCapabilityInput {
+        surface_id: SourceIdentifier::try_from("provider.private-account")?,
+        revision: ProviderCapabilityRevision::new(1)?,
+        setup_mode: SetupMode::ManualApiKeyImport,
+        official_entry_uri: "https://provider.example.test/settings/api".to_owned(),
+        human_boundary: HumanBoundary::ProviderControlled,
+        credential_kind: CredentialKind::ApiKey,
+        minimum_authority: AuthoritySet::try_new(vec![SourceIdentifier::try_from(
+            "account.read",
+        )?])?,
+        maximum_authority: AuthoritySet::try_new(vec![SourceIdentifier::try_from(
+            "account.read",
+        )?])?,
+        verifier_revision: SourceIdentifier::try_from("provider-key-info-v1")?,
+        rate_policy: RatePolicyDescriptor::try_new(
+            SourceIdentifier::try_from("provider/private/rest/key-info/v1")?,
+            digest(75),
+            true,
+        )?,
+        rights_state: RightsAdmissionState::Pending,
+        lifecycle_support: LifecycleSupport::new(true, false, true),
+        evidence: vec![EvidenceBinding::new(
+            SourceIdentifier::try_from("DOC-TEST-001")?,
+            digest(76),
+        )],
+        refresh_trigger: SourceIdentifier::try_from("provider-private")?,
+    })?)
 }
 
 fn digest(byte: u8) -> EvidenceDigest {

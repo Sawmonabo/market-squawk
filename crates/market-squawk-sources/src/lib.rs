@@ -13,6 +13,7 @@ mod extraction;
 mod health;
 mod live;
 mod metadata;
+mod onboarding;
 mod policy;
 mod registry;
 mod tls;
@@ -86,6 +87,15 @@ pub use metadata::{
     NetworkAccessPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
     SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
     SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
+};
+pub use onboarding::{
+    AuthorityBindings, AuthoritySet, AuthorityVerification, AuthorityVerificationInput,
+    CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, EvidenceBinding,
+    HumanBoundary, LifecycleSupport, LocalDeletionOutcome, OnboardingEvent, OnboardingEventKind,
+    OnboardingLifecycle, OnboardingState, OnboardingStateError, ProviderCapability,
+    ProviderCapabilityError, ProviderCapabilityInput, ProviderCapabilityRegistry,
+    ProviderCapabilityRevision, RatePolicyDescriptor, RemoteRevocationOutcome,
+    RightsAdmissionState, RuntimeCapabilityObservation, RuntimeProviderCapability, SetupMode,
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,

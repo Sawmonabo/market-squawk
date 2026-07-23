@@ -87,6 +87,17 @@ impl EncryptedSet {
         Ok(())
     }
 
+    pub(super) fn contains(&self, token: &str) -> bool {
+        self.entries.contains_key(token)
+    }
+
+    pub(super) fn remove(&mut self, token: &str) -> Result<(), LocalSecretStoreError> {
+        self.entries
+            .remove(token)
+            .map(drop)
+            .ok_or(LocalSecretStoreError::NotFound)
+    }
+
     pub(super) fn decrypt(
         &self,
         token: &str,

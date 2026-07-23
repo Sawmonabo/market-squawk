@@ -13,7 +13,7 @@ use market_squawk_domain::{
     SchemaVersion, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp,
 };
 use market_squawk_platform::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
-use market_squawk_sources::SourceMetadataError;
+use market_squawk_sources::{OnboardingStateError, ProviderCapabilityError, SourceMetadataError};
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -794,6 +794,30 @@ pub enum CatalogError {
     /// A durable record violated a bounded invariant.
     #[error("catalog record is invalid")]
     InvalidRecord,
+    /// A code-owned provider capability failed validation.
+    #[error("catalog provider capability is invalid: {0}")]
+    ProviderCapability(#[from] ProviderCapabilityError),
+    /// A provider onboarding event failed pure state validation.
+    #[error("catalog provider onboarding transition is invalid: {0}")]
+    OnboardingState(#[from] OnboardingStateError),
+    /// An immutable provider capability position retained different evidence.
+    #[error("catalog provider capability revision conflicts")]
+    ProviderCapabilityConflict,
+    /// The exact provider capability was not registered before onboarding.
+    #[error("catalog provider capability is not registered")]
+    ProviderCapabilityNotRegistered,
+    /// The onboarding receipt was not sealed by this catalog writer session.
+    #[error("catalog provider onboarding reservation is not valid for this session")]
+    InvalidOnboardingReservationCapability,
+    /// The requested provider onboarding session does not exist.
+    #[error("catalog provider onboarding session was not found")]
+    OnboardingSessionNotFound,
+    /// An event skipped or conflicted with the append-only onboarding sequence.
+    #[error("catalog provider onboarding event sequence conflicts")]
+    OnboardingSequenceConflict,
+    /// The fixed onboarding deadline elapsed before this transition.
+    #[error("catalog provider onboarding deadline elapsed")]
+    OnboardingDeadlineExceeded,
     /// The catalog path or final file type was unsafe.
     #[error("catalog path is not a safe local regular file")]
     UnsafePath,

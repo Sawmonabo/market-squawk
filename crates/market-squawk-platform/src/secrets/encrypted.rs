@@ -13,8 +13,9 @@ use super::crypto::{
     decrypt_entries, validate_matching_keys,
 };
 use super::{
-    LocalSecretStoreError, RotationAuthority, RotationOutcome, SecretKey, SecretStore,
-    map_state_error,
+    LocalSecretStoreError, RotationAuthority, RotationOutcome, SecretBackend, SecretGeneration,
+    SecretInteractionCapability, SecretKey, SecretOperationControl, SecretRef, SecretStore,
+    SecretStoreCapabilities, map_state_error,
 };
 use crate::{AuthorityCommitContext, LocalAuthorityStateStore, SecretValue};
 
@@ -275,6 +276,146 @@ impl fmt::Debug for EncryptedFileSecretStore {
 }
 
 impl SecretStore for EncryptedFileSecretStore {
+    fn probe(
+        &self,
+        control: &SecretOperationControl,
+    ) -> Result<SecretStoreCapabilities, LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        drop(unlocks);
+        control.read_postflight()?;
+        Ok(capabilities)
+    }
+
+    fn create(
+        &self,
+        key: &SecretKey,
+        generation: SecretGeneration,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretRef, LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        let reference = SecretRef::from_key(key, capabilities.backend(), generation)?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        let mut active = match self.load_vault()? {
+            None => EncryptedSet::empty(&unlocks.current)?,
+            Some(loaded) => loaded.into_authenticated_stable(&unlocks.current)?,
+        };
+        if active.contains(reference.locator()) {
+            return Err(LocalSecretStoreError::Conflict);
+        }
+        if active.entries.len() == MAX_ENTRIES {
+            return Err(LocalSecretStoreError::CapacityExceeded);
+        }
+        active.insert(reference.locator().to_owned(), &value, &unlocks.current)?;
+        self.publish_stable(active, &unlocks.current)?;
+        drop(unlocks);
+        control.mutation_postflight()?;
+        Ok(reference)
+    }
+
+    fn read(
+        &self,
+        reference: &SecretRef,
+        control: &SecretOperationControl,
+    ) -> Result<SecretValue, LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        require_backend(reference, capabilities.backend())?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        let loaded = self.load_vault()?.ok_or(LocalSecretStoreError::NotFound)?;
+        let active = loaded.into_authenticated_stable(&unlocks.current)?;
+        let value = active.decrypt(reference.locator(), &unlocks.current)?;
+        drop(unlocks);
+        control.read_postflight()?;
+        Ok(value)
+    }
+
+    fn replace(
+        &self,
+        key: &SecretKey,
+        current: &SecretRef,
+        candidate_generation: SecretGeneration,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretRef, LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        require_backend(current, capabilities.backend())?;
+        if candidate_generation <= current.generation()
+            || SecretRef::from_key(key, capabilities.backend(), current.generation())? != *current
+        {
+            return Err(LocalSecretStoreError::Conflict);
+        }
+        let candidate = SecretRef::from_key(key, capabilities.backend(), candidate_generation)?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        let loaded = self.load_vault()?.ok_or(LocalSecretStoreError::NotFound)?;
+        let mut active = loaded.into_authenticated_stable(&unlocks.current)?;
+        if !active.contains(current.locator()) {
+            return Err(LocalSecretStoreError::NotFound);
+        }
+        if active.contains(candidate.locator()) {
+            return Err(LocalSecretStoreError::Conflict);
+        }
+        if active.entries.len() == MAX_ENTRIES {
+            return Err(LocalSecretStoreError::CapacityExceeded);
+        }
+        active.insert(candidate.locator().to_owned(), &value, &unlocks.current)?;
+        self.publish_stable(active, &unlocks.current)?;
+        drop(unlocks);
+        control.mutation_postflight()?;
+        Ok(candidate)
+    }
+
+    fn delete(
+        &self,
+        reference: &SecretRef,
+        control: &SecretOperationControl,
+    ) -> Result<(), LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        require_backend(reference, capabilities.backend())?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        let loaded = self.load_vault()?.ok_or(LocalSecretStoreError::NotFound)?;
+        let mut active = loaded.into_authenticated_stable(&unlocks.current)?;
+        active.remove(reference.locator())?;
+        self.publish_stable(active, &unlocks.current)?;
+        drop(unlocks);
+        control.mutation_postflight()
+    }
+
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), LocalSecretStoreError> {
         let token = key.token()?;
         let unlocks = self
@@ -334,6 +475,24 @@ impl SecretStore for EncryptedFileSecretStore {
                 }
             }
         }
+    }
+}
+
+const fn encrypted_capabilities() -> SecretStoreCapabilities {
+    SecretStoreCapabilities::new(
+        SecretBackend::EncryptedFile,
+        SecretInteractionCapability::Never,
+    )
+}
+
+fn require_backend(
+    reference: &SecretRef,
+    expected: SecretBackend,
+) -> Result<(), LocalSecretStoreError> {
+    if reference.backend() == expected {
+        Ok(())
+    } else {
+        Err(LocalSecretStoreError::InvalidReference)
     }
 }
 
