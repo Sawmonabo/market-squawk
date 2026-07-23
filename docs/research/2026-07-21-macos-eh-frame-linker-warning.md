@@ -2,11 +2,14 @@
 
 **As of:** 2026-07-21
 
+**Last measured update:** 2026-07-22
+
 ## Decision
 
-Treat the warning as a narrowly scoped limitation of three oversized macOS test executables. Do
+Treat the warning as a narrowly scoped limitation of measured oversized macOS test executables. Do
 not change release linking, do not disable compact unwind, and do not suppress linker diagnostics
-workspace-wide. If approved, allow `linker_messages` only at the three affected test crate roots,
+workspace-wide. Allow `linker_messages` only at an affected test crate root after measuring its
+executable and `__eh_frame`,
 with a comment linking the open Rust issue. Remove those allowances when Rust or Apple's linker
 provides a safe upstream resolution.
 
@@ -20,7 +23,12 @@ The clean gate ran on macOS 26.5.1 arm64 with Apple `ld` 1267 and Rust 1.97.1 / 
 | `ingest_vertical` | 328,274,176 bytes | 20.11 MiB |
 | `market_squawk_data` lib test | 323,676,176 bytes | 19.94 MiB |
 | `publication_recovery` | 322,018,376 bytes | 19.68 MiB |
+| `control_plane` | 354,986,784 bytes | 21.96 MiB |
 | Release `market-squawk` | 8,804,400 bytes | 42,024 bytes |
+
+The `control_plane` measurement was added after its existing consolidated harness gained the real
+research-dataset-to-backtest authority vertical. Its measured `__eh_frame` is 23,027,100 bytes;
+the allowance remains scoped to that test crate root.
 
 The LLVM arm64 Mach-O definition assigns only the low 24 bits of a compact-unwind entry to the
 DWARF FDE offset and defines the mask as `0x00FF_FFFF`, or 16 MiB minus one byte. Each affected
@@ -45,16 +53,17 @@ the underlying large test-binary condition was already possible.
 - Changing optimization or dependency topology solely to silence this diagnostic would alter the
   entire test build and require a separate performance and semantic evaluation.
 
-## Proposed bounded change
+## Bounded classification
 
-Add `#![allow(linker_messages)]` only to:
+Add `#![allow(linker_messages)]` only to the currently measured affected roots:
 
 1. the `publication_recovery` integration-test root;
 2. the `ingest_vertical` integration-test root; and
-3. the `market-squawk-data` library only under `cfg(test)`.
+3. the `market-squawk-data` library only under `cfg(test)`; and
+4. the consolidated application `control_plane` integration-test root.
 
 This does not change generated code, unwind behavior, product behavior, or test coverage. It
-classifies three measured diagnostics while every other linker message remains visible.
+classifies four measured diagnostics while every other linker message remains visible.
 
 ## Sources
 

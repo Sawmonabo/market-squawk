@@ -166,7 +166,7 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Consolidated existing integration tests from 115 separately linked executables to 41 without
   adding behavioral tests or removing the inventoried assertions, ignored network tests, Loom
   models, or Trybuild privacy checks.
-- Scoped Rust 1.97's macOS compact-unwind linker diagnostic only at the three affected large test
+- Scoped Rust 1.97's macOS compact-unwind linker diagnostic only at the four measured affected test
   crates. The production binary and workspace-wide diagnostics remain unsuppressed; unsafe linker
   workarounds were not introduced.
 - Corrected the stdio MCP smoke client's required initialization handshake and published bounded,
