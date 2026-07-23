@@ -280,6 +280,47 @@ pub struct ProductionModelRuntime {
 }
 
 impl ProductionModelRuntime {
+    /// Reports whether the fixed durable runtime index contains any admitted generation.
+    ///
+    /// The complete canonical index is decoded under the supplied production limits. This lets
+    /// application composition distinguish a genuinely fresh model namespace from an existing
+    /// runtime that must not be hidden when its verified training-environment capability is
+    /// unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed local-path, persistence, index-validation, or resource error.
+    pub fn has_durable_admissions(
+        paths: &LocalPaths,
+        limits: ProductionModelRuntimeLimits,
+    ) -> Result<bool, ProductionModelRuntimeError> {
+        let (_store, index) = open_runtime_index(paths, limits)?;
+        Ok(!index.entries().is_empty())
+    }
+
+    /// Constructs the truthful empty model inventory used only for a fresh local namespace.
+    ///
+    /// Callers must first establish with [`Self::has_durable_admissions`] that no durable model
+    /// generation exists. Inference over this snapshot returns not-found through the normal model
+    /// domain service; it never represents an unavailable admitted generation as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error if the code-owned production limits cannot construct an empty
+    /// bounded registry.
+    pub fn empty_snapshot(
+        limits: ProductionModelRuntimeLimits,
+    ) -> Result<ModelRuntimeSnapshot, ProductionModelRuntimeError> {
+        let registry = Arc::new(ModelRegistry::try_new(
+            limits.index.maximum_generations(),
+            limits.registry_retained_bytes,
+        )?);
+        Ok(ModelRuntimeSnapshot {
+            registry,
+            backends: Vec::new(),
+        })
+    }
+
     /// Opens the fixed model-control namespace and reconstructs every durable runtime generation.
     ///
     /// An empty index is a valid admission owner but [`Self::snapshot`] refuses to represent it as
@@ -296,16 +337,7 @@ impl ProductionModelRuntime {
         onnx_worker: Option<OnnxWorkerProgram>,
         limits: ProductionModelRuntimeLimits,
     ) -> Result<Self, ProductionModelRuntimeError> {
-        let control = paths.control_root()?;
-        control.try_clone_directory()?;
-        let store = LocalAuthorityStateStore::try_open(
-            control.root().join(MODEL_RUNTIME_AUTHORITY_DIRECTORY),
-        )?;
-        control.try_clone_directory()?;
-        let index = store.load()?.map_or_else(
-            || Ok(ModelRuntimeIndex::empty()),
-            |bytes| ModelRuntimeIndex::decode(&bytes, limits.index),
-        )?;
+        let (store, index) = open_runtime_index(paths, limits)?;
         let feature_registry = ProductionFeatureRegistry::try_new()?;
         let runtime = build_runtime(
             paths,
@@ -427,6 +459,22 @@ impl ProductionModelRuntime {
             backends,
         })
     }
+}
+
+fn open_runtime_index(
+    paths: &LocalPaths,
+    limits: ProductionModelRuntimeLimits,
+) -> Result<(LocalAuthorityStateStore, ModelRuntimeIndex), ProductionModelRuntimeError> {
+    let control = paths.control_root()?;
+    control.try_clone_directory()?;
+    let store =
+        LocalAuthorityStateStore::try_open(control.root().join(MODEL_RUNTIME_AUTHORITY_DIRECTORY))?;
+    control.try_clone_directory()?;
+    let index = store.load()?.map_or_else(
+        || Ok(ModelRuntimeIndex::empty()),
+        |bytes| ModelRuntimeIndex::decode(&bytes, limits.index),
+    )?;
+    Ok((store, index))
 }
 
 impl fmt::Debug for ProductionModelRuntime {
