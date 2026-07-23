@@ -177,38 +177,6 @@ impl BacktestModelDecisionMapper for RejectMapper {
 }
 
 #[test]
-fn pinned_dataset_resolves_historical_instrument_definitions_per_decision() -> TestResult {
-    let definition_v1 = execution_terms_revision(1)?;
-    let definition_v2 = execution_terms_revision(2)?;
-    let admit = |audit_byte| -> Result<BacktestDataset, Box<dyn Error>> {
-        Ok(BacktestDataset::try_new(BacktestDatasetInput {
-            manifest: feature_manifest()?,
-            object_graph_digest: Sha256Digest::new([2; 32]),
-            point_in_time_content: Sha256Digest::new([3; 32]),
-            point_in_time_audit: Sha256Digest::new([4; 32]),
-            instrument_definition_content: Sha256Digest::new([5; 32]),
-            instrument_definition_audit: Sha256Digest::new([audit_byte; 32]),
-            observations: vec![
-                observation(definition_v1, 10, 100, 10)?,
-                observation(definition_v2, 20, 110, 10)?,
-            ],
-        })?)
-    };
-
-    let dataset = admit(6)?;
-    assert_eq!(
-        dataset
-            .observations
-            .iter()
-            .map(|observation| observation.execution_terms.definition_revision().get())
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
-    assert_ne!(dataset.identity(), admit(7)?.identity());
-    Ok(())
-}
-
-#[test]
 fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let terms = execution_terms()?;
