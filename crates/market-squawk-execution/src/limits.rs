@@ -86,6 +86,9 @@ impl fmt::Display for AccountRiskViolation {
 /// Maximum configured eligible-instrument universe retained by one risk policy.
 pub const MAX_RISK_INSTRUMENTS: usize = 4_096;
 
+/// Canonical upper bound shared by paper configuration, fee calculation, and central risk.
+pub const MAX_PAPER_FEE_BASIS_POINTS: u64 = 10_000;
+
 /// Complete untrusted input for constructing [`RiskLimits`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskLimitsInput {
@@ -179,7 +182,9 @@ impl RiskLimits {
                 return Err(RiskLimitsError::NegativeBasisPoints);
             }
         }
-        if input.maximum_fee.get() > 10_000
+        let maximum_fee = u64::try_from(input.maximum_fee.get())
+            .map_err(|_| RiskLimitsError::NegativeBasisPoints)?;
+        if maximum_fee > MAX_PAPER_FEE_BASIS_POINTS
             || input.maximum_price_deviation.get() > 10_000
             || input.maximum_slippage.get() > 10_000
             || input.maximum_leverage.get() > 1_000_000

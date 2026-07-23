@@ -166,6 +166,28 @@ impl ExecutionMarketReference {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_strategy_test(
+        execution_terms: InstrumentExecutionTerms,
+        observed_at: Timestamp,
+        bids: &[BookLevel],
+        asks: &[BookLevel],
+    ) -> Self {
+        let (bids, bid_count) = copy_levels(bids);
+        let (asks, ask_count) = copy_levels(asks);
+        Self {
+            execution_terms,
+            observed_at,
+            source_timestamp: Some(observed_at),
+            quality: DataQuality::DirectVerified,
+            bids,
+            asks,
+            bid_count,
+            ask_count,
+            depth_complete: true,
+        }
+    }
+
     /// Returns the immutable, revision-bound execution terms.
     pub const fn execution_terms(self) -> InstrumentExecutionTerms {
         self.execution_terms
