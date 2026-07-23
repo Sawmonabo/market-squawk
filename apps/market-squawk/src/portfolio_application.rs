@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use market_squawk_domain::AccountId;
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
+use market_squawk_portfolio::PortfolioRevision;
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, TypedToolRequest, TypedToolResult,
 };
@@ -185,6 +187,67 @@ impl PortfolioApplicationService {
                 idle: Notify::new(),
             }),
         })
+    }
+
+    /// Returns read-only access to genuine immutable portfolio revisions.
+    ///
+    /// The capability cannot import, publish, revoke, or reconstruct a revision.
+    pub fn fair_value_reader(&self) -> PortfolioFairValueReadCapability {
+        PortfolioFairValueReadCapability {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+}
+
+/// Cloneable least-authority exporter for genuine portfolio revisions.
+#[derive(Clone)]
+pub struct PortfolioFairValueReadCapability {
+    runtime: Arc<Runtime>,
+}
+
+impl PortfolioFairValueReadCapability {
+    /// Clones the exact current immutable revision for one account.
+    ///
+    /// The clone retains the producer-issued revision token and complete evidence. Missing
+    /// accounts, cancellation, deadlines, and service shutdown fail closed.
+    pub fn current_revision(
+        &self,
+        account_id: AccountId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PortfolioRevision, PortfolioApplicationServiceError> {
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if !self.runtime.accepting.load(Ordering::Acquire) {
+            return Err(PortfolioApplicationServiceError::Authority);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        let image = self.runtime.image.load();
+        let revision = image
+            .revisions
+            .current_revisions()
+            .find(|revision| revision.account_id() == account_id)
+            .cloned()
+            .ok_or(PortfolioApplicationServiceError::NotFound)?;
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        Ok(revision)
+    }
+}
+
+impl fmt::Debug for PortfolioFairValueReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PortfolioFairValueReadCapability")
+            .field("revision_source", &"[IMMUTABLE PORTFOLIO READ IMAGE]")
+            .finish()
     }
 }
 

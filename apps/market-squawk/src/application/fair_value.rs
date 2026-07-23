@@ -25,8 +25,16 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, ensure_request_live},
 };
 
+mod resolver;
 mod serialization;
 
+pub use resolver::{
+    AnalyticsFairValueInputPublisher, FairValueInputAuthorityError,
+    FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits, FairValueReceiptReference,
+    FairValueReceiptRegistration, LiveFairValueInputPublisher, PortfolioFairValueInputPublisher,
+    ProductionFairValueInputAuthority, ProductionFairValueInputResolver,
+    ResearchFairValueInputPublisher,
+};
 use serialization::{
     approval_value, classification_value, evidence_value, explanation_reason_value,
     measurement_value, predicate_result_value, timestamp_value,

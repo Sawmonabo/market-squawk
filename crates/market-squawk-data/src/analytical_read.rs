@@ -13,8 +13,8 @@ use crate::manifest::CatalogGenerationPage;
 use crate::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DatasetSchemaRegistry, GenerationKind, GenerationParent, ManifestCatalogError,
-    ParquetObjectStore, PinnedDataset, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
-    ResearchQueryEngine, Sha256Digest,
+    ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue, PinnedMonetaryValue,
+    PinnedQueryOutput, QueryError, QueryLimits, QueryRequest, ResearchQueryEngine, Sha256Digest,
 };
 
 const MAX_READ_ITEMS: usize = 64;
@@ -450,6 +450,104 @@ impl AnalyticalReadCapability {
             result = execution.as_mut() => result?,
         };
         Ok(AnalyticalObservationOutput { source_id, output })
+    }
+
+    /// Reads one producer-issued monetary observation from an exact immutable generation.
+    ///
+    /// The only selector is a bounded canonical row offset. Caller SQL, physical paths, catalog
+    /// mutation, and caller-supplied monetary values are absent from this capability.
+    pub async fn research_monetary_value(
+        &self,
+        manifest: &DatasetManifestRef,
+        row: usize,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedMonetaryValue, AnalyticalReadError> {
+        let (pinned, _) = self
+            .manifests
+            .read_exact(manifest, deadline, &cancellation)?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let objects = Arc::clone(&self.objects);
+        let execution = async move {
+            let engine = ResearchQueryEngine::from_pinned_dataset(
+                pinned,
+                OBSERVATION_TABLE,
+                objects,
+                execution_cancellation.clone(),
+            )
+            .await?;
+            engine
+                .canonical_research_monetary_value(row, limits, execution_cancellation)
+                .await
+        };
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                Err(AnalyticalReadError::Query(QueryError::Cancelled))
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded))
+            }
+            result = execution.as_mut() => result.map_err(Into::into),
+        }
+    }
+
+    /// Reads one producer-issued monetary feature from an exact immutable generation.
+    ///
+    /// The feature identity, point-in-time coordinate, lineage, value, and currency all come from
+    /// the registered canonical feature row.
+    pub async fn feature_monetary_value(
+        &self,
+        manifest: &DatasetManifestRef,
+        row: usize,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedFeatureMonetaryValue, AnalyticalReadError> {
+        let (pinned, _) = self
+            .manifests
+            .read_exact(manifest, deadline, &cancellation)?;
+        let operation_cancellation = cancellation.child_token();
+        let execution_cancellation = operation_cancellation.clone();
+        let objects = Arc::clone(&self.objects);
+        let execution = async move {
+            let engine = ResearchQueryEngine::from_pinned_dataset(
+                pinned,
+                OBSERVATION_TABLE,
+                objects,
+                execution_cancellation.clone(),
+            )
+            .await?;
+            engine
+                .canonical_feature_monetary_value(row, limits, execution_cancellation)
+                .await
+        };
+        tokio::pin!(execution);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                Err(AnalyticalReadError::Query(QueryError::Cancelled))
+            }
+            _ = deadline_wait.as_mut() => {
+                operation_cancellation.cancel();
+                let _ignored = execution.as_mut().await;
+                Err(AnalyticalReadError::Query(QueryError::DeadlineExceeded))
+            }
+            result = execution.as_mut() => result.map_err(Into::into),
+        }
     }
 }
 

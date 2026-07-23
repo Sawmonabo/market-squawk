@@ -122,6 +122,21 @@ impl QualifiedMarketObservationLease {
     pub const fn observation(&self) -> &CommittedQualifiedMarketObservation {
         &self.observation
     }
+
+    /// Returns the conservative retained-byte charge transferred with this observation.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self._retained_budget.num_permits()
+    }
+
+    /// Transfers the genuine committed observation out of the export-channel byte lease.
+    ///
+    /// The channel reservation is released when this method consumes the lease. The receiving
+    /// bounded authority must establish its own byte reservation before retaining the observation.
+    #[must_use]
+    pub fn into_observation(self) -> CommittedQualifiedMarketObservation {
+        self.observation
+    }
 }
 
 /// Sole consumer for one route's bounded post-decision exports.

@@ -1,5 +1,6 @@
 //! Producer receipt for one exact canonical point-in-time feature value.
 
+use std::mem::size_of;
 use std::num::NonZeroU32;
 
 use arrow::array::{
@@ -126,6 +127,20 @@ impl PinnedFeatureMonetaryValue {
             currency,
             lineage_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, lineage),
         })
+    }
+
+    /// Returns a checked conservative retained-byte charge for this owned receipt.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        size_of::<Self>()
+            .checked_add(self.manifest.dataset_id().as_str().len())?
+            .checked_add(self.manifest.schema().name().len())?
+            .checked_add(self.example_id.retained_bytes())?
+            .checked_add(self.component_name.capacity())?
+            .checked_add(
+                self.unit
+                    .as_ref()
+                    .map_or(0, SourceIdentifier::retained_bytes),
+            )
     }
 
     /// Returns the exact queried generation.

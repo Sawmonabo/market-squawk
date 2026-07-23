@@ -1,5 +1,7 @@
 //! Non-forgeable receipts for exact manifest-pinned query results.
 
+use std::mem::size_of;
+
 use arrow::array::{
     Array as _, BinaryArray, Decimal128Array, StringArray, TimestampNanosecondArray, UInt8Array,
     UInt32Array,
@@ -256,6 +258,20 @@ pub struct PinnedMonetaryValue {
 }
 
 impl PinnedMonetaryValue {
+    /// Returns a checked conservative retained-byte charge for this owned receipt.
+    ///
+    /// The charge includes the inline value and every receipt-owned string allocation. Shared
+    /// immutable catalog/object-store state is deliberately excluded because this receipt does
+    /// not own it.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        size_of::<Self>()
+            .checked_add(self.manifest.dataset_id().as_str().len())?
+            .checked_add(self.manifest.schema().name().len())?
+            .checked_add(self.source_id.retained_bytes())?
+            .checked_add(self.venue_id.as_ref().map_or(0, VenueId::retained_bytes))?
+            .checked_add(self.source_identifier.retained_bytes())
+    }
+
     /// Returns the exact queried dataset generation.
     pub const fn manifest(&self) -> &DatasetManifestRef {
         &self.manifest

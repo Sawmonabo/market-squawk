@@ -28,8 +28,13 @@ pub mod source;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
 pub use fair_value::{
-    FairValueDomainService, FairValueInputResolutionError, FairValueInputResolutionRequest,
-    FairValueInputResolver, FairValueProducerKind,
+    AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
+    FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
+    FairValueInputResolutionError, FairValueInputResolutionRequest, FairValueInputResolver,
+    FairValueProducerKind, FairValueReceiptReference, FairValueReceiptRegistration,
+    LiveFairValueInputPublisher, PortfolioFairValueInputPublisher,
+    ProductionFairValueInputAuthority, ProductionFairValueInputResolver,
+    ResearchFairValueInputPublisher,
 };
 pub use paper::PaperApplicationServices;
 pub use research::{

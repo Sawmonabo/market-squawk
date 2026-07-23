@@ -61,7 +61,7 @@ pub use paper_bot::{
 };
 pub use portfolio_application::{
     PortfolioApplicationLimitInput, PortfolioApplicationLimits, PortfolioApplicationService,
-    PortfolioApplicationServiceError,
+    PortfolioApplicationServiceError, PortfolioFairValueReadCapability,
 };
 pub use provider_onboarding::{
     OnboardingNextAction, OnboardingSessionView, ProviderOnboardingError, ProviderOnboardingPortal,

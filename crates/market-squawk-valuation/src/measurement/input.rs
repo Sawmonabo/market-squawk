@@ -258,6 +258,18 @@ impl ValuationInput {
         })
     }
 
+    /// Derives one identical-instrument input from an exact registered point-in-time feature.
+    ///
+    /// The registry must resolve the exact feature version as point-in-time compatible and
+    /// monetary. Modeled quality remains independent of fair-value hierarchy classification.
+    pub fn from_analytics(
+        value: &PinnedFeatureMonetaryValue,
+        registry: &FeatureRegistry,
+        significance: InputSignificance,
+    ) -> Result<Self, FairValueError> {
+        Self::try_from_spec(Self::analytics_spec(value, registry, significance)?)
+    }
+
     /// Derives one input from an actual immutable portfolio revision and selected real position.
     ///
     /// The instrument argument is only a bounded selector; the input identity, quantity, amount,

@@ -176,7 +176,10 @@ impl ProductionFeatureRegistry {
         Ok(Self { registry })
     }
 
-    fn registry(&self) -> &FeatureRegistry {
+    /// Returns immutable access to the exact code-owned feature registry.
+    ///
+    /// This grants neither metadata registration nor model admission authority.
+    pub const fn feature_registry(&self) -> &FeatureRegistry {
         &self.registry
     }
 }
@@ -246,7 +249,12 @@ pub fn verify_model_candidate(
         &selection,
         Some(training_environment),
     )?;
-    let bundle = ModelBundle::load(root, metadata, &expectations, feature_registry.registry())?;
+    let bundle = ModelBundle::load(
+        root,
+        metadata,
+        &expectations,
+        feature_registry.feature_registry(),
+    )?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
@@ -277,7 +285,12 @@ pub fn recover_model_candidate(
 ) -> Result<ValidatedModelCandidate, ModelAdmissionError> {
     let selection = dataset.verify(dataset_root, dataset_limits, deadline, cancellation)?;
     let (authority, expectations) = authority(authority_bytes, authority_sha256, &selection, None)?;
-    let bundle = ModelBundle::load(root, metadata, &expectations, feature_registry.registry())?;
+    let bundle = ModelBundle::load(
+        root,
+        metadata,
+        &expectations,
+        feature_registry.feature_registry(),
+    )?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
