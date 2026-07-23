@@ -3348,6 +3348,7 @@ name = "market-squawk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "bytes",
  "cap-fs-ext",
@@ -3362,6 +3363,7 @@ dependencies = [
  "market-squawk-adapter-coinbase",
  "market-squawk-adapter-kraken",
  "market-squawk-adapter-paper",
+ "market-squawk-adapter-portfolio",
  "market-squawk-analytics",
  "market-squawk-backtesting",
  "market-squawk-data",

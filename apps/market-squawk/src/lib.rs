@@ -15,6 +15,7 @@ mod live_source;
 pub mod mcp;
 pub mod order_book;
 pub mod paper_bot;
+pub mod portfolio_application;
 pub mod quality;
 pub mod replay;
 pub mod research_service;
@@ -55,5 +56,9 @@ pub use paper_bot::{
     ProductionPaperBotRollback, ProductionPaperBotRoute, ProductionPaperBotRuntime,
     ProductionPaperBotShutdown, ProductionPaperBotStartError, ProductionPaperCheckpointError,
     ProductionPaperCheckpointEvidence,
+};
+pub use portfolio_application::{
+    PortfolioApplicationLimitInput, PortfolioApplicationLimits, PortfolioApplicationService,
+    PortfolioApplicationServiceError,
 };
 pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};
