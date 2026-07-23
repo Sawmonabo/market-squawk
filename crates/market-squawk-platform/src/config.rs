@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -41,6 +41,282 @@ const MAX_SOURCE_SHUTDOWN_MS: u64 = 60_000;
 const MAX_SECRET_REFERENCE_BYTES: usize = 512;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Configuration layer that supplied one effective setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOrigin {
+    /// Built-in safe default.
+    SafeDefault,
+    /// Explicit local configuration file.
+    LocalFile,
+    /// Supplied `MARKET_SQUAWK_*` environment.
+    Environment,
+    /// Highest-precedence CLI override.
+    Cli,
+}
+
+/// Stable effective-configuration setting identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ConfigSetting {
+    /// Local data directory.
+    DataDirectory,
+    /// Configured provider products.
+    Products,
+    /// Market-price staleness threshold.
+    StaleAfter,
+    /// Capture queue capacity.
+    CaptureQueueCapacity,
+    /// Per-channel capture memory ceiling.
+    CaptureMemoryCeiling,
+    /// Process capture-destination registry memory ceiling.
+    CaptureDestinationRegistryMemoryCeiling,
+    /// Paper-bot enablement.
+    PaperBotEnabled,
+    /// Capture flush interval.
+    CaptureFlushInterval,
+    /// Capture shutdown deadline.
+    CaptureShutdown,
+    /// Source shutdown deadline.
+    SourceShutdown,
+    /// Redacted source-secret reference.
+    SourceSecret,
+    /// Coinbase production profile.
+    Coinbase,
+    /// Kraken production profile.
+    Kraken,
+}
+
+impl ConfigSetting {
+    const ALL: [Self; 13] = [
+        Self::DataDirectory,
+        Self::Products,
+        Self::StaleAfter,
+        Self::CaptureQueueCapacity,
+        Self::CaptureMemoryCeiling,
+        Self::CaptureDestinationRegistryMemoryCeiling,
+        Self::PaperBotEnabled,
+        Self::CaptureFlushInterval,
+        Self::CaptureShutdown,
+        Self::SourceShutdown,
+        Self::SourceSecret,
+        Self::Coinbase,
+        Self::Kraken,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Exact origin of every effective configuration value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigProvenance {
+    origins: [ConfigOrigin; ConfigSetting::ALL.len()],
+}
+
+impl Default for ConfigProvenance {
+    fn default() -> Self {
+        Self {
+            origins: [ConfigOrigin::SafeDefault; ConfigSetting::ALL.len()],
+        }
+    }
+}
+
+impl ConfigProvenance {
+    /// Returns the layer that supplied one effective setting.
+    #[must_use]
+    pub const fn origin(&self, setting: ConfigSetting) -> ConfigOrigin {
+        self.origins[setting.index()]
+    }
+
+    /// Iterates every setting and its effective origin in stable order.
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (ConfigSetting, ConfigOrigin)> + '_ {
+        ConfigSetting::ALL
+            .into_iter()
+            .map(|setting| (setting, self.origin(setting)))
+    }
+
+    fn mark(&mut self, setting: ConfigSetting, origin: ConfigOrigin) {
+        self.origins[setting.index()] = origin;
+    }
+
+    fn apply_file(&mut self, file: &FileConfig) {
+        self.mark_if(
+            file.data_dir.is_some(),
+            ConfigSetting::DataDirectory,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.products.is_some(),
+            ConfigSetting::Products,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.stale_after_ms.is_some(),
+            ConfigSetting::StaleAfter,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.capture_queue_capacity.is_some(),
+            ConfigSetting::CaptureQueueCapacity,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.capture_memory_ceiling_bytes.is_some(),
+            ConfigSetting::CaptureMemoryCeiling,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.capture_destination_registry_memory_ceiling_bytes
+                .is_some(),
+            ConfigSetting::CaptureDestinationRegistryMemoryCeiling,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.paper_bot_enabled.is_some(),
+            ConfigSetting::PaperBotEnabled,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.capture_flush_interval_ms.is_some(),
+            ConfigSetting::CaptureFlushInterval,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.capture_shutdown_ms.is_some(),
+            ConfigSetting::CaptureShutdown,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.source_shutdown_ms.is_some(),
+            ConfigSetting::SourceShutdown,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.source_secret.is_some(),
+            ConfigSetting::SourceSecret,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.coinbase.is_some(),
+            ConfigSetting::Coinbase,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
+            file.kraken.is_some(),
+            ConfigSetting::Kraken,
+            ConfigOrigin::LocalFile,
+        );
+    }
+
+    fn apply_environment(&mut self, environment: &BTreeMap<OsString, OsString>) {
+        for key in environment.keys().filter_map(|key| key.to_str()) {
+            let setting = match key {
+                "MARKET_SQUAWK_DATA_DIR" => Some(ConfigSetting::DataDirectory),
+                "MARKET_SQUAWK_PRODUCTS" => Some(ConfigSetting::Products),
+                "MARKET_SQUAWK_STALE_AFTER_MS" => Some(ConfigSetting::StaleAfter),
+                "MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY" => Some(ConfigSetting::CaptureQueueCapacity),
+                "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES" => {
+                    Some(ConfigSetting::CaptureMemoryCeiling)
+                }
+                "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES" => {
+                    Some(ConfigSetting::CaptureDestinationRegistryMemoryCeiling)
+                }
+                "MARKET_SQUAWK_PAPER_BOT_ENABLED" => Some(ConfigSetting::PaperBotEnabled),
+                "MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS" => {
+                    Some(ConfigSetting::CaptureFlushInterval)
+                }
+                "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => Some(ConfigSetting::CaptureShutdown),
+                "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => Some(ConfigSetting::SourceShutdown),
+                "MARKET_SQUAWK_SOURCE_SECRET" => Some(ConfigSetting::SourceSecret),
+                "MARKET_SQUAWK_COINBASE_JSON" => Some(ConfigSetting::Coinbase),
+                "MARKET_SQUAWK_KRAKEN_JSON" => Some(ConfigSetting::Kraken),
+                _ => None,
+            };
+            if let Some(setting) = setting {
+                self.mark(setting, ConfigOrigin::Environment);
+            }
+        }
+    }
+
+    fn apply_cli(&mut self, cli: &ConfigOverrides) {
+        self.mark_if(
+            cli.data_dir.is_some(),
+            ConfigSetting::DataDirectory,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.products.is_some(),
+            ConfigSetting::Products,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.stale_after_ms.is_some(),
+            ConfigSetting::StaleAfter,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.capture_queue_capacity.is_some(),
+            ConfigSetting::CaptureQueueCapacity,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.capture_memory_ceiling_bytes.is_some(),
+            ConfigSetting::CaptureMemoryCeiling,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.capture_destination_registry_memory_ceiling_bytes
+                .is_some(),
+            ConfigSetting::CaptureDestinationRegistryMemoryCeiling,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.paper_bot_enabled.is_some(),
+            ConfigSetting::PaperBotEnabled,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.capture_flush_interval_ms.is_some(),
+            ConfigSetting::CaptureFlushInterval,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.capture_shutdown_ms.is_some(),
+            ConfigSetting::CaptureShutdown,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.source_shutdown_ms.is_some(),
+            ConfigSetting::SourceShutdown,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.source_secret.is_some(),
+            ConfigSetting::SourceSecret,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.coinbase.is_some(),
+            ConfigSetting::Coinbase,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.kraken.is_some(),
+            ConfigSetting::Kraken,
+            ConfigOrigin::Cli,
+        );
+    }
+
+    fn mark_if(&mut self, present: bool, setting: ConfigSetting, origin: ConfigOrigin) {
+        if present {
+            self.mark(setting, origin);
+        }
+    }
+}
 
 /// A redacted locator resolved by an explicitly configured local secret provider.
 #[derive(Clone, Eq, PartialEq)]
@@ -241,7 +517,11 @@ pub struct AppConfig {
     source_secret: Option<SecretReference>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
+    provenance: ConfigProvenance,
 }
+
+/// Validated effective configuration after all four precedence layers are composed.
+pub type EffectiveConfig = AppConfig;
 
 impl fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -269,6 +549,7 @@ impl fmt::Debug for AppConfig {
             )
             .field("coinbase", &self.coinbase)
             .field("kraken", &self.kraken)
+            .field("provenance", &self.provenance)
             .finish()
     }
 }
@@ -302,6 +583,7 @@ impl Default for AppConfig {
             source_secret: None,
             coinbase: None,
             kraken: None,
+            provenance: ConfigProvenance::default(),
         }
     }
 }
@@ -310,6 +592,7 @@ impl AppConfig {
     /// Loads and validates defaults, file, supplied environment, then CLI overrides.
     pub fn load(sources: ConfigSources<'_>) -> Result<Self, ConfigError> {
         let mut values = ConfigOverrides::from(Self::default());
+        let mut provenance = ConfigProvenance::default();
         if let Some(path) = sources.config_file {
             let file =
                 std::fs::File::open(path).map_err(|source| ConfigError::FileIo { source })?;
@@ -323,11 +606,16 @@ impl AppConfig {
             let text = String::from_utf8(bytes).map_err(|_source| ConfigError::FileParse)?;
             let file =
                 toml::from_str::<FileConfig>(&text).map_err(|_source| ConfigError::FileParse)?;
+            provenance.apply_file(&file);
             values.apply_file(file)?;
         }
         values.apply_environment(sources.environment)?;
+        provenance.apply_environment(sources.environment);
+        provenance.apply_cli(&sources.cli);
         values.apply(sources.cli);
-        Self::try_from(values)
+        let mut config = Self::try_from(values)?;
+        config.provenance = provenance;
+        Ok(config)
     }
 
     /// Returns the local data root.
@@ -393,6 +681,11 @@ impl AppConfig {
     /// Returns the optional strict production Kraken book-v2 source profile.
     pub const fn kraken(&self) -> Option<&KrakenSourceConfig> {
         self.kraken.as_ref()
+    }
+
+    /// Returns the exact layer that supplied every effective setting.
+    pub const fn provenance(&self) -> &ConfigProvenance {
+        &self.provenance
     }
 }
 
@@ -648,6 +941,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             source_secret: values.source_secret,
             coinbase: values.coinbase,
             kraken: values.kraken,
+            provenance: ConfigProvenance::default(),
         })
     }
 }

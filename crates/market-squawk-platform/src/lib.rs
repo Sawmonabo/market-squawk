@@ -40,10 +40,10 @@ pub use capture::{CaptureReceiverTestCoordinationError, ProcessCaptureHelperTest
 pub use config::{
     AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
-    CoinbaseSourceConfig, ConfigError, ConfigOverrides, ConfigSources,
-    KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
-    KrakenInstrumentMapping, KrakenSourceConfig, SecretError, SecretProvider, SecretReference,
-    SecretValue,
+    CoinbaseSourceConfig, ConfigError, ConfigOrigin, ConfigOverrides, ConfigProvenance,
+    ConfigSetting, ConfigSources, EffectiveConfig, KRAKEN_WEBSOCKET_V2_ENDPOINT,
+    KrakenAuthorizationAttestation, KrakenConfigurationError, KrakenInstrumentMapping,
+    KrakenSourceConfig, SecretError, SecretProvider, SecretReference, SecretValue,
 };
 pub use input::{
     BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,

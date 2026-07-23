@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use market_squawk_domain::{AssetClass, Denomination, LiveEventClass, MarketDepth, TradingStatus};
 use market_squawk_platform::{
-    AppConfig, COINBASE_EXCHANGE_ENDPOINT, ConfigError, ConfigOverrides, ConfigSources,
-    KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
+    AppConfig, COINBASE_EXCHANGE_ENDPOINT, ConfigError, ConfigOrigin, ConfigOverrides,
+    ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
 };
 use tempfile::tempdir;
 
@@ -351,6 +351,7 @@ source_secret = "keyring:coinbase"
             "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES",
             "3145728",
         ),
+        ("MARKET_SQUAWK_PAPER_BOT_ENABLED", "true"),
         ("MARKET_SQUAWK_SOURCE_SHUTDOWN_MS", "4000"),
     ]);
     let cli = ConfigOverrides {
@@ -376,10 +377,27 @@ source_secret = "keyring:coinbase"
         4_194_304
     );
     assert_eq!(config.stale_after().as_millis(), 4_000);
+    assert!(config.paper_bot_enabled());
     assert_eq!(config.source_shutdown().as_millis(), 6_000);
     assert_eq!(
         config.source_secret(),
         Some(&SecretReference::try_from("keyring:coinbase")?)
+    );
+    assert_eq!(
+        config.provenance().origin(ConfigSetting::DataDirectory),
+        ConfigOrigin::Cli
+    );
+    assert_eq!(
+        config.provenance().origin(ConfigSetting::PaperBotEnabled),
+        ConfigOrigin::Environment
+    );
+    assert_eq!(
+        config.provenance().origin(ConfigSetting::StaleAfter),
+        ConfigOrigin::LocalFile
+    );
+    assert_eq!(
+        config.provenance().origin(ConfigSetting::Coinbase),
+        ConfigOrigin::SafeDefault
     );
     Ok(())
 }
