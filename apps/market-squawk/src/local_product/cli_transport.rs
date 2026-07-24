@@ -347,8 +347,11 @@ async fn feature(
     command: FeatureCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
-        FeatureCommand::List => {
+        FeatureCommand::List { after_dataset } => {
             let mut arguments = Map::new();
+            if let Some(after_dataset) = after_dataset {
+                arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
+            }
             invoke(
                 product,
                 "Analysis.GetFeatureDatasets",

@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     ArrowConversionError, CatalogEndpointIdentity, CatalogError, DatasetBuildSpecDigest,
-    DatasetManifestRef, Sha256Digest, UniverseId,
+    DatasetManifestRef, DatasetSplitCounts, Sha256Digest, UniverseId,
 };
 
 const MAX_PYTHON_DATASET_ROWS: usize = 100_000;
@@ -185,6 +185,35 @@ pub struct PythonDatasetIdentity {
     universe_digest: Sha256Digest,
     policy_digest: Sha256Digest,
     universe_id: UniverseId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PythonFeatureDatasetSummary {
+    pub(crate) identity: PythonDatasetIdentity,
+    pub(crate) split_counts: DatasetSplitCounts,
+}
+
+pub(crate) fn feature_dataset_summary(
+    descriptor_bytes: &[u8],
+    export_sha256: Sha256Digest,
+) -> Result<PythonFeatureDatasetSummary, PythonDatasetCatalogError> {
+    if descriptor_bytes.is_empty()
+        || descriptor_bytes.len() > crate::MAX_FEATURE_LABEL_EXPORT_BYTES
+        || Sha256Digest::new(Sha256::digest(descriptor_bytes).into()) != export_sha256
+    {
+        return Err(PythonDatasetCatalogError::CorruptAdmission);
+    }
+    let descriptor = descriptor::Descriptor::parse(descriptor_bytes)?;
+    let identity = descriptor.identity()?;
+    let split_counts = DatasetSplitCounts::from_parts(
+        descriptor.split_counts.train,
+        descriptor.split_counts.validation,
+        descriptor.split_counts.test,
+    );
+    Ok(PythonFeatureDatasetSummary {
+        identity,
+        split_counts,
+    })
 }
 
 impl PythonDatasetIdentity {

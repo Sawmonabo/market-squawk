@@ -33,8 +33,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository, AuditResultClass, McpLimits,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    AuditResultClass, McpLimits,
     framing::OutputChannel,
     protocol::{SdkInboundRequest, TransportError, WriterSupervisor},
     server::{ServerError, ServiceHandler},
@@ -401,6 +402,15 @@ impl ArtifactRepository for SdkArtifactRepository {
             () = tokio::time::sleep_until(deadline) => Err(ArtifactError::DeadlineExceeded),
             outcome = result => outcome.map_err(|_| ArtifactError::Unavailable)?,
         }
+    }
+
+    async fn read(
+        &self,
+        _request: ArtifactReadRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        context.ensure_live()?;
+        Err(ArtifactError::Unavailable)
     }
 }
 

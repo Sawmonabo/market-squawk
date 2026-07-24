@@ -65,6 +65,10 @@ const DATASET_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("dataset", ArgumentKind::Identifier)];
 const OPTIONAL_DATASET_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::optional("dataset", ArgumentKind::Identifier)];
+const FEATURE_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("dataset", ArgumentKind::Identifier),
+    ArgumentSpec::optional("afterDataset", ArgumentKind::Identifier),
+];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
@@ -355,7 +359,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return registered feature contracts and immutable feature datasets.",
         ServiceDomain::Analysis,
         DATA_SCOPE,
-        OPTIONAL_DATASET_ARGUMENT,
+        FEATURE_DATASET_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read(

@@ -1,20 +1,22 @@
 use std::{
     collections::VecDeque,
     error::Error,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
-    AuditPhase, AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase,
+    AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer,
     MutationAuditBundle, MutationAuditReservation, ServerExit,
 };
 use market_squawk_services::{
@@ -292,6 +294,23 @@ impl ArtifactRepository for RecordingArtifacts {
             .map_err(|_| ArtifactError::Unavailable)?
             .push(publication);
         Ok(reference)
+    }
+
+    async fn read(
+        &self,
+        request: ArtifactReadRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        context.ensure_live()?;
+        let publications = self
+            .publications
+            .lock()
+            .map_err(|_| ArtifactError::Unavailable)?;
+        let publication = publications
+            .iter()
+            .find(|publication| publication.sha256_hex() == request.reference().sha256())
+            .ok_or(ArtifactError::NotFound)?;
+        ArtifactRead::try_new(request.into_reference(), publication.content().to_vec())
     }
 }
 
@@ -935,6 +954,14 @@ impl ArtifactRepository for NonCooperativeArtifacts {
             publication.media_type(),
         )
     }
+
+    async fn read(
+        &self,
+        _request: ArtifactReadRequest,
+        _context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        Err(ArtifactError::Unavailable)
+    }
 }
 
 #[tokio::test]
@@ -1441,6 +1468,47 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
     assert!(!encoded.contains("sensitive-value"));
     assert!(!encoded.contains("path"));
     assert_eq!(artifacts.publication_count()?, 1);
+    let artifact = &large["result"]["structuredContent"]["artifact"];
+    let byte_count = usize::try_from(
+        artifact["byteCount"]
+            .as_u64()
+            .ok_or("artifact byte count is missing")?,
+    )?;
+    let reference = ArtifactReference::try_new(
+        artifact["id"].as_str().ok_or("artifact id is missing")?,
+        artifact["sha256"]
+            .as_str()
+            .ok_or("artifact digest is missing")?,
+        byte_count,
+        artifact["mediaType"]
+            .as_str()
+            .ok_or("artifact media type is missing")?,
+    )?;
+    let under_bound = NonZeroUsize::new(byte_count.saturating_sub(1))
+        .ok_or("artifact unexpectedly had one byte")?;
+    assert_eq!(
+        ArtifactReadRequest::try_new(reference.clone(), under_bound),
+        Err(ArtifactError::ReadLimitExceeded)
+    );
+    let read = artifacts
+        .read(
+            ArtifactReadRequest::try_new(
+                reference.clone(),
+                NonZeroUsize::new(byte_count).ok_or("artifact byte bound is zero")?,
+            )?,
+            ArtifactReadContext::new(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .await?;
+    assert_eq!(read.reference(), &reference);
+    assert_eq!(read.content().len(), byte_count);
+    assert!(
+        serde_json::from_slice::<Value>(read.content())?
+            .to_string()
+            .contains("sensitive-value")
+    );
 
     send(
         &mut writer,

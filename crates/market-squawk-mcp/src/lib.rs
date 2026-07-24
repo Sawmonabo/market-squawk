@@ -14,8 +14,8 @@ mod protocol;
 mod server;
 
 pub use artifact::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
 pub use audit::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,

@@ -682,6 +682,9 @@ fn generation_value(generation: &AnalyticalGeneration) -> Value {
         "buildSpecDigest": generation
             .build_spec_digest()
             .map(|digest| encode_hex(digest.digest().bytes())),
+        "pythonExportSha256": generation
+            .python_export_sha256()
+            .map(|digest| encode_hex(digest.bytes())),
         "parents": generation
             .parents()
             .iter()
@@ -753,6 +756,7 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         ManifestCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         ManifestCatalogError::ObjectLimitExceeded { .. }
         | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
+        | ManifestCatalogError::FeatureDatasetCandidateLimitExceeded { .. }
         | ManifestCatalogError::CountOverflow
         | ManifestCatalogError::AllocationContract => ServiceError::ResourceExhausted,
         ManifestCatalogError::InvalidConfiguration

@@ -12,10 +12,11 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
-    AuditPhase, AuditSink, LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer,
-    MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
+    LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer, MutationAuditBundle,
+    MutationAuditReservation, ServerError, ServerExit,
 };
 use market_squawk_services::{
     ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
@@ -156,6 +157,14 @@ impl ArtifactRepository for RejectingArtifacts {
         _publication: ArtifactPublication,
         _context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError> {
+        Err(ArtifactError::Unavailable)
+    }
+
+    async fn read(
+        &self,
+        _request: ArtifactReadRequest,
+        _context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
         Err(ArtifactError::Unavailable)
     }
 }

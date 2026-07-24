@@ -11,10 +11,14 @@ use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
 
-pub(crate) use self::catalog::CatalogGenerationPage;
 pub use self::catalog::{
-    AnalyticalManifestCatalog, GenerationKind, ManifestCatalogError, PinnedDataset,
+    AnalyticalManifestCatalog, GenerationKind, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
+    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, PinnedDataset,
     PinnedManifestObject,
+};
+pub(crate) use self::catalog::{
+    CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
+    CatalogGenerationPage,
 };
 
 /// Fixed maximum number of exact input generations retained by one derived generation.

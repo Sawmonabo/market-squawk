@@ -35,6 +35,7 @@ pub use analytical_backup::{
     AnalyticalRestoreMode, AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
 };
 pub use analytical_read::{
+    AnalyticalFeatureDataset, AnalyticalFeatureDatasetPage, AnalyticalFeatureDatasetSelection,
     AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalObservationOutput,
     AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
     AnalyticalReadError, AnalyticalReadLimit, ObservationKnowledgeRange,
@@ -86,8 +87,9 @@ pub use ingest::{
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, ManifestCatalogError, ManifestObject, ManifestPlan,
-    ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
+    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
+    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, ManifestObject,
+    ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,

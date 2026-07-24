@@ -1,10 +1,26 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use clap::Parser as _;
+use market_squawk::application::analysis::{
+    AnalysisCatalog, AnalysisDatasetScope, AnalysisDomainService, FeatureDatasetRegistration,
+    GovernedBacktestAuthority, GovernedBacktestCommand, GovernedBacktestInputRegistrar,
+    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestRecord,
+};
+use market_squawk::application::{ApplicationDomainService, application_capabilities};
+use market_squawk::cli::{Cli, Command, FeatureCommand};
 use market_squawk::{
     AppPaths, PinnedBacktestInput, ProductionBacktestService, ProductionBacktestServiceError,
     ResearchIngestRequest, ResearchService,
+};
+use market_squawk_analytics::{
+    BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies,
+    MissingValuePolicy as AnalyticsMissingValuePolicy, REQUIRED_BATCH_FEATURE_COUNT,
+    ShockComposition, VarianceConvention, WeightPolicy,
 };
 use market_squawk_backtesting::{
     AVAILABLE_AT_COMPONENT, BacktestContext, BacktestDataset, BacktestEngine, BacktestError,
@@ -20,11 +36,12 @@ use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPolicy,
     CorporateActionSensitivity, DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy,
     DatasetBuildRequest, DatasetId, DatasetManifestRef, DatasetOutputAuthorization,
-    FeatureLabelComponentInput, FeatureLabelComponentSpec, ObjectStoreConfig, ObservationFamilyKey,
-    PinnedInstrumentDefinitions, PinnedQueryOutput, PointInTimeLimits, PointInTimePolicy,
-    PointInTimeRevisionMode, QueryLimits, QueryRequest, ResearchQueryEngine, ResearchUse,
-    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
-    SourceOperation, UniverseId, UniverseLimits, UniverseMembership, extraction_batch_digest,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset, ObjectStoreConfig,
+    ObservationFamilyKey, PinnedInstrumentDefinitions, PinnedQueryOutput, PointInTimeLimits,
+    PointInTimePolicy, PointInTimeRevisionMode, QueryLimits, QueryRequest, ResearchQueryEngine,
+    ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis,
+    RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
+    extraction_batch_digest,
 };
 use market_squawk_domain::{
     AccountId, AuthorizationBasis, AvailabilityEvidence, BasisPoints, ChecksumCapability,
@@ -37,6 +54,10 @@ use market_squawk_domain::{
 };
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
+use market_squawk_services::{
+    JsonStructureLimits, RequestContext, RequestId, ResultCompleteness, ServiceError,
+    ServiceLimits, TypedToolRequest,
+};
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
     CanonicalObservationPayload, CoverageDomain, DiscoveryRequest, ExtractionBatch,
@@ -45,10 +66,56 @@ use market_squawk_sources::{
     SourceMetadataInput, SourceObject, SourceProtocolProfile,
 };
 use rust_decimal::Decimal;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[derive(Debug)]
+struct UnusedBacktestInputRegistrar;
+
+#[async_trait]
+impl GovernedBacktestInputRegistrar for UnusedBacktestInputRegistrar {
+    async fn register_input(
+        &self,
+        _input: GovernedBacktestInputRegistrationInput,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct UnusedBacktestAuthority;
+
+#[async_trait]
+impl GovernedBacktestAuthority for UnusedBacktestAuthority {
+    async fn run(
+        &self,
+        _command: GovernedBacktestCommand,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    async fn get(
+        &self,
+        _run_id: &str,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<Option<GovernedBacktestRecord>, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn begin_shutdown(&self) {}
+
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
 
 #[test]
 fn production_backtest_inventory_is_confined_to_the_controlled_artifact_root()
@@ -146,6 +213,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let built = service
         .build_dataset(
             fixture_dataset_request(
+                "derived.backtest.reference-authority",
                 source_dataset.manifest().clone(),
                 instrument_id,
                 membership_evidence,
@@ -153,6 +221,294 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             CancellationToken::new(),
         )
         .await?;
+    let successor = service
+        .build_dataset(
+            fixture_dataset_request(
+                "derived.backtest.reference-authority-successor",
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let terminal = service
+        .build_dataset(
+            fixture_dataset_request(
+                "derived.backtest.reference-authority-terminal",
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let legacy_paths = AppPaths::prepare(directory.path().join("legacy-feature-catalog"))?;
+    let legacy = fixture_feature_dataset(
+        &legacy_paths,
+        "derived.backtest.reference-authority-secondary",
+        instrument_id,
+    )
+    .await?;
+    let legacy_scope = AnalysisDatasetScope::try_new(
+        vec![instrument_id],
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(200),
+        vec![SourceId::try_from("backtest-fixture")?],
+        vec![DataQuality::DirectVerified],
+    )?;
+    let analysis = AnalysisDomainService::new_with_feature_reader(
+        Arc::new(fixture_analysis_catalog(vec![
+            FeatureDatasetRegistration::new(legacy, legacy_scope.clone()),
+            FeatureDatasetRegistration::new(successor.clone(), legacy_scope),
+        ])?),
+        service.analytical_reader(),
+        Arc::new(UnusedBacktestInputRegistrar),
+        Arc::new(UnusedBacktestAuthority),
+    );
+    let undersized = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(101)?,
+        )
+        .await;
+    assert!(matches!(undersized, Err(ServiceError::ResourceExhausted)));
+
+    let first_page_evidence = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 1,
+                    "maximumBytes": 65536
+                }
+            }))?,
+            feature_dataset_context(102)?,
+        )
+        .await?;
+    let first_page_byte_ceiling = first_page_evidence.encoded_bytes();
+    assert_eq!(
+        first_page_evidence.item_count(),
+        REQUIRED_BATCH_FEATURE_COUNT + 1
+    );
+    assert_eq!(
+        first_page_evidence.structured_content()["nextAfterDataset"],
+        "derived.backtest.reference-authority"
+    );
+    assert_eq!(first_page_evidence.structured_content()["hasMore"], true);
+
+    let first = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 3,
+                    "maximumBytes": first_page_byte_ceiling
+                }
+            }))?,
+            feature_dataset_context(103)?,
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("tight-byte first feature page failed: {error:?}"))
+        })?;
+    let first_content = first.structured_content();
+    let first_items = first_content["items"]
+        .as_array()
+        .ok_or("first feature page has no items")?;
+    let cursor = first_content["nextAfterDataset"]
+        .as_str()
+        .ok_or("first feature page has no durable cursor")?
+        .to_owned();
+    assert_eq!(first_items.len(), REQUIRED_BATCH_FEATURE_COUNT + 1);
+    assert!(
+        first_items[..REQUIRED_BATCH_FEATURE_COUNT]
+            .iter()
+            .all(|item| item["kind"] == "feature_contract")
+    );
+    assert_eq!(
+        first_items[REQUIRED_BATCH_FEATURE_COUNT]["manifest"]["dataset"],
+        "derived.backtest.reference-authority"
+    );
+    assert_eq!(cursor, "derived.backtest.reference-authority");
+    assert_eq!(first_content["hasMore"], true);
+    assert_eq!(first.encoded_bytes(), first_page_byte_ceiling);
+    assert_eq!(
+        first.metadata().available_items(),
+        Some(REQUIRED_BATCH_FEATURE_COUNT + 4)
+    );
+    assert_eq!(first.metadata().source_coverage()["datasetCount"], 1);
+
+    let cli = Cli::try_parse_from([
+        "market-squawk",
+        "feature",
+        "list",
+        "--after-dataset",
+        cursor.as_str(),
+    ])
+    .map_err(|error| {
+        std::io::Error::other(format!("feature continuation CLI parsing failed: {error}"))
+    })?;
+    assert!(matches!(
+        cli.command,
+        Command::Feature {
+            command: FeatureCommand::List {
+                after_dataset: Some(ref value)
+            }
+        } if value == &cursor
+    ));
+
+    let continuation_evidence = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": cursor.clone(),
+                "resultLimits": {"maximumItems": 1, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(104)?,
+        )
+        .await?;
+    let continuation_byte_ceiling = continuation_evidence.encoded_bytes();
+    assert_eq!(continuation_evidence.item_count(), 1);
+    assert_eq!(
+        continuation_evidence.structured_content()["items"][0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-secondary"
+    );
+    assert_eq!(
+        continuation_evidence.structured_content()["nextAfterDataset"],
+        "derived.backtest.reference-authority-secondary"
+    );
+    assert_eq!(continuation_evidence.structured_content()["hasMore"], true);
+
+    let continued_request = feature_dataset_request(json!({
+        "afterDataset": cursor,
+        "resultLimits": {
+            "maximumItems": 2,
+            "maximumBytes": continuation_byte_ceiling
+        }
+    }))
+    .map_err(|error| {
+        std::io::Error::other(format!("feature continuation admission failed: {error}"))
+    })?;
+    let continued = analysis
+        .call(continued_request, feature_dataset_context(105)?)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("tight-byte feature continuation failed: {error:?}"))
+        })?;
+    let continued_content = continued.structured_content();
+    let continued_items = continued_content["items"]
+        .as_array()
+        .ok_or("continued feature page has no items")?;
+    let continued_cursor = continued_content["nextAfterDataset"]
+        .as_str()
+        .ok_or("continued feature page has no durable cursor")?
+        .to_owned();
+    assert_eq!(continued_items.len(), 1);
+    assert_eq!(continued_items[0]["kind"], "feature_dataset");
+    assert_eq!(
+        continued_items[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-secondary"
+    );
+    assert_eq!(
+        continued_cursor,
+        "derived.backtest.reference-authority-secondary"
+    );
+    assert_eq!(continued_content["hasMore"], true);
+    assert_eq!(continued.encoded_bytes(), continuation_byte_ceiling);
+    assert_eq!(continued.metadata().available_items(), Some(3));
+    assert_eq!(continued.metadata().source_coverage()["datasetCount"], 1);
+
+    let final_page = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": continued_cursor,
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(106)?,
+        )
+        .await?;
+    let final_content = final_page.structured_content();
+    let final_items = final_content["items"]
+        .as_array()
+        .ok_or("final feature page has no items")?;
+    assert_eq!(final_items.len(), 2);
+    assert_eq!(final_items[0]["kind"], "feature_dataset");
+    assert_eq!(
+        final_items[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert!(
+        final_items[0]["pythonExportSha256"].is_string(),
+        "the durable generation must win an overlapping legacy identity"
+    );
+    assert_eq!(final_items[1]["kind"], "feature_dataset");
+    assert_eq!(
+        final_items[1]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-terminal"
+    );
+    assert_eq!(final_content["hasMore"], false);
+    assert!(final_content["nextAfterDataset"].is_null());
+    assert_eq!(
+        final_page.metadata().completeness(),
+        ResultCompleteness::Complete
+    );
+    assert_eq!(final_page.metadata().available_items(), None);
+
+    let exact_overlap = analysis
+        .call(
+            feature_dataset_request(json!({
+                "dataset": "derived.backtest.reference-authority-successor",
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 1,
+                    "maximumBytes": 65536
+                }
+            }))?,
+            feature_dataset_context(107)?,
+        )
+        .await?;
+    let exact_overlap_items = exact_overlap.structured_content()["items"]
+        .as_array()
+        .ok_or("exact overlap result has no items")?;
+    let exact_overlap_datasets = exact_overlap_items
+        .iter()
+        .filter(|item| item["kind"] == "feature_dataset")
+        .collect::<Vec<_>>();
+    assert_eq!(exact_overlap_datasets.len(), 1);
+    assert_eq!(
+        exact_overlap_datasets[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert!(exact_overlap_datasets[0]["pythonExportSha256"].is_string());
+
+    let exhausted = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(108)?,
+        )
+        .await?;
+    assert!(exhausted.structured_content().is_null());
+    assert_eq!(exhausted.item_count(), 0);
+    assert_eq!(
+        exhausted.metadata().completeness(),
+        ResultCompleteness::Complete
+    );
+    assert_eq!(exhausted.metadata().available_items(), None);
+
+    let conflicting = analysis
+        .call(
+            feature_dataset_request(json!({
+                "dataset": "derived.backtest.reference-authority-successor",
+                "afterDataset": "derived.backtest.reference-authority",
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(109)?,
+        )
+        .await;
+    assert!(matches!(conflicting, Err(ServiceError::InvalidRequest)));
+
     let query = ResearchQueryEngine::from_pinned_dataset(
         built.pinned().clone(),
         "components",
@@ -164,6 +520,9 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let changed_identity_output = query_backtest_rows(&query, built.manifest()).await?;
     let coverage_mismatch_output = query_backtest_rows(&query, built.manifest()).await?;
     drop(query);
+    drop(analysis);
+    drop(terminal);
+    drop(successor);
     drop(built);
     drop(source_dataset);
     drop(service);
@@ -364,6 +723,7 @@ fn fixture_context(
 }
 
 fn fixture_dataset_request(
+    dataset_id: &str,
     source_manifest: DatasetManifestRef,
     instrument_id: InstrumentId,
     membership_evidence: EvidenceDigest,
@@ -389,7 +749,7 @@ fn fixture_dataset_request(
         ],
     )?;
     Ok(DatasetBuildRequest::try_new(
-        DatasetId::try_from("derived.backtest.reference-authority")?,
+        DatasetId::try_from(dataset_id)?,
         inputs,
         DatasetBuildPolicy::new(
             ChronologicalSplitPolicy::try_new(
@@ -433,6 +793,113 @@ fn fixture_dataset_request(
             )?,
         )?,
     )?)
+}
+
+async fn fixture_feature_dataset(
+    paths: &AppPaths,
+    dataset_id: &str,
+    instrument_id: InstrumentId,
+) -> TestResult<FeatureLabelDataset> {
+    let catalog_config = fixture_catalog_config(paths)?;
+    let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 128, Duration::from_secs(60))?;
+    let source = fixture_source("backtest-fixture")?;
+    let (batch, membership_evidence) = fixture_extraction_batch(instrument_id)?;
+    let rights = RightsDecisionInput {
+        source_id: source.source_id().clone(),
+        payload_digest: extraction_batch_digest(&batch)?,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms("https://example.test/backtest-fixture/v1", digest(31))?,
+        authorization_evidence: digest(32),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    };
+    {
+        let catalog = CatalogAuthority::open(catalog_config.clone())?;
+        catalog.register_source(&source, rights.retrieved_at)?;
+        catalog.register_source(
+            &fixture_source("market-squawk.derived")?,
+            Timestamp::from_unix_nanos(10),
+        )?;
+        let registered_rights = catalog.admit_source_rights(rights.clone())?;
+        catalog.admit_research_use_grant(ResearchUseGrantInput::try_new(
+            registered_rights.rights_id(),
+            ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+            digest(33),
+            Some(Timestamp::from_unix_nanos(i64::MAX)),
+        )?)?;
+    }
+    let service = ResearchService::initialize(paths, catalog_config, 8, object_config)?;
+    let source_dataset = service
+        .ingest(
+            ResearchIngestRequest::locally_observed(
+                source,
+                rights,
+                "legacy-feature-pagination-v1",
+                batch,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    service
+        .build_dataset(
+            fixture_dataset_request(
+                dataset_id,
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(Into::into)
+}
+
+fn fixture_analysis_catalog(
+    feature_datasets: Vec<FeatureDatasetRegistration>,
+) -> TestResult<AnalysisCatalog> {
+    let config = BatchFeatureCatalogConfig::try_new(
+        NonZeroU32::new(252).ok_or("nonzero periods per year")?,
+        NonZeroU32::new(950_000).ok_or("nonzero confidence level")?,
+        6,
+        BatchFeaturePolicies::new(
+            VarianceConvention::Sample,
+            AnalyticsMissingValuePolicy::Reject,
+            WeightPolicy::PositiveNormalized,
+            market_squawk_domain::RoundingPolicy::NearestEven,
+            ShockComposition::Compounded,
+        ),
+    )?;
+    Ok(AnalysisCatalog::try_new(
+        Vec::new(),
+        BatchFeatureCatalog::try_new(config, "feature-pagination-test-v1")?,
+        feature_datasets,
+    )?)
+}
+
+fn feature_dataset_request(arguments: Value) -> TestResult<TypedToolRequest> {
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or("feature dataset arguments must be an object")?;
+    Ok(application_capabilities()?
+        .find("Analysis.GetFeatureDatasets")
+        .ok_or("feature dataset operation is not registered")?
+        .admit(arguments)?)
+}
+
+fn feature_dataset_context(id: i64) -> TestResult<RequestContext> {
+    Ok(RequestContext::new(
+        RequestId::Integer(id),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+        ServiceLimits::try_new(
+            64 * 1024,
+            64,
+            64 * 1024,
+            64,
+            JsonStructureLimits::try_new(16, 16 * 1024, 256, 256)?,
+        )?,
+    ))
 }
 
 fn fixture_component_specs() -> TestResult<Vec<FeatureLabelComponentSpec>> {

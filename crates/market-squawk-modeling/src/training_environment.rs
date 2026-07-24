@@ -17,6 +17,9 @@ const RELEASE_MANIFEST: &str = "share/market-squawk/market-squawk-release.json";
 const MAX_AUTHORITY_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_APPLICATION_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
+const MAX_ONNX_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILES: usize = 8_192;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
@@ -97,7 +100,9 @@ struct SignedReleaseManifestWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseManifestWire {
+    application: FileDigestWire,
     foundation_sha256: String,
+    onnx_worker: FileDigestWire,
     project_wheel: ProjectWheelWire,
     schema_version: u32,
     validator: FileDigestWire,
@@ -242,6 +247,27 @@ pub fn verify_validator_training_environment(
     verified.into_public()
 }
 
+/// Verifies the fixed installed receipt, current application, and sibling ONNX worker.
+///
+/// # Errors
+///
+/// Returns an error when the application, worker, or any installed release identity differs.
+pub fn verify_application_training_environment(
+    root: &Path,
+    application: &Path,
+    onnx_worker: &Path,
+) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
+    let verified = verify_installed_files(root)?;
+    let expected_application = verified.root.join("bin/market-squawk");
+    let expected_worker = verified.root.join("bin/market-squawk-onnx-worker");
+    if canonical(application)? != canonical(&expected_application)?
+        || canonical(onnx_worker)? != canonical(&expected_worker)?
+    {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+    verified.into_public()
+}
+
 impl VerifiedFiles {
     fn into_public(self) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
         Ok(VerifiedTrainingEnvironment {
@@ -284,7 +310,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::ReleaseManifest,
     )?;
     if signed_environment.schema_version != 1
-        || signed_manifest.schema_version != 1
+        || signed_manifest.schema_version != 2
         || !verify_signature(
             &foundation.release_public_key,
             ENVIRONMENT_RECEIPT_DOMAIN,
@@ -303,7 +329,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let environment = signed_environment.payload;
     let manifest = signed_manifest.payload;
 
-    if manifest.schema_version != 1
+    if manifest.schema_version != 2
         || parse_hex(&environment.foundation_sha256)? != foundation_sha256
         || parse_hex(&manifest.foundation_sha256)? != foundation_sha256
         || parse_hex(&environment.release_manifest_sha256)? != manifest_file.sha256
@@ -311,6 +337,8 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         || environment.validator_sha256 != manifest.validator.sha256
         || !valid_interpreter(&environment.interpreter)
         || !valid_project_wheel(&manifest.project_wheel)
+        || manifest.application.size_bytes == 0
+        || manifest.onnx_worker.size_bytes == 0
         || manifest.validator.size_bytes == 0
     {
         return Err(TrainingEnvironmentError::EnvironmentReceipt);
@@ -332,13 +360,39 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let validator = read_controlled(
         &canonical_root,
         Path::new("bin/market-squawk-model-validator"),
-        MAX_DISTRIBUTION_FILE_BYTES,
+        MAX_VALIDATOR_EXECUTABLE_BYTES,
         false,
     )?;
     exact_file(
         &validator,
         &manifest.validator.sha256,
         manifest.validator.size_bytes,
+        TrainingEnvironmentError::RuntimeWitness,
+    )?;
+
+    let application = read_controlled(
+        &canonical_root,
+        Path::new("bin/market-squawk"),
+        MAX_APPLICATION_EXECUTABLE_BYTES,
+        false,
+    )?;
+    exact_file(
+        &application,
+        &manifest.application.sha256,
+        manifest.application.size_bytes,
+        TrainingEnvironmentError::RuntimeWitness,
+    )?;
+
+    let onnx_worker = read_controlled(
+        &canonical_root,
+        Path::new("bin/market-squawk-onnx-worker"),
+        MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+        false,
+    )?;
+    exact_file(
+        &onnx_worker,
+        &manifest.onnx_worker.sha256,
+        manifest.onnx_worker.size_bytes,
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 

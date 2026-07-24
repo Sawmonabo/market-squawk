@@ -62,6 +62,15 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
     def test_repository_lock_admits_the_complete_source_closure(self) -> None:
         lock = builder.load_lock(ROOT / "python" / "wheelhouse-lock.json")
 
+        expected = builder.expected_source_paths(ROOT)
+        self.assertIn("apps/market-squawk/Cargo.toml", expected)
+        self.assertIn("apps/market-squawk/src/main.rs", expected)
+        self.assertIn("crates/market-squawk-platform/build_support.rs", expected)
+        self.assertIn("docs/verification/onnx-runtime-policy.json", expected)
+        self.assertIn(
+            "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",
+            expected,
+        )
         builder.admit_sources(lock, ROOT)
 
     def test_offline_admission_never_fetches_a_missing_wheel(self) -> None:
@@ -158,6 +167,12 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             )
             project_wheel = root / "market_squawk-0.1.0-cp310-abi3-macosx_12_0_arm64.whl"
             project_wheel.write_bytes(b"wheel")
+            application = root / "market-squawk"
+            application.write_bytes(b"application")
+            onnx_worker = root / "market-squawk-onnx-worker"
+            onnx_worker.write_bytes(b"onnx-worker")
+            validator = root / "market-squawk-model-validator"
+            validator.write_bytes(b"validator")
             signer = mock.Mock()
             signer.sign.return_value = "66" * 64
             manifest, manifest_digest = builder.build_release_manifest(
@@ -166,8 +181,11 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 "cp310",
                 "abi3",
                 "macosx_12_0_arm64",
-                7,
-                "33" * 32,
+                builder.NativeReleaseExecutables(
+                    application=application,
+                    onnx_worker=onnx_worker,
+                    validator=validator,
+                ),
                 signer,
             )
 
@@ -182,12 +200,75 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 [{"name": "pyarrow", "version": "25.0.0"}],
             )
             self.assertEqual(release["payload"]["foundation_sha256"], digest)
-            self.assertEqual(release["payload"]["validator"]["sha256"], "33" * 32)
+            self.assertEqual(release["schema_version"], 2)
+            self.assertEqual(release["payload"]["schema_version"], 2)
+            self.assertEqual(
+                release["payload"]["application"]["sha256"],
+                hashlib.sha256(b"application").hexdigest(),
+            )
+            self.assertEqual(
+                release["payload"]["onnx_worker"]["sha256"],
+                hashlib.sha256(b"onnx-worker").hexdigest(),
+            )
+            self.assertEqual(
+                release["payload"]["validator"]["sha256"],
+                hashlib.sha256(b"validator").hexdigest(),
+            )
             self.assertEqual(release["signature"], "66" * 64)
             self.assertEqual(
                 release["payload"]["project_wheel"]["sha256"],
                 hashlib.sha256(b"wheel").hexdigest(),
             )
+            self.assertEqual(
+                builder.MAX_APPLICATION_EXECUTABLE_BYTES,
+                768 * 1024 * 1024,
+            )
+            self.assertEqual(
+                builder.MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+                256 * 1024 * 1024,
+            )
+            self.assertEqual(
+                builder.MAX_VALIDATOR_EXECUTABLE_BYTES,
+                256 * 1024 * 1024,
+            )
+
+            for executable, maximum_bytes, original in (
+                (
+                    application,
+                    builder.MAX_APPLICATION_EXECUTABLE_BYTES,
+                    b"application",
+                ),
+                (
+                    onnx_worker,
+                    builder.MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+                    b"onnx-worker",
+                ),
+                (
+                    validator,
+                    builder.MAX_VALIDATOR_EXECUTABLE_BYTES,
+                    b"validator",
+                ),
+            ):
+                with self.subTest(executable=executable.name):
+                    with executable.open("r+b") as oversized:
+                        oversized.truncate(maximum_bytes + 1)
+                    signer.reset_mock()
+                    with self.assertRaises(builder.ReleaseBuildError):
+                        builder.build_release_manifest(
+                            digest,
+                            project_wheel,
+                            "cp310",
+                            "abi3",
+                            "macosx_12_0_arm64",
+                            builder.NativeReleaseExecutables(
+                                application=application,
+                                onnx_worker=onnx_worker,
+                                validator=validator,
+                            ),
+                            signer,
+                        )
+                    signer.sign.assert_not_called()
+                    executable.write_bytes(original)
 
 
 if __name__ == "__main__":

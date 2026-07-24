@@ -957,6 +957,18 @@ pub struct DatasetSplitCounts {
 }
 
 impl DatasetSplitCounts {
+    pub(crate) const fn from_parts(
+        train_examples: usize,
+        validation_examples: usize,
+        test_examples: usize,
+    ) -> Self {
+        Self {
+            train_examples,
+            validation_examples,
+            test_examples,
+        }
+    }
+
     pub(super) fn record(&mut self, split: DatasetSplit) {
         match split {
             DatasetSplit::Train => self.train_examples += 1,

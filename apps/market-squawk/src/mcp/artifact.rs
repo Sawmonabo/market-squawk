@@ -1,28 +1,275 @@
 //! Capability-confined immutable MCP artifact publication.
 
 use std::{
+    future::Future,
     io::{Read as _, Write as _},
     num::NonZeroUsize,
     path::Path,
+    pin::Pin,
+    sync::{
+        Arc, LazyLock,
+        mpsc::{SyncSender, sync_channel},
+    },
+    task::{Context, Poll},
+    thread::JoinHandle as ThreadJoinHandle,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
 use market_squawk_platform::ArtifactRoot;
 use sha2::{Digest, Sha256};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 
 const ARTIFACT_NAMESPACE: &str = "mcp/v1";
+const READ_CHECKPOINT_BYTES: usize = 64 * 1024;
+const MAXIMUM_CONCURRENT_ARTIFACT_READS: usize = 8;
+const MAXIMUM_PENDING_ARTIFACT_REAPS: usize = 64;
+const ARTIFACT_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const _: () = assert!(MAXIMUM_CONCURRENT_ARTIFACT_READS <= Semaphore::MAX_PERMITS);
+const _: () = assert!(MAXIMUM_PENDING_ARTIFACT_REAPS <= Semaphore::MAX_PERMITS);
+
+static ARTIFACT_READ_REAPER: LazyLock<ArtifactReadReaper> =
+    LazyLock::new(ArtifactReadReaper::start);
+
+#[derive(Clone, Debug)]
+struct ArtifactReadSupervisor {
+    admission: Arc<Semaphore>,
+}
+
+impl ArtifactReadSupervisor {
+    fn try_new(capacity: NonZeroUsize) -> Result<Self, ArtifactError> {
+        ARTIFACT_READ_REAPER.ensure_available()?;
+        Ok(Self {
+            admission: Arc::new(Semaphore::new(capacity.get())),
+        })
+    }
+
+    async fn run<T, F>(
+        &self,
+        context: ArtifactReadContext,
+        operation: F,
+    ) -> Result<T, ArtifactError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> Result<T, ArtifactError> + Send + 'static,
+    {
+        context.ensure_live()?;
+        let cancellation = context.cancellation().clone();
+        let deadline = tokio::time::Instant::from_std(context.deadline());
+        let permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| ArtifactError::Unavailable)?;
+        let mut task = ArtifactReadTask::spawn(permit, operation)?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                task.cancel();
+                Err(ArtifactError::Cancelled)
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                task.cancel();
+                Err(ArtifactError::DeadlineExceeded)
+            }
+            result = &mut task => result,
+        }
+    }
+}
+
+struct ArtifactReadTask<T: Send + 'static> {
+    cancellation: CancellationToken,
+    command: Option<ArtifactReapCommand>,
+    result: oneshot::Receiver<Result<T, ArtifactError>>,
+}
+
+impl<T: Send + 'static> ArtifactReadTask<T> {
+    fn spawn<F>(operation_permit: OwnedSemaphorePermit, operation: F) -> Result<Self, ArtifactError>
+    where
+        F: FnOnce(CancellationToken) -> Result<T, ArtifactError> + Send + 'static,
+    {
+        let reaper_capacity = ARTIFACT_READ_REAPER.try_reserve()?;
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (result_sender, result) = oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _operation_permit = operation_permit;
+            let outcome = operation(worker_cancellation);
+            let _ignored = result_sender.send(outcome);
+        });
+        Ok(Self {
+            cancellation,
+            command: Some(ArtifactReapCommand {
+                worker,
+                _capacity: reaper_capacity,
+            }),
+            result,
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn handoff_pending_worker(&mut self) {
+        let Some(command) = self.command.take() else {
+            return;
+        };
+        if command.worker.is_finished() {
+            return;
+        }
+        ARTIFACT_READ_REAPER.reap(command);
+    }
+}
+
+impl<T: Send + 'static> Future for ArtifactReadTask<T> {
+    type Output = Result<T, ArtifactError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.result).poll(context) {
+            Poll::Ready(Ok(result)) => {
+                self.handoff_pending_worker();
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_closed)) => {
+                let Some(command) = self.command.as_mut() else {
+                    return Poll::Ready(Err(ArtifactError::Unavailable));
+                };
+                match Pin::new(&mut command.worker).poll(context) {
+                    Poll::Ready(result) => {
+                        self.command = None;
+                        if result.is_err() {
+                            tracing::error!("blocking artifact reader failed before returning");
+                        }
+                        Poll::Ready(Err(ArtifactError::Unavailable))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for ArtifactReadTask<T> {
+    fn drop(&mut self) {
+        self.cancel();
+        self.handoff_pending_worker();
+    }
+}
+
+struct ArtifactReapCommand {
+    worker: JoinHandle<()>,
+    _capacity: OwnedSemaphorePermit,
+}
+
+struct ArtifactReadReaper {
+    sender: Option<SyncSender<ArtifactReapCommand>>,
+    capacity: Arc<Semaphore>,
+    _thread: Option<ThreadJoinHandle<()>>,
+}
+
+impl ArtifactReadReaper {
+    fn start() -> Self {
+        let capacity = Arc::new(Semaphore::new(MAXIMUM_PENDING_ARTIFACT_REAPS));
+        let (sender, receiver) =
+            sync_channel::<ArtifactReapCommand>(MAXIMUM_PENDING_ARTIFACT_REAPS);
+        let thread = std::thread::Builder::new()
+            .name("market-squawk-artifact-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    Self::reap_worker(command);
+                }
+            });
+        match thread {
+            Ok(thread) => Self {
+                sender: Some(sender),
+                capacity,
+                _thread: Some(thread),
+            },
+            Err(_error) => Self {
+                sender: None,
+                capacity,
+                _thread: None,
+            },
+        }
+    }
+
+    fn ensure_available(&self) -> Result<(), ArtifactError> {
+        if self.sender.is_some() {
+            Ok(())
+        } else {
+            Err(ArtifactError::Unavailable)
+        }
+    }
+
+    fn try_reserve(&self) -> Result<OwnedSemaphorePermit, ArtifactError> {
+        self.ensure_available()?;
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| ArtifactError::Unavailable)
+    }
+
+    fn reap(&self, command: ArtifactReapCommand) {
+        let Some(sender) = self.sender.as_ref() else {
+            self.reap_without_worker_thread(command);
+            return;
+        };
+        // The semaphore and channel have equal capacity, and each queued command retains one
+        // permit. An admitted command therefore already owns a channel slot.
+        if let Err(error) = sender.send(command) {
+            self.reap_without_worker_thread(error.0);
+        }
+    }
+
+    fn reap_without_worker_thread(&self, command: ArtifactReapCommand) {
+        Self::reap_worker(command);
+    }
+
+    fn reap_worker(mut command: ArtifactReapCommand) {
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        loop {
+            match Pin::new(&mut command.worker).poll(&mut context) {
+                Poll::Ready(result) => {
+                    if result.is_err() {
+                        tracing::error!("blocking artifact reader failed while being reaped");
+                    }
+                    drop(command._capacity);
+                    return;
+                }
+                Poll::Pending => std::thread::sleep(ARTIFACT_REAPER_POLL_INTERVAL),
+            }
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the integration-owned shared artifact domain consumes this factory"
+)]
+pub(crate) fn controlled_artifact_repository(
+    root: ArtifactRoot,
+    maximum_bytes: NonZeroUsize,
+) -> Result<Arc<dyn ArtifactRepository>, ArtifactError> {
+    ControlledArtifactRepository::try_new(root, maximum_bytes)
+        .map(|repository| Arc::new(repository) as Arc<dyn ArtifactRepository>)
+}
 
 /// Bounded content-addressed repository under the configured artifact capability.
 #[derive(Debug)]
 pub(super) struct ControlledArtifactRepository {
     root: ArtifactRoot,
     maximum_bytes: NonZeroUsize,
+    reads: ArtifactReadSupervisor,
 }
 
 impl ControlledArtifactRepository {
@@ -36,9 +283,12 @@ impl ControlledArtifactRepository {
         directory
             .create_dir_all(ARTIFACT_NAMESPACE)
             .map_err(|_| ArtifactError::Unavailable)?;
+        let read_capacity = NonZeroUsize::new(MAXIMUM_CONCURRENT_ARTIFACT_READS)
+            .ok_or(ArtifactError::Unavailable)?;
         Ok(Self {
             root,
             maximum_bytes,
+            reads: ArtifactReadSupervisor::try_new(read_capacity)?,
         })
     }
 
@@ -125,6 +375,27 @@ impl ArtifactRepository for ControlledArtifactRepository {
     ) -> Result<ArtifactReference, ArtifactError> {
         self.publish_bounded(&publication, &context)
     }
+
+    async fn read(
+        &self,
+        request: ArtifactReadRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        let root = self.root.clone();
+        let maximum_bytes = self.maximum_bytes;
+        let worker_context = context.clone();
+        self.reads
+            .run(context, move |worker_cancellation| {
+                read_verified_artifact(
+                    &root,
+                    maximum_bytes,
+                    request,
+                    &worker_context,
+                    &worker_cancellation,
+                )
+            })
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -199,6 +470,110 @@ fn read_bounded_regular(
     Ok(bytes)
 }
 
+fn read_verified_artifact(
+    root: &ArtifactRoot,
+    repository_maximum: NonZeroUsize,
+    request: ArtifactReadRequest,
+    context: &ArtifactReadContext,
+    worker_cancellation: &CancellationToken,
+) -> Result<ArtifactRead, ArtifactError> {
+    ensure_artifact_read_live(context, worker_cancellation)?;
+    let reference = request.reference();
+    if reference.id() != format!("mcp-{}", reference.sha256())
+        || reference.media_type() != "application/json"
+    {
+        return Err(ArtifactError::InvalidReference);
+    }
+    if reference.byte_count() > repository_maximum.get()
+        || reference.byte_count() > request.maximum_bytes().get()
+    {
+        return Err(ArtifactError::ReadLimitExceeded);
+    }
+    let prefix = reference
+        .sha256()
+        .get(..2)
+        .ok_or(ArtifactError::InvalidReference)?;
+    let artifact_reference = format!("{ARTIFACT_NAMESPACE}/{prefix}/{}.json", reference.sha256());
+    let artifact_path = Path::new(&artifact_reference);
+    drop(
+        root.resolve(artifact_path)
+            .map_err(|_| ArtifactError::InvalidReference)?,
+    );
+    let directory = root
+        .try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    configure_nonblocking_read(&mut options);
+    let mut file = directory
+        .open_with(artifact_path, &options)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactError::NotFound
+            } else {
+                ArtifactError::Unavailable
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| ArtifactError::Unavailable)?;
+    let size = usize::try_from(metadata.len()).map_err(|_| ArtifactError::Unavailable)?;
+    if !metadata.is_file()
+        || size != reference.byte_count()
+        || size > repository_maximum.get()
+        || size > request.maximum_bytes().get()
+    {
+        return Err(ArtifactError::Unavailable);
+    }
+    let mut content = Vec::new();
+    content
+        .try_reserve_exact(size)
+        .map_err(|_| ArtifactError::ReadLimitExceeded)?;
+    content.resize(size, 0);
+    let mut offset = 0_usize;
+    let mut digest = Sha256::new();
+    while offset < size {
+        ensure_artifact_read_live(context, worker_cancellation)?;
+        let end = offset
+            .checked_add(READ_CHECKPOINT_BYTES)
+            .map(|end| end.min(size))
+            .ok_or(ArtifactError::ReadLimitExceeded)?;
+        let read = file
+            .read(&mut content[offset..end])
+            .map_err(|_| ArtifactError::Unavailable)?;
+        if read == 0 {
+            return Err(ArtifactError::Unavailable);
+        }
+        let read_end = offset
+            .checked_add(read)
+            .ok_or(ArtifactError::ReadLimitExceeded)?;
+        digest.update(&content[offset..read_end]);
+        offset = read_end;
+    }
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|_| ArtifactError::Unavailable)?
+        != 0
+        || format!("{:x}", digest.finalize()) != reference.sha256()
+    {
+        return Err(ArtifactError::Unavailable);
+    }
+    ensure_artifact_read_live(context, worker_cancellation)?;
+    ArtifactRead::try_new(request.into_reference(), content)
+}
+
+fn ensure_artifact_read_live(
+    context: &ArtifactReadContext,
+    worker_cancellation: &CancellationToken,
+) -> Result<(), ArtifactError> {
+    context.ensure_live()?;
+    if worker_cancellation.is_cancelled() {
+        Err(ArtifactError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len().saturating_mul(2));
@@ -256,4 +631,114 @@ fn synchronize_publication_directories(
     _artifact_path: &Path,
 ) -> Result<(), ArtifactError> {
     Err(ArtifactError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            Arc, LazyLock,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use market_squawk_mcp::{ArtifactError, ArtifactReadContext};
+    use tokio_util::sync::CancellationToken;
+
+    use super::ArtifactReadSupervisor;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    static ARTIFACT_READ_TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn dropped_artifact_waiter_is_reaped_and_capacity_recovers_after_worker_exit()
+    -> TestResult {
+        let _serial = ARTIFACT_READ_TEST_SERIAL.lock().await;
+        let supervisor = ArtifactReadSupervisor::try_new(NonZeroUsize::MIN)?;
+        let (started_sender, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let (cancelled_sender, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = mpsc::sync_channel(1);
+        let first_supervisor = supervisor.clone();
+        let first = tokio::spawn(async move {
+            first_supervisor
+                .run(
+                    ArtifactReadContext::new(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(5),
+                    ),
+                    move |worker_cancellation| {
+                        started_sender
+                            .send(())
+                            .map_err(|_| ArtifactError::Unavailable)?;
+                        released.recv().map_err(|_| ArtifactError::Unavailable)?;
+                        cancelled_sender
+                            .send(worker_cancellation.is_cancelled())
+                            .map_err(|_| ArtifactError::Unavailable)?;
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), started.recv()).await,
+            Ok(Some(()))
+        ));
+        first.abort();
+        assert!(first.await.is_err());
+
+        let saturated_worker_started = Arc::new(AtomicBool::new(false));
+        let saturated_worker_observation = Arc::clone(&saturated_worker_started);
+        let saturated = supervisor
+            .run(
+                ArtifactReadContext::new(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                move |_worker_cancellation| {
+                    saturated_worker_observation.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await;
+        assert_eq!(saturated, Err(ArtifactError::Unavailable));
+        assert!(!saturated_worker_started.load(Ordering::Acquire));
+
+        release.send(())?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cancelled.recv()).await?,
+            Some(true)
+        );
+
+        let recovered_starts = Arc::new(AtomicUsize::new(0));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let recovered_observation = Arc::clone(&recovered_starts);
+                match supervisor
+                    .run(
+                        ArtifactReadContext::new(
+                            CancellationToken::new(),
+                            Instant::now() + Duration::from_secs(5),
+                        ),
+                        move |_worker_cancellation| {
+                            recovered_observation.fetch_add(1, Ordering::AcqRel);
+                            Ok(())
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(ArtifactError::Unavailable) => tokio::task::yield_now().await,
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(recovered_starts.load(Ordering::Acquire), 1);
+        Ok(())
+    }
 }
