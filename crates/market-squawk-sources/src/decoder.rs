@@ -208,7 +208,7 @@ impl ProviderBookLevel {
 }
 
 /// Provider side for a typed book change.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProviderBookSide {
     /// Bid-side change.
     Bid,

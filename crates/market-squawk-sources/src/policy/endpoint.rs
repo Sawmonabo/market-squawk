@@ -8,6 +8,51 @@ pub struct EndpointPolicy {
 }
 
 impl EndpointPolicy {
+    /// Creates one policy containing exact endpoints and structurally bounded HTTPS API rules.
+    ///
+    /// This is the composition form for a protocol that requires both a fixed secure WebSocket
+    /// endpoint and one or more REST resources. At least one exact endpoint or API rule is
+    /// required.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid/duplicate exact endpoints, excessive collections, or an empty combined
+    /// policy.
+    pub fn try_new_combined<I, S>(
+        endpoints: I,
+        api_rules: Vec<ApiEndpointRule>,
+        request_bounds: HttpRequestBounds,
+    ) -> Result<Self, NetworkPolicyError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut normalized = Vec::new();
+        for endpoint in endpoints {
+            if normalized.len() == MAX_ENDPOINTS {
+                return Err(NetworkPolicyError::TooManyEndpoints { max: MAX_ENDPOINTS });
+            }
+            let endpoint = NormalizedEndpoint::parse(endpoint.as_ref())?;
+            if normalized.contains(&endpoint) {
+                return Err(NetworkPolicyError::DuplicateEndpoint);
+            }
+            normalized.push(endpoint);
+        }
+        if normalized.is_empty() && api_rules.is_empty() {
+            return Err(NetworkPolicyError::EmptyEndpointSet);
+        }
+        let endpoints = BoundedVec::try_new(normalized)
+            .map_err(|error| NetworkPolicyError::TooManyEndpoints { max: error.max })?;
+        let api_rules = BoundedVec::try_new(api_rules)
+            .map_err(|error| NetworkPolicyError::TooManyEndpoints { max: error.max })?;
+        Ok(Self {
+            endpoints,
+            api_rules,
+            request_bounds,
+            client_profile: HttpClientProfile::hardened(),
+        })
+    }
+
     /// Creates an allowlist with hardened default request bounds.
     ///
     /// # Errors

@@ -23,7 +23,7 @@ pub const COINBASE_EXCHANGE_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.co
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const CONFIGURED_PRODUCTS: &str = "coinbase-exchange-configured-products-v1";
-const CONFIGURED_CHANNELS: &str = "level2+matches+heartbeat";
+const CONFIGURED_CHANNELS: &str = "level2_batch+matches+heartbeat";
 const MAX_PRODUCTS: usize = 100;
 const MAX_PRODUCT_BYTES: usize = 64;
 const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024;
@@ -32,7 +32,7 @@ const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// Closed channel set supported by the pinned Exchange v1 adapter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CoinbaseChannel {
-    /// Full price-level snapshot followed by absolute-size updates.
+    /// Unauthenticated batched price-level snapshot followed by absolute-size updates.
     Level2,
     /// Match and initial `last_match` trade messages.
     Matches,
@@ -43,7 +43,7 @@ pub enum CoinbaseChannel {
 impl CoinbaseChannel {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Level2 => "level2",
+            Self::Level2 => "level2_batch",
             Self::Matches => "matches",
             Self::Heartbeat => "heartbeat",
         }
@@ -414,7 +414,7 @@ pub enum CoinbaseConfigError {
     #[error("Coinbase internal instrument mapping is duplicated")]
     DuplicateInstrument,
     /// The required exact channel profile was missing, duplicated, or extended.
-    #[error("Coinbase channel profile must be exactly level2, matches, and heartbeat")]
+    #[error("Coinbase channel profile must be exactly level2_batch, matches, and heartbeat")]
     InvalidChannelProfile,
     /// Frame or operation timeout bounds were invalid.
     #[error("Coinbase transport limits are invalid")]
@@ -428,4 +428,10 @@ pub enum CoinbaseConfigError {
     /// Validated source metadata did not expose the exact live protocol invariants.
     #[error("Coinbase source metadata is missing its validated live protocol profile")]
     InvalidProtocolProfile,
+    /// Direct profile requires explicit user-authorized read-only market-data evidence.
+    #[error("Coinbase Direct profile requires user-authorized credentials")]
+    InvalidDirectAuthorization,
+    /// Direct snapshot, segmentation, replay, or level-3 owner limits are invalid.
+    #[error("Coinbase Direct bounds are invalid")]
+    InvalidDirectLimits,
 }

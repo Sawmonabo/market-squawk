@@ -3453,6 +3453,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "market-squawk-domain",
+ "market-squawk-live",
  "market-squawk-sources",
  "serde",
  "serde_json",

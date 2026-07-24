@@ -43,7 +43,7 @@ fn official_protocol_fixtures_match_the_pinned_manifest() -> TestResult {
         ("retrieved_at", "2026-07-21"),
         (
             "derivation",
-            "Minimal deterministic fixtures transcribed from the documented snapshot, l2update, match, heartbeat, and subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
+            "Minimal deterministic fixtures transcribed from the documented unauthenticated level2_batch snapshot/update, match, heartbeat, and subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
         ),
         (
             "protocol_revision",
