@@ -1,11 +1,12 @@
 # Coinbase Direct Market Data execution-quality candidate
 
-- Audit date: 2026-07-22 (America/New_York)
+- Initial audit date: 2026-07-22 (America/New_York)
+- Implementation-blocker review: 2026-07-24 (America/New_York)
 - Provider: Coinbase Exchange
 - Candidate endpoint: `wss://ws-direct.exchange.coinbase.com`
 - Candidate channel: authenticated `full`
 - Intended coverage: one Coinbase Exchange venue and explicitly configured products
-- Decision status: implementation candidate; not qualification or release evidence
+- Decision status: blocked production design; not qualification or release evidence
 
 ## Question
 
@@ -26,9 +27,48 @@ sequence numbers and documents the required snapshot/replay algorithm: queue str
 obtain a level-3 snapshot, discard queued messages at or below the snapshot sequence, and replay
 the rest. Sequence gaps can therefore invalidate the generation and require a new snapshot.
 
-This evidence is sufficient to authorize implementation, not to assign `DirectVerified`.
+The 2026-07-24 blocker review found that this evidence is not sufficient to begin with the
+repository's current frame and decoded-payload contracts. A live official BTC-USD level-3 snapshot
+was 6,691,816 bytes and contained 108,522 order rows; the corresponding level-2 snapshot still
+contained 44,102 aggregate price levels. Both exceed current capture or decoded-item bounds.
+Coinbase also documents authentication for `level2` and `full`, a source `time` on REST book
+snapshots, and sequence caveats for authenticated-only messages. The production implementation
+therefore requires bounded segmented HTTP capture, streaming level-3 ownership, a replay phase,
+cursor-only sequence advancement, and an authorized trace proving which authenticated messages
+belong to the public-book sequence domain.
+
 Qualification still requires an authorized live run at the exact release candidate proving every
-source, sequence, snapshot, timestamp, freshness, status, precision, and coverage predicate.
+source, sequence, snapshot, timestamp, freshness, status, precision, rights, and coverage
+predicate.
+
+## 2026-07-24 implementation blockers
+
+1. Coinbase has required authentication for Exchange `level2`, `level3`, and `full`
+   subscriptions since 2023-08-01. The existing unauthenticated `ws-feed` `level2` fallback is
+   stale and must either authenticate or select a documented unauthenticated lower-quality
+   channel.
+2. Coinbase added `time` to REST level-1, level-2, and level-3 book responses on 2023-03-02. That
+   source time initializes snapshot freshness; receive time must not replace it.
+3. A level-3 snapshot is an unpaginated full order book. A production synchronizer must stream it
+   through bounded capture segments into an explicitly bounded order-ID map and derive only the
+   configured top price-level depth for the shared live runtime. Increasing the current single
+   frame or 20,000-item limits is not an acceptable substitute.
+4. Snapshot loading and queued replay must be distinct non-authoritative phases. Only an atomic
+   handoff from a fully drained contiguous replay queue to the same live owner may establish a
+   healthy generation.
+5. `received` and valid unknown-order `done` or `change` messages can advance the exact sequence
+   without publishing a market mutation. Unknown sequenced message types, gaps, regressions,
+   order-map inconsistencies, or any count/byte overflow quarantine the generation and force a
+   completely fresh snapshot.
+6. The onboarding catalog currently describes a credential-free Advanced Trade surface while
+   granting a `DirectVerified` ceiling, but the shipping Exchange adapter is a different
+   `DirectUnverified` surface. The catalog entry must be corrected and a distinct authenticated
+   Exchange Direct profile must bind its endpoint, credential, protocol, rights, and coverage
+   evidence.
+7. Coinbase's Market Data Terms constrain downstream use, including fair-value-related uses.
+   Activation must bind an applicable authorization or enforce a technical data-use boundary that
+   prevents Coinbase-derived evidence from entering disallowed valuation, export, redistribution,
+   or display paths.
 
 ## Provider evidence
 
@@ -47,7 +87,9 @@ source, sequence, snapshot, timestamp, freshness, status, precision, and coverag
 ## Required implementation contract
 
 1. Add a separate authenticated Direct Market Data profile inside the Coinbase adapter package.
-   Preserve the existing public profile and its `DirectUnverified` metadata unchanged.
+   Keep its source identity and generation separate from every public or fallback surface. Correct
+   the existing public profile's stale authentication/channel configuration while retaining its
+   `DirectUnverified` ceiling.
 2. Admit only the exact Direct WebSocket and Exchange REST snapshot endpoints through the source
    endpoint policy.
 3. Accept a redacted, bounded signing capability from application composition. Request read-only
@@ -55,15 +97,18 @@ source, sequence, snapshot, timestamp, freshness, status, precision, and coverag
 4. Limit the baseline configuration to the documented free subscription allowance and use one
    product per full-channel connection by default.
 5. Capture every WebSocket frame before decoding. Queue a count-and-byte-bounded set of sequenced
-   events while a bounded REST level-3 snapshot request is outstanding.
+   events while a bounded, segmented REST level-3 snapshot capture and streaming parse is
+   outstanding. Bind the HTTP method, admitted final URL, status, body length, digest, and every
+   segment into one snapshot receipt.
 6. Commit the snapshot and only the contiguous suffix after its sequence in one instrument-owned
    transition. Overflow, gap, regression, malformed update, generation change, timeout, or
    incomplete replay invalidates the attempt.
 7. Treat unsupported or newly introduced sequenced message types as an integrity break unless the
    pinned protocol revision proves they cannot affect the maintained state. Coinbase permits new
    message types, so silently advancing past an unclassified state-changing event is unsafe.
-8. Require a source timestamp from the first contiguous post-snapshot event before price freshness
-   can become valid. Connection receipt time cannot substitute for venue event time.
+8. Use the required REST snapshot `time` as the initializing source timestamp. When replay has a
+   nonempty contiguous suffix, advance freshness from its last applicable source timestamp.
+   Connection receipt time cannot substitute for venue event time.
 9. Bind current venue status, product identity, tick/lot precision, explicit product coverage,
    source authorization, and current connection generation into qualification.
 10. Publish `DirectVerified` authority only after the central qualifier proves the entire
@@ -112,3 +157,13 @@ Retrieved 2026-07-22:
 - [Coinbase Exchange market-data connection limits](https://help.coinbase.com/en/exchange/managing-my-account/market-data-connections)
 - [Coinbase Exchange API-key creation](https://help.coinbase.com/en/exchange/managing-my-account/how-to-create-an-api-key)
 - [Coinbase Advanced Trade WebSocket channels](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels)
+
+Reviewed 2026-07-24:
+
+- [Coinbase Exchange changelog](https://docs.cdp.coinbase.com/exchange/changes/changelog)
+- [Get product book](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-book)
+- [Get single product](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-single-product)
+- [Coinbase Exchange REST authentication](https://docs.cdp.coinbase.com/exchange/rest-api/authentication)
+- [Coinbase Exchange WebSocket rate limits](https://docs.cdp.coinbase.com/exchange/websocket-feed/rate-limits)
+- [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data)
+- [Live official BTC-USD level-3 endpoint used for the boundedness observation](https://api.exchange.coinbase.com/products/BTC-USD/book?level=3)
