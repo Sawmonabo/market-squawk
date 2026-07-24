@@ -90,11 +90,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   metadata prune are complete.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
-  workflows and clean-machine evidence, provider discovery-to-ingestion, the public
-  analytical-query overflow publisher, a supported production training driver, an ONNX candidate
-  producer/demo, prerequisite-issue reconciliation, and Task 20's integrated demonstration,
-  performance/fuzz/security evidence, final grouped review, exact-head gate, publication, and
-  cleanup.
+  workflows and clean-machine evidence, the public analytical-query overflow publisher, a supported
+  production training driver, an ONNX candidate producer/demo, prerequisite-issue reconciliation,
+  and Task 20's integrated demonstration, performance/fuzz/security evidence, final grouped review,
+  exact-head gate, publication, and cleanup.
 
 ## Documentation candidate and accepted-head truth
 
@@ -106,7 +105,7 @@ for documentation writers:
   `doctor`, with portfolio import/analytics and fair-value workflows routed through the production
   `LocalProduct` and shared application services.
 - The shipping stdio MCP surface is the sole production composition over all 11 required domains
-  and 60 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
+  and 62 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
   capability nor a reference source.
 - Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
   and training components, immutable model bundles, native and tract ONNX inference, governed

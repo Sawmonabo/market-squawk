@@ -666,17 +666,12 @@ three-scope grouped review gates but was rejected on substantiated findings. Cor
 remaining copy/paste and public-query ripples, which accepted head `a2596a6` corrected. The complete
 correction set repairs authority diagrams, fail-fast no-overwrite installation and recovery
 procedures, explicit restore coordinates, historical/current navigation, and public product truth.
-It also records mandatory product gaps that remain release blockers: provider discovery object IDs
-are not publicly
-returned for FRED/BLS/Treasury first-use ingestion; `dataset list` cannot consume its cursor; the
-dataset export digest needed by Python is not exposed; feature builds do not populate the public
-feature-dataset registry; no typed public operation resolves MCP overflow artifacts; `Bot.Start`
-fee admission differs between its descriptor and paper runtime; the shipping secret composition
-lacks the platform's encrypted-file fallback; the sealed Python builder does not construct the
-matching final application bundle; and no supported production training driver or ONNX candidate
-producer/demo exists. Optional external ONNX Runtime remains a library-level path that the current
-product composition does not select. These gaps belong to Tasks 19/19A/20 and must not be described
-as a complete operator workflow.
+At that historical head it also recorded then-open first-use handoff gaps. The 2026-07-24
+integrations below supersede its provider-discovery, dataset-cursor/export, feature-registry,
+artifact-read, paper-fee, and sealed application/worker entries. Current unresolved blockers remain
+the shipping encrypted-secret fallback, a supported production training driver and ONNX candidate
+demonstration, provider qualification and rights outcomes, clean-machine acceptance, and Task 20's
+final release gate.
 
 Accepted exact head `a2596a6ae4dafa9915d2b42cac71635c77c632f8` closed every review finding;
 all three final scopes reported zero Critical, Important, or Minor findings. Documentation Tasks

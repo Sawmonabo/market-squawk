@@ -154,7 +154,7 @@ work is bound by the single canonical
   sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
   paper execution, fair value, MCP, and readiness diagnosis. Mutating operations retain explicit
   confirmation, typed request admission, shared application-service authority, and bounded output.
-- A sole production local stdio MCP composition spanning all 11 required domains and 60 code-owned
+- A sole production local stdio MCP composition spanning all 11 required domains and 62 code-owned
   typed tools. The shared application descriptors enforce schemas, authorization, evidence and
   artifact policy, bounds, deadlines, cancellation, durable audit, controlled artifacts, and
   lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services,
@@ -183,7 +183,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
 | `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery is implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, the shipping secret store does not activate the platform's encrypted-file fallback, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
 | `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
-| `Missing` | complete provider discovery-to-ingestion workflow | FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public command returns the discovery batch needed to select those exact object IDs | Issues `#24`, `#31` / Tasks 19–20 |
 | `Missing` | complete analytical-query overflow publication | Opaque MCP artifacts are now retrievable through bounded `Analysis.ReadArtifact` chunks, but the public DataFusion query compositions still omit the engine's artifact-publication authority and therefore reject non-inline query results | Issue `#25` / Task 20 |
 | `Missing` | supported end-to-end model release demonstration | Dataset export identity, durable feature-dataset selection, and the signed application/validator/ONNX-worker release are composed, but the repository has no supported production training driver or supported ONNX candidate producer/demo | Issue `#25` / Task 20 |
 | `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |

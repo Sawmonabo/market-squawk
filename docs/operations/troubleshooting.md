@@ -196,7 +196,7 @@ MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on
 | --- | --- | --- |
 | Client receives no tools | Initialization handshake or `tools/list` did not complete | Send a supported initialize request, initialized notification, then `tools/list` in order |
 | JSON parse/frame failure | A non-protocol writer contaminated stdout or the frame exceeded bounds | Remove wrapper output from stdout, preserve stderr separately, and restart a fresh session |
-| Unknown tool | Name differs from the exact 60-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
+| Unknown tool | Name differs from the exact 62-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
 | Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain the complete reference and read bounded chunks with `Analysis.ReadArtifact` or `query artifact`; never derive or open a filesystem path |

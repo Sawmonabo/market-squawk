@@ -37,7 +37,7 @@ service registry.
 The reviewed server:
 
 - uses inherited standard input and standard output only;
-- advertises the MCP tools capability and exactly 60 application operations;
+- advertises the MCP tools capability and exactly 62 application operations;
 - does not advertise or serve MCP resources or prompts;
 - forbids MCP task execution for every tool;
 - does not expose an HTTP, WebSocket, or other network transport; and
@@ -90,7 +90,7 @@ The negotiated capability surface is intentionally narrow:
 
 | MCP feature | Reviewed-head behavior |
 | --- | --- |
-| Tools | Advertised; one complete, deterministic 60-tool list |
+| Tools | Advertised; one complete, deterministic 62-tool list |
 | Tool-list pagination | Unsupported; a non-null cursor is invalid parameters |
 | Tool-list change notifications | Not advertised; the list is immutable for the process |
 | Resources | Not advertised and no resource handlers are registered |
@@ -212,12 +212,12 @@ combined item count may not exceed 4,096.
 
 ## Complete tool inventory
 
-The production registry contains exactly 60 tools. “Read” means `read_only` authorization and,
+The production registry contains exactly 62 tools. “Read” means `read_only` authorization and,
 unless stated otherwise, opaque artifact fallback on overflow. “Confirm” means local confirmation
 and inline-only result. “Risk” means risk-mediated authorization, still with `confirm: true` and
 inline-only result.
 
-### Source — 5 tools
+### Source — 7 tools
 
 | Tool | Specific arguments | Effect | Purpose |
 | --- | --- | --- | --- |
@@ -226,9 +226,14 @@ inline-only result.
 | `Source.GetCoverage` | None | Read | Return explicit provider, venue, instrument, and delay coverage |
 | `Source.GetHealth` | None | Read | Return bounded connection, integrity, and freshness health |
 | `Source.Setup` | `provider` | Confirm | Start or resume capability-gated local provider onboarding |
+| `Source.ListObjects` | `provider`, `dataset` | Read | List bounded exact provider objects without minting ingestion authority |
+| `Source.Discover` | `provider`, `dataset` | Confirm | Discover bounded exact provider objects and process-local, receipt-bound ingestion authority |
 
-All five use Source scope. `sourceCoverage`, when supplied to a read, filters the code-owned profile
-surface identifiers and active runtime source identifiers.
+The first five tools use Source scope. `Source.ListObjects` and `Source.Discover` use the dedicated
+source-discovery scope and bind the exact provider and dataset. The listing operation is
+authority-free; the confirmed discovery operation mints a process-local, single-use receipt that
+`Research.IngestSource` must consume. `sourceCoverage`, when supplied to a read, filters the
+code-owned profile surface identifiers and active runtime source identifiers.
 
 ### Market — 6 tools
 

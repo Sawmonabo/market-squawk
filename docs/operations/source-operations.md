@@ -22,6 +22,7 @@ authority-free source status views.
 - [Register a source profile](#register-a-source-profile)
 - [Run the supported Treasury Fiscal Data setup](#run-the-supported-treasury-fiscal-data-setup)
 - [Understand the source activate boundary](#understand-the-source-activate-boundary)
+- [Discover and ingest an exact provider object](#discover-and-ingest-an-exact-provider-object)
 - [Coinbase, Kraken, capture, and bot ceiling](#coinbase-kraken-capture-and-bot-ceiling)
 - [Expected success evidence](#expected-success-evidence)
 - [Rollback and recovery](#rollback-and-recovery)
@@ -40,6 +41,7 @@ source status [PROVIDER]
 source coverage [PROVIDER]
 source health [PROVIDER]
 source setup <PROVIDER> --confirm
+source discover <PROVIDER> --dataset <DATASET>
 source activate <REQUEST> --confirm
 ```
 
@@ -380,6 +382,36 @@ reconstruct or reformat a portal request from status output, and do not use `sou
 a portal activation to try to “make it more active.” An exact idempotent replay is accepted;
 competing configuration for an already active surface is rejected.
 
+## Discover and ingest an exact provider object
+
+After the provider adapter is active and its rights permit the intended operation, list the bounded
+objects in one exact provider dataset namespace:
+
+```bash
+"$MSQ" --config "$CONFIG" --output json \
+  source discover <PROVIDER> --dataset <DATASET>
+```
+
+Copy an exact returned object identifier into the confirmed ingestion command:
+
+```bash
+"$MSQ" --config "$CONFIG" --output json \
+  ingest source <PROVIDER> <OBJECT> --dataset <DATASET> --confirm
+```
+
+The listing calls `Source.ListObjects`. It validates registered-adapter metadata, coverage, quality,
+rights, and result bounds, but mints no ingestion receipt. The ingestion command independently calls
+the confirmed `Source.Discover`, selects the exact provider/dataset/object identity, consumes its
+process-local single-use receipt through `Research.IngestSource`, and publishes only under the
+retained rights and dataset authority. A listing is therefore useful for object selection but can
+never be replayed as ingestion authority.
+
+An MCP client that performs the same workflow calls confirmed `Source.Discover` and passes the
+returned `discoveryReceipt` with the exact provider, dataset, and object to confirmed
+`Research.IngestSource` in the same application process. Receipts are not cross-process
+credentials, cannot authorize a different object, and are revoked when discovery publication
+fails.
+
 ## Coinbase, Kraken, capture, and bot ceiling
 
 The Coinbase and Kraken onboarding profiles declare `direct_verified` as a theoretical code-owned
@@ -444,6 +476,15 @@ extraction completed or that a dataset was published.
 - Runtime absence is explicit rather than guessed.
 - `executionEligibilityUnchanged` remains `true` for status inspection.
 
+### Provider-object discovery and ingestion
+
+- `source discover` returns a bounded exact-object listing with complete source metadata and no
+  authority receipt.
+- For an active, rights-admitted provider, `ingest source` rediscovers and binds the exact selected
+  object before immutable publication.
+- Provider, dataset, object, metadata, coverage, quality, and receipt identity remain consistent;
+  a stale or mismatched selection fails closed.
+
 ## Rollback and recovery
 
 - **Registration was unintended:** there is no unregister command. Registration alone activates
@@ -484,6 +525,7 @@ lifecycle operation; do not remove files or catalog rows by hand.
 | SEC or BLS cannot activate | Reviewed profiles are `refresh_required` | Wait for a new code-owned evidence revision; implementation presence is not release availability |
 | FRED key/import or use is rejected | Profile is `rights_blocked` or per-series evidence is insufficient | Do not import a key; obtain qualified rights and a reviewed profile revision first |
 | Treasury XML cannot publish durably | Its separate rights profile admits retrieve/display but not persistence | Use the available Fiscal Data surface when its dataset fits; never inherit rights across surfaces |
+| Discovery or ingestion rejects an object | Provider activation, rights, exact dataset/object identity, metadata, or the fresh process-local receipt no longer matches | Read current source status, rerun the bounded listing, and retry the exact confirmed ingestion; never fabricate or reuse a receipt |
 | Status shows `currentSession: active` and `runtime: not_active` | Research extraction adapter is active but no live market runtime exists in this process | Treat session/activation evidence as extraction status; do not fabricate live health |
 | Coinbase/Kraken coverage says `direct_verified` but runtime quality does not | Profile ceiling was confused with evidence-derived current qualification | Use runtime quality and the data-quality gate; current shipping ceiling is `DirectUnverified` |
 | Activation request rejects as invalid | Wrong schema version, unknown field/kind, oversized or symlinked input, surface/session mismatch, missing evidence, or bad hash | Use the exact controlled request and evidence root; do not weaken validation |

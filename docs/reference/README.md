@@ -17,7 +17,7 @@ quality semantics, and time/provenance contract at the reviewed product commit.
 | --- | --- |
 | [Command-line interface](cli.md) | Command hierarchy, global options, confirmations, limits, output, and authority mapping |
 | [Configuration and secrets](configuration.md) | Precedence, keys, defaults, environment, provider profiles, secret locators, and reporting |
-| [Model Context Protocol](mcp.md) | Stdio lifecycle, exact 60-tool registry, schemas, annotations, limits, artifacts, audits, and cancellation |
+| [Model Context Protocol](mcp.md) | Stdio lifecycle, exact 62-tool registry, schemas, annotations, limits, artifacts, audits, and cancellation |
 | [Source coverage](source-coverage.md) | Supported adapters, current coverage/quality ceilings, rights, credentials, and health semantics |
 | [Data quality](data-quality.md) | Independent quality classes, `DirectVerified` evidence, transitions, and execution eligibility |
 | [Time and provenance](time-and-provenance.md) | Canonical identifiers, event/research time fields, revision/supersession, and point-in-time rules |

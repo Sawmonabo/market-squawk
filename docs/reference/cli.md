@@ -84,6 +84,7 @@ Configuration precedence, every environment mapping, and the provider-profile co
 | `source coverage [PROVIDER]` | Provider filter is optional | `Source.GetCoverage` |
 | `source health [PROVIDER]` | Provider filter is optional | `Source.GetHealth` |
 | `source setup <PROVIDER> --confirm` | Starts or resumes local onboarding; keeps the bounded loopback portal alive until Ctrl-C or expiry | `Source.Setup` plus the local portal owner |
+| `source discover <PROVIDER> --dataset <DATASET>` | Provider and exact dataset namespace are required | `Source.ListObjects`; bounded listing only, with no ingestion receipt |
 | `source activate <REQUEST> --confirm` | Versioned activation request file, at most 1 MiB | Evidence-bound provider activation and durable restart authority |
 | `capture` | `--products <CSV>` defaults to `BTC-USD`; optional `--seconds <U64>` and `--paper-bot` | Diagnostic Coinbase capture composition, not the production application-service path |
 
