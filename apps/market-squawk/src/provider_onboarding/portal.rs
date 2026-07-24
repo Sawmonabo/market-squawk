@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -342,8 +343,9 @@ async fn handle_request(
         ));
     }
     let request_cancellation = cancellation.child_token();
-    let response = match tokio::time::timeout(
+    let response = match await_portal_request(
         config.request_timeout,
+        request_cancellation.clone(),
         dispatch(
             request,
             service,
@@ -354,14 +356,30 @@ async fn handle_request(
     )
     .await
     {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => map_error(error),
-        Err(_) => {
-            request_cancellation.cancel();
-            error_response(StatusCode::REQUEST_TIMEOUT, "request_timeout")
-        }
+        Some(Ok(response)) => response,
+        Some(Err(error)) => map_error(error),
+        None => error_response(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
     };
     Ok(response)
+}
+
+async fn await_portal_request<F>(
+    timeout: Duration,
+    cancellation: CancellationToken,
+    request: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        output = &mut request => Some(output),
+        () = tokio::time::sleep(timeout) => {
+            cancellation.cancel();
+            None
+        }
+    }
 }
 
 async fn dispatch(
@@ -468,6 +486,55 @@ async fn dispatch(
         }
     }
     Err(PortalRequestError::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct PendingRequest {
+        cancellation: CancellationToken,
+        dropped: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    impl Future for PendingRequest {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRequest {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ignored = dropped.send(self.cancellation.is_cancelled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn portal_timeout_cancels_request_before_dropping_dispatch_waiter() {
+        let cancellation = CancellationToken::new();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        let result = await_portal_request(
+            Duration::ZERO,
+            cancellation.clone(),
+            PendingRequest {
+                cancellation,
+                dropped: Some(dropped_tx),
+            },
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(matches!(dropped_rx.await, Ok(true)));
+    }
 }
 
 fn validate_common_request(

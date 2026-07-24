@@ -184,6 +184,28 @@ fn preferred_store_requires_explicit_memory_only_fallback_unlock() -> TestResult
         preferred.read(&reference, &control),
         Err(LocalSecretStoreError::Locked)
     ));
+    let cancelled_unlock = SecretCancellation::new();
+    cancelled_unlock.cancel();
+    let cancelled_unlock_control = SecretOperationControl::try_new(
+        "provider-onboarding-cancelled-unlock",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        cancelled_unlock,
+    )?;
+    assert!(matches!(
+        preferred.unlock_encrypted_file_fallback(
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "correct unlock phrase".to_owned()
+            )?),
+            &cancelled_unlock_control,
+        ),
+        Err(LocalSecretStoreError::OperationCancelled)
+    ));
+    assert_eq!(
+        preferred.encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Locked
+    );
     assert!(matches!(
         preferred.unlock_encrypted_file_fallback(
             EncryptedFileUnlockCapability::new(SecretValue::new(
@@ -205,6 +227,27 @@ fn preferred_store_requires_explicit_memory_only_fallback_unlock() -> TestResult
             )?),
             &control,
         )?,
+        EncryptedFileFallbackStatus::Ready
+    );
+    assert_eq!(
+        preferred.read(&reference, &control)?.expose_secret(),
+        "fallback-only credential"
+    );
+    let cancelled_lock = SecretCancellation::new();
+    cancelled_lock.cancel();
+    let cancelled_lock_control = SecretOperationControl::try_new(
+        "provider-onboarding-cancelled-lock",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        cancelled_lock,
+    )?;
+    assert!(matches!(
+        preferred.lock_encrypted_file_fallback(&cancelled_lock_control),
+        Err(LocalSecretStoreError::OperationCancelled)
+    ));
+    assert_eq!(
+        preferred.encrypted_file_fallback_status()?,
         EncryptedFileFallbackStatus::Ready
     );
     assert_eq!(

@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,65 @@ pub enum EncryptedFileFallbackStatus {
 struct ConfiguredEncryptedFileFallback {
     root: PathBuf,
     store: Mutex<Option<EncryptedFileSecretStore>>,
+}
+
+struct FallbackStateTransition<'a, T> {
+    state: MutexGuard<'a, Option<T>>,
+    prior: Option<Option<T>>,
+}
+
+impl<'a, T> FallbackStateTransition<'a, T> {
+    fn begin(mut state: MutexGuard<'a, Option<T>>, candidate: Option<T>) -> Self {
+        let prior = std::mem::replace(&mut *state, candidate);
+        Self {
+            state,
+            prior: Some(prior),
+        }
+    }
+
+    fn commit(mut self) {
+        drop(self.prior.take());
+    }
+
+    fn rollback(mut self) {
+        self.restore_prior();
+    }
+
+    fn restore_prior(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            let candidate = std::mem::replace(&mut *self.state, prior);
+            drop(candidate);
+        }
+    }
+}
+
+impl<T> Drop for FallbackStateTransition<'_, T> {
+    fn drop(&mut self) {
+        self.restore_prior();
+    }
+}
+
+fn commit_fallback_state_transition<T>(
+    state: MutexGuard<'_, Option<T>>,
+    candidate: Option<T>,
+    committed_status: EncryptedFileFallbackStatus,
+    mutation_postflight: impl FnOnce() -> Result<(), LocalSecretStoreError>,
+    rollback_postflight: impl FnOnce() -> Result<(), LocalSecretStoreError>,
+) -> Result<EncryptedFileFallbackStatus, LocalSecretStoreError> {
+    let transition = FallbackStateTransition::begin(state, candidate);
+    match mutation_postflight() {
+        Ok(()) => {
+            transition.commit();
+            Ok(committed_status)
+        }
+        Err(indeterminate) => {
+            transition.rollback();
+            match rollback_postflight() {
+                Ok(()) => Err(indeterminate),
+                Err(definite_boundary) => Err(definite_boundary),
+            }
+        }
+    }
 }
 
 impl ConfiguredEncryptedFileFallback {
@@ -241,18 +300,23 @@ impl SecretStore for PreferredSecretStore {
             SecretBackend::EncryptedFile,
             super::SecretInteractionCapability::Never,
         ))?;
-        let mut store = fallback
+        let store = fallback
             .store
             .lock()
             .map_err(|_error| LocalSecretStoreError::WriterUnavailable)?;
         if store.is_some() {
+            control.read_postflight()?;
             return Ok(EncryptedFileFallbackStatus::Ready);
         }
         let opened = EncryptedFileSecretStore::try_open(&fallback.root, unlock.0)?;
         opened.validate_current_unlock(control)?;
-        *store = Some(opened);
-        control.mutation_postflight()?;
-        Ok(EncryptedFileFallbackStatus::Ready)
+        commit_fallback_state_transition(
+            store,
+            Some(opened),
+            EncryptedFileFallbackStatus::Ready,
+            || control.mutation_postflight(),
+            || control.read_postflight(),
+        )
     }
 
     fn lock_encrypted_file_fallback(
@@ -264,14 +328,21 @@ impl SecretStore for PreferredSecretStore {
             SecretBackend::EncryptedFile,
             super::SecretInteractionCapability::Never,
         ))?;
-        let prior = fallback
+        let store = fallback
             .store
             .lock()
-            .map_err(|_error| LocalSecretStoreError::WriterUnavailable)?
-            .take();
-        drop(prior);
-        control.mutation_postflight()?;
-        Ok(EncryptedFileFallbackStatus::Locked)
+            .map_err(|_error| LocalSecretStoreError::WriterUnavailable)?;
+        if store.is_none() {
+            control.read_postflight()?;
+            return Ok(EncryptedFileFallbackStatus::Locked);
+        }
+        commit_fallback_state_transition(
+            store,
+            None,
+            EncryptedFileFallbackStatus::Locked,
+            || control.mutation_postflight(),
+            || control.read_postflight(),
+        )
     }
 
     fn probe(
@@ -368,6 +439,66 @@ impl SecretStore for PreferredSecretStore {
 
     fn load(&self, key: &SecretKey) -> Result<SecretValue, LocalSecretStoreError> {
         self.primary.load(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_unlock_transition_restores_locked_authority() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let state = Mutex::new(None);
+
+        let result = commit_fallback_state_transition(
+            state
+                .lock()
+                .map_err(|_| "fallback state lock was poisoned")?,
+            Some(7_u8),
+            EncryptedFileFallbackStatus::Ready,
+            || Err(LocalSecretStoreError::IndeterminateCompletion),
+            || Err(LocalSecretStoreError::OperationCancelled),
+        );
+
+        assert!(matches!(
+            result,
+            Err(LocalSecretStoreError::OperationCancelled)
+        ));
+        assert_eq!(
+            *state
+                .lock()
+                .map_err(|_| "fallback state lock was poisoned")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_lock_transition_restores_ready_authority() -> Result<(), Box<dyn std::error::Error>> {
+        let state = Mutex::new(Some(11_u8));
+
+        let result = commit_fallback_state_transition(
+            state
+                .lock()
+                .map_err(|_| "fallback state lock was poisoned")?,
+            None,
+            EncryptedFileFallbackStatus::Locked,
+            || Err(LocalSecretStoreError::IndeterminateCompletion),
+            || Err(LocalSecretStoreError::DeadlineExceeded),
+        );
+
+        assert!(matches!(
+            result,
+            Err(LocalSecretStoreError::DeadlineExceeded)
+        ));
+        assert_eq!(
+            *state
+                .lock()
+                .map_err(|_| "fallback state lock was poisoned")?,
+            Some(11)
+        );
+        Ok(())
     }
 }
 
