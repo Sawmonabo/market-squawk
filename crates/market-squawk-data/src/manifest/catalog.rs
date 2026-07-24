@@ -8,7 +8,10 @@ use std::time::Instant;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
 use market_squawk_platform::{CatalogFileGuard, CatalogLocation};
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior,
+    params,
+};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -26,6 +29,15 @@ use crate::{
 };
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
+const FEATURE_DATASET_MEMBERSHIP_CHUNK: usize = 128;
+const MAX_FEATURE_DATASET_LEGACY_CANDIDATES: usize = 4_096;
+const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
+
+/// Maximum immutable Python dataset-admission rows retained by one local catalog.
+pub const MAX_RETAINED_PYTHON_DATASET_ADMISSIONS: usize = 4_096;
+
+/// Maximum canonical descriptor bytes retained across all Python dataset admissions.
+pub const MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES: usize = 256 * 1024 * 1024;
 
 /// One manifest-pinned object resolved from immutable catalog metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +141,13 @@ pub(crate) struct CatalogFeatureDatasetPage {
     pub(crate) datasets: Vec<CatalogFeatureDataset>,
     pub(crate) has_more: bool,
     pub(crate) available: usize,
+    pub(crate) overlapping_legacy_dataset_ids: Vec<DatasetId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CatalogFeatureDatasetSelection<'a> {
+    Exact(&'a DatasetId),
+    Page { after: Option<&'a DatasetId> },
 }
 
 type RetainedFeatureDatasetAdmission =
@@ -182,12 +201,28 @@ impl AnalyticalManifestCatalog {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
             [],
             |row| row.get(0),
         )?;
         if !migrated {
             return Err(ManifestCatalogError::MigrationMissing);
+        }
+        let retention_is_consistent: bool = connection.query_row(
+            "SELECT retained_rows = (
+                        SELECT COUNT(*) FROM python_dataset_admissions
+                    )
+                    AND retained_descriptor_bytes = (
+                        SELECT COALESCE(SUM(length(descriptor_json)), 0)
+                        FROM python_dataset_admissions
+                    )
+             FROM python_dataset_admission_retention
+             WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !retention_is_consistent {
+            return Err(ManifestCatalogError::CorruptCatalog);
         }
         catalog_file.validate_identity()?;
         Ok(Self {
@@ -859,145 +894,58 @@ impl AnalyticalManifestCatalog {
         })
     }
 
-    pub(crate) fn read_feature_dataset_page(
+    pub(crate) fn read_feature_dataset_snapshot(
         &self,
-        after: Option<&DatasetId>,
+        selection: CatalogFeatureDatasetSelection<'_>,
+        legacy_candidates: &[DatasetId],
         limit: usize,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<CatalogFeatureDatasetPage, ManifestCatalogError> {
         check_read_operation(deadline, cancellation)?;
-        let retrieval_limit = limit
-            .checked_add(1)
-            .ok_or(ManifestCatalogError::CountOverflow)?;
-        let retrieval_limit_sql =
-            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
-        let connection = self.lock()?;
-        let available_sql: i64 = connection.query_row(
-            "SELECT COUNT(DISTINCT dataset_id) FROM python_dataset_admissions",
-            [],
-            |row| row.get(0),
-        )?;
-        let available =
-            usize::try_from(available_sql).map_err(|_| ManifestCatalogError::CountOverflow)?;
-        let mut statement = connection.prepare(
-            "WITH latest AS (
-                 SELECT dataset_id, MAX(manifest_version) AS manifest_version
-                 FROM python_dataset_admissions
-                 WHERE dataset_id>?1
-                 GROUP BY dataset_id
-                 ORDER BY dataset_id
-                 LIMIT ?2
-             )
-             SELECT generation.dataset_id, generation.manifest_version,
-                    generation.schema_name, generation.schema_version,
-                    generation.schema_fingerprint, generation.content_hash,
-                    admission.export_sha256, admission.descriptor_json
-             FROM latest
-             JOIN analytical_generations AS generation USING (dataset_id, manifest_version)
-             JOIN python_dataset_admissions AS admission USING (dataset_id, manifest_version)
-             ORDER BY generation.dataset_id",
-        )?;
-        let rows = statement.query_map(
-            params![
-                after.map(DatasetId::as_str).unwrap_or_default(),
-                retrieval_limit_sql
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
-                ))
-            },
-        )?;
-        let mut admissions = Vec::new();
-        admissions
-            .try_reserve_exact(retrieval_limit)
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        for row in rows {
-            check_read_operation(deadline, cancellation)?;
-            admissions.push(row?);
+        if legacy_candidates.len() > MAX_FEATURE_DATASET_LEGACY_CANDIDATES {
+            return Err(ManifestCatalogError::FeatureDatasetCandidateLimitExceeded {
+                max_candidates: MAX_FEATURE_DATASET_LEGACY_CANDIDATES,
+            });
         }
-        drop(statement);
-        let has_more = admissions.len() > limit;
-        admissions.truncate(limit);
-
-        let mut datasets = Vec::new();
-        datasets
-            .try_reserve_exact(admissions.len())
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        for admission in admissions {
-            check_read_operation(deadline, cancellation)?;
-            datasets.push(load_feature_dataset_admission(
-                &connection,
-                admission,
-                self.max_objects_per_generation,
-                deadline,
-                cancellation,
-            )?);
-        }
-        check_read_operation(deadline, cancellation)?;
-        Ok(CatalogFeatureDatasetPage {
-            datasets,
-            has_more,
-            available,
-        })
-    }
-
-    pub(crate) fn read_feature_dataset(
-        &self,
-        dataset_id: &DatasetId,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<CatalogFeatureDataset>, ManifestCatalogError> {
-        check_read_operation(deadline, cancellation)?;
-        let connection = self.lock()?;
-        let admission: Option<RetainedFeatureDatasetAdmission> = connection
-            .query_row(
-                "SELECT generation.dataset_id, generation.manifest_version,
-                        generation.schema_name, generation.schema_version,
-                        generation.schema_fingerprint, generation.content_hash,
-                        admission.export_sha256, admission.descriptor_json
-                 FROM python_dataset_admissions AS admission
-                 JOIN analytical_generations AS generation
-                   USING (dataset_id, manifest_version)
-                 WHERE generation.dataset_id=?1
-                 ORDER BY generation.manifest_version DESC
-                 LIMIT 1",
-                [dataset_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let dataset = admission
-            .map(|admission| {
-                load_feature_dataset_admission(
-                    &connection,
+        let mut connection = self.lock()?;
+        let token = cancellation.clone();
+        connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let operation = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let overlapping_legacy_dataset_ids =
+                feature_dataset_overlaps(&transaction, legacy_candidates, deadline, cancellation)?;
+            let (admissions, has_more, available) =
+                feature_dataset_admissions(&transaction, selection, limit, deadline, cancellation)?;
+            let mut datasets = Vec::new();
+            datasets
+                .try_reserve_exact(admissions.len())
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            for admission in admissions {
+                check_read_operation(deadline, cancellation)?;
+                datasets.push(load_feature_dataset_admission(
+                    &transaction,
                     admission,
                     self.max_objects_per_generation,
                     deadline,
                     cancellation,
-                )
+                )?);
+            }
+            check_read_operation(deadline, cancellation)?;
+            transaction.commit()?;
+            Ok(CatalogFeatureDatasetPage {
+                datasets,
+                has_more,
+                available,
+                overlapping_legacy_dataset_ids,
             })
-            .transpose()?;
-        check_read_operation(deadline, cancellation)?;
-        Ok(dataset)
+        })();
+        connection.progress_handler::<fn() -> bool>(0, None)?;
+        operation.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
     /// Resolves only candidate reachability in bounded chunks under one consistent read snapshot.
@@ -1069,6 +1017,183 @@ impl AnalyticalManifestCatalog {
         self.connection
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
+    }
+}
+
+fn feature_dataset_admissions(
+    transaction: &Transaction<'_>,
+    selection: CatalogFeatureDatasetSelection<'_>,
+    limit: usize,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<RetainedFeatureDatasetAdmission>, bool, usize), ManifestCatalogError> {
+    check_read_operation(deadline, cancellation)?;
+    let after = match selection {
+        CatalogFeatureDatasetSelection::Exact(dataset_id) => {
+            let admission = transaction
+                .query_row(
+                    "SELECT generation.dataset_id, generation.manifest_version,
+                            generation.schema_name, generation.schema_version,
+                            generation.schema_fingerprint, generation.content_hash,
+                            admission.export_sha256, admission.descriptor_json
+                     FROM python_dataset_admissions AS admission
+                     JOIN analytical_generations AS generation
+                       USING (dataset_id, manifest_version)
+                     WHERE generation.dataset_id=?1
+                     ORDER BY generation.manifest_version DESC
+                     LIMIT 1",
+                    [dataset_id.as_str()],
+                    retained_feature_dataset_admission,
+                )
+                .optional()?;
+            let available = usize::from(admission.is_some());
+            let mut admissions = Vec::new();
+            admissions
+                .try_reserve_exact(available)
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            admissions.extend(admission);
+            return Ok((admissions, false, available));
+        }
+        CatalogFeatureDatasetSelection::Page { after } => after,
+    };
+    let after = after.map(DatasetId::as_str).unwrap_or_default();
+    let available_sql: i64 = transaction.query_row(
+        "SELECT COUNT(DISTINCT dataset_id)
+         FROM python_dataset_admissions
+         WHERE dataset_id>?1",
+        [after],
+        |row| row.get(0),
+    )?;
+    let available =
+        usize::try_from(available_sql).map_err(|_| ManifestCatalogError::CountOverflow)?;
+    let retrieval_limit = limit
+        .checked_add(1)
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    let retrieval_limit_sql =
+        i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
+    let mut statement = transaction.prepare(
+        "WITH latest AS (
+             SELECT dataset_id, MAX(manifest_version) AS manifest_version
+             FROM python_dataset_admissions
+             WHERE dataset_id>?1
+             GROUP BY dataset_id
+             ORDER BY dataset_id
+             LIMIT ?2
+         )
+         SELECT generation.dataset_id, generation.manifest_version,
+                generation.schema_name, generation.schema_version,
+                generation.schema_fingerprint, generation.content_hash,
+                admission.export_sha256, admission.descriptor_json
+         FROM latest
+         JOIN analytical_generations AS generation USING (dataset_id, manifest_version)
+         JOIN python_dataset_admissions AS admission USING (dataset_id, manifest_version)
+         ORDER BY generation.dataset_id",
+    )?;
+    let rows = statement.query_map(
+        params![after, retrieval_limit_sql],
+        retained_feature_dataset_admission,
+    )?;
+    let mut admissions = Vec::new();
+    admissions
+        .try_reserve_exact(retrieval_limit)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for row in rows {
+        check_read_operation(deadline, cancellation)?;
+        admissions.push(row?);
+    }
+    drop(statement);
+    let has_more = admissions.len() > limit;
+    admissions.truncate(limit);
+    if admissions.len() > available || has_more != (admissions.len() < available) {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    Ok((admissions, has_more, available))
+}
+
+fn retained_feature_dataset_admission(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RetainedFeatureDatasetAdmission> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn feature_dataset_overlaps(
+    transaction: &Transaction<'_>,
+    legacy_candidates: &[DatasetId],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Vec<DatasetId>, ManifestCatalogError> {
+    let mut overlaps = Vec::new();
+    overlaps
+        .try_reserve_exact(legacy_candidates.len())
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for candidates in legacy_candidates.chunks(FEATURE_DATASET_MEMBERSHIP_CHUNK) {
+        check_read_operation(deadline, cancellation)?;
+        let query_capacity = candidates
+            .len()
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(192))
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let mut query = String::new();
+        query
+            .try_reserve_exact(query_capacity)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        query.push_str(
+            "SELECT DISTINCT dataset_id FROM python_dataset_admissions WHERE dataset_id IN (",
+        );
+        for index in 0..candidates.len() {
+            if index > 0 {
+                query.push(',');
+            }
+            write!(&mut query, "?{}", index + 1)
+                .map_err(|_| ManifestCatalogError::AllocationContract)?;
+        }
+        query.push_str(") ORDER BY dataset_id");
+        let mut statement = transaction.prepare(&query)?;
+        for (index, candidate) in candidates.iter().enumerate() {
+            statement.raw_bind_parameter(index + 1, candidate.as_str())?;
+        }
+        let mut rows = statement.raw_query();
+        while let Some(row) = rows.next()? {
+            check_read_operation(deadline, cancellation)?;
+            let dataset = row.get::<_, String>(0)?;
+            overlaps.push(DatasetId::try_from(dataset.as_str())?);
+        }
+    }
+    overlaps.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    overlaps.dedup_by(|left, right| left == right);
+    if overlaps.len() > legacy_candidates.len() {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    Ok(overlaps)
+}
+
+fn classify_sqlite_interrupt(
+    error: ManifestCatalogError,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> ManifestCatalogError {
+    match error {
+        ManifestCatalogError::Sqlite(sqlite)
+            if sqlite.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) =>
+        {
+            if cancellation.is_cancelled() {
+                ManifestCatalogError::Cancelled
+            } else if Instant::now() >= deadline {
+                ManifestCatalogError::DeadlineExceeded
+            } else {
+                ManifestCatalogError::Sqlite(sqlite)
+            }
+        }
+        error => error,
     }
 }
 
@@ -1194,6 +1319,11 @@ pub enum ManifestCatalogError {
     /// Candidate reachability work exceeds the explicit operation ceiling.
     #[error("analytical reference lookup exceeds the {max_candidates}-candidate work ceiling")]
     ReferenceWorkLimitExceeded { max_candidates: usize },
+    /// Legacy/durable overlap work exceeded the fixed candidate ceiling.
+    #[error(
+        "analytical feature-dataset overlap lookup exceeds the {max_candidates}-candidate ceiling"
+    )]
+    FeatureDatasetCandidateLimitExceeded { max_candidates: usize },
     /// Candidate reachability was cancelled before its read snapshot completed.
     #[error("analytical reference lookup was cancelled")]
     Cancelled,

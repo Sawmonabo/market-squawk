@@ -713,6 +713,7 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         ManifestCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         ManifestCatalogError::ObjectLimitExceeded { .. }
         | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
+        | ManifestCatalogError::FeatureDatasetCandidateLimitExceeded { .. }
         | ManifestCatalogError::CountOverflow
         | ManifestCatalogError::AllocationContract => ServiceError::ResourceExhausted,
         ManifestCatalogError::InvalidConfiguration

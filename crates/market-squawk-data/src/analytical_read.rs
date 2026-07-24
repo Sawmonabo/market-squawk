@@ -9,7 +9,10 @@ use market_squawk_domain::{InstrumentId, SourceId, Timestamp};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::manifest::{CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogGenerationPage};
+use crate::manifest::{
+    CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
+    CatalogGenerationPage,
+};
 use crate::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DatasetSchemaRegistry, DatasetSplitCounts, GenerationKind, GenerationParent,
@@ -239,12 +242,22 @@ impl AnalyticalFeatureDataset {
     }
 }
 
+/// Closed exact-or-page selector for one coherent feature-dataset catalog snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnalyticalFeatureDatasetSelection<'a> {
+    /// Resolve only the latest durable generation for one exact identity.
+    Exact(&'a DatasetId),
+    /// Resolve the durable identity suffix strictly after an optional cursor.
+    Page { after: Option<&'a DatasetId> },
+}
+
 /// One stable bounded page of durable Python-admitted feature datasets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyticalFeatureDatasetPage {
     datasets: Box<[AnalyticalFeatureDataset]>,
     has_more: bool,
     available: usize,
+    overlapping_legacy_dataset_ids: Box<[DatasetId]>,
 }
 
 impl AnalyticalFeatureDatasetPage {
@@ -259,6 +272,7 @@ impl AnalyticalFeatureDatasetPage {
             datasets,
             has_more: page.has_more,
             available: page.available,
+            overlapping_legacy_dataset_ids: page.overlapping_legacy_dataset_ids.into_boxed_slice(),
         })
     }
 
@@ -272,9 +286,14 @@ impl AnalyticalFeatureDatasetPage {
         self.has_more
     }
 
-    /// Returns the exact number of latest admitted dataset identities in the catalog snapshot.
+    /// Returns the exact number of admitted durable identities in the selected cursor suffix.
     pub const fn available(&self) -> usize {
         self.available
+    }
+
+    /// Returns bounded legacy identities also present in the same durable catalog snapshot.
+    pub fn overlapping_legacy_dataset_ids(&self) -> &[DatasetId] {
+        &self.overlapping_legacy_dataset_ids
     }
 }
 
@@ -489,8 +508,40 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalFeatureDatasetPage, AnalyticalReadError> {
+        self.feature_dataset_snapshot(
+            AnalyticalFeatureDatasetSelection::Page { after },
+            &[],
+            limit,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Reads one exact or cursor-relative durable page and bounded legacy overlap set atomically.
+    pub fn feature_dataset_snapshot(
+        &self,
+        selection: AnalyticalFeatureDatasetSelection<'_>,
+        legacy_candidates: &[DatasetId],
+        limit: AnalyticalReadLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AnalyticalFeatureDatasetPage, AnalyticalReadError> {
+        let selection = match selection {
+            AnalyticalFeatureDatasetSelection::Exact(dataset_id) => {
+                CatalogFeatureDatasetSelection::Exact(dataset_id)
+            }
+            AnalyticalFeatureDatasetSelection::Page { after } => {
+                CatalogFeatureDatasetSelection::Page { after }
+            }
+        };
         self.manifests
-            .read_feature_dataset_page(after, limit.get(), deadline, cancellation)
+            .read_feature_dataset_snapshot(
+                selection,
+                legacy_candidates,
+                limit.get(),
+                deadline,
+                cancellation,
+            )
             .map_err(AnalyticalReadError::from)
             .and_then(AnalyticalFeatureDatasetPage::from_catalog)
     }
@@ -502,11 +553,18 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<AnalyticalFeatureDataset>, AnalyticalReadError> {
-        self.manifests
-            .read_feature_dataset(dataset_id, deadline, cancellation)
-            .map_err(AnalyticalReadError::from)?
-            .map(AnalyticalFeatureDataset::from_catalog)
-            .transpose()
+        Ok(self
+            .feature_dataset_snapshot(
+                AnalyticalFeatureDatasetSelection::Exact(dataset_id),
+                &[],
+                AnalyticalReadLimit::try_new(1)?,
+                deadline,
+                cancellation,
+            )?
+            .datasets
+            .into_vec()
+            .into_iter()
+            .next())
     }
 
     /// Resolves the latest immutable generation for one dataset.

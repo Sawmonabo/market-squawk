@@ -10,22 +10,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{StringArray, TimestampNanosecondArray, UInt32Array};
 use market_squawk_data::{
-    AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalObservationReadRequest,
-    AnalyticalObservationTemplate, AnalyticalReadLimit, CatalogAuthority, CatalogConfig,
-    CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset,
-    CompactionRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
-    ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
-    CorporateActionPolicy, CorporateActionSensitivity, DatasetBuildError, DatasetBuildInputs,
-    DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetId,
-    DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRegistry,
-    FeatureLabelComponentInput, FeatureLabelComponentSpec, IngestError, IngestIdentity,
-    MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, ObservationKnowledgeRange,
-    ParquetStoreError, PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode,
-    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, ResearchUse,
-    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
-    Sha256Digest, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
-    extraction_batch_digest,
+    AnalyticalDataService, AnalyticalFeatureDatasetSelection, AnalyticalManifestCatalog,
+    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadError,
+    AnalyticalReadLimit, CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit,
+    CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset, CompactionRequest,
+    ComponentAdjustmentEvidence, ComponentKind, ComponentScope, ComponentSelector, ComponentValue,
+    CorporateActionAdjustment, CorporateActionLimits, CorporateActionPolicy,
+    CorporateActionSensitivity, DatasetBuildError, DatasetBuildInputs, DatasetBuildLimits,
+    DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetId, DatasetManifestRef,
+    DatasetOutputAuthorization, DatasetSchemaRegistry, FeatureLabelComponentInput,
+    FeatureLabelComponentSpec, IngestError, IngestIdentity, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
+    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, MissingValuePolicy,
+    ObjectStoreConfig, ObservationFamilyKey, ObservationKnowledgeRange, ParquetStoreError,
+    PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
+    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
+    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
+    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
+    UniverseMembership, extraction_batch_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -1141,6 +1142,164 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
             .map(SourceId::as_str)
             .collect::<Vec<_>>(),
         vec!["fred-local-fixture"]
+    );
+    let overlap_candidate = built.manifest().dataset_id().clone();
+    let legacy_only_candidate = DatasetId::try_from("derived.feature-labels.legacy-only-snapshot")?;
+    let legacy_candidates = [overlap_candidate.clone(), legacy_only_candidate];
+    let snapshot = reader.feature_dataset_snapshot(
+        AnalyticalFeatureDatasetSelection::Page { after: None },
+        &legacy_candidates,
+        AnalyticalReadLimit::try_new(8)?,
+        deadline,
+        &cancellation,
+    )?;
+    assert_eq!(snapshot.available(), 1);
+    assert_eq!(snapshot.datasets().len(), 1);
+    assert_eq!(
+        snapshot.overlapping_legacy_dataset_ids(),
+        std::slice::from_ref(&overlap_candidate)
+    );
+    let exhausted_snapshot = reader.feature_dataset_snapshot(
+        AnalyticalFeatureDatasetSelection::Page {
+            after: Some(&overlap_candidate),
+        },
+        &legacy_candidates,
+        AnalyticalReadLimit::try_new(8)?,
+        deadline,
+        &cancellation,
+    )?;
+    assert_eq!(exhausted_snapshot.available(), 0);
+    assert!(exhausted_snapshot.datasets().is_empty());
+    assert_eq!(
+        exhausted_snapshot.overlapping_legacy_dataset_ids(),
+        std::slice::from_ref(&overlap_candidate)
+    );
+    let exact_snapshot = reader.feature_dataset_snapshot(
+        AnalyticalFeatureDatasetSelection::Exact(&overlap_candidate),
+        std::slice::from_ref(&overlap_candidate),
+        AnalyticalReadLimit::try_new(1)?,
+        deadline,
+        &cancellation,
+    )?;
+    assert_eq!(exact_snapshot.available(), 1);
+    assert_eq!(exact_snapshot.datasets().len(), 1);
+    assert_eq!(
+        exact_snapshot.overlapping_legacy_dataset_ids(),
+        std::slice::from_ref(&overlap_candidate)
+    );
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        reader.feature_dataset_snapshot(
+            AnalyticalFeatureDatasetSelection::Page { after: None },
+            &legacy_candidates,
+            AnalyticalReadLimit::try_new(8)?,
+            Instant::now() + Duration::from_secs(30),
+            &cancelled,
+        ),
+        Err(AnalyticalReadError::Manifest(
+            ManifestCatalogError::Cancelled
+        ))
+    ));
+    assert!(matches!(
+        reader.feature_dataset_snapshot(
+            AnalyticalFeatureDatasetSelection::Page { after: None },
+            &legacy_candidates,
+            AnalyticalReadLimit::try_new(8)?,
+            Instant::now(),
+            &CancellationToken::new(),
+        ),
+        Err(AnalyticalReadError::Manifest(
+            ManifestCatalogError::DeadlineExceeded
+        ))
+    ));
+
+    let bounds_paths = LocalPaths::prepare(directory.path().join("admission-bounds"))?;
+    let bounds_location = bounds_paths.catalog()?.clone();
+    drop(CatalogAuthority::open(test_catalog_config(
+        bounds_location.clone(),
+    )?)?);
+    let bounds = rusqlite::Connection::open(bounds_location.path())?;
+    bounds.pragma_update(None, "foreign_keys", "OFF")?;
+    let retained: (i64, i64) = bounds.query_row(
+        "SELECT retained_rows, retained_descriptor_bytes
+         FROM python_dataset_admission_retention
+         WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(retained, (0, 0));
+    bounds.execute(
+        "INSERT INTO python_dataset_admissions
+         (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
+          selection_digest_version, registered_at_ns)
+         VALUES (?1, ?2, 'bounds-fixture', 1, ?3, 1, 1)",
+        params![[1_u8; 32], [2_u8; 32], b"{}".as_slice()],
+    )?;
+    assert_eq!(
+        bounds.query_row(
+            "SELECT retained_rows, retained_descriptor_bytes
+             FROM python_dataset_admission_retention
+             WHERE singleton=1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?,
+        (1, 2)
+    );
+    bounds.execute(
+        "UPDATE python_dataset_admission_retention
+         SET retained_rows=?1, retained_descriptor_bytes=?2
+         WHERE singleton=1",
+        params![
+            i64::try_from(MAX_RETAINED_PYTHON_DATASET_ADMISSIONS)?,
+            i64::try_from(MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES)?
+        ],
+    )?;
+    assert_eq!(
+        bounds.execute(
+            "INSERT OR IGNORE INTO python_dataset_admissions
+             (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
+              selection_digest_version, registered_at_ns)
+             VALUES (?1, ?2, 'bounds-fixture', 1, ?3, 1, 1)",
+            params![[1_u8; 32], [2_u8; 32], b"{}".as_slice()],
+        )?,
+        0,
+        "an ignored immutable replay must not consume retained budget"
+    );
+    assert!(
+        bounds
+            .execute(
+                "INSERT INTO python_dataset_admissions
+                 (export_sha256, catalog_identity, dataset_id, manifest_version, descriptor_json,
+                  selection_digest_version, registered_at_ns)
+                 VALUES (?1, ?2, 'bounds-overflow', 1, ?3, 1, 2)",
+                params![[3_u8; 32], [2_u8; 32], b"{}".as_slice()],
+            )
+            .is_err(),
+        "a new retained admission must not cross either immutable ceiling"
+    );
+    assert!(
+        bounds
+            .execute(
+                "UPDATE python_dataset_admission_retention
+                 SET retained_rows=?1
+                 WHERE singleton=1",
+                [i64::try_from(MAX_RETAINED_PYTHON_DATASET_ADMISSIONS)? + 1],
+            )
+            .is_err(),
+        "the schema ceiling itself must reject an over-limit retained count"
+    );
+    assert!(
+        bounds
+            .execute(
+                "UPDATE python_dataset_admission_retention
+                 SET retained_descriptor_bytes=?1
+                 WHERE singleton=1",
+                [i64::try_from(MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES)? + 1],
+            )
+            .is_err(),
+        "the schema ceiling itself must reject over-limit retained descriptor bytes"
     );
     let query = ResearchQueryEngine::from_pinned_dataset(
         built.pinned().clone(),

@@ -9,8 +9,8 @@ use market_squawk_analytics::{
     StatisticalResult,
 };
 use market_squawk_data::{
-    AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit,
-    DatasetId, ManifestCatalogError, QueryError,
+    AnalyticalFeatureDataset, AnalyticalFeatureDatasetSelection, AnalyticalReadCapability,
+    AnalyticalReadError, AnalyticalReadLimit, DatasetId, ManifestCatalogError, QueryError,
 };
 use market_squawk_domain::{DataQuality, InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
@@ -251,19 +251,21 @@ impl AnalysisDomainService {
         }
         let continuation = after_dataset.is_some();
         let limits = admitted_result_limits(request, context)?;
-        let mut selected = if continuation {
-            Vec::new()
-        } else {
-            self.catalog
-                .feature_datasets()
-                .iter()
-                .filter(|dataset| {
-                    requested_dataset.as_ref().is_none_or(|requested| {
-                        dataset.dataset().manifest().dataset_id() == requested
-                    }) && scope.matches(dataset.scope())
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut selected = self
+            .catalog
+            .feature_datasets()
+            .iter()
+            .filter(|dataset| {
+                let dataset_id = dataset.dataset().manifest().dataset_id();
+                requested_dataset
+                    .as_ref()
+                    .is_none_or(|requested| dataset_id == requested)
+                    && after_dataset
+                        .as_ref()
+                        .is_none_or(|after| dataset_id.as_str() > after.as_str())
+                    && scope.matches(dataset.scope())
+            })
+            .collect::<Vec<_>>();
         selected.sort_unstable_by(|left, right| {
             left.dataset()
                 .manifest()
@@ -271,143 +273,146 @@ impl AnalysisDomainService {
                 .as_str()
                 .cmp(right.dataset().manifest().dataset_id().as_str())
         });
-        self.remove_durable_legacy_overlaps(&mut selected, &scope, context)?;
-        let static_available = if continuation {
+        let context_available = if continuation {
             0
         } else {
             self.catalog.feature_catalog().entries().len()
         };
-        let context_available = static_available
-            .checked_add(selected.len())
-            .ok_or(ServiceError::ResourceExhausted)?;
-        let published_limit = if continuation {
+        let dataset_limit = if continuation {
             limits.maximum_result_items().min(64)
         } else {
             limits
                 .maximum_result_items()
                 .saturating_sub(context_available)
-                .max(1)
-                .min(64)
+                .clamp(1, 64)
         };
-        let (published, published_available, published_has_more) = self
-            .published_feature_datasets(
+        let mut legacy_candidates = Vec::new();
+        legacy_candidates
+            .try_reserve_exact(selected.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        legacy_candidates.extend(
+            selected
+                .iter()
+                .map(|dataset| dataset.dataset().manifest().dataset_id().clone()),
+        );
+        let (published, published_available, overlapping_legacy) = self
+            .published_feature_dataset_snapshot(
                 requested_dataset.as_ref(),
                 after_dataset.as_ref(),
                 &scope,
-                published_limit,
+                &legacy_candidates,
+                dataset_limit,
                 context,
             )?;
-        if requested_dataset.is_some() && selected.is_empty() && published.is_empty() {
+        selected.retain(|dataset| {
+            overlapping_legacy
+                .binary_search_by(|overlap| {
+                    overlap
+                        .as_str()
+                        .cmp(dataset.dataset().manifest().dataset_id().as_str())
+                })
+                .is_err()
+        });
+        let logical_available = selected
+            .len()
+            .checked_add(published_available)
+            .ok_or(ServiceError::ResourceExhausted)?;
+        if requested_dataset.is_some() && logical_available == 0 {
             return Err(ServiceError::NotFound);
         }
-        if scope.has_filter() && selected.is_empty() {
+        if scope.has_filter() && logical_available == 0 {
             return Err(ServiceError::NotFound);
         }
         let required_first_page_items = context_available
-            .checked_add(usize::from(!published.is_empty()))
+            .checked_add(usize::from(logical_available > 0))
             .ok_or(ServiceError::ResourceExhausted)?;
         if !continuation && limits.maximum_result_items() < required_first_page_items {
             return Err(ServiceError::ResourceExhausted);
         }
-        let available = static_available
-            .checked_add(selected.len())
-            .and_then(|available| available.checked_add(published_available))
+        let available = context_available
+            .checked_add(logical_available)
             .ok_or(ServiceError::ResourceExhausted)?;
         let mut context_items = Vec::new();
         if !continuation {
             for metadata in self.catalog.feature_catalog().entries() {
                 context_items.push(feature_metadata_value(metadata));
             }
-            for dataset in &selected {
-                context_items.push(feature_dataset_value(dataset.dataset()));
-            }
         }
-        let published_items = published
+        if continuation && logical_available == 0 {
+            return empty_feature_page_result(limits);
+        }
+        let candidate_capacity = selected
+            .len()
+            .checked_add(published.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(candidate_capacity)
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        candidates.extend(selected.into_iter().map(FeatureDatasetCandidate::Legacy));
+        candidates.extend(published.iter().map(FeatureDatasetCandidate::Durable));
+        candidates.sort_unstable_by(|left, right| {
+            left.dataset_id().as_str().cmp(right.dataset_id().as_str())
+        });
+        candidates.truncate(dataset_limit);
+        if candidates.is_empty() != (logical_available == 0) {
+            return Err(ServiceError::InvalidResult);
+        }
+        let dataset_items = candidates
             .iter()
-            .map(published_feature_dataset_value)
+            .map(FeatureDatasetCandidate::value)
             .collect::<Vec<_>>();
-        let published_cursors = published
+        let dataset_cursors = candidates
             .iter()
-            .map(|dataset| dataset.generation().manifest().dataset_id().as_str())
+            .map(|dataset| dataset.dataset_id().as_str())
             .collect::<Vec<_>>();
-        let minimum_published = usize::from(!published.is_empty());
+        let minimum_datasets = usize::from(logical_available > 0);
         bounded_feature_page_result(
             &context_items,
-            &published_items,
-            &published_cursors,
-            minimum_published,
-            published_has_more,
+            &dataset_items,
+            &dataset_cursors,
+            minimum_datasets,
+            logical_available,
             limits,
-            |published_count, returned| {
-                combined_feature_metadata(
-                    &selected,
-                    &published[..published_count],
-                    returned,
-                    available,
-                )
+            |dataset_count, returned| {
+                combined_feature_metadata(&candidates[..dataset_count], returned, available)
             },
         )
     }
 
-    fn published_feature_datasets(
+    fn published_feature_dataset_snapshot(
         &self,
         requested_dataset: Option<&DatasetId>,
         after_dataset: Option<&DatasetId>,
         scope: &ReadScope,
+        legacy_candidates: &[DatasetId],
         limit: usize,
         context: &RequestContext,
-    ) -> Result<(Vec<AnalyticalFeatureDataset>, usize, bool), ServiceError> {
+    ) -> Result<(Vec<AnalyticalFeatureDataset>, usize, Vec<DatasetId>), ServiceError> {
         let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
-            if after_dataset.is_some() {
-                return Err(ServiceError::Unavailable);
-            }
-            return Ok((Vec::new(), 0, false));
+            return Ok((Vec::new(), 0, Vec::new()));
         };
-        if let Some(dataset) = requested_dataset {
-            let selected = reader
-                .feature_dataset(dataset, context.deadline(), context.cancellation())
-                .map_err(map_feature_read_error)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            let available = selected.len();
-            return Ok((selected, available, false));
-        }
         let limit = AnalyticalReadLimit::try_new(limit).map_err(map_feature_read_error)?;
+        let selection = requested_dataset.map_or(
+            AnalyticalFeatureDatasetSelection::Page {
+                after: after_dataset,
+            },
+            AnalyticalFeatureDatasetSelection::Exact,
+        );
         let page = reader
-            .feature_datasets(
-                after_dataset,
+            .feature_dataset_snapshot(
+                selection,
+                legacy_candidates,
                 limit,
                 context.deadline(),
                 context.cancellation(),
             )
             .map_err(map_feature_read_error)?;
-        Ok((page.datasets().to_vec(), page.available(), page.has_more()))
-    }
-
-    fn remove_durable_legacy_overlaps(
-        &self,
-        selected: &mut Vec<&FeatureDataset>,
-        scope: &ReadScope,
-        context: &RequestContext,
-    ) -> Result<(), ServiceError> {
-        let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
-            return Ok(());
-        };
-        let mut legacy_only = Vec::with_capacity(selected.len());
-        for dataset in selected.drain(..) {
-            let durable = reader
-                .feature_dataset(
-                    dataset.dataset().manifest().dataset_id(),
-                    context.deadline(),
-                    context.cancellation(),
-                )
-                .map_err(map_feature_read_error)?;
-            if durable.is_none() {
-                legacy_only.push(dataset);
-            }
-        }
-        *selected = legacy_only;
-        Ok(())
+        Ok((
+            page.datasets().to_vec(),
+            page.available(),
+            page.overlapping_legacy_dataset_ids().to_vec(),
+        ))
     }
 
     async fn get_backtest(
@@ -712,9 +717,29 @@ fn dataset_metadata(
     }
 }
 
+enum FeatureDatasetCandidate<'a> {
+    Legacy(&'a FeatureDataset),
+    Durable(&'a AnalyticalFeatureDataset),
+}
+
+impl FeatureDatasetCandidate<'_> {
+    fn dataset_id(&self) -> &DatasetId {
+        match self {
+            Self::Legacy(dataset) => dataset.dataset().manifest().dataset_id(),
+            Self::Durable(dataset) => dataset.generation().manifest().dataset_id(),
+        }
+    }
+
+    fn value(&self) -> Value {
+        match self {
+            Self::Legacy(dataset) => feature_dataset_value(dataset.dataset()),
+            Self::Durable(dataset) => published_feature_dataset_value(dataset),
+        }
+    }
+}
+
 fn combined_feature_metadata(
-    selected: &[&FeatureDataset],
-    published: &[AnalyticalFeatureDataset],
+    datasets: &[FeatureDatasetCandidate<'_>],
     returned: usize,
     available: usize,
 ) -> Result<ToolResultMetadata, FeaturePageCandidateError> {
@@ -722,31 +747,52 @@ fn combined_feature_metadata(
     let mut qualities = Vec::new();
     let mut source_set = HashSet::new();
     let mut quality_set = HashSet::new();
-    for dataset in selected {
-        for source in dataset.scope().sources() {
-            if source_set.insert(source.clone()) {
-                sources.push(source.clone());
+    for dataset in datasets {
+        match dataset {
+            FeatureDatasetCandidate::Legacy(dataset) => {
+                for source in dataset.scope().sources() {
+                    if source_set.insert(source.clone()) {
+                        sources.push(source.clone());
+                    }
+                }
+                for quality in dataset.scope().qualities() {
+                    if quality_set.insert(*quality) {
+                        qualities.push(*quality);
+                    }
+                }
             }
-        }
-        for quality in dataset.scope().qualities() {
-            if quality_set.insert(*quality) {
-                qualities.push(*quality);
-            }
-        }
-    }
-    for dataset in published {
-        for source in dataset.source_ids() {
-            if source_set.insert(source.clone()) {
-                sources.push(source.clone());
+            FeatureDatasetCandidate::Durable(dataset) => {
+                for source in dataset.source_ids() {
+                    if source_set.insert(source.clone()) {
+                        sources.push(source.clone());
+                    }
+                }
             }
         }
     }
     sources.sort_unstable();
-    let dataset_count = selected
-        .len()
-        .checked_add(published.len())
-        .ok_or(FeaturePageCandidateError::Invariant)?;
-    feature_page_metadata(sources, qualities, dataset_count, returned, available)
+    feature_page_metadata(sources, qualities, datasets.len(), returned, available)
+}
+
+fn empty_feature_page_result(limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
+    let metadata = match feature_page_metadata(Vec::new(), Vec::new(), 0, 0, 0) {
+        Ok(metadata) => metadata,
+        Err(FeaturePageCandidateError::DoesNotFit) => {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        Err(FeaturePageCandidateError::Invariant) => return Err(ServiceError::InvalidResult),
+    };
+    TypedToolResult::try_new(Value::Null, 0, metadata, limits).map_err(|error| match error {
+        ServiceContractError::TooManyItems
+        | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
+            ServiceError::ResourceExhausted
+        }
+        ServiceContractError::ZeroItemsForNonNullResult
+        | ServiceContractError::InvalidMetadata
+        | ServiceContractError::InvalidCompleteness
+        | ServiceContractError::SourceEvidencePolicy
+        | ServiceContractError::Json(_) => ServiceError::InvalidResult,
+    })
 }
 
 enum FeaturePageCandidateError {
@@ -802,27 +848,30 @@ fn validate_feature_evidence_structure(evidence: &Value) -> Result<(), FeaturePa
 
 fn bounded_feature_page_result<M>(
     context_items: &[Value],
-    published_items: &[Value],
-    published_cursors: &[&str],
-    minimum_published: usize,
-    published_has_more: bool,
+    dataset_items: &[Value],
+    dataset_cursors: &[&str],
+    minimum_datasets: usize,
+    dataset_available: usize,
     limits: ServiceLimits,
     mut metadata_for: M,
 ) -> Result<TypedToolResult, ServiceError>
 where
     M: FnMut(usize, usize) -> Result<ToolResultMetadata, FeaturePageCandidateError>,
 {
-    if published_items.len() != published_cursors.len() || minimum_published > published_items.len()
+    if dataset_items.len() != dataset_cursors.len()
+        || minimum_datasets > dataset_items.len()
+        || dataset_items.len() > dataset_available
+        || (dataset_available > 0 && minimum_datasets == 0)
     {
         return Err(ServiceError::InvalidResult);
     }
-    for published_count in (minimum_published..=published_items.len()).rev() {
-        let actual_has_more = published_count < published_items.len() || published_has_more;
+    for dataset_count in (minimum_datasets..=dataset_items.len()).rev() {
+        let actual_has_more = dataset_count < dataset_available;
         let next_after_dataset = if actual_has_more {
             Some(
-                *published_cursors
+                *dataset_cursors
                     .get(
-                        published_count
+                        dataset_count
                             .checked_sub(1)
                             .ok_or(ServiceError::InvalidResult)?,
                     )
@@ -832,9 +881,9 @@ where
             None
         };
         let mut items = context_items.to_vec();
-        items.extend(published_items[..published_count].iter().cloned());
+        items.extend(dataset_items[..dataset_count].iter().cloned());
         let returned = items.len();
-        let metadata = match metadata_for(published_count, returned) {
+        let metadata = match metadata_for(dataset_count, returned) {
             Ok(metadata) => metadata,
             Err(FeaturePageCandidateError::DoesNotFit) => continue,
             Err(FeaturePageCandidateError::Invariant) => {
@@ -883,6 +932,7 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::Manifest(
             ManifestCatalogError::ObjectLimitExceeded { .. }
             | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
+            | ManifestCatalogError::FeatureDatasetCandidateLimitExceeded { .. }
             | ManifestCatalogError::CountOverflow
             | ManifestCatalogError::AllocationContract,
         )
@@ -1052,7 +1102,7 @@ mod tests {
             &published_items,
             &cursor_refs,
             1,
-            false,
+            DURABLE_COUNT,
             limits,
             |published_count, returned| {
                 feature_page_metadata(
@@ -1091,7 +1141,7 @@ mod tests {
             &published_items[expected_first_count..],
             &cursor_refs[expected_first_count..],
             1,
-            false,
+            DURABLE_COUNT - expected_first_count,
             limits,
             |published_count, returned| {
                 feature_page_metadata(
@@ -1099,7 +1149,7 @@ mod tests {
                     Vec::new(),
                     published_count,
                     returned,
-                    DURABLE_COUNT,
+                    DURABLE_COUNT - expected_first_count,
                 )
             },
         )?;
@@ -1125,7 +1175,7 @@ mod tests {
             &[],
             &[],
             0,
-            false,
+            0,
             ServiceLimits::try_new(
                 64 * 1024,
                 DURABLE_COUNT,

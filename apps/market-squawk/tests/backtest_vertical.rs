@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use clap::Parser as _;
 use market_squawk::application::analysis::{
-    AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority, GovernedBacktestCommand,
-    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
-    GovernedBacktestInputRegistrationReceipt, GovernedBacktestRecord,
+    AnalysisCatalog, AnalysisDatasetScope, AnalysisDomainService, FeatureDatasetRegistration,
+    GovernedBacktestAuthority, GovernedBacktestCommand, GovernedBacktestInputRegistrar,
+    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestRecord,
 };
 use market_squawk::application::{ApplicationDomainService, application_capabilities};
 use market_squawk::cli::{Cli, Command, FeatureCommand};
@@ -35,11 +36,12 @@ use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPolicy,
     CorporateActionSensitivity, DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy,
     DatasetBuildRequest, DatasetId, DatasetManifestRef, DatasetOutputAuthorization,
-    FeatureLabelComponentInput, FeatureLabelComponentSpec, ObjectStoreConfig, ObservationFamilyKey,
-    PinnedInstrumentDefinitions, PinnedQueryOutput, PointInTimeLimits, PointInTimePolicy,
-    PointInTimeRevisionMode, QueryLimits, QueryRequest, ResearchQueryEngine, ResearchUse,
-    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
-    SourceOperation, UniverseId, UniverseLimits, UniverseMembership, extraction_batch_digest,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset, ObjectStoreConfig,
+    ObservationFamilyKey, PinnedInstrumentDefinitions, PinnedQueryOutput, PointInTimeLimits,
+    PointInTimePolicy, PointInTimeRevisionMode, QueryLimits, QueryRequest, ResearchQueryEngine,
+    ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis,
+    RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
+    extraction_batch_digest,
 };
 use market_squawk_domain::{
     AccountId, AuthorizationBasis, AvailabilityEvidence, BasisPoints, ChecksumCapability,
@@ -53,7 +55,8 @@ use market_squawk_domain::{
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits, TypedToolRequest,
+    JsonStructureLimits, RequestContext, RequestId, ResultCompleteness, ServiceError,
+    ServiceLimits, TypedToolRequest,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
@@ -240,8 +243,25 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             CancellationToken::new(),
         )
         .await?;
+    let legacy_paths = AppPaths::prepare(directory.path().join("legacy-feature-catalog"))?;
+    let legacy = fixture_feature_dataset(
+        &legacy_paths,
+        "derived.backtest.reference-authority-secondary",
+        instrument_id,
+    )
+    .await?;
+    let legacy_scope = AnalysisDatasetScope::try_new(
+        vec![instrument_id],
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(200),
+        vec![SourceId::try_from("backtest-fixture")?],
+        vec![DataQuality::DirectVerified],
+    )?;
     let analysis = AnalysisDomainService::new_with_feature_reader(
-        Arc::new(fixture_analysis_catalog()?),
+        Arc::new(fixture_analysis_catalog(vec![
+            FeatureDatasetRegistration::new(legacy, legacy_scope.clone()),
+            FeatureDatasetRegistration::new(successor.clone(), legacy_scope),
+        ])?),
         service.analytical_reader(),
         Arc::new(UnusedBacktestInputRegistrar),
         Arc::new(UnusedBacktestAuthority),
@@ -315,7 +335,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     assert_eq!(first.encoded_bytes(), first_page_byte_ceiling);
     assert_eq!(
         first.metadata().available_items(),
-        Some(REQUIRED_BATCH_FEATURE_COUNT + 3)
+        Some(REQUIRED_BATCH_FEATURE_COUNT + 4)
     );
     assert_eq!(first.metadata().source_coverage()["datasetCount"], 1);
 
@@ -351,11 +371,11 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     assert_eq!(continuation_evidence.item_count(), 1);
     assert_eq!(
         continuation_evidence.structured_content()["items"][0]["manifest"]["dataset"],
-        "derived.backtest.reference-authority-successor"
+        "derived.backtest.reference-authority-secondary"
     );
     assert_eq!(
         continuation_evidence.structured_content()["nextAfterDataset"],
-        "derived.backtest.reference-authority-successor"
+        "derived.backtest.reference-authority-secondary"
     );
     assert_eq!(continuation_evidence.structured_content()["hasMore"], true);
 
@@ -387,11 +407,11 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     assert_eq!(continued_items[0]["kind"], "feature_dataset");
     assert_eq!(
         continued_items[0]["manifest"]["dataset"],
-        "derived.backtest.reference-authority-successor"
+        "derived.backtest.reference-authority-secondary"
     );
     assert_eq!(
         continued_cursor,
-        "derived.backtest.reference-authority-successor"
+        "derived.backtest.reference-authority-secondary"
     );
     assert_eq!(continued_content["hasMore"], true);
     assert_eq!(continued.encoded_bytes(), continuation_byte_ceiling);
@@ -411,14 +431,71 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let final_items = final_content["items"]
         .as_array()
         .ok_or("final feature page has no items")?;
-    assert_eq!(final_items.len(), 1);
+    assert_eq!(final_items.len(), 2);
     assert_eq!(final_items[0]["kind"], "feature_dataset");
     assert_eq!(
         final_items[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert!(
+        final_items[0]["pythonExportSha256"].is_string(),
+        "the durable generation must win an overlapping legacy identity"
+    );
+    assert_eq!(final_items[1]["kind"], "feature_dataset");
+    assert_eq!(
+        final_items[1]["manifest"]["dataset"],
         "derived.backtest.reference-authority-terminal"
     );
     assert_eq!(final_content["hasMore"], false);
     assert!(final_content["nextAfterDataset"].is_null());
+    assert_eq!(
+        final_page.metadata().completeness(),
+        ResultCompleteness::Complete
+    );
+    assert_eq!(final_page.metadata().available_items(), None);
+
+    let exact_overlap = analysis
+        .call(
+            feature_dataset_request(json!({
+                "dataset": "derived.backtest.reference-authority-successor",
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 1,
+                    "maximumBytes": 65536
+                }
+            }))?,
+            feature_dataset_context(107)?,
+        )
+        .await?;
+    let exact_overlap_items = exact_overlap.structured_content()["items"]
+        .as_array()
+        .ok_or("exact overlap result has no items")?;
+    let exact_overlap_datasets = exact_overlap_items
+        .iter()
+        .filter(|item| item["kind"] == "feature_dataset")
+        .collect::<Vec<_>>();
+    assert_eq!(exact_overlap_datasets.len(), 1);
+    assert_eq!(
+        exact_overlap_datasets[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert!(exact_overlap_datasets[0]["pythonExportSha256"].is_string());
+
+    let exhausted = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(108)?,
+        )
+        .await?;
+    assert!(exhausted.structured_content().is_null());
+    assert_eq!(exhausted.item_count(), 0);
+    assert_eq!(
+        exhausted.metadata().completeness(),
+        ResultCompleteness::Complete
+    );
+    assert_eq!(exhausted.metadata().available_items(), None);
 
     let conflicting = analysis
         .call(
@@ -427,7 +504,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
                 "afterDataset": "derived.backtest.reference-authority",
                 "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
             }))?,
-            feature_dataset_context(107)?,
+            feature_dataset_context(109)?,
         )
         .await;
     assert!(matches!(conflicting, Err(ServiceError::InvalidRequest)));
@@ -718,7 +795,68 @@ fn fixture_dataset_request(
     )?)
 }
 
-fn fixture_analysis_catalog() -> TestResult<AnalysisCatalog> {
+async fn fixture_feature_dataset(
+    paths: &AppPaths,
+    dataset_id: &str,
+    instrument_id: InstrumentId,
+) -> TestResult<FeatureLabelDataset> {
+    let catalog_config = fixture_catalog_config(paths)?;
+    let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 128, Duration::from_secs(60))?;
+    let source = fixture_source("backtest-fixture")?;
+    let (batch, membership_evidence) = fixture_extraction_batch(instrument_id)?;
+    let rights = RightsDecisionInput {
+        source_id: source.source_id().clone(),
+        payload_digest: extraction_batch_digest(&batch)?,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms("https://example.test/backtest-fixture/v1", digest(31))?,
+        authorization_evidence: digest(32),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    };
+    {
+        let catalog = CatalogAuthority::open(catalog_config.clone())?;
+        catalog.register_source(&source, rights.retrieved_at)?;
+        catalog.register_source(
+            &fixture_source("market-squawk.derived")?,
+            Timestamp::from_unix_nanos(10),
+        )?;
+        let registered_rights = catalog.admit_source_rights(rights.clone())?;
+        catalog.admit_research_use_grant(ResearchUseGrantInput::try_new(
+            registered_rights.rights_id(),
+            ResearchUseSet::try_new(vec![ResearchUse::LocalAnalysis])?,
+            digest(33),
+            Some(Timestamp::from_unix_nanos(i64::MAX)),
+        )?)?;
+    }
+    let service = ResearchService::initialize(paths, catalog_config, 8, object_config)?;
+    let source_dataset = service
+        .ingest(
+            ResearchIngestRequest::locally_observed(
+                source,
+                rights,
+                "legacy-feature-pagination-v1",
+                batch,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    service
+        .build_dataset(
+            fixture_dataset_request(
+                dataset_id,
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(Into::into)
+}
+
+fn fixture_analysis_catalog(
+    feature_datasets: Vec<FeatureDatasetRegistration>,
+) -> TestResult<AnalysisCatalog> {
     let config = BatchFeatureCatalogConfig::try_new(
         NonZeroU32::new(252).ok_or("nonzero periods per year")?,
         NonZeroU32::new(950_000).ok_or("nonzero confidence level")?,
@@ -734,7 +872,7 @@ fn fixture_analysis_catalog() -> TestResult<AnalysisCatalog> {
     Ok(AnalysisCatalog::try_new(
         Vec::new(),
         BatchFeatureCatalog::try_new(config, "feature-pagination-test-v1")?,
-        Vec::new(),
+        feature_datasets,
     )?)
 }
 
