@@ -8,8 +8,8 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 | Document type | Operations runbook |
 | Audience | Local operators, incident responders, integrators, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -196,10 +196,10 @@ MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on
 | --- | --- | --- |
 | Client receives no tools | Initialization handshake or `tools/list` did not complete | Send a supported initialize request, initialized notification, then `tools/list` in order |
 | JSON parse/frame failure | A non-protocol writer contaminated stdout or the frame exceeded bounds | Remove wrapper output from stdout, preserve stderr separately, and restart a fresh session |
-| Unknown tool | Name differs from the exact 59-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
+| Unknown tool | Name differs from the exact 60-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
-| Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain and report the opaque reference; no current MCP operation resolves it, so narrow or rerun the read when inline content is required |
+| Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain the complete reference and read bounded chunks with `Analysis.ReadArtifact` or `query artifact`; never derive or open a filesystem path |
 | Session shutdown is incomplete | One domain/helper failed its bounded drain | Preserve stderr and audit evidence, reconcile the named domain, and start a fresh session only after ownership is resolved |
 
 Do not send ordinary CLI output through an MCP client's protocol stdout stream.

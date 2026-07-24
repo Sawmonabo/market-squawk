@@ -684,3 +684,44 @@ all three final scopes reported zero Critical, Important, or Minor findings. Doc
 to PR `#26`, and the completed `docs/product-documentation` branch was deleted locally and on
 origin before metadata was pruned. Product issues and Project 5 items remain open until their
 separate acceptance evidence exists. Work resumes with Tasks 19/19A, then Task 20.
+
+## 2026-07-24 research/model first-use and shared-release checkpoint
+
+The pushed release head is
+`3ef05dc8724ec2be808f98543e0bc695f2ae0937`; the local and origin release refs match. Research/model
+first-use authority is integrated through merge head `92f2b72`. The accepted lane supplies durable
+point-in-time feature datasets, stable bounded pagination, retained Python export digests, signed
+application/validator/ONNX-worker release construction, and bounded artifact-read worker ownership.
+
+Release commit `3ef05dc` composes those capabilities into the product:
+
+- one application-owned, path-free `ArtifactRepository` is shared by CLI and MCP;
+- `Analysis.ReadArtifact` reconstructs the complete opaque identity, verifies the complete artifact,
+  and returns only caller-bounded 32 KiB Base64 chunks;
+- the production model domain verifies the running application and sibling ONNX worker against the
+  signed release-manifest digests;
+- configured paper initial cash becomes an immutable evidence-bound sandbox portfolio revision
+  consumed by central risk instead of an unavailable placeholder; and
+- the production analysis service receives the durable feature-dataset reader.
+
+Fresh focused evidence passed at this checkpoint: the exact production MCP composition, paper
+composition, and merged point-in-time backtest tests; affected services/application/MCP/modeling
+Clippy with warnings denied; formatting; and diff integrity. A services-only Clippy gate exposed
+and corrected an undeclared Serde `rc` feature dependency before the commit was pushed.
+
+The accepted research worktree target removed 8.3 GiB, after which the worktree, merged local
+branch, origin branch, and stale refs were deleted. The root target is approximately 5.4 GiB. The
+only remaining feature worktree is `feature/coinbase-direct-market-data`, approximately 0.9 GiB and
+below its 10 GiB ceiling.
+
+Coinbase direct-market-data core candidate
+`09f289ff27e1f4fac5f68343bd4a6e53b3b4dba6` is clean and in independent exact-head review. Its
+focused direct tests passed 4/4 without warnings, but it is not integrated release authority. Its
+remaining product boundary is application credential activation, rights and onboarding
+reconciliation, central live qualification, and an authorized unchanged-head trace.
+
+PR `#26` and issue `#24` contain the current checkpoint. GitHub Actions run `30131065227` at
+`3ef05dc` created `verify`, `macos`, and `windows` jobs with empty step lists; no workflow step
+executed. This remains an external Actions account billing/spending-state blocker rather than a
+code-owned failure. Project 5 keeps `#24` and `#31` In Progress and `#25` Todo. The next barrier is
+Coinbase exact-head review/integration, followed by provider/onboarding closure and Task 20.

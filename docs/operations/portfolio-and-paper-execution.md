@@ -8,8 +8,8 @@ revision-bound portfolio analytics, and operating the risk-enforced paper runtim
 | Document type | Operations runbook |
 | Audience | Local operators, portfolio analysts, and execution reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -38,13 +38,15 @@ services exposed by local stdio MCP. It covers:
 
 Portfolio imports and paper accounts are currently separate authorities. Importing a broker
 portfolio does not fund or configure the paper runtime. The paper runtime creates its own virtual
-account from the supplied initial-cash and fee assumptions.
+account from the supplied initial-cash and fee assumptions and publishes that cash as an immutable,
+evidence-bound sandbox portfolio revision consumed by central risk.
 
-The current Coinbase and Kraken profiles are `DirectUnverified`, and the shipping paper
-composition uses a no-intent strategy. It can exercise the complete source, book, risk, dispatcher,
-audit, checkpoint, and shutdown lifecycle, but it cannot produce an execution-eligible order from
-current provider observations. A successful process start is therefore not evidence of a working
-live-to-paper trading strategy; that remains a release blocker in the
+The current Coinbase and Kraken profiles are `DirectUnverified`. The shipping paper composition
+owns a fee-aware book-imbalance strategy, but source qualification stops the path before its intent
+can receive approval. It can exercise the complete source, book, risk, dispatcher, audit,
+checkpoint, and shutdown lifecycle, but it cannot produce an execution-eligible order from current
+provider observations. A successful process start is therefore not evidence of a working
+live-to-paper result; that remains a release blocker in the
 [delivery ledger](../plans/delivery-ledger.md).
 
 ## Operating boundaries
@@ -59,7 +61,7 @@ flowchart LR
 
     Provider["Coinbase or Kraken generation"]
     Integrity["Source and book integrity"]
-    Strategy["Current no-intent strategy"]
+    Strategy["Fee-aware book-imbalance strategy"]
     Risk["Central pre-trade risk"]
     Dispatch["Single-use dispatch"]
     Paper["Paper ledger and matching"]
@@ -67,7 +69,7 @@ flowchart LR
 
     Export --> Import --> Reconcile --> Revision --> Analytics
     Provider --> Integrity --> Strategy
-    Strategy -. "no current order intent" .-> Risk --> Dispatch --> Paper --> Audit
+    Strategy -. "blocked without DirectVerified source" .-> Risk --> Dispatch --> Paper --> Audit
 ```
 
 All monetary input is parsed as checked decimal text. Orders, balances, positions, cost basis,

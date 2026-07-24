@@ -8,8 +8,8 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Document type | Reference |
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -51,7 +51,7 @@ Clap marks the options below as global, so they may appear with any public subco
 | `--json-logs` | Flag | Off | Emits structured tracing to stderr |
 | `--output <human|json>` | Enum | `human` | Selects human plus pretty JSON or compact JSON for supported commands |
 | `--source-shutdown-ms <U64>` | Milliseconds | Configuration value, initially `5000` | Overrides the source-supervisor shutdown deadline; valid range is `1..=60000` |
-| `--training-release-root <PATH>` | Absolute path | None | Selects the installed, verified Python training release used for model admission |
+| `--training-release-root <PATH>` | Absolute path | None | Selects the installed signed training release; the running application and sibling ONNX worker must be the exact files from that release |
 | `--capture-queue-capacity <USIZE>` | Count | Configuration value, initially `16384` | Overrides the fixed raw-capture queue capacity; valid range is `1..=1048576` |
 | `--capture-memory-ceiling-bytes <USIZE>` | Bytes | Configuration value, initially `67108864` | Overrides the per-channel capture memory ceiling; valid range is `1..=4294967295` |
 | `--capture-destination-registry-memory-ceiling-bytes <USIZE>` | Bytes | Configuration value, initially `1048576` | Overrides the process-wide destination-registry ceiling; valid range is `1..=67108864` |
@@ -102,8 +102,9 @@ command result and local log.
 | `dataset manifest <DATASET>` | Dataset identity is positional | `Research.GetManifest` |
 | `dataset build <REQUEST> --confirm` | Closed point-in-time build request, at most 8 MiB | Research dataset builder and immutable publication |
 | `query dataset <DATASET>` | `--maximum-rows <USIZE>` defaults to `1000` | `Research.GetHistory` with the requested result-count ceiling |
+| `query artifact --artifact-id <ID> --sha256 <HEX> --byte-count <N>` | Optional `--media-type application/json`, `--offset 0`, and `--maximum-bytes 32768` | `Analysis.ReadArtifact` over the shared path-free controlled-artifact authority |
 | `query sql --dataset <DATASET> <STATEMENT>` | `--maximum-rows <USIZE>` defaults to `1000` | CLI-only bounded read-only DataFusion over the latest pinned immutable generation |
-| `feature list` | None | `Analysis.GetFeatureDatasets` |
+| `feature list` | Optional `--after-dataset <DATASET>` stable cursor | `Analysis.GetFeatureDatasets` |
 | `feature build <REQUEST> --confirm` | Same closed point-in-time build contract as `dataset build` | Research dataset builder and immutable publication |
 
 The SQL command is deliberately absent from MCP. Its fixed query ceilings are 64 KiB SQL text,

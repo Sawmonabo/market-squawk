@@ -9,8 +9,8 @@ authorization, audit behavior, and error mapping.
 | Document type | Reference |
 | Audience | MCP client authors, operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -37,7 +37,7 @@ service registry.
 The reviewed server:
 
 - uses inherited standard input and standard output only;
-- advertises the MCP tools capability and exactly 59 application operations;
+- advertises the MCP tools capability and exactly 60 application operations;
 - does not advertise or serve MCP resources or prompts;
 - forbids MCP task execution for every tool;
 - does not expose an HTTP, WebSocket, or other network transport; and
@@ -90,7 +90,7 @@ The negotiated capability surface is intentionally narrow:
 
 | MCP feature | Reviewed-head behavior |
 | --- | --- |
-| Tools | Advertised; one complete, deterministic 59-tool list |
+| Tools | Advertised; one complete, deterministic 60-tool list |
 | Tool-list pagination | Unsupported; a non-null cursor is invalid parameters |
 | Tool-list change notifications | Not advertised; the list is immutable for the process |
 | Resources | Not advertised and no resource handlers are registered |
@@ -212,9 +212,10 @@ combined item count may not exceed 4,096.
 
 ## Complete tool inventory
 
-The production registry contains exactly 59 tools. “Read” means `read_only` authorization and
-opaque artifact fallback on overflow. “Confirm” means local confirmation and inline-only result.
-“Risk” means risk-mediated authorization, still with `confirm: true` and inline-only result.
+The production registry contains exactly 60 tools. “Read” means `read_only` authorization and,
+unless stated otherwise, opaque artifact fallback on overflow. “Confirm” means local confirmation
+and inline-only result. “Risk” means risk-mediated authorization, still with `confirm: true` and
+inline-only result.
 
 ### Source — 5 tools
 
@@ -290,7 +291,7 @@ All four use Data scope and require source evidence.
 
 All six use Portfolio scope. The five reads require source evidence.
 
-### Analysis — 7 tools
+### Analysis — 8 tools
 
 | Tool | Specific arguments | Effect | Purpose |
 | --- | --- | --- | --- |
@@ -301,9 +302,12 @@ All six use Portfolio scope. The five reads require source evidence.
 | `Analysis.GetFeatureDatasets` | Optional `dataset` | Read | Return registered feature contracts and immutable feature datasets |
 | `Analysis.GetBacktests` | `runId` | Read | Return governed backtest experiment metadata and results |
 | `Analysis.RunBacktest` | Nonempty `registration` object | Confirm | Run one governed point-in-time backtest experiment |
+| `Analysis.ReadArtifact` | `artifactId`, `sha256`, `byteCount`, `mediaType`, `offset`, `maximumBytes` | Read, inline only | Return one digest-verified, caller-bounded Base64 chunk from an opaque controlled artifact |
 
-The first five use Data scope and require source evidence. Backtest lookup and execution use Local
-scope and not-applicable source evidence.
+The first five use Data scope and require source evidence. Backtest lookup, execution, and artifact
+read use Local scope and not-applicable source evidence. `Analysis.ReadArtifact` is inline-only;
+`maximumBytes` is limited to 32 KiB so artifact retrieval cannot recursively overflow into another
+artifact.
 
 ### Model — 4 tools
 
@@ -421,9 +425,15 @@ valid local-result shape; a source-derived artifact carries actual coverage and 
 The reference ID begins with an ASCII alphanumeric byte, contains only ASCII alphanumerics, `_`,
 and `-`, and is at most 160 bytes. The digest is exactly 64 lowercase hexadecimal characters,
 `byteCount` is positive, and the media type is a bounded 1–128-byte token. The reference is
-path-free and must be treated as opaque. The reviewed server exposes no MCP resource or tool that
-retrieves an artifact by this reference; clients cannot translate it into a filesystem path or
+path-free and must be treated as opaque. Clients cannot translate it into a filesystem path or
 `resources/read` URI.
+
+Retrieve the artifact only through `Analysis.ReadArtifact`. Supply the complete returned reference,
+an `offset` from `0` through the declared `byteCount`, and `maximumBytes` from `1` through `32768`.
+The result returns `contentBase64`, `returnedBytes`, `nextOffset`, and `complete`. Continue with the
+returned `nextOffset` until `complete` is true, retaining the same complete identity on every call.
+The repository verifies the complete artifact against the supplied digest and byte count before
+returning any chunk; a missing, changed, oversized, cancelled, or late read fails closed.
 
 Mutation descriptors are `inline_only`. A mutation result that cannot fit inline fails with
 `-32010`; it is never silently replaced by an artifact reference.

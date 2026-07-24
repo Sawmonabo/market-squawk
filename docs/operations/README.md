@@ -9,8 +9,8 @@ recovery behavior.
 | Document type | Operations index |
 | Audience | Local operators, analysts, integrators, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed product commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed product commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Runbooks
 
@@ -69,10 +69,12 @@ checkout as the complete first local release.
 ## Current operational ceiling
 
 The current CLI and complete local stdio MCP are runnable across the documented product domains.
-Coinbase and Kraken still declare `DirectUnverified` quality, and the shipping paper composition
-uses a no-intent strategy. Therefore the runbooks do not claim an execution-eligible live-to-paper
-demonstration. Provider onboarding completion and the remaining release acceptance work are tracked
-in the [delivery ledger](../plans/delivery-ledger.md).
+Coinbase and Kraken still declare `DirectUnverified` quality. The shipping paper composition has a
+fee-aware book-imbalance strategy and evidence-bound initial sandbox portfolio, but source
+qualification stops the path before an executable intent can be approved. Therefore the runbooks
+do not claim an execution-eligible live-to-paper demonstration. Provider onboarding completion and
+the remaining release acceptance work are tracked in the
+[delivery ledger](../plans/delivery-ledger.md).
 
 ## Reference while operating
 

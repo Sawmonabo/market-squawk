@@ -9,8 +9,8 @@ authority-free source status views.
 | Document type | Operations runbook |
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -400,7 +400,8 @@ Therefore:
   onboarding or execution qualification;
 - `capture --paper-bot` remains paper-only;
 - `bot start --provider coinbase|kraken` is subject to the same `DirectUnverified` source ceiling,
-  central risk, and the shipping no-intent default strategy; it cannot produce live orders.
+  the fee-aware book-imbalance strategy, and central risk; source qualification prevents an
+  executable intent or live order.
 
 For the complete qualification rules, see
 [Data quality and live qualification](../reference/data-quality.md). Current provider blockers and

@@ -9,8 +9,8 @@ order, and recovery surfaces at the reviewed commit.
 | Document type | Deployment architecture |
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -121,9 +121,11 @@ loopback-scoped onboarding task. Source endpoints are selected through immutable
 and configuration allowlists. Local structured logs and explicit provider operations account for
 the product's operational output and network activity.
 
-The ONNX worker is not a generic executable hook. Startup identifies a bounded, regular sibling
-file; model admission fixes graph/operator/tensor/resource policy before publication. The capture
-helper is likewise a validated sibling and receives one confined journal destination.
+The ONNX worker is not a generic executable hook. When a signed training release is selected,
+startup verifies that the running application and bounded regular sibling worker are the canonical
+installed paths and match the signed release-manifest digests. Model admission then fixes
+graph/operator/tensor/resource policy before publication. The capture helper is likewise a
+validated sibling and receives one confined journal destination.
 
 ## On-disk layout
 
@@ -185,7 +187,8 @@ For a production product command or MCP session, startup proceeds in authority o
 2. prepare the local root and open the catalog, object-store authority, and durable source state;
 3. recover provider onboarding/activation recipes, portfolio revisions, governed backtests, and
    model admissions;
-4. require the configured signed training release if durable model admissions exist;
+4. require the configured signed training release if durable model admissions exist, and when one
+   is configured verify the running application and sibling ONNX worker against it;
 5. construct every required application-domain service;
 6. admit the exact complete application descriptor; and
 7. expose the CLI operation or MCP transport only after composition succeeds.

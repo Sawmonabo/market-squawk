@@ -7,9 +7,9 @@ admission, native and ONNX inference, evaluation evidence, and restart recovery.
 | --- | --- |
 | Document type | Operations runbook |
 | Audience | Local research operators, model reviewers, release engineers, and incident responders |
-| Status | Current, with release-demo, dataset-export, and ONNX-producer limitations called out below |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Status | Current, with production-driver and ONNX-producer limitations called out below |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -47,10 +47,10 @@ This page documents:
 - restart validation, immutable replay, no-action failure, and recovery.
 
 It does not place Python in the live event-to-decision path, make a model output an order, provide a
-CLI command that trains a model, or grant authority by naming a path. It also does not claim a
-complete first-use release demo: the reviewed tree lacks both a CLI-exposed dataset-export digest
-handoff and a supported end-to-end build that binds the produced Python release to the final
-`market-squawk` application binary.
+CLI command that trains a model, or grant authority by naming a path. Dataset build output now
+exposes the exact Python export digest, and the sealed release builder binds the final application,
+validator, and ONNX worker. The repository still lacks a supported production training driver and
+ONNX candidate producer/demo, so those first-use demonstrations remain release blockers.
 
 ## Safety and authority boundaries
 
@@ -102,17 +102,12 @@ Before admission:
 - ONNX admission additionally requires the exact sibling `market-squawk-onnx-worker` beside the
   running application executable.
 
-Three current limitations affect a new operator:
+Two current limitations affect a new operator:
 
-1. `dataset build` registers a Python export descriptor but its CLI result does not expose
-   `exportSha256`, and no reviewed command retrieves it. Training cannot safely begin from the
-   manifest or build-spec digest instead. See
-   [Dataset build and query operations](datasets-and-query.md).
-2. `scripts/build_python_release.py` creates the sealed Python environments, validator, and
-   release evidence, but does not build the main `market-squawk` executable. The application
-   verifies a matching release foundation, so an independently built arbitrary binary/release
-   pairing is not a supported admission procedure.
-3. The Python training API produces native linear or logistic bundles only. The repository has no
+1. The Python training API and the reviewed procedure below are complete, but the repository has
+   no supported production training-driver file or one-command first-use demonstration. A copied
+   fixture or ad hoc notebook is not release evidence.
+2. The Python training API produces native linear or logistic bundles only. The repository has no
    supported operator demo or producer for an ONNX candidate. ONNX admission is runnable only when
    an exact conforming candidate and its full evidence already exist.
 
@@ -151,15 +146,18 @@ One selected release root must contain and bind at least:
 <training-release-root>/
 ├── bin/
 │   ├── python
-│   └── market-squawk-model-validator
+│   ├── market-squawk
+│   ├── market-squawk-model-validator
+│   └── market-squawk-onnx-worker
 └── share/market-squawk/
     ├── training-environment.json
     └── market-squawk-release.json
 ```
 
 The verifier also checks the installed interpreter, native extension, wheels, distribution
-`RECORD` entries, signatures, release manifest, validator identity, and application foundation.
-File presence alone is not success evidence.
+`RECORD` entries, signatures, release manifest, and the signed application, validator, and ONNX
+worker identities. The running application and its sibling worker must be those exact installed
+files. File presence alone is not success evidence.
 
 Use the release's isolated interpreter for an authority-free smoke check:
 
@@ -181,11 +179,11 @@ PY
 This proves only that the sealed Python environment can run one bounded kernel. It does not prove
 that the application binary accepts the release or that a model is admitted.
 
-Every `market-squawk` process that opens the model namespace must select the same release, either
-through configuration or the global option:
+Every process that opens the model namespace must run the exact application installed in the
+selected signed release and select that same release root:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -408,7 +406,7 @@ the data root. Candidate-internal authority is rejected.
 Run:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -481,24 +479,28 @@ limits aggregate intermediate elements, intermediate tensors, and compute to 50,
 
 ### Sibling worker requirement
 
-Install `market-squawk-onnx-worker` beside the exact running `market-squawk` executable. At process
-startup, the application:
+The sealed builder installs `market-squawk-onnx-worker` beside the exact signed
+`market-squawk` executable. At process startup, the application:
 
-1. rejects a symlink or non-regular helper and enforces a 256 MiB ceiling;
-2. hashes the unchanged helper in two passes;
-3. copies it to a private content-addressed temporary generation;
-4. rechecks the copied digest and invokes it by absolute path, never `PATH`;
-5. starts one worker generation while constructing each ONNX backend;
-6. preflights, compiles, and warms the exact model before publishing that backend.
+1. verifies that the running application and sibling worker are the canonical installed release
+   paths;
+2. rejects a symlink or non-regular helper and enforces a 256 MiB ceiling;
+3. hashes the unchanged helper in two passes and compares it with the signed release-manifest
+   digest;
+4. copies it to a private content-addressed temporary generation;
+5. rechecks the copied digest and invokes it by absolute path, never `PATH`;
+6. starts one worker generation while constructing each ONNX backend; and
+7. preflights, compiles, and warms the exact model before publishing that backend.
 
 The admitted helper remains running and handles bounded inference requests. It is not spawned once
-per event or prediction. A missing helper is acceptable for an empty or native-only runtime, but
-startup fails closed when a durable ONNX admission needs it.
+per event or prediction. When a training release is configured, a missing or mismatched signed
+helper fails startup even for an empty or native-only model inventory; this preserves the complete
+installed release identity before any durable admission is opened.
 
 With an exact conforming candidate and helper already present, admit it using the same command:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -514,7 +516,7 @@ external ONNX Runtime path described later.
 List every admitted immutable generation:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -527,7 +529,7 @@ dataset manifest, and `no_action` fallback.
 Inspect one model:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -564,7 +566,7 @@ count. The model UUID and exact bundle coordinate must already exist.
 Predict without retaining evaluation evidence:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -574,7 +576,7 @@ market-squawk \
 Evaluate the same inference and retain its bounded process-local evidence:
 
 ```bash
-market-squawk \
+"$TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --data-dir "$DATA_ROOT" \
   --training-release-root "$TRAINING_RELEASE_ROOT" \
   --output json \
@@ -744,15 +746,15 @@ There is no CLI de-admit, delete, or “set current” operation:
 | Authority path/file rejected | Path is not absolute, file is not bounded/no-follow, root overlaps data root, or bytes changed | Restore the exact independently reviewed authority under a disjoint controlled root |
 | Candidate root unavailable | `candidateDirectory` escaped its grammar or does not exist below `artifacts` | Correct the relative coordinate; do not widen filesystem authority |
 | Dataset admission mismatch | Export, as-of cutoff, selection, catalog identity, manifest, or rows differ | Restore the exact dataset/catalog evidence or train a new candidate |
-| Training environment mismatch | Installed release, validator, wheel, `RECORD`, signature, or application foundation differs | Restore the exact release/application pair; rebuild through the supported release path |
+| Training environment mismatch | Installed release, application, validator, ONNX worker, wheel, `RECORD`, signature, or foundation differs | Restore the exact signed release set; rebuild through the supported release path |
 | Backend policy mismatch | Native/ONNX request does not match the bundle format or ONNX artifact digest | Correct the request from the accepted bundle receipt |
 | ONNX policy rejection | Graph violates digest, opset, shape, operator, tensor, node, finite-value, or bound policy | Produce a new conforming graph and full candidate evidence; do not relax policy |
-| Missing ONNX worker | An ONNX generation exists but the exact sibling helper was not installed | Restore the matched packaged helper before reopening the model namespace |
+| Missing ONNX worker | The configured signed release is incomplete or the exact sibling helper is absent | Restore the complete signed release before reopening the model namespace |
 | Prediction not found | Exact model/bundle/version is not admitted | Inspect `model list`; do not silently fall forward to another version |
 | Invalid prediction input | Wrong closed fields, feature count/order, nonfinite value, or zero version | Recreate input from exact `model metadata` |
 | Inference unavailable/deadline | Backend/helper failed, result was late, or termination was uncertain | Treat as `no_action`; inspect and restore the exact runtime before retry |
 | Evaluation evidence disappeared after restart | Retention is deliberately process-local | Use the externally retained command result; do not claim durable evaluation storage |
-| Native training cannot begin after a CLI dataset build | Required `exportSha256` is not exposed | Stop and obtain accepted export evidence; do not use manifest/build-spec digest |
+| Native training driver unavailable | The repository has no supported production driver or complete first-use demonstration | Preserve the exact dataset/release evidence and wait for the accepted driver; do not promote an ad hoc fixture or notebook |
 | No ONNX candidate producer | Current Python handoff emits native bundles only | Use ONNX only with an independently produced, fully conforming candidate; otherwise remain native |
 
 ## Local state locations
@@ -770,9 +772,8 @@ External but required evidence:
 
 | Root | Purpose |
 | --- | --- |
-| `<training-release-root>` | Signed interpreter, package, validator, manifests, signatures, and foundation |
+| `<training-release-root>` | Signed application, ONNX worker, validator, interpreter, package, manifests, signatures, and foundation |
 | `<authority-root>` | Independent bundle authority, disjoint from the data root |
-| Application binary directory | Exact `market-squawk` and, for ONNX, sibling `market-squawk-onnx-worker` |
 | Optional ONNX Runtime root | Library-level optional native runtime and evidence; not selected by current CLI |
 
 ## Related documentation, code, and evidence

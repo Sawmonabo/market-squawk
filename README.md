@@ -90,11 +90,12 @@ work is bound by the single canonical
   metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
   identities are bound before external authority is accepted. The sealed builder verifies the
   370-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
-  project wheel, then installs and tests without network access. A native package-root initializer
-  verifies the signed Market Squawk, PyArrow, interpreter, and native-library file sets before any
-  shipped mutable Python module executes. Prior exact-head evidence proves these components, but a
-  new operator cannot yet complete the application-integrated first-use handoff because the public
-  dataset export digest and matching application/release construction are missing below.
+  project wheel; builds and signs the application, validator, and ONNX worker; and then installs and
+  tests without network access. A native package-root initializer verifies the signed Market Squawk,
+  PyArrow, interpreter, and native-library file sets before any shipped mutable Python module
+  executes. Dataset publication now returns the exact Python export digest and registers the
+  durable feature dataset for point-in-time selection. A supported repository-owned production
+  training driver and ONNX candidate demonstration remain missing below.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -118,9 +119,9 @@ work is bound by the single canonical
   slippage, partial fills, rejections, cancellations, balances, positions, reservations,
   reconciliation, versioned recovery checkpoints, and fail-closed shutdown. The `paper-bot`
   command composes the production Coinbase source, instrument-owned live runtime, canonical risk,
-  one-time dispatcher, and paper worker under one lifecycle. Coinbase remains `DirectUnverified`,
-  and the command installs a no-intent strategy, so this runnable ownership path cannot authorize or
-  place an order.
+  one-use dispatcher, evidence-bound initial sandbox portfolio, fee-aware book-imbalance strategy,
+  and paper worker under one lifecycle. Coinbase remains `DirectUnverified`, so source
+  qualification prevents the strategy from producing an executable intent or paper order.
 - Immutable portfolio accounting revisions over source-evidenced normalized transactions, with
   long/short lots, FIFO and specific identification, cash flows, income, exact gains, explicit
   complete/incomplete basis measurements, corporate-action snapshots, source-total reconciliation,
@@ -153,10 +154,11 @@ work is bound by the single canonical
   sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
   paper execution, fair value, MCP, and readiness diagnosis. Mutating operations retain explicit
   confirmation, typed request admission, shared application-service authority, and bounded output.
-- A sole production local stdio MCP composition spanning all 11 required domains and 59 code-owned
+- A sole production local stdio MCP composition spanning all 11 required domains and 60 code-owned
   typed tools. The shared application descriptors enforce schemas, authorization, evidence and
   artifact policy, bounds, deadlines, cancellation, durable audit, controlled artifacts, and
-  lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services.
+  lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services,
+  including digest-bound, chunked reads of opaque controlled artifacts without exposing paths.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
   production source.
 
@@ -175,17 +177,15 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
+| `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path and controlled book-imbalance strategy are runnable, but the integrated Coinbase source remains capped at `DirectUnverified` and cannot satisfy the execution gate | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
-| `Missing` | production order-producing strategy | Bounded risk, private approval, one-time dispatch, reconciliation, and terminal audit are runnable, but no controlled production strategy can emit an executable intent against a currently `DirectVerified` source | Issue `#7` / Task 20 |
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
 | `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery is implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, the shipping secret store does not activate the platform's encrypted-file fallback, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
 | `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
 | `Missing` | complete provider discovery-to-ingestion workflow | FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public command returns the discovery batch needed to select those exact object IDs | Issues `#24`, `#31` / Tasks 19–20 |
-| `Missing` | complete dataset-to-Python training handoff | Dataset publication registers a Python export descriptor, but CLI output exposes neither its `exportSha256` nor a retrieval operation; `feature build` also does not populate the public feature-dataset registry | Issues `#24`, `#25` / Tasks 19–20 |
-| `Missing` | complete bounded artifact retrieval | MCP can return an opaque overflow-artifact reference, but no typed public operation resolves it; public analytical query compositions also omit the engine's artifact-publication authority and therefore reject non-inline results | Issue `#25` / Task 20 |
-| `Missing` | supported end-to-end model release demonstration | The Python release builder does not build and bind the final application bundle, the repository has no supported production training driver, and no supported ONNX candidate producer/demo exists | Issue `#25` / Task 20 |
+| `Missing` | complete analytical-query overflow publication | Opaque MCP artifacts are now retrievable through bounded `Analysis.ReadArtifact` chunks, but the public DataFusion query compositions still omit the engine's artifact-publication authority and therefore reject non-inline query results | Issue `#25` / Task 20 |
+| `Missing` | supported end-to-end model release demonstration | Dataset export identity, durable feature-dataset selection, and the signed application/validator/ONNX-worker release are composed, but the repository has no supported production training driver or supported ONNX candidate producer/demo | Issue `#25` / Task 20 |
 | `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |
 
 This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
@@ -510,10 +510,11 @@ market-squawk paper-bot \
 ```
 
 It starts and shuts down the sealed Coinbase-to-live-to-risk-to-dispatch-to-paper graph. The graph
-uses the realistic paper engine and canonical risk contracts, but it intentionally produces no
-orders: Coinbase is still `DirectUnverified`, and the CLI installs a no-intent strategy as a second
-fail-closed barrier. This command demonstrates production ownership and lifecycle behavior; it does
-not demonstrate an execution-qualified strategy.
+uses the realistic paper engine, an evidence-bound initial sandbox portfolio, the fee-aware
+book-imbalance strategy, and canonical risk contracts. It still produces no executable orders
+because the integrated Coinbase source is `DirectUnverified`; source qualification stops the path
+before strategy intent can receive approval. This command demonstrates production ownership and
+lifecycle behavior, not an execution-eligible source-to-fill result.
 
 ## Local verification
 

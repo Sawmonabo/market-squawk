@@ -7,9 +7,9 @@ dataset reads, and the CLI-only read-only SQL surface.
 | --- | --- |
 | Document type | Operations runbook |
 | Audience | Local research operators, feature producers, data stewards, and incident responders |
-| Status | Current, with Python-export and feature-registry limitations called out below |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Status | Current, with analytical-query overflow limitations called out below |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -172,15 +172,20 @@ Translate names only; copy the values byte-for-byte.
 market-squawk --data-dir "$DATA_ROOT" --output json feature list
 ```
 
-At the reviewed commit, local composition supplies a code-owned batch feature catalog but
-constructs the analysis dataset registry with no dataset registrations. Consequently:
+Local composition returns the code-owned batch feature catalog followed by durable
+Python-admitted feature/label generations from the analytical catalog. A successful
+`dataset build` or `feature build` is therefore inspectable through `dataset list`,
+`dataset manifest`, query commands, and `feature list`. Each durable feature-dataset entry includes
+its exact manifest, build, policy, universe, split, source, and `pythonExportSha256` identities.
+When a page reports more entries, continue with the last returned dataset identity:
 
-- `feature list` reports the built-in versioned feature metadata; and
-- a dataset published by `feature build` is inspectable through `dataset list`,
-  `dataset manifest`, and query commands, but is not dynamically added to `feature list`.
-
-Do not use absence from `feature list` as evidence that a successful feature build was rolled back.
-Verify the exact build receipt and manifest instead.
+```bash
+market-squawk \
+  --data-dir "$DATA_ROOT" \
+  --output json \
+  feature list \
+  --after-dataset <LAST_DATASET_ID>
+```
 
 ## Prepare an exact point-in-time build
 
@@ -546,6 +551,7 @@ On success, retain the complete result:
   "buildSpecSha256": "...",
   "policySha256": "...",
   "universeSha256": "...",
+  "pythonExportSha256": "...",
   "splitExamples": {
     "train": 6,
     "validation": 2,
@@ -557,13 +563,12 @@ On success, retain the complete result:
 The numbers and digests above illustrate the output shape. Check a real result against the reviewed
 request's expected admitted split counts.
 
-The builder publishes an immutable Parquet generation, records exact lineage, and registers a
-canonical Python dataset export descriptor in the catalog. However, the CLI success result does
-not return that descriptor's `exportSha256`, and no reviewed CLI command retrieves it. Therefore
-the Python training handoff is runnable only when the exact export digest is already retained in
-accepted producer evidence. Do not substitute `contentSha256`, `buildSpecSha256`, or another
-digest; they identify different objects. This release gap is tracked in the mutable
-[delivery ledger](../plans/delivery-ledger.md).
+The builder publishes an immutable Parquet generation, records exact lineage, registers a canonical
+Python dataset export descriptor in the catalog, and returns that descriptor's exact
+`pythonExportSha256`. Retain it with the complete result; `contentSha256`,
+`buildSpecSha256`, `policySha256`, and `universeSha256` identify different objects and are not
+substitutes. The durable feature registry independently revalidates the descriptor bytes against
+this digest before returning the generation to model consumers.
 
 ## Read a dataset without SQL
 
@@ -634,7 +639,7 @@ A completed build has all of the following:
 
 1. Exit status `0` and a complete JSON result.
 2. A manifest tuple whose dataset identity matches `outputDataset`.
-3. Nonzero `buildSpecSha256`, `policySha256`, and `universeSha256`.
+3. Nonzero `buildSpecSha256`, `policySha256`, `universeSha256`, and `pythonExportSha256`.
 4. Split counts that match the reviewed chronological policy and admitted examples.
 5. A subsequent `dataset manifest <OUTPUT_DATASET>` result with the same manifest values after
    translating the field names shown above.
@@ -681,12 +686,11 @@ operation:
 | Point-in-time, rights, or resource invariant failure | Parent pin, availability, selector, split, authorization, or bound is invalid | Correct the source evidence or lower the requested workload; do not alter timestamps/digests to force admission |
 | Parent or dataset not found | The named/latest generation is absent under this data root | Confirm `--data-dir`, then inspect the exact parent receipt and catalog |
 | Revision/universe/corporate-action conflict | Evidence cannot produce one result under the declared policy or exceeded its conflict budget | Review the competing source records and issue a new truthful policy/request |
-| `hasMore: true` from `dataset list` | More than 64 identities exist, but CLI pagination is unavailable | Address known IDs with `dataset manifest`; retain that the list was incomplete |
-| Built dataset absent from `feature list` | The current analysis registry is not dynamically populated | Verify through the build receipt and dataset commands |
+| `hasMore: true` from `dataset list` or `feature list` | More identities exist after this stable page | Continue with `--after-dataset <LAST_DATASET_ID>` from the same operation |
+| Built dataset absent from `feature list` | The generation is not a valid durable Python-admitted feature dataset, the wrong data root is selected, or the page cursor excludes it | Verify the build receipt/data root, request the exact dataset or continue pagination, and preserve any catalog-corruption error |
 | Query limit/resource exhausted | Row, byte, memory, AST, plan, or deadline ceiling was reached | Narrow the read or SQL; do not increase beyond fixed ceilings |
 | SQL statement/relation/function rejected | It is outside the read-only allowlist | Rewrite it as one bounded query over `dataset` using admitted functions |
 | Dataset or SQL query reports resource exhaustion or required artifact authority | Result exceeded an inline boundary and the current public path has no artifact publication authority | Reduce projection, predicates, grouping, or rows; both public query paths are inline-only |
-| Python training cannot start from build output alone | Exact `exportSha256` is not exposed by the CLI | Stop; obtain accepted producer evidence for that exact descriptor rather than substituting another digest |
 
 ## Local state locations
 

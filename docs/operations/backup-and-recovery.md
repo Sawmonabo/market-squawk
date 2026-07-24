@@ -8,8 +8,8 @@ local Market Squawk data root without separating catalogs from their authority a
 | Document type | Operations runbook |
 | Audience | Local operators, release engineers, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-24 |
+| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
 
 ## Contents
 
@@ -261,26 +261,28 @@ RESTORED_DATA_ROOT="/absolute/path/to/fresh-restore-parent/.market-squawk"
 RESTORED_CONFIG="/absolute/path/to/restored-market-squawk.toml"
 RESTORED_TRAINING_RELEASE_ROOT="/absolute/path/to/restored-python-release"
 
-market-squawk \
+"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --config "$RESTORED_CONFIG" \
   --data-dir "$RESTORED_DATA_ROOT" \
   --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
   config validate
-market-squawk \
+"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --config "$RESTORED_CONFIG" \
   --data-dir "$RESTORED_DATA_ROOT" \
   --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
   doctor
-market-squawk \
+"$RESTORED_TRAINING_RELEASE_ROOT/bin/market-squawk" \
   --config "$RESTORED_CONFIG" \
   --data-dir "$RESTORED_DATA_ROOT" \
   --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
   dataset list
 ```
 
-If the restored root has no durable model admission, omit `--training-release-root`; otherwise it
-must name the exact separately restored and verified release. Use the same explicit `--config`,
-`--data-dir`, and applicable `--training-release-root` coordinates for every domain command below.
+If the restored root has no durable model admission, omit `--training-release-root` and use the
+normal installed application. Otherwise the option must name the exact separately restored release,
+and every validation command must run that release's signed `bin/market-squawk`. Use the same
+explicit `--config`, `--data-dir`, and applicable release coordinates for every domain command
+below.
 
 Then validate the domains actually present in the backup:
 

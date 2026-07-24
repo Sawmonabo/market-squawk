@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -9,6 +9,29 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
+- Current pushed release head: `3ef05dc8724ec2be808f98543e0bc695f2ae0937`;
+  local and `origin/release/market-squawk-v0.1.0` match.
+- Research/model first-use authority is integrated through merge head `92f2b72`. Durable
+  point-in-time feature datasets, stable bounded pagination, retained Python export digests, sealed
+  application/validator/ONNX-worker release construction, and bounded artifact-read lifecycle
+  ownership are now in the release line.
+- Shared release composition is integrated at `3ef05dc`: one controlled path-free artifact
+  repository serves application, CLI, and MCP; `Analysis.ReadArtifact` exposes digest-bound
+  32 KiB chunks; the model domain admits the signed application and ONNX worker; and configured
+  initial paper cash becomes an immutable evidence-bound portfolio revision consumed by central
+  risk.
+- Fresh focused evidence at `3ef05dc`: exact production MCP composition, production paper
+  composition, and merged point-in-time backtest tests passed; affected services/application/MCP/
+  modeling Clippy passed with warnings denied; formatting and diff checks passed.
+- The accepted research worktree target (8.3 GiB), worktree, local branch, origin branch, and stale
+  refs are removed. The active root target is approximately 5.4 GiB. The only feature worktree is
+  `feature/coinbase-direct-market-data`, approximately 0.9 GiB.
+- Coinbase direct-market-data core candidate
+  `09f289ff27e1f4fac5f68343bd4a6e53b3b4dba6` is clean and under exact-head independent review; it
+  is not integrated or runnable release authority yet.
+- Hosted Actions run `30131065227` at `3ef05dc` created three jobs with empty step lists. No
+  checkout, build, lint, or test step ran; the external Actions billing/spending-state blocker
+  remains recorded on PR `#26`.
 - Documentation execution source head:
   `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
@@ -68,14 +91,14 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
   workflows and clean-machine evidence, provider discovery-to-ingestion, the public
-  dataset-to-Python export handoff, a supported application-bound Python/model first-use workflow,
-  an ONNX candidate producer/demo, prerequisite-issue reconciliation, and Task 20's integrated
-  demonstration, performance/fuzz/security evidence, final grouped review,
-  exact-head gate, publication, and cleanup.
+  analytical-query overflow publisher, a supported production training driver, an ONNX candidate
+  producer/demo, prerequisite-issue reconciliation, and Task 20's integrated demonstration,
+  performance/fuzz/security evidence, final grouped review, exact-head gate, publication, and
+  cleanup.
 
 ## Documentation candidate and accepted-head truth
 
-The 2026-07-23 refresh inspected code, the locked exact-head release binary, accepted evidence, the
+The 2026-07-24 refresh inspected code, focused exact-head evidence, the
 README, this ledger, open GitHub issues, and Project 5. It established the following current scope
 for documentation writers:
 
@@ -83,7 +106,7 @@ for documentation writers:
   `doctor`, with portfolio import/analytics and fair-value workflows routed through the production
   `LocalProduct` and shared application services.
 - The shipping stdio MCP surface is the sole production composition over all 11 required domains
-  and 59 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
+  and 60 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
   capability nor a reference source.
 - Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
   and training components, immutable model bundles, native and tract ONNX inference, governed
@@ -105,16 +128,16 @@ procedures:
 
 - FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public
   discovery command returns the exact IDs needed for a first-use ingestion.
-- `feature build` does not populate the public feature-dataset registry.
-- Dataset publication registers a Python export descriptor but exposes neither `exportSha256` nor
-  a public retrieval operation.
-- The Python release builder does not build and bind the final application bundle, no supported
-  production training driver completes that handoff, and no supported ONNX candidate producer/demo
-  exists.
+- `feature build` and `dataset build` now populate the durable public feature-dataset registry and
+  return `pythonExportSha256`; the remaining model first-use gap is the supported production
+  training driver and accepted demonstration.
+- The Python release builder now builds and signs the application, validator, and ONNX worker.
+  No supported production training driver or supported ONNX candidate producer/demo exists.
 - Optional external ONNX Runtime support exists at library/evidence level but is not selectable by
   the current product composition; required tract inference remains the shipping ONNX path.
-- MCP overflow-artifact publication returns an opaque reference without a typed public retrieval
-  operation; the public analytical query paths also do not compose query artifact authority.
+- MCP overflow-artifact publication is retrievable through typed, bounded
+  `Analysis.ReadArtifact`; the public analytical query paths still do not compose query artifact
+  publication authority.
 - The reviewed `LocalProduct` composes only the OS-keyring backend. The platform encrypted-file
   fallback and unlock contract are not activated by the shipping application, so complete
   credential setup and recovery remain part of the onboarding blocker.
