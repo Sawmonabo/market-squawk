@@ -1,4 +1,4 @@
-//! Capability-confined immutable MCP artifact publication.
+//! Capability-confined immutable artifact publication shared by local application surfaces.
 
 use std::{
     future::Future,
@@ -18,11 +18,11 @@ use std::{
 use async_trait::async_trait;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use market_squawk_mcp::{
+use market_squawk_platform::ArtifactRoot;
+use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
-use market_squawk_platform::ArtifactRoot;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, oneshot},
@@ -252,10 +252,6 @@ impl ArtifactReadReaper {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the integration-owned shared artifact domain consumes this factory"
-)]
 pub(crate) fn controlled_artifact_repository(
     root: ArtifactRoot,
     maximum_bytes: NonZeroUsize,
@@ -266,14 +262,14 @@ pub(crate) fn controlled_artifact_repository(
 
 /// Bounded content-addressed repository under the configured artifact capability.
 #[derive(Debug)]
-pub(super) struct ControlledArtifactRepository {
+pub(crate) struct ControlledArtifactRepository {
     root: ArtifactRoot,
     maximum_bytes: NonZeroUsize,
     reads: ArtifactReadSupervisor,
 }
 
 impl ControlledArtifactRepository {
-    pub(super) fn try_new(
+    pub(crate) fn try_new(
         root: ArtifactRoot,
         maximum_bytes: NonZeroUsize,
     ) -> Result<Self, ArtifactError> {
@@ -645,7 +641,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use market_squawk_mcp::{ArtifactError, ArtifactReadContext};
+    use market_squawk_services::{ArtifactError, ArtifactReadContext};
     use tokio_util::sync::CancellationToken;
 
     use super::ArtifactReadSupervisor;

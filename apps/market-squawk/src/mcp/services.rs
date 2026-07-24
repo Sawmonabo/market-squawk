@@ -329,7 +329,9 @@ fn ensure_request_live(context: &RequestContext) -> Result<(), ServiceError> {
 mod tests {
     use std::{error::Error, sync::Arc, time::Duration};
 
-    use market_squawk_services::{JsonStructureLimits, RequestId, ServiceLimits, ToolServices};
+    use market_squawk_services::{
+        ArtifactRepository, JsonStructureLimits, RequestId, ServiceLimits, ToolServices,
+    };
     use parking_lot::RwLock;
     use serde_json::{Map, Value};
     use tokio_util::sync::CancellationToken;
@@ -348,6 +350,7 @@ mod tests {
         let _shipping_constructor: fn(
             &AppPaths,
             Arc<Application>,
+            Arc<dyn ArtifactRepository>,
         )
             -> Result<LocalMcpComposition, LocalMcpCompositionError> = LocalMcpComposition::try_new;
         let temporary = tempfile::tempdir()?;

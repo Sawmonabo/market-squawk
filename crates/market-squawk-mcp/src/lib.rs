@@ -5,7 +5,6 @@
 //! opaque artifact boundaries. Business-domain implementations live behind
 //! [`market_squawk_services::ToolServices`].
 
-mod artifact;
 mod audit;
 mod framing;
 mod isolation;
@@ -13,14 +12,14 @@ mod limits;
 mod protocol;
 mod server;
 
-pub use artifact::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
-    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
-};
 pub use audit::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
     AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass, MutationAuditBundle,
     MutationAuditReservation,
 };
 pub use limits::{McpLimitError, McpLimitSpec, McpLimits};
+pub use market_squawk_services::{
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+};
 pub use server::{McpServer, ServerError, ServerExit};

@@ -318,6 +318,27 @@ pub enum DatasetCommand {
 /// Analytical-query operation.
 #[derive(Debug, Subcommand)]
 pub enum QueryCommand {
+    /// Read one verified bounded chunk from an opaque local analytical artifact.
+    Artifact {
+        /// Opaque artifact identifier returned by Market Squawk.
+        #[arg(long)]
+        artifact_id: String,
+        /// Lowercase SHA-256 digest returned with the artifact reference.
+        #[arg(long)]
+        sha256: String,
+        /// Exact complete artifact size returned with the artifact reference.
+        #[arg(long)]
+        byte_count: usize,
+        /// Registered artifact media type.
+        #[arg(long, default_value = "application/json")]
+        media_type: String,
+        /// Zero-based byte offset for this chunk.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Maximum raw bytes returned in this chunk.
+        #[arg(long, default_value_t = 32 * 1024)]
+        maximum_bytes: usize,
+    },
     /// Run bounded read-only DataFusion SQL. This operation is CLI-only.
     Sql {
         /// Exact immutable dataset generation to expose as the query relation.

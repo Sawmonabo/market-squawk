@@ -3,7 +3,7 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize as _, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -23,10 +23,20 @@ pub struct ArtifactPublication {
 }
 
 impl ArtifactPublication {
-    pub(crate) fn try_json(content: Vec<u8>) -> Result<Self, ArtifactError> {
+    /// Creates an immutable JSON publication and derives its content identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidPublication`] when `content` is empty or is not one
+    /// complete JSON value.
+    pub fn try_json(content: Vec<u8>) -> Result<Self, ArtifactError> {
         if content.is_empty() {
             return Err(ArtifactError::InvalidPublication);
         }
+        let mut deserializer = serde_json::Deserializer::from_slice(&content);
+        IgnoredAny::deserialize(&mut deserializer)
+            .and_then(|_value| deserializer.end())
+            .map_err(|_| ArtifactError::InvalidPublication)?;
         Ok(Self {
             sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
             content: content.into(),
@@ -79,7 +89,9 @@ pub struct ArtifactPublicationContext {
 }
 
 impl ArtifactPublicationContext {
-    pub(crate) const fn new(cancellation: CancellationToken, deadline: Instant) -> Self {
+    /// Creates publication lifecycle authority from a transport-neutral request.
+    #[must_use]
+    pub const fn new(cancellation: CancellationToken, deadline: Instant) -> Self {
         Self {
             cancellation,
             deadline,
@@ -179,7 +191,9 @@ impl ArtifactReference {
         })
     }
 
-    pub(crate) fn matches(&self, publication: &ArtifactPublication) -> bool {
+    /// Returns whether this reference exactly identifies `publication`.
+    #[must_use]
+    pub fn matches(&self, publication: &ArtifactPublication) -> bool {
         self.sha256.as_ref() == publication.sha256_hex()
             && self.byte_count == publication.byte_count()
             && self.media_type.as_ref() == publication.media_type()

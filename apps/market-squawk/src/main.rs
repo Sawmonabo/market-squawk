@@ -163,7 +163,11 @@ async fn main() -> Result<()> {
             }
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             let product = LocalProduct::try_new(config)?;
-            let composition = LocalMcpComposition::try_new(product.paths(), product.application())?;
+            let composition = LocalMcpComposition::try_new(
+                product.paths(),
+                product.application(),
+                product.artifacts(),
+            )?;
             let _exit = composition.serve_stdio(CancellationToken::new()).await?;
         }
         Command::Replay(arguments) => {

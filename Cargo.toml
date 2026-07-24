@@ -23,6 +23,7 @@ arrow = { version = "=58.3.0", default-features = false, features = [
 ] }
 async-trait = "0.1"
 atomicwrites = "=0.4.4"
+base64 = "=0.22.1"
 bs58 = "0.5"
 bytes = "1.10"
 cap-fs-ext = "4.0.2"

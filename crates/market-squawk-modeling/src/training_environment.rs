@@ -55,6 +55,9 @@ pub enum TrainingEnvironmentError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedTrainingEnvironment {
     receipt_sha256: [u8; 32],
+    application_sha256: [u8; 32],
+    onnx_worker_sha256: [u8; 32],
+    validator_sha256: [u8; 32],
     training_code_revision: Box<str>,
 }
 
@@ -63,6 +66,24 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub const fn receipt_sha256(&self) -> [u8; 32] {
         self.receipt_sha256
+    }
+
+    /// Returns the signed exact application executable digest.
+    #[must_use]
+    pub const fn application_sha256(&self) -> [u8; 32] {
+        self.application_sha256
+    }
+
+    /// Returns the signed exact ONNX worker executable digest.
+    #[must_use]
+    pub const fn onnx_worker_sha256(&self) -> [u8; 32] {
+        self.onnx_worker_sha256
+    }
+
+    /// Returns the signed exact model-validator executable digest.
+    #[must_use]
+    pub const fn validator_sha256(&self) -> [u8; 32] {
+        self.validator_sha256
     }
 
     /// Returns the builder-derived source-closure revision.
@@ -190,6 +211,9 @@ struct RuntimeRequirementWire {
 struct VerifiedFiles {
     environment: EnvironmentWire,
     receipt_sha256: [u8; 32],
+    application_sha256: [u8; 32],
+    onnx_worker_sha256: [u8; 32],
+    validator_sha256: [u8; 32],
     root: PathBuf,
 }
 
@@ -272,6 +296,9 @@ impl VerifiedFiles {
     fn into_public(self) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
         Ok(VerifiedTrainingEnvironment {
             receipt_sha256: self.receipt_sha256,
+            application_sha256: self.application_sha256,
+            onnx_worker_sha256: self.onnx_worker_sha256,
+            validator_sha256: self.validator_sha256,
             training_code_revision: self.environment.training_code_revision.into(),
         })
     }
@@ -413,6 +440,9 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     Ok(VerifiedFiles {
         environment,
         receipt_sha256: receipt_file.sha256,
+        application_sha256: application.sha256,
+        onnx_worker_sha256: onnx_worker.sha256,
+        validator_sha256: validator.sha256,
         root: canonical_root,
     })
 }

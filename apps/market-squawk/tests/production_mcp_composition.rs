@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, ffi::OsString};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    time::{Duration, Instant},
+};
 
 use market_squawk::{
     LocalProduct, application::application_capabilities, mcp::LocalMcpComposition,
 };
 use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
+use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -24,7 +29,20 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         },
     ))?;
     let product = LocalProduct::try_new(config)?;
-    let composition = LocalMcpComposition::try_new(product.paths(), product.application())?;
+    let artifacts = product.artifacts();
+    let artifact = artifacts
+        .publish(
+            ArtifactPublication::try_json(br#"{"value":1}"#.to_vec())?,
+            ArtifactPublicationContext::new(
+                CancellationToken::new(),
+                Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or("artifact publication deadline overflow")?,
+            ),
+        )
+        .await?;
+    let composition =
+        LocalMcpComposition::try_new(product.paths(), product.application(), artifacts)?;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server);
     let cancellation = CancellationToken::new();
@@ -71,6 +89,36 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
     assert_eq!(names, expected_names);
+    assert!(names.contains(&"Analysis.ReadArtifact"));
+    write_message(
+        &mut client_writer,
+        json!({
+            "jsonrpc":"2.0","id":"shipping-artifact","method":"tools/call",
+            "params":{"name":"Analysis.ReadArtifact","arguments":{
+                "artifactId":artifact.id(),
+                "sha256":artifact.sha256(),
+                "byteCount":artifact.byte_count(),
+                "mediaType":artifact.media_type(),
+                "offset":0,
+                "maximumBytes":32768,
+                "resultLimits":{"maximumItems":1,"maximumBytes":65536}
+            }}
+        }),
+    )
+    .await?;
+    let artifact_read = read_message(&mut client_reader).await?;
+    assert_eq!(
+        artifact_read["result"]["structuredContent"]["data"]["artifact"]["artifactId"],
+        artifact.id()
+    );
+    assert_eq!(
+        artifact_read["result"]["structuredContent"]["data"]["contentBase64"],
+        "eyJ2YWx1ZSI6MX0="
+    );
+    assert_eq!(
+        artifact_read["result"]["structuredContent"]["data"]["complete"],
+        true
+    );
     write_message(
         &mut client_writer,
         json!({

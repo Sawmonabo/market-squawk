@@ -320,6 +320,31 @@ async fn query(
     command: QueryCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
+        QueryCommand::Artifact {
+            artifact_id,
+            sha256,
+            byte_count,
+            media_type,
+            offset,
+            maximum_bytes,
+        } => {
+            let mut arguments = json_object(json!({
+                "artifactId": artifact_id,
+                "sha256": sha256,
+                "byteCount": byte_count,
+                "mediaType": media_type,
+                "offset": offset,
+                "maximumBytes": maximum_bytes,
+            }))?;
+            invoke(
+                product,
+                "Analysis.ReadArtifact",
+                &mut arguments,
+                Some(1),
+                "artifact chunk read",
+            )
+            .await
+        }
         QueryCommand::Dataset {
             dataset,
             maximum_rows,

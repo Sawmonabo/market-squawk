@@ -1,8 +1,9 @@
 //! Manifest-pinned analytical kernels, feature datasets, and governed backtest services.
 
-use std::{collections::HashSet, fmt, str::FromStr, sync::Arc, time::Instant};
+use std::{collections::HashSet, fmt, num::NonZeroUsize, str::FromStr, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::DateTime;
 use market_squawk_analytics::{
     ExactDecimalUnit, FactorRegressionResult, MonetaryBasis, PortfolioAttribution,
@@ -14,6 +15,7 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{DataQuality, InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
+    ArtifactError, ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
     JsonContractError, JsonStructureLimits, RequestContext, ServiceContractError, ServiceDomain,
     ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
     validate_json_contract,
@@ -59,11 +61,13 @@ const GET_SCENARIOS: &str = "Analysis.GetScenarios";
 const GET_FEATURE_DATASETS: &str = "Analysis.GetFeatureDatasets";
 const GET_BACKTESTS: &str = "Analysis.GetBacktests";
 const RUN_BACKTEST: &str = "Analysis.RunBacktest";
+const READ_ARTIFACT: &str = "Analysis.ReadArtifact";
 
 /// Application-owned analytical surface over immutable inputs and governed experiment authority.
 pub struct AnalysisDomainService {
     catalog: Arc<AnalysisCatalog>,
     feature_reader: Option<AnalyticalReadCapability>,
+    artifacts: Option<Arc<dyn ArtifactRepository>>,
     backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
     backtests: Arc<dyn GovernedBacktestAuthority>,
     lifecycle: Arc<DomainLifecycle>,
@@ -80,6 +84,7 @@ impl AnalysisDomainService {
         Self {
             catalog,
             feature_reader: None,
+            artifacts: None,
             backtest_inputs,
             backtests,
             lifecycle: DomainLifecycle::new(),
@@ -97,6 +102,26 @@ impl AnalysisDomainService {
         Self {
             catalog,
             feature_reader: Some(feature_reader),
+            artifacts: None,
+            backtest_inputs,
+            backtests,
+            lifecycle: DomainLifecycle::new(),
+        }
+    }
+
+    /// Binds durable feature-dataset and controlled artifact read authorities.
+    #[must_use]
+    pub fn new_with_feature_reader_and_artifacts(
+        catalog: Arc<AnalysisCatalog>,
+        feature_reader: AnalyticalReadCapability,
+        artifacts: Arc<dyn ArtifactRepository>,
+        backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
+        backtests: Arc<dyn GovernedBacktestAuthority>,
+    ) -> Self {
+        Self {
+            catalog,
+            feature_reader: Some(feature_reader),
+            artifacts: Some(artifacts),
             backtest_inputs,
             backtests,
             lifecycle: DomainLifecycle::new(),
@@ -470,6 +495,75 @@ impl AnalysisDomainService {
         not_applicable_result(record.content().clone(), request, context)
     }
 
+    async fn read_artifact(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let artifacts = self.artifacts.as_ref().ok_or(ServiceError::Unavailable)?;
+        let artifact_id = required_string(request, "artifactId")?;
+        let sha256 = required_string(request, "sha256")?;
+        let media_type = required_string(request, "mediaType")?;
+        let byte_count = required_usize(request, "byteCount")?;
+        let offset = required_usize(request, "offset")?;
+        let maximum_bytes = required_usize(request, "maximumBytes")?;
+        let complete_limit = NonZeroUsize::new(byte_count).ok_or(ServiceError::InvalidRequest)?;
+        let reference = ArtifactReference::try_new(
+            artifact_id.to_owned(),
+            sha256.to_owned(),
+            byte_count,
+            media_type.to_owned(),
+        )
+        .map_err(map_artifact_error)?;
+        let read = artifacts
+            .read(
+                ArtifactReadRequest::try_new(reference, complete_limit)
+                    .map_err(map_artifact_error)?,
+                ArtifactReadContext::new(context.cancellation().clone(), context.deadline()),
+            )
+            .await
+            .map_err(map_artifact_error)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        if offset > read.content().len() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let end = offset
+            .checked_add(maximum_bytes)
+            .map(|end| end.min(read.content().len()))
+            .ok_or(ServiceError::InvalidRequest)?;
+        let content_base64 = BASE64_STANDARD.encode(&read.content()[offset..end]);
+        let reference = read.reference();
+        TypedToolResult::try_new(
+            json!({
+                "artifact": {
+                    "artifactId": reference.id(),
+                    "sha256": reference.sha256(),
+                    "byteCount": reference.byte_count(),
+                    "mediaType": reference.media_type(),
+                },
+                "offset": offset,
+                "returnedBytes": end - offset,
+                "contentBase64": content_base64,
+                "nextOffset": end,
+                "complete": end == read.content().len(),
+            }),
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            admitted_result_limits(request, context)?,
+        )
+        .map_err(|error| match error {
+            ServiceContractError::TooManyItems
+            | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
+                ServiceError::ResourceExhausted
+            }
+            ServiceContractError::ZeroItemsForNonNullResult
+            | ServiceContractError::InvalidMetadata
+            | ServiceContractError::InvalidCompleteness
+            | ServiceContractError::SourceEvidencePolicy
+            | ServiceContractError::Json(_) => ServiceError::InvalidResult,
+        })
+    }
+
     fn selected_dataset(
         &self,
         request: &TypedToolRequest,
@@ -496,6 +590,7 @@ impl fmt::Debug for AnalysisDomainService {
         formatter
             .debug_struct("AnalysisDomainService")
             .field("catalog", &self.catalog)
+            .field("artifacts_configured", &self.artifacts.is_some())
             .field(
                 "backtest_inputs",
                 &"[GOVERNED INPUT REGISTRATION AUTHORITY]",
@@ -529,6 +624,7 @@ impl ApplicationDomainService for AnalysisDomainService {
             GET_FEATURE_DATASETS => self.feature_datasets(&request, &context),
             GET_BACKTESTS => self.get_backtest(&request, &context).await,
             RUN_BACKTEST => self.run_backtest(&request, &context).await,
+            READ_ARTIFACT => self.read_artifact(&request, &context).await,
             _ => Err(ServiceError::NotFound),
         }?;
         ensure_request_live(&context, &self.lifecycle)?;
@@ -951,6 +1047,39 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
         AnalyticalReadError::Manifest(_) | AnalyticalReadError::Query(_) => {
             ServiceError::Unavailable
         }
+    }
+}
+
+fn required_string<'request>(
+    request: &'request TypedToolRequest,
+    name: &str,
+) -> Result<&'request str, ServiceError> {
+    request
+        .arguments()
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)
+}
+
+fn required_usize(request: &TypedToolRequest, name: &str) -> Result<usize, ServiceError> {
+    request
+        .arguments()
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::InvalidRequest)
+        .and_then(|value| usize::try_from(value).map_err(|_| ServiceError::InvalidRequest))
+}
+
+const fn map_artifact_error(error: ArtifactError) -> ServiceError {
+    match error {
+        ArtifactError::InvalidReference | ArtifactError::ReadLimitExceeded => {
+            ServiceError::InvalidRequest
+        }
+        ArtifactError::NotFound => ServiceError::NotFound,
+        ArtifactError::Unavailable => ServiceError::Unavailable,
+        ArtifactError::Cancelled => ServiceError::Cancelled,
+        ArtifactError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        ArtifactError::InvalidPublication => ServiceError::Internal,
     }
 }
 

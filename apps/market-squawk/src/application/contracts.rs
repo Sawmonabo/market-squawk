@@ -24,6 +24,8 @@ const MAXIMUM_TEXT_BYTES: usize = 4 * 1024;
 const MAXIMUM_FAIR_VALUE_INPUTS: usize = 4_096;
 const MAXIMUM_FAIR_VALUE_ACTOR_BYTES: usize = 128;
 const MAXIMUM_FAIR_VALUE_ROW_OFFSET: u64 = 999_999;
+const MAXIMUM_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const MAXIMUM_ARTIFACT_CHUNK_BYTES: u64 = 32 * 1024;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -131,6 +133,35 @@ const FAIR_VALUE_MARKET_ACCESS_ARGUMENTS: &[ArgumentSpec] = &[
 const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("registration", ArgumentKind::Object)];
 const RUN_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
+const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("artifactId", ArgumentKind::Identifier),
+    ArgumentSpec::required("sha256", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "byteCount",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: MAXIMUM_ARTIFACT_BYTES,
+        },
+    ),
+    ArgumentSpec::required(
+        "mediaType",
+        ArgumentKind::Enumeration(&["application/json"]),
+    ),
+    ArgumentSpec::required(
+        "offset",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: MAXIMUM_ARTIFACT_BYTES,
+        },
+    ),
+    ArgumentSpec::required(
+        "maximumBytes",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: MAXIMUM_ARTIFACT_CHUNK_BYTES,
+        },
+    ),
+];
 const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
         "provider",
@@ -377,6 +408,11 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         BACKTEST_RUN_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
+    ),
+    artifact_read(
+        "Analysis.ReadArtifact",
+        "Read one verified bounded chunk from an opaque local analytical artifact.",
+        ARTIFACT_READ_ARGUMENTS,
     ),
     read(
         "Model.GetMetadata",
@@ -795,6 +831,26 @@ const fn read_analysis(name: &'static str, description: &'static str) -> Operati
     )
 }
 
+const fn artifact_read(
+    name: &'static str,
+    description: &'static str,
+    arguments: &'static [ArgumentSpec],
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain: ServiceDomain::Analysis,
+        scope: LOCAL_SCOPE,
+        arguments,
+        authorization: ToolAuthorization::ReadOnly,
+        source_evidence: SourceEvidencePolicy::NotApplicable,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ArgumentSpec {
     name: &'static str,
@@ -823,6 +879,7 @@ impl ArgumentSpec {
 #[derive(Clone, Copy)]
 enum ArgumentKind {
     Identifier,
+    Sha256,
     Text,
     Decimal,
     Object,
@@ -952,6 +1009,12 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "type": "string",
             "minLength": 1,
             "maxLength": MAXIMUM_IDENTIFIER_BYTES
+        }),
+        ArgumentKind::Sha256 => json!({
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
         }),
         ArgumentKind::Text => json!({
             "type": "string",
@@ -1145,6 +1208,16 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::Identifier => value
             .as_str()
             .filter(|value| valid_identifier(value))
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Sha256 => value
+            .as_str()
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Text => value

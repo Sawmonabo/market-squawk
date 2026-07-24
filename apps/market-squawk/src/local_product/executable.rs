@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use market_squawk_modeling::{OnnxWorkerProgram, OnnxWorkerProgramError};
 use sha2::{Digest as _, Sha256};
@@ -20,12 +20,8 @@ pub(super) fn current_executable_sha256() -> Result<[u8; 32], ExecutableIdentity
     hash_stable_regular_file(&executable, MAXIMUM_APPLICATION_BYTES)
 }
 
-/// Admits the exact sibling ONNX worker when it is installed beside the application.
-///
-/// Absence is represented explicitly because a native-only or empty model runtime does not need
-/// a worker. Persisted ONNX generations still fail closed later if this capability is absent.
-pub(super) fn admit_installed_onnx_worker()
--> Result<Option<OnnxWorkerProgram>, ExecutableIdentityError> {
+/// Returns the current application and its fixed sibling ONNX worker path.
+pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), ExecutableIdentityError> {
     let executable = std::env::current_exe()
         .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
     let directory = executable
@@ -35,15 +31,19 @@ pub(super) fn admit_installed_onnx_worker()
         "{ONNX_WORKER_BASENAME}{}",
         std::env::consts::EXE_SUFFIX
     ));
-    match fs::symlink_metadata(&candidate) {
-        Ok(_) => {}
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(ExecutableIdentityError::Metadata { source }),
-    }
+    Ok((executable, candidate))
+}
+
+/// Admits the exact sibling ONNX worker against its signed release-manifest digest.
+pub(super) fn admit_installed_onnx_worker(
+    expected_digest: [u8; 32],
+) -> Result<OnnxWorkerProgram, ExecutableIdentityError> {
+    let (_application, candidate) = installed_release_programs()?;
     let digest = hash_stable_regular_file(&candidate, MAXIMUM_ONNX_WORKER_BYTES)?;
-    OnnxWorkerProgram::admit(candidate, digest)
-        .map(Some)
-        .map_err(Into::into)
+    if digest != expected_digest {
+        return Err(ExecutableIdentityError::SignedDigestMismatch);
+    }
+    OnnxWorkerProgram::admit(candidate, expected_digest).map_err(Into::into)
 }
 
 fn hash_stable_regular_file(
@@ -166,6 +166,9 @@ pub enum ExecutableIdentityError {
     /// Two passes or retained metadata disagreed.
     #[error("executable changed while its identity was established")]
     Changed,
+    /// The installed helper differs from its signed release-manifest identity.
+    #[error("executable differs from its signed release identity")]
+    SignedDigestMismatch,
     /// The ONNX worker rejected the exact sibling executable.
     #[error("ONNX worker admission failed: {0}")]
     OnnxWorker(#[from] OnnxWorkerProgramError),

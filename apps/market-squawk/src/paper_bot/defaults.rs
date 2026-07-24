@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -14,15 +14,12 @@ use market_squawk_adapter_paper::{
     PaperVenueSessionCalendar,
 };
 use market_squawk_analytics::{ExactFeatureRatio, RequiredLiveFeature};
-#[cfg(test)]
 use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
-#[cfg(test)]
 use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, InstrumentDefinition, Money, OrderId,
     OrderReasonCode, PriceTicks, RuleVersion, SourceIdentifier, StrategyId, Timestamp,
 };
-#[cfg(test)]
 use market_squawk_execution::portfolio_execution_state;
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
@@ -38,14 +35,12 @@ use market_squawk_live::{
     SnapshotLimits,
 };
 use market_squawk_platform::LocalPaths;
-#[cfg(test)]
 use market_squawk_portfolio::{
     CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, PortfolioLedger, PortfolioLimitInput,
     PortfolioLimits, PortfolioService, PortfolioServiceLimitInput, PortfolioServiceLimits,
     RevisionEvidence, TransactionRevision, ValuationSet,
 };
 use rust_decimal::Decimal;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -83,11 +78,9 @@ const LOCAL_PAPER_MATCHING_WORK_QUANTUM: usize = 256;
 
 /// Builds the controlled local CLI service using explicit virtual cash and fee assumptions.
 ///
-/// The currently selectable sealed public-source profiles remain `DirectUnverified`, so this
-/// composition installs the full execution graph but cannot issue live authority or mutate paper
-/// state. If a future officially qualified source supplies authority, the built-in transparent
-/// strategy can produce at most one short-lived paper intent per route; unavailable canonical
-/// portfolio state remains a separate central-risk barrier.
+/// Initial cash is admitted as an explicit evidence-bound paper sandbox portfolio. That immutable
+/// revision is the same capability consumed by central risk; no empty or bypass portfolio
+/// authority is installed.
 pub fn local_paper_bot(
     config: AppConfig,
     provider: ProductionSourceProvider,
@@ -246,16 +239,8 @@ where
         positions: Vec::new(),
         position_cost_basis: Vec::new(),
     };
-    let portfolio_results = nonzero_usize(routes.len().max(1))?;
-    let portfolio_retained_bytes = nonzero_usize(4 * 1024 * 1024)?;
-    // This local profile has no published portfolio dataset. Keep central risk fail-closed instead
-    // of manufacturing provenance; the bounded strategy can emit an authority-free intent, but it
-    // cannot approve or dispatch that intent until real current portfolio revision state exists.
-    let portfolio = PortfolioReadCapability::unavailable(PortfolioReadLimits::new(
-        portfolio_results,
-        portfolio_retained_bytes,
-        nonzero_usize(4_096)?,
-    ))?;
+    let portfolio =
+        paper_sandbox_portfolio_capability(account_id, cash, routes.len(), current_timestamp()?)?;
     let risk_limits = RiskLimits::try_new(RiskLimitsInput {
         currency,
         eligible_instruments: routes
@@ -367,11 +352,11 @@ where
     )?)
 }
 
-#[cfg(test)]
-fn local_paper_portfolio_capability(
+fn paper_sandbox_portfolio_capability(
     account_id: AccountId,
     cash: Money,
     maximum_instruments: usize,
+    admitted_at: Timestamp,
 ) -> Result<PortfolioReadCapability> {
     let maximum_instruments = maximum_instruments.max(1);
     let limits = PortfolioLimits::try_new(PortfolioLimitInput {
@@ -385,26 +370,28 @@ fn local_paper_portfolio_capability(
         max_results: maximum_instruments,
         max_retained_bytes: 4 * 1024 * 1024,
     })?;
-    let source = SourceIdentifier::try_from("local-paper-account-bootstrap")?;
-    let as_of = Timestamp::from_unix_nanos(0);
-    let point_in_time_content = Sha256Digest::new(local_paper_portfolio_digest(
-        b"market-squawk/local-paper-portfolio-pit-content/v1\0",
+    let source = SourceIdentifier::try_from("paper-sandbox-user-authorized-initial-cash")?;
+    let point_in_time_content = Sha256Digest::new(paper_sandbox_portfolio_digest(
+        b"market-squawk/paper-sandbox-portfolio-pit-content/v1\0",
         account_id,
         cash,
+        admitted_at,
     ));
-    let point_in_time_audit = Sha256Digest::new(local_paper_portfolio_digest(
-        b"market-squawk/local-paper-portfolio-pit-audit/v1\0",
+    let point_in_time_audit = Sha256Digest::new(paper_sandbox_portfolio_digest(
+        b"market-squawk/paper-sandbox-portfolio-pit-audit/v1\0",
         account_id,
         cash,
+        admitted_at,
     ));
     let dataset = DatasetManifestRef::try_new_with_schema(
-        DatasetId::try_from("local-paper-account-bootstrap")?,
+        DatasetId::try_from("paper-sandbox-initial-capital")?,
         1,
         DatasetSchemaRegistry::local().canonical_research_observations()?,
-        Sha256Digest::new(local_paper_portfolio_digest(
-            b"market-squawk/local-paper-portfolio-manifest/v1\0",
+        Sha256Digest::new(paper_sandbox_portfolio_digest(
+            b"market-squawk/paper-sandbox-portfolio-manifest/v1\0",
             account_id,
             cash,
+            admitted_at,
         )),
     )?;
     let mut ledger = PortfolioLedger::try_new(account_id, cash.currency(), limits)?;
@@ -412,18 +399,18 @@ fn local_paper_portfolio_capability(
         vec![LedgerEntry::try_new(
             account_id,
             TransactionRevision::try_new(
-                SourceIdentifier::try_from("local-paper-initial-cash")?,
+                SourceIdentifier::try_from("paper-sandbox-initial-cash-deposit")?,
                 RevisionNumber::new(1)?,
                 None,
             )?,
-            as_of,
+            admitted_at,
             source.clone(),
             LedgerEntryKind::CashFlow(CashFlow::try_new(CashFlowKind::Deposit, cash, None)?),
         )?],
         None,
         ValuationSet::try_new(
             cash.currency(),
-            as_of,
+            admitted_at,
             dataset.clone(),
             point_in_time_content,
             Vec::new(),
@@ -431,7 +418,7 @@ fn local_paper_portfolio_capability(
             limits,
         )?,
         RevisionEvidence::try_new(
-            as_of,
+            admitted_at,
             dataset,
             point_in_time_content,
             point_in_time_audit,
@@ -462,8 +449,12 @@ fn local_paper_portfolio_capability(
     .1)
 }
 
-#[cfg(test)]
-fn local_paper_portfolio_digest(domain: &[u8], account_id: AccountId, cash: Money) -> [u8; 32] {
+fn paper_sandbox_portfolio_digest(
+    domain: &[u8],
+    account_id: AccountId,
+    cash: Money,
+    admitted_at: Timestamp,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(domain);
     digest.update(account_id.as_uuid().as_bytes());
@@ -471,7 +462,16 @@ fn local_paper_portfolio_digest(domain: &[u8], account_id: AccountId, cash: Mone
     digest.update(cash.amount().normalize().to_string().as_bytes());
     digest.update([0]);
     digest.update(cash.currency().as_str().as_bytes());
+    digest.update([0]);
+    digest.update(admitted_at.unix_nanos().to_be_bytes());
     digest.finalize().into()
+}
+
+fn current_timestamp() -> Result<Timestamp> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(Timestamp::from_unix_nanos(i64::try_from(
+        elapsed.as_nanos(),
+    )?))
 }
 
 #[cfg(test)]
@@ -480,7 +480,12 @@ pub(crate) fn local_paper_portfolio_capability_for_test(
     cash: Money,
     maximum_instruments: usize,
 ) -> Result<PortfolioReadCapability> {
-    local_paper_portfolio_capability(account_id, cash, maximum_instruments)
+    paper_sandbox_portfolio_capability(
+        account_id,
+        cash,
+        maximum_instruments,
+        Timestamp::from_unix_nanos(0),
+    )
 }
 
 #[cfg(test)]

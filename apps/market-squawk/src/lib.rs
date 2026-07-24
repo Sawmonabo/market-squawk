@@ -4,6 +4,7 @@
 //! event model is explicitly diagnostic and remains isolated from current execution authority.
 
 pub mod application;
+mod artifact_repository;
 pub mod backtest_service;
 pub mod backtest_strategy;
 pub mod bot;

@@ -7,7 +7,6 @@
 //! use market_squawk::mcp::McpServer;
 //! ```
 
-mod artifact;
 mod audit;
 #[cfg(test)]
 mod journal_worker;
@@ -15,18 +14,16 @@ mod journal_worker;
 mod services;
 
 use std::{
-    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use artifact::ControlledArtifactRepository;
 use audit::DurableAuditSink;
 use market_squawk_mcp::{
-    ArtifactError, McpLimitError, McpLimitSpec, McpLimits, McpServer as HardenedMcpServer,
-    ServerError, ServerExit,
+    McpLimitError, McpLimitSpec, McpLimits, McpServer as HardenedMcpServer, ServerError, ServerExit,
 };
 use market_squawk_platform::{LocalPaths, PathError};
+use market_squawk_services::ArtifactRepository;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -34,8 +31,6 @@ use tokio_util::sync::CancellationToken;
 pub use audit::LocalAuditError;
 
 use crate::application::{Application, ApplicationShutdownReport};
-
-const LOCAL_MCP_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shipping local MCP ownership composed over the hardened protocol crate.
 pub struct LocalMcpComposition {
@@ -70,15 +65,10 @@ impl LocalMcpComposition {
     pub fn try_new(
         paths: &LocalPaths,
         application: Arc<Application>,
+        artifacts: Arc<dyn ArtifactRepository>,
     ) -> std::result::Result<Self, LocalMcpCompositionError> {
         let control = paths.control_root()?.try_clone_directory()?;
         let audit = Arc::new(DurableAuditSink::try_new(control)?);
-        let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MCP_MAXIMUM_ARTIFACT_BYTES)
-            .ok_or(LocalMcpCompositionError::InvalidArtifactLimit)?;
-        let artifacts = Arc::new(ControlledArtifactRepository::try_new(
-            paths.artifacts()?.clone(),
-            maximum_artifact_bytes,
-        )?);
         let limit_spec = McpLimitSpec::default();
         let application_shutdown_timeout = limit_spec.shutdown_timeout;
         let limits = McpLimits::try_from(limit_spec)?;
@@ -222,15 +212,11 @@ pub enum LocalMcpCompositionError {
     #[error(transparent)]
     Limits(#[from] McpLimitError),
     #[error(transparent)]
-    Artifact(#[from] ArtifactError),
-    #[error(transparent)]
     Audit(#[from] LocalAuditError),
     #[error(transparent)]
     Server(#[from] ServerError),
     #[error(transparent)]
     Application(#[from] LocalMcpApplicationShutdownError),
-    #[error("local MCP artifact limit is invalid")]
-    InvalidArtifactLimit,
     #[error("local MCP session termination did not complete cleanly")]
     SessionTermination {
         /// Protocol-server failure, if the server did not terminate normally.

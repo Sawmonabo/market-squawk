@@ -21,8 +21,9 @@ use market_squawk_analytics::{
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
 use market_squawk_domain::RoundingPolicy;
-use market_squawk_modeling::{TrainingEnvironmentError, verify_validator_training_environment};
+use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
+use market_squawk_services::{ArtifactError, ArtifactRepository};
 use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
@@ -35,6 +36,7 @@ pub use self::cli_provider::CliProviderActivationError;
 pub use self::cli_transport::{CliProductError, CliProductResult, execute_cli_command};
 use self::executable::{
     ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
+    installed_release_programs,
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::provider_activation_state::DurableProviderActivationState;
@@ -58,6 +60,7 @@ use crate::application::{
     ResearchApplicationServices, ResearchExtractionLimits, ResearchSourceDiscoveryCoordinator,
     SourceDomainService,
 };
+use crate::artifact_repository::controlled_artifact_repository;
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
@@ -80,10 +83,12 @@ const MAXIMUM_ROW_GROUP_ROWS: usize = 65_536;
 const ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const MODEL_EVALUATION_RECORDS: usize = 4_096;
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
+const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Lifecycle owner for every production local authority required by the product surface.
 pub struct LocalProduct {
     paths: LocalPaths,
+    artifacts: Arc<dyn ArtifactRepository>,
     application: Arc<Application>,
     research: Arc<ResearchService>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
@@ -104,6 +109,10 @@ impl LocalProduct {
     pub fn try_new(config: AppConfig) -> Result<Self, LocalProductError> {
         let paths = LocalPaths::prepare(config.data_dir())?;
         let research = Arc::new(open_research(&paths)?);
+        let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
+            .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+        let artifacts =
+            controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
 
         let source_store = LocalAuthorityStateStore::try_open(
             paths
@@ -192,11 +201,15 @@ impl LocalProduct {
             ProductionBacktestAuthority::new(backtest_service, repository),
         );
         let backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar> = backtest_inputs.clone();
-        let analysis = Arc::new(AnalysisDomainService::new(
-            Arc::new(analysis_catalog()?),
-            backtest_registrar,
-            backtests,
-        ));
+        let analysis = Arc::new(
+            AnalysisDomainService::new_with_feature_reader_and_artifacts(
+                Arc::new(analysis_catalog()?),
+                research.analytical_reader(),
+                Arc::clone(&artifacts),
+                backtest_registrar,
+                backtests,
+            ),
+        );
 
         let model_limits = ProductionModelRuntimeLimits::standard()?;
         let (model_runtime, model) = open_model_domain(&paths, &config, model_limits)?;
@@ -236,6 +249,7 @@ impl LocalProduct {
         )?);
         Ok(Self {
             paths,
+            artifacts,
             application,
             research,
             research_ingest,
@@ -256,6 +270,11 @@ impl LocalProduct {
     /// Returns the controlled local paths used by MCP and CLI artifact boundaries.
     pub const fn paths(&self) -> &LocalPaths {
         &self.paths
+    }
+
+    /// Returns the sole controlled path-free artifact authority shared by local transports.
+    pub fn artifacts(&self) -> Arc<dyn ArtifactRepository> {
+        Arc::clone(&self.artifacts)
     }
 
     /// Returns the analytical publication and point-in-time read authority.
@@ -305,6 +324,7 @@ impl std::fmt::Debug for LocalProduct {
         formatter
             .debug_struct("LocalProduct")
             .field("paths", &"[LOCAL CAPABILITIES]")
+            .field("artifacts", &"[CONTROLLED ARTIFACT AUTHORITY]")
             .field("application", &self.application)
             .field("research", &"[ANALYTICAL AUTHORITY]")
             .field("provider_onboarding", &"[ONBOARDING AUTHORITY]")
@@ -391,12 +411,10 @@ fn open_model_domain(
         None if durable => return Err(LocalProductError::TrainingReleaseRequired),
         None => (None, ProductionModelRuntime::empty_snapshot(limits)?),
         Some(root) => {
-            let validator = root.join("bin").join(format!(
-                "market-squawk-model-validator{}",
-                std::env::consts::EXE_SUFFIX
-            ));
-            let training = verify_validator_training_environment(root, &validator)?;
-            let onnx_worker = admit_installed_onnx_worker()?;
+            let (application, onnx_worker_path) = installed_release_programs()?;
+            let training =
+                verify_application_training_environment(root, &application, &onnx_worker_path)?;
+            let onnx_worker = Some(admit_installed_onnx_worker(training.onnx_worker_sha256())?);
             let runtime = Arc::new(ProductionModelRuntime::try_open(
                 paths,
                 training,
@@ -436,6 +454,9 @@ pub enum LocalProductError {
     /// Controlled local paths could not be prepared.
     #[error(transparent)]
     Path(#[from] market_squawk_platform::PathError),
+    /// Controlled local artifact authority could not be established.
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
     /// The analytical catalog policy was invalid.
     #[error(transparent)]
     Catalog(#[from] market_squawk_data::CatalogError),
