@@ -38,6 +38,7 @@ pub struct DecoderEvidence {
     binding: FrameSessionBinding,
     frame_id: FrameId,
     receipt: TrustedReceiptObservation,
+    frame_bytes: usize,
     payload_digest: EvidenceDigest,
     decoder_rule: IntegrityRule,
 }
@@ -54,6 +55,7 @@ impl DecoderEvidence {
             binding: frame.binding().clone(),
             frame_id: frame.frame_id(),
             receipt: validated.trusted_receipt().clone(),
+            frame_bytes: frame.payload().len(),
             payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, bytes),
             decoder_rule,
         }
@@ -76,6 +78,11 @@ impl DecoderEvidence {
     /// Returns the exact generation-local raw-frame identity.
     pub const fn frame_id(&self) -> FrameId {
         self.frame_id
+    }
+
+    /// Returns the exact raw payload byte charge derived from the validated frame.
+    pub const fn frame_bytes(&self) -> usize {
+        self.frame_bytes
     }
 
     /// Returns the digest computed from exact raw payload bytes.

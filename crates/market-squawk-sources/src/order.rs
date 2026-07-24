@@ -1,29 +1,38 @@
 //! Provider-neutral, sequence-bearing level-3 order contracts.
 
-use market_squawk_domain::{ProviderProduct, SequenceNumber, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    InstrumentExecutionTerms, PriceTicks, ProviderProduct, QuantityLots, SequenceNumber,
+    SourceIdentifier, Timestamp,
+};
 use thiserror::Error;
 
-use crate::{ProviderBookLevel, ProviderBookSide, ProviderQuantity};
+use crate::{DecoderEvidence, ProviderBookSide};
 
 /// A complete order owned by a provider's level-3 book.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderOrderRecord {
     order_id: SourceIdentifier,
     side: ProviderBookSide,
-    level: ProviderBookLevel,
+    price: PriceTicks,
+    quantity: QuantityLots,
+    terms: InstrumentExecutionTerms,
 }
 
 impl ProviderOrderRecord {
-    /// Constructs an exact provider order without inventing normalized tick or lot evidence.
+    /// Constructs an adapter-normalized provider order.
     pub const fn new(
         order_id: SourceIdentifier,
         side: ProviderBookSide,
-        level: ProviderBookLevel,
+        price: PriceTicks,
+        quantity: QuantityLots,
+        terms: InstrumentExecutionTerms,
     ) -> Self {
         Self {
             order_id,
             side,
-            level,
+            price,
+            quantity,
+            terms,
         }
     }
 
@@ -37,9 +46,19 @@ impl ProviderOrderRecord {
         self.side
     }
 
-    /// Returns the exact price and remaining quantity.
-    pub const fn level(&self) -> &ProviderBookLevel {
-        &self.level
+    /// Returns the instrument-scaled price.
+    pub const fn price(&self) -> PriceTicks {
+        self.price
+    }
+
+    /// Returns the instrument-scaled remaining quantity.
+    pub const fn quantity(&self) -> QuantityLots {
+        self.quantity
+    }
+
+    /// Returns the immutable terms used for exact adapter normalization.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.terms
     }
 }
 
@@ -63,8 +82,8 @@ pub enum ProviderOrderEventKind {
     Match {
         /// Exact maker order identity.
         maker_order_id: SourceIdentifier,
-        /// Exact executed quantity.
-        quantity: ProviderQuantity,
+        /// Instrument-scaled executed quantity.
+        quantity: QuantityLots,
     },
     /// Remove a known order. A valid unknown received-only order is a cursor-only no-op.
     Done {
@@ -75,9 +94,13 @@ pub enum ProviderOrderEventKind {
     Change {
         /// Exact provider order identity.
         order_id: SourceIdentifier,
+        /// Provider-reported scaled price before a limit-order change.
+        previous_price: Option<PriceTicks>,
+        /// Scaled replacement price for a documented modify-order change.
+        new_price: Option<PriceTicks>,
         /// New remaining size when the message describes a maintained limit order. `None` is a
         /// documented non-book funds change.
-        new_quantity: Option<ProviderQuantity>,
+        new_quantity: Option<QuantityLots>,
     },
 }
 
@@ -88,7 +111,8 @@ pub struct ProviderOrderEvent {
     sequence: SequenceNumber,
     timestamp: Timestamp,
     kind: ProviderOrderEventKind,
-    wire_bytes: usize,
+    terms: InstrumentExecutionTerms,
+    evidence: DecoderEvidence,
 }
 
 impl ProviderOrderEvent {
@@ -102,17 +126,23 @@ impl ProviderOrderEvent {
         sequence: SequenceNumber,
         timestamp: Timestamp,
         kind: ProviderOrderEventKind,
-        wire_bytes: usize,
+        terms: InstrumentExecutionTerms,
+        evidence: DecoderEvidence,
     ) -> Result<Self, ProviderOrderEventError> {
-        if wire_bytes == 0 || wire_bytes > crate::MAX_RAW_FRAME_BYTES {
+        if evidence.frame_bytes() == 0 || evidence.frame_bytes() > crate::MAX_RAW_FRAME_BYTES {
             return Err(ProviderOrderEventError::InvalidWireBytes);
+        }
+        if matches!(&kind, ProviderOrderEventKind::Open(order) if order.execution_terms() != terms)
+        {
+            return Err(ProviderOrderEventError::InstrumentTermsMismatch);
         }
         Ok(Self {
             product,
             sequence,
             timestamp,
             kind,
-            wire_bytes,
+            terms,
+            evidence,
         })
     }
 
@@ -136,9 +166,19 @@ impl ProviderOrderEvent {
         &self.kind
     }
 
+    /// Returns the immutable instrument terms used for exact adapter normalization.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.terms
+    }
+
+    /// Returns the validated raw-frame, source/session, receipt, digest, and decoder-rule proof.
+    pub const fn evidence(&self) -> &DecoderEvidence {
+        &self.evidence
+    }
+
     /// Returns the exact raw-frame byte charge used by bounded replay admission.
     pub const fn wire_bytes(&self) -> usize {
-        self.wire_bytes
+        self.evidence.frame_bytes()
     }
 }
 
@@ -148,4 +188,7 @@ pub enum ProviderOrderEventError {
     /// Queue byte accounting must bind one nonempty capturable raw frame.
     #[error("provider order event has an invalid raw-frame byte charge")]
     InvalidWireBytes,
+    /// Nested normalized order state must use the event's exact instrument terms.
+    #[error("provider order event has inconsistent instrument execution terms")]
+    InstrumentTermsMismatch,
 }

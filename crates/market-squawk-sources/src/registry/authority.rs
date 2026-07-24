@@ -454,6 +454,78 @@ impl CurrentSourceSession {
     }
 }
 
+/// Single-use completion authority for one exact HTTP response capture.
+#[derive(Debug)]
+pub(crate) struct HttpResponseReceiptAuthority(HttpResponseReceiptAuthorityInner);
+
+#[derive(Debug)]
+enum HttpResponseReceiptAuthorityInner {
+    Live {
+        binding: FrameSessionBinding,
+        lease: Arc<SessionLeaseState>,
+        clock: Arc<SealedRegistryClock>,
+    },
+    #[cfg(test)]
+    Fixed {
+        binding: FrameSessionBinding,
+        observation: TrustedReceiptObservation,
+    },
+}
+
+impl HttpResponseReceiptAuthority {
+    fn live(
+        binding: FrameSessionBinding,
+        lease: Arc<SessionLeaseState>,
+        clock: Arc<SealedRegistryClock>,
+    ) -> Self {
+        Self(HttpResponseReceiptAuthorityInner::Live {
+            binding,
+            lease,
+            clock,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        binding: FrameSessionBinding,
+        observation: TrustedReceiptObservation,
+    ) -> Self {
+        Self(HttpResponseReceiptAuthorityInner::Fixed {
+            binding,
+            observation,
+        })
+    }
+
+    pub(crate) fn observe(
+        self,
+    ) -> Result<(FrameSessionBinding, TrustedReceiptObservation), crate::SegmentedHttpCaptureError>
+    {
+        match self.0 {
+            HttpResponseReceiptAuthorityInner::Live {
+                binding,
+                lease,
+                clock,
+            } => {
+                if !lease.is_current() {
+                    return Err(crate::SegmentedHttpCaptureError::AuthorityUnavailable);
+                }
+                let observation = clock
+                    .observe_receipt()
+                    .map_err(|_error| crate::SegmentedHttpCaptureError::AuthorityUnavailable)?;
+                lease
+                    .validate_receipt(&observation)
+                    .map_err(|_error| crate::SegmentedHttpCaptureError::AuthorityUnavailable)?;
+                Ok((binding, observation))
+            }
+            #[cfg(test)]
+            HttpResponseReceiptAuthorityInner::Fixed {
+                binding,
+                observation,
+            } => Ok((binding, observation)),
+        }
+    }
+}
+
 /// Once-issued, non-serializable raw-frame construction capability for one exact generation.
 #[derive(Debug)]
 pub struct RawFrameFactory {
@@ -477,6 +549,47 @@ impl RawFrameFactory {
                 .continuity()
                 .shares_allocation_with(&lease.continuity)
             && capture.is_bound_to(self.clock.continuity(), lease.started_at)
+    }
+
+    /// Starts one bounded HTTP response capture whose completion receipt is observed by this
+    /// exact registry generation.
+    ///
+    /// The trusted observation is sampled only after [`crate::SegmentedHttpResponseBuilder::finish`]
+    /// has accepted the complete body. Session rollover or trusted-clock failure before that
+    /// completion rejects the capture.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, unsafe response coordinates, and invalid count/byte bounds.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "HTTP response identity and every boundedness input remain explicit"
+    )]
+    pub fn try_http_response_builder(
+        &mut self,
+        method: crate::HttpCaptureMethod,
+        final_url: &str,
+        status: u16,
+        declared_body_length: Option<u64>,
+        max_body_bytes: u64,
+        max_segments: usize,
+    ) -> Result<crate::SegmentedHttpResponseBuilder, crate::SegmentedHttpCaptureError> {
+        if !self.lease.is_current() {
+            return Err(crate::SegmentedHttpCaptureError::AuthorityUnavailable);
+        }
+        crate::SegmentedHttpResponseBuilder::try_new(
+            HttpResponseReceiptAuthority::live(
+                self.binding.clone(),
+                Arc::clone(&self.lease),
+                Arc::clone(&self.clock),
+            ),
+            method,
+            final_url,
+            status,
+            declared_body_length,
+            max_body_bytes,
+            max_segments,
+        )
     }
 
     /// Constructs one bounded exact transport frame under this generation's identity.

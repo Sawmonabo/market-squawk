@@ -480,6 +480,7 @@ mod tests {
                     NonZeroU64::new(1).ok_or("frame fixture must be nonzero")?,
                 ),
                 receipt: trusted_test_receipt(Timestamp::from_unix_nanos(1), 1)?,
+                frame_bytes: 1,
                 payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
                 decoder_rule: IntegrityRule::new(decoder, RuleVersion::new(1)?),
             })

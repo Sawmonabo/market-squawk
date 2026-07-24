@@ -1,16 +1,15 @@
 //! Bounded level-3 ownership and atomic snapshot/replay handoff.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use market_squawk_domain::{
-    ConnectionGeneration, ProviderProduct, SequenceNumber, SourceIdentifier, Timestamp,
+    ConnectionGeneration, InstrumentExecutionTerms, PriceTicks, ProviderProduct, QuantityLots,
+    SequenceNumber, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ProviderBookLevel, ProviderBookSide, ProviderDecimalLexeme, ProviderOrderEvent,
-    ProviderOrderEventKind, ProviderOrderRecord, ProviderPrice, ProviderQuantity,
-    SegmentedHttpResponseReceipt,
+    FrameSessionBinding, ProviderBookSide, ProviderOrderEvent, ProviderOrderEventKind,
+    ProviderOrderRecord, SegmentedHttpResponseReceipt,
 };
-use rust_decimal::Decimal;
 use thiserror::Error;
 
 const MAX_DIRECT_ORDERS: usize = 2_000_000;
@@ -112,32 +111,31 @@ impl DirectBookLimits {
 #[derive(Clone, Debug)]
 struct OwnedOrder {
     side: ProviderBookSide,
-    price: ProviderPrice,
-    quantity: ProviderQuantity,
+    price: PriceTicks,
+    quantity: QuantityLots,
 }
 
 impl OwnedOrder {
     fn from_record(record: &ProviderOrderRecord) -> Self {
         Self {
             side: record.side(),
-            price: record.level().price().clone(),
-            quantity: record.level().quantity().clone(),
+            price: record.price(),
+            quantity: record.quantity(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct PriceAggregate {
-    side: ProviderBookSide,
-    price: ProviderPrice,
-    quantity: Decimal,
+    quantity: QuantityLots,
     orders: usize,
 }
 
 #[derive(Debug)]
 struct OrderBookState {
     orders: HashMap<SourceIdentifier, OwnedOrder>,
-    levels: HashMap<(ProviderBookSide, Decimal), PriceAggregate>,
+    bids: BTreeMap<PriceTicks, PriceAggregate>,
+    asks: BTreeMap<PriceTicks, PriceAggregate>,
     limits: DirectBookLimits,
 }
 
@@ -147,49 +145,79 @@ impl OrderBookState {
         orders
             .try_reserve(limits.max_orders)
             .map_err(|_| DirectOrderBookError::Allocation)?;
-        let mut levels = HashMap::new();
-        levels
-            .try_reserve(limits.max_price_levels)
-            .map_err(|_| DirectOrderBookError::Allocation)?;
         Ok(Self {
             orders,
-            levels,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
             limits,
         })
     }
 
+    fn levels(&self, side: ProviderBookSide) -> &BTreeMap<PriceTicks, PriceAggregate> {
+        match side {
+            ProviderBookSide::Bid => &self.bids,
+            ProviderBookSide::Ask => &self.asks,
+        }
+    }
+
+    fn levels_mut(&mut self, side: ProviderBookSide) -> &mut BTreeMap<PriceTicks, PriceAggregate> {
+        match side {
+            ProviderBookSide::Bid => &mut self.bids,
+            ProviderBookSide::Ask => &mut self.asks,
+        }
+    }
+
+    fn level_count(&self) -> Result<usize, DirectOrderBookError> {
+        self.bids
+            .len()
+            .checked_add(self.asks.len())
+            .ok_or(DirectOrderBookError::NumericInvariant)
+    }
+
     fn insert(&mut self, record: &ProviderOrderRecord) -> Result<(), DirectOrderBookError> {
-        let price = record.level().price().value().decimal();
-        let quantity = record.level().quantity().value().decimal();
-        validate_positive(price)?;
-        validate_positive(quantity)?;
+        let price = record.price();
+        let quantity = record.quantity();
+        validate_positive_price(price)?;
+        validate_positive_quantity(quantity)?;
         if self.orders.contains_key(record.order_id()) {
             return Err(DirectOrderBookError::DuplicateOrder);
         }
         if self.orders.len() == self.limits.max_orders {
             return Err(DirectOrderBookError::OrderCapacityExceeded);
         }
-        let key = (record.side(), price);
-        if !self.levels.contains_key(&key) && self.levels.len() == self.limits.max_price_levels {
+        let existing = self.levels(record.side()).get(&price);
+        if existing.is_none() && self.level_count()? == self.limits.max_price_levels {
             return Err(DirectOrderBookError::PriceLevelCapacityExceeded);
         }
-        match self.levels.get_mut(&key) {
-            Some(aggregate) => {
-                aggregate.quantity = aggregate
+        let next_existing = existing
+            .map(|aggregate| {
+                if aggregate.orders == 0 || aggregate.quantity.get() == 0 {
+                    return Err(DirectOrderBookError::AggregateInvariant);
+                }
+                let next_quantity = aggregate
                     .quantity
                     .checked_add(quantity)
-                    .ok_or(DirectOrderBookError::NumericInvariant)?;
-                aggregate.orders = aggregate
+                    .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+                let next_orders = aggregate
                     .orders
                     .checked_add(1)
                     .ok_or(DirectOrderBookError::NumericInvariant)?;
+                Ok((next_quantity, next_orders))
+            })
+            .transpose()?;
+        match next_existing {
+            Some((next_quantity, next_orders)) => {
+                let aggregate = self
+                    .levels_mut(record.side())
+                    .get_mut(&price)
+                    .ok_or(DirectOrderBookError::AggregateInvariant)?;
+                aggregate.quantity = next_quantity;
+                aggregate.orders = next_orders;
             }
             None => {
-                self.levels.insert(
-                    key,
+                self.levels_mut(record.side()).insert(
+                    price,
                     PriceAggregate {
-                        side: record.side(),
-                        price: record.level().price().clone(),
                         quantity,
                         orders: 1,
                     },
@@ -205,53 +233,57 @@ impl OrderBookState {
         &mut self,
         order_id: &SourceIdentifier,
     ) -> Result<bool, DirectOrderBookError> {
-        let Some(order) = self.orders.remove(order_id) else {
+        let Some(order) = self.orders.get(order_id).cloned() else {
             return Ok(false);
         };
-        let key = (order.side, order.price.value().decimal());
-        let remove_level = {
-            let aggregate = self
-                .levels
-                .get_mut(&key)
-                .ok_or(DirectOrderBookError::AggregateInvariant)?;
-            let quantity = order.quantity.value().decimal();
-            if aggregate.orders == 0 || aggregate.quantity < quantity {
-                return Err(DirectOrderBookError::AggregateInvariant);
-            }
-            aggregate.orders -= 1;
-            aggregate.quantity = aggregate
-                .quantity
-                .checked_sub(quantity)
-                .ok_or(DirectOrderBookError::NumericInvariant)?;
-            (aggregate.orders == 0) == aggregate.quantity.is_zero() && aggregate.orders == 0
-        };
+        let price = order.price;
+        let quantity = order.quantity;
+        let aggregate = self
+            .levels(order.side)
+            .get(&price)
+            .ok_or(DirectOrderBookError::AggregateInvariant)?;
+        validate_owned_aggregate(aggregate, quantity)?;
+        let next_orders = aggregate
+            .orders
+            .checked_sub(1)
+            .ok_or(DirectOrderBookError::AggregateInvariant)?;
+        let next_quantity = aggregate
+            .quantity
+            .checked_sub(quantity)
+            .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+        let remove_level = next_orders == 0;
+        if remove_level != (next_quantity.get() == 0) {
+            return Err(DirectOrderBookError::AggregateInvariant);
+        }
         if remove_level {
-            self.levels.remove(&key);
+            self.levels_mut(order.side).remove(&price);
         } else {
             let aggregate = self
-                .levels
-                .get(&key)
+                .levels_mut(order.side)
+                .get_mut(&price)
                 .ok_or(DirectOrderBookError::AggregateInvariant)?;
-            if aggregate.orders == 0 || aggregate.quantity <= Decimal::ZERO {
-                return Err(DirectOrderBookError::AggregateInvariant);
-            }
+            aggregate.orders = next_orders;
+            aggregate.quantity = next_quantity;
         }
+        self.orders
+            .remove(order_id)
+            .ok_or(DirectOrderBookError::AggregateInvariant)?;
         Ok(true)
     }
 
     fn apply_match(
         &mut self,
         maker_order_id: &SourceIdentifier,
-        quantity: &ProviderQuantity,
+        quantity: QuantityLots,
     ) -> Result<(), DirectOrderBookError> {
-        let matched = quantity.value().decimal();
-        validate_positive(matched)?;
+        let matched = quantity;
+        validate_positive_quantity(matched)?;
         let order = self
             .orders
             .get(maker_order_id)
             .cloned()
             .ok_or(DirectOrderBookError::UnknownMakerOrder)?;
-        let remaining = order.quantity.value().decimal();
+        let remaining = order.quantity;
         if matched > remaining {
             return Err(DirectOrderBookError::MatchExceedsRemaining);
         }
@@ -263,58 +295,144 @@ impl OrderBookState {
         }
         let next = remaining
             .checked_sub(matched)
-            .ok_or(DirectOrderBookError::NumericInvariant)?;
-        let next_quantity = quantity_from_decimal(next)?;
-        let key = (order.side, order.price.value().decimal());
+            .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+        let price = order.price;
         let aggregate = self
-            .levels
-            .get_mut(&key)
+            .levels(order.side)
+            .get(&price)
             .ok_or(DirectOrderBookError::AggregateInvariant)?;
-        aggregate.quantity = aggregate
+        validate_owned_aggregate(aggregate, remaining)?;
+        let next_aggregate_quantity = aggregate
             .quantity
             .checked_sub(matched)
-            .ok_or(DirectOrderBookError::NumericInvariant)?;
-        if aggregate.quantity <= Decimal::ZERO {
+            .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+        if next_aggregate_quantity.get() == 0 {
             return Err(DirectOrderBookError::AggregateInvariant);
         }
+        self.levels_mut(order.side)
+            .get_mut(&price)
+            .ok_or(DirectOrderBookError::AggregateInvariant)?
+            .quantity = next_aggregate_quantity;
         self.orders
             .get_mut(maker_order_id)
             .ok_or(DirectOrderBookError::UnknownMakerOrder)?
-            .quantity = next_quantity;
+            .quantity = next;
         Ok(())
     }
 
     fn apply_change(
         &mut self,
         order_id: &SourceIdentifier,
-        new_quantity: Option<&ProviderQuantity>,
+        previous_price: Option<PriceTicks>,
+        new_price: Option<PriceTicks>,
+        new_quantity: Option<QuantityLots>,
     ) -> Result<(), DirectOrderBookError> {
-        let Some(new_quantity) = new_quantity else {
+        if new_price.is_some() && previous_price.is_none() {
+            return Err(DirectOrderBookError::InvalidChange);
+        }
+        if previous_price.is_none() && new_price.is_none() && new_quantity.is_none() {
             return Ok(());
-        };
+        }
         let Some(order) = self.orders.get(order_id).cloned() else {
             return Ok(());
         };
-        let next = new_quantity.value().decimal();
-        validate_positive(next)?;
-        let previous = order.quantity.value().decimal();
-        let key = (order.side, order.price.value().decimal());
-        let aggregate = self
-            .levels
-            .get_mut(&key)
-            .ok_or(DirectOrderBookError::AggregateInvariant)?;
-        aggregate.quantity = aggregate
-            .quantity
-            .checked_sub(previous)
-            .and_then(|value| value.checked_add(next))
-            .ok_or(DirectOrderBookError::NumericInvariant)?;
-        if aggregate.quantity <= Decimal::ZERO {
-            return Err(DirectOrderBookError::AggregateInvariant);
+
+        let previous_price_value = order.price;
+        if previous_price.is_some_and(|expected| expected != previous_price_value) {
+            return Err(DirectOrderBookError::ChangePriceMismatch);
         }
-        self.orders
+        let next_price = new_price.unwrap_or(order.price);
+        let next_quantity = new_quantity.unwrap_or(order.quantity);
+        let next_price_value = next_price;
+        let previous_quantity_value = order.quantity;
+        let next_quantity_value = next_quantity;
+        validate_positive_price(next_price_value)?;
+        validate_positive_quantity(next_quantity_value)?;
+
+        let previous_aggregate = self
+            .levels(order.side)
+            .get(&previous_price_value)
+            .ok_or(DirectOrderBookError::AggregateInvariant)?;
+        validate_owned_aggregate(previous_aggregate, previous_quantity_value)?;
+        if next_price_value == previous_price_value {
+            let next_aggregate_quantity = previous_aggregate
+                .quantity
+                .checked_sub(previous_quantity_value)
+                .and_then(|value| value.checked_add(next_quantity_value))
+                .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+            validate_positive_quantity(next_aggregate_quantity)?;
+            self.levels_mut(order.side)
+                .get_mut(&previous_price_value)
+                .ok_or(DirectOrderBookError::AggregateInvariant)?
+                .quantity = next_aggregate_quantity;
+        } else {
+            let previous_level_quantity = previous_aggregate
+                .quantity
+                .checked_sub(previous_quantity_value)
+                .map_err(|_| DirectOrderBookError::NumericInvariant)?;
+            let remove_previous_level = previous_aggregate.orders == 1;
+            if remove_previous_level != (previous_level_quantity.get() == 0) {
+                return Err(DirectOrderBookError::AggregateInvariant);
+            }
+
+            let next_existing = self.levels(order.side).get(&next_price_value);
+            if next_existing.is_none()
+                && self.level_count()? == self.limits.max_price_levels
+                && !remove_previous_level
+            {
+                return Err(DirectOrderBookError::PriceLevelCapacityExceeded);
+            }
+            let next_level_quantity =
+                next_existing.map_or(Ok(next_quantity_value), |aggregate| {
+                    if aggregate.orders == 0 || aggregate.quantity.get() == 0 {
+                        return Err(DirectOrderBookError::AggregateInvariant);
+                    }
+                    aggregate
+                        .quantity
+                        .checked_add(next_quantity_value)
+                        .map_err(|_| DirectOrderBookError::NumericInvariant)
+                })?;
+            let next_level_orders = next_existing.map_or(Ok(1), |aggregate| {
+                aggregate
+                    .orders
+                    .checked_add(1)
+                    .ok_or(DirectOrderBookError::NumericInvariant)
+            })?;
+            validate_positive_quantity(next_level_quantity)?;
+
+            if remove_previous_level {
+                self.levels_mut(order.side).remove(&previous_price_value);
+            } else {
+                let aggregate = self
+                    .levels_mut(order.side)
+                    .get_mut(&previous_price_value)
+                    .ok_or(DirectOrderBookError::AggregateInvariant)?;
+                aggregate.quantity = previous_level_quantity;
+                aggregate.orders -= 1;
+            }
+            match self.levels_mut(order.side).get_mut(&next_price_value) {
+                Some(aggregate) => {
+                    aggregate.quantity = next_level_quantity;
+                    aggregate.orders = next_level_orders;
+                }
+                None => {
+                    self.levels_mut(order.side).insert(
+                        next_price_value,
+                        PriceAggregate {
+                            quantity: next_level_quantity,
+                            orders: next_level_orders,
+                        },
+                    );
+                }
+            }
+        }
+
+        let maintained = self
+            .orders
             .get_mut(order_id)
-            .ok_or(DirectOrderBookError::AggregateInvariant)?
-            .quantity = new_quantity.clone();
+            .ok_or(DirectOrderBookError::AggregateInvariant)?;
+        maintained.price = next_price;
+        maintained.quantity = next_quantity;
         Ok(())
     }
 
@@ -325,99 +443,111 @@ impl OrderBookState {
             ProviderOrderEventKind::Match {
                 maker_order_id,
                 quantity,
-            } => self.apply_match(maker_order_id, quantity),
+            } => self.apply_match(maker_order_id, *quantity),
             ProviderOrderEventKind::Done { order_id } => {
                 let _known = self.remove_if_known(order_id)?;
                 Ok(())
             }
             ProviderOrderEventKind::Change {
                 order_id,
+                previous_price,
+                new_price,
                 new_quantity,
-            } => self.apply_change(order_id, new_quantity.as_ref()),
+            } => self.apply_change(order_id, *previous_price, *new_price, *new_quantity),
         }
     }
 
-    fn published(&self, depth: usize) -> Result<DirectPublishedBook, DirectOrderBookError> {
-        let mut bids = self
-            .levels
-            .values()
-            .filter(|level| level.side == ProviderBookSide::Bid)
-            .collect::<Vec<_>>();
-        let mut asks = self
-            .levels
-            .values()
-            .filter(|level| level.side == ProviderBookSide::Ask)
-            .collect::<Vec<_>>();
-        bids.sort_unstable_by(|left, right| {
-            right
-                .price
-                .value()
-                .decimal()
-                .cmp(&left.price.value().decimal())
-        });
-        asks.sort_unstable_by(|left, right| {
-            left.price
-                .value()
-                .decimal()
-                .cmp(&right.price.value().decimal())
-        });
-        let bids = published_side(bids.into_iter().take(depth), depth)?;
-        let asks = published_side(asks.into_iter().take(depth), depth)?;
-        Ok(DirectPublishedBook { bids, asks })
+    fn published(&self, depth: usize) -> Result<DirectPublishedBook<'_>, DirectOrderBookError> {
+        if depth != self.limits.published_depth {
+            return Err(DirectOrderBookError::InvalidLimits);
+        }
+        Ok(DirectPublishedBook {
+            bids: &self.bids,
+            asks: &self.asks,
+            depth,
+        })
     }
 }
 
-fn published_side<'a>(
-    levels: impl Iterator<Item = &'a PriceAggregate>,
-    depth: usize,
-) -> Result<Box<[ProviderBookLevel]>, DirectOrderBookError> {
-    let mut published = Vec::new();
-    published
-        .try_reserve_exact(depth)
-        .map_err(|_| DirectOrderBookError::Allocation)?;
-    for aggregate in levels {
-        published.push(ProviderBookLevel::new(
-            aggregate.price.clone(),
-            quantity_from_decimal(aggregate.quantity)?,
-        ));
+fn validate_owned_aggregate(
+    aggregate: &PriceAggregate,
+    owned_quantity: QuantityLots,
+) -> Result<(), DirectOrderBookError> {
+    if aggregate.orders == 0
+        || aggregate.quantity < owned_quantity
+        || (aggregate.orders == 1) != (aggregate.quantity == owned_quantity)
+    {
+        Err(DirectOrderBookError::AggregateInvariant)
+    } else {
+        Ok(())
     }
-    published.shrink_to_fit();
-    Ok(published.into_boxed_slice())
 }
 
-fn quantity_from_decimal(value: Decimal) -> Result<ProviderQuantity, DirectOrderBookError> {
-    validate_positive(value)?;
-    let lexeme = value.normalize().to_string();
-    Ok(ProviderQuantity::new(
-        ProviderDecimalLexeme::try_new(&lexeme)
-            .map_err(|_| DirectOrderBookError::NumericInvariant)?,
-    ))
-}
-
-fn validate_positive(value: Decimal) -> Result<(), DirectOrderBookError> {
-    if value <= Decimal::ZERO {
+fn validate_positive_price(value: PriceTicks) -> Result<(), DirectOrderBookError> {
+    if value.get() <= 0 {
         Err(DirectOrderBookError::NumericInvariant)
     } else {
         Ok(())
     }
 }
 
-/// Top configured price levels derived from the complete healthy order owner.
-#[derive(Clone, Debug)]
-pub struct DirectPublishedBook {
-    bids: Box<[ProviderBookLevel]>,
-    asks: Box<[ProviderBookLevel]>,
+fn validate_positive_quantity(value: QuantityLots) -> Result<(), DirectOrderBookError> {
+    if value.get() == 0 {
+        Err(DirectOrderBookError::NumericInvariant)
+    } else {
+        Ok(())
+    }
 }
 
-impl DirectPublishedBook {
-    /// Returns bids in descending price order.
-    pub fn bids(&self) -> &[ProviderBookLevel] {
-        &self.bids
+/// One allocation-free aggregate level view from a healthy direct order book.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectPublishedLevel {
+    price: PriceTicks,
+    quantity: QuantityLots,
+}
+
+impl DirectPublishedLevel {
+    /// Returns the instrument-scaled aggregate price.
+    pub const fn price(self) -> PriceTicks {
+        self.price
     }
 
-    /// Returns asks in ascending price order.
-    pub fn asks(&self) -> &[ProviderBookLevel] {
-        &self.asks
+    /// Returns the instrument-scaled aggregate quantity.
+    pub const fn quantity(self) -> QuantityLots {
+        self.quantity
+    }
+}
+
+/// Allocation-free top-depth view derived directly from the ordered aggregate owner.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectPublishedBook<'a> {
+    bids: &'a BTreeMap<PriceTicks, PriceAggregate>,
+    asks: &'a BTreeMap<PriceTicks, PriceAggregate>,
+    depth: usize,
+}
+
+impl DirectPublishedBook<'_> {
+    /// Iterates bids in descending price order without copying or allocating.
+    pub fn bids(&self) -> impl Iterator<Item = DirectPublishedLevel> + '_ {
+        self.bids
+            .iter()
+            .rev()
+            .take(self.depth)
+            .map(|(price, aggregate)| DirectPublishedLevel {
+                price: *price,
+                quantity: aggregate.quantity,
+            })
+    }
+
+    /// Iterates asks in ascending price order without copying or allocating.
+    pub fn asks(&self) -> impl Iterator<Item = DirectPublishedLevel> + '_ {
+        self.asks
+            .iter()
+            .take(self.depth)
+            .map(|(price, aggregate)| DirectPublishedLevel {
+                price: *price,
+                quantity: aggregate.quantity,
+            })
     }
 }
 
@@ -425,7 +555,9 @@ impl DirectPublishedBook {
 #[derive(Debug)]
 pub struct DirectOrderBook {
     generation: ConnectionGeneration,
+    binding: Option<FrameSessionBinding>,
     product: ProviderProduct,
+    terms: InstrumentExecutionTerms,
     limits: DirectBookLimits,
     phase: DirectSyncPhase,
     queue: VecDeque<ProviderOrderEvent>,
@@ -437,7 +569,6 @@ pub struct DirectOrderBook {
     active: Option<OrderBookState>,
     last_sequence: Option<SequenceNumber>,
     source_timestamp: Option<Timestamp>,
-    published: Option<DirectPublishedBook>,
     snapshot_receipt: Option<SegmentedHttpResponseReceipt>,
 }
 
@@ -450,6 +581,7 @@ impl DirectOrderBook {
     pub fn try_new(
         generation: ConnectionGeneration,
         product: ProviderProduct,
+        terms: InstrumentExecutionTerms,
         limits: DirectBookLimits,
     ) -> Result<Self, DirectOrderBookError> {
         let mut queue = VecDeque::new();
@@ -458,7 +590,9 @@ impl DirectOrderBook {
             .map_err(|_| DirectOrderBookError::Allocation)?;
         Ok(Self {
             generation,
+            binding: None,
             product,
+            terms,
             limits,
             phase: DirectSyncPhase::AwaitingSnapshot,
             queue,
@@ -470,7 +604,6 @@ impl DirectOrderBook {
             active: None,
             last_sequence: None,
             source_timestamp: None,
-            published: None,
             snapshot_receipt: None,
         })
     }
@@ -483,6 +616,11 @@ impl DirectOrderBook {
     /// Returns the immutable provider product sequence domain.
     pub const fn product(&self) -> &ProviderProduct {
         &self.product
+    }
+
+    /// Returns the immutable instrument terms required by every normalized event and snapshot.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.terms
     }
 
     /// Returns the current synchronization phase.
@@ -503,7 +641,9 @@ impl DirectOrderBook {
             ) {
                 return Err(DirectOrderBookError::WrongPhase);
             }
+            self.bind_event_authority(&event)?;
             self.validate_product(&event)?;
+            self.validate_terms(&event)?;
             if self.queue.len() == self.limits.max_queue_events {
                 return Err(DirectOrderBookError::QueueCountExceeded);
             }
@@ -558,6 +698,9 @@ impl DirectOrderBook {
             {
                 return Err(DirectOrderBookError::WrongPhase);
             }
+            if order.execution_terms() != self.terms {
+                return Err(DirectOrderBookError::InstrumentTermsMismatch);
+            }
             self.candidate
                 .as_mut()
                 .ok_or(DirectOrderBookError::SnapshotRequired)?
@@ -572,11 +715,14 @@ impl DirectOrderBook {
         source_timestamp: Timestamp,
     ) -> Result<(), DirectOrderBookError> {
         let outcome = (|| {
-            if self.phase != DirectSyncPhase::AwaitingSnapshot
-                || self.candidate.is_none()
-                || self.candidate_sequence.is_none()
-            {
+            if self.phase != DirectSyncPhase::AwaitingSnapshot {
+                return Err(DirectOrderBookError::WrongPhase);
+            }
+            if self.candidate.is_none() || self.candidate_sequence.is_none() {
                 return Err(DirectOrderBookError::SnapshotRequired);
+            }
+            if self.candidate_receipt.is_none() {
+                return Err(DirectOrderBookError::SnapshotReceiptRequired);
             }
             self.candidate_timestamp = Some(source_timestamp);
             self.phase = DirectSyncPhase::SnapshotLoaded;
@@ -586,8 +732,6 @@ impl DirectOrderBook {
     }
 
     /// Binds the complete segmented HTTP response receipt to the unpublished snapshot.
-    ///
-    /// Fixture-only callers may omit this evidence, but no production snapshot decoder should.
     pub fn bind_snapshot_receipt(
         &mut self,
         receipt: SegmentedHttpResponseReceipt,
@@ -600,6 +744,7 @@ impl DirectOrderBook {
             {
                 return Err(DirectOrderBookError::WrongPhase);
             }
+            self.bind_snapshot_authority(receipt.binding())?;
             self.candidate_receipt = Some(receipt);
             Ok(())
         })();
@@ -690,13 +835,17 @@ impl DirectOrderBook {
                 .candidate_timestamp
                 .take()
                 .ok_or(DirectOrderBookError::SnapshotTimestampRequired)?;
-            let receipt = self.candidate_receipt.take();
-            let published = candidate.published(self.limits.published_depth)?;
+            let receipt = self
+                .candidate_receipt
+                .take()
+                .ok_or(DirectOrderBookError::SnapshotReceiptRequired)?;
+            if self.binding.is_none() {
+                return Err(DirectOrderBookError::SnapshotReceiptRequired);
+            }
             self.active = Some(candidate);
             self.last_sequence = Some(sequence);
             self.source_timestamp = Some(timestamp);
-            self.published = Some(published);
-            self.snapshot_receipt = receipt;
+            self.snapshot_receipt = Some(receipt);
             self.phase = DirectSyncPhase::Healthy;
             Ok(())
         })();
@@ -712,31 +861,33 @@ impl DirectOrderBook {
             if self.phase != DirectSyncPhase::Healthy {
                 return Err(DirectOrderBookError::WrongPhase);
             }
+            self.bind_event_authority(&event)?;
             self.validate_product(&event)?;
+            self.validate_terms(&event)?;
             let previous = self
                 .last_sequence
                 .ok_or(DirectOrderBookError::SnapshotRequired)?;
             validate_successor(previous, event.sequence())?;
-            let mut active = self
-                .active
-                .take()
-                .ok_or(DirectOrderBookError::SnapshotRequired)?;
-            active.apply(event.kind())?;
-            let published = active.published(self.limits.published_depth)?;
-            self.active = Some(active);
+            self.active
+                .as_mut()
+                .ok_or(DirectOrderBookError::SnapshotRequired)?
+                .apply(event.kind())?;
             self.last_sequence = Some(event.sequence());
             self.source_timestamp = Some(event.timestamp());
-            self.published = Some(published);
             Ok(())
         })();
         self.fail_closed(outcome)
     }
 
     /// Returns a healthy top-depth book. Every earlier or failed phase returns `None`.
-    pub fn published_book(&self) -> Option<&DirectPublishedBook> {
-        (self.phase == DirectSyncPhase::Healthy)
-            .then_some(self.published.as_ref())
-            .flatten()
+    pub fn published_book(&self) -> Option<DirectPublishedBook<'_>> {
+        if self.phase != DirectSyncPhase::Healthy {
+            return None;
+        }
+        self.active
+            .as_ref()?
+            .published(self.limits.published_depth)
+            .ok()
     }
 
     /// Returns the unpublished replay cursor for diagnostics.
@@ -786,6 +937,53 @@ impl DirectOrderBook {
         }
     }
 
+    fn validate_terms(&self, event: &ProviderOrderEvent) -> Result<(), DirectOrderBookError> {
+        if event.execution_terms() == self.terms {
+            Ok(())
+        } else {
+            Err(DirectOrderBookError::InstrumentTermsMismatch)
+        }
+    }
+
+    fn bind_event_authority(
+        &mut self,
+        event: &ProviderOrderEvent,
+    ) -> Result<(), DirectOrderBookError> {
+        let observed = event.evidence().binding();
+        if observed.connection_generation() != self.generation {
+            return Err(DirectOrderBookError::EventGenerationMismatch);
+        }
+        match self.binding.as_ref() {
+            Some(expected) if !expected.shares_allocation_with(observed) => {
+                Err(DirectOrderBookError::EventSessionMismatch)
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.binding = Some(observed.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn bind_snapshot_authority(
+        &mut self,
+        observed: &FrameSessionBinding,
+    ) -> Result<(), DirectOrderBookError> {
+        if observed.connection_generation() != self.generation {
+            return Err(DirectOrderBookError::SnapshotGenerationMismatch);
+        }
+        match self.binding.as_ref() {
+            Some(expected) if !expected.shares_allocation_with(observed) => {
+                Err(DirectOrderBookError::SnapshotSessionMismatch)
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.binding = Some(observed.clone());
+                Ok(())
+            }
+        }
+    }
+
     fn fail_closed<T>(
         &mut self,
         outcome: Result<T, DirectOrderBookError>,
@@ -798,6 +996,7 @@ impl DirectOrderBook {
 
     fn quarantine(&mut self) {
         self.phase = DirectSyncPhase::Quarantined;
+        self.binding = None;
         self.queue.clear();
         self.queue_bytes = 0;
         self.candidate = None;
@@ -807,7 +1006,6 @@ impl DirectOrderBook {
         self.active = None;
         self.last_sequence = None;
         self.source_timestamp = None;
-        self.published = None;
         self.snapshot_receipt = None;
     }
 }
@@ -846,6 +1044,21 @@ pub enum DirectOrderBookError {
     /// An event belongs to another product sequence domain.
     #[error("direct order-book event belongs to the wrong product")]
     WrongProduct,
+    /// An event was normalized against different instrument execution terms.
+    #[error("direct order-book event uses different instrument execution terms")]
+    InstrumentTermsMismatch,
+    /// A WebSocket event belongs to another connection generation.
+    #[error("direct order-book event belongs to another connection generation")]
+    EventGenerationMismatch,
+    /// A WebSocket event does not share the exact source/session allocation.
+    #[error("direct order-book event belongs to another source session")]
+    EventSessionMismatch,
+    /// A snapshot receipt belongs to another connection generation.
+    #[error("direct order-book snapshot belongs to another connection generation")]
+    SnapshotGenerationMismatch,
+    /// A snapshot receipt does not share the exact source/session allocation.
+    #[error("direct order-book snapshot belongs to another source session")]
+    SnapshotSessionMismatch,
     /// The bounded replay queue exhausted its event count.
     #[error("direct replay queue event capacity was exceeded")]
     QueueCountExceeded,
@@ -870,6 +1083,12 @@ pub enum DirectOrderBookError {
     /// A match quantity exceeded the maker's remaining quantity.
     #[error("direct match quantity exceeded remaining maker quantity")]
     MatchExceedsRemaining,
+    /// A change omitted the old-price evidence required for a price replacement.
+    #[error("direct order change is structurally invalid")]
+    InvalidChange,
+    /// A change's previous price disagreed with the maintained order.
+    #[error("direct order change previous price does not match maintained state")]
+    ChangePriceMismatch,
     /// Exact numeric state was nonpositive, inexact, or overflowed.
     #[error("direct order numeric invariant failed")]
     NumericInvariant,
@@ -879,6 +1098,9 @@ pub enum DirectOrderBookError {
     /// A snapshot candidate has not been initialized.
     #[error("direct order-book snapshot is required")]
     SnapshotRequired,
+    /// A complete registry-trusted HTTP receipt was not bound to the snapshot.
+    #[error("direct order-book snapshot receipt is required")]
+    SnapshotReceiptRequired,
     /// The snapshot omitted its required provider source time.
     #[error("direct order-book snapshot source time is required")]
     SnapshotTimestampRequired,
@@ -901,17 +1123,19 @@ pub enum DirectOrderBookError {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
+
     use market_squawk_domain::{
-        ConnectionGeneration, ProviderProduct, SequenceNumber, SourceIdentifier, Timestamp,
+        ConnectionGeneration, Currency, Denomination, InstrumentDefinitionRevision,
+        InstrumentExecutionTerms, InstrumentId, LotSize, PriceTicks, ProviderProduct, QuantityLots,
+        SequenceNumber, SourceIdentifier, TickSize, Timestamp,
     };
-    use market_squawk_sources::{
-        ProviderBookLevel, ProviderBookSide, ProviderCursorOnlyReason, ProviderDecimalLexeme,
-        ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord, ProviderPrice,
-        ProviderQuantity,
-    };
+    use market_squawk_sources::{ProviderBookSide, ProviderOrderEventKind, ProviderOrderRecord};
     use rust_decimal::Decimal;
 
-    use super::{DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectSyncPhase};
+    use super::{
+        DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectSyncPhase, OrderBookState,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -923,11 +1147,16 @@ mod tests {
         Ok(ProviderProduct::new(id("BTC-USD")?))
     }
 
-    fn level(price: &str, quantity: &str) -> TestResult<ProviderBookLevel> {
-        Ok(ProviderBookLevel::new(
-            ProviderPrice::new(ProviderDecimalLexeme::try_new(price)?),
-            ProviderQuantity::new(ProviderDecimalLexeme::try_new(quantity)?),
-        ))
+    fn terms() -> TestResult<InstrumentExecutionTerms> {
+        Ok(InstrumentExecutionTerms::try_new(
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+            InstrumentDefinitionRevision::try_from(1)?,
+            TickSize::try_from_decimal(Decimal::new(1, 2))?,
+            LotSize::try_from_decimal(Decimal::new(1, 2))?,
+            Currency::try_from("USD")?,
+            Denomination::Currency(Currency::try_from("BTC")?),
+            Decimal::ONE,
+        )?)
     }
 
     fn order(
@@ -936,25 +1165,14 @@ mod tests {
         price: &str,
         quantity: &str,
     ) -> TestResult<ProviderOrderRecord> {
+        let terms = terms()?;
         Ok(ProviderOrderRecord::new(
             id(order_id)?,
             side,
-            level(price, quantity)?,
+            PriceTicks::try_from_decimal(Decimal::from_str_exact(price)?, terms.price_tick())?,
+            QuantityLots::try_from_decimal(Decimal::from_str_exact(quantity)?, terms.lot_size())?,
+            terms,
         ))
-    }
-
-    fn event(
-        sequence: u64,
-        kind: ProviderOrderEventKind,
-        wire_bytes: usize,
-    ) -> TestResult<ProviderOrderEvent> {
-        Ok(ProviderOrderEvent::try_new(
-            product()?,
-            SequenceNumber::new(sequence),
-            Timestamp::from_unix_nanos(i64::try_from(sequence)?),
-            kind,
-            wire_bytes,
-        )?)
     }
 
     fn limits() -> TestResult<DirectBookLimits> {
@@ -962,82 +1180,87 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_replay_advances_exactly_and_publishes_only_after_atomic_handoff() -> TestResult {
-        let mut owner =
-            DirectOrderBook::try_new(ConnectionGeneration::new(1)?, product()?, limits()?)?;
-        assert_eq!(owner.phase(), DirectSyncPhase::AwaitingSnapshot);
-        assert!(owner.published_book().is_none());
-
-        owner.try_queue(event(
-            11,
-            ProviderOrderEventKind::CursorOnly(ProviderCursorOnlyReason::Received),
-            64,
-        )?)?;
-        owner.try_queue(event(
-            12,
-            ProviderOrderEventKind::Done {
-                order_id: id("unknown-received-only")?,
-            },
-            64,
-        )?)?;
-
+    fn snapshot_without_a_trusted_receipt_can_never_reach_replay() -> TestResult {
+        let mut owner = DirectOrderBook::try_new(
+            ConnectionGeneration::new(1)?,
+            product()?,
+            terms()?,
+            limits()?,
+        )?;
         owner.begin_snapshot(SequenceNumber::new(10))?;
         owner.try_push_snapshot_order(order("bid-a", ProviderBookSide::Bid, "100.00", "5.00")?)?;
-        owner.try_push_snapshot_order(order("ask-a", ProviderBookSide::Ask, "101.00", "4.00")?)?;
-        owner.finish_snapshot(Timestamp::from_unix_nanos(10))?;
-        assert_eq!(owner.phase(), DirectSyncPhase::SnapshotLoaded);
-        assert!(owner.published_book().is_none());
-
-        owner.begin_replay()?;
-        assert_eq!(owner.phase(), DirectSyncPhase::Replaying);
-        assert!(owner.published_book().is_none());
-        assert!(owner.replay_next()?);
-        assert!(owner.replay_next()?);
-        assert!(!owner.replay_next()?);
-        assert_eq!(owner.candidate_sequence(), Some(SequenceNumber::new(12)));
-        assert!(owner.published_book().is_none());
-
-        owner.finish_replay()?;
-        assert_eq!(owner.phase(), DirectSyncPhase::Healthy);
-        assert_eq!(owner.last_sequence(), Some(SequenceNumber::new(12)));
-        let published = owner.published_book().ok_or("missing healthy book")?;
-        assert_eq!(published.bids().len(), 1);
-        assert_eq!(published.asks().len(), 1);
         assert_eq!(
-            published.bids()[0].quantity().value().decimal(),
-            Decimal::new(500, 2)
+            owner.finish_snapshot(Timestamp::from_unix_nanos(10)),
+            Err(DirectOrderBookError::SnapshotReceiptRequired)
         );
-        assert_eq!(
-            published.asks()[0].quantity().value().decimal(),
-            Decimal::new(400, 2)
-        );
+        assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
+        assert!(owner.published_book().is_none());
         Ok(())
     }
 
     #[test]
-    fn replay_invariant_failure_quarantines_without_exposing_candidate_state() -> TestResult {
-        let mut owner =
-            DirectOrderBook::try_new(ConnectionGeneration::new(1)?, product()?, limits()?)?;
-        owner.try_queue(event(
-            11,
-            ProviderOrderEventKind::Match {
-                maker_order_id: id("missing-maker")?,
-                quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
-            },
-            96,
-        )?)?;
-        owner.begin_snapshot(SequenceNumber::new(10))?;
-        owner.try_push_snapshot_order(order("bid-a", ProviderBookSide::Bid, "100.00", "5.00")?)?;
-        owner.finish_snapshot(Timestamp::from_unix_nanos(10))?;
-        owner.begin_replay()?;
+    fn bounded_incremental_depth_handles_atomic_price_moves_and_capacity_failure() -> TestResult {
+        let limits = DirectBookLimits::try_new(3, 2, 2, 1_024, 1)?;
+        let mut state = OrderBookState::try_new(limits)?;
+        state.insert(&order("bid-a", ProviderBookSide::Bid, "100.00", "2.00")?)?;
+        state.insert(&order("bid-b", ProviderBookSide::Bid, "99.00", "3.00")?)?;
+        assert_eq!(
+            state
+                .published(1)?
+                .bids()
+                .next()
+                .ok_or(DirectOrderBookError::AggregateInvariant)?
+                .price(),
+            PriceTicks::new(10_000)
+        );
+
+        state.apply(&ProviderOrderEventKind::Change {
+            order_id: id("bid-a")?,
+            previous_price: Some(PriceTicks::new(10_000)),
+            new_price: Some(PriceTicks::new(9_800)),
+            new_quantity: Some(QuantityLots::new(200)?),
+        })?;
+        assert_eq!(
+            state
+                .published(1)?
+                .bids()
+                .next()
+                .ok_or(DirectOrderBookError::AggregateInvariant)?
+                .price(),
+            PriceTicks::new(9_900)
+        );
+        assert_eq!(
+            state.insert(&order("bid-c", ProviderBookSide::Bid, "97.00", "1.00")?),
+            Err(DirectOrderBookError::PriceLevelCapacityExceeded)
+        );
+        let published = state.published(1)?;
+        assert_eq!(
+            published
+                .bids()
+                .next()
+                .ok_or(DirectOrderBookError::AggregateInvariant)?
+                .price(),
+            PriceTicks::new(9_900)
+        );
 
         assert_eq!(
-            owner.replay_next(),
-            Err(DirectOrderBookError::UnknownMakerOrder)
+            state.apply(&ProviderOrderEventKind::Change {
+                order_id: id("bid-b")?,
+                previous_price: Some(PriceTicks::new(10_100)),
+                new_price: Some(PriceTicks::new(9_600)),
+                new_quantity: Some(QuantityLots::new(300)?),
+            }),
+            Err(DirectOrderBookError::ChangePriceMismatch)
         );
-        assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
-        assert!(owner.published_book().is_none());
-        assert_eq!(owner.last_sequence(), None);
+        assert_eq!(
+            state
+                .published(1)?
+                .bids()
+                .next()
+                .ok_or(DirectOrderBookError::AggregateInvariant)?
+                .price(),
+            PriceTicks::new(9_900)
+        );
         Ok(())
     }
 }

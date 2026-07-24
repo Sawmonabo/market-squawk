@@ -32,7 +32,8 @@ pub use cross_venue::{
     CrossVenueVenueSnapshot,
 };
 pub use direct_order_book::{
-    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook, DirectSyncPhase,
+    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
+    DirectPublishedLevel, DirectSyncPhase,
 };
 pub use features::{FeatureInvalidationReason, RouteFeatureError, RouteFeatureState};
 pub use integrity::{

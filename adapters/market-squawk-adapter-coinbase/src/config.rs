@@ -431,6 +431,9 @@ pub enum CoinbaseConfigError {
     /// Direct profile requires explicit user-authorized read-only market-data evidence.
     #[error("Coinbase Direct profile requires user-authorized credentials")]
     InvalidDirectAuthorization,
+    /// Direct execution terms belong to a different mapped instrument.
+    #[error("Coinbase Direct execution terms do not match the mapped instrument")]
+    InvalidDirectInstrumentTerms,
     /// Direct snapshot, segmentation, replay, or level-3 owner limits are invalid.
     #[error("Coinbase Direct bounds are invalid")]
     InvalidDirectLimits,

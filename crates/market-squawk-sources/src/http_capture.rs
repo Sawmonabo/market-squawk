@@ -3,10 +3,16 @@
 use std::io::{self, Read};
 
 use bytes::Bytes;
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
+use market_squawk_domain::{
+    ConnectionGeneration, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, Timestamp,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
+
+use crate::authority_time::TrustedReceiptObservation;
+use crate::registry::HttpResponseReceiptAuthority;
+use crate::{FrameSessionBinding, SessionId};
 
 const MAX_CAPTURE_URL_BYTES: usize = 2_048;
 const MAX_SEGMENTED_HTTP_BODY_BYTES: u64 = 256 * 1024 * 1024;
@@ -47,6 +53,8 @@ impl HttpResponseSegmentReceipt {
 /// One receipt binding response metadata, the complete body, and every retained segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentedHttpResponseReceipt {
+    binding: FrameSessionBinding,
+    observation: TrustedReceiptObservation,
     method: HttpCaptureMethod,
     final_url: Box<str>,
     status: u16,
@@ -57,6 +65,36 @@ pub struct SegmentedHttpResponseReceipt {
 }
 
 impl SegmentedHttpResponseReceipt {
+    /// Returns the exact registry-issued source/session allocation.
+    pub const fn binding(&self) -> &FrameSessionBinding {
+        &self.binding
+    }
+
+    /// Returns the source identity of the generation that observed the response.
+    pub fn source_id(&self) -> &SourceId {
+        self.binding.source_id()
+    }
+
+    /// Returns the metadata revision of the generation that observed the response.
+    pub fn metadata_revision(&self) -> &MetadataRevision {
+        self.binding.metadata_revision()
+    }
+
+    /// Returns the source-defined session identity that observed the response.
+    pub fn session_id(&self) -> &SessionId {
+        self.binding.session_id()
+    }
+
+    /// Returns the connection generation that observed the complete response.
+    pub fn connection_generation(&self) -> ConnectionGeneration {
+        self.binding.connection_generation()
+    }
+
+    /// Returns the registry-trusted local observation after the complete body was captured.
+    pub const fn received_at(&self) -> Timestamp {
+        self.observation.received_at()
+    }
+
     /// Returns the exact request method.
     pub const fn method(&self) -> HttpCaptureMethod {
         self.method
@@ -169,6 +207,7 @@ impl Read for SegmentedHttpResponseReader<'_> {
 /// Single-use bounded response capture builder.
 #[derive(Debug)]
 pub struct SegmentedHttpResponseBuilder {
+    authority: HttpResponseReceiptAuthority,
     method: HttpCaptureMethod,
     final_url: Box<str>,
     status: u16,
@@ -192,7 +231,8 @@ impl SegmentedHttpResponseBuilder {
         clippy::too_many_arguments,
         reason = "HTTP response identity and all boundedness inputs remain explicit"
     )]
-    pub fn try_new(
+    pub(crate) fn try_new(
+        authority: HttpResponseReceiptAuthority,
         method: HttpCaptureMethod,
         final_url: &str,
         status: u16,
@@ -219,6 +259,7 @@ impl SegmentedHttpResponseBuilder {
             .try_reserve_exact(max_segments)
             .map_err(|_| SegmentedHttpCaptureError::Allocation)?;
         Ok(Self {
+            authority,
             method,
             final_url: final_url.to_owned().into_boxed_str(),
             status,
@@ -289,9 +330,12 @@ impl SegmentedHttpResponseBuilder {
         {
             return Err(SegmentedHttpCaptureError::Incomplete);
         }
+        let (binding, observation) = self.authority.observe()?;
         let body_digest: [u8; 32] = self.body_hasher.finalize().into();
         Ok(SegmentedHttpResponseCapture {
             receipt: SegmentedHttpResponseReceipt {
+                binding,
+                observation,
                 method: self.method,
                 final_url: self.final_url,
                 status: self.status,
@@ -324,6 +368,9 @@ fn validate_final_url(value: &str) -> Result<(), SegmentedHttpCaptureError> {
 /// Bounded segmented-response capture failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SegmentedHttpCaptureError {
+    /// Registry currentness or trusted response-observation time was unavailable.
+    #[error("segmented HTTP capture authority is unavailable")]
+    AuthorityUnavailable,
     /// The admitted final URL is invalid or unsafe.
     #[error("segmented HTTP capture final URL is invalid")]
     InvalidFinalUrl,
@@ -352,10 +399,15 @@ mod tests {
     use std::io::Read as _;
 
     use bytes::Bytes;
+    use market_squawk_domain::{
+        ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    };
     use sha2::{Digest as _, Sha256};
 
     use super::{HttpCaptureMethod, SegmentedHttpResponseBuilder};
-    use crate::MAX_RAW_FRAME_BYTES;
+    use crate::authority_time::trusted_test_receipt;
+    use crate::registry::HttpResponseReceiptAuthority;
+    use crate::{FrameSessionBinding, MAX_RAW_FRAME_BYTES, SessionId};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -365,7 +417,15 @@ mod tests {
         let total = MAX_RAW_FRAME_BYTES
             .checked_add(tail_bytes)
             .ok_or("fixture length overflow")?;
+        let binding = FrameSessionBinding::new(
+            SourceId::try_from("coinbase-direct")?,
+            MetadataRevision::new(SourceIdentifier::try_from("coinbase-direct-v1")?),
+            SessionId::new(SourceIdentifier::try_from("coinbase-direct-session")?),
+            ConnectionGeneration::new(7)?,
+        );
+        let observation = trusted_test_receipt(Timestamp::from_unix_nanos(11), 11)?;
         let mut builder = SegmentedHttpResponseBuilder::try_new(
+            HttpResponseReceiptAuthority::for_test(binding, observation),
             HttpCaptureMethod::Get,
             "https://api.exchange.coinbase.com/products/BTC-USD/book?level=3",
             200,
@@ -389,6 +449,14 @@ mod tests {
         );
         assert_eq!(capture.receipt().method(), HttpCaptureMethod::Get);
         assert_eq!(capture.receipt().status(), 200);
+        assert_eq!(
+            capture.receipt().connection_generation(),
+            ConnectionGeneration::new(7)?
+        );
+        assert_eq!(
+            capture.receipt().received_at(),
+            Timestamp::from_unix_nanos(11)
+        );
         assert_eq!(
             capture.receipt().final_url(),
             "https://api.exchange.coinbase.com/products/BTC-USD/book?level=3"

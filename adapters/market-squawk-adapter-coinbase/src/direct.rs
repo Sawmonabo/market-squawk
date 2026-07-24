@@ -1,34 +1,38 @@
 //! Authenticated Coinbase Exchange Direct Market Data profile and level-3 decoders.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 
 use chrono::DateTime;
 use market_squawk_domain::{
     AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    EffectiveInterval, ExactPayloadEvidence, IntegrityRule, LiveEventClass, MarketDepth,
-    ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion,
-    SequenceCapability, SequenceNumber, SequenceValidationRule, SnapshotApplicability, SourceId,
-    SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    EffectiveInterval, ExactPayloadEvidence, InstrumentExecutionTerms, IntegrityRule,
+    LiveEventClass, MarketDepth, PriceTicks, ProviderChannel, ProviderProduct, QuantityLots,
+    RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability, SequenceNumber,
+    SequenceValidationRule, SnapshotApplicability, SourceId, SourceIdentifier, Timestamp,
+    TradingStatus, VenueId,
 };
-use market_squawk_live::{DirectBookLimits, DirectOrderBook, DirectOrderBookError};
+use market_squawk_live::{
+    DirectBookLimits, DirectOrderBook, DirectOrderBookError, normalize_delta_quantity,
+    normalize_positive_quantity, normalize_price,
+};
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
-    CoverageTopology, EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpCaptureMethod,
-    HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule,
-    LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBookLevel, ProviderBookSide,
+    CoverageTopology, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
+    HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration,
+    LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBookSide,
     ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
     ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord, ProviderPrice,
     ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
     SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
     SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile,
+    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{CoinbaseConfigError, CoinbaseProductMapping, CoinbaseTransportLimits};
 
@@ -111,6 +115,7 @@ impl CoinbaseDirectLimits {
 pub struct CoinbaseDirectConfig {
     metadata: SourceMetadata,
     mapping: CoinbaseProductMapping,
+    terms: InstrumentExecutionTerms,
     limits: CoinbaseDirectLimits,
     snapshot_url: Box<str>,
     product_url: Box<str>,
@@ -133,12 +138,16 @@ impl CoinbaseDirectConfig {
         coverage_evidence: ExactPayloadEvidence,
         effective: EffectiveInterval,
         mapping: CoinbaseProductMapping,
+        terms: InstrumentExecutionTerms,
         freshness: FreshnessPolicy,
         budget: ProviderBudgetPolicy,
         limits: CoinbaseDirectLimits,
     ) -> Result<Self, CoinbaseConfigError> {
         if authorization.mode() != AuthorizationMode::UserAuthorized {
             return Err(CoinbaseConfigError::InvalidDirectAuthorization);
+        }
+        if terms.instrument_id() != mapping.instrument() {
+            return Err(CoinbaseConfigError::InvalidDirectInstrumentTerms);
         }
         let product = mapping.product().as_source_identifier().as_str();
         let snapshot_base = format!("{COINBASE_REST_ORIGIN}/products/{product}/book");
@@ -215,7 +224,7 @@ impl CoinbaseDirectConfig {
                 decoder_rule,
                 SemanticInterpretationProfile::new(
                     direct_rule("coinbase-exchange-direct-maker-side")?,
-                    direct_rule("coinbase-exchange-direct-auction-unused")?,
+                    direct_rule("coinbase-exchange-direct-auction-mode-v1")?,
                     direct_rule("coinbase-exchange-direct-product-status")?,
                     direct_rule("coinbase-exchange-direct-corporate-action-unused")?,
                 ),
@@ -234,6 +243,7 @@ impl CoinbaseDirectConfig {
         Ok(Self {
             metadata,
             mapping,
+            terms,
             limits,
             snapshot_url: snapshot_url.into_boxed_str(),
             product_url: product_url.into_boxed_str(),
@@ -270,6 +280,11 @@ impl CoinbaseDirectConfig {
         self.mapping.instrument()
     }
 
+    /// Returns the immutable instrument terms used for exact Direct normalization.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.terms
+    }
+
     /// Returns all direct transport and ownership limits.
     pub const fn limits(&self) -> CoinbaseDirectLimits {
         self.limits
@@ -298,12 +313,13 @@ impl CoinbaseDirectConfig {
             passphrase: authentication.passphrase(),
             timestamp: &timestamp,
         };
-        let payload =
-            serde_json::to_string(&wire).map_err(|_| CoinbaseDirectSigningError::Serialization)?;
+        let payload = Zeroizing::new(
+            serde_json::to_string(&wire).map_err(|_| CoinbaseDirectSigningError::Serialization)?,
+        );
         if payload.len() > MAX_SIGNED_SUBSCRIPTION_BYTES {
             return Err(CoinbaseDirectSigningError::SubscriptionTooLarge);
         }
-        Ok(CoinbaseSignedSubscription(payload.into_boxed_str()))
+        Ok(CoinbaseSignedSubscription(payload))
     }
 
     /// Decodes current product status and increments from an exact captured REST response.
@@ -314,6 +330,8 @@ impl CoinbaseDirectConfig {
         validate_http_capture(
             capture,
             self.product_url(),
+            self.metadata.source_id(),
+            self.metadata.revision(),
             self.limits.max_snapshot_bytes,
             self.limits.max_snapshot_segments,
         )
@@ -327,6 +345,11 @@ impl CoinbaseDirectConfig {
             .map_err(|_| CoinbaseDirectProductError::Increment)?;
         let quote_increment = parse_direct_quantity(&wire.quote_increment)
             .map_err(|_| CoinbaseDirectProductError::Increment)?;
+        if base_increment.value().decimal() != self.terms.lot_size().as_decimal()
+            || quote_increment.value().decimal() != self.terms.price_tick().as_decimal()
+        {
+            return Err(CoinbaseDirectProductError::Increment);
+        }
         let status = SourceIdentifier::try_from(wire.status.as_str())
             .map_err(|_| CoinbaseDirectProductError::Status)?;
         let trading_status = if wire.status == "online"
@@ -334,6 +357,7 @@ impl CoinbaseDirectConfig {
             && !wire.cancel_only
             && !wire.post_only
             && !wire.limit_only
+            && !wire.auction_mode
         {
             TradingStatus::Active
         } else if wire.status == "delisted" {
@@ -351,6 +375,7 @@ impl CoinbaseDirectConfig {
             cancel_only: wire.cancel_only,
             post_only: wire.post_only,
             limit_only: wire.limit_only,
+            auction_mode: wire.auction_mode,
             capture: capture.receipt().clone(),
         })
     }
@@ -417,21 +442,23 @@ pub trait CoinbaseDirectSigningCapability: fmt::Debug + Send + Sync {
 }
 
 /// Bounded authentication fields. Debug output never reveals any field.
-#[derive(Clone)]
 pub struct CoinbaseDirectAuthentication {
-    key: Box<str>,
-    passphrase: Box<str>,
-    signature: Box<str>,
+    key: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
+    signature: Zeroizing<String>,
 }
 
 impl CoinbaseDirectAuthentication {
     /// Constructs bounded authentication output from the trusted signing boundary.
     pub fn try_new(
-        key: &str,
-        passphrase: &str,
-        signature: &str,
+        key: String,
+        passphrase: String,
+        signature: String,
     ) -> Result<Self, CoinbaseDirectSigningError> {
-        for value in [key, passphrase, signature] {
+        let key = Zeroizing::new(key);
+        let passphrase = Zeroizing::new(passphrase);
+        let signature = Zeroizing::new(signature);
+        for value in [key.as_str(), passphrase.as_str(), signature.as_str()] {
             if value.is_empty()
                 || value.len() > MAX_SIGNING_FIELD_BYTES
                 || value.chars().any(char::is_control)
@@ -440,9 +467,9 @@ impl CoinbaseDirectAuthentication {
             }
         }
         Ok(Self {
-            key: key.to_owned().into_boxed_str(),
-            passphrase: passphrase.to_owned().into_boxed_str(),
-            signature: signature.to_owned().into_boxed_str(),
+            key,
+            passphrase,
+            signature,
         })
     }
 
@@ -466,8 +493,7 @@ impl fmt::Debug for CoinbaseDirectAuthentication {
 }
 
 /// Serialized authenticated subscription with redacted diagnostics.
-#[derive(Clone)]
-pub struct CoinbaseSignedSubscription(Box<str>);
+pub struct CoinbaseSignedSubscription(Zeroizing<String>);
 
 impl CoinbaseSignedSubscription {
     /// Returns exact bytes for the immediate WebSocket send.
@@ -517,15 +543,29 @@ pub enum CoinbaseDirectSigningError {
 /// Exact classifier for sequenced Coinbase `full` messages.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectDecoder {
+    source_id: SourceId,
+    metadata_revision: market_squawk_domain::MetadataRevision,
     product: ProviderProduct,
+    terms: InstrumentExecutionTerms,
+    decoder_rule: IntegrityRule,
     max_frame_bytes: usize,
 }
 
 impl CoinbaseDirectDecoder {
     /// Binds the decoder to one immutable Direct product profile.
     pub fn try_new(config: &CoinbaseDirectConfig) -> Result<Self, CoinbaseConfigError> {
+        let live = match config.metadata().protocol_profile() {
+            SourceProtocolProfile::Live(profile) => profile,
+            SourceProtocolProfile::NotLive => {
+                return Err(CoinbaseConfigError::InvalidProtocolProfile);
+            }
+        };
         Ok(Self {
+            source_id: config.metadata().source_id().clone(),
+            metadata_revision: config.metadata().revision().clone(),
             product: config.product().clone(),
+            terms: config.execution_terms(),
+            decoder_rule: live.decoder_rule().clone(),
             max_frame_bytes: config.limits.websocket().max_frame_bytes(),
         })
     }
@@ -534,10 +574,18 @@ impl CoinbaseDirectDecoder {
     ///
     /// Unknown sequenced types and every schema/invariant violation return an error that requires
     /// a completely fresh snapshot/generation.
-    pub fn decode_captured_text(
+    pub fn decode(
         &self,
-        payload: &[u8],
+        validated: &ValidatedRawMarketFrame<'_>,
     ) -> Result<ProviderOrderEvent, CoinbaseDirectDecodeError> {
+        let frame = validated.frame();
+        if frame.source_id() != &self.source_id
+            || frame.metadata_revision() != &self.metadata_revision
+            || frame.transport() != TransportFrameKind::Text
+        {
+            return Err(CoinbaseDirectDecodeError::FrameAuthority);
+        }
+        let payload = frame.payload();
         if payload.is_empty() || payload.len() > self.max_frame_bytes {
             return Err(CoinbaseDirectDecodeError::FrameTooLarge);
         }
@@ -561,6 +609,8 @@ impl CoinbaseDirectDecoder {
                         "side",
                         "funds",
                         "client_oid",
+                        "user_id",
+                        "profile_id",
                     ],
                     &[
                         "type",
@@ -572,6 +622,13 @@ impl CoinbaseDirectDecoder {
                     ],
                 )?;
                 let _order_id = parse_order_id(object, "order_id")?;
+                validate_optional_enum(object, "order_type", &["limit", "market"])?;
+                validate_optional_price(object, "price", self.terms)?;
+                validate_optional_quantity(object, "size", self.terms, false)?;
+                validate_optional_side(object, "side")?;
+                validate_optional_nonnegative_decimal(object, "funds")?;
+                validate_optional_identifier(object, "client_oid")?;
+                validate_authenticated_identity(object)?;
                 ProviderOrderEventKind::CursorOnly(ProviderCursorOnlyReason::Received)
             }
             "open" => {
@@ -586,6 +643,8 @@ impl CoinbaseDirectDecoder {
                         "price",
                         "remaining_size",
                         "side",
+                        "user_id",
+                        "profile_id",
                     ],
                     &[
                         "type",
@@ -598,13 +657,16 @@ impl CoinbaseDirectDecoder {
                         "side",
                     ],
                 )?;
+                validate_authenticated_identity(object)?;
                 ProviderOrderEventKind::Open(ProviderOrderRecord::new(
                     parse_order_id(object, "order_id")?,
                     parse_direct_side(required_text(object, "side")?)?,
-                    ProviderBookLevel::new(
-                        parse_direct_price(required_text(object, "price")?)?,
-                        parse_direct_quantity(required_text(object, "remaining_size")?)?,
-                    ),
+                    normalize_direct_price(required_text(object, "price")?, self.terms)?,
+                    normalize_direct_quantity(
+                        required_text(object, "remaining_size")?,
+                        self.terms,
+                    )?,
+                    self.terms,
                 ))
             }
             "match" => {
@@ -625,19 +687,46 @@ impl CoinbaseDirectDecoder {
                         "user_id",
                         "taker_profile_id",
                         "profile_id",
+                        "taker_fee_rate",
+                        "maker_user_id",
+                        "maker_profile_id",
+                        "maker_fee_rate",
                     ],
                     &[
                         "type",
                         "time",
                         "product_id",
                         "sequence",
+                        "trade_id",
                         "maker_order_id",
+                        "taker_order_id",
                         "size",
+                        "price",
+                        "side",
                     ],
                 )?;
+                required_u64(object, "trade_id")?;
+                let _taker_order_id = parse_order_id(object, "taker_order_id")?;
+                normalize_direct_price(required_text(object, "price")?, self.terms)?;
+                parse_direct_side(required_text(object, "side")?)?;
+                for field in [
+                    "taker_user_id",
+                    "user_id",
+                    "taker_profile_id",
+                    "profile_id",
+                    "maker_user_id",
+                    "maker_profile_id",
+                ] {
+                    validate_optional_identifier(object, field)?;
+                }
+                validate_optional_nonnegative_decimal(object, "taker_fee_rate")?;
+                validate_optional_nonnegative_decimal(object, "maker_fee_rate")?;
                 ProviderOrderEventKind::Match {
                     maker_order_id: parse_order_id(object, "maker_order_id")?,
-                    quantity: parse_direct_quantity(required_text(object, "size")?)?,
+                    quantity: normalize_direct_quantity(
+                        required_text(object, "size")?,
+                        self.terms,
+                    )?,
                 }
             }
             "done" => {
@@ -654,6 +743,9 @@ impl CoinbaseDirectDecoder {
                         "remaining_size",
                         "side",
                         "order_type",
+                        "user_id",
+                        "profile_id",
+                        "cancel_reason",
                     ],
                     &[
                         "type",
@@ -664,6 +756,19 @@ impl CoinbaseDirectDecoder {
                         "reason",
                     ],
                 )?;
+                let reason = required_text(object, "reason")?;
+                if !matches!(reason, "filled" | "canceled") {
+                    return Err(CoinbaseDirectDecodeError::Schema);
+                }
+                validate_optional_price(object, "price", self.terms)?;
+                validate_optional_quantity(object, "remaining_size", self.terms, true)?;
+                validate_optional_side(object, "side")?;
+                validate_optional_enum(object, "order_type", &["limit", "market"])?;
+                validate_authenticated_identity(object)?;
+                validate_optional_cancel_reason(object)?;
+                if reason != "canceled" && object.contains_key("cancel_reason") {
+                    return Err(CoinbaseDirectDecodeError::Schema);
+                }
                 ProviderOrderEventKind::Done {
                     order_id: parse_order_id(object, "order_id")?,
                 }
@@ -683,18 +788,92 @@ impl CoinbaseDirectDecoder {
                         "old_size",
                         "new_funds",
                         "old_funds",
+                        "reason",
+                        "old_price",
+                        "new_price",
+                        "user_id",
+                        "profile_id",
                     ],
-                    &["type", "time", "product_id", "sequence", "order_id"],
+                    &[
+                        "type",
+                        "time",
+                        "product_id",
+                        "sequence",
+                        "order_id",
+                        "reason",
+                        "side",
+                    ],
                 )?;
-                let new_quantity = match (object.get("new_size"), object.get("new_funds")) {
-                    (Some(value), None) => Some(parse_direct_quantity(
-                        value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
-                    )?),
-                    (None, Some(value)) if value.is_string() => None,
-                    _ => return Err(CoinbaseDirectDecodeError::Schema),
-                };
+                parse_direct_side(required_text(object, "side")?)?;
+                validate_authenticated_identity(object)?;
+                let (previous_price, new_price, new_quantity) =
+                    match required_text(object, "reason")? {
+                        "modify_order" => {
+                            if object.contains_key("price")
+                                || object.contains_key("new_funds")
+                                || object.contains_key("old_funds")
+                            {
+                                return Err(CoinbaseDirectDecodeError::Schema);
+                            }
+                            let previous_price = normalize_direct_price(
+                                required_text(object, "old_price")?,
+                                self.terms,
+                            )?;
+                            let new_price = normalize_direct_price(
+                                required_text(object, "new_price")?,
+                                self.terms,
+                            )?;
+                            let _old_quantity = normalize_direct_quantity(
+                                required_text(object, "old_size")?,
+                                self.terms,
+                            )?;
+                            let new_quantity = normalize_direct_quantity(
+                                required_text(object, "new_size")?,
+                                self.terms,
+                            )?;
+                            (Some(previous_price), Some(new_price), Some(new_quantity))
+                        }
+                        "STP" => match (
+                            object.get("old_size"),
+                            object.get("new_size"),
+                            object.get("old_funds"),
+                            object.get("new_funds"),
+                        ) {
+                            (Some(old_size), Some(new_size), None, None)
+                                if !object.contains_key("old_price")
+                                    && !object.contains_key("new_price") =>
+                            {
+                                let previous_price = normalize_direct_price(
+                                    required_text(object, "price")?,
+                                    self.terms,
+                                )?;
+                                normalize_direct_quantity(
+                                    old_size.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
+                                    self.terms,
+                                )?;
+                                let new_quantity = normalize_direct_quantity(
+                                    new_size.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
+                                    self.terms,
+                                )?;
+                                (Some(previous_price), None, Some(new_quantity))
+                            }
+                            (None, None, Some(old_funds), Some(new_funds))
+                                if !object.contains_key("old_price")
+                                    && !object.contains_key("new_price")
+                                    && object.get("price").is_none_or(Value::is_null) =>
+                            {
+                                parse_nonnegative_decimal_value(old_funds)?;
+                                parse_nonnegative_decimal_value(new_funds)?;
+                                (None, None, None)
+                            }
+                            _ => return Err(CoinbaseDirectDecodeError::Schema),
+                        },
+                        _ => return Err(CoinbaseDirectDecodeError::Schema),
+                    };
                 ProviderOrderEventKind::Change {
                     order_id: parse_order_id(object, "order_id")?,
+                    previous_price,
+                    new_price,
                     new_quantity,
                 }
             }
@@ -718,7 +897,8 @@ impl CoinbaseDirectDecoder {
             sequence,
             timestamp,
             event_kind,
-            payload.len(),
+            self.terms,
+            DecoderEvidence::from_validated_frame(validated, self.decoder_rule.clone()),
         )
         .map_err(|_| CoinbaseDirectDecodeError::FrameTooLarge)
     }
@@ -739,11 +919,139 @@ fn validate_fields(
     allowed: &[&str],
     required: &[&str],
 ) -> Result<(), CoinbaseDirectDecodeError> {
-    let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
-    if object.keys().any(|field| !allowed.contains(field.as_str()))
+    if object
+        .keys()
+        .any(|field| !allowed.contains(&field.as_str()))
         || required.iter().any(|field| !object.contains_key(*field))
     {
         Err(CoinbaseDirectDecodeError::Schema)
+    } else {
+        Ok(())
+    }
+}
+
+fn required_u64(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<u64, CoinbaseDirectDecodeError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or(CoinbaseDirectDecodeError::Schema)
+}
+
+fn validate_authenticated_identity(
+    object: &Map<String, Value>,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    validate_optional_identifier(object, "user_id")?;
+    validate_optional_identifier(object, "profile_id")
+}
+
+fn validate_optional_identifier(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    let value = value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?;
+    SourceIdentifier::try_from(value)
+        .map(|_identifier| ())
+        .map_err(|_| CoinbaseDirectDecodeError::Schema)
+}
+
+fn validate_optional_cancel_reason(
+    object: &Map<String, Value>,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get("cancel_reason") else {
+        return Ok(());
+    };
+    if matches!(
+        value,
+        Value::String(code)
+            if matches!(code.as_str(), "101" | "102" | "103" | "104" | "105" | "106" | "107")
+    ) || matches!(value, Value::Number(code) if matches!(code.as_u64(), Some(101..=107)))
+    {
+        Ok(())
+    } else {
+        Err(CoinbaseDirectDecodeError::Schema)
+    }
+}
+
+fn validate_optional_enum(
+    object: &Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    let value = value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?;
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(CoinbaseDirectDecodeError::Schema)
+    }
+}
+
+fn validate_optional_side(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    parse_direct_side(value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?).map(|_side| ())
+}
+
+fn validate_optional_price(
+    object: &Map<String, Value>,
+    field: &str,
+    terms: InstrumentExecutionTerms,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    normalize_direct_price(
+        value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
+        terms,
+    )
+    .map(|_price| ())
+}
+
+fn validate_optional_quantity(
+    object: &Map<String, Value>,
+    field: &str,
+    terms: InstrumentExecutionTerms,
+    allow_zero: bool,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    let value = value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?;
+    if allow_zero {
+        normalize_direct_delta_quantity(value, terms).map(|_quantity| ())
+    } else {
+        normalize_direct_quantity(value, terms).map(|_quantity| ())
+    }
+}
+
+fn validate_optional_nonnegative_decimal(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<(), CoinbaseDirectDecodeError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    parse_nonnegative_decimal_value(value)
+}
+
+fn parse_nonnegative_decimal_value(value: &Value) -> Result<(), CoinbaseDirectDecodeError> {
+    let value = value.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?;
+    let lexeme =
+        ProviderDecimalLexeme::try_new(value).map_err(|_| CoinbaseDirectDecodeError::Numeric)?;
+    if lexeme.decimal().is_sign_negative() {
+        Err(CoinbaseDirectDecodeError::Numeric)
     } else {
         Ok(())
     }
@@ -791,9 +1099,39 @@ fn parse_direct_quantity(value: &str) -> Result<ProviderQuantity, CoinbaseDirect
     Ok(ProviderQuantity::new(lexeme))
 }
 
+fn normalize_direct_price(
+    value: &str,
+    terms: InstrumentExecutionTerms,
+) -> Result<PriceTicks, CoinbaseDirectDecodeError> {
+    normalize_price(&parse_direct_price(value)?, terms.price_tick())
+        .map_err(|_| CoinbaseDirectDecodeError::Numeric)
+}
+
+fn normalize_direct_quantity(
+    value: &str,
+    terms: InstrumentExecutionTerms,
+) -> Result<QuantityLots, CoinbaseDirectDecodeError> {
+    normalize_positive_quantity(&parse_direct_quantity(value)?, terms.lot_size())
+        .map_err(|_| CoinbaseDirectDecodeError::Numeric)
+}
+
+fn normalize_direct_delta_quantity(
+    value: &str,
+    terms: InstrumentExecutionTerms,
+) -> Result<QuantityLots, CoinbaseDirectDecodeError> {
+    let lexeme =
+        ProviderDecimalLexeme::try_new(value).map_err(|_| CoinbaseDirectDecodeError::Numeric)?;
+    let provider = ProviderQuantity::new(lexeme);
+    normalize_delta_quantity(&provider, terms.lot_size())
+        .map_err(|_| CoinbaseDirectDecodeError::Numeric)
+}
+
 /// A `full` frame that cannot safely advance the maintained product cursor.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CoinbaseDirectDecodeError {
+    /// The validated frame belongs to another configured source/revision or transport.
+    #[error("Coinbase Direct frame authority does not match the decoder")]
+    FrameAuthority,
     /// The captured frame is empty or exceeds its configured WebSocket bound.
     #[error("Coinbase Direct frame size is invalid")]
     FrameTooLarge,
@@ -823,7 +1161,10 @@ pub enum CoinbaseDirectDecodeError {
 /// Streaming level-3 snapshot decoder bound to one exact Direct profile.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectSnapshotDecoder {
+    source_id: SourceId,
+    metadata_revision: market_squawk_domain::MetadataRevision,
     product: ProviderProduct,
+    terms: InstrumentExecutionTerms,
     snapshot_url: Box<str>,
     limits: CoinbaseDirectLimits,
 }
@@ -832,7 +1173,10 @@ impl CoinbaseDirectSnapshotDecoder {
     /// Constructs the snapshot decoder from immutable direct configuration.
     pub fn try_new(config: &CoinbaseDirectConfig) -> Result<Self, CoinbaseConfigError> {
         Ok(Self {
+            source_id: config.metadata().source_id().clone(),
+            metadata_revision: config.metadata().revision().clone(),
             product: config.product().clone(),
+            terms: config.execution_terms(),
             snapshot_url: config.snapshot_url().to_owned().into_boxed_str(),
             limits: config.limits(),
         })
@@ -852,9 +1196,17 @@ impl CoinbaseDirectSnapshotDecoder {
             owner.invalidate_generation();
             return Err(CoinbaseDirectSnapshotError::WrongProduct);
         }
+        if owner.execution_terms() != self.terms {
+            owner.invalidate_generation();
+            return Err(CoinbaseDirectSnapshotError::Owner(
+                DirectOrderBookError::InstrumentTermsMismatch,
+            ));
+        }
         if let Err(error) = validate_http_capture(
             capture,
             &self.snapshot_url,
+            &self.source_id,
+            &self.metadata_revision,
             self.limits.max_snapshot_bytes,
             self.limits.max_snapshot_segments,
         ) {
@@ -875,10 +1227,18 @@ impl CoinbaseDirectSnapshotDecoder {
                 return Err(CoinbaseDirectSnapshotError::Timestamp);
             }
         };
+        if let Err(error) = validate_snapshot_auction(&metadata, self.terms) {
+            owner.invalidate_generation();
+            return Err(error);
+        }
         owner.begin_snapshot(SequenceNumber::new(metadata.sequence))?;
         let parsed = {
             let mut deserializer = serde_json::Deserializer::from_reader(capture.reader());
-            let decoded = SnapshotRowsSeed { owner }.deserialize(&mut deserializer);
+            let decoded = SnapshotRowsSeed {
+                owner,
+                terms: self.terms,
+            }
+            .deserialize(&mut deserializer);
             decoded.and_then(|count| {
                 deserializer.end()?;
                 if count == 0 {
@@ -902,14 +1262,58 @@ impl CoinbaseDirectSnapshotDecoder {
 struct SnapshotMetadataWire {
     sequence: u64,
     time: String,
+    auction_mode: Option<bool>,
+    auction: Option<SnapshotAuctionWire>,
     #[serde(rename = "bids")]
     _bids: IgnoredAny,
     #[serde(rename = "asks")]
     _asks: IgnoredAny,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotAuctionWire {
+    indicative_open_price: String,
+    indicative_open_size: String,
+    indicative_bid_price: String,
+    indicative_bid_size: String,
+    indicative_ask_price: String,
+    indicative_ask_size: String,
+    auction_status: String,
+}
+
+fn validate_snapshot_auction(
+    metadata: &SnapshotMetadataWire,
+    terms: InstrumentExecutionTerms,
+) -> Result<(), CoinbaseDirectSnapshotError> {
+    match (metadata.auction_mode, metadata.auction.as_ref()) {
+        (Some(true), Some(auction)) => {
+            normalize_direct_price(&auction.indicative_open_price, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            normalize_direct_quantity(&auction.indicative_open_size, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            normalize_direct_price(&auction.indicative_bid_price, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            normalize_direct_quantity(&auction.indicative_bid_size, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            normalize_direct_price(&auction.indicative_ask_price, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            normalize_direct_quantity(&auction.indicative_ask_size, terms)
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            SourceIdentifier::try_from(auction.auction_status.as_str())
+                .map_err(|_| CoinbaseDirectSnapshotError::Schema)?;
+            Err(CoinbaseDirectSnapshotError::AuctionMode)
+        }
+        (Some(true), None) | (Some(false), Some(_)) | (None, Some(_)) => {
+            Err(CoinbaseDirectSnapshotError::Schema)
+        }
+        (Some(false), None) | (None, None) => Ok(()),
+    }
+}
+
 struct SnapshotRowsSeed<'a> {
     owner: &'a mut DirectOrderBook,
+    terms: InstrumentExecutionTerms,
 }
 
 impl<'de> DeserializeSeed<'de> for SnapshotRowsSeed<'_> {
@@ -919,12 +1323,16 @@ impl<'de> DeserializeSeed<'de> for SnapshotRowsSeed<'_> {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(SnapshotRowsVisitor { owner: self.owner })
+        deserializer.deserialize_map(SnapshotRowsVisitor {
+            owner: self.owner,
+            terms: self.terms,
+        })
     }
 }
 
 struct SnapshotRowsVisitor<'a> {
     owner: &'a mut DirectOrderBook,
+    terms: InstrumentExecutionTerms,
 }
 
 impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
@@ -942,6 +1350,8 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
         let mut seen_time = false;
         let mut seen_bids = false;
         let mut seen_asks = false;
+        let mut seen_auction_mode = false;
+        let mut seen_auction = false;
         let mut count = 0_usize;
         while let Some(field) = map.next_key::<String>()? {
             match field.as_str() {
@@ -958,6 +1368,7 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
                         .checked_add(map.next_value_seed(SnapshotSideSeed {
                             owner: &mut *self.owner,
                             side: ProviderBookSide::Bid,
+                            terms: self.terms,
                         })?)
                         .ok_or_else(|| A::Error::custom("snapshot order count overflow"))?;
                     seen_bids = true;
@@ -967,9 +1378,18 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
                         .checked_add(map.next_value_seed(SnapshotSideSeed {
                             owner: &mut *self.owner,
                             side: ProviderBookSide::Ask,
+                            terms: self.terms,
                         })?)
                         .ok_or_else(|| A::Error::custom("snapshot order count overflow"))?;
                     seen_asks = true;
+                }
+                "auction_mode" if !seen_auction_mode => {
+                    let _value = map.next_value::<bool>()?;
+                    seen_auction_mode = true;
+                }
+                "auction" if !seen_auction => {
+                    let _value = map.next_value::<Option<SnapshotAuctionWire>>()?;
+                    seen_auction = true;
                 }
                 _ => return Err(A::Error::custom("unknown or duplicate snapshot field")),
             }
@@ -984,6 +1404,7 @@ impl<'de> Visitor<'de> for SnapshotRowsVisitor<'_> {
 struct SnapshotSideSeed<'a> {
     owner: &'a mut DirectOrderBook,
     side: ProviderBookSide,
+    terms: InstrumentExecutionTerms,
 }
 
 impl<'de> DeserializeSeed<'de> for SnapshotSideSeed<'_> {
@@ -996,6 +1417,7 @@ impl<'de> DeserializeSeed<'de> for SnapshotSideSeed<'_> {
         deserializer.deserialize_seq(SnapshotSideVisitor {
             owner: self.owner,
             side: self.side,
+            terms: self.terms,
         })
     }
 }
@@ -1003,6 +1425,7 @@ impl<'de> DeserializeSeed<'de> for SnapshotSideSeed<'_> {
 struct SnapshotSideVisitor<'a> {
     owner: &'a mut DirectOrderBook,
     side: ProviderBookSide,
+    terms: InstrumentExecutionTerms,
 }
 
 impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
@@ -1020,15 +1443,13 @@ impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
         while let Some([price, quantity, order_id]) = sequence.next_element::<[String; 3]>()? {
             let order_id = SourceIdentifier::try_from(order_id)
                 .map_err(|_| A::Error::custom("invalid snapshot order id"))?;
-            let price = parse_direct_price(&price)
+            let price = normalize_direct_price(&price, self.terms)
                 .map_err(|_| A::Error::custom("invalid snapshot price"))?;
-            let quantity = parse_direct_quantity(&quantity)
+            let quantity = normalize_direct_quantity(&quantity, self.terms)
                 .map_err(|_| A::Error::custom("invalid snapshot quantity"))?;
             self.owner
                 .try_push_snapshot_order(ProviderOrderRecord::new(
-                    order_id,
-                    self.side,
-                    ProviderBookLevel::new(price, quantity),
+                    order_id, self.side, price, quantity, self.terms,
                 ))
                 .map_err(A::Error::custom)?;
             count = count
@@ -1042,11 +1463,15 @@ impl<'de> Visitor<'de> for SnapshotSideVisitor<'_> {
 fn validate_http_capture(
     capture: &SegmentedHttpResponseCapture,
     expected_url: &str,
+    expected_source: &SourceId,
+    expected_revision: &market_squawk_domain::MetadataRevision,
     max_body_bytes: u64,
     max_segments: usize,
 ) -> Result<(), CoinbaseDirectCaptureError> {
     let receipt = capture.receipt();
-    if receipt.method() != HttpCaptureMethod::Get
+    if receipt.source_id() != expected_source
+        || receipt.metadata_revision() != expected_revision
+        || receipt.method() != HttpCaptureMethod::Get
         || receipt.status() != 200
         || receipt.final_url() != expected_url
         || receipt.body_length() == 0
@@ -1077,6 +1502,9 @@ pub enum CoinbaseDirectSnapshotError {
     /// Required provider source time is invalid.
     #[error("Coinbase Direct snapshot time is invalid")]
     Timestamp,
+    /// Auction indicative books are retained provider evidence, not execution authority.
+    #[error("Coinbase Direct snapshot is in auction mode")]
+    AuctionMode,
     /// Instrument-owned lifecycle, sequence, map, count, byte, or invariant failure.
     #[error("Coinbase Direct snapshot owner rejected state: {0}")]
     Owner(#[from] DirectOrderBookError),
@@ -1100,6 +1528,7 @@ struct ProductWire {
     cancel_only: bool,
     post_only: bool,
     limit_only: bool,
+    auction_mode: bool,
 }
 
 /// Current provider-authored product status and precision evidence.
@@ -1114,6 +1543,7 @@ pub struct CoinbaseDirectProductEvidence {
     cancel_only: bool,
     post_only: bool,
     limit_only: bool,
+    auction_mode: bool,
     capture: SegmentedHttpResponseReceipt,
 }
 
@@ -1163,6 +1593,16 @@ impl CoinbaseDirectProductEvidence {
         self.limit_only
     }
 
+    /// Returns whether the product is in provider auction mode.
+    pub const fn auction_mode(&self) -> bool {
+        self.auction_mode
+    }
+
+    /// Returns the registry-trusted effective observation coordinate for this product response.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.capture.received_at()
+    }
+
     /// Returns the exact HTTP capture receipt.
     pub const fn capture_receipt(&self) -> &SegmentedHttpResponseReceipt {
         &self.capture
@@ -1193,30 +1633,39 @@ pub enum CoinbaseDirectProductError {
 mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
     use std::str::FromStr as _;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
     use market_squawk_domain::{
-        AuthorizationBasis, ChecksumCapability, ConnectionGeneration, DigestAlgorithm,
-        EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId, MetadataRevision,
-        ProviderProduct, RevisionBoundPayloadEvidence, SequenceCapability, SourceId,
-        SourceIdentifier, Timestamp, TradingStatus,
+        AuthorizationBasis, ChecksumCapability, ConnectionGeneration, Currency, Denomination,
+        DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+        InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
+        MetadataRevision, PriceTicks, ProviderProduct, QuantityLots, RevisionBoundPayloadEvidence,
+        SequenceCapability, SourceId, SourceIdentifier, TickSize, Timestamp, TradingStatus,
     };
     use market_squawk_live::{DirectBookLimits, DirectOrderBook, DirectSyncPhase};
     use market_squawk_sources::{
-        AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
-        HttpCaptureMethod, ProviderBudgetPolicy, ProviderOrderEventKind,
-        SegmentedHttpResponseBuilder,
+        AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
+        AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
+        BudgetScope, CurrentSourceSession, FreshnessPolicy, HttpCaptureMethod,
+        ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderOrderEventKind, RawFrameFactory,
+        SessionId, TransportFrameKind,
     };
+    use sha2::Digest as _;
 
     use crate::{
         COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectAuthentication, CoinbaseDirectConfig,
         CoinbaseDirectDecodeError, CoinbaseDirectDecoder, CoinbaseDirectLimits,
         CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
-        CoinbaseDirectSnapshotDecoder, CoinbaseProductMapping, CoinbaseTransportLimits,
+        CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseProductMapping,
+        CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    static_assertions::assert_not_impl_any!(CoinbaseDirectAuthentication: Clone);
+    static_assertions::assert_not_impl_any!(super::CoinbaseSignedSubscription: Clone);
 
     fn id(value: &str) -> TestResult<SourceIdentifier> {
         Ok(SourceIdentifier::try_from(value)?)
@@ -1230,6 +1679,16 @@ mod tests {
     }
 
     fn config() -> TestResult<CoinbaseDirectConfig> {
+        let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+        let terms = InstrumentExecutionTerms::try_new(
+            instrument,
+            InstrumentDefinitionRevision::try_from(1)?,
+            TickSize::try_from_decimal(ProviderDecimalLexeme::try_new("0.01")?.decimal())?,
+            LotSize::try_from_decimal(ProviderDecimalLexeme::try_new("0.00000001")?.decimal())?,
+            Currency::try_from("USD")?,
+            Denomination::Currency(Currency::try_from("BTC")?),
+            ProviderDecimalLexeme::try_new("1")?.decimal(),
+        )?;
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
         let authorization = AuthorizationGrant::new(
             AuthorizationMode::UserAuthorized,
@@ -1257,10 +1716,8 @@ mod tests {
             authorization,
             evidence(4),
             effective,
-            CoinbaseProductMapping::try_new(
-                ProviderProduct::new(id("BTC-USD")?),
-                InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-            )?,
+            CoinbaseProductMapping::try_new(ProviderProduct::new(id("BTC-USD")?), instrument)?,
+            terms,
             FreshnessPolicy::try_new(
                 5_000_000_000,
                 1_000_000_000,
@@ -1283,11 +1740,53 @@ mod tests {
         .map_err(Into::into)
     }
 
+    fn capture_authority(
+        config: &CoinbaseDirectConfig,
+        generation: u64,
+    ) -> TestResult<(
+        AuthoritativeSourceRegistry,
+        CurrentSourceSession,
+        RawFrameFactory,
+    )> {
+        let mut registry =
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+                Arc::new(FixtureAuthorizationSubjectResolver),
+            )?;
+        let registered =
+            registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+        let session = registry.begin_session(
+            &registered,
+            SessionId::new(id("coinbase-direct-test-session")?),
+            ConnectionGeneration::new(generation)?,
+            Timestamp::from_unix_nanos(1),
+        )?;
+        let frames = registry.take_raw_frame_factory(&session)?;
+        Ok((registry, session, frames))
+    }
+
+    #[derive(Debug)]
+    struct FixtureAuthorizationSubjectResolver;
+
+    impl AuthorizationSubjectResolver for FixtureAuthorizationSubjectResolver {
+        fn resolve_subject_record(
+            &self,
+            mode: AuthorizationMode,
+            _evidence: EvidenceDigest,
+        ) -> Result<SourceIdentifier, AuthorizationSubjectResolutionError> {
+            if mode != AuthorizationMode::UserAuthorized {
+                return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
+            }
+            SourceIdentifier::try_from("coinbase-direct-fixture-credential")
+                .map_err(|_| AuthorizationSubjectResolutionError::EvidenceUnresolved)
+        }
+    }
+
     fn capture(
+        frames: &mut RawFrameFactory,
         url: &str,
         body: &[u8],
     ) -> TestResult<market_squawk_sources::SegmentedHttpResponseCapture> {
-        let mut builder = SegmentedHttpResponseBuilder::try_new(
+        let mut builder = frames.try_http_response_builder(
             HttpCaptureMethod::Get,
             url,
             200,
@@ -1303,6 +1802,16 @@ mod tests {
         Ok(builder.finish()?)
     }
 
+    fn decode_event(
+        decoder: &CoinbaseDirectDecoder,
+        frames: &mut RawFrameFactory,
+        session: &CurrentSourceSession,
+        payload: &'static [u8],
+    ) -> TestResult<market_squawk_sources::ProviderOrderEvent> {
+        let frame = frames.try_frame(TransportFrameKind::Text, Bytes::from_static(payload))?;
+        Ok(decoder.decode(&session.validate_live_frame(&frame)?)?)
+    }
+
     #[derive(Debug)]
     struct FixtureSigner;
 
@@ -1314,9 +1823,9 @@ mod tests {
             assert_eq!(request.method(), "GET");
             assert_eq!(request.path(), "/users/self/verify");
             CoinbaseDirectAuthentication::try_new(
-                "fixture-key",
-                "fixture-pass",
-                "fixture-signature",
+                "fixture-key".to_owned(),
+                "fixture-pass".to_owned(),
+                "fixture-signature".to_owned(),
             )
         }
     }
@@ -1388,18 +1897,52 @@ mod tests {
     fn full_decoder_classifies_cursor_and_rejects_unknown_sequenced_types() -> TestResult {
         let config = config()?;
         let decoder = CoinbaseDirectDecoder::try_new(&config)?;
-        let received = decoder.decode_captured_text(
-            br#"{"type":"received","time":"2026-07-24T21:34:10.600Z","product_id":"BTC-USD","sequence":11,"order_id":"order-a","order_type":"limit","size":"1.00","price":"100.00","side":"buy"}"#,
+        let (_registry, session, mut frames) = capture_authority(&config, 1)?;
+        let received_frame = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"received","time":"2026-07-24T21:34:10.600Z","product_id":"BTC-USD","sequence":11,"order_id":"order-a","order_type":"limit","size":"1.00","price":"100.00","side":"buy"}"#,
+            ),
         )?;
+        let validated = session.validate_live_frame(&received_frame)?;
+        let received = decoder.decode(&validated)?;
         assert!(matches!(
             received.kind(),
             ProviderOrderEventKind::CursorOnly(_)
         ));
         assert_eq!(received.sequence().get(), 11);
+        assert_eq!(received.wire_bytes(), received_frame.payload().len());
+        assert_eq!(received.evidence().frame_id(), received_frame.frame_id());
         assert_eq!(
-            decoder.decode_captured_text(
-                br#"{"type":"new_state_changing_message","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":12}"#
+            received.evidence().payload_digest().bytes(),
+            <[u8; 32]>::from(sha2::Sha256::digest(received_frame.payload()))
+        );
+        assert!(
+            received
+                .evidence()
+                .binding()
+                .shares_allocation_with(received_frame.binding())
+        );
+        let mut byte_bounded_owner = DirectOrderBook::try_new(
+            session.generation(),
+            config.product().clone(),
+            config.execution_terms(),
+            DirectBookLimits::try_new(4, 4, 2, received.wire_bytes() - 1, 2)?,
+        )?;
+        assert_eq!(
+            byte_bounded_owner.try_queue(received),
+            Err(market_squawk_live::DirectOrderBookError::QueueBytesExceeded)
+        );
+        assert_eq!(byte_bounded_owner.phase(), DirectSyncPhase::Quarantined);
+
+        let unknown_frame = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"new_state_changing_message","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":12}"#,
             ),
+        )?;
+        assert_eq!(
+            decoder.decode(&session.validate_live_frame(&unknown_frame)?),
             Err(CoinbaseDirectDecodeError::UnknownSequencedMessage)
         );
         Ok(())
@@ -1408,11 +1951,13 @@ mod tests {
     #[test]
     fn snapshot_streams_orders_and_required_time_into_non_authoritative_owner() -> TestResult {
         let config = config()?;
-        let body = br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z"}"#;
-        let capture = capture(config.snapshot_url(), body)?;
+        let (_registry, session, mut frames) = capture_authority(&config, 1)?;
+        let body = br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z","auction_mode":false}"#;
+        let capture = capture(&mut frames, config.snapshot_url(), body)?;
         let mut owner = DirectOrderBook::try_new(
             ConnectionGeneration::new(1)?,
             config.product().clone(),
+            config.execution_terms(),
             config.limits().book(),
         )?;
         CoinbaseDirectSnapshotDecoder::try_new(&config)?.decode_into(&capture, &mut owner)?;
@@ -1428,6 +1973,11 @@ mod tests {
                 .map(|receipt| receipt.body_digest()),
             Some(capture.receipt().body_digest())
         );
+        assert_eq!(
+            capture.receipt().connection_generation(),
+            session.generation()
+        );
+        assert!(capture.receipt().received_at() >= session.started_at());
         owner.begin_replay()?;
         owner.finish_replay()?;
         assert_eq!(owner.phase(), DirectSyncPhase::Healthy);
@@ -1438,9 +1988,11 @@ mod tests {
     #[test]
     fn product_response_supplies_actual_status_and_increment_evidence() -> TestResult {
         let config = config()?;
+        let (_registry, session, mut frames) = capture_authority(&config, 1)?;
         let capture = capture(
+            &mut frames,
             config.product_url(),
-            br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false}"#,
+            br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#,
         )?;
         let evidence = config.decode_product_evidence(&capture)?;
         assert_eq!(evidence.trading_status(), TradingStatus::Active);
@@ -1449,6 +2001,136 @@ mod tests {
         assert_eq!(
             evidence.capture_receipt().body_digest(),
             capture.receipt().body_digest()
+        );
+        assert_eq!(evidence.observed_at(), capture.receipt().received_at());
+        assert_eq!(
+            evidence.capture_receipt().connection_generation(),
+            session.generation()
+        );
+        assert_eq!(evidence.capture_receipt().final_url(), config.product_url());
+        Ok(())
+    }
+
+    #[test]
+    fn auction_evidence_is_retained_but_cannot_establish_execution_authority() -> TestResult {
+        let config = config()?;
+        let (_registry, _session, mut frames) = capture_authority(&config, 1)?;
+        let product_capture = capture(
+            &mut frames,
+            config.product_url(),
+            br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":true}"#,
+        )?;
+        let product = config.decode_product_evidence(&product_capture)?;
+        assert!(product.auction_mode());
+        assert_eq!(product.trading_status(), TradingStatus::Inactive);
+
+        let snapshot_capture = capture(
+            &mut frames,
+            config.snapshot_url(),
+            br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z","auction_mode":true,"auction":{"indicative_open_price":"100.50","indicative_open_size":"1.25","indicative_bid_price":"100.00","indicative_bid_size":"5.00","indicative_ask_price":"101.00","indicative_ask_size":"4.00","auction_status":"CAN_OPEN"}}"#,
+        )?;
+        let mut owner = DirectOrderBook::try_new(
+            ConnectionGeneration::new(1)?,
+            config.product().clone(),
+            config.execution_terms(),
+            config.limits().book(),
+        )?;
+        assert_eq!(
+            CoinbaseDirectSnapshotDecoder::try_new(&config)?
+                .decode_into(&snapshot_capture, &mut owner),
+            Err(CoinbaseDirectSnapshotError::AuctionMode)
+        );
+        assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
+        assert!(owner.published_book().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_receipt_from_another_generation_cannot_advance_health() -> TestResult {
+        let config = config()?;
+        let (_registry, _session, mut frames) = capture_authority(&config, 1)?;
+        let capture = capture(
+            &mut frames,
+            config.snapshot_url(),
+            br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z","auction_mode":false}"#,
+        )?;
+        let mut owner = DirectOrderBook::try_new(
+            ConnectionGeneration::new(2)?,
+            config.product().clone(),
+            config.execution_terms(),
+            config.limits().book(),
+        )?;
+        assert_eq!(
+            CoinbaseDirectSnapshotDecoder::try_new(&config)?.decode_into(&capture, &mut owner),
+            Err(CoinbaseDirectSnapshotError::Owner(
+                market_squawk_live::DirectOrderBookError::SnapshotGenerationMismatch
+            ))
+        );
+        assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
+        assert!(owner.published_book().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn modify_order_reprices_atomically_and_authenticated_additions_are_typed() -> TestResult {
+        let config = config()?;
+        let decoder = CoinbaseDirectDecoder::try_new(&config)?;
+        let (_registry, session, mut frames) = capture_authority(&config, 1)?;
+        let modified = decode_event(
+            &decoder,
+            &mut frames,
+            &session,
+            br#"{"type":"change","reason":"modify_order","time":"2026-07-24T21:34:10.600Z","sequence":11,"order_id":"bid-a","side":"buy","product_id":"BTC-USD","old_size":"5.00","new_size":"4.00","old_price":"100.00","new_price":"99.50","user_id":"user-a","profile_id":"profile-a"}"#,
+        )?;
+        let mut owner = DirectOrderBook::try_new(
+            session.generation(),
+            config.product().clone(),
+            config.execution_terms(),
+            config.limits().book(),
+        )?;
+        owner.try_queue(modified)?;
+        let snapshot = capture(
+            &mut frames,
+            config.snapshot_url(),
+            br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z","auction_mode":false}"#,
+        )?;
+        CoinbaseDirectSnapshotDecoder::try_new(&config)?.decode_into(&snapshot, &mut owner)?;
+        owner.begin_replay()?;
+        assert!(owner.replay_next()?);
+        assert!(!owner.replay_next()?);
+        owner.finish_replay()?;
+        assert_eq!(owner.phase(), DirectSyncPhase::Healthy);
+        let published = owner.published_book().ok_or("missing healthy book")?;
+        let best_bid = published.bids().next().ok_or("missing best bid")?;
+        assert_eq!(best_bid.price(), PriceTicks::new(9_950));
+        assert_eq!(best_bid.quantity(), QuantityLots::new(400_000_000)?);
+
+        let matched = decode_event(
+            &decoder,
+            &mut frames,
+            &session,
+            br#"{"type":"match","trade_id":12,"sequence":12,"maker_order_id":"bid-a","taker_order_id":"taker-a","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","size":"1.00","price":"99.50","side":"buy","maker_user_id":"maker-user","user_id":"maker-user","maker_profile_id":"maker-profile","profile_id":"maker-profile","maker_fee_rate":"0.001"}"#,
+        )?;
+        assert!(matches!(
+            matched.kind(),
+            ProviderOrderEventKind::Match { .. }
+        ));
+        let done = decode_event(
+            &decoder,
+            &mut frames,
+            &session,
+            br#"{"type":"done","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":13,"order_id":"bid-a","reason":"canceled","price":"99.50","remaining_size":"4.00","side":"buy","user_id":"user-a","profile_id":"profile-a","cancel_reason":"101"}"#,
+        )?;
+        assert!(matches!(done.kind(), ProviderOrderEventKind::Done { .. }));
+        let invalid_match = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"match","trade_id":14,"sequence":14,"maker_order_id":"bid-a","taker_order_id":"taker-a","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","size":"1.00","price":"99.50","side":"buy","maker_fee_rate":[]}"#,
+            ),
+        )?;
+        assert_eq!(
+            decoder.decode(&session.validate_live_frame(&invalid_match)?),
+            Err(CoinbaseDirectDecodeError::Schema)
         );
         Ok(())
     }
