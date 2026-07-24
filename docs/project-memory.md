@@ -719,3 +719,36 @@ PR `#26` and issue `#24` contain the current checkpoint. GitHub Actions run `301
 executed. This remains an external Actions account billing/spending-state blocker rather than a
 code-owned failure. Project 5 keeps `#24` and `#31` In Progress and `#25` Todo. The next barrier is
 Coinbase exact-head review/integration, followed by provider/onboarding closure and Task 20.
+
+## 2026-07-24 release-truth reconciliation and active product lanes
+
+The pushed release head is
+`3c2cfe5516db47e7a3489921586360332ff3725c`; the local and origin release refs match. Commits
+`241599a` and `3c2cfe5` reconcile maintained documentation with code already present at the reviewed
+product head:
+
+- the sole production stdio MCP registry contains 62 tools;
+- CLI object listing and receipt-bound provider discovery-to-ingestion are public, bounded product
+  paths; and
+- `LocalProduct` composes OS-keyring-first secret storage with an initially locked, code-owned
+  encrypted fallback whose only unlock/lock surface is the foreground loopback portal.
+
+These corrections removed false release blockers without product-code changes, Cargo commands,
+new tests, checkers, generators, or scripts.
+
+The independent Coinbase review rejected candidate `09f289f` before integration with zero Critical
+and seven Important findings: auction authority, trusted observation time, generation/frame/receipt
+binding, current modify-order price semantics, bounded live publication, secret zeroization, and
+focused proof of those exact invariants. Remediation remains in the existing
+`feature/coinbase-direct-market-data` worktree; no rejected code is on the release branch.
+
+One grouped non-conflicting `feature/research-model-release` lane owns both public analytical-query
+overflow publication and the supported production training/ONNX candidate workflow. It is based on
+the pushed `241599a` product/documentation checkpoint and cannot push or integrate before focused
+verification and independent review.
+
+Generated Cargo state is approximately 5.4 GiB in the root and 0.9 GiB in the Coinbase lane; the
+research/model lane has not created a target tree. All remain below the 20 GiB root and 10 GiB lane
+ceilings. Project 5 keeps `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
+Actions run `30132539779` at `3c2cfe5` again created three jobs with empty step lists, so no
+repository checkout or code-owned CI step ran.
