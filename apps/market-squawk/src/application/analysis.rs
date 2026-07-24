@@ -12,10 +12,11 @@ use market_squawk_data::{
     AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit,
     DatasetId, ManifestCatalogError, QueryError,
 };
-use market_squawk_domain::{InstrumentId, RoundingPolicy, SourceId, Timestamp};
+use market_squawk_domain::{DataQuality, InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
-    RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
-    TypedToolResult,
+    JsonContractError, JsonStructureLimits, RequestContext, ServiceContractError, ServiceDomain,
+    ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
+    validate_json_contract,
 };
 use serde_json::{Map, Value, json};
 
@@ -325,33 +326,27 @@ impl AnalysisDomainService {
             .iter()
             .map(published_feature_dataset_value)
             .collect::<Vec<_>>();
+        let published_cursors = published
+            .iter()
+            .map(|dataset| dataset.generation().manifest().dataset_id().as_str())
+            .collect::<Vec<_>>();
         let minimum_published = usize::from(!published.is_empty());
-        for published_count in (minimum_published..=published.len()).rev() {
-            let actual_published = &published[..published_count];
-            let actual_has_more = published_count < published.len() || published_has_more;
-            let next_after_dataset = actual_published
-                .last()
-                .filter(|_| actual_has_more)
-                .map(|dataset| dataset.generation().manifest().dataset_id().as_str());
-            let mut items = context_items.clone();
-            items.extend(published_items[..published_count].iter().cloned());
-            let returned = items.len();
-            let metadata =
-                combined_feature_metadata(&selected, actual_published, returned, available)?;
-            if let Ok(result) = TypedToolResult::try_new(
-                json!({
-                    "items": items,
-                    "hasMore": actual_has_more,
-                    "nextAfterDataset": next_after_dataset
-                }),
-                returned.max(1),
-                metadata,
-                limits,
-            ) {
-                return Ok(result);
-            }
-        }
-        Err(ServiceError::ResourceExhausted)
+        bounded_feature_page_result(
+            &context_items,
+            &published_items,
+            &published_cursors,
+            minimum_published,
+            published_has_more,
+            limits,
+            |published_count, returned| {
+                combined_feature_metadata(
+                    &selected,
+                    &published[..published_count],
+                    returned,
+                    available,
+                )
+            },
+        )
     }
 
     fn published_feature_datasets(
@@ -722,7 +717,7 @@ fn combined_feature_metadata(
     published: &[AnalyticalFeatureDataset],
     returned: usize,
     available: usize,
-) -> Result<ToolResultMetadata, ServiceError> {
+) -> Result<ToolResultMetadata, FeaturePageCandidateError> {
     let mut sources = Vec::new();
     let mut qualities = Vec::new();
     let mut source_set = HashSet::new();
@@ -750,7 +745,25 @@ fn combined_feature_metadata(
     let dataset_count = selected
         .len()
         .checked_add(published.len())
-        .ok_or(ServiceError::ResourceExhausted)?;
+        .ok_or(FeaturePageCandidateError::Invariant)?;
+    feature_page_metadata(sources, qualities, dataset_count, returned, available)
+}
+
+enum FeaturePageCandidateError {
+    DoesNotFit,
+    Invariant,
+}
+
+fn feature_page_metadata(
+    sources: Vec<SourceId>,
+    qualities: Vec<DataQuality>,
+    dataset_count: usize,
+    returned: usize,
+    available: usize,
+) -> Result<ToolResultMetadata, FeaturePageCandidateError> {
+    if returned > available || dataset_count > returned {
+        return Err(FeaturePageCandidateError::Invariant);
+    }
     let coverage = json!({
         "sources": sources,
         "datasetCount": dataset_count,
@@ -760,11 +773,99 @@ fn combined_feature_metadata(
         "classes": qualities,
         "executionEligible": false
     });
-    if returned < available {
-        ToolResultMetadata::try_truncated(available, coverage, quality).map_err(Into::into)
+    validate_feature_evidence_structure(&coverage)?;
+    validate_feature_evidence_structure(&quality)?;
+    let metadata = if returned < available {
+        ToolResultMetadata::try_truncated(available, coverage, quality)
     } else {
-        ToolResultMetadata::try_complete(coverage, quality).map_err(Into::into)
+        ToolResultMetadata::try_complete(coverage, quality)
+    };
+    metadata.map_err(|error| match error {
+        ServiceContractError::InvalidMetadata => FeaturePageCandidateError::DoesNotFit,
+        ServiceContractError::ZeroItemsForNonNullResult
+        | ServiceContractError::TooManyItems
+        | ServiceContractError::InvalidCompleteness
+        | ServiceContractError::SourceEvidencePolicy
+        | ServiceContractError::Json(_) => FeaturePageCandidateError::Invariant,
+    })
+}
+
+fn validate_feature_evidence_structure(evidence: &Value) -> Result<(), FeaturePageCandidateError> {
+    // Keep the fixed ToolResultMetadata structural contract explicit so only its independent
+    // encoded-byte ceiling is eligible for page-prefix retry.
+    let limits = JsonStructureLimits::try_new(8, 4 * 1024, 256, 256)
+        .map_err(|_| FeaturePageCandidateError::Invariant)?;
+    validate_json_contract(evidence, limits, usize::MAX)
+        .map(|_| ())
+        .map_err(|_| FeaturePageCandidateError::Invariant)
+}
+
+fn bounded_feature_page_result<M>(
+    context_items: &[Value],
+    published_items: &[Value],
+    published_cursors: &[&str],
+    minimum_published: usize,
+    published_has_more: bool,
+    limits: ServiceLimits,
+    mut metadata_for: M,
+) -> Result<TypedToolResult, ServiceError>
+where
+    M: FnMut(usize, usize) -> Result<ToolResultMetadata, FeaturePageCandidateError>,
+{
+    if published_items.len() != published_cursors.len() || minimum_published > published_items.len()
+    {
+        return Err(ServiceError::InvalidResult);
     }
+    for published_count in (minimum_published..=published_items.len()).rev() {
+        let actual_has_more = published_count < published_items.len() || published_has_more;
+        let next_after_dataset = if actual_has_more {
+            Some(
+                *published_cursors
+                    .get(
+                        published_count
+                            .checked_sub(1)
+                            .ok_or(ServiceError::InvalidResult)?,
+                    )
+                    .ok_or(ServiceError::InvalidResult)?,
+            )
+        } else {
+            None
+        };
+        let mut items = context_items.to_vec();
+        items.extend(published_items[..published_count].iter().cloned());
+        let returned = items.len();
+        let metadata = match metadata_for(published_count, returned) {
+            Ok(metadata) => metadata,
+            Err(FeaturePageCandidateError::DoesNotFit) => continue,
+            Err(FeaturePageCandidateError::Invariant) => {
+                return Err(ServiceError::InvalidResult);
+            }
+        };
+        match TypedToolResult::try_new(
+            json!({
+                "items": items,
+                "hasMore": actual_has_more,
+                "nextAfterDataset": next_after_dataset
+            }),
+            returned.max(1),
+            metadata,
+            limits,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(
+                ServiceContractError::TooManyItems
+                | ServiceContractError::Json(JsonContractError::EncodingOrBytes),
+            ) => {}
+            Err(
+                ServiceContractError::ZeroItemsForNonNullResult
+                | ServiceContractError::InvalidMetadata
+                | ServiceContractError::InvalidCompleteness
+                | ServiceContractError::SourceEvidencePolicy
+                | ServiceContractError::Json(_),
+            ) => return Err(ServiceError::InvalidResult),
+        }
+    }
+    Err(ServiceError::ResourceExhausted)
 }
 
 fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
@@ -879,5 +980,167 @@ const fn rounding_policy_name(value: RoundingPolicy) -> &'static str {
         RoundingPolicy::TowardZero => "toward_zero",
         RoundingPolicy::Floor => "floor",
         RoundingPolicy::Ceiling => "ceiling",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use market_squawk_domain::SourceId;
+    use market_squawk_services::{
+        JsonStructureLimits, ServiceContractError, ServiceError, ServiceLimits, ToolResultMetadata,
+    };
+    use serde_json::json;
+
+    use super::{bounded_feature_page_result, feature_page_metadata};
+
+    #[test]
+    fn feature_page_skips_oversized_source_metadata_without_losing_durable_rows()
+    -> Result<(), Box<dyn Error>> {
+        const DURABLE_COUNT: usize = 64;
+
+        let cursors = (0..DURABLE_COUNT)
+            .map(|index| format!("dataset-{index:02}"))
+            .collect::<Vec<_>>();
+        let cursor_refs = cursors.iter().map(String::as_str).collect::<Vec<_>>();
+        let published_items = cursors
+            .iter()
+            .map(|cursor| json!({"manifest": {"dataset": cursor}}))
+            .collect::<Vec<_>>();
+        let sources = (0..DURABLE_COUNT)
+            .map(|index| {
+                let prefix = format!("source-{index:02}-");
+                SourceId::try_from(format!(
+                    "{prefix}{}",
+                    "s".repeat(SourceId::MAX_LENGTH - prefix.len())
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_metadata = |count: usize| {
+            let coverage = json!({
+                "sources": &sources[..count],
+                "datasetCount": count,
+                "pointInTime": true
+            });
+            let quality = json!({"classes": [], "executionEligible": false});
+            if count < DURABLE_COUNT {
+                ToolResultMetadata::try_truncated(DURABLE_COUNT, coverage, quality)
+            } else {
+                ToolResultMetadata::try_complete(coverage, quality)
+            }
+        };
+        assert!(matches!(
+            raw_metadata(DURABLE_COUNT),
+            Err(ServiceContractError::InvalidMetadata)
+        ));
+        let expected_first_count = (1..DURABLE_COUNT)
+            .rev()
+            .find(|count| raw_metadata(*count).is_ok())
+            .ok_or("no source metadata prefix fits")?;
+        assert!(raw_metadata(expected_first_count + 1).is_err());
+
+        let limits = ServiceLimits::try_new(
+            64 * 1024,
+            DURABLE_COUNT,
+            64 * 1024,
+            DURABLE_COUNT,
+            JsonStructureLimits::try_new(8, 64 * 1024, 128, 128)?,
+        )?;
+        let first = bounded_feature_page_result(
+            &[],
+            &published_items,
+            &cursor_refs,
+            1,
+            false,
+            limits,
+            |published_count, returned| {
+                feature_page_metadata(
+                    sources[..published_count].to_vec(),
+                    Vec::new(),
+                    published_count,
+                    returned,
+                    DURABLE_COUNT,
+                )
+            },
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "metadata-bounded first feature page failed: {error:?}"
+            ))
+        })?;
+        let first_items = first.structured_content()["items"]
+            .as_array()
+            .ok_or("metadata-bounded first page has no items")?;
+        assert_eq!(first_items.len(), expected_first_count);
+        assert_eq!(first.structured_content()["hasMore"], true);
+        assert_eq!(
+            first.structured_content()["nextAfterDataset"],
+            cursors[expected_first_count - 1]
+        );
+        assert_eq!(
+            first.metadata().source_coverage()["sources"]
+                .as_array()
+                .map(Vec::len),
+            Some(expected_first_count)
+        );
+
+        let remaining_sources = &sources[expected_first_count..];
+        let terminal = bounded_feature_page_result(
+            &[],
+            &published_items[expected_first_count..],
+            &cursor_refs[expected_first_count..],
+            1,
+            false,
+            limits,
+            |published_count, returned| {
+                feature_page_metadata(
+                    remaining_sources[..published_count].to_vec(),
+                    Vec::new(),
+                    published_count,
+                    returned,
+                    DURABLE_COUNT,
+                )
+            },
+        )?;
+        let terminal_items = terminal.structured_content()["items"]
+            .as_array()
+            .ok_or("metadata-bounded terminal page has no items")?;
+        assert_eq!(terminal_items.len(), DURABLE_COUNT - expected_first_count);
+        assert_eq!(terminal.structured_content()["hasMore"], false);
+        assert!(terminal.structured_content()["nextAfterDataset"].is_null());
+        let observed = first_items
+            .iter()
+            .chain(terminal_items)
+            .map(|item| {
+                item["manifest"]["dataset"]
+                    .as_str()
+                    .ok_or("feature page dataset cursor is absent")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(observed, cursor_refs);
+
+        let structurally_invalid = bounded_feature_page_result(
+            &[json!({"nested": {"too": {"deep": true}}})],
+            &[],
+            &[],
+            0,
+            false,
+            ServiceLimits::try_new(
+                64 * 1024,
+                DURABLE_COUNT,
+                64 * 1024,
+                DURABLE_COUNT,
+                JsonStructureLimits::try_new(3, 64 * 1024, 128, 128)?,
+            )?,
+            |_published_count, returned| {
+                feature_page_metadata(Vec::new(), Vec::new(), 0, returned, 1)
+            },
+        );
+        assert_eq!(
+            structurally_invalid.err(),
+            Some(ServiceError::InvalidResult)
+        );
+        Ok(())
     }
 }
