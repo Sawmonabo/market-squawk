@@ -235,16 +235,13 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
-    /// Discover exact provider objects and receipt-bound ingestion authority.
+    /// List exact provider objects without minting ingestion authority.
     Discover {
         /// Active configured provider identifier.
         provider: String,
         /// Exact provider dataset namespace.
         #[arg(long)]
         dataset: String,
-        /// Explicit local authority-minting confirmation.
-        #[arg(long)]
-        confirm: bool,
     },
 }
 
@@ -288,9 +285,6 @@ pub enum IngestCommand {
         /// Destination dataset identity.
         #[arg(long)]
         dataset: String,
-        /// Opaque receipt returned by `source discover` for this exact object.
-        #[arg(long)]
-        discovery_receipt: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,

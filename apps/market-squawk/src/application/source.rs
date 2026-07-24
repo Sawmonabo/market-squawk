@@ -15,8 +15,8 @@ use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
 };
-use market_squawk_sources::MAX_DISCOVERY_OBJECTS;
-use serde_json::json;
+use market_squawk_sources::{DiscoveryRequestId, MAX_DISCOVERY_OBJECTS, SourceMetadata};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
     sync::Mutex,
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ApplicationDomainService, ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator,
+    ResearchSourceObjectListing,
     domain_support::{DomainLifecycle, admitted_result_limits, ensure_request_live},
 };
 use crate::{
@@ -54,6 +55,7 @@ const SOURCE_GET_STATUS: &str = "Source.GetStatus";
 const SOURCE_GET_COVERAGE: &str = "Source.GetCoverage";
 const SOURCE_GET_HEALTH: &str = "Source.GetHealth";
 const SOURCE_SETUP: &str = "Source.Setup";
+const SOURCE_LIST_OBJECTS: &str = "Source.ListObjects";
 const SOURCE_DISCOVER: &str = "Source.Discover";
 
 const MAX_CURRENT_SESSIONS: usize = 32;
@@ -129,6 +131,11 @@ impl ApplicationDomainService for SourceDomainService {
         match request.name() {
             SOURCE_REGISTER => self.controller.register(&request, &context, limits),
             SOURCE_SETUP => self.controller.setup(&request, &context, limits).await,
+            SOURCE_LIST_OBJECTS => {
+                self.controller
+                    .list_objects(&request, &context, limits)
+                    .await
+            }
             SOURCE_DISCOVER => self.controller.discover(&request, &context, limits).await,
             SOURCE_GET_STATUS => {
                 self.controller
@@ -147,6 +154,15 @@ impl ApplicationDomainService for SourceDomainService {
             }
             _ => Err(ServiceError::NotFound),
         }
+    }
+
+    fn rollback_unpublished_result(
+        &self,
+        request: &TypedToolRequest,
+        result: &TypedToolResult,
+    ) -> Result<(), ServiceError> {
+        self.controller
+            .rollback_unpublished_discovery(request, result)
     }
 
     fn begin_shutdown(&self) {
@@ -177,6 +193,44 @@ struct SourceController {
 }
 
 impl SourceController {
+    async fn list_objects(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        ensure_request_live(context, &self.lifecycle)?;
+        let profile = required_identifier(request, "provider")?;
+        let dataset = required_identifier(request, "dataset")?;
+        ensure_exact_provider_scope(request, &profile)?;
+        let (publication_limits, maximum_items) = self.discovery_limits(limits)?;
+        let listed = self
+            .discovery
+            .list_registered_objects(&profile, &dataset, None, maximum_items, context)
+            .await?;
+        ensure_request_live(context, &self.lifecycle)?;
+        validate_listing(&listed, &profile, &dataset, maximum_items)?;
+        if listed.objects().is_empty() {
+            return Err(ServiceError::NotFound);
+        }
+
+        let coverage = discovery_coverage(
+            &profile,
+            &dataset,
+            listed.metadata(),
+            listed.request().request_id(),
+        );
+        let quality = discovery_quality(listed.metadata());
+        let metadata = ToolResultMetadata::try_complete(coverage, quality)
+            .map_err(|_error| ServiceError::InvalidResult)?;
+        let item_count = listed.objects().len();
+        let result =
+            TypedToolResult::try_new(to_json(&listed)?, item_count, metadata, publication_limits)
+                .map_err(|_error| ServiceError::ResourceExhausted)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        Ok(result)
+    }
+
     async fn discover(
         &self,
         request: &TypedToolRequest,
@@ -187,6 +241,54 @@ impl SourceController {
         let profile = required_identifier(request, "provider")?;
         let dataset = required_identifier(request, "dataset")?;
         ensure_exact_provider_scope(request, &profile)?;
+        let (publication_limits, maximum_items) = self.discovery_limits(limits)?;
+        let publication = DiscoveryPublicationGuard::new(
+            Arc::clone(&self.discovery),
+            self.discovery
+                .discover_registered_objects(&profile, &dataset, None, maximum_items, context)
+                .await?,
+        );
+        let discovered = publication.discovery()?;
+        let result = (|| {
+            ensure_request_live(context, &self.lifecycle)?;
+            validate_discovery(discovered, &profile, &dataset, maximum_items)?;
+            if discovered.objects().is_empty() {
+                return Err(ServiceError::NotFound);
+            }
+
+            let coverage = discovery_coverage(
+                &profile,
+                &dataset,
+                discovered.metadata(),
+                discovered.request().request_id(),
+            );
+            let quality = discovery_quality(discovered.metadata());
+            let metadata = ToolResultMetadata::try_complete(coverage, quality)
+                .map_err(|_error| ServiceError::InvalidResult)?;
+            let item_count = discovered.objects().len();
+            let result = TypedToolResult::try_new(
+                to_json(&discovered)?,
+                item_count,
+                metadata,
+                publication_limits,
+            )
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+            ensure_request_live(context, &self.lifecycle)?;
+            Ok(result)
+        })();
+        match result {
+            Ok(result) => {
+                publication.commit();
+                Ok(result)
+            }
+            Err(error) => publication.rollback().and(Err(error)),
+        }
+    }
+
+    fn discovery_limits(
+        &self,
+        limits: ServiceLimits,
+    ) -> Result<(ServiceLimits, NonZeroU16), ServiceError> {
         let maximum_inline_items = limits
             .maximum_inline_items()
             .min(limits.maximum_result_items());
@@ -212,55 +314,53 @@ impl SourceController {
             .ok()
             .and_then(NonZeroU16::new)
             .ok_or(ServiceError::InvalidRequest)?;
-        let publication = DiscoveryPublicationGuard::new(
-            Arc::clone(&self.discovery),
-            self.discovery
-                .discover_registered_objects(&profile, &dataset, None, maximum_items, context)
-                .await?,
-        );
-        let discovered = publication.discovery()?;
-        let result = (|| {
-            ensure_request_live(context, &self.lifecycle)?;
-            validate_discovery(discovered, &profile, &dataset, maximum_items)?;
-            if discovered.objects().is_empty() {
-                return Err(ServiceError::NotFound);
-            }
+        Ok((publication_limits, maximum_items))
+    }
 
-            let coverage = json!({
-                "provider": profile,
-                "providerDataset": dataset,
-                "sourceId": discovered.metadata().source_id(),
-                "metadataRevision": discovered.metadata().revision(),
-                "coverageDomain": discovered.metadata().coverage().domain(),
-                "coverageEvidence": discovered.metadata().coverage().evidence(),
-                "coverageEffective": discovered.metadata().coverage().effective_interval(),
-                "discoveryRequestId": discovered.request().request_id(),
-            });
-            let quality = json!({
-                "qualityCeiling": discovered.metadata().quality_ceiling(),
-                "exactSourceObjectEvidence": true,
-                "executionEligible": false,
-            });
-            let metadata = ToolResultMetadata::try_complete(coverage, quality)
-                .map_err(|_error| ServiceError::InvalidResult)?;
-            let item_count = discovered.objects().len();
-            let result = TypedToolResult::try_new(
-                to_json(&discovered)?,
-                item_count,
-                metadata,
-                publication_limits,
-            )
-            .map_err(|_error| ServiceError::ResourceExhausted)?;
-            ensure_request_live(context, &self.lifecycle)?;
-            Ok(result)
-        })();
-        match result {
-            Ok(result) => {
-                publication.commit();
-                Ok(result)
-            }
-            Err(error) => publication.rollback().and(Err(error)),
+    fn rollback_unpublished_discovery(
+        &self,
+        request: &TypedToolRequest,
+        result: &TypedToolResult,
+    ) -> Result<(), ServiceError> {
+        if request.name() != SOURCE_DISCOVER {
+            return Ok(());
         }
+        let profile = required_identifier(request, "provider")?;
+        let dataset = required_identifier(request, "dataset")?;
+        ensure_exact_provider_scope(request, &profile)?;
+        let discovered =
+            ResearchSourceDiscovery::from_publication(result.structured_content().clone())?;
+        let maximum_items = NonZeroU16::new(discovered.request().max_results())
+            .ok_or(ServiceError::InvalidResult)?;
+        let requested_items = request
+            .arguments()
+            .get("resultLimits")
+            .and_then(Value::as_object)
+            .and_then(|limits| limits.get("maximumItems"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(ServiceError::InvalidRequest)?;
+        if usize::from(maximum_items.get())
+            > requested_items.min(MAX_DISCOVERY_OBJECTS).min(usize::from(
+                self.discovery.maximum_discovery_objects().get(),
+            ))
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        validate_discovery(&discovered, &profile, &dataset, maximum_items)?;
+        if result.item_count() != discovered.objects().len()
+            || result.metadata().source_coverage()
+                != &discovery_coverage(
+                    &profile,
+                    &dataset,
+                    discovered.metadata(),
+                    discovered.request().request_id(),
+                )
+            || result.metadata().data_quality() != &discovery_quality(discovered.metadata())
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        self.discovery.revoke_discovery_receipts(&discovered)
     }
 
     fn register(
@@ -629,6 +729,15 @@ fn validate_discovery(
         || discovery.objects().len() > usize::from(maximum_items.get())
         || discovery.receipts_survive_restart()
         || !discovery.rights().persistence_operation_admitted()
+        || discovery
+            .objects()
+            .iter()
+            .enumerate()
+            .any(|(index, object)| {
+                discovery.objects()[index.saturating_add(1)..]
+                    .iter()
+                    .any(|candidate| candidate.discovery_receipt() == object.discovery_receipt())
+            })
         || discovery.objects().iter().any(|object| {
             object.source_object().dataset() != dataset
                 || object.source_object().source_id() != discovery.metadata().source_id()
@@ -639,6 +748,54 @@ fn validate_discovery(
         return Err(ServiceError::InvalidResult);
     }
     Ok(())
+}
+
+fn validate_listing(
+    listing: &ResearchSourceObjectListing,
+    profile: &SourceIdentifier,
+    dataset: &SourceIdentifier,
+    maximum_items: NonZeroU16,
+) -> Result<(), ServiceError> {
+    if listing.profile() != profile
+        || listing.request().dataset() != dataset
+        || listing.request().effective_at().is_some()
+        || listing.request().max_results() != maximum_items.get()
+        || listing.objects().len() > usize::from(maximum_items.get())
+        || listing.objects().iter().any(|object| {
+            object.dataset() != dataset
+                || object.source_id() != listing.metadata().source_id()
+                || object.metadata_revision() != listing.metadata().revision()
+        })
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(())
+}
+
+fn discovery_coverage(
+    profile: &SourceIdentifier,
+    dataset: &SourceIdentifier,
+    metadata: &SourceMetadata,
+    request_id: DiscoveryRequestId,
+) -> Value {
+    json!({
+        "provider": profile,
+        "providerDataset": dataset,
+        "sourceId": metadata.source_id(),
+        "metadataRevision": metadata.revision(),
+        "coverageDomain": metadata.coverage().domain(),
+        "coverageEvidence": metadata.coverage().evidence(),
+        "coverageEffective": metadata.coverage().effective_interval(),
+        "discoveryRequestId": request_id,
+    })
+}
+
+fn discovery_quality(metadata: &SourceMetadata) -> Value {
+    json!({
+        "qualityCeiling": metadata.quality_ceiling(),
+        "exactSourceObjectEvidence": true,
+        "executionEligible": false,
+    })
 }
 
 /// Revokes an unpublished receipt batch on every scope-exit path.

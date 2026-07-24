@@ -20,12 +20,12 @@ use market_squawk_services::{
     TypedToolResult,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, DiscoveryRequest, ExtractionBatch, ExtractionRequest,
-    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, MAX_DISCOVERY_OBJECTS,
-    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, RegisteredSource, RegistryError,
-    SourceError, SourceMetadata, SourceObject,
+    AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
+    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
+    RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -43,7 +43,9 @@ const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
 mod selection;
 
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
-pub use selection::{ResearchSourceDiscovery, ResearchSourceDiscoveryObject};
+pub use selection::{
+    ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceObjectListing,
+};
 
 /// Fixed operation ceilings applied independently of transport result limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,13 +174,22 @@ impl ResearchRightsAuthority {
         }
         Ok(())
     }
+
+    fn matches_discovery_evidence(&self, evidence: &ResearchSourceDiscoveryRights) -> bool {
+        evidence.basis_reference == self.basis.reference()
+            && evidence.basis_digest == self.basis.digest()
+            && evidence.root_identity_digest == self.basis.root_identity_digest()
+            && evidence.authorization_evidence == self.authorization_evidence
+            && evidence.authorization_expires_at == self.authorization_expires_at
+            && evidence.persistence_operation_admitted
+    }
 }
 
 /// Retained persistence-rights evidence for one provider discovery result.
 ///
 /// Discovery does not manufacture a payload-specific rights decision. The existing ingestion
 /// consumer rebinds this authority to the exact extracted payload digest before publication.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchSourceDiscoveryRights {
     basis_reference: String,
@@ -414,6 +425,35 @@ impl ProductionResearchIngestCoordinator {
         Ok(authority.sources.contains_key(profile))
     }
 
+    /// Lists exact source objects from one registered provider without minting receipts.
+    ///
+    /// This read crosses the same registry, adapter, rights, metadata, cancellation, and deadline
+    /// checks as receipt-minting discovery but retains no selection authority.
+    pub async fn list_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceObjectListing, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation_deadline = operation_deadline(context, self.limits.duration)?;
+        let operation = self.lifecycle.shutdown_token().child_token();
+        let (prepared, discovery, _observed_monotonic, _observed_wall) = self
+            .discover_registered_batch(
+                profile,
+                dataset,
+                effective_at,
+                max_results,
+                context,
+                &operation,
+                operation_deadline,
+            )
+            .await?;
+        ResearchSourceObjectListing::new(profile.clone(), prepared.metadata, discovery)
+    }
+
     /// Discovers exact source objects from one already registered provider profile.
     ///
     /// This is the public producer for [`ResearchIngestCoordinator::ingest`]. It uses the same
@@ -439,33 +479,18 @@ impl ProductionResearchIngestCoordinator {
     ) -> Result<ResearchSourceDiscovery, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
         let operation_deadline = operation_deadline(context, self.limits.duration)?;
-        if effective_at.is_some() || max_results.get() > self.limits.discovery_objects.get() {
-            return Err(ServiceError::InvalidRequest);
-        }
         let operation = self.lifecycle.shutdown_token().child_token();
-        let prepared = self.prepare(profile)?;
-        prepared.rights.validate_at(system_timestamp()?)?;
-        let deadline = wall_deadline(operation_deadline, &operation)?;
-        let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
-            .map_err(|_error| ServiceError::InvalidRequest)?;
-        let discovery = await_extraction(
-            prepared
-                .source
-                .discover(prepared.authority, request, operation.clone()),
-            context,
-            &operation,
-            operation_deadline,
-        )
-        .await?;
-        ensure_operation_live(operation_deadline, &operation)?;
-        if discovery.objects().iter().any(|object| {
-            object.source_id() != prepared.metadata.source_id()
-                || object.metadata_revision() != prepared.metadata.revision()
-        }) {
-            return Err(ServiceError::InvalidResult);
-        }
-        let observed_monotonic = Instant::now();
-        let observed_wall = system_timestamp()?;
+        let (prepared, discovery, observed_monotonic, observed_wall) = self
+            .discover_registered_batch(
+                profile,
+                dataset,
+                effective_at,
+                max_results,
+                context,
+                &operation,
+                operation_deadline,
+            )
+            .await?;
         let mut authority = self
             .authority
             .lock()
@@ -487,6 +512,50 @@ impl ProductionResearchIngestCoordinator {
             operation.cancel();
         }
         retained
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one exact discovery request and its shared lifecycle bounds remain explicit"
+    )]
+    async fn discover_registered_batch(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+        operation: &CancellationToken,
+        operation_deadline: Instant,
+    ) -> Result<(PreparedExtraction, DiscoveryBatch, Instant, Timestamp), ServiceError> {
+        if effective_at.is_some() || max_results.get() > self.limits.discovery_objects.get() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let prepared = self.prepare(profile)?;
+        prepared.rights.validate_at(system_timestamp()?)?;
+        let deadline = wall_deadline(operation_deadline, operation)?;
+        let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        let discovery = await_extraction(
+            prepared
+                .source
+                .discover(prepared.authority.clone(), request, operation.clone()),
+            context,
+            operation,
+            operation_deadline,
+        )
+        .await?;
+        ensure_operation_live(operation_deadline, operation)?;
+        if discovery.objects().iter().any(|object| {
+            object.source_id() != prepared.metadata.source_id()
+                || object.metadata_revision() != prepared.metadata.revision()
+        }) {
+            return Err(ServiceError::InvalidResult);
+        }
+        let observed_monotonic = Instant::now();
+        let observed_wall = system_timestamp()?;
+        prepared.rights.validate_at(observed_wall)?;
+        Ok((prepared, discovery, observed_monotonic, observed_wall))
     }
 
     /// Extracts one exact object from an already registered profile without analytical
@@ -743,6 +812,25 @@ impl ResearchSourceDiscoveryCoordinator for ProductionResearchIngestCoordinator 
             .map_err(|_error| ServiceError::Unavailable)?
             .selections
             .revoke(discovery)
+    }
+
+    async fn list_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceObjectListing, ServiceError> {
+        ProductionResearchIngestCoordinator::list_registered_objects(
+            self,
+            profile,
+            dataset,
+            effective_at,
+            max_results,
+            context,
+        )
+        .await
     }
 
     async fn discover_registered_objects(

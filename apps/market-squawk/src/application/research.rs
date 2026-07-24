@@ -34,6 +34,7 @@ pub use ingest::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchRevisionPlanError, ResearchRightsAuthority,
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
+    ResearchSourceObjectListing,
 };
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
@@ -95,6 +96,16 @@ pub trait ResearchSourceDiscoveryCoordinator: Send + Sync + 'static {
         &self,
         discovery: &ResearchSourceDiscovery,
     ) -> Result<(), ServiceError>;
+
+    /// Lists bounded exact objects without allocating ingestion receipts or retained capacity.
+    async fn list_registered_objects(
+        &self,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        effective_at: Option<Timestamp>,
+        max_results: NonZeroU16,
+        context: &RequestContext,
+    ) -> Result<ResearchSourceObjectListing, ServiceError>;
 
     /// Discovers bounded exact objects for one active registered provider profile.
     async fn discover_registered_objects(

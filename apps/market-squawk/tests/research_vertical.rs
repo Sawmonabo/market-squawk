@@ -192,6 +192,19 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
     let discover = capabilities
         .find("Source.Discover")
         .ok_or("Source.Discover is not registered")?;
+    let list_objects = capabilities
+        .find("Source.ListObjects")
+        .ok_or("Source.ListObjects is not registered")?;
+    let list_effects = list_objects.effects();
+    assert!(
+        list_objects.contract().authorization() == ToolAuthorization::ReadOnly
+            && list_objects.contract().result().source_evidence() == SourceEvidencePolicy::Required
+            && list_objects.contract().result().artifact() == ToolArtifactPolicy::InlineOnly
+            && list_effects.read_only()
+            && !list_effects.destructive()
+            && list_effects.idempotent()
+            && list_effects.open_world()
+    );
     let effects = discover.effects();
     assert!(
         discover.contract().authorization() == ToolAuthorization::LocalConfirmation
@@ -398,6 +411,22 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             .await,
         Err(ServiceError::ResourceExhausted)
     ));
+    let outer_publication = discover.admit(
+        json!({
+            "provider": capacity_profile,
+            "dataset": capacity_dataset,
+            "confirm": true,
+            "sourceCoverage": [capacity_profile],
+            "resultLimits": {"maximumItems": 1, "maximumBytes": 1024 * 1024},
+        })
+        .as_object()
+        .cloned()
+        .ok_or("outer publication arguments must be an object")?,
+    )?;
+    let unpublished = source_service
+        .call(outer_publication.clone(), discovery_context()?)
+        .await?;
+    source_service.rollback_unpublished_result(&outer_publication, &unpublished)?;
     for _index in 1..MAX_DISCOVERY_OBJECTS {
         coordinator
             .discover_registered_objects(
@@ -421,6 +450,30 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             .await,
         Err(ServiceError::ResourceExhausted)
     ));
+    let listed = source_service
+        .call(
+            list_objects.admit(
+                json!({
+                    "provider": capacity_profile,
+                    "dataset": capacity_dataset,
+                    "sourceCoverage": [capacity_profile],
+                    "resultLimits": {"maximumItems": 1, "maximumBytes": 1024 * 1024},
+                })
+                .as_object()
+                .cloned()
+                .ok_or("listing arguments must be an object")?,
+            )?,
+            capacity_context.clone(),
+        )
+        .await?;
+    let listed_wire = listed.structured_content();
+    assert!(
+        listed.item_count() == 1
+            && listed_wire["objects"][0]["object_id"] == "receipt-capacity-object"
+            && listed_wire["objects"][0].get("discovery_receipt").is_none()
+            && listed_wire.get("rights").is_none()
+            && listed_wire.get("receipts_survive_restart").is_none()
+    );
     let (capacity_object, capacity_receipt) = first_capacity_selection;
     let capacity_ingest = admitted_ingest(
         &capacity_profile,
@@ -516,7 +569,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             "treasury.fiscal-data",
             "--dataset",
             "average-interest-rates",
-            "--confirm",
         ])
         .is_ok()
     );
@@ -529,21 +581,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             "average-interest-rates:sha256:fixture",
             "--dataset",
             "average-interest-rates",
-            "--confirm",
-        ])
-        .is_err()
-    );
-    assert!(
-        Cli::try_parse_from([
-            "market-squawk",
-            "ingest",
-            "source",
-            "treasury.fiscal-data",
-            "average-interest-rates:sha256:fixture",
-            "--dataset",
-            "average-interest-rates",
-            "--discovery-receipt",
-            "11111111-1111-4111-8111-111111111111",
             "--confirm",
         ])
         .is_ok()
@@ -621,6 +658,56 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
     )
     .await?;
     assert_eq!(local_ingest.value()["data"]["rowCount"], 1);
+    assert!(
+        product
+            .application()
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .is_complete()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifetime()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let environment = BTreeMap::<OsString, OsString>::new();
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &environment,
+        ConfigOverrides {
+            data_dir: Some(directory.path().join("one-shot-product")),
+            ..ConfigOverrides::default()
+        },
+    ))?;
+    let product = LocalProduct::try_new(config)?;
+    let profile = SourceIdentifier::try_from("treasury.one-shot-cli")?;
+    let dataset = SourceIdentifier::try_from("one-shot-dataset")?;
+    let source = DiscoveryFixtureSource::try_new(
+        "one-shot-cli-fixture",
+        "one-shot-object",
+        FixtureDiscovery::Once,
+        FixtureExtraction::Observation,
+    )?;
+    let source_id = source.metadata().source_id().clone();
+    product.research_ingest().register_source(
+        profile.clone(),
+        source,
+        fixture_rights(source_id, 101)?,
+    )?;
+    let cli = Cli::try_parse_from([
+        "market-squawk",
+        "ingest",
+        "source",
+        profile.as_str(),
+        "one-shot-object",
+        "--dataset",
+        dataset.as_str(),
+        "--confirm",
+    ])?;
+    let ingested = execute_cli_command(&product, cli.command).await?;
+    assert_eq!(ingested.value()["data"]["rowCount"], 1);
     assert!(
         product
             .application()

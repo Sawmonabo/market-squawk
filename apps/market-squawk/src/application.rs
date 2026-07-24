@@ -45,7 +45,7 @@ pub use research::{
     ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
     ResearchIngestCoordinator, ResearchRevisionPlanError, ResearchRightsAuthority,
     ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
-    ResearchSourceDiscoveryRights,
+    ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
 };
 pub use source::{
     SourceApplicationError, SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshot,
@@ -82,6 +82,20 @@ pub trait ApplicationDomainService: Send + Sync + 'static {
         request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError>;
+
+    /// Revokes authority represented only by a domain result that was never published.
+    ///
+    /// The default deliberately leaves durable domain mutations unchanged. Implementations may
+    /// override this only for pending, unpublished authority encoded in their own exact
+    /// request/result pair. The hook must be synchronous, idempotent, and affect no unrelated
+    /// authority.
+    fn rollback_unpublished_result(
+        &self,
+        _request: &TypedToolRequest,
+        _result: &TypedToolResult,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 
     /// Atomically rejects new work and triggers cancellation of owned background activity.
     ///
@@ -315,15 +329,65 @@ impl ToolServices for Application {
             .domains
             .service(request.contract().domain())
             .ok_or(ServiceError::Unavailable)?;
-        let result = service.call(request, context.clone()).await?;
-        ensure_request_live(&context)?;
-        result
-            .validate_against(context.limits())
-            .map_err(ServiceError::from)?;
-        result
-            .validate_for(descriptor)
-            .map_err(ServiceError::from)?;
-        Ok(result)
+        let result = service.call(request.clone(), context.clone()).await?;
+        let publication = ApplicationPublicationGuard::arm(service.as_ref(), &request, &result);
+        let validation = (|| {
+            ensure_request_live(&context)?;
+            result
+                .validate_against(context.limits())
+                .map_err(ServiceError::from)?;
+            result.validate_for(descriptor).map_err(ServiceError::from)
+        })();
+        match validation {
+            Ok(()) => {
+                publication.commit();
+                Ok(result)
+            }
+            Err(error) => publication.rollback().and(Err(error)),
+        }
+    }
+}
+
+/// Owns rollback from domain-result creation through the final application publication checks.
+struct ApplicationPublicationGuard<'a> {
+    service: &'a dyn ApplicationDomainService,
+    request: &'a TypedToolRequest,
+    result: &'a TypedToolResult,
+    armed: bool,
+}
+
+impl<'a> ApplicationPublicationGuard<'a> {
+    fn arm(
+        service: &'a dyn ApplicationDomainService,
+        request: &'a TypedToolRequest,
+        result: &'a TypedToolResult,
+    ) -> Self {
+        Self {
+            service,
+            request,
+            result,
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(mut self) -> Result<(), ServiceError> {
+        self.armed = false;
+        self.service
+            .rollback_unpublished_result(self.request, self.result)
+    }
+}
+
+impl Drop for ApplicationPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _rollback = self
+                .service
+                .rollback_unpublished_result(self.request, self.result);
+        }
     }
 }
 
@@ -434,4 +498,122 @@ pub enum ApplicationCompositionError {
     /// A code-owned descriptor violated the shared service contract.
     #[error("application capability contract is invalid: {0}")]
     Capability(#[from] ServiceCapabilityError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+    use market_squawk_services::{
+        JsonStructureLimits, RequestContext, RequestId, ServiceDomain, ServiceError, ServiceLimits,
+        ToolResultMetadata, ToolServices, TypedToolRequest, TypedToolResult,
+    };
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        Application, ApplicationDomainService, ApplicationDomainServices, REQUIRED_DOMAINS,
+    };
+
+    #[tokio::test]
+    async fn application_rejection_drops_only_the_unpublished_source_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let retained = Arc::new([AtomicUsize::new(0), AtomicUsize::new(1)]);
+        let domains = REQUIRED_DOMAINS.into_iter().map(|domain| {
+            Arc::new(PublicationProbe {
+                domain,
+                retained: Arc::clone(&retained),
+            }) as Arc<dyn ApplicationDomainService>
+        });
+        let application = Application::try_new(ApplicationDomainServices::try_new(domains)?)?;
+        let request = application.admit(
+            "Source.Discover",
+            json!({
+                "provider": "test.provider",
+                "dataset": "test-dataset",
+                "confirm": true,
+                "sourceCoverage": ["test.provider"],
+                "resultLimits": {"maximumItems": 1, "maximumBytes": 4096},
+            })
+            .as_object()
+            .cloned()
+            .ok_or("source arguments must be an object")?,
+        )?;
+
+        assert!(matches!(
+            ToolServices::call(&application, request, context()?).await,
+            Err(ServiceError::InvalidResult)
+        ));
+        assert_eq!(retained[0].load(Ordering::Acquire), 0);
+        assert_eq!(retained[1].load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    struct PublicationProbe {
+        domain: ServiceDomain,
+        retained: Arc<[AtomicUsize; 2]>,
+    }
+
+    #[async_trait]
+    impl ApplicationDomainService for PublicationProbe {
+        fn domain(&self) -> ServiceDomain {
+            self.domain
+        }
+
+        async fn call(
+            &self,
+            _request: TypedToolRequest,
+            context: RequestContext,
+        ) -> Result<TypedToolResult, ServiceError> {
+            if self.domain == ServiceDomain::Source {
+                self.retained[0].fetch_add(1, Ordering::AcqRel);
+            }
+            TypedToolResult::try_new(
+                serde_json::Value::Null,
+                0,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into)
+        }
+
+        fn rollback_unpublished_result(
+            &self,
+            request: &TypedToolRequest,
+            _result: &TypedToolResult,
+        ) -> Result<(), ServiceError> {
+            if self.domain == ServiceDomain::Source && request.name() == "Source.Discover" {
+                self.retained[0].store(0, Ordering::Release);
+            }
+            Ok(())
+        }
+
+        fn begin_shutdown(&self) {}
+
+        async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn context() -> Result<RequestContext, Box<dyn std::error::Error>> {
+        Ok(RequestContext::new(
+            RequestId::Integer(1),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+            ServiceLimits::try_new(
+                4096,
+                8,
+                4096,
+                8,
+                JsonStructureLimits::try_new(16, 4096, 64, 64)?,
+            )?,
+        ))
+    }
 }

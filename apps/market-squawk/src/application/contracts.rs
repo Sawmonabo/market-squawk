@@ -191,6 +191,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PROVIDER_ARGUMENT,
         ToolAuthorization::LocalConfirmation,
     ),
+    source_listing(
+        "Source.ListObjects",
+        "List bounded exact provider objects without minting ingestion authority.",
+        ServiceDomain::Source,
+        SOURCE_DISCOVERY_SCOPE,
+        SOURCE_DISCOVERY_ARGUMENTS,
+    ),
     source_discovery(
         "Source.Discover",
         "Discover bounded exact provider objects and receipt-bound ingestion authority.",
@@ -558,11 +565,12 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
         })?;
     for spec in OPERATION_SPECS {
         let schema = schema_for(*spec);
-        let effects = if matches!(spec.authorization, ToolAuthorization::ReadOnly) {
-            ToolEffects::read_only_closed_world()
-        } else {
-            ToolEffects::try_new(false, spec.destructive, spec.idempotent, spec.open_world)?
-        };
+        let effects = ToolEffects::try_new(
+            matches!(spec.authorization, ToolAuthorization::ReadOnly),
+            spec.destructive,
+            spec.idempotent,
+            spec.open_world,
+        )?;
         let contract = ToolContract::new(
             spec.domain,
             spec.authorization,
@@ -685,6 +693,28 @@ const fn source_discovery(
         artifact: ToolArtifactPolicy::InlineOnly,
         destructive: false,
         idempotent: false,
+        open_world: true,
+    }
+}
+
+const fn source_listing(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization: ToolAuthorization::ReadOnly,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: true,
         open_world: true,
     }
 }

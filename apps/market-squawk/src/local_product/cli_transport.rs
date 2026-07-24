@@ -149,16 +149,11 @@ async fn source(
             json_object(json!({"provider": provider, "confirm": confirm}))?,
             "source setup opened",
         ),
-        SourceCommand::Discover {
-            provider,
-            dataset,
-            confirm,
-        } => (
-            "Source.Discover",
+        SourceCommand::Discover { provider, dataset } => (
+            "Source.ListObjects",
             json_object(json!({
                 "provider": provider,
                 "dataset": dataset,
-                "confirm": confirm,
                 "sourceCoverage": [provider],
             }))?,
             "source objects discovered",
@@ -186,9 +181,24 @@ async fn ingest(
             provider,
             object,
             dataset,
-            discovery_receipt,
             confirm,
         } => {
+            let mut discovery_arguments = json_object(json!({
+                "provider": provider,
+                "dataset": dataset,
+                "confirm": confirm,
+                "sourceCoverage": [provider],
+            }))?;
+            let discovery = invoke(
+                product,
+                "Source.Discover",
+                &mut discovery_arguments,
+                None,
+                "source ingestion authority minted",
+            )
+            .await?;
+            let discovery_receipt =
+                exact_discovery_receipt(&discovery, &provider, &dataset, &object)?;
             let mut arguments = json_object(json!({
                 "provider": provider,
                 "object": object,
@@ -213,6 +223,58 @@ async fn ingest(
             confirm,
         } => files::ingest_local_file(product, &manifest, object, dataset, confirm).await,
     }
+}
+
+fn exact_discovery_receipt(
+    discovery: &CliProductResult,
+    provider: &str,
+    dataset: &str,
+    object: &str,
+) -> Result<String, CliProductError> {
+    let data = discovery
+        .value()
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ))?;
+    if data.get("profile").and_then(Value::as_str) != Some(provider)
+        || data
+            .get("request")
+            .and_then(Value::as_object)
+            .and_then(|request| request.get("dataset"))
+            .and_then(Value::as_str)
+            != Some(dataset)
+    {
+        return Err(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ));
+    }
+    let objects =
+        data.get("objects")
+            .and_then(Value::as_array)
+            .ok_or(CliProductError::Application(
+                market_squawk_services::ServiceError::InvalidResult,
+            ))?;
+    let mut matches = objects.iter().filter(|candidate| {
+        candidate.get("object_id").and_then(Value::as_str) == Some(object)
+            && candidate.get("dataset").and_then(Value::as_str) == Some(dataset)
+    });
+    let selected = matches.next().ok_or(CliProductError::Application(
+        market_squawk_services::ServiceError::NotFound,
+    ))?;
+    if matches.next().is_some() {
+        return Err(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ));
+    }
+    selected
+        .get("discovery_receipt")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ))
 }
 
 async fn dataset(
