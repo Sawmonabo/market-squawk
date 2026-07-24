@@ -34,7 +34,8 @@ by the reviewed `LocalProduct`.
 
 Market Squawk builds one immutable `AppConfig` at process startup. This page covers its four
 configuration layers, every accepted setting, closed-file validation, redacted inspection,
-OS-keyring composition, and the stop-correct-validate-restart procedure.
+OS-keyring-first secret composition, explicit encrypted-fallback unlock, and the
+stop-correct-validate-restart procedure.
 
 Configuration can select local paths, resource ceilings, timing, optional provider profiles, and
 opaque secret locators. It cannot:
@@ -44,7 +45,7 @@ opaque secret locators. It cannot:
 - qualify data as `DirectVerified`;
 - admit a Python training release, model, order, or execution decision merely by naming a path;
 - update a running process;
-- configure an encrypted-file secret fallback for the current `LocalProduct`.
+- provide an encrypted-file unlock through configuration, environment, or CLI arguments.
 
 Use [Source operations](source-operations.md) for evidence-bound provider onboarding. Mutable
 release blockers and provider-qualification status remain in the
@@ -58,9 +59,10 @@ release blockers and provider-qualification status remain in the
 - Select an operator-owned absolute path for the TOML file. The application accepts relative paths,
   but an absolute path avoids working-directory ambiguity in services and scheduled jobs.
 - Inventory all inherited `MARKET_SQUAWK_*` environment variables in the launch environment.
-- For any future code-admitted credential workflow, ensure the runtime operator has an available
-  interactive OS credential service. At the reviewed commit, every credentialed built-in provider
-  is release-gated, so no credentialed provider setup procedure is currently operable.
+- For any future code-admitted credential workflow, use an available interactive OS credential
+  service or plan an explicit foreground unlock of the encrypted fallback through the loopback
+  portal. At the reviewed commit, every credentialed built-in provider is release-gated, so no
+  credentialed provider setup procedure is currently operable.
 
 Examples use:
 
@@ -242,10 +244,13 @@ arguments directly.
 Production `LocalProduct` constructs:
 
 ```text
-PreferredSecretStore::try_new("market-squawk", None)
+PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
+    "market-squawk",
+    "<data-root>/control/secrets/provider-credentials",
+)
 ```
 
-The preferred store uses the operating-system credential service:
+The preferred store probes the operating-system credential service first:
 
 - Apple Keychain on macOS;
 - Windows Credential Manager on Windows;
@@ -267,18 +272,27 @@ available:
 The portal therefore provides no current credential-import procedure for either profile. Do not
 weaken the release gate or use another provider's slot.
 
-### What is not composed
+### Encrypted fallback lifecycle
 
-The platform crate implements an encrypted-file store, unlock capability, and optional
-OS-first fallback routing. `LocalProduct` passes `None` for that fallback. Consequently:
+The fallback root is code-owned under the data root and starts locked in every new process. No
+unlock is read from a file, configuration, environment variable, command argument, or background
+restart. To make the fallback eligible for the current portal process:
 
-- there is no encrypted-file fallback root or unlock capability in the production composition;
-- there is no supported encrypted-file setup, migration, or recovery procedure for this
-  application head;
-- a syntactically valid `source_secret = "encrypted-file:..."` locator does not make the backend
-  available;
-- keyring unavailability for a future credentialed workflow fails closed rather than silently
-  writing a local encrypted file.
+1. Open the bounded loopback portal with `source setup` as described in
+   [Source operations](source-operations.md).
+2. In **Encrypted credential fallback**, enter the fallback unlock and select **Unlock fallback**.
+   The value is sent only to that loopback process as a bounded binary secret, redacted, and
+   zeroized after admission.
+3. Confirm that the portal reports the fallback as ready. Secret creation still uses the OS
+   credential service when its exact lifecycle is available; only a proved unavailable,
+   session-unavailable, or unsupported primary permits the ready fallback.
+4. Select **Lock fallback** when the foreground workflow is finished. Process shutdown also drops
+   the in-memory unlock authority.
+
+An existing `SecretRef` remains permanently bound to its recorded backend and generation. The
+router never probes another backend for that reference and never migrates secret bytes between the
+OS store and encrypted vault. A syntactically valid `source_secret = "encrypted-file:..."` locator
+does not unlock the vault or bypass the onboarding lifecycle.
 
 There is also no public generic `secret set`, `secret get`, `secret list`, or `secret delete`
 command. Do not manipulate catalog secret references or OS-keyring entries independently of their
@@ -360,8 +374,15 @@ commands for those separate checks.
   layers, validate, and restart. If the new version opened durable state, use the coherent
   pre-change backup unless backward compatibility is explicitly verified.
 - **Keyring operation is unavailable or indeterminate:** preserve the onboarding session status
-  and error, do not submit the credential through another channel, and follow the session's
-  fail-closed reconciliation state when that provider becomes release available.
+  and error. For a code-admitted foreground workflow, explicitly unlock the configured fallback in
+  the same portal process and retry only the lifecycle-owned operation; otherwise follow the
+  session's fail-closed reconciliation state.
+- **Encrypted fallback is locked after restart:** reopen the loopback portal and submit the same
+  unlock through its write-only fallback control. Do not place the unlock in startup configuration
+  or automation.
+- **Fallback unlock is lost or rejected:** the vault cannot be recovered without its authentic
+  unlock. Preserve the vault and backup evidence; do not replace it, guess completion, or rewrite
+  retained secret references.
 - **Secret reference appears orphaned:** do not delete catalog rows or keyring entries by hand.
   The recorded backend and generation are part of lifecycle authority; retain evidence for a
   product-owned reconciliation path.
@@ -377,8 +398,10 @@ commands for those separate checks.
 | Capture timing rejects | Flush interval is zero/greater than shutdown, or shutdown exceeds `60000` | Correct both values as one merged configuration |
 | Changed file has no effect | Environment or CLI layer wins, or the existing process has not restarted | Inspect launch inputs, stop the old process, validate, and start anew |
 | `config show` has no origins | Current CLI does not expose stored `ConfigProvenance` | Audit file, environment, and CLI separately; do not infer |
-| `source_secret_configured` is `true` but secret use fails | The value is only a locator, or names the unwired encrypted-file backend | Remove unsupported configuration and use only a future code-admitted portal/keyring workflow |
-| OS credential prompt or service is unavailable | Primary keyring backend/session unavailable | Do not fall back manually or expose the secret; the current product fails closed |
+| `source_secret_configured` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
+| OS credential prompt or service is unavailable | Primary keyring backend/session unavailable | Unlock the code-owned fallback through the foreground portal before an admitted credential mutation, or fail closed |
+| Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
+| Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
 | `config validate` succeeds but `doctor` fails | Configuration validity is narrower than application/path/catalog/helper composition | Preserve doctor stderr and repair the named composition failure |
 | `doctor` remains top-level `blocked` | Release-level barriers remain | Consult the delivery ledger; configuration is not authority to clear them |
 
@@ -389,6 +412,7 @@ commands for those separate checks.
 | Explicit TOML path | Operator-owned non-secret startup policy; not copied into the data root by `AppConfig` |
 | Process environment and launch arguments | Higher-precedence ephemeral configuration; inventory outside Market Squawk |
 | OS credential service | Credential bytes and opaque generations for admitted onboarding; not stored under the data root |
+| `<data-root>/control/secrets/provider-credentials/` | Authenticated encrypted fallback vault; unlock material is never persisted there |
 | `<data-root>/catalog.sqlite3` | Durable onboarding references and product catalog; may have SQLite sidecars while active |
 | `<data-root>/control/` | Durable non-secret authority and recovery state |
 | stdout | Redacted command results |
@@ -413,8 +437,8 @@ file.
 - [Application configuration command output](../../apps/market-squawk/src/main.rs)
 - [Production `LocalProduct` composition](../../apps/market-squawk/src/local_product/mod.rs)
 - [Secret-store interfaces](../../crates/market-squawk-platform/src/secrets.rs)
-- [OS-first and optional-fallback implementation](../../crates/market-squawk-platform/src/secrets/preferred.rs)
-- [Encrypted-file implementation not wired into `LocalProduct`](../../crates/market-squawk-platform/src/secrets/encrypted.rs)
+- [Encrypted-file implementation](../../crates/market-squawk-platform/src/secrets/encrypted.rs)
+- [OS-first fallback router and explicit unlock lifecycle](../../crates/market-squawk-platform/src/secrets/preferred.rs)
 
 ## Official sources
 

@@ -148,6 +148,7 @@ subdirectories, and retains directory capabilities.
 │   └── admitted model-related artifacts
 ├── control/                        local authority, audit, and recovery state
 │   ├── sources/research-runtime/
+│   ├── secrets/provider-credentials/
 │   ├── portfolio/
 │   ├── model/runtime-admissions/
 │   ├── analysis/governed-backtest-inputs/
@@ -170,11 +171,12 @@ export workflow.
 Configuration files are operator-selected and need not live under the data root. Effective
 configuration retains the origin of each value and redacts secret references from reports.
 
-The reviewed `LocalProduct` composes `PreferredSecretStore` with the OS keyring and no encrypted
-fallback instance. The platform includes an explicit, separately unlocked encrypted-file fallback
-implementation, but it is not activated by this application composition. Therefore the current
-supported credential-persistence deployment requires the OS keyring; complete onboarding
-acceptance remains tracked in the [delivery ledger](../plans/delivery-ledger.md).
+The reviewed `LocalProduct` composes `PreferredSecretStore` with the OS keyring as primary and a
+code-owned encrypted-file fallback rooted under `control/secrets/provider-credentials/`. The
+fallback starts locked in every process and accepts its bounded unlock only through the foreground
+loopback portal. It becomes eligible only when the primary cannot provide its exact lifecycle;
+retained references never migrate between backends. Provider release availability and clean-machine
+onboarding acceptance remain tracked in the [delivery ledger](../plans/delivery-ledger.md).
 
 ## Startup and shutdown
 

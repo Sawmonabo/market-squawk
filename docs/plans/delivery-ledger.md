@@ -122,11 +122,10 @@ for documentation writers:
 
 The migration corrected stale README statements for the removed diagnostic MCP, complete CLI/MCP,
 portfolio import, FairValue composition, Python source-closure cardinality, and the Quarter 3 gate.
-Source-derived runbooks then exposed additional mandatory product gaps instead of writing fictional
-procedures:
+Subsequent source-derived review established the current first-use handoff state:
 
-- FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public
-  discovery command returns the exact IDs needed for a first-use ingestion.
+- `source discover` now returns bounded exact provider objects without minting authority; confirmed
+  ingestion independently discovers the selected object and consumes its process-local receipt.
 - `feature build` and `dataset build` now populate the durable public feature-dataset registry and
   return `pythonExportSha256`; the remaining model first-use gap is the supported production
   training driver and accepted demonstration.
@@ -137,9 +136,9 @@ procedures:
 - MCP overflow-artifact publication is retrievable through typed, bounded
   `Analysis.ReadArtifact`; the public analytical query paths still do not compose query artifact
   publication authority.
-- The reviewed `LocalProduct` composes only the OS-keyring backend. The platform encrypted-file
-  fallback and unlock contract are not activated by the shipping application, so complete
-  credential setup and recovery remain part of the onboarding blocker.
+- The reviewed `LocalProduct` composes OS-keyring-first routing with a code-owned, initially locked
+  encrypted-file fallback and explicit foreground portal unlock/lock. The remaining onboarding
+  blocker is provider release availability and the clean-machine acceptance demonstration.
 
 As verified through GitHub on 2026-07-23, issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31`
 remain open. Project 5 marks `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.

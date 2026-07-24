@@ -197,6 +197,11 @@ encrypted-file fallback is eligible only when it was explicitly configured and u
 pre-mutation primary probe reports the backend unavailable, the session unavailable, or the exact
 lifecycle unsupported. An existing reference is never moved between backends by fallback routing.
 
+The production `LocalProduct` configures that fallback at the code-owned
+`<data-root>/control/secrets/provider-credentials/` root in a locked state. Its only public unlock
+surface is the bounded foreground onboarding portal; configuration files, environment variables,
+CLI arguments, and restart recovery cannot supply the unlock.
+
 Secret material is admitted into `SecretValue` only when it is 1–65536 bytes. Its debug
 representation is redacted and its allocation is zeroized on drop. Secret keys and opaque
 references also redact their debug representations. Backend operations carry explicit interaction,

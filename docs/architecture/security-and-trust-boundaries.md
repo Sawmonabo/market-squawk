@@ -186,9 +186,12 @@ Credential material is not ordinary configuration:
   catalog-safe metadata.
 - Creation, read, replacement, and deletion use exact generations. Replacement does not silently
   erase the current generation before the candidate is known.
-- The reviewed `LocalProduct` composes the operating-system keyring and no encrypted-file fallback.
-  The platform-level preferred-store contract can route to an explicit encrypted fallback only
-  when a caller supplies that backend and its unlock capability; the shipping application does not.
+- The reviewed `LocalProduct` composes the operating-system keyring first and a code-owned,
+  initially locked encrypted-file fallback. Only an explicit foreground loopback-portal operation
+  can submit the fallback unlock; configuration, environment, command arguments, disk, and
+  background restart cannot.
+- A new secret can use the unlocked fallback only after the primary backend proves unavailable or
+  unable to provide the exact lifecycle.
 - Once a reference exists, its backend is authoritative. The router does not probe another backend
   with that reference or copy secret bytes between stores.
 - Interaction policy distinguishes a forbidden prompt from an explicitly permitted

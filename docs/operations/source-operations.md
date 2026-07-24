@@ -123,7 +123,8 @@ or forward its URL.
 If a future release-available profile requests a provider-created key, enter it only into the
 write-only password field served by that exact local portal. Never put it in a source activation
 request, TOML, an environment variable, CLI argument, issue, log, or chat. The current
-`LocalProduct` uses the OS keyring and has no encrypted-file fallback; see
+`LocalProduct` uses the OS keyring first and a code-owned encrypted-file fallback that accepts its
+unlock only through the explicit foreground loopback portal; see
 [Configuration and secrets operations](configuration-and-secrets.md).
 
 ### Treat rights as authority, not advice
@@ -540,6 +541,7 @@ lifecycle operation; do not remove files or catalog rows by hand.
 | `<data-root>/control/sources/provider-activation-v1/recipes/` | Desired or quarantined, secret-free provider activation recipes |
 | `<data-root>/control/sources/provider-activation-v1/evidence/` | Digest-addressed exact evidence objects referenced by activation recipes |
 | `<data-root>/control/sources/provider-adapters/sec/` | SEC raw-evidence and representation state, created only for admitted SEC activation |
+| `<data-root>/control/secrets/provider-credentials/` | Authenticated encrypted fallback vault, used only after explicit foreground unlock when the OS credential service is unavailable |
 | `<data-root>/journal/` | Capture/diagnostic journals; not onboarding authority |
 | `<data-root>/artifacts/` | Controlled extraction, dataset, model, and other application artifacts |
 | OS credential service | Opaque provider credential generations for admitted workflows; never under the data root |

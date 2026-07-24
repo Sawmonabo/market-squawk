@@ -669,9 +669,8 @@ procedures, explicit restore coordinates, historical/current navigation, and pub
 At that historical head it also recorded then-open first-use handoff gaps. The 2026-07-24
 integrations below supersede its provider-discovery, dataset-cursor/export, feature-registry,
 artifact-read, paper-fee, and sealed application/worker entries. Current unresolved blockers remain
-the shipping encrypted-secret fallback, a supported production training driver and ONNX candidate
-demonstration, provider qualification and rights outcomes, clean-machine acceptance, and Task 20's
-final release gate.
+a supported production training driver and ONNX candidate demonstration, provider qualification and
+rights outcomes, clean-machine acceptance, and Task 20's final release gate.
 
 Accepted exact head `a2596a6ae4dafa9915d2b42cac71635c77c632f8` closed every review finding;
 all three final scopes reported zero Critical, Important, or Minor findings. Documentation Tasks
