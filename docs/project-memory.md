@@ -722,10 +722,9 @@ Coinbase exact-head review/integration, followed by provider/onboarding closure 
 
 ## 2026-07-24 release-truth reconciliation and active product lanes
 
-The pushed release head is
-`3c2cfe5516db47e7a3489921586360332ff3725c`; the local and origin release refs match. Commits
-`241599a` and `3c2cfe5` reconcile maintained documentation with code already present at the reviewed
-product head:
+Release documentation commits `241599a` and
+`3c2cfe5516db47e7a3489921586360332ff3725c` reconcile maintained documentation with code already
+present at the reviewed product head:
 
 - the sole production stdio MCP registry contains 62 tools;
 - CLI object listing and receipt-bound provider discovery-to-ingestion are public, bounded product
