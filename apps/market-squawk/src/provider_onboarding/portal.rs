@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use market_squawk_platform::SecretValue;
+use market_squawk_platform::{EncryptedFileFallbackStatus, LocalSecretStoreError, SecretValue};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
@@ -342,8 +343,9 @@ async fn handle_request(
         ));
     }
     let request_cancellation = cancellation.child_token();
-    let response = match tokio::time::timeout(
+    let response = match await_portal_request(
         config.request_timeout,
+        request_cancellation.clone(),
         dispatch(
             request,
             service,
@@ -354,14 +356,30 @@ async fn handle_request(
     )
     .await
     {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => map_error(error),
-        Err(_) => {
-            request_cancellation.cancel();
-            error_response(StatusCode::REQUEST_TIMEOUT, "request_timeout")
-        }
+        Some(Ok(response)) => response,
+        Some(Err(error)) => map_error(error),
+        None => error_response(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
     };
     Ok(response)
+}
+
+async fn await_portal_request<F>(
+    timeout: Duration,
+    cancellation: CancellationToken,
+    request: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        output = &mut request => Some(output),
+        () = tokio::time::sleep(timeout) => {
+            cancellation.cancel();
+            None
+        }
+    }
 }
 
 async fn dispatch(
@@ -392,9 +410,37 @@ async fn dispatch(
     if method == Method::GET && path == "/api/v1/bootstrap" {
         let response = BootstrapResponse {
             csrf_token: &security.csrf_token,
+            encrypted_file_fallback: service.encrypted_file_fallback_status()?,
             profiles: service.profiles(),
         };
         return with_session_cookie(json_response(StatusCode::OK, &response), &security);
+    }
+    if method == Method::POST && path == "/api/v1/secrets/fallback/unlock" {
+        validate_mutation(&request, &security, "application/octet-stream")?;
+        let unlock = collect_secret_body(request.into_body()).await?;
+        let status = service
+            .unlock_encrypted_file_fallback(unlock, cancellation)
+            .await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            &SecretFallbackResponse {
+                encrypted_file_fallback: status,
+            },
+        ));
+    }
+    if method == Method::POST && path == "/api/v1/secrets/fallback/lock" {
+        validate_mutation(&request, &security, "application/json")?;
+        let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+        if !body.is_empty() && body != b"{}" {
+            return Err(PortalRequestError::InvalidBody);
+        }
+        let status = service.lock_encrypted_file_fallback(cancellation).await?;
+        return Ok(json_response(
+            StatusCode::OK,
+            &SecretFallbackResponse {
+                encrypted_file_fallback: status,
+            },
+        ));
     }
     if method == Method::POST && path == "/api/v1/sessions" {
         validate_mutation(&request, &security, "application/json")?;
@@ -416,11 +462,7 @@ async fn dispatch(
         }
         if method == Method::POST && action == Some("secret") {
             validate_mutation(&request, &security, "application/octet-stream")?;
-            let body = collect_body(request.into_body(), MAX_SECRET_BODY_BYTES).await?;
-            let value =
-                String::from_utf8(body).map_err(|_| PortalRequestError::InvalidSecretBody)?;
-            let secret =
-                SecretValue::new(value).map_err(|_| PortalRequestError::InvalidSecretBody)?;
+            let secret = collect_secret_body(request.into_body()).await?;
             let status = service
                 .submit_secret(session_id, secret, cancellation)
                 .await?;
@@ -444,6 +486,55 @@ async fn dispatch(
         }
     }
     Err(PortalRequestError::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct PendingRequest {
+        cancellation: CancellationToken,
+        dropped: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    impl Future for PendingRequest {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRequest {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ignored = dropped.send(self.cancellation.is_cancelled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn portal_timeout_cancels_request_before_dropping_dispatch_waiter() {
+        let cancellation = CancellationToken::new();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        let result = await_portal_request(
+            Duration::ZERO,
+            cancellation.clone(),
+            PendingRequest {
+                cancellation,
+                dropped: Some(dropped_tx),
+            },
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(matches!(dropped_rx.await, Ok(true)));
+    }
 }
 
 fn validate_common_request(
@@ -546,6 +637,60 @@ async fn collect_body(mut body: Incoming, max_bytes: usize) -> Result<Vec<u8>, P
         retained.extend_from_slice(&data);
     }
     Ok(retained)
+}
+
+async fn collect_secret_body(mut body: Incoming) -> Result<SecretValue, PortalRequestError> {
+    let mut retained = SecretBodyBuffer::try_new()?;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| PortalRequestError::InvalidSecretBody)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        retained.extend_from_slice(&data)?;
+    }
+    retained.into_secret()
+}
+
+struct SecretBodyBuffer {
+    bytes: Option<Vec<u8>>,
+}
+
+impl SecretBodyBuffer {
+    fn try_new() -> Result<Self, PortalRequestError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(MAX_SECRET_BODY_BYTES)
+            .map_err(|_error| PortalRequestError::Internal)?;
+        Ok(Self { bytes: Some(bytes) })
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) -> Result<(), PortalRequestError> {
+        let bytes = self.bytes.as_mut().ok_or(PortalRequestError::Internal)?;
+        let next = bytes
+            .len()
+            .checked_add(data.len())
+            .ok_or(PortalRequestError::BodyTooLarge)?;
+        if next > MAX_SECRET_BODY_BYTES {
+            return Err(PortalRequestError::BodyTooLarge);
+        }
+        bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn into_secret(mut self) -> Result<SecretValue, PortalRequestError> {
+        let bytes = self.bytes.take().ok_or(PortalRequestError::Internal)?;
+        SecretValue::from_utf8_bytes(bytes).map_err(|_error| PortalRequestError::InvalidSecretBody)
+    }
+}
+
+impl Drop for SecretBodyBuffer {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take()
+            && let Ok(secret) = SecretValue::from_utf8_bytes(bytes)
+        {
+            drop(secret);
+        }
+    }
 }
 
 fn parse_session_path(path: &str) -> Option<(Uuid, Option<&str>)> {
@@ -656,6 +801,17 @@ fn map_error(error: PortalRequestError) -> Response<Full<Bytes>> {
         | PortalRequestError::Application(ProviderOnboardingError::RightsBlocked) => {
             error_response(StatusCode::CONFLICT, "invalid_session_state")
         }
+        PortalRequestError::Application(ProviderOnboardingError::SecretStore(
+            LocalSecretStoreError::AuthenticationFailed
+            | LocalSecretStoreError::CandidateUnlockNotAuthoritative
+            | LocalSecretStoreError::SupersededUnlock,
+        )) => error_response(StatusCode::FORBIDDEN, "invalid_unlock"),
+        PortalRequestError::Application(ProviderOnboardingError::SecretStore(
+            LocalSecretStoreError::UnsupportedOperation | LocalSecretStoreError::Locked,
+        )) => error_response(StatusCode::CONFLICT, "fallback_unavailable"),
+        PortalRequestError::Application(ProviderOnboardingError::OperationCancelled) => {
+            error_response(StatusCode::REQUEST_TIMEOUT, "operation_cancelled")
+        }
         PortalRequestError::Activation(ProviderPortalActivationError::InvalidRequest) => {
             error_response(StatusCode::BAD_REQUEST, "invalid_adapter_request")
         }
@@ -694,7 +850,13 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[derive(Serialize)]
 struct BootstrapResponse<'a> {
     csrf_token: &'a str,
+    encrypted_file_fallback: EncryptedFileFallbackStatus,
     profiles: Vec<ProviderProfileView>,
+}
+
+#[derive(Serialize)]
+struct SecretFallbackResponse {
+    encrypted_file_fallback: EncryptedFileFallbackStatus,
 }
 
 #[derive(Deserialize)]
@@ -765,6 +927,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <main>
 <h1>Market Squawk provider setup</h1>
 <p>This local page lists exact provider requirements, release gates, and official handoffs.</p>
+<section id="fallback"></section>
 <div id="profiles">Loading code-owned provider profiles…</div>
 <pre id="status" aria-live="polite"></pre>
 </main>
@@ -799,6 +962,43 @@ function requiredValue(node) {
 function dateValue(node) {
   const parts = requiredValue(node).split('-').map(Number);
   return {year: parts[0], month: parts[1], day: parts[2]};
+}
+function renderFallback(state) {
+  const section = document.getElementById('fallback'); section.textContent = '';
+  const title = document.createElement('h2'); title.textContent = 'Encrypted credential fallback';
+  const detail = document.createElement('p');
+  if (state === 'disabled') {
+    detail.textContent = 'No encrypted fallback is configured; the operating-system credential store is required.';
+    section.append(title, detail); return;
+  }
+  if (state === 'locked') {
+    detail.textContent = 'The encrypted fallback is locked. Its unlock is submitted only to this process.';
+    const unlock = input('password', 'Encrypted fallback unlock', 8192);
+    unlock.autocomplete = 'new-password';
+    const button = document.createElement('button'); button.textContent = 'Unlock fallback';
+    button.addEventListener('click', async () => {
+      const value = requiredValue(unlock); unlock.value = '';
+      try {
+        const result = await mutate('/api/v1/secrets/fallback/unlock',
+          value, 'application/octet-stream');
+        renderFallback(result.encrypted_file_fallback);
+      } catch (error) {
+        document.getElementById('status').textContent = String(error);
+      }
+    });
+    section.append(title, detail, unlock, button); return;
+  }
+  detail.textContent = 'The encrypted fallback is ready in this process.';
+  const button = document.createElement('button'); button.textContent = 'Lock fallback';
+  button.addEventListener('click', async () => {
+    try {
+      const result = await mutate('/api/v1/secrets/fallback/lock', '{}', 'application/json');
+      renderFallback(result.encrypted_file_fallback);
+    } catch (error) {
+      document.getElementById('status').textContent = String(error);
+    }
+  });
+  section.append(title, detail, button);
 }
 function blsConfiguration(section) {
   const start = input('number', 'Start year');
@@ -879,6 +1079,7 @@ async function start(profile, organization, email, adapterRequest) {
 }
 fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
   csrf = data.csrf_token;
+  renderFallback(data.encrypted_file_fallback);
   const root = document.getElementById('profiles'); root.textContent = '';
   for (const profile of data.profiles) {
     const section = document.createElement('section');

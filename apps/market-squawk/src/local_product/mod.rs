@@ -55,7 +55,8 @@ use crate::application::{
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
     LiveFairValueObservationBufferError, PaperApplicationServices,
     ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
-    ResearchApplicationServices, ResearchExtractionLimits, SourceDomainService,
+    ResearchApplicationServices, ResearchExtractionLimits, ResearchSourceDiscoveryCoordinator,
+    SourceDomainService,
 };
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
 use crate::backtest_strategy::{
@@ -68,6 +69,7 @@ use crate::{
 };
 
 const SOURCE_AUTHORITY_DIRECTORY: &str = "sources/research-runtime";
+const PROVIDER_SECRET_DIRECTORY: &str = "secrets/provider-credentials";
 const CATALOG_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const CATALOG_MAXIMUM_ROWS: usize = 10_000;
 const CATALOG_MAXIMUM_RECORD_BYTES: usize = 1024 * 1024;
@@ -116,7 +118,12 @@ impl LocalProduct {
             ResearchExtractionLimits::standard(),
         ));
 
-        let secrets = Arc::new(PreferredSecretStore::try_new("market-squawk", None)?);
+        let secrets = Arc::new(
+            PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
+                "market-squawk",
+                paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY),
+            )?,
+        );
         let onboarding = Arc::new(ProviderOnboardingService::try_new(
             research.onboarding_catalog(),
             secrets,
@@ -145,9 +152,12 @@ impl LocalProduct {
             maximum_live_route_count(&config)?,
         )?);
         let paper = PaperApplicationServices::new(config.clone(), Arc::clone(&live_fair_value));
+        let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
+            Arc::clone(&research_ingest) as Arc<_>;
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
             Arc::clone(&onboarding),
             paper.source_runtime_view(),
+            source_discovery,
             portal_activation,
         )?);
         let research_domains = ResearchApplicationServices::new(

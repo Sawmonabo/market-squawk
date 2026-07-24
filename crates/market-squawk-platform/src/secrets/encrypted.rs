@@ -45,6 +45,48 @@ impl EncryptedFileSecretStore {
         })
     }
 
+    pub(super) fn validate_current_unlock(
+        &self,
+        control: &SecretOperationControl,
+    ) -> Result<(), LocalSecretStoreError> {
+        let capabilities = encrypted_capabilities();
+        control.preflight(capabilities)?;
+        let unlocks = self
+            .unlocks
+            .lock()
+            .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
+        if unlocks.candidate.is_some() {
+            return Err(LocalSecretStoreError::RotationRecoveryRequired);
+        }
+        if let Some(loaded) = self.load_vault()? {
+            let active = loaded.authenticates_active(&unlocks.current);
+            let secondary = loaded.authenticates_secondary(&unlocks.current);
+            match loaded.into_state() {
+                VaultState::Stable { .. } if active => {}
+                VaultState::Prepared { .. } if secondary => {
+                    return Err(LocalSecretStoreError::CandidateUnlockNotAuthoritative);
+                }
+                VaultState::Prepared { .. } if active => {
+                    return Err(LocalSecretStoreError::RotationRecoveryRequired);
+                }
+                VaultState::Committed { .. } if secondary => {
+                    return Err(LocalSecretStoreError::SupersededUnlock);
+                }
+                VaultState::Committed { .. } if active => {
+                    return Err(LocalSecretStoreError::RotationFinalizationPending);
+                }
+                VaultState::Stable { .. }
+                | VaultState::Prepared { .. }
+                | VaultState::Committed { .. } => {
+                    return Err(LocalSecretStoreError::AuthenticationFailed);
+                }
+            }
+        }
+        drop(unlocks);
+        control.read_postflight()
+    }
+
     /// Re-encrypts every entry under a new unlock using a durable three-phase transition.
     ///
     /// A prepared vault keeps the prior unlock authoritative, a committed vault makes the

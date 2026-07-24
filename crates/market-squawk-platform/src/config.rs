@@ -391,6 +391,23 @@ impl SecretValue {
         Ok(Self(value))
     }
 
+    /// Consumes bounded UTF-8 bytes without leaving rejected secret material unzeroized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::InvalidValue`] after zeroizing invalid UTF-8, empty, or oversized
+    /// input.
+    pub fn from_utf8_bytes(bytes: Vec<u8>) -> Result<Self, SecretError> {
+        match String::from_utf8(bytes) {
+            Ok(value) => Self::new(value),
+            Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.zeroize();
+                Err(SecretError::InvalidValue)
+            }
+        }
+    }
+
     /// Borrows secret material for its immediate authorized use.
     pub fn expose_secret(&self) -> &str {
         &self.0

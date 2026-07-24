@@ -2,7 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
+use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
@@ -12,8 +17,9 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
-    LocalSecretStoreError, SecretCancellation, SecretInteractionPolicy, SecretKey,
-    SecretOperationControl, SecretStore, SecretValue,
+    EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
+    SecretCancellation, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
+    SecretValue,
 };
 use market_squawk_sources::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, OnboardingEvent,
@@ -24,7 +30,8 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -36,8 +43,29 @@ use super::contracts::{
 const SESSION_DURATION: Duration = Duration::from_secs(15 * 60);
 const SECRET_OPERATION_DURATION: Duration = Duration::from_secs(30);
 const MAXIMUM_CONCURRENT_SECRET_OPERATIONS: usize = 1;
+const MAXIMUM_PENDING_SECRET_REAPS: usize = 64;
+const _: () = assert!(MAXIMUM_PENDING_SECRET_REAPS <= Semaphore::MAX_PERMITS);
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
+static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
+    LazyLock::new(SecretOperationReaper::start);
+
+struct SecretOperationTask<T: Send + 'static> {
+    cancellation: SecretCancellation,
+    command: Option<SecretReapCommand>,
+    result: oneshot::Receiver<Result<T, ProviderOnboardingError>>,
+}
+
+struct SecretReapCommand {
+    worker: JoinHandle<()>,
+    _capacity: OwnedSemaphorePermit,
+}
+
+struct SecretOperationReaper {
+    sender: Option<SyncSender<SecretReapCommand>>,
+    capacity: Arc<Semaphore>,
+    _thread: Option<ThreadJoinHandle<()>>,
+}
 
 /// Bounded request to start one exact code-owned profile.
 #[derive(Clone, Debug)]
@@ -130,6 +158,57 @@ impl ProviderOnboardingService {
     /// Returns every built-in profile in stable identity order.
     pub fn profiles(&self) -> Vec<ProviderProfileView> {
         self.profiles.iter().map(Into::into).collect()
+    }
+
+    /// Returns non-secret encrypted-fallback readiness without probing or mutating a backend.
+    pub fn encrypted_file_fallback_status(
+        &self,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        self.secrets
+            .encrypted_file_fallback_status()
+            .map_err(Into::into)
+    }
+
+    /// Consumes an explicit foreground unlock through the single-flight secret executor.
+    pub async fn unlock_encrypted_file_fallback(
+        &self,
+        unlock: SecretValue,
+        cancellation: CancellationToken,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        let secrets = Arc::clone(&self.secrets);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| {
+                let control = secret_fallback_control("provider-fallback-unlock", operation)?;
+                secrets
+                    .unlock_encrypted_file_fallback(
+                        EncryptedFileUnlockCapability::new(unlock),
+                        &control,
+                    )
+                    .map_err(Into::into)
+            },
+        )
+        .await
+    }
+
+    /// Drops the process-held fallback unlock through the single-flight secret executor.
+    pub async fn lock_encrypted_file_fallback(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<EncryptedFileFallbackStatus, ProviderOnboardingError> {
+        let secrets = Arc::clone(&self.secrets);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| {
+                let control = secret_fallback_control("provider-fallback-lock", operation)?;
+                secrets
+                    .lock_encrypted_file_fallback(&control)
+                    .map_err(Into::into)
+            },
+        )
+        .await
     }
 
     /// Idempotently registers one exact code-owned capability without starting setup.
@@ -994,34 +1073,167 @@ where
             permit.map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?
         }
     };
-    let secret_cancellation = SecretCancellation::new();
-    let operation_cancellation = secret_cancellation.clone();
-    let mut task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        operation(operation_cancellation)
-    });
+    let mut task = SecretOperationTask::spawn(permit, operation)?;
     tokio::select! {
         biased;
         () = cancellation.cancelled() => {
-            secret_cancellation.cancel();
-            reap_secret_operation(task);
-            Err(ProviderOnboardingError::OperationCancelled)
+            task.cancel();
+            match task.await {
+                Err(ProviderOnboardingError::SecretStore(
+                    LocalSecretStoreError::OperationCancelled,
+                )) => Err(ProviderOnboardingError::OperationCancelled),
+                result => result,
+            }
         }
-        result = &mut task => {
-            result.map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?
+        result = &mut task => result,
+    }
+}
+
+impl<T: Send + 'static> SecretOperationTask<T> {
+    fn spawn<F>(
+        operation_permit: OwnedSemaphorePermit,
+        operation: F,
+    ) -> Result<Self, ProviderOnboardingError>
+    where
+        F: FnOnce(SecretCancellation) -> Result<T, ProviderOnboardingError> + Send + 'static,
+    {
+        let reaper_capacity = SECRET_OPERATION_REAPER.try_reserve()?;
+        let cancellation = SecretCancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let (result_sender, result) = oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _operation_permit = operation_permit;
+            let outcome = operation(operation_cancellation);
+            let _ignored = result_sender.send(outcome);
+        });
+        Ok(Self {
+            cancellation,
+            command: Some(SecretReapCommand {
+                worker,
+                _capacity: reaper_capacity,
+            }),
+            result,
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn handoff_pending_worker(&mut self) {
+        let Some(command) = self.command.take() else {
+            return;
+        };
+        if command.worker.is_finished() {
+            return;
+        }
+        SECRET_OPERATION_REAPER.reap(command);
+    }
+}
+
+impl<T: Send + 'static> Future for SecretOperationTask<T> {
+    type Output = Result<T, ProviderOnboardingError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.result).poll(context) {
+            Poll::Ready(Ok(result)) => {
+                self.handoff_pending_worker();
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_closed)) => {
+                let Some(command) = self.command.as_mut() else {
+                    return Poll::Ready(Err(ProviderOnboardingError::SecretOperationUnavailable));
+                };
+                match Pin::new(&mut command.worker).poll(context) {
+                    Poll::Ready(result) => {
+                        self.command = None;
+                        if result.is_err() {
+                            tracing::error!("blocking secret worker failed before returning");
+                        }
+                        Poll::Ready(Err(ProviderOnboardingError::SecretOperationUnavailable))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-fn reap_secret_operation<T>(task: tokio::task::JoinHandle<Result<T, ProviderOnboardingError>>)
-where
-    T: Send + 'static,
-{
-    std::mem::drop(tokio::spawn(async move {
-        if task.await.is_err() {
-            tracing::error!("blocking secret worker failed while being reaped");
+impl<T: Send + 'static> Drop for SecretOperationTask<T> {
+    fn drop(&mut self) {
+        self.cancel();
+        self.handoff_pending_worker();
+    }
+}
+
+impl SecretOperationReaper {
+    fn start() -> Self {
+        let capacity = Arc::new(Semaphore::new(MAXIMUM_PENDING_SECRET_REAPS));
+        let (sender, receiver) = sync_channel::<SecretReapCommand>(MAXIMUM_PENDING_SECRET_REAPS);
+        let thread = std::thread::Builder::new()
+            .name("market-squawk-secret-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    Self::reap_worker(command);
+                }
+            });
+        match thread {
+            Ok(thread) => Self {
+                sender: Some(sender),
+                capacity,
+                _thread: Some(thread),
+            },
+            Err(_error) => Self {
+                sender: None,
+                capacity,
+                _thread: None,
+            },
         }
-    }));
+    }
+
+    fn try_reserve(&self) -> Result<OwnedSemaphorePermit, ProviderOnboardingError> {
+        if self.sender.is_none() {
+            return Err(ProviderOnboardingError::SecretOperationUnavailable);
+        }
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)
+    }
+
+    fn reap(&self, command: SecretReapCommand) {
+        let Some(sender) = self.sender.as_ref() else {
+            self.reap_without_worker_thread(command);
+            return;
+        };
+        // The semaphore and channel have equal capacity, and every queued command retains one
+        // permit. An admitted command therefore always owns a channel slot: this send can fail
+        // after a reaper disconnect, but it cannot wait for channel capacity.
+        if let Err(error) = sender.send(command) {
+            self.reap_without_worker_thread(error.0);
+        }
+    }
+
+    fn reap_without_worker_thread(&self, command: SecretReapCommand) {
+        Self::reap_worker(command);
+    }
+
+    fn reap_worker(mut command: SecretReapCommand) {
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        loop {
+            match Pin::new(&mut command.worker).poll(&mut context) {
+                Poll::Ready(result) => {
+                    if result.is_err() {
+                        tracing::error!("blocking secret worker failed while being reaped");
+                    }
+                    drop(command._capacity);
+                    return;
+                }
+                Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
 }
 
 fn read_secret_reference(
@@ -1042,6 +1254,23 @@ fn read_secret_reference(
         cancellation,
     )?;
     secrets.read(reference, &control).map_err(Into::into)
+}
+
+fn secret_fallback_control(
+    owner: &'static str,
+    cancellation: SecretCancellation,
+) -> Result<SecretOperationControl, ProviderOnboardingError> {
+    let deadline = Instant::now()
+        .checked_add(SECRET_OPERATION_DURATION)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    SecretOperationControl::try_new(
+        owner,
+        deadline,
+        0,
+        SecretInteractionPolicy::Forbid,
+        cancellation,
+    )
+    .map_err(Into::into)
 }
 
 fn require_same_active_lease(
@@ -1404,21 +1633,57 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
-    async fn cancelled_secret_work_remains_bounded_until_the_worker_is_reaped() -> TestResult {
+    async fn simultaneous_secret_completion_and_cancellation_returns_worker_outcome() -> TestResult
+    {
         let admission = Arc::new(Semaphore::new(1));
         let cancellation = CancellationToken::new();
         let trigger = cancellation.clone();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let operation = tokio::spawn(await_blocking_secret_operation(
+            admission,
+            cancellation,
+            move |_secret_cancellation| {
+                started_tx
+                    .send(())
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                release_rx
+                    .recv()
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                Ok(EncryptedFileFallbackStatus::Ready)
+            },
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(250), started_rx.recv()).await,
+            Ok(Some(()))
+        ));
+        trigger.cancel();
+        release_tx.send(())?;
+
+        let result = tokio::time::timeout(Duration::from_millis(250), operation).await???;
+        assert_eq!(result, EncryptedFileFallbackStatus::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_secret_waiter_cancels_and_reaps_worker_before_releasing_admission()
+    -> TestResult {
+        let admission = Arc::new(Semaphore::new(1));
         let (first_started_tx, mut first_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (first_cancelled_tx, mut first_cancelled_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let first = tokio::spawn(await_blocking_secret_operation(
             Arc::clone(&admission),
-            cancellation,
-            move |_secret_cancellation| {
+            CancellationToken::new(),
+            move |secret_cancellation| {
                 first_started_tx
                     .send(())
                     .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
                 release_rx
                     .recv()
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                first_cancelled_tx
+                    .send(secret_cancellation.is_cancelled())
                     .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
                 Ok(())
             },
@@ -1427,13 +1692,8 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(250), first_started_rx.recv()).await,
             Ok(Some(()))
         ));
-        trigger.cancel();
-
-        let first_result = tokio::time::timeout(Duration::from_millis(250), first).await??;
-        assert!(matches!(
-            first_result,
-            Err(ProviderOnboardingError::OperationCancelled)
-        ));
+        first.abort();
+        assert!(first.await.is_err());
 
         let (second_started_tx, mut second_started_rx) = tokio::sync::mpsc::unbounded_channel();
         let second = tokio::spawn(await_blocking_secret_operation(
@@ -1452,6 +1712,10 @@ mod tests {
                 .is_err()
         );
         release_tx.send(())?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), first_cancelled_rx.recv()).await?,
+            Some(true)
+        );
         assert!(matches!(
             tokio::time::timeout(Duration::from_millis(250), second_started_rx.recv()).await,
             Ok(Some(()))

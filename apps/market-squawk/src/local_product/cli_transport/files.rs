@@ -95,11 +95,55 @@ pub(super) async fn ingest_local_file(
         return Err(CliProductError::RequestShape);
     };
     let provider = activated.profile().as_str().to_owned();
+    let mut discovery_arguments = json_object(json!({
+        "provider": provider,
+        "dataset": dataset,
+        "confirm": confirm,
+        "sourceCoverage": [provider],
+    }))?;
+    let discovery = invoke(
+        product,
+        "Source.Discover",
+        &mut discovery_arguments,
+        None,
+        "local manifest objects discovered",
+    )
+    .await?;
+    let discovered_objects = discovery
+        .value()
+        .pointer("/data/objects")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ))?;
+    let mut matches = discovered_objects.iter().filter(|candidate| {
+        candidate
+            .get("object_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(object.as_str())
+            && candidate.get("dataset").and_then(serde_json::Value::as_str)
+                == Some(dataset.as_str())
+    });
+    let selected = matches.next().ok_or(CliProductError::Application(
+        market_squawk_services::ServiceError::NotFound,
+    ))?;
+    if matches.next().is_some() {
+        return Err(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ));
+    }
+    let discovery_receipt = selected
+        .get("discovery_receipt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(CliProductError::Application(
+            market_squawk_services::ServiceError::InvalidResult,
+        ))?;
     let mut arguments = json_object(json!({
         "provider": provider,
         "object": object,
         "dataset": dataset,
-        "confirm": true,
+        "discoveryReceipt": discovery_receipt,
+        "confirm": confirm,
         "sourceCoverage": [provider],
     }))?;
     invoke(

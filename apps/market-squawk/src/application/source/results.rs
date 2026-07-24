@@ -254,6 +254,32 @@ pub(super) fn ensure_provider_scope(
     }
 }
 
+pub(super) fn ensure_exact_provider_scope(
+    request: &TypedToolRequest,
+    provider: &SourceIdentifier,
+) -> Result<(), ServiceError> {
+    let filters = requested_sources(request)?;
+    if filters.len() == 1 && filters.first() == Some(provider) {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidRequest)
+    }
+}
+
+pub(super) fn required_identifier(
+    request: &TypedToolRequest,
+    name: &str,
+) -> Result<SourceIdentifier, ServiceError> {
+    request
+        .arguments()
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)
+        .and_then(|value| {
+            SourceIdentifier::try_from(value).map_err(|_error| ServiceError::InvalidRequest)
+        })
+}
+
 pub(super) fn requested_sources(
     request: &TypedToolRequest,
 ) -> Result<Vec<SourceIdentifier>, ServiceError> {

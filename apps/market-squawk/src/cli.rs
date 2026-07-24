@@ -235,6 +235,14 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// List exact provider objects without minting ingestion authority.
+    Discover {
+        /// Active configured provider identifier.
+        provider: String,
+        /// Exact provider dataset namespace.
+        #[arg(long)]
+        dataset: String,
+    },
 }
 
 /// Direct capture arguments.
