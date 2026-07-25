@@ -23,6 +23,7 @@ from market_squawk.finance import feature_contracts
 from market_squawk.finance import OperationContext
 from market_squawk.training import TrainingRun, TrainingValidationError
 from market_squawk.training_driver import (
+    _strict_regular_file_coordinate,
     admit_candidate,
     finalize_candidate,
     write_proposal,
@@ -128,6 +129,7 @@ def _signed_prediction(
             },
         },
     )
+    request = _strict_regular_file_coordinate(request, "signed prediction request")
     release_root = Path(sys.prefix).resolve(strict=True)
     application = release_root / "bin" / "market-squawk"
     completed = subprocess.run(
@@ -151,6 +153,29 @@ def _signed_prediction(
     )
     value = json.loads(completed.stdout.decode("ascii"))
     return value["data"]["score"]
+
+
+def _initialize_signed_data_root(data_root: Path) -> None:
+    release_root = Path(sys.prefix).resolve(strict=True)
+    application = (release_root / "bin" / "market-squawk").resolve(strict=True)
+    subprocess.run(
+        [
+            str(application),
+            "--data-dir",
+            str(data_root),
+            "--training-release-root",
+            str(release_root),
+            "--output",
+            "json",
+            "feature",
+            "list",
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=70,
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
+    )
 
 
 class TrainingBundleContracts(unittest.TestCase):
@@ -442,7 +467,11 @@ class TrainingBundleContracts(unittest.TestCase):
                     request_root = case_root / "requests"
                     for path in (data_root, authority_root, request_root):
                         path.mkdir(parents=True)
-                    digest = _fixture(data_root, label_mantissas=label_mantissas)
+                    digest = _fixture(
+                        data_root,
+                        label_mantissas=label_mantissas,
+                        initialize_root=_initialize_signed_data_root,
+                    )
                     dataset = open_dataset(
                         data_root,
                         digest,

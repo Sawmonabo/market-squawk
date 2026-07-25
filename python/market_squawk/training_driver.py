@@ -137,7 +137,9 @@ def admit_candidate(
     before = tuple(_executable_sha256(path) for path, _digest in expected)
     if any(observed != digest for observed, (_path, digest) in zip(before, expected, strict=True)):
         raise TrainingDriverError("signed native release identity mismatch")
-    request = Path(request_path).absolute()
+    request = _strict_regular_file_coordinate(
+        Path(request_path), "model admission request"
+    )
     command = [
         str(application),
         "--data-dir",
@@ -505,31 +507,118 @@ def _candidate_parts(value: str) -> tuple[str, ...]:
 def _write_exclusive(path: Path, content: bytes) -> Path:
     if not content or len(content) > MAX_OUTPUT_BYTES:
         raise TrainingDriverError("driver output exceeds its byte bound")
-    absolute = path.absolute()
-    parent = absolute.parent
-    if parent.is_symlink() or not parent.is_dir():
-        raise TrainingDriverError("driver output parent is not a controlled directory")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    parent, leaf, directory = _open_canonical_parent(path, "driver output")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        descriptor = os.open(absolute, flags, 0o600)
-    except OSError as error:
-        raise TrainingDriverError("driver output cannot be created exclusively") from error
-    try:
-        offset = 0
-        while offset < len(content):
-            written = os.write(descriptor, content[offset:])
-            if written <= 0:
-                raise TrainingDriverError("driver output write did not make progress")
-            offset += written
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
+        try:
+            descriptor = os.open(leaf, flags, 0o600, dir_fd=directory)
+        except OSError as error:
+            raise TrainingDriverError(
+                "driver output cannot be created exclusively"
+            ) from error
+        try:
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise TrainingDriverError(
+                        "driver output write did not make progress"
+                    )
+                offset += written
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            named = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size != len(content)
+                or _file_identity(opened) != _file_identity(named)
+            ):
+                raise TrainingDriverError("driver output identity changed during write")
+        finally:
+            os.close(descriptor)
+        _validate_open_directory(parent, directory, "driver output")
         os.fsync(directory)
+        _validate_open_directory(parent, directory, "driver output")
     finally:
         os.close(directory)
-    return absolute
+    return parent / leaf
+
+
+def _strict_regular_file_coordinate(path: Path, name: str) -> Path:
+    parent, leaf, directory = _open_canonical_parent(path, name)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        try:
+            descriptor = os.open(leaf, flags, dir_fd=directory)
+        except OSError as error:
+            raise TrainingDriverError(f"{name} is unavailable") from error
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or _file_identity(opened) != _file_identity(named)
+            ):
+                raise TrainingDriverError(f"{name} is not a strict regular file")
+        finally:
+            os.close(descriptor)
+        _validate_open_directory(parent, directory, name)
+    finally:
+        os.close(directory)
+    return parent / leaf
+
+
+def _open_canonical_parent(path: Path, name: str) -> tuple[Path, str, int]:
+    absolute = path.absolute()
+    leaf = absolute.name
+    if not leaf or leaf in {".", ".."}:
+        raise TrainingDriverError(f"{name} coordinate is invalid")
+    try:
+        parent = absolute.parent.resolve(strict=True)
+    except OSError as error:
+        raise TrainingDriverError(f"{name} parent is unavailable") from error
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        directory = os.open(parent, flags)
+    except OSError as error:
+        raise TrainingDriverError(
+            f"{name} parent is not a controlled directory"
+        ) from error
+    try:
+        _validate_open_directory(parent, directory, name)
+    except TrainingDriverError:
+        os.close(directory)
+        raise
+    return parent, leaf, directory
+
+
+def _validate_open_directory(parent: Path, descriptor: int, name: str) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(parent, follow_symlinks=False)
+    except OSError as error:
+        raise TrainingDriverError(f"{name} parent identity is unavailable") from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise TrainingDriverError(f"{name} parent identity changed")
 
 
 def _executable_sha256(path: Path) -> str:

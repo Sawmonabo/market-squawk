@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
@@ -54,9 +55,13 @@ def _fixture(
     *,
     corrupt_split: bool = False,
     label_mantissas: tuple[int, ...] | None = None,
+    initialize_root: Callable[[Path], None] | None = None,
 ) -> str:
     for directory in ("artifacts", "control", "journal"):
         (root / directory).mkdir()
+    if initialize_root is not None:
+        initialize_root(root)
+        _verify_initialized_root(root)
     metadata = {
         b"market_squawk.build_sha256": BUILD.encode(),
         b"market_squawk.component_layout": b"fixed-width-long-form-v2",
@@ -203,12 +208,65 @@ def _fixture(
     }
     export_bytes = json.dumps(export, sort_keys=True, separators=(",", ":")).encode()
     export_sha256 = hashlib.sha256(export_bytes).hexdigest()
-    _install_catalog(root, export_bytes, export_sha256, export)
+    _install_catalog(
+        root,
+        export_bytes,
+        export_sha256,
+        export,
+        initialized_root=initialize_root is not None,
+    )
     return export_sha256
 
 
+def _verify_initialized_root(root: Path) -> None:
+    catalog = (root / "catalog.sqlite3").resolve(strict=True)
+    connection = sqlite3.connect(f"{catalog.as_uri()}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(
+            """SELECT sequence, format_version, event_kind, transition_kind,
+                      authority_generation, root_binding_generation,
+                      root_marker_record_digest IS NOT NULL,
+                      stable_root_identity IS NOT NULL,
+                      root_binding_record_digest IS NOT NULL
+               FROM analytical_artifact_root_authority_events
+               ORDER BY sequence"""
+        ).fetchall()
+    finally:
+        connection.close()
+    if len(rows) != 2:
+        raise RuntimeError("signed fixture initialization did not commit two authority events")
+    prepared, bound = rows
+    generation = bound[4]
+    if (
+        prepared[:4] != (1, 2, "prepared", "initialize")
+        or bound[:4] != (2, 2, "bound", "initialize")
+        or not isinstance(generation, int)
+        or generation <= 0
+        or prepared[4:] != (generation, generation, 0, 0, 0)
+        or bound[4:] != (generation, generation, 1, 1, 1)
+    ):
+        raise RuntimeError("signed fixture initialization did not commit bound v2 authority")
+    artifact_root = root / "artifacts"
+    identity = artifact_root / ".analytical-root.identity.v2"
+    binding = artifact_root / f".analytical-root-catalog.binding.{generation:016}"
+    if (
+        not identity.is_file()
+        or identity.stat().st_size == 0
+        or not binding.is_file()
+        or binding.stat().st_size == 0
+        or identity.with_name(f"{identity.name}.pending").exists()
+        or binding.with_name(f"{binding.name}.pending").exists()
+    ):
+        raise RuntimeError("signed fixture initialization controls are not committed")
+
+
 def _install_catalog(
-    root: Path, export_bytes: bytes, export_sha256: str, export: dict
+    root: Path,
+    export_bytes: bytes,
+    export_sha256: str,
+    export: dict,
+    *,
+    initialized_root: bool = False,
 ) -> None:
     catalog = root / "catalog.sqlite3"
     connection = sqlite3.connect(catalog)
@@ -217,20 +275,23 @@ def _install_catalog(
         connection.execute("PRAGMA foreign_keys=ON")
         if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
             raise RuntimeError("test catalog did not enter WAL mode")
-        connection.execute("PRAGMA application_id=1297305931")
-        migration_script = ["BEGIN IMMEDIATE;"]
-        for version, migration in enumerate(sorted(MIGRATIONS.glob("*.sql")), start=1):
-            sql = migration.read_text(encoding="utf-8")
-            digest = hashlib.sha256(sql.encode()).hexdigest()
-            migration_script.extend(
-                (
-                    sql,
-                    "INSERT INTO schema_migrations(version, sha256, applied_at_ns) "
-                    f"VALUES ({version}, X'{digest}', 1);",
+        if not initialized_root:
+            connection.execute("PRAGMA application_id=1297305931")
+            migration_script = ["BEGIN IMMEDIATE;"]
+            for version, migration in enumerate(
+                sorted(MIGRATIONS.glob("*.sql")), start=1
+            ):
+                sql = migration.read_text(encoding="utf-8")
+                digest = hashlib.sha256(sql.encode()).hexdigest()
+                migration_script.extend(
+                    (
+                        sql,
+                        "INSERT INTO schema_migrations(version, sha256, applied_at_ns) "
+                        f"VALUES ({version}, X'{digest}', 1);",
+                    )
                 )
-            )
-        migration_script.append("COMMIT;")
-        connection.executescript("\n".join(migration_script))
+            migration_script.append("COMMIT;")
+            connection.executescript("\n".join(migration_script))
         identity = _catalog_identity(catalog)
         _insert_catalog_fixture(connection, identity, export_bytes, export_sha256, export)
         connection.commit()

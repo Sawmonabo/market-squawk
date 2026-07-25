@@ -3962,8 +3962,8 @@
     },
     {
       "path": "python/market_squawk/training_driver.py",
-      "sha256": "9e6e4397b7e7d1b5c71da6f0ea5724fc7c7154236cb9b21dbfda9b5ad25aefe2",
-      "size_bytes": 22758
+      "sha256": "b3fbfe2815bd1f564ffdcd3d44b0e2f2c55f45c0d643683714c0303163c2b937",
+      "size_bytes": 25852
     },
     {
       "path": "python/market_squawk/visualization.py",
@@ -3982,8 +3982,8 @@
     },
     {
       "path": "python/tests/test_data.py",
-      "sha256": "7a1e6b43f5a22cba95b3a0b7f93e227b17e6e58d334a7ba2b20a4cf8d062ba72",
-      "size_bytes": 18375
+      "sha256": "e2a98e7cca904f366fee9902470c92bed06f028c50a3b09a11a8c1c281439e6c",
+      "size_bytes": 20703
     },
     {
       "path": "python/tests/test_finance_parity.py",
@@ -3992,8 +3992,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "2f51e216dae716e0e9bdd15a5177ed35c40f3eae590849ad559f12b4eaa7a614",
-      "size_bytes": 22041
+      "sha256": "28e4c9f5890f2783b1af17ab598e64b4fcdca06d43a6b86da9b1a8bce70d5e19",
+      "size_bytes": 22972
     },
     {
       "path": "python/tests/test_visualization_examples.py",
