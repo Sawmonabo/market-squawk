@@ -798,11 +798,26 @@ impl ProviderOnboardingService {
         }
         let mut resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let profile = self.profile_for(&resumed)?;
-        if resumed.lifecycle().state() != OnboardingState::Blocked {
+        let lifecycle = resumed.lifecycle();
+        let quarantine_established = matches!(
+            lifecycle.state(),
+            OnboardingState::Blocked | OnboardingState::CleanupRequired
+        ) && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation().is_none()
+            && lifecycle.generation_states().all(|(_generation, state)| {
+                matches!(
+                    state,
+                    CredentialGenerationState::CleanupRequired
+                        | CredentialGenerationState::Retired
+                        | CredentialGenerationState::Tombstoned
+                        | CredentialGenerationState::AbandonedNoEffect
+                )
+            });
+        if !quarantine_established {
             self.append(
                 resumed.reservation(),
                 resumed.next_sequence(),
-                OnboardingEvent::Blocked { evidence_digest },
+                OnboardingEvent::ActivationQuarantined { evidence_digest },
             )?;
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
         }
@@ -2007,9 +2022,86 @@ pub enum ProviderOnboardingError {
 
 #[cfg(test)]
 mod tests {
+    use market_squawk_data::{
+        CatalogConfig, CatalogResultLimits, ObjectStoreConfig, SqliteProviderRateStore,
+    };
+    use market_squawk_platform::{EncryptedFileSecretStore, LocalPaths};
+
     use super::*;
+    use crate::ResearchService;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+        let research = ResearchService::initialize(
+            &paths,
+            CatalogConfig::try_new(
+                paths.catalog()?.clone(),
+                Duration::from_millis(750),
+                CatalogLimit::new(64)?,
+                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+            )?,
+            8,
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+        )?;
+        let catalog = research.onboarding_catalog();
+        let profiles = built_in_provider_profiles()?;
+        let sec = profiles
+            .get("sec.edgar-public")
+            .ok_or("SEC onboarding profile is missing")?;
+        let historical = sec
+            .capability_history()
+            .next()
+            .ok_or("SEC historical capability is missing")?;
+        catalog.register_provider_capability(historical)?;
+        let request = StartOnboardingRequest::try_new(
+            sec.id(),
+            Some("Market Squawk".to_owned()),
+            Some("operations@example.test".to_owned()),
+        )?;
+        let public_configuration = provider_public_configuration(sec, &request)?;
+        for index in 0..33_u8 {
+            let reservation = OnboardingReservationRequest::try_new(
+                historical,
+                public_configuration.clone(),
+                historical.maximum_authority().clone(),
+                SourceIdentifier::try_from("startup-recovery-test")?,
+                SourceIdentifier::try_from(format!("startup-recovery-{index}"))?,
+                wall_deadline(SESSION_DURATION)?,
+                0,
+            )?;
+            let _reservation = catalog.reserve_provider_onboarding(&reservation)?;
+        }
+
+        let provider_rate =
+            ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
+                directory.path().join("startup-provider-rate.sqlite3"),
+            )?))?;
+        let secrets = Arc::new(EncryptedFileSecretStore::try_open(
+            directory.path().join("startup-secrets"),
+            SecretValue::new("startup reconciliation unlock".to_owned())?,
+        )?);
+        let service =
+            ProviderOnboardingService::try_new_with_provider_rate(catalog, secrets, provider_rate)?;
+        let session_ids = service
+            .catalog
+            .provider_onboarding_session_ids_after(None, CatalogLimit::new(64)?)?;
+        assert_eq!(session_ids.len(), 33);
+        for session_id in session_ids {
+            assert_eq!(
+                service
+                    .catalog
+                    .resume_provider_onboarding(session_id)?
+                    .lifecycle()
+                    .state(),
+                OnboardingState::RefreshRequired
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn simultaneous_secret_completion_and_cancellation_returns_worker_outcome() -> TestResult

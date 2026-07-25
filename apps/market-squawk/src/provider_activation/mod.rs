@@ -155,12 +155,13 @@ impl ProviderAdapterActivation {
     }
 
     /// Revokes the exact research generation and all in-flight or retained request authority.
-    pub(crate) fn revoke_research_runtime(
+    pub(crate) async fn revoke_research_runtime(
         &self,
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ProviderAdapterActivationError> {
         self.research
             .revoke_provider_generation(expected.profile(), expected)
+            .await
             .map_err(Into::into)
     }
 

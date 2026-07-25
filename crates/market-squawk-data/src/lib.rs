@@ -83,7 +83,8 @@ pub use dataset_builder::{
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    QueryArtifactPublication, ResearchIngestService, extraction_batch_digest,
+    IngestPrecommitAuthority, QueryArtifactPublication, ResearchIngestService,
+    extraction_batch_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,

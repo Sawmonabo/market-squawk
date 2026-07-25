@@ -259,6 +259,25 @@ fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal
         lifecycle.generation_local_deletion(generation_one),
         Some(LocalDeletionOutcome::Deleted)
     );
+    let active_reference = secret_ref(2, 'b')?;
+    lifecycle.apply(
+        &capability_v1,
+        OnboardingEvent::ActivationQuarantined {
+            evidence_digest: digest(46),
+        },
+        rotation_at,
+    )?;
+    assert_eq!(lifecycle.state(), OnboardingState::CleanupRequired);
+    assert_eq!(lifecycle.active_generation(), None);
+    assert_eq!(lifecycle.candidate_generation(), None);
+    assert_eq!(
+        lifecycle.generation_state(generation_two),
+        Some(CredentialGenerationState::CleanupRequired)
+    );
+    assert_eq!(
+        lifecycle.generation_reference(generation_two),
+        Some(&active_reference)
+    );
     Ok(())
 }
 

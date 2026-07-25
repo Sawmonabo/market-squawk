@@ -986,6 +986,7 @@ fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &Onboard
             | OnboardingEvent::CandidateCancelledNoEffect { .. }
             | OnboardingEvent::IndeterminateRemoteState { .. }
             | OnboardingEvent::CleanupRequired { .. }
+            | OnboardingEvent::ActivationQuarantined { .. }
             | OnboardingEvent::RemoteRevocation { .. }
             | OnboardingEvent::LocalDeletion { .. }
             | OnboardingEvent::Retire { .. }
@@ -1075,6 +1076,9 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
         }
         market_squawk_sources::OnboardingEventKind::CleanupRequired => {
             "provider-onboarding.cleanup-required"
+        }
+        market_squawk_sources::OnboardingEventKind::ActivationQuarantined => {
+            "provider-onboarding.activation-quarantined"
         }
         market_squawk_sources::OnboardingEventKind::Blocked => "provider-onboarding.blocked",
         market_squawk_sources::OnboardingEventKind::Cancelled => "provider-onboarding.cancelled",

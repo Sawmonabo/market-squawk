@@ -1,12 +1,14 @@
 //! Application-owned composition for local research ingestion and point-in-time datasets.
 
+use std::sync::Arc;
+
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
     CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
     FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
-    InstrumentDefinitionReadCapability, ManifestCatalogError, ObjectStoreConfig,
-    OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput, RightsError,
-    SourceOperation, extraction_batch_digest,
+    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
+    ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
+    RightsError, SourceOperation, extraction_batch_digest,
 };
 use market_squawk_platform::{LocalPaths, PathError};
 use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
@@ -22,6 +24,7 @@ pub struct ResearchIngestRequest {
     identity: IngestIdentity,
     batch: ExtractionBatch,
     revisions: Option<ExtractionRevisionPlan>,
+    precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
 }
 
 impl ResearchIngestRequest {
@@ -75,7 +78,16 @@ impl ResearchIngestRequest {
             identity,
             batch,
             revisions,
+            precommit_authority: None,
         })
+    }
+
+    pub(crate) fn with_precommit_authority(
+        mut self,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Self {
+        self.precommit_authority = Some(precommit_authority);
+        self
     }
 }
 
@@ -156,13 +168,34 @@ impl ResearchService {
                 &cancellation,
             )
             .await?;
-        match request.revisions {
-            Some(revisions) => self
+        match (request.revisions, request.precommit_authority) {
+            (Some(revisions), Some(precommit_authority)) => self
+                .analytical
+                .ingest_with_revision_plan_and_precommit_authority(
+                    reservation,
+                    request.batch,
+                    revisions,
+                    cancellation,
+                    precommit_authority,
+                )
+                .await
+                .map_err(Into::into),
+            (Some(revisions), None) => self
                 .analytical
                 .ingest_with_revision_plan(reservation, request.batch, revisions, cancellation)
                 .await
                 .map_err(Into::into),
-            None => self
+            (None, Some(precommit_authority)) => self
+                .analytical
+                .ingest_with_precommit_authority(
+                    reservation,
+                    request.batch,
+                    cancellation,
+                    precommit_authority,
+                )
+                .await
+                .map_err(Into::into),
+            (None, None) => self
                 .analytical
                 .ingest(reservation, request.batch, cancellation)
                 .await

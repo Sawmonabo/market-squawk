@@ -954,6 +954,10 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             rights,
             admission,
         } = extracted;
+        let publication = admission
+            .acquire_publication_lease()
+            .await
+            .map_err(|_error| ServiceError::Unavailable)?;
         let idempotency_key = ingest_identity(&profile, &dataset, &object_id, payload_digest);
         let ingest = match revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
@@ -970,7 +974,8 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
                 batch,
             ),
         }
-        .map_err(map_research_error)?;
+        .map_err(map_research_error)?
+        .with_precommit_authority(Arc::new(publication));
         let committed = await_publication(
             self.research.ingest(ingest, operation.clone()),
             context,
@@ -1207,7 +1212,8 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::RevisionEvidenceRequired
         | IngestError::InvalidDataset
         | IngestError::ContentIdentity(_) => ServiceError::InvalidResult,
-        IngestError::Plan(_)
+        IngestError::PublicationAuthorityRevoked
+        | IngestError::Plan(_)
         | IngestError::Parquet(_)
         | IngestError::Arrow(_)
         | IngestError::Manifest(_)

@@ -199,6 +199,7 @@ impl ProviderResearchActivationService {
             {
                 self.activation
                     .revoke_research_runtime(&runtime)
+                    .await
                     .map_err(CliProviderActivationError::Activation)?;
             }
             if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
@@ -330,7 +331,10 @@ async fn publish_research_activation(
             )?;
             return Err(error);
         }
-        if let Err(error) = activation_authority.revoke_research_runtime(&expected) {
+        if let Err(error) = activation_authority
+            .revoke_research_runtime(&expected)
+            .await
+        {
             quarantine_failed_candidate(
                 state,
                 onboarding,
@@ -373,6 +377,7 @@ async fn publish_research_activation(
         if activated.generation() != &candidate {
             activation_authority
                 .revoke_research_runtime(&candidate)
+                .await
                 .map_err(CliProviderActivationError::Activation)?;
             quarantine_failed_candidate(
                 state,
@@ -389,6 +394,7 @@ async fn publish_research_activation(
             Err(_error) => {
                 activation_authority
                     .revoke_research_runtime(&candidate)
+                    .await
                     .map_err(CliProviderActivationError::Activation)?;
                 quarantine_failed_candidate(
                     state,
@@ -404,6 +410,7 @@ async fn publish_research_activation(
         if desired != candidate_state_digest {
             activation_authority
                 .revoke_research_runtime(&candidate)
+                .await
                 .map_err(CliProviderActivationError::Activation)?;
             quarantine_failed_candidate(
                 state,
@@ -489,6 +496,7 @@ async fn publish_research_activation(
     if activated.generation() != &candidate {
         activation_authority
             .revoke_research_runtime(&candidate)
+            .await
             .map_err(CliProviderActivationError::Activation)?;
         quarantine_failed_candidate(
             state,
@@ -505,6 +513,7 @@ async fn publish_research_activation(
         Err(_error) => {
             activation_authority
                 .revoke_research_runtime(&candidate)
+                .await
                 .map_err(CliProviderActivationError::Activation)?;
             quarantine_failed_candidate(
                 state,
@@ -520,6 +529,7 @@ async fn publish_research_activation(
     if desired != candidate_state_digest {
         activation_authority
             .revoke_research_runtime(&candidate)
+            .await
             .map_err(CliProviderActivationError::Activation)?;
         quarantine_failed_candidate(
             state,

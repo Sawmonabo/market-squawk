@@ -106,6 +106,12 @@ pub fn extraction_batch_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest
         .map_err(IngestError::ContentIdentity)
 }
 
+/// Process-local authority that must remain live through the durable ingest commit boundary.
+pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
+    /// Revalidates the exact caller authority immediately before catalog and manifest commit.
+    fn validate_precommit(&self) -> Result<(), IngestError>;
+}
+
 /// Rights-bound research ingestion service.
 #[allow(
     async_fn_in_trait,
@@ -745,6 +751,7 @@ impl AnalyticalDataService {
             plan,
             published,
             GenerationKind::Compaction,
+            None,
         )
     }
 
@@ -805,6 +812,7 @@ impl AnalyticalDataService {
         batch: ExtractionBatch,
         revision_plan: Option<ExtractionRevisionPlan>,
         cancellation: CancellationToken,
+        precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_batch_digest(&batch)?;
         let source_id = batch.request().object().source_id().clone();
@@ -914,7 +922,45 @@ impl AnalyticalDataService {
             plan,
             published,
             GenerationKind::Ingest,
+            precommit_authority.as_deref(),
         )
+    }
+
+    /// Ingests a locally observed batch while retaining exact caller authority through commit.
+    pub async fn ingest_with_precommit_authority(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            batch,
+            None,
+            cancellation,
+            Some(precommit_authority),
+        )
+        .await
+    }
+
+    /// Ingests provider revisions while retaining exact caller authority through commit.
+    pub async fn ingest_with_revision_plan_and_precommit_authority(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            batch,
+            Some(revisions),
+            cancellation,
+            Some(precommit_authority),
+        )
+        .await
     }
 
     fn validate_run(
@@ -1012,9 +1058,13 @@ impl AnalyticalDataService {
         plan: ManifestPlan,
         published: PublishedObject,
         kind: GenerationKind,
+        precommit_authority: Option<&dyn IngestPrecommitAuthority>,
     ) -> Result<CommittedDataset, IngestError> {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
+        }
+        if let Some(precommit_authority) = precommit_authority {
+            precommit_authority.validate_precommit()?;
         }
         let created_at = published.created_at().max(reservation.requested_at());
         let artifact = ArtifactRecord::try_new(
@@ -1088,7 +1138,7 @@ impl ResearchIngestService for AnalyticalDataService {
         batch: ExtractionBatch,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, None, cancellation)
+        self.ingest_batch(reservation, batch, None, cancellation, None)
             .await
     }
 
@@ -1099,7 +1149,7 @@ impl ResearchIngestService for AnalyticalDataService {
         revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, Some(revisions), cancellation)
+        self.ingest_batch(reservation, batch, Some(revisions), cancellation, None)
             .await
     }
 }
@@ -1107,6 +1157,9 @@ impl ResearchIngestService for AnalyticalDataService {
 /// Analytical ingestion, publication, reconciliation, or compaction failure.
 #[derive(Debug, Error)]
 pub enum IngestError {
+    /// Exact process-local publication authority was revoked before durable commit.
+    #[error("research publication authority was revoked before durable commit")]
+    PublicationAuthorityRevoked,
     /// The explicit analytical catalog/root authority transition was rejected.
     #[error("analytical artifact-root authority transition was rejected")]
     AuthorityTransitionRejected,

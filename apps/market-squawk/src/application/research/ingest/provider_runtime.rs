@@ -1,12 +1,15 @@
 //! Generation-bound publication of callable research-provider adapters.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
+use market_squawk_data::{IngestError, IngestPrecommitAuthority};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -230,8 +233,46 @@ fn digest_runtime_wire<T: Serialize>(
 #[derive(Clone, Debug)]
 pub(super) struct ResearchProviderAdmission {
     generation_digest: Option<EvidenceDigest>,
-    identity: Arc<()>,
+    state: Arc<ResearchProviderAdmissionState>,
     cancellation: CancellationToken,
+}
+
+const ADMISSION_ACTIVE: u8 = 0;
+const ADMISSION_REVOKING: u8 = 1;
+const ADMISSION_DRAINED: u8 = 2;
+
+#[derive(Debug)]
+struct ResearchProviderAdmissionState {
+    phase: AtomicU8,
+    publication_barrier: Arc<RwLock<()>>,
+}
+
+/// Exact-generation lease retained across the durable research publication boundary.
+pub(super) struct ResearchProviderPublicationLease {
+    admission: ResearchProviderAdmission,
+    _publication: OwnedRwLockReadGuard<()>,
+}
+
+impl std::fmt::Debug for ResearchProviderPublicationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResearchProviderPublicationLease")
+            .field("generation_digest", &self.admission.generation_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResearchProviderPublicationLease {
+    pub(super) fn validate_precommit(&self) -> Result<(), ResearchIngestCompositionError> {
+        self.admission.ensure_live()
+    }
+}
+
+impl IngestPrecommitAuthority for ResearchProviderPublicationLease {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        ResearchProviderPublicationLease::validate_precommit(self)
+            .map_err(|_error| IngestError::PublicationAuthorityRevoked)
+    }
 }
 
 impl ResearchProviderAdmission {
@@ -242,13 +283,18 @@ impl ResearchProviderAdmission {
             generation_digest: generation
                 .map(ResearchProviderRuntimeGeneration::generation_digest)
                 .transpose()?,
-            identity: Arc::new(()),
+            state: Arc::new(ResearchProviderAdmissionState {
+                phase: AtomicU8::new(ADMISSION_ACTIVE),
+                publication_barrier: Arc::new(RwLock::new(())),
+            }),
             cancellation: CancellationToken::new(),
         })
     }
 
     pub(super) fn ensure_live(&self) -> Result<(), ResearchIngestCompositionError> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || self.state.phase.load(Ordering::Acquire) != ADMISSION_ACTIVE
+        {
             Err(ResearchIngestCompositionError::StaleRuntimeGeneration)
         } else {
             Ok(())
@@ -256,12 +302,48 @@ impl ResearchProviderAdmission {
     }
 
     pub(super) fn matches(&self, other: &Self) -> bool {
-        self.generation_digest == other.generation_digest
-            && Arc::ptr_eq(&self.identity, &other.identity)
+        self.generation_digest == other.generation_digest && Arc::ptr_eq(&self.state, &other.state)
     }
 
     pub(super) fn revoke(&self) {
+        self.begin_revocation();
+    }
+
+    fn begin_revocation(&self) {
+        let _phase = self.state.phase.compare_exchange(
+            ADMISSION_ACTIVE,
+            ADMISSION_REVOKING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.cancellation.cancel();
+    }
+
+    pub(super) async fn acquire_publication_lease(
+        &self,
+    ) -> Result<ResearchProviderPublicationLease, ResearchIngestCompositionError> {
+        self.ensure_live()?;
+        let publication = Arc::clone(&self.state.publication_barrier)
+            .read_owned()
+            .await;
+        self.ensure_live()?;
+        Ok(ResearchProviderPublicationLease {
+            admission: self.clone(),
+            _publication: publication,
+        })
+    }
+
+    pub(super) async fn revoke_and_drain(&self) {
+        self.begin_revocation();
+        let publication = Arc::clone(&self.state.publication_barrier)
+            .write_owned()
+            .await;
+        self.state.phase.store(ADMISSION_DRAINED, Ordering::Release);
+        drop(publication);
+    }
+
+    pub(super) fn revocation_drained(&self) -> bool {
+        self.state.phase.load(Ordering::Acquire) == ADMISSION_DRAINED
     }
 
     pub(super) const fn cancellation(&self) -> &CancellationToken {
@@ -317,7 +399,7 @@ impl PreparedResearchProviderReplacement {
         if current.generation.as_ref() != Some(&self.expected) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
-        if !current.admission.cancellation().is_cancelled() {
+        if !current.admission.revocation_drained() {
             return Err(ResearchIngestCompositionError::RuntimeGenerationStillCallable);
         }
         let candidate_source = self
@@ -494,24 +576,57 @@ impl ProductionResearchIngestCoordinator {
     }
 
     /// Revokes exactly one callable generation and every retained receipt minted from it.
-    pub fn revoke_provider_generation(
+    pub async fn revoke_provider_generation(
         &self,
         profile: &SourceIdentifier,
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ResearchIngestCompositionError> {
-        let mut authority = self
-            .authority
-            .lock()
-            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        let current = authority
-            .sources
-            .get(profile)
-            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-        if current.generation.as_ref() != Some(expected) {
-            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
-        }
-        current.admission.revoke();
-        authority.selections.revoke_profile(profile);
+        let admission = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            let current = authority
+                .sources
+                .get(profile)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation.as_ref() != Some(expected) {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.revoke();
+            let admission = current.admission.clone();
+            authority.selections.revoke_profile(profile);
+            admission
+        };
+        admission.revoke_and_drain().await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_generation_revocation_drains_the_publication_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admission = ResearchProviderAdmission::new(None)?;
+        let publication = admission.acquire_publication_lease().await?;
+        let cancellation = admission.cancellation().clone();
+        let revoking = admission.clone();
+        let drain = tokio::spawn(async move {
+            revoking.revoke_and_drain().await;
+        });
+
+        cancellation.cancelled().await;
+        assert!(!drain.is_finished());
+        assert!(publication.validate_precommit().is_err());
+
+        drop(publication);
+        tokio::time::timeout(Duration::from_secs(1), drain).await??;
+        assert!(admission.revocation_drained());
         Ok(())
     }
 }

@@ -244,7 +244,9 @@ async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_re
             .as_str(),
         "bls-object-generation-one"
     );
-    coordinator.revoke_provider_generation(&profile, &old)?;
+    coordinator
+        .revoke_provider_generation(&profile, &old)
+        .await?;
     assert_eq!(prepared.commit()?, candidate);
     assert_eq!(
         coordinator

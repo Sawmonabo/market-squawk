@@ -9,8 +9,9 @@ use market_squawk_platform::{
     SecretKey, SecretOperationControl, SecretReconciliationObservation,
 };
 use market_squawk_sources::{
-    AuthorityVerification, CredentialGenerationState, LocalDeletionOutcome, OnboardingEvent,
-    OnboardingState, ProfileReleaseState, RemoteRevocationOutcome, SecretStoreClearOutcome,
+    AuthorityVerification, CredentialGenerationState, LifecycleSupport, LocalDeletionOutcome,
+    OnboardingEvent, OnboardingState, ProfileReleaseState, RemoteRevocationOutcome,
+    SecretStoreClearOutcome,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -296,17 +297,105 @@ impl ProviderOnboardingService {
                 return Ok(());
             }
             for session_id in &session_ids {
-                let _view = self.resume(*session_id)?;
-                self.cleanup_startup_unattended(*session_id)?;
+                let resumed = self.catalog.resume_provider_onboarding(*session_id)?;
+                let profile = self.profiles.get(resumed.lifecycle().surface_id().as_str());
+                let exact_capability = profile.and_then(|profile| {
+                    profile.capability_at(
+                        resumed.lifecycle().capability_revision(),
+                        resumed.lifecycle().capability_digest(),
+                    )
+                });
+                let public_configuration_valid = profile.is_some_and(|profile| {
+                    super::validate_recovered_public_configuration(
+                        profile,
+                        resumed.public_configuration(),
+                    )
+                    .is_ok()
+                });
+                let exact_lifecycle_support =
+                    exact_capability.map(|capability| capability.lifecycle_support());
+                let current_runtime_admitted =
+                    profile
+                        .zip(exact_capability)
+                        .is_some_and(|(profile, capability)| {
+                            public_configuration_valid
+                                && capability == profile.capability()
+                                && matches!(
+                                    profile.release_state(),
+                                    ProfileReleaseState::Available
+                                        | ProfileReleaseState::RightsLimited
+                                )
+                        });
+
+                if profile.is_some() && exact_capability.is_some() && public_configuration_valid {
+                    let _view = self.resume(*session_id)?;
+                }
+
+                let resumed = self.catalog.resume_provider_onboarding(*session_id)?;
+                let lifecycle = resumed.lifecycle();
+                let secret_authority_retained =
+                    lifecycle.generation_states().any(|(generation, state)| {
+                        !matches!(
+                            state,
+                            CredentialGenerationState::Retired
+                                | CredentialGenerationState::Tombstoned
+                                | CredentialGenerationState::AbandonedNoEffect
+                        ) && lifecycle.generation_cleanup_reference(generation).is_some()
+                    });
+                let authority_recognized =
+                    profile.is_some() && exact_capability.is_some() && public_configuration_valid;
+                if (!current_runtime_admitted && secret_authority_retained) || !authority_recognized
+                {
+                    self.quarantine_startup_authority(&resumed)?;
+                }
+                self.cleanup_startup_unattended(*session_id, exact_lifecycle_support)?;
             }
             after = session_ids.last().copied();
         }
     }
 
-    fn cleanup_startup_unattended(&self, session_id: Uuid) -> Result<(), ProviderOnboardingError> {
+    fn quarantine_startup_authority(
+        &self,
+        resumed: &market_squawk_data::ResumedProviderOnboarding,
+    ) -> Result<(), ProviderOnboardingError> {
+        let lifecycle = resumed.lifecycle();
+        let quarantine_established = matches!(
+            lifecycle.state(),
+            OnboardingState::Blocked | OnboardingState::CleanupRequired
+        ) && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation().is_none()
+            && lifecycle.generation_states().all(|(_generation, state)| {
+                matches!(
+                    state,
+                    CredentialGenerationState::CleanupRequired
+                        | CredentialGenerationState::Retired
+                        | CredentialGenerationState::Tombstoned
+                        | CredentialGenerationState::AbandonedNoEffect
+                )
+            });
+        if quarantine_established {
+            return Ok(());
+        }
+        self.append(
+            resumed.reservation(),
+            resumed.next_sequence(),
+            OnboardingEvent::ActivationQuarantined {
+                evidence_digest: event_digest(
+                    b"startup-activation-quarantined",
+                    resumed.reservation().session_id(),
+                    lifecycle.candidate_generation(),
+                ),
+            },
+        )
+    }
+
+    fn cleanup_startup_unattended(
+        &self,
+        session_id: Uuid,
+        lifecycle_support: Option<LifecycleSupport>,
+    ) -> Result<(), ProviderOnboardingError> {
         loop {
             let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-            let profile = self.current_profile_for(&resumed)?;
             let lifecycle = resumed.lifecycle();
             let target = lifecycle.generation_states().find(|(generation, state)| {
                 lifecycle.active_generation() != Some(*generation)
@@ -380,7 +469,7 @@ impl ProviderOnboardingService {
             {
                 let key = SecretKey::try_new(
                     "provider-onboarding",
-                    &format!("{}.{}", profile.id(), session_id.simple()),
+                    &format!("{}.{}", lifecycle.surface_id(), session_id.simple()),
                 )?;
                 let outcome = match self.secrets.delete_planned(&key, &plan, &control) {
                     Ok(SecretDeletionDisposition::Deleted) => SecretStoreClearOutcome::Deleted,
@@ -398,8 +487,35 @@ impl ProviderOnboardingService {
                 )?;
                 continue;
             }
+            if lifecycle_support.is_none()
+                && !matches!(
+                    lifecycle.generation_local_deletion(generation),
+                    Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
+                )
+            {
+                let Some(reference) = lifecycle.generation_cleanup_reference(generation) else {
+                    return Ok(());
+                };
+                let outcome = match self.secrets.delete(reference, &control) {
+                    Ok(()) => LocalDeletionOutcome::Deleted,
+                    Err(LocalSecretStoreError::NotFound) => LocalDeletionOutcome::NotFound,
+                    Err(_) => return Ok(()),
+                };
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::LocalDeletion {
+                        generation,
+                        outcome,
+                    },
+                )?;
+                continue;
+            }
             if lifecycle.generation_remote_revocation(generation).is_none() {
-                if profile.capability().lifecycle_support().remote_revocation() {
+                let Some(lifecycle_support) = lifecycle_support else {
+                    return Ok(());
+                };
+                if lifecycle_support.remote_revocation() {
                     return Ok(());
                 }
                 self.append(
