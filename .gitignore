@@ -108,6 +108,10 @@ tmp/
 
 # Rust build artifacts — Plan-024 sidecar crate (per cargo workspace at repo root)
 target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+/fuzz/target/
 
 /target/
 /.market-squawk/

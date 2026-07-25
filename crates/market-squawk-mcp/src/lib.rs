@@ -7,6 +7,8 @@
 
 mod audit;
 mod framing;
+#[cfg(feature = "fuzzing")]
+mod fuzzing;
 mod isolation;
 mod limits;
 mod protocol;
@@ -17,6 +19,8 @@ pub use audit::{
     AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass, MutationAuditBundle,
     MutationAuditReservation,
 };
+#[cfg(feature = "fuzzing")]
+pub use fuzzing::fuzz_decode_client_message;
 pub use limits::{McpLimitError, McpLimitSpec, McpLimits};
 pub use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,

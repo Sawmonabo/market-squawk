@@ -114,6 +114,7 @@ pub async fn execute_cli_command(
         Command::Init
         | Command::Config { .. }
         | Command::Capture(_)
+        | Command::Release { .. }
         | Command::Mcp { .. }
         | Command::Doctor
         | Command::Mock(_)

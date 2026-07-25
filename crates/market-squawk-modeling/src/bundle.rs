@@ -39,6 +39,18 @@ pub const MAX_ONNX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum exact training-run provenance bytes admitted before parsing.
 pub const MAX_TRAINING_RUN_BYTES: usize = 256 * 1024;
 
+/// Exercises the production bundle-metadata structural and wire decoders.
+///
+/// Invalid metadata is a normal fuzz input. This entry point retains no decoded value and exists
+/// only with the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_bundle_metadata(bytes: &[u8]) {
+    if bytes.len() > MAX_METADATA_BYTES || validate_json_structure(bytes).is_err() {
+        return;
+    }
+    let _metadata = serde_json::from_slice::<MetadataWire>(bytes);
+}
+
 /// Exact metadata object expected beneath a controlled model root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleMetadataRef {

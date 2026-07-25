@@ -24,6 +24,8 @@ pub use admission::{
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
     recover_model_candidate, verify_model_candidate,
 };
+#[cfg(feature = "fuzzing")]
+pub use bundle::fuzz_parse_bundle_metadata;
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
     MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES,

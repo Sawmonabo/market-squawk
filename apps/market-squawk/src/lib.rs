@@ -22,6 +22,7 @@ pub mod portfolio_application;
 pub mod provider_activation;
 pub mod provider_onboarding;
 pub mod quality;
+pub mod release;
 pub mod replay;
 pub mod research_service;
 pub mod risk;
