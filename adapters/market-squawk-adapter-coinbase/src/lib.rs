@@ -1,13 +1,15 @@
-//! Bounded Coinbase Exchange WebSocket v1 market-data adapter.
+//! Bounded Coinbase Exchange public and authenticated Direct market-data adapters.
 //!
-//! This adapter is pinned to the public Coinbase Exchange Market Data endpoint and an immutable
-//! `DirectUnverified` ceiling. It emits provider-normalized evidence; canonical tick/lot
-//! conversion, book qualification, capture admission, and execution eligibility remain owned by
+//! The public profile remains pinned to the Exchange Market Data endpoint and a
+//! `DirectUnverified` ceiling. The authenticated profile combines `ws-direct` `full` with exact
+//! REST product and level-3 snapshot capture. Both emit provider evidence only; current
+//! qualification, canonical events, order composition, and execution eligibility remain owned by
 //! their respective platform services.
 
 mod config;
 mod decoder;
 mod direct;
+mod direct_transport;
 mod source;
 
 pub use config::{
@@ -24,5 +26,9 @@ pub use direct::{
     CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
     CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
     CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
+};
+pub use direct_transport::{
+    CoinbaseDirectBookUpdate, CoinbaseDirectOutput, CoinbaseDirectSession,
+    CoinbaseDirectSessionError,
 };
 pub use source::CoinbaseExchangeSource;

@@ -817,6 +817,46 @@ impl ActiveLiveSourceGeneration {
         Ok(())
     }
 
+    /// Returns the immutable connection-generation identity retained by this authority.
+    ///
+    /// This is data identity only. It exposes no binding, lease, frame factory, or minting
+    /// capability.
+    pub fn generation(&self) -> market_squawk_domain::ConnectionGeneration {
+        self.binding.connection_generation()
+    }
+
+    /// Validates one frame minted by this exact active generation.
+    ///
+    /// The complete generation graph and capture health are checked before and after exact
+    /// binding and trusted-receipt validation. A value-equivalent reconstructed frame cannot pass
+    /// the process-local binding-allocation check.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for stale or capture-unhealthy authority, a transplanted frame allocation, or
+    /// a missing/discontinuous trusted receipt.
+    pub fn validate_live_frame<'a>(
+        &self,
+        frame: &'a crate::RawMarketFrame,
+    ) -> Result<crate::ValidatedRawMarketFrame<'a>, crate::SourceError> {
+        self.validate_current()?;
+        if !self.binding.shares_allocation_with(frame.binding()) {
+            return Err(crate::SourceError::GenerationAuthorityMismatch);
+        }
+        let receipt = frame
+            .trusted_receipt()
+            .ok_or(crate::SourceError::TrustedTimeDiscontinuity)?;
+        self.lease
+            .validate_receipt(receipt)
+            .map_err(|_error| crate::SourceError::TrustedTimeDiscontinuity)?;
+        self.validate_current()?;
+        Ok(crate::ValidatedRawMarketFrame::new(
+            frame,
+            receipt,
+            FrameSessionLease::new(self.binding.clone(), Arc::clone(&self.lease)),
+        ))
+    }
+
     /// Returns the exact registry-coordinated provider budget after revalidating this generation.
     ///
     /// # Errors

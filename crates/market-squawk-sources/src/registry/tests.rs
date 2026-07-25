@@ -158,6 +158,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_live_generation_validates_only_its_exact_current_frames() -> TestResult {
+        let metadata = direct_metadata("active-frame-source", "active-frame-revision")?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+        let session = registry.begin_session(
+            &registered,
+            SessionId::new(SourceIdentifier::try_from("active-frame-session")?),
+            ConnectionGeneration::new(1)?,
+            Timestamp::from_unix_nanos(1),
+        )?;
+        let capture = registry.take_capture_generation_capabilities(&session)?;
+        let (mut initialization, _admission, _degradation) = capture.into_parts();
+        initialization.mark_healthy()?;
+        let generation = registry.take_live_source_generation(&session)?;
+        let mut active = generation.try_start(&metadata)?;
+
+        assert_eq!(active.generation(), ConnectionGeneration::new(1)?);
+        let frame = active.frames_mut()?.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(br#"{"type":"fixture"}"#),
+        )?;
+        let validated = active.validate_live_frame(&frame)?;
+        assert_eq!(validated.frame().frame_id(), frame.frame_id());
+
+        let _successor = registry.begin_session(
+            &registered,
+            SessionId::new(SourceIdentifier::try_from("active-frame-successor")?),
+            ConnectionGeneration::new(2)?,
+            Timestamp::from_unix_nanos(2),
+        )?;
+        assert!(matches!(
+            active.validate_live_frame(&frame),
+            Err(SourceError::SessionNotCurrent)
+        ));
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct HealthHarness {
         registry: AuthoritativeSourceRegistry,

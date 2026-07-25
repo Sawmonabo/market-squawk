@@ -17,6 +17,7 @@ futures-util.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-live.workspace = true
 market-squawk-sources.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
