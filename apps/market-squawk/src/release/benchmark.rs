@@ -243,7 +243,7 @@ pub(super) async fn run(
     }
     let process_completed = supervised.process.exit_code == 0;
     let process_observed_rss_passed =
-        supervised.process.peak_process_tree_rss_bytes <= worker::supervisor_rss_bytes();
+        supervised.process.observed_peak_process_tree_rss_bytes <= worker::supervisor_rss_bytes();
     if !process_completed || !process_observed_rss_passed {
         bail!("release benchmark worker process did not satisfy its fixed observed limits");
     }
@@ -267,7 +267,9 @@ pub(super) async fn run(
         memory: MemoryEvidence {
             warm_plateau_rss_bytes: memory.warm_plateau_rss_bytes,
             post_measurement_rss_bytes: memory.post_measurement_rss_bytes,
-            observed_peak_process_tree_rss_bytes: supervised.process.peak_process_tree_rss_bytes,
+            observed_peak_process_tree_rss_bytes: supervised
+                .process
+                .observed_peak_process_tree_rss_bytes,
             tail_growth_bytes: memory.tail_growth_bytes,
             permitted_tail_growth_bytes: memory.permitted_tail_growth_bytes,
             current_process_plateau_sample_interval_millis: memory

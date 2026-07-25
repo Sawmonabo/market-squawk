@@ -46,7 +46,7 @@ pub(super) struct ProcessLimits {
 #[serde(deny_unknown_fields)]
 pub(super) struct ProcessEvidence {
     pub(super) elapsed_millis: u64,
-    pub(super) peak_process_tree_rss_bytes: u64,
+    pub(super) observed_peak_process_tree_rss_bytes: u64,
     pub(super) exit_code: i32,
     pub(super) stdout_sha256: String,
     pub(super) stdout_bytes: u64,
@@ -93,7 +93,7 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         .ok_or_else(|| anyhow::anyhow!("bounded process stderr is unavailable"))?;
     let stdout_reader = spawn_reader(stdout);
     let stderr_reader = spawn_reader(stderr);
-    let mut peak_rss = 0_u64;
+    let mut observed_peak_rss = 0_u64;
     let mut primary_error: Option<anyhow::Error> = None;
     let status = loop {
         if let Some(status) = child
@@ -104,10 +104,10 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         }
         match process_group_rss_bytes(process_id) {
             Ok(rss) => {
-                peak_rss = peak_rss.max(rss);
+                observed_peak_rss = observed_peak_rss.max(rss);
                 if rss > request.limits.rss_bytes {
                     primary_error = Some(anyhow::anyhow!(
-                        "bounded process exceeded its resident-memory limit"
+                        "bounded process observed a resident-memory sample above its limit"
                     ));
                     break None;
                 }
@@ -145,7 +145,7 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
     Ok(ProcessOutput {
         evidence: ProcessEvidence {
             elapsed_millis,
-            peak_process_tree_rss_bytes: peak_rss,
+            observed_peak_process_tree_rss_bytes: observed_peak_rss,
             exit_code: final_status.code().unwrap_or_default(),
             stdout_sha256: stdout.sha256,
             stdout_bytes: stdout.byte_count,
