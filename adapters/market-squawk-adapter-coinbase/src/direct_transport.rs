@@ -13,13 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
-use market_squawk_domain::{SequenceNumber, Timestamp};
+use market_squawk_domain::{ConnectionGeneration, SequenceNumber, Timestamp};
 use market_squawk_live::{DirectOrderBook, DirectOrderBookError, DirectPublishedBook};
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, HttpCaptureMethod,
     LiveSourceGeneration, NetworkAccessPolicy, RawMarketSink, SegmentedHttpCaptureError,
     SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SharedProviderBudget, SinkError,
-    SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    SourceError, SourceMetadata, SourceMetadataProvider, TlsProviderCapability, TransportFrameKind,
     apply_http_retry_after,
 };
 use serde::Deserialize;
@@ -160,17 +160,19 @@ pub struct CoinbaseDirectSession {
 }
 
 impl CoinbaseDirectSession {
-    /// Consumes one registry-minted generation and creates the hardened production HTTP client.
+    /// Consumes one registry-minted generation and the project-installed TLS capability before
+    /// creating the hardened production HTTP client.
     ///
     /// No credentials are read or retained. The signing capability is supplied only to
     /// [`Self::run`] at first use.
     pub fn try_new(
         config: CoinbaseDirectConfig,
         generation: LiveSourceGeneration,
+        tls_provider: TlsProviderCapability,
     ) -> Result<Self, CoinbaseDirectSessionError> {
         let bounds = direct_http_bounds(&config)?;
         let http = Arc::new(
-            ReqwestCoinbaseDirectHttpTransport::try_new(bounds)
+            ReqwestCoinbaseDirectHttpTransport::try_new(bounds, tls_provider)
                 .map_err(|_error| CoinbaseDirectSessionError::HttpResponse)?,
         );
         Self::try_new_inner(config, generation, http)
@@ -247,8 +249,6 @@ impl CoinbaseDirectSession {
         }
         self.validate_generation()?;
         self.authorize_endpoint(self.config.websocket_endpoint())?;
-        let timestamp = current_unix_seconds()?;
-        let subscription = self.config.try_signed_subscription(timestamp, signer)?;
         let permit = self.acquire_budget()?;
         let limits = self.config.limits().websocket();
         let websocket_config = WebSocketConfig::default()
@@ -267,7 +267,7 @@ impl CoinbaseDirectSession {
                 map_connect_error(error, &self.budget)
             })
             .await?;
-        self.run_connected(socket, permit, subscription, output, cancellation)
+        self.run_connected(socket, permit, signer, None, output, cancellation)
             .await
     }
 
@@ -289,10 +289,16 @@ impl CoinbaseDirectSession {
                 return Err(SourceError::Cancelled.into());
             }
             self.validate_generation()?;
-            let subscription = self.config.try_signed_subscription(unix_seconds, signer)?;
             let permit = self.acquire_budget()?;
-            self.run_connected(socket, permit, subscription, output, cancellation)
-                .await
+            self.run_connected(
+                socket,
+                permit,
+                signer,
+                Some(unix_seconds),
+                output,
+                cancellation,
+            )
+            .await
         }
         .await;
         self.finish_generation(outcome)
@@ -300,9 +306,10 @@ impl CoinbaseDirectSession {
 
     async fn run_connected<S>(
         &mut self,
-        mut socket: WebSocketStream<S>,
-        connection_permit: BudgetPermit,
-        subscription: CoinbaseSignedSubscription,
+        socket: WebSocketStream<S>,
+        connection_guard: BudgetPermit,
+        signer: &dyn CoinbaseDirectSigningCapability,
+        fixed_unix_seconds: Option<u64>,
         output: &mut dyn CoinbaseDirectOutput,
         cancellation: CancellationToken,
     ) -> Result<(), CoinbaseDirectSessionError>
@@ -310,29 +317,46 @@ impl CoinbaseDirectSession {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let limits = self.config.limits().websocket();
-        let outcome = self
-            .run_connected_inner(
-                &mut socket,
-                connection_permit,
-                subscription,
-                output,
-                &cancellation,
-            )
-            .await;
-        if matches!(
-            outcome,
-            Err(CoinbaseDirectSessionError::Source(SourceError::Cancelled))
-        ) {
-            self.shutdown_socket(&mut socket, output, limits.io_timeout())
-                .await?;
-        }
+        let (outcome, shutdown) = {
+            let mut socket = socket;
+            let outcome = async {
+                let unix_seconds = match fixed_unix_seconds {
+                    Some(unix_seconds) => unix_seconds,
+                    None => current_unix_seconds()?,
+                };
+                if cancellation.is_cancelled() {
+                    return Err(SourceError::Cancelled.into());
+                }
+                self.validate_generation()?;
+                let subscription = self.config.try_signed_subscription(unix_seconds, signer)?;
+                self.validate_generation()?;
+                if cancellation.is_cancelled() {
+                    return Err(SourceError::Cancelled.into());
+                }
+                self.run_connected_inner(&mut socket, subscription, output, &cancellation)
+                    .await
+            };
+            let outcome = outcome.await;
+            let shutdown = if matches!(
+                outcome,
+                Err(CoinbaseDirectSessionError::Source(SourceError::Cancelled))
+            ) {
+                self.shutdown_socket(&mut socket, output, limits.io_timeout())
+                    .await
+            } else {
+                Ok(())
+            };
+            (outcome, shutdown)
+        };
+        // The socket has completed its bounded shutdown or terminal drop before this release.
+        connection_guard.release();
+        shutdown?;
         outcome
     }
 
     async fn run_connected_inner<S>(
         &mut self,
         socket: &mut WebSocketStream<S>,
-        connection_permit: BudgetPermit,
         subscription: CoinbaseSignedSubscription,
         output: &mut dyn CoinbaseDirectOutput,
         cancellation: &CancellationToken,
@@ -341,6 +365,7 @@ impl CoinbaseDirectSession {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let limits = self.config.limits().websocket();
+        self.validate_generation()?;
         send_with_deadline(
             socket,
             Message::Text(subscription.as_str().into()),
@@ -354,7 +379,6 @@ impl CoinbaseDirectSession {
         self.budget
             .record_success()
             .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
-        drop(connection_permit);
 
         self.bootstrap_and_run_live(socket, output, cancellation)
             .await
@@ -369,27 +393,28 @@ impl CoinbaseDirectSession {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        loop {
-            let message = read_with_deadline(
-                socket,
-                output,
-                cancellation,
-                self.config.limits().websocket().io_timeout(),
-            )
-            .await?;
-            if self
-                .handle_message(
-                    socket,
-                    message,
-                    output,
-                    cancellation,
-                    InboundMode::AwaitingAck,
-                )
-                .await?
-                == MessageDisposition::Acknowledged
-            {
-                return Ok(());
+        let io_timeout = self.config.limits().websocket().io_timeout();
+        let acknowledgement = async {
+            loop {
+                let message = read_with_deadline(socket, output, cancellation, io_timeout).await?;
+                if self
+                    .handle_message(
+                        socket,
+                        message,
+                        output,
+                        cancellation,
+                        InboundMode::AwaitingAck,
+                    )
+                    .await?
+                    == MessageDisposition::Acknowledged
+                {
+                    return Ok(());
+                }
             }
+        };
+        match tokio::time::timeout(io_timeout, acknowledgement).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(SourceError::ConnectionIdle.into()),
         }
     }
 
@@ -418,6 +443,9 @@ impl CoinbaseDirectSession {
             .await?;
         let snapshot_capture = self.finish_http_capture(&snapshot_url, snapshot_response)?;
         let snapshot_receipt = snapshot_capture.receipt().clone();
+        let frontier = handoff_frontier_payload(&snapshot_receipt, self.authority.generation());
+        self.await_handoff_frontier(socket, output, cancellation, frontier)
+            .await?;
         self.snapshot_decoder
             .decode_into(&snapshot_capture, &mut self.book)?;
         self.book.begin_replay()?;
@@ -430,6 +458,7 @@ impl CoinbaseDirectSession {
             }
         }
         self.book.finish_replay()?;
+        self.validate_generation()?;
         self.snapshot_receipt = Some(snapshot_receipt);
         self.publish_book(output)?;
 
@@ -444,6 +473,43 @@ impl CoinbaseDirectSession {
             let _disposition = self
                 .handle_message(socket, message, output, cancellation, InboundMode::Live)
                 .await?;
+        }
+    }
+
+    async fn await_handoff_frontier<S>(
+        &mut self,
+        socket: &mut WebSocketStream<S>,
+        output: &mut dyn CoinbaseDirectOutput,
+        cancellation: &CancellationToken,
+        frontier: Bytes,
+    ) -> Result<(), CoinbaseDirectSessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let io_timeout = self.config.limits().websocket().io_timeout();
+        let operation = async {
+            self.validate_generation()?;
+            send_with_deadline(
+                socket,
+                Message::Ping(frontier.clone()),
+                cancellation,
+                io_timeout,
+            )
+            .await?;
+            loop {
+                let message = read_with_deadline(socket, output, cancellation, io_timeout).await?;
+                if matches!(&message, Message::Pong(payload) if payload == &frontier) {
+                    self.validate_generation()?;
+                    return Ok(());
+                }
+                let _disposition = self
+                    .handle_message(socket, message, output, cancellation, InboundMode::Queueing)
+                    .await?;
+            }
+        };
+        match tokio::time::timeout(io_timeout, operation).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(SourceError::ConnectionIdle.into()),
         }
     }
 
@@ -1008,6 +1074,18 @@ fn ensure_frame_bound(actual: usize, maximum: usize) -> Result<(), CoinbaseDirec
     } else {
         Ok(())
     }
+}
+
+fn handoff_frontier_payload(
+    receipt: &SegmentedHttpResponseReceipt,
+    generation: ConnectionGeneration,
+) -> Bytes {
+    let mut payload = [0_u8; 56];
+    payload[..8].copy_from_slice(b"MSQCBF01");
+    payload[8..40].copy_from_slice(&receipt.body_digest().bytes());
+    payload[40..48].copy_from_slice(&receipt.received_at().unix_nanos().to_be_bytes());
+    payload[48..].copy_from_slice(&generation.get().to_be_bytes());
+    Bytes::copy_from_slice(&payload)
 }
 
 fn content_type_is_json(value: Option<&[u8]>) -> bool {

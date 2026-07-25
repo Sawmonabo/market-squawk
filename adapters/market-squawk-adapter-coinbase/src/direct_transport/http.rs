@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{StreamExt as _, future::BoxFuture};
-use market_squawk_sources::{HttpRequestBounds, MAX_RAW_FRAME_BYTES};
+use market_squawk_sources::{HttpRequestBounds, MAX_RAW_FRAME_BYTES, TlsProviderCapability};
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
     USER_AGENT,
@@ -112,7 +112,9 @@ pub(super) struct ReqwestCoinbaseDirectHttpTransport {
 impl ReqwestCoinbaseDirectHttpTransport {
     pub(super) fn try_new(
         bounds: HttpRequestBounds,
+        tls_provider: TlsProviderCapability,
     ) -> Result<Self, CoinbaseDirectHttpTransportError> {
+        let _consumed_provider_identity = tls_provider.provider_id();
         let client = reqwest::Client::builder()
             .https_only(true)
             .tls_backend_rustls()

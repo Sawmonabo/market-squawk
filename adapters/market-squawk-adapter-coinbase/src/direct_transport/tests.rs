@@ -16,9 +16,10 @@ use market_squawk_domain::{
 use market_squawk_live::{DirectBookLimits, DirectSyncPhase};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
-    FreshnessPolicy, LiveSourceGeneration, ProviderBudgetPolicy, ProviderDecimalLexeme,
-    RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
+    BudgetDecision, BudgetScope, BudgetUnavailableReason, FreshnessPolicy, LiveSourceGeneration,
+    ProviderBudgetPolicy, ProviderDecimalLexeme, RawMarketFrame, RawMarketSink, SessionId,
+    SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
@@ -44,7 +45,8 @@ const SNAPSHOT_BODY: &[u8] = br#"{"sequence":100,"time":"2026-07-24T21:34:10.600
 const SEQUENCE_101: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":101,"order_id":"order-101","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_102: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":102,"order_id":"order-102","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_103: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":103,"order_id":"order-103","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
-const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
+const SEQUENCE_104: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","sequence":104,"order_id":"order-104","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
+const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
 const SUBSCRIPTION_ACK: &str =
     r#"{"type":"subscriptions","channels":[{"name":"full","product_ids":["BTC-USD"]}]}"#;
 
@@ -267,6 +269,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
 {
     let config = config()?;
     let (mut registry, session, generation) = live_generation(&config, "direct-transport-happy")?;
+    let budget = session
+        .budget()
+        .ok_or("fixture session lacks its shared provider budget")?
+        .clone();
     let (http, controls) = scripted_http(&config);
     let mut direct =
         CoinbaseDirectSession::try_new_with_transport(config.clone(), generation, http)?;
@@ -299,6 +305,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
 
         controls.product_started.await?;
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
         socket.send(Message::Text(SEQUENCE_101.into())).await?;
         sequence_101_captured.notified().await;
         controls
@@ -307,6 +317,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .map_err(|_| "product request was dropped")?;
 
         controls.snapshot_started.await?;
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
         socket.send(Message::Text(SEQUENCE_102.into())).await?;
         sequence_102_captured.notified().await;
         controls
@@ -314,8 +328,19 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .send(())
             .map_err(|_| "snapshot request was dropped")?;
 
-        first_book.notified().await;
         socket.send(Message::Text(SEQUENCE_103.into())).await?;
+        let frontier = socket
+            .next()
+            .await
+            .ok_or("snapshot handoff frontier Ping was not sent")??;
+        let Message::Ping(frontier) = frontier else {
+            return Err("snapshot handoff frontier was not a Ping".into());
+        };
+        assert_eq!(frontier.len(), 56);
+        socket.send(Message::Pong(frontier)).await?;
+
+        first_book.notified().await;
+        socket.send(Message::Text(SEQUENCE_104.into())).await?;
         socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
         socket
             .send(Message::Ping(Bytes::from_static(b"direct-probe")))
@@ -356,7 +381,7 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         .await?
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-    assert_eq!(output.frames.len(), 5);
+    assert_eq!(output.frames.len(), 6);
     assert_eq!(output.frames[0].payload(), SUBSCRIPTION_ACK.as_bytes());
     assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 1);
@@ -364,13 +389,13 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         output.books,
         [
             RecordedBook {
-                sequence: 102,
+                sequence: 103,
                 snapshot_url: config.snapshot_url().to_owned(),
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
             },
             RecordedBook {
-                sequence: 103,
+                sequence: 104,
                 snapshot_url: config.snapshot_url().to_owned(),
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
@@ -488,7 +513,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
         BudgetScope::for_authorization(identifier("coinbase-exchange")?, &authorization)?,
         NonZeroU32::new(8).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(1).ok_or("zero concurrency")?,
+        NonZeroU16::new(2).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,
