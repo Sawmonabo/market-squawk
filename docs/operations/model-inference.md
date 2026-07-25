@@ -46,11 +46,10 @@ This page documents:
 - the tract-based ONNX graph policy and persistent sibling-worker lifecycle; and
 - restart validation, immutable replay, no-action failure, and recovery.
 
-It does not place Python in the live event-to-decision path, make a model output an order, provide a
-CLI command that trains a model, or grant authority by naming a path. Dataset build output now
-exposes the exact Python export digest, and the sealed release builder binds the final application,
-validator, and ONNX worker. The repository still lacks a supported production training driver and
-ONNX candidate producer/demo, so those first-use demonstrations remain release blockers.
+It does not place Python in the live event-to-decision path, make a model output an order, or grant
+authority by naming a path. Dataset build output exposes the exact Python export digest, and the
+sealed release builder binds the final application, validator, ONNX worker, and supported
+`market-squawk-train` driver.
 
 ## Safety and authority boundaries
 
@@ -843,8 +842,6 @@ There is no CLI de-admit, delete, or “set current” operation:
 | Invalid prediction input | Wrong closed fields, feature count/order, nonfinite value, or zero version | Recreate input from exact `model metadata` |
 | Inference unavailable/deadline | Backend/helper failed, result was late, or termination was uncertain | Treat as `no_action`; inspect and restore the exact runtime before retry |
 | Evaluation evidence disappeared after restart | Retention is deliberately process-local | Use the externally retained command result; do not claim durable evaluation storage |
-| Native training driver unavailable | The repository has no supported production driver or complete first-use demonstration | Preserve the exact dataset/release evidence and wait for the accepted driver; do not promote an ad hoc fixture or notebook |
-| No ONNX candidate producer | Current Python handoff emits native bundles only | Use ONNX only with an independently produced, fully conforming candidate; otherwise remain native |
 
 ## Local state locations
 

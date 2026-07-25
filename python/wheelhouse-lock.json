@@ -902,8 +902,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research.rs",
-      "sha256": "5e234c017d0fa01ef14b8a2df31c2d403cfffaffd131c339dcc05c723cd9652c",
-      "size_bytes": 32764
+      "sha256": "17bd66a8c472b6250e7c81378c31545d04d2eaa3e050052dda9124341124485e",
+      "size_bytes": 33260
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest.rs",

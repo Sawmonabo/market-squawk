@@ -55,7 +55,6 @@ const MACRO_GET_VINTAGES: &str = "Macro.GetVintages";
 const MACRO_GET_REVISIONS: &str = "Macro.GetRevisions";
 
 const MAX_ANALYTICAL_PAGE: usize = 64;
-const RESULT_ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
 const QUERY_ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
 const QUERY_ARTIFACT_OWNER: &str = "market-squawk.research-query";
 
@@ -527,9 +526,6 @@ async fn observation_result(
     });
     let metadata = ToolResultMetadata::try_complete(coverage, quality)
         .map_err(|_error| ServiceError::InvalidResult)?;
-    let maximum_json_bytes = limits
-        .maximum_inline_bytes()
-        .saturating_sub(RESULT_ENVELOPE_RESERVE_BYTES);
     match pinned.result() {
         QueryResult::Inline {
             batches,
@@ -544,9 +540,23 @@ async fn observation_result(
                 return TypedToolResult::try_new(Value::Null, 0, metadata, limits)
                     .map_err(Into::into);
             }
+            let manifest_content = manifest_value(manifest);
+            let empty_content = json!({
+                "manifest": manifest_content.clone(),
+                "arrowIpcBytes": byte_count,
+                "rows": [],
+            });
+            let empty_result =
+                TypedToolResult::try_new(empty_content, returned, metadata.clone(), limits)
+                    .map_err(ServiceError::from)?;
+            let maximum_json_bytes = limits
+                .maximum_result_bytes()
+                .checked_sub(empty_result.encoded_bytes())
+                .and_then(|remaining| remaining.checked_add(2))
+                .ok_or(ServiceError::ResourceExhausted)?;
             let rows = arrow_rows(batches, maximum_json_bytes)?;
             let content = json!({
-                "manifest": manifest_value(manifest),
+                "manifest": manifest_content,
                 "arrowIpcBytes": byte_count,
                 "rows": rows,
             });
