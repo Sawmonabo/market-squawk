@@ -17,9 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::identity::RepositoryIdentity;
 use super::io::{
-    PublishedReport, StableFileIdentity, hash_stable_file, hex_digest, publish_report, sha256_bytes,
+    PublishedReport, StableFileIdentity, hash_stable_file, hex_digest,
+    publish_report_with_identity_barrier, sha256_bytes,
 };
-use super::process::ProcessEvidence;
+use super::process::{ProcessEvidence, process_tree_rss_sample_interval_millis};
 use crate::AppConfig;
 use crate::cli::ReleaseBenchmarkArguments;
 use crate::paper_bot::{ReleasePaperBotBenchmarkComposition, ReleasePaperBotBenchmarkResult};
@@ -42,6 +43,7 @@ struct PerformanceEvidence {
     repository: RepositoryIdentity,
     evidence_authority: EvidenceAuthority,
     application_binary: StableFileIdentity,
+    worker_binding: worker::WorkerBinding,
     onnx_worker_binary: StableFileIdentity,
     cargo_lock: StableFileIdentity,
     rust_toolchain_file: StableFileIdentity,
@@ -127,10 +129,11 @@ struct IntegratedLiveEvidence {
 struct MemoryEvidence {
     warm_plateau_rss_bytes: u64,
     post_measurement_rss_bytes: u64,
-    peak_process_tree_rss_bytes: u64,
+    observed_peak_process_tree_rss_bytes: u64,
     tail_growth_bytes: u64,
     permitted_tail_growth_bytes: u64,
-    sample_interval_millis: u64,
+    current_process_plateau_sample_interval_millis: u64,
+    process_tree_rss_sample_interval_millis: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -140,7 +143,7 @@ struct WorkerMemoryEvidence {
     post_measurement_rss_bytes: u64,
     tail_growth_bytes: u64,
     permitted_tail_growth_bytes: u64,
-    sample_interval_millis: u64,
+    current_process_plateau_sample_interval_millis: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +156,7 @@ struct ThresholdDecision {
     live_queue_bound_passed: bool,
     storage_completed: bool,
     worker_process_completed: bool,
-    worker_process_rss_passed: bool,
+    worker_process_observed_rss_passed: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -239,15 +242,16 @@ pub(super) async fn run(
         bail!("release benchmark worker returned a failed threshold decision");
     }
     let process_completed = supervised.process.exit_code == 0;
-    let process_rss_passed =
+    let process_observed_rss_passed =
         supervised.process.peak_process_tree_rss_bytes <= worker::supervisor_rss_bytes();
-    if !process_completed || !process_rss_passed {
-        bail!("release benchmark worker process did not satisfy its fixed limits");
+    if !process_completed || !process_observed_rss_passed {
+        bail!("release benchmark worker process did not satisfy its fixed observed limits");
     }
     let payload = PerformanceEvidence {
         repository,
         evidence_authority: authority,
         application_binary,
+        worker_binding: supervised.binding,
         onnx_worker_binary,
         cargo_lock,
         rust_toolchain_file,
@@ -263,28 +267,37 @@ pub(super) async fn run(
         memory: MemoryEvidence {
             warm_plateau_rss_bytes: memory.warm_plateau_rss_bytes,
             post_measurement_rss_bytes: memory.post_measurement_rss_bytes,
-            peak_process_tree_rss_bytes: supervised.process.peak_process_tree_rss_bytes,
+            observed_peak_process_tree_rss_bytes: supervised.process.peak_process_tree_rss_bytes,
             tail_growth_bytes: memory.tail_growth_bytes,
             permitted_tail_growth_bytes: memory.permitted_tail_growth_bytes,
-            sample_interval_millis: memory.sample_interval_millis,
+            current_process_plateau_sample_interval_millis: memory
+                .current_process_plateau_sample_interval_millis,
+            process_tree_rss_sample_interval_millis: process_tree_rss_sample_interval_millis(),
         },
         worker_process: supervised.process,
         threshold_decision: ThresholdDecision {
-            passed: threshold_decision.passed && process_completed && process_rss_passed,
+            passed: threshold_decision.passed && process_completed && process_observed_rss_passed,
             live_throughput_passed: threshold_decision.live_throughput_passed,
             live_p99_passed: threshold_decision.live_p99_passed,
             live_tail_growth_passed: threshold_decision.live_tail_growth_passed,
             live_queue_bound_passed: threshold_decision.live_queue_bound_passed,
             storage_completed: threshold_decision.storage_completed,
             worker_process_completed: process_completed,
-            worker_process_rss_passed: process_rss_passed,
+            worker_process_observed_rss_passed: process_observed_rss_passed,
         },
         worker_started_at,
         worker_completed_at,
         started_at,
         completed_at: now(),
     };
-    let published = publish_report(&arguments.output, REPORT_KIND, &payload)?;
+    let published =
+        publish_report_with_identity_barrier(&arguments.output, REPORT_KIND, &payload, || {
+            let binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+            if binary != payload.application_binary {
+                bail!("release benchmark executable changed at the publication barrier");
+            }
+            payload.repository.verify_unchanged()
+        })?;
     Ok(publication_value(&published))
 }
 
@@ -430,7 +443,7 @@ async fn collect_worker_measurements(
             post_measurement_rss_bytes: post_measurement,
             tail_growth_bytes: tail_growth,
             permitted_tail_growth_bytes: permitted_tail_growth,
-            sample_interval_millis: host::memory_sample_interval_millis(),
+            current_process_plateau_sample_interval_millis: host::memory_sample_interval_millis(),
         },
         threshold_decision,
         started_at,

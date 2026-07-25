@@ -41,14 +41,14 @@ impl WorkerEnvelope {
         }
     }
 
-    fn validate(self, expected: &WorkerBinding) -> Result<WorkerMeasurements> {
+    fn validate(self, expected: &WorkerBinding) -> Result<(WorkerBinding, WorkerMeasurements)> {
         if self.schema_version != WORKER_SCHEMA_VERSION
             || self.kind != WORKER_KIND
             || &self.binding != expected
         {
             bail!("release benchmark worker binding did not match the admitted request");
         }
-        Ok(self.measurements)
+        Ok((self.binding, self.measurements))
     }
 }
 
@@ -77,6 +77,7 @@ pub(super) struct WorkerBinding {
     argv_count: u64,
     supervisor_timeout_millis: u64,
     supervisor_rss_bytes: u64,
+    supervisor_process_tree_rss_sample_interval_millis: u64,
 }
 
 impl WorkerBinding {
@@ -112,11 +113,14 @@ impl WorkerBinding {
                 .context("release benchmark argv count exceeds u64")?,
             supervisor_timeout_millis: supervisor_timeout_millis(),
             supervisor_rss_bytes: SUPERVISOR_RSS_BYTES,
+            supervisor_process_tree_rss_sample_interval_millis:
+                process::process_tree_rss_sample_interval_millis(),
         })
     }
 }
 
 pub(super) struct SupervisedWorker {
+    pub(super) binding: WorkerBinding,
     pub(super) measurements: WorkerMeasurements,
     pub(super) process: ProcessEvidence,
 }
@@ -182,8 +186,9 @@ pub(super) fn supervise(
     if output.stdout != canonical {
         bail!("release benchmark worker emitted noncanonical or additional stdout");
     }
-    let measurements = envelope.validate(expected)?;
+    let (binding, measurements) = envelope.validate(expected)?;
     Ok(SupervisedWorker {
+        binding,
         measurements,
         process: output.evidence,
     })

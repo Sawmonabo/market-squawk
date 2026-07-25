@@ -337,6 +337,10 @@ pub(super) struct ProcessOutput {
     pub(super) stdout: Vec<u8>,
 }
 
+pub(super) fn process_tree_rss_sample_interval_millis() -> u64 {
+    u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl CapturedOutput {
     fn retained_text(&self) -> String {
         String::from_utf8_lossy(&self.retained).into_owned()

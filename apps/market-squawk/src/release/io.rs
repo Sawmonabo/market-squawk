@@ -35,6 +35,40 @@ pub(super) fn publish_report<T: Serialize>(
     kind: &'static str,
     payload: &T,
 ) -> Result<PublishedReport> {
+    let bytes = report_bytes(kind, payload)?;
+    write_report(output, &bytes)
+}
+
+pub(super) fn publish_report_with_identity_barrier<T, F>(
+    output: &Path,
+    kind: &'static str,
+    payload: &T,
+    mut revalidate: F,
+) -> Result<PublishedReport>
+where
+    T: Serialize,
+    F: FnMut() -> Result<()>,
+{
+    let bytes = report_bytes(kind, payload)?;
+    revalidate().context("release-evidence pre-publication identity barrier failed")?;
+    let published = write_report(output, &bytes)?;
+    if let Err(revalidation_error) = revalidate() {
+        if let Err(cleanup_error) = remove_created_report(&published) {
+            return Err(anyhow::anyhow!(
+                "release-evidence post-publication identity barrier failed: \
+                 {revalidation_error:#}; just-created report cleanup also failed: \
+                 {cleanup_error:#}"
+            ));
+        }
+        return Err(revalidation_error).context(
+            "release-evidence post-publication identity barrier failed; \
+             the just-created report was removed",
+        );
+    }
+    Ok(published)
+}
+
+fn report_bytes<T: Serialize>(kind: &'static str, payload: &T) -> Result<Vec<u8>> {
     let payload_value =
         serde_json::to_value(payload).context("failed to serialize release-evidence payload")?;
     let payload_bytes = serde_json::to_vec(&payload_value)
@@ -54,6 +88,10 @@ pub(super) fn publish_report<T: Serialize>(
     if bytes.len() > MAXIMUM_REPORT_BYTES {
         bail!("release-evidence report exceeds its fixed bound");
     }
+    Ok(bytes)
+}
+
+fn write_report(output: &Path, bytes: &[u8]) -> Result<PublishedReport> {
     let path = normalized_new_file(output)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -65,10 +103,33 @@ pub(super) fn publish_report<T: Serialize>(
     let mut file = options
         .open(&path)
         .context("release-evidence output could not be created")?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .context("release-evidence output write failed")?;
     file.sync_all()
         .context("release-evidence output synchronization failed")?;
+    sync_parent(&path)?;
+    Ok(PublishedReport {
+        path,
+        sha256: sha256_bytes(bytes),
+        byte_count: bytes.len(),
+    })
+}
+
+fn remove_created_report(published: &PublishedReport) -> Result<()> {
+    let expected_bytes =
+        u64::try_from(published.byte_count).context("release-evidence output size exceeds u64")?;
+    let identity = hash_stable_file(&published.path, expected_bytes)
+        .context("just-created release-evidence output could not be revalidated for cleanup")?;
+    if identity.byte_count != expected_bytes || identity.sha256 != published.sha256 {
+        bail!("refusing to remove a changed release-evidence output");
+    }
+    fs::remove_file(&published.path)
+        .context("just-created release-evidence output could not be removed")?;
+    sync_parent(&published.path)
+        .context("release-evidence parent could not be synchronized after cleanup")
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
     let parent = File::open(
         path.parent()
             .ok_or_else(|| anyhow::anyhow!("release-evidence output has no parent"))?,
@@ -76,12 +137,7 @@ pub(super) fn publish_report<T: Serialize>(
     .context("release-evidence parent could not be opened")?;
     parent
         .sync_all()
-        .context("release-evidence parent synchronization failed")?;
-    Ok(PublishedReport {
-        path,
-        sha256: sha256_bytes(&bytes),
-        byte_count: bytes.len(),
-    })
+        .context("release-evidence parent synchronization failed")
 }
 
 pub(super) fn hash_stable_file(path: &Path, maximum_bytes: u64) -> Result<StableFileIdentity> {
