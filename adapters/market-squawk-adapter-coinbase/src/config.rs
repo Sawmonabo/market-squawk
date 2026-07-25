@@ -434,6 +434,9 @@ pub enum CoinbaseConfigError {
     /// Direct execution terms belong to a different mapped instrument.
     #[error("Coinbase Direct execution terms do not match the mapped instrument")]
     InvalidDirectInstrumentTerms,
+    /// Direct provider budget cannot fund the concurrent WebSocket and REST bootstrap.
+    #[error("Coinbase Direct provider budget cannot fund transport bootstrap")]
+    InvalidDirectBudget,
     /// Direct snapshot, segmentation, replay, or level-3 owner limits are invalid.
     #[error("Coinbase Direct bounds are invalid")]
     InvalidDirectLimits,

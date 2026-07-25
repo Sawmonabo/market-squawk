@@ -47,6 +47,8 @@ const MAX_SIGNING_FIELD_BYTES: usize = 1_024;
 const MAX_SIGNED_SUBSCRIPTION_BYTES: usize = 16 * 1024;
 const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
+const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 2;
+const MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW: u32 = 3;
 
 /// Complete transport, snapshot, queue, and level-3 ownership limits for one product generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +151,7 @@ impl CoinbaseDirectConfig {
         if terms.instrument_id() != mapping.instrument() {
             return Err(CoinbaseConfigError::InvalidDirectInstrumentTerms);
         }
+        validate_direct_budget(&budget)?;
         let product = mapping.product().as_source_identifier().as_str();
         let snapshot_base = format!("{COINBASE_REST_ORIGIN}/products/{product}/book");
         let snapshot_url = format!("{snapshot_base}?level=3");
@@ -379,6 +382,21 @@ impl CoinbaseDirectConfig {
             capture: capture.receipt().clone(),
         })
     }
+}
+
+fn validate_direct_budget(budget: &ProviderBudgetPolicy) -> Result<(), CoinbaseConfigError> {
+    if budget.max_concurrent() < MIN_DIRECT_CONCURRENT_REQUESTS {
+        return Err(CoinbaseConfigError::InvalidDirectBudget);
+    }
+    for index in 0..budget.window_count() {
+        let window = budget
+            .window(index)
+            .ok_or(CoinbaseConfigError::InvalidDirectBudget)?;
+        if window.requests_per_window() < MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW {
+            return Err(CoinbaseConfigError::InvalidDirectBudget);
+        }
+    }
+    Ok(())
 }
 
 fn direct_request_bounds(
@@ -2078,19 +2096,20 @@ mod tests {
     use market_squawk_sources::{
         AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
         AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-        BudgetScope, CurrentSourceSession, FreshnessPolicy, HttpCaptureMethod, ProviderBookSide,
-        ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderOrderChangeReason,
-        ProviderOrderEventKind, RawFrameFactory, SessionId, TransportFrameKind,
+        BudgetScope, BudgetWindowSemantics, CurrentSourceSession, FreshnessPolicy,
+        HttpCaptureMethod, ProviderBookSide, ProviderBudgetPolicy, ProviderBudgetWindow,
+        ProviderDecimalLexeme, ProviderOrderChangeReason, ProviderOrderEventKind, RawFrameFactory,
+        SessionId, TransportFrameKind,
     };
     use sha2::Digest as _;
 
     use crate::{
-        COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectAuthentication, CoinbaseDirectConfig,
-        CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
-        CoinbaseDirectLimits, CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability,
-        CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
-        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseProductMapping,
-        CoinbaseTransportLimits,
+        COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError, CoinbaseDirectAuthentication,
+        CoinbaseDirectConfig, CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome,
+        CoinbaseDirectDecoder, CoinbaseDirectLimits, CoinbaseDirectNonBookKind,
+        CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
+        CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
+        CoinbaseProductMapping, CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2110,6 +2129,13 @@ mod tests {
     }
 
     fn config() -> TestResult<CoinbaseDirectConfig> {
+        Ok(config_with_budget(2, &[(8, 1_000_000_000)])??)
+    }
+
+    fn config_with_budget(
+        max_concurrent: u16,
+        windows: &[(u32, u64)],
+    ) -> TestResult<Result<CoinbaseDirectConfig, CoinbaseConfigError>> {
         let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
         let terms = InstrumentExecutionTerms::try_new(
             instrument,
@@ -2127,18 +2153,27 @@ mod tests {
             evidence(2),
             effective,
         );
-        let budget = ProviderBudgetPolicy::try_new(
+        let windows = windows
+            .iter()
+            .map(|&(requests_per_window, window_nanos)| {
+                Ok(ProviderBudgetWindow::try_new(
+                    NonZeroU32::new(requests_per_window).ok_or("zero request budget")?,
+                    NonZeroU64::new(window_nanos).ok_or("zero budget window")?,
+                    BudgetWindowSemantics::Tumbling,
+                )?)
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let budget = ProviderBudgetPolicy::try_new_conjunctive(
             BudgetScope::for_authorization(id("coinbase-exchange")?, &authorization)?,
-            NonZeroU32::new(8).ok_or("zero request budget")?,
-            NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-            NonZeroU16::new(1).ok_or("zero concurrency")?,
+            &windows,
+            NonZeroU16::new(max_concurrent).ok_or("zero concurrency")?,
             BackoffPolicy::try_new(
                 NonZeroU64::new(1_000_000).ok_or("zero initial backoff")?,
                 NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,
                 1_000,
             )?,
         )?;
-        CoinbaseDirectConfig::try_new(
+        Ok(CoinbaseDirectConfig::try_new(
             SourceId::try_from("coinbase-exchange-direct")?,
             RevisionBoundPayloadEvidence::new(
                 MetadataRevision::new(id("coinbase-direct-2026-07-24")?),
@@ -2167,8 +2202,7 @@ mod tests {
                 8,
                 DirectBookLimits::try_new(128, 64, 32, 512 * 1024, 8)?,
             )?,
-        )
-        .map_err(Into::into)
+        ))
     }
 
     fn capture_authority(
@@ -2326,6 +2360,23 @@ mod tests {
             "full"
         );
         assert!(!format!("{subscription:?}").contains("fixture-pass"));
+        for (case, max_concurrent, short_window_requests, long_window_requests) in [
+            ("concurrency", 1, 3, 3),
+            ("primary window", 2, 2, 3),
+            ("additional window", 2, 3, 2),
+        ] {
+            let outcome = config_with_budget(
+                max_concurrent,
+                &[
+                    (short_window_requests, 1_000_000_000),
+                    (long_window_requests, 2_000_000_000),
+                ],
+            )?;
+            assert!(
+                matches!(outcome, Err(CoinbaseConfigError::InvalidDirectBudget)),
+                "{case} unexpectedly admitted an unusable Direct budget: {outcome:?}"
+            );
+        }
         Ok(())
     }
 
