@@ -706,14 +706,19 @@ The accepted research worktree target removed 8.3 GiB, after which the worktree,
 branch, origin branch, and stale refs were deleted.
 
 Coinbase Direct integrity candidate `6182da007312023ef5fa78a0537ccb273d63a24f` completed final
-independent review with zero Critical, Important, or Minor findings and is integrated at release
-merge `4cb6e02124a3f730430e4e152b1b1f29e7e0f9fe`. The merged tree passed focused order-book,
-decoder, segmented HTTP-receipt, allocation-accounting, strict affected-package Clippy, formatting,
-and diff gates. The completed 970.7 MiB target, worktree, merged local branch, and stale refs were
-removed; no matching origin feature branch existed. The remaining product boundary is
-application-owned credential activation, authenticated transport supervision, rights and
-onboarding reconciliation, central qualification, strategy/risk/paper composition, and an
-authorized unchanged-head trace. Issue `#7` therefore remains open and In Progress.
+independent review with zero Critical, Important, or Minor findings and was integrated at release
+merge `4cb6e02124a3f730430e4e152b1b1f29e7e0f9fe`. The later authenticated Direct transport candidate
+`cef4d59` also completed independent review with zero findings. Its four commits rebased one-for-one
+onto the current release history and were accepted unchanged through `ff406e9`; source authority
+was reconciled at exact integrated head `2e6d6c6faca8bd23e5496a717787a043068dc517`, tree
+`eadc19e1d02324a0af2eef1a0596f4945a9eb239`, with 790 of 790 expected source files locked.
+Focused authenticated-profile, bounded bootstrap/queue, same-owner handoff, and
+sink-rejection-before-mutation tests passed with strict Coinbase/sources Clippy, formatting, and
+diff integrity. The accepted target, worktree, merged local branch, and stale refs were removed;
+no matching origin feature branch existed. The remaining product boundary is application-owned
+credential activation, shared provider-rate authority, shipping composition, central
+qualification, strategy/risk/paper authority, and an authorized unchanged-head trace. Issue `#7`
+therefore remains open and In Progress.
 
 GitHub Actions run `30131065227` at `3ef05dc` created `verify`, `macos`, and `windows` jobs with
 empty step lists; no workflow step executed. This was an external Actions account
@@ -757,10 +762,9 @@ logistic prediction. The release-manifest, evidence, and wheel SHA-256 identitie
 The release branch fast-forwarded unchanged to that candidate. Its 9.0 GiB generated target,
 worktree, and merged local branch were removed; no matching origin branch existed.
 
-Generated Cargo state is approximately 6.1 GiB in root, 5.0 GiB in the active onboarding lane, and
-0.9 GiB in the accepted Coinbase lane. All remain below their enforced ceilings. Task 4 issue `#9`
-is closed and its Project 5 item is `Done`; `#7`, `#10`, `#11`, `#24`, and `#31` remain In Progress,
-and `#25` remains Todo.
-Actions run `30143890262` at accepted research head `37b6641` created three jobs with empty step
+Generated Cargo state is approximately 6.1 GiB in root and 5.0 GiB in the sole active onboarding
+lane. Both remain below their enforced ceilings. Task 4 issue `#9` is closed and its Project 5 item
+is `Done`; `#7`, `#10`, `#11`, `#24`, and `#31` remain In Progress, and `#25` remains Todo.
+Actions run `30144094932` at integrated Coinbase head `2e6d6c6` created three jobs with empty step
 lists. Each check reported that recent account payments failed or the spending limit must be
 increased; no repository checkout or code-owned CI step ran.

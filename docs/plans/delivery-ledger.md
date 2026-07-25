@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `37b664111ff8f3342a9851b411f5fe6b6f16dc97`
-  (`fix(research): preserve bounded MCP overflow`), tree
-  `bda7c091a19fdbda58c365df74aaeb8125fa37d5`.
+  `2e6d6c6faca8bd23e5496a717787a043068dc517`
+  (`build: bind Coinbase Direct release sources`), tree
+  `eadc19e1d02324a0af2eef1a0596f4945a9eb239`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -37,20 +37,24 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Fresh focused evidence at `3ef05dc`: exact production MCP composition, production paper
   composition, and merged point-in-time backtest tests passed; affected services/application/MCP/
   modeling Clippy passed with warnings denied; formatting and diff checks passed.
-- Coinbase Direct integrity candidate `6182da007312023ef5fa78a0537ccb273d63a24f` passed final
-  independent review with zero Critical, Important, or Minor findings and is integrated at
-  `4cb6e02`. The merged tree passed the focused order-book, decoder, HTTP-receipt,
-  allocation-accounting, strict affected-package Clippy, formatting, and diff gates. The core now
-  provides bounded segmented snapshot evidence, level-3 ownership and replay, closed sequence
-  domains, currentness and provider-consistency evidence, and fail-closed quarantine. It is not a
-  runnable authenticated source or `DirectVerified` release authority: credential activation,
-  transport supervision, central qualification, strategy/risk/paper composition, and an authorized
-  unchanged-head trace remain open under issue `#7`.
+- Coinbase Direct integrity candidate `6182da007312023ef5fa78a0537ccb273d63a24f` and authenticated
+  transport candidate `cef4d59` passed independent review with zero Critical, Important, or Minor
+  findings. The transport's four commits were rebased one-for-one onto the integrated release tree
+  and accepted unchanged at `ff406e9`; release-source authority was reconciled at `2e6d6c6` with
+  all 790 expected source files locked. Focused evidence passed for authenticated-profile truth,
+  bounded HTTP bootstrap and sequenced-frame queuing, same-owner handoff to live supervision,
+  sink-rejection-before-state-mutation, strict Coinbase/sources Clippy, formatting, and diff
+  integrity. Shipping credential activation, shared rate authority, application composition,
+  central qualification, strategy/risk/paper authority, and an authorized unchanged-head trace
+  remain open under issue `#7`; the integrated transport alone cannot publish `DirectVerified`
+  authority.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
-  is pruned. Active generated targets are approximately 6.1 GiB in root, 5.0 GiB in the provider
-  onboarding lane, and 0.9 GiB in the accepted Coinbase lane, all below their enforced ceilings.
-- Hosted Actions run `30143890262` at `37b6641` created three jobs with empty step lists. No
+  is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
+  branch is deleted, no matching origin branch existed, and metadata is pruned. Active generated
+  targets are approximately 6.1 GiB in root and 5.0 GiB in the sole provider-onboarding lane, both
+  below their enforced ceilings.
+- Hosted Actions run `30144094932` at `2e6d6c6` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
   payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
 - Documentation execution source head:
