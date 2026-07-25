@@ -120,6 +120,11 @@ pub(super) async fn import_portfolio_manifest(
         PortfolioImportLimits::standard(),
         ownership_evidence,
     );
+    let activation_guard = product
+        .provider_activation_state()
+        .acquire_activation(PORTFOLIO_PROFILE)
+        .await
+        .map_err(|_error| CliPortfolioImportError::AuthorityUnavailable)?;
     let activated = product
         .provider_activation()
         .activate_ready_profile(
@@ -132,6 +137,7 @@ pub(super) async fn import_portfolio_manifest(
     let ProviderActivationOutcome::Research(activated) = activated else {
         return Err(CliPortfolioImportError::Activation);
     };
+    drop(activation_guard);
     let batch = product
         .research_ingest()
         .extract_registered_batch(

@@ -3,6 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -31,6 +32,7 @@ use market_squawk::{
 };
 use market_squawk_data::{
     CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig, RightsBasis,
+    SqliteProviderRateStore,
 };
 use market_squawk_domain::{
     AuthorizationBasis, AvailabilityEvidence, ChecksumCapability, CoverageDelay, DataQuality,
@@ -54,9 +56,9 @@ use market_squawk_sources::{
     CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
     ExtractionRecord, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
     ExtractionSourceError, FreshnessPolicy, HistoricalCapability, MAX_DISCOVERY_OBJECTS,
-    NetworkAccessPolicy, ProviderCapabilityRevision, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile,
+    NetworkAccessPolicy, ProviderCapabilityRevision, ProviderRateAuthority, SourceCapabilities,
+    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider,
+    SourceObject, SourceProtocolProfile,
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use rust_decimal::Decimal;
@@ -76,6 +78,14 @@ impl ProviderPortalActivationAuthority for UnusedAdapterActivation {
         _request: ProviderPortalActivationRequest,
         _cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        Err(ProviderPortalActivationError::Unavailable)
+    }
+
+    async fn cancel(
+        &self,
+        _session_id: Uuid,
+        _cancellation: CancellationToken,
+    ) -> Result<market_squawk::OnboardingSessionView, ProviderPortalActivationError> {
         Err(ProviderPortalActivationError::Unavailable)
     }
 }
@@ -214,7 +224,7 @@ async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_re
         capability_digest,
         Some(generation_two),
         Some(reference_two),
-        Timestamp::from_unix_nanos(0),
+        Timestamp::from_unix_nanos(1),
         metadata,
         rights.clone(),
     )?;
@@ -234,6 +244,7 @@ async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_re
             .as_str(),
         "bls-object-generation-one"
     );
+    coordinator.revoke_provider_generation(&profile, &old)?;
     assert_eq!(prepared.commit()?, candidate);
     assert_eq!(
         coordinator
@@ -288,12 +299,13 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             Duration::from_secs(60),
         )?,
     ));
-    let onboarding = Arc::new(ProviderOnboardingService::try_new(
+    let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
         research.onboarding_catalog(),
         Arc::new(EncryptedFileSecretStore::try_open(
             directory.path().join("discovery-provider-secrets"),
             SecretValue::new("discovery test unlock".to_owned())?,
         )?),
+        provider_rate_authority(&directory.path().join("discovery-provider-rate.sqlite3"))?,
     )?);
     let discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> = Arc::clone(&coordinator) as Arc<_>;
     let source_service = SourceDomainService::try_new(
@@ -978,7 +990,9 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let research = ResearchService::initialize(&paths, catalog, 8, objects)?;
-    let fallback_service = Arc::new(ProviderOnboardingService::try_new(
+    let provider_rate =
+        provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
+    let fallback_service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
         research.onboarding_catalog(),
         Arc::new(
             PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
@@ -986,6 +1000,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
                 directory.path().join("preferred-provider-secrets"),
             )?,
         ),
+        provider_rate.clone(),
     )?);
     assert_eq!(
         fallback_service.encrypted_file_fallback_status()?,
@@ -1043,9 +1058,10 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         directory.path().join("provider-secrets"),
         SecretValue::new("test vault unlock".to_owned())?,
     )?);
-    let service = Arc::new(ProviderOnboardingService::try_new(
+    let service = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
         research.onboarding_catalog(),
         secrets,
+        provider_rate,
     )?);
     let registered = service.register_profile("bls.v2-registered")?;
     let replayed = service.register_profile("bls.v2-registered")?;
@@ -1130,7 +1146,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     portal.shutdown().await?;
 
     assert!(
-        registered.outcome() == ProviderProfileRegistrationOutcome::Inserted
+        registered.outcome() == ProviderProfileRegistrationOutcome::Replay
             && registered.profile().id() == "bls.v2-registered"
             && replayed.outcome() == ProviderProfileRegistrationOutcome::Replay
             && rejected.status() == reqwest::StatusCode::FORBIDDEN
@@ -1449,6 +1465,12 @@ fn fixture_observation(source_id: SourceId) -> Result<ResearchObservation, Box<d
         Decimal::ONE,
         SourceIdentifier::try_from("percent")?,
     )))
+}
+
+fn provider_rate_authority(path: &Path) -> Result<ProviderRateAuthority, Box<dyn Error>> {
+    Ok(ProviderRateAuthority::try_new(Arc::new(
+        SqliteProviderRateStore::try_open(path.to_path_buf())?,
+    ))?)
 }
 
 fn current_timestamp() -> Result<Timestamp, Box<dyn Error>> {

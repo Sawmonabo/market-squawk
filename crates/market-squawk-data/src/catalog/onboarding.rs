@@ -434,6 +434,36 @@ impl CatalogAuthority {
         self.list_provider_onboarding_sessions(limit, true)
     }
 
+    /// Returns one deterministic page of durable session identities for complete startup scans.
+    pub fn provider_onboarding_session_ids_after(
+        &self,
+        after: Option<Uuid>,
+        limit: super::CatalogLimit,
+    ) -> Result<Vec<Uuid>, CatalogError> {
+        self.catalog().enforce_limit(limit)?;
+        let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+        let after = after.map(|session_id| session_id.hyphenated().to_string());
+        let mut statement = self.catalog().connection.prepare(
+            "SELECT session_id
+             FROM provider_onboarding_sessions
+             WHERE (?1 IS NULL OR session_id > ?1)
+             ORDER BY session_id
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, row_limit], |row| row.get::<_, String>(0))?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        let mut sessions = Vec::new();
+        sessions
+            .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+            .map_err(|_| CatalogError::Allocation)?;
+        for row in rows {
+            let encoded = row?;
+            budget.charge([encoded.len()])?;
+            sessions.push(Uuid::parse_str(&encoded).map_err(|_| CatalogError::CorruptCatalog)?);
+        }
+        Ok(sessions)
+    }
+
     fn list_provider_onboarding_sessions(
         &self,
         limit: super::CatalogLimit,

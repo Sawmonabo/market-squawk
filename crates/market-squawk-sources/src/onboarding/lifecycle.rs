@@ -824,6 +824,7 @@ pub struct OnboardingLifecycle {
     anonymous_rights_digest: Option<EvidenceDigest>,
     anonymous_rate_policy_digest: Option<EvidenceDigest>,
     anonymous_runtime_digest: Option<EvidenceDigest>,
+    cancelled: bool,
 }
 
 impl OnboardingLifecycle {
@@ -876,6 +877,7 @@ impl OnboardingLifecycle {
             anonymous_rights_digest: None,
             anonymous_rate_policy_digest: None,
             anonymous_runtime_digest: None,
+            cancelled: false,
         })
     }
 
@@ -1234,14 +1236,15 @@ impl OnboardingLifecycle {
                 if record.state != CredentialGenerationState::Reserved
                     || record.store_plan.is_some()
                     || record.reference.is_some()
-                    || !active_exists
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 record.state = CredentialGenerationState::AbandonedNoEffect;
                 self.candidate_generation = None;
                 self.clear_rotation_operation();
-                self.state = if renewal_required {
+                self.state = if !active_exists {
+                    OnboardingState::Blocked
+                } else if renewal_required {
                     OnboardingState::RenewalRequired
                 } else {
                     OnboardingState::ActiveScoped
@@ -1325,23 +1328,32 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidTransition);
                 } else {
                     self.generation_mut(generation)?.remote_revocation = Some(outcome);
-                    self.state = match (outcome, generation_state) {
-                        (RemoteRevocationOutcome::Indeterminate, _) => {
-                            OnboardingState::IndeterminateRemoteState
-                        }
-                        (_, CredentialGenerationState::CleanupRequired) => {
-                            OnboardingState::CleanupRequired
-                        }
-                        (
-                            RemoteRevocationOutcome::Confirmed | RemoteRevocationOutcome::NotFound,
-                            _,
-                        ) => OnboardingState::ActiveScoped,
-                        (RemoteRevocationOutcome::Unsupported, _) if supports_remote_revocation => {
-                            OnboardingState::RefreshRequired
-                        }
-                        (RemoteRevocationOutcome::Unsupported, _) => OnboardingState::ActiveScoped,
-                        (RemoteRevocationOutcome::Failed, _) => {
-                            OnboardingState::RevocationUnconfirmed
+                    self.state = if self.active_generation.is_none() {
+                        OnboardingState::CleanupRequired
+                    } else {
+                        match (outcome, generation_state) {
+                            (RemoteRevocationOutcome::Indeterminate, _) => {
+                                OnboardingState::IndeterminateRemoteState
+                            }
+                            (_, CredentialGenerationState::CleanupRequired) => {
+                                OnboardingState::CleanupRequired
+                            }
+                            (
+                                RemoteRevocationOutcome::Confirmed
+                                | RemoteRevocationOutcome::NotFound,
+                                _,
+                            ) => OnboardingState::ActiveScoped,
+                            (RemoteRevocationOutcome::Unsupported, _)
+                                if supports_remote_revocation =>
+                            {
+                                OnboardingState::RefreshRequired
+                            }
+                            (RemoteRevocationOutcome::Unsupported, _) => {
+                                OnboardingState::ActiveScoped
+                            }
+                            (RemoteRevocationOutcome::Failed, _) => {
+                                OnboardingState::RevocationUnconfirmed
+                            }
                         }
                     };
                 }
@@ -1359,6 +1371,7 @@ impl OnboardingLifecycle {
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
+                let active_exists = self.active_generation.is_some();
                 let record = self.generation_mut(generation)?;
                 record.local_deletion = Some(outcome);
                 if matches!(
@@ -1369,14 +1382,18 @@ impl OnboardingLifecycle {
                     self.state = OnboardingState::CleanupRequired;
                 } else {
                     record.state = CredentialGenerationState::SupersededRetained;
-                    self.state = match record.remote_revocation {
-                        Some(RemoteRevocationOutcome::Failed) => {
-                            OnboardingState::RevocationUnconfirmed
+                    self.state = if !active_exists {
+                        OnboardingState::CleanupRequired
+                    } else {
+                        match record.remote_revocation {
+                            Some(RemoteRevocationOutcome::Failed) => {
+                                OnboardingState::RevocationUnconfirmed
+                            }
+                            Some(RemoteRevocationOutcome::Indeterminate) => {
+                                OnboardingState::IndeterminateRemoteState
+                            }
+                            _ => OnboardingState::ActiveScoped,
                         }
-                        Some(RemoteRevocationOutcome::Indeterminate) => {
-                            OnboardingState::IndeterminateRemoteState
-                        }
-                        _ => OnboardingState::ActiveScoped,
                     };
                 }
             }
@@ -1421,6 +1438,8 @@ impl OnboardingLifecycle {
                     };
                 } else if self.active_generation.is_some() {
                     self.state = OnboardingState::ActiveScoped;
+                } else {
+                    self.state = OnboardingState::Blocked;
                 }
             }
             OnboardingEvent::RefreshRequired { evidence_digest } => {
@@ -1447,17 +1466,25 @@ impl OnboardingLifecycle {
             } => {
                 require_digest(evidence_digest)?;
                 if let Some(generation) = generation {
+                    let active_is_target = self.active_generation == Some(generation);
                     let record = self.generation_mut(generation)?;
                     if record.reference.is_none() && record.store_plan.is_none() {
                         return Err(OnboardingStateError::InvalidTransition);
                     }
                     record.state = CredentialGenerationState::CleanupRequired;
+                    if active_is_target {
+                        self.active_generation = None;
+                    }
                 }
                 self.state = OnboardingState::CleanupRequired;
             }
-            OnboardingEvent::Blocked { evidence_digest }
-            | OnboardingEvent::Cancelled { evidence_digest } => {
+            OnboardingEvent::Blocked { evidence_digest } => {
                 require_digest(evidence_digest)?;
+                self.state = OnboardingState::Blocked;
+            }
+            OnboardingEvent::Cancelled { evidence_digest } => {
+                require_digest(evidence_digest)?;
+                self.cancelled = true;
                 self.state = OnboardingState::Blocked;
             }
         }
@@ -1628,6 +1655,11 @@ impl OnboardingLifecycle {
     /// Returns the no-credential runtime verification.
     pub const fn anonymous_runtime_digest(&self) -> Option<EvidenceDigest> {
         self.anonymous_runtime_digest
+    }
+
+    /// Returns whether terminal cancellation was durably recorded after cleanup.
+    pub const fn cancellation_recorded(&self) -> bool {
+        self.cancelled
     }
 
     /// Returns the latest separately retained remote-revocation result.

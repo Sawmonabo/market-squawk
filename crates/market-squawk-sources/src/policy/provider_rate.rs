@@ -58,6 +58,36 @@ pub struct ProviderRateDeclaration {
 }
 
 impl ProviderRateDeclaration {
+    /// Derives the conservative governed subject used when a provider has not supplied a verified
+    /// immutable account identifier.
+    ///
+    /// The result is stable across onboarding sessions, credential generations, and process
+    /// restarts. It is derived only from the code-owned provider identity; secret material,
+    /// verification evidence, and session identifiers are deliberately excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation failure when the canonical subject cannot be represented.
+    pub fn governed_provider_subject(
+        provider: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, BudgetPoolError> {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/provider-rate-governed-provider-subject/v1\0");
+        let length = u64::try_from(provider.as_str().len())
+            .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+        digest.update(length.to_be_bytes());
+        digest.update(provider.as_str().as_bytes());
+        let digest: [u8; 32] = digest.finalize().into();
+        let mut encoded = String::with_capacity(83);
+        encoded.push_str("governed-provider-");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        SourceIdentifier::try_from(encoded).map_err(|_| BudgetPoolError::CoordinatorAllocation)
+    }
+
     /// Builds a public-interface declaration from normalized endpoint authority.
     ///
     /// # Errors
@@ -329,6 +359,9 @@ pub enum ProviderRateDecision {
 /// Stable failure classes exposed by a provider-rate store.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ProviderRateStoreError {
+    /// Another live product process owns this exact provider-rate data root.
+    #[error("provider rate authority is already owned")]
+    AlreadyOwned,
     /// SQLite or its controlled path is unavailable.
     #[error("provider rate persistence is unavailable")]
     Unavailable,
@@ -715,9 +748,9 @@ fn map_store_registration_error(error: ProviderRateStoreError) -> BudgetPoolErro
         ProviderRateStoreError::Conflict => BudgetPoolError::ConflictingPolicy,
         ProviderRateStoreError::Capacity => BudgetPoolError::CoordinatorCapacity,
         ProviderRateStoreError::Clock => BudgetPoolError::ClockUnavailable,
-        ProviderRateStoreError::Unavailable | ProviderRateStoreError::Corrupt => {
-            BudgetPoolError::Persistence
-        }
+        ProviderRateStoreError::AlreadyOwned
+        | ProviderRateStoreError::Unavailable
+        | ProviderRateStoreError::Corrupt => BudgetPoolError::Persistence,
     }
 }
 
@@ -725,7 +758,8 @@ fn map_store_runtime_error(error: ProviderRateStoreError) -> BudgetUnavailableRe
     match error {
         ProviderRateStoreError::Clock => BudgetUnavailableReason::ClockUnavailable,
         ProviderRateStoreError::Corrupt => BudgetUnavailableReason::StateCorrupt,
-        ProviderRateStoreError::Unavailable
+        ProviderRateStoreError::AlreadyOwned
+        | ProviderRateStoreError::Unavailable
         | ProviderRateStoreError::Conflict
         | ProviderRateStoreError::Capacity => BudgetUnavailableReason::PersistenceUnavailable,
     }

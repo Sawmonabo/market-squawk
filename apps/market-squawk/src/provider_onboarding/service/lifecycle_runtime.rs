@@ -5,8 +5,8 @@ use std::{sync::Arc, time::Instant};
 use market_squawk_data::CatalogLimit;
 use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::{
-    LocalSecretStoreError, SecretCancellation, SecretInteractionPolicy, SecretKey,
-    SecretOperationControl, SecretReconciliationObservation,
+    LocalSecretStoreError, SecretCancellation, SecretDeletionDisposition, SecretInteractionPolicy,
+    SecretKey, SecretOperationControl, SecretReconciliationObservation,
 };
 use market_squawk_sources::{
     AuthorityVerification, CredentialGenerationState, LocalDeletionOutcome, OnboardingEvent,
@@ -108,6 +108,47 @@ impl ProviderOnboardingService {
                         session_id,
                         Some(generation),
                     ),
+                },
+            };
+            self.append(resumed.reservation(), resumed.next_sequence(), event)?;
+            resumed = self.catalog.resume_provider_onboarding(session_id)?;
+            profile = self.profile_for(&resumed)?;
+        }
+        if capability_is_current
+            && resumed.lifecycle().active_generation().is_none()
+            && !matches!(
+                resumed.lifecycle().state(),
+                OnboardingState::Blocked
+                    | OnboardingState::CleanupRequired
+                    | OnboardingState::RevocationUnconfirmed
+                    | OnboardingState::IndeterminateRemoteState
+            )
+            && resumed.reservation().deadline_at() <= observed_at
+        {
+            let event = match resumed.lifecycle().candidate_generation() {
+                Some(generation)
+                    if resumed.lifecycle().generation_state(generation)
+                        == Some(CredentialGenerationState::Reserved) =>
+                {
+                    OnboardingEvent::CandidateCancelledNoEffect {
+                        generation,
+                        evidence_digest: event_digest(
+                            b"initial-session-expired-no-effect",
+                            session_id,
+                            Some(generation),
+                        ),
+                    }
+                }
+                Some(generation) => OnboardingEvent::CleanupRequired {
+                    generation: Some(generation),
+                    evidence_digest: event_digest(
+                        b"initial-session-expired-cleanup",
+                        session_id,
+                        Some(generation),
+                    ),
+                },
+                None => OnboardingEvent::Cancelled {
+                    evidence_digest: event_digest(b"initial-session-expired", session_id, None),
                 },
             };
             self.append(resumed.reservation(), resumed.next_sequence(), event)?;
@@ -246,11 +287,164 @@ impl ProviderOnboardingService {
         &self,
         limit: CatalogLimit,
     ) -> Result<(), ProviderOnboardingError> {
-        let sessions = self.catalog.current_provider_onboarding_sessions(limit)?;
-        for session in sessions {
-            let _view = self.resume(session.reservation().session_id())?;
+        let mut after = None;
+        loop {
+            let session_ids = self
+                .catalog
+                .provider_onboarding_session_ids_after(after, limit)?;
+            if session_ids.is_empty() {
+                return Ok(());
+            }
+            for session_id in &session_ids {
+                let _view = self.resume(*session_id)?;
+                self.cleanup_startup_unattended(*session_id)?;
+            }
+            after = session_ids.last().copied();
         }
-        Ok(())
+    }
+
+    fn cleanup_startup_unattended(&self, session_id: Uuid) -> Result<(), ProviderOnboardingError> {
+        loop {
+            let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+            let profile = self.current_profile_for(&resumed)?;
+            let lifecycle = resumed.lifecycle();
+            let target = lifecycle.generation_states().find(|(generation, state)| {
+                lifecycle.active_generation() != Some(*generation)
+                    && matches!(
+                        state,
+                        CredentialGenerationState::Reserved
+                            | CredentialGenerationState::SupersededRetained
+                            | CredentialGenerationState::CleanupRequired
+                            | CredentialGenerationState::Retired
+                    )
+            });
+            let Some((generation, state)) = target else {
+                if lifecycle.active_generation().is_none()
+                    && lifecycle.state() == OnboardingState::Blocked
+                    && !lifecycle.cancellation_recorded()
+                    && resumed.reservation().deadline_at() <= system_timestamp()?
+                {
+                    self.append(
+                        resumed.reservation(),
+                        resumed.next_sequence(),
+                        OnboardingEvent::Cancelled {
+                            evidence_digest: event_digest(
+                                b"startup-expired-cleanup-complete",
+                                session_id,
+                                None,
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
+                return Ok(());
+            };
+            if state == CredentialGenerationState::Reserved {
+                if lifecycle.candidate_generation() != Some(generation) {
+                    return Ok(());
+                }
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::CandidateCancelledNoEffect {
+                        generation,
+                        evidence_digest: event_digest(
+                            b"startup-cancelled-no-effect",
+                            session_id,
+                            Some(generation),
+                        ),
+                    },
+                )?;
+                continue;
+            }
+            if state == CredentialGenerationState::Retired {
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::Tombstone { generation },
+                )?;
+                continue;
+            }
+            let deadline = Instant::now()
+                .checked_add(SECRET_OPERATION_DURATION)
+                .ok_or(ProviderOnboardingError::Clock)?;
+            let control = SecretOperationControl::try_new(
+                format!("provider-startup-cleanup-{session_id}-{}", generation.get()),
+                deadline,
+                0,
+                SecretInteractionPolicy::Forbid,
+                SecretCancellation::new(),
+            )?;
+            if let Some(plan) = lifecycle.generation_store_plan(generation).cloned()
+                && lifecycle.generation_reference(generation).is_none()
+            {
+                let key = SecretKey::try_new(
+                    "provider-onboarding",
+                    &format!("{}.{}", profile.id(), session_id.simple()),
+                )?;
+                let outcome = match self.secrets.delete_planned(&key, &plan, &control) {
+                    Ok(SecretDeletionDisposition::Deleted) => SecretStoreClearOutcome::Deleted,
+                    Ok(SecretDeletionDisposition::AlreadyAbsent) => SecretStoreClearOutcome::Absent,
+                    Err(_) => return Ok(()),
+                };
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::SecretStoreCleared {
+                        generation,
+                        reference: plan.target().clone(),
+                        outcome,
+                    },
+                )?;
+                continue;
+            }
+            if lifecycle.generation_remote_revocation(generation).is_none() {
+                if profile.capability().lifecycle_support().remote_revocation() {
+                    return Ok(());
+                }
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::RemoteRevocation {
+                        generation,
+                        outcome: RemoteRevocationOutcome::Unsupported,
+                        evidence_digest: event_digest(
+                            b"startup-remote-revocation-unsupported",
+                            session_id,
+                            Some(generation),
+                        ),
+                    },
+                )?;
+                continue;
+            }
+            if !matches!(
+                lifecycle.generation_local_deletion(generation),
+                Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
+            ) {
+                let Some(reference) = lifecycle.generation_cleanup_reference(generation) else {
+                    return Ok(());
+                };
+                let outcome = match self.secrets.delete(reference, &control) {
+                    Ok(()) => LocalDeletionOutcome::Deleted,
+                    Err(LocalSecretStoreError::NotFound) => LocalDeletionOutcome::NotFound,
+                    Err(_) => return Ok(()),
+                };
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::LocalDeletion {
+                        generation,
+                        outcome,
+                    },
+                )?;
+                continue;
+            }
+            self.append(
+                resumed.reservation(),
+                resumed.next_sequence(),
+                OnboardingEvent::Retire { generation },
+            )?;
+        }
     }
 
     /// Reconciles and retires every non-active credential generation for one current session.
@@ -265,7 +459,7 @@ impl ProviderOnboardingService {
         self.resume(session_id)
     }
 
-    async fn cleanup_superseded_unlocked(
+    pub(super) async fn cleanup_superseded_unlocked(
         &self,
         session_id: Uuid,
         cancellation: CancellationToken,
@@ -298,6 +492,52 @@ impl ProviderOnboardingService {
                     resumed.reservation(),
                     resumed.next_sequence(),
                     OnboardingEvent::Tombstone { generation },
+                )?;
+                continue;
+            }
+            if let Some(plan) = lifecycle.generation_store_plan(generation).cloned()
+                && lifecycle.generation_reference(generation).is_none()
+            {
+                let key = SecretKey::try_new(
+                    "provider-onboarding",
+                    &format!("{}.{}", profile.id(), session_id.simple()),
+                )?;
+                let secrets = Arc::clone(&self.secrets);
+                let target = plan.target().clone();
+                let outcome = await_blocking_secret_operation(
+                    Arc::clone(&self.secret_operations),
+                    cancellation.clone(),
+                    move |operation| {
+                        let deadline = Instant::now()
+                            .checked_add(SECRET_OPERATION_DURATION)
+                            .ok_or(ProviderOnboardingError::Clock)?;
+                        let control = SecretOperationControl::try_new(
+                            format!("provider-planned-cleanup-{session_id}-{}", generation.get()),
+                            deadline,
+                            0,
+                            SecretInteractionPolicy::AllowPlatformPrompt,
+                            operation,
+                        )?;
+                        match secrets.delete_planned(&key, &plan, &control) {
+                            Ok(SecretDeletionDisposition::Deleted) => {
+                                Ok(SecretStoreClearOutcome::Deleted)
+                            }
+                            Ok(SecretDeletionDisposition::AlreadyAbsent) => {
+                                Ok(SecretStoreClearOutcome::Absent)
+                            }
+                            Err(failure) => Err(failure.into_error().into()),
+                        }
+                    },
+                )
+                .await?;
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::SecretStoreCleared {
+                        generation,
+                        reference: target,
+                        outcome,
+                    },
                 )?;
                 continue;
             }

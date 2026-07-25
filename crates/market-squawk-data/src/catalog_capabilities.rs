@@ -181,6 +181,16 @@ impl OnboardingCatalogCapability {
         self.lock()?.current_provider_onboarding_sessions(limit)
     }
 
+    /// Returns one deterministic page of session identities for complete startup reconciliation.
+    pub fn provider_onboarding_session_ids_after(
+        &self,
+        after: Option<Uuid>,
+        limit: CatalogLimit,
+    ) -> Result<Vec<Uuid>, CatalogError> {
+        self.lock()?
+            .provider_onboarding_session_ids_after(after, limit)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
         self.authority
             .lock()

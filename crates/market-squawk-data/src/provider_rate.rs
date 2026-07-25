@@ -1,9 +1,14 @@
 //! SQLite-backed aggregate provider request and connection admission.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
     AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics, ProviderBudgetPolicy,
@@ -27,6 +32,7 @@ const MAXIMUM_DECLARATIONS: i64 = 4_096;
 const MAXIMUM_COLLISION_KEYS: usize = 64;
 const COLLISION_KEY_BYTES: usize = 33;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(750);
+const OWNER_LOCK_FILE: &str = "provider-rate-authority.owner.lock";
 
 const SCHEMA: &str = r#"
 CREATE TABLE provider_rate_runs (
@@ -85,6 +91,21 @@ CREATE INDEX provider_rate_permits_group
 #[derive(Clone, Debug)]
 pub struct SqliteProviderRateStore {
     path: PathBuf,
+    owner: Arc<ProviderRateOwnerLease>,
+}
+
+struct ProviderRateOwnerLease {
+    _file: File,
+    run_id: Mutex<Option<ProviderRateRunId>>,
+}
+
+impl std::fmt::Debug for ProviderRateOwnerLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRateOwnerLease")
+            .field("file", &"[EXCLUSIVE OWNER LOCK]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteProviderRateStore {
@@ -96,6 +117,7 @@ impl SqliteProviderRateStore {
     /// configuration, and corrupt state.
     pub fn try_open(path: impl Into<PathBuf>) -> Result<Self, ProviderRateStoreError> {
         let path = prepare_path(path.into())?;
+        let owner = Arc::new(acquire_owner_lease(&path)?);
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -107,7 +129,7 @@ impl SqliteProviderRateStore {
         harden_file_permissions(&path)?;
         verify_connection_configuration(&connection)?;
         verify_database_integrity(&connection)?;
-        Ok(Self { path })
+        Ok(Self { path, owner })
     }
 
     fn connection(&self) -> Result<Connection, ProviderRateStoreError> {
@@ -125,6 +147,14 @@ impl SqliteProviderRateStore {
 
 impl ProviderRateStore for SqliteProviderRateStore {
     fn start_run(&self, now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+        let mut owned_run = self
+            .owner
+            .run_id
+            .lock()
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if let Some(run_id) = *owned_run {
+            return Ok(run_id);
+        }
         let mut connection = self.connection()?;
         let transaction = immediate(&mut connection)?;
         validate_global_clock(&transaction, now)?;
@@ -169,6 +199,7 @@ impl ProviderRateStore for SqliteProviderRateStore {
             )
             .map_err(map_sql)?;
         transaction.commit().map_err(map_sql)?;
+        *owned_run = Some(run_id);
         Ok(run_id)
     }
 
@@ -529,6 +560,73 @@ impl ProviderRateStore for SqliteProviderRateStore {
             Ok(subject)
         })
         .transpose()
+    }
+}
+
+fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRateStoreError> {
+    let parent = path.parent().ok_or(ProviderRateStoreError::Unavailable)?;
+    let directory = Dir::open_ambient_dir(parent, ambient_authority())
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    reject_unsafe_owner_entry(&directory)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    options.follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let file = directory
+        .open_with(OWNER_LOCK_FILE, &options)
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    let named = directory
+        .symlink_metadata(OWNER_LOCK_FILE)
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    if !metadata.is_file()
+        || !named.is_file()
+        || (metadata.dev(), metadata.ino()) != (named.dev(), named.ino())
+        || metadata.nlink() != 1
+    {
+        return Err(ProviderRateStoreError::Unavailable);
+    }
+    let file = file.into_std();
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(ProviderRateStoreError::AlreadyOwned);
+        }
+        Err(_) => return Err(ProviderRateStoreError::Unavailable),
+    }
+    let locked = file
+        .metadata()
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    let named = directory
+        .symlink_metadata(OWNER_LOCK_FILE)
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
+    if !locked.is_file()
+        || !named.is_file()
+        || (locked.dev(), locked.ino()) != (named.dev(), named.ino())
+        || locked.nlink() != 1
+    {
+        return Err(ProviderRateStoreError::Unavailable);
+    }
+    harden_file_permissions(&parent.join(OWNER_LOCK_FILE))?;
+    Ok(ProviderRateOwnerLease {
+        _file: file,
+        run_id: Mutex::new(None),
+    })
+}
+
+fn reject_unsafe_owner_entry(directory: &Dir) -> Result<(), ProviderRateStoreError> {
+    match directory.symlink_metadata(OWNER_LOCK_FILE) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Ok(()),
+        Ok(_) => Err(ProviderRateStoreError::Unavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ProviderRateStoreError::Unavailable),
     }
 }
 

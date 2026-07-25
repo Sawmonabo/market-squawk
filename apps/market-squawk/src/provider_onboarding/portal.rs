@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::contracts::{
-    OnboardingNextAction, OnboardingSessionView, ProviderPortalActivationRequest,
-    ProviderPortalActivationView, ProviderProfileView,
+    OnboardingSessionView, ProviderPortalActivationRequest, ProviderPortalActivationView,
+    ProviderProfileView,
 };
 use super::service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 
@@ -49,6 +49,13 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         request: ProviderPortalActivationRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError>;
+
+    /// Revokes callable runtime authority before deterministic onboarding cleanup.
+    async fn cancel(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<OnboardingSessionView, ProviderPortalActivationError>;
 }
 
 /// Closed portal-facing adapter activation failure.
@@ -477,13 +484,6 @@ async fn dispatch(
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
             let input: ProviderPortalActivationRequest =
                 serde_json::from_slice(&body).map_err(|_| PortalRequestError::InvalidBody)?;
-            let session = service.resume(session_id)?;
-            if matches!(
-                session.next_action(),
-                OnboardingNextAction::VerifyAndActivate | OnboardingNextAction::VerifyAndCutover
-            ) {
-                let _lease = service.activate(session_id, cancellation.clone()).await?;
-            }
             let activated = activation.activate(session_id, input, cancellation).await?;
             return Ok(json_response(StatusCode::OK, &activated));
         }
@@ -505,7 +505,8 @@ async fn dispatch(
             validate_mutation(&request, &security, "application/json")?;
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
             require_empty_json_body(&body)?;
-            return Ok(json_response(StatusCode::OK, &service.cancel(session_id)?));
+            let status = activation.cancel(session_id, cancellation).await?;
+            return Ok(json_response(StatusCode::OK, &status));
         }
     }
     Err(PortalRequestError::NotFound)

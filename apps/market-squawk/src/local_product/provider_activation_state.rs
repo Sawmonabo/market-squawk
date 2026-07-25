@@ -1,6 +1,7 @@
 //! Crash-safe, secret-free persistence for reconstructible research-provider activation.
 
-use std::collections::BTreeMap;
+mod evidence;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,10 +13,13 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-const RECIPE_SCHEMA_VERSION: u16 = 2;
-const QUARANTINE_SCHEMA_VERSION: u16 = 1;
+pub(super) use evidence::ActivationEvidenceCandidate;
+
+const RECIPE_SCHEMA_VERSION: u16 = 3;
+const LEGACY_RECIPE_SCHEMA_VERSION: u16 = 2;
+const QUARANTINE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
-const MAXIMUM_EVIDENCE_OBJECTS: usize = 1_024;
+const MAXIMUM_RECIPE_EVIDENCE_OBJECTS: usize = 1_024;
 const ACTIVATION_STATE_DIRECTORY: &str = "sources/provider-activation-v1";
 
 pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 6] = [
@@ -25,6 +29,16 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 6] = [
     "treasury.daily-rates-xml",
     "treasury.fiscal-data",
     "fred-alfred.api-v1-v2",
+];
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
+    "sec.edgar-public",
+    "bls.v1-unregistered",
+    "bls.v2-registered",
+    "treasury.daily-rates-xml",
+    "treasury.fiscal-data",
+    "fred-alfred.api-v1-v2",
+    "local.files",
+    "local.portfolio-imports",
 ];
 
 /// Exact activation recipe recovered from crash-safe application-owned state.
@@ -43,6 +57,8 @@ pub(super) enum DurableActivationRecipeState {
     Missing,
     /// One exact activation is durable and must be reconstructed on restart.
     Desired(DurableActivationRecipe),
+    /// One exact adapter was prepared but durable onboarding/callable cutover did not complete.
+    Staged(DurableActivationRecipe),
     /// Prior state was disabled and requires a new onboarding activation.
     Quarantined(DurableActivationQuarantine),
 }
@@ -52,6 +68,7 @@ pub(super) struct DurableActivationQuarantine {
     pub(super) session_id: Option<Uuid>,
     pub(super) reason: DurableActivationQuarantineReason,
     pub(super) state_digest: EvidenceDigest,
+    pub(super) evidence_digests: Vec<String>,
 }
 
 /// Code-owned reasons that disable one provider without blocking the rest of the product.
@@ -66,57 +83,34 @@ pub(super) enum DurableActivationQuarantineReason {
     AuthorityInvalidated,
     /// Adapter reconstruction rejected the retained exact configuration.
     AdapterRejected,
+    /// The owning application operation cancelled and withdrew this exact activation.
+    Cancelled,
 }
 
 /// Controlled persistence for activation recipes and their digest-addressed evidence objects.
 #[derive(Clone)]
 pub(super) struct DurableProviderActivationState {
     root: PathBuf,
-    activation_gates: Arc<BTreeMap<&'static str, Arc<AsyncMutex<()>>>>,
+    activation_gate: Arc<AsyncMutex<()>>,
 }
 
 impl DurableProviderActivationState {
     pub(super) fn new(control_root: PathBuf) -> Self {
         Self {
             root: control_root.join(ACTIVATION_STATE_DIRECTORY),
-            activation_gates: Arc::new(
-                RESTORABLE_RESEARCH_SURFACES
-                    .into_iter()
-                    .map(|surface_id| (surface_id, Arc::new(AsyncMutex::new(()))))
-                    .collect(),
-            ),
+            activation_gate: Arc::new(AsyncMutex::new(())),
         }
     }
 
-    /// Serializes activation publication for one exact provider surface.
+    /// Serializes every activation that can mutate the shared runtime or evidence index.
     pub(super) async fn acquire_activation(
         &self,
         surface_id: &str,
     ) -> Result<OwnedMutexGuard<()>, DurableProviderActivationStateError> {
-        surface_key(surface_id)?;
-        let gate = self
-            .activation_gates
-            .get(surface_id)
-            .cloned()
-            .ok_or(DurableProviderActivationStateError::UnknownSurface)?;
-        Ok(gate.lock_owned().await)
-    }
-
-    pub(super) fn persist_evidence(
-        &self,
-        sha256: &str,
-        bytes: &[u8],
-    ) -> Result<(), DurableProviderActivationStateError> {
-        validate_sha256(sha256)?;
-        if sha256_bytes(bytes) != sha256 {
-            return Err(DurableProviderActivationStateError::Integrity);
+        if !SERIALIZED_RESEARCH_SURFACES.contains(&surface_id) {
+            return Err(DurableProviderActivationStateError::UnknownSurface);
         }
-        let store = LocalAuthorityStateStore::try_open(self.evidence_root(sha256))?;
-        match store.load()? {
-            Some(existing) if existing == bytes => Ok(()),
-            Some(_) => Err(DurableProviderActivationStateError::Integrity),
-            None => store.store(bytes).map_err(Into::into),
-        }
+        Ok(Arc::clone(&self.activation_gate).lock_owned().await)
     }
 
     pub(super) fn load_evidence(
@@ -124,11 +118,7 @@ impl DurableProviderActivationState {
         sha256: &str,
         maximum_bytes: u64,
     ) -> Result<StoredActivationEvidence, DurableProviderActivationStateError> {
-        validate_sha256(sha256)?;
-        let store = LocalAuthorityStateStore::try_open(self.evidence_root(sha256))?;
-        let bytes = store
-            .load()?
-            .ok_or(DurableProviderActivationStateError::MissingEvidence)?;
+        let bytes = self.load_indexed_evidence(sha256, maximum_bytes)?;
         let length = u64::try_from(bytes.len())
             .map_err(|_| DurableProviderActivationStateError::ResourceExhausted)?;
         if length > maximum_bytes || sha256_bytes(&bytes) != sha256 {
@@ -145,6 +135,7 @@ impl DurableProviderActivationState {
         clippy::too_many_arguments,
         reason = "independent authority dimensions stay explicit for review and exact CAS"
     )]
+    #[cfg(test)]
     pub(super) fn publish_recipe(
         &self,
         surface_id: &str,
@@ -155,6 +146,59 @@ impl DurableProviderActivationState {
         runtime_generation_digest: EvidenceDigest,
         predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        self.publish_recipe_with_state(
+            surface_id,
+            expected_state_digest,
+            session_id,
+            request_bytes,
+            evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+            RecipePublicationState::Desired,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent authority dimensions stay explicit for review and exact CAS"
+    )]
+    pub(super) fn publish_staged_recipe(
+        &self,
+        surface_id: &str,
+        expected_state_digest: Option<EvidenceDigest>,
+        session_id: Uuid,
+        request_bytes: &[u8],
+        evidence_digests: &[String],
+        runtime_generation_digest: EvidenceDigest,
+        predecessor_runtime_generation_digest: Option<EvidenceDigest>,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        self.publish_recipe_with_state(
+            surface_id,
+            expected_state_digest,
+            session_id,
+            request_bytes,
+            evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+            RecipePublicationState::Staged,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent authority dimensions stay explicit for review and exact CAS"
+    )]
+    fn publish_recipe_with_state(
+        &self,
+        surface_id: &str,
+        expected_state_digest: Option<EvidenceDigest>,
+        session_id: Uuid,
+        request_bytes: &[u8],
+        evidence_digests: &[String],
+        runtime_generation_digest: EvidenceDigest,
+        predecessor_runtime_generation_digest: Option<EvidenceDigest>,
+        publication_state: RecipePublicationState,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
         let key = surface_key(surface_id)?;
         let (encoded, state_digest) = encode_recipe(
             surface_id,
@@ -163,6 +207,7 @@ impl DurableProviderActivationState {
             evidence_digests,
             runtime_generation_digest,
             predecessor_runtime_generation_digest,
+            publication_state,
         )?;
         let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
         let current = store.load()?;
@@ -171,6 +216,39 @@ impl DurableProviderActivationState {
         }
         store.store(&encoded)?;
         Ok(state_digest)
+    }
+
+    /// Promotes only the exact staged recipe to restart-desired authority.
+    pub(super) fn promote_staged_recipe(
+        &self,
+        surface_id: &str,
+        expected_staged_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        let DurableActivationRecipeState::Staged(recipe) = self.load_recipe(surface_id)? else {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        };
+        if recipe.state_digest != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let key = surface_key(surface_id)?;
+        let (encoded, desired_digest) = encode_recipe(
+            surface_id,
+            recipe.session_id,
+            &recipe.request_bytes,
+            &recipe.evidence_digests,
+            recipe.runtime_generation_digest,
+            recipe.predecessor_runtime_generation_digest,
+            RecipePublicationState::Desired,
+        )?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store
+            .load()?
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        if digest_bytes(&current) != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&encoded)?;
+        Ok(desired_digest)
     }
 
     /// Computes the exact candidate-state digest without publishing it.
@@ -191,6 +269,7 @@ impl DurableProviderActivationState {
             evidence_digests,
             runtime_generation_digest,
             predecessor_runtime_generation_digest,
+            RecipePublicationState::Desired,
         )
         .map(|(_encoded, digest)| digest)
     }
@@ -222,8 +301,13 @@ impl DurableProviderActivationState {
                 || quarantine.record_kind != QUARANTINE_RECORD_KIND
                 || quarantine.surface_id != surface_id
                 || !valid_sha256(&quarantine.state_sha256)
+                || quarantine.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
+                || !strictly_ordered(&quarantine.evidence_digests)
             {
                 return Err(DurableProviderActivationStateError::InvalidRecipe);
+            }
+            for digest in &quarantine.evidence_digests {
+                validate_sha256(digest)?;
             }
             let state_digest = digest_from_lower_hex(&quarantine.state_sha256)?;
             return Ok(DurableActivationRecipeState::Quarantined(
@@ -231,15 +315,18 @@ impl DurableProviderActivationState {
                     session_id: quarantine.session_id,
                     reason: quarantine.reason,
                     state_digest,
+                    evidence_digests: quarantine.evidence_digests,
                 },
             ));
         }
         let recipe: RecipeWire = serde_json::from_slice(&encoded)
             .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
-        if recipe.schema_version != RECIPE_SCHEMA_VERSION
-            || recipe.surface_id != surface_id
+        if !matches!(
+            recipe.schema_version,
+            RECIPE_SCHEMA_VERSION | LEGACY_RECIPE_SCHEMA_VERSION
+        ) || recipe.surface_id != surface_id
             || recipe.request_json.is_empty()
-            || recipe.evidence_digests.len() > MAXIMUM_EVIDENCE_OBJECTS
+            || recipe.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
             || !strictly_ordered(&recipe.evidence_digests)
         {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
@@ -256,9 +343,12 @@ impl DurableProviderActivationState {
         if predecessor_runtime_generation_digest == Some(runtime_generation_digest) {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         }
+        let publication_state = recipe.publication_state;
         let request_bytes = recipe.request_json.into_bytes();
         if sha256_bytes(&request_bytes) != recipe.request_sha256
             || bundle_digest(
+                recipe.schema_version,
+                publication_state,
                 surface_id,
                 recipe.session_id,
                 &request_bytes,
@@ -269,16 +359,18 @@ impl DurableProviderActivationState {
         {
             return Err(DurableProviderActivationStateError::Integrity);
         }
-        Ok(DurableActivationRecipeState::Desired(
-            DurableActivationRecipe {
-                session_id: recipe.session_id,
-                request_bytes: request_bytes.into_boxed_slice(),
-                evidence_digests: recipe.evidence_digests,
-                runtime_generation_digest,
-                predecessor_runtime_generation_digest,
-                state_digest,
-            },
-        ))
+        let recipe = DurableActivationRecipe {
+            session_id: recipe.session_id,
+            request_bytes: request_bytes.into_boxed_slice(),
+            evidence_digests: recipe.evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+            state_digest,
+        };
+        Ok(match publication_state {
+            RecipePublicationState::Desired => DurableActivationRecipeState::Desired(recipe),
+            RecipePublicationState::Staged => DurableActivationRecipeState::Staged(recipe),
+        })
     }
 
     /// Replaces unreadable or superseded activation state with an explicit disabled record.
@@ -324,8 +416,23 @@ impl DurableProviderActivationState {
         self.root.join("recipes").join(key)
     }
 
-    fn evidence_root(&self, sha256: &str) -> PathBuf {
-        self.root.join("evidence").join(sha256)
+    pub(super) fn referenced_evidence_digests(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, DurableProviderActivationStateError> {
+        let mut referenced = std::collections::BTreeSet::new();
+        for surface_id in RESTORABLE_RESEARCH_SURFACES {
+            match self.load_recipe(surface_id)? {
+                DurableActivationRecipeState::Missing => {}
+                DurableActivationRecipeState::Desired(recipe)
+                | DurableActivationRecipeState::Staged(recipe) => {
+                    referenced.extend(recipe.evidence_digests);
+                }
+                DurableActivationRecipeState::Quarantined(quarantine) => {
+                    referenced.extend(quarantine.evidence_digests);
+                }
+            }
+        }
+        Ok(referenced)
     }
 }
 
@@ -340,12 +447,27 @@ fn quarantine_encoded(
         && existing.record_kind == QUARANTINE_RECORD_KIND
         && existing.surface_id == surface_id
         && valid_sha256(&existing.state_sha256)
+        && existing.evidence_digests.len() <= MAXIMUM_RECIPE_EVIDENCE_OBJECTS
+        && strictly_ordered(&existing.evidence_digests)
+        && existing
+            .evidence_digests
+            .iter()
+            .all(|digest| valid_sha256(digest))
     {
         return digest_from_lower_hex(&existing.state_sha256);
     }
-    let session_id = serde_json::from_slice::<RecipeWire>(encoded)
-        .ok()
-        .map(|recipe| recipe.session_id);
+    let recipe = serde_json::from_slice::<RecipeWire>(encoded).ok();
+    let session_id = recipe.as_ref().map(|recipe| recipe.session_id);
+    let mut evidence_digests = recipe
+        .map(|recipe| recipe.evidence_digests)
+        .unwrap_or_default();
+    evidence_digests.sort_unstable();
+    evidence_digests.dedup();
+    if evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
+        || evidence_digests.iter().any(|digest| !valid_sha256(digest))
+    {
+        evidence_digests.clear();
+    }
     let state_sha256 = sha256_bytes(encoded);
     let state_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(encoded).into());
     let quarantine = QuarantineWire {
@@ -355,6 +477,7 @@ fn quarantine_encoded(
         session_id,
         state_sha256,
         reason,
+        evidence_digests,
     };
     let encoded = serde_json::to_vec(&quarantine)
         .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
@@ -398,6 +521,16 @@ struct RecipeWire {
     predecessor_runtime_generation_sha256: Option<String>,
     bundle_sha256: String,
     request_json: String,
+    #[serde(default)]
+    publication_state: RecipePublicationState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecipePublicationState {
+    Staged,
+    #[default]
+    Desired,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -409,6 +542,7 @@ struct QuarantineWire {
     session_id: Option<Uuid>,
     state_sha256: String,
     reason: DurableActivationQuarantineReason,
+    evidence_digests: Vec<String>,
 }
 
 fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivationStateError> {
@@ -430,6 +564,7 @@ fn encode_recipe(
     evidence_digests: &[String],
     runtime_generation_digest: EvidenceDigest,
     predecessor_runtime_generation_digest: Option<EvidenceDigest>,
+    publication_state: RecipePublicationState,
 ) -> Result<(Vec<u8>, EvidenceDigest), DurableProviderActivationStateError> {
     if request_bytes.is_empty()
         || runtime_generation_digest.bytes() == [0; 32]
@@ -443,7 +578,7 @@ fn encode_recipe(
     let mut evidence_digests = evidence_digests.to_vec();
     evidence_digests.sort_unstable();
     evidence_digests.dedup();
-    if evidence_digests.len() > MAXIMUM_EVIDENCE_OBJECTS {
+    if evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS {
         return Err(DurableProviderActivationStateError::ResourceExhausted);
     }
     for digest in &evidence_digests {
@@ -458,6 +593,8 @@ fn encode_recipe(
         predecessor_runtime_generation_sha256: predecessor_runtime_generation_digest
             .map(|digest| lower_hex(&digest.bytes())),
         bundle_sha256: bundle_digest(
+            RECIPE_SCHEMA_VERSION,
+            publication_state,
             surface_id,
             session_id,
             request_bytes,
@@ -467,6 +604,7 @@ fn encode_recipe(
         )?,
         evidence_digests,
         request_json,
+        publication_state,
     };
     let encoded = serde_json::to_vec(&recipe)
         .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
@@ -479,6 +617,8 @@ fn digest_bytes(bytes: &[u8]) -> EvidenceDigest {
 }
 
 fn bundle_digest(
+    schema_version: u16,
+    publication_state: RecipePublicationState,
     surface_id: &str,
     session_id: Uuid,
     request_bytes: &[u8],
@@ -487,7 +627,19 @@ fn bundle_digest(
     predecessor_runtime_generation_digest: Option<EvidenceDigest>,
 ) -> Result<String, DurableProviderActivationStateError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk:durable-provider-activation:v2");
+    match schema_version {
+        LEGACY_RECIPE_SCHEMA_VERSION => {
+            hasher.update(b"market-squawk:durable-provider-activation:v2");
+        }
+        RECIPE_SCHEMA_VERSION => {
+            hasher.update(b"market-squawk:durable-provider-activation:v3");
+            hasher.update([match publication_state {
+                RecipePublicationState::Staged => 0,
+                RecipePublicationState::Desired => 1,
+            }]);
+        }
+        _ => return Err(DurableProviderActivationStateError::InvalidRecipe),
+    }
     hash_field(&mut hasher, surface_id.as_bytes())?;
     hasher.update(session_id.as_bytes());
     hash_field(&mut hasher, request_bytes)?;
@@ -591,6 +743,8 @@ pub(super) enum DurableProviderActivationStateError {
     ResourceExhausted,
     #[error("provider activation state changed before exact publication")]
     StaleState,
+    #[error("provider activation evidence reclamation failed")]
+    EvidenceReclamation(#[source] std::io::Error),
     #[error(transparent)]
     Store(#[from] LocalAuthorityStateStoreError),
 }

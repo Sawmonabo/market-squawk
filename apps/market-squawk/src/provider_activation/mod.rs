@@ -27,7 +27,8 @@ use crate::{
     ProviderOnboardingError, ProviderOnboardingService,
 };
 use market_squawk_sources::{
-    AuthorizationMode, DataUseOperation, ProviderRateAuthority, SourceMetadata,
+    AuthorizationMode, DataUseOperation, ProviderRateAuthority, ProviderRateDeclaration,
+    SourceMetadata,
 };
 
 pub use specs::{
@@ -81,7 +82,7 @@ impl ProviderAdapterActivation {
     ///
     /// Fails closed for refresh-required or rights-blocked profiles, request/surface mismatch,
     /// cancellation, invalid provider configuration, or durable registry rejection.
-    pub async fn activate_ready_profile(
+    pub(crate) async fn activate_ready_profile(
         &self,
         session_id: Uuid,
         request: ProviderAdapterActivationRequest,
@@ -134,7 +135,7 @@ impl ProviderAdapterActivation {
     ///
     /// Fails closed when the durable session is not active or when the retained adapter request
     /// no longer satisfies its exact provider contract.
-    pub fn restore_active_profile(
+    pub(crate) fn restore_active_profile(
         &self,
         session_id: Uuid,
         request: ProviderAdapterActivationRequest,
@@ -150,6 +151,16 @@ impl ProviderAdapterActivation {
     ) -> Result<Option<ResearchProviderRuntimeGeneration>, ProviderAdapterActivationError> {
         self.research
             .provider_runtime_generation(profile)
+            .map_err(Into::into)
+    }
+
+    /// Revokes the exact research generation and all in-flight or retained request authority.
+    pub(crate) fn revoke_research_runtime(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        self.research
+            .revoke_provider_generation(expected.profile(), expected)
             .map_err(Into::into)
     }
 
@@ -177,7 +188,7 @@ impl ProviderAdapterActivation {
     /// Fully constructs and reserves an exact credential-generation replacement.
     pub(crate) async fn prepare_research_replacement(
         &self,
-        session_id: Uuid,
+        lease: ProviderActivationLease,
         request: ProviderAdapterActivationRequest,
         expected: ResearchProviderRuntimeGeneration,
         cancellation: CancellationToken,
@@ -185,15 +196,14 @@ impl ProviderAdapterActivation {
         if cancellation.is_cancelled() {
             return Err(ProviderAdapterActivationError::Cancelled);
         }
-        let lease = self.onboarding.activation_lease(session_id)?;
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
-        self.bind_authorization_subject(&lease, candidate.metadata())?;
+        self.bind_authorization_subject(candidate.metadata())?;
         let prepared = match request {
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
                 let secret = self
                     .onboarding
-                    .read_active_secret_for_request(&lease, cancellation.clone())
+                    .read_secret_for_activation_request(&lease, cancellation.clone())
                     .await?;
                 let authorization = BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
                     secret.expose_secret().to_owned(),
@@ -217,7 +227,7 @@ impl ProviderAdapterActivation {
                 require_surface(&lease, FRED_SURFACE)?;
                 let secret = self
                     .onboarding
-                    .read_active_secret_for_request(&lease, cancellation.clone())
+                    .read_secret_for_activation_request(&lease, cancellation.clone())
                     .await?;
                 let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
                 let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
@@ -372,7 +382,7 @@ impl ProviderAdapterActivation {
             BLS_REGISTERED_SURFACE => {
                 let secret = self
                     .onboarding
-                    .read_active_secret_for_request(&lease, cancellation)
+                    .read_secret_for_activation_request(&lease, cancellation)
                     .await?;
                 BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
                     secret.expose_secret().to_owned(),
@@ -438,7 +448,7 @@ impl ProviderAdapterActivation {
         require_surface(&lease, FRED_SURFACE)?;
         let secret = self
             .onboarding
-            .read_active_secret_for_request(&lease, cancellation)
+            .read_secret_for_activation_request(&lease, cancellation)
             .await?;
         let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
         let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
@@ -505,7 +515,7 @@ impl ProviderAdapterActivation {
     {
         let profile = lease.surface_id().clone();
         let generation = runtime_generation(&lease, source.metadata().clone(), rights.clone())?;
-        self.bind_authorization_subject(&lease, generation.metadata())?;
+        self.bind_authorization_subject(generation.metadata())?;
         self.research
             .register_provider_source(generation.clone(), source, rights)?;
         Ok(ActivatedResearchProvider {
@@ -517,13 +527,18 @@ impl ProviderAdapterActivation {
 
     fn bind_authorization_subject(
         &self,
-        lease: &ProviderActivationLease,
         metadata: &SourceMetadata,
     ) -> Result<(), ProviderAdapterActivationError> {
         let authorization = metadata.authorization();
         match authorization.mode() {
             AuthorizationMode::UserAuthorized | AuthorizationMode::Licensed => {
-                let subject = authorization_subject(lease)?;
+                let policy = metadata
+                    .budget_policy()
+                    .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+                let subject = ProviderRateDeclaration::governed_provider_subject(
+                    policy.scope().as_source_identifier(),
+                )
+                .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
                 self.provider_rate.bind_authorization_subject(
                     authorization.mode(),
                     authorization.evidence().content_digest(),
@@ -666,13 +681,6 @@ fn require_surface(
     } else {
         Err(ProviderAdapterActivationError::SurfaceMismatch)
     }
-}
-
-fn authorization_subject(
-    lease: &ProviderActivationLease,
-) -> Result<SourceIdentifier, ProviderAdapterActivationError> {
-    SourceIdentifier::try_from(format!("provider-session-{}", lease.session_id().simple()))
-        .map_err(|_| ProviderAdapterActivationError::SourceBinding)
 }
 
 fn provider_research_rights(

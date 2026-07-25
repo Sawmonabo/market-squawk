@@ -7,6 +7,7 @@ use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -225,6 +226,49 @@ fn digest_runtime_wire<T: Serialize>(
     ))
 }
 
+/// Per-generation, process-local authority checked before and during every provider request.
+#[derive(Clone, Debug)]
+pub(super) struct ResearchProviderAdmission {
+    generation_digest: Option<EvidenceDigest>,
+    identity: Arc<()>,
+    cancellation: CancellationToken,
+}
+
+impl ResearchProviderAdmission {
+    pub(super) fn new(
+        generation: Option<&ResearchProviderRuntimeGeneration>,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        Ok(Self {
+            generation_digest: generation
+                .map(ResearchProviderRuntimeGeneration::generation_digest)
+                .transpose()?,
+            identity: Arc::new(()),
+            cancellation: CancellationToken::new(),
+        })
+    }
+
+    pub(super) fn ensure_live(&self) -> Result<(), ResearchIngestCompositionError> {
+        if self.cancellation.is_cancelled() {
+            Err(ResearchIngestCompositionError::StaleRuntimeGeneration)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        self.generation_digest == other.generation_digest
+            && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+
+    pub(super) fn revoke(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(super) const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
 /// Fully constructed replacement held outside the callable runtime until exact commit.
 pub struct PreparedResearchProviderReplacement {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
@@ -233,6 +277,7 @@ pub struct PreparedResearchProviderReplacement {
     expected: ResearchProviderRuntimeGeneration,
     candidate: ResearchProviderRuntimeGeneration,
     candidate_source: Option<Arc<dyn ManagedResearchExtractionSource>>,
+    candidate_admission: ResearchProviderAdmission,
     committed: bool,
 }
 
@@ -272,6 +317,9 @@ impl PreparedResearchProviderReplacement {
         if current.generation.as_ref() != Some(&self.expected) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
+        if !current.admission.cancellation().is_cancelled() {
+            return Err(ResearchIngestCompositionError::RuntimeGenerationStillCallable);
+        }
         let candidate_source = self
             .candidate_source
             .take()
@@ -306,6 +354,7 @@ impl PreparedResearchProviderReplacement {
         }
         current.rights = self.candidate.rights.clone();
         current.generation = Some(self.candidate.clone());
+        current.admission = self.candidate_admission.clone();
         self.committed = true;
         Ok(self.candidate.clone())
     }
@@ -408,6 +457,7 @@ impl ProductionResearchIngestCoordinator {
         let profile = candidate.profile().clone();
         let token = Uuid::new_v4();
         let candidate_source: Arc<dyn ManagedResearchExtractionSource> = Arc::new(source);
+        let candidate_admission = ResearchProviderAdmission::new(Some(&candidate))?;
         let mut authority = self
             .authority
             .lock()
@@ -438,7 +488,30 @@ impl ProductionResearchIngestCoordinator {
             expected,
             candidate,
             candidate_source: Some(candidate_source),
+            candidate_admission,
             committed: false,
         })
+    }
+
+    /// Revokes exactly one callable generation and every retained receipt minted from it.
+    pub fn revoke_provider_generation(
+        &self,
+        profile: &SourceIdentifier,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        let mut authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        let current = authority
+            .sources
+            .get(profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation.as_ref() != Some(expected) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        current.admission.revoke();
+        authority.selections.revoke_profile(profile);
+        Ok(())
     }
 }

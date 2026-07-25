@@ -44,6 +44,7 @@ const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
 mod provider_runtime;
 mod selection;
 
+use provider_runtime::ResearchProviderAdmission;
 pub use provider_runtime::{
     PreparedResearchProviderReplacement, ResearchProviderRuntimeGeneration,
 };
@@ -323,6 +324,7 @@ struct RegisteredExtractionSource {
     registration: RegisteredSource,
     rights: ResearchRightsAuthority,
     generation: Option<ResearchProviderRuntimeGeneration>,
+    admission: ResearchProviderAdmission,
 }
 
 struct CoordinatorAuthority {
@@ -401,6 +403,7 @@ impl ProductionResearchIngestCoordinator {
         }
         let registered_at = system_timestamp()
             .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+        let admission = ResearchProviderAdmission::new(generation.as_ref())?;
         let mut authority = self
             .authority
             .lock()
@@ -424,6 +427,7 @@ impl ProductionResearchIngestCoordinator {
                 registration,
                 rights,
                 generation,
+                admission,
             },
         );
         Ok(())
@@ -524,6 +528,7 @@ impl ProductionResearchIngestCoordinator {
             profile,
             &prepared.metadata,
             &prepared.rights,
+            &prepared.admission,
             discovery,
             self.limits.duration,
             observed_monotonic,
@@ -564,10 +569,15 @@ impl ProductionResearchIngestCoordinator {
                 .discover(prepared.authority.clone(), request, operation.clone()),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
         ensure_operation_live(operation_deadline, operation)?;
+        prepared
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         if discovery.objects().iter().any(|object| {
             object.source_id() != prepared.metadata.source_id()
                 || object.metadata_revision() != prepared.metadata.revision()
@@ -628,6 +638,10 @@ impl ProductionResearchIngestCoordinator {
             .sources
             .get(profile)
             .ok_or(ServiceError::NotFound)?;
+        registered
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         let extraction = registry
             .extraction_authority(&registered.registration, registered.source.as_ref())
             .map_err(map_registry_error)?;
@@ -636,6 +650,7 @@ impl ProductionResearchIngestCoordinator {
             metadata: registered.metadata.clone(),
             rights: registered.rights.clone(),
             authority: extraction,
+            admission: registered.admission.clone(),
         })
     }
 
@@ -665,6 +680,7 @@ impl ProductionResearchIngestCoordinator {
             ),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
@@ -725,6 +741,7 @@ impl ProductionResearchIngestCoordinator {
             rights,
             authority,
             object,
+            admission,
         } = prepared;
         self.extract_prepared_object(
             PreparedExtraction {
@@ -732,6 +749,7 @@ impl ProductionResearchIngestCoordinator {
                 metadata,
                 rights,
                 authority,
+                admission,
             },
             object,
             context,
@@ -764,6 +782,7 @@ impl ProductionResearchIngestCoordinator {
                 .extract(prepared.authority, extraction_request, operation.clone()),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
@@ -775,12 +794,17 @@ impl ProductionResearchIngestCoordinator {
         let retrieved_at = system_timestamp()?;
         let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
         ensure_operation_live(operation_deadline, operation)?;
+        prepared
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
             batch,
             revisions,
             payload_digest,
             rights,
+            admission: prepared.admission,
         })
     }
 
@@ -792,6 +816,9 @@ impl ProductionResearchIngestCoordinator {
                 .map_err(|_error| ServiceError::Unavailable)?;
             authority.selections.clear();
             authority.pending_replacements.clear();
+            for registered in authority.sources.values() {
+                registered.admission.revoke();
+            }
             authority.sources.clear();
             authority.registry.take()
         };
@@ -881,6 +908,7 @@ struct PreparedExtraction {
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
     authority: market_squawk_sources::ExtractionAuthority,
+    admission: ResearchProviderAdmission,
 }
 
 struct AuthorizedExtraction {
@@ -889,6 +917,7 @@ struct AuthorizedExtraction {
     revisions: Option<ExtractionRevisionPlan>,
     payload_digest: EvidenceDigest,
     rights: RightsDecisionInput,
+    admission: ResearchProviderAdmission,
 }
 
 #[async_trait]
@@ -917,21 +946,28 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
                 operation_deadline,
             )
             .await?;
-        let idempotency_key =
-            ingest_identity(&profile, &dataset, &object_id, extracted.payload_digest);
-        let ingest = match extracted.revisions {
+        let AuthorizedExtraction {
+            metadata: source_metadata,
+            batch,
+            revisions,
+            payload_digest,
+            rights,
+            admission,
+        } = extracted;
+        let idempotency_key = ingest_identity(&profile, &dataset, &object_id, payload_digest);
+        let ingest = match revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
-                extracted.metadata.clone(),
-                extracted.rights,
+                source_metadata.clone(),
+                rights,
                 idempotency_key,
-                extracted.batch,
+                batch,
                 revisions,
             ),
             None => ResearchIngestRequest::locally_observed(
-                extracted.metadata.clone(),
-                extracted.rights,
+                source_metadata.clone(),
+                rights,
                 idempotency_key,
-                extracted.batch,
+                batch,
             ),
         }
         .map_err(map_research_error)?;
@@ -939,23 +975,24 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             self.research.ingest(ingest, operation.clone()),
             context,
             &operation,
+            &admission,
             operation_deadline,
         )
         .await?;
         let manifest = committed.manifest();
         let plan = committed.pinned().plan();
         let coverage = json!({
-            "sourceId": extracted.metadata.source_id(),
-            "provider": extracted.metadata.provider(),
+            "sourceId": source_metadata.source_id(),
+            "provider": source_metadata.provider(),
             "profile": profile,
             "providerDataset": dataset,
             "objectId": object_id,
-            "metadataRevision": extracted.metadata.revision(),
-            "payloadDigest": encode_hex(extracted.payload_digest.bytes()),
+            "metadataRevision": source_metadata.revision(),
+            "payloadDigest": encode_hex(payload_digest.bytes()),
             "manifest": manifest_value(manifest),
         });
         let quality = json!({
-            "qualityCeiling": extracted.metadata.quality_ceiling(),
+            "qualityCeiling": source_metadata.quality_ceiling(),
             "recordLevelProvenance": true,
             "executionEligible": false,
         });
@@ -970,6 +1007,9 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         });
         let result = TypedToolResult::try_new(content, 1, metadata, limits)?;
         ensure_operation_live(operation_deadline, &operation)?;
+        admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         Ok(result)
     }
 
@@ -988,6 +1028,7 @@ async fn await_extraction<T>(
     future: impl Future<Output = Result<T, ExtractionSourceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
     if Instant::now() >= operation_deadline {
@@ -1001,6 +1042,10 @@ async fn await_extraction<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = admission.cancellation().cancelled() => {
+            operation.cancel();
+            Err(ServiceError::Unavailable)
+        }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
@@ -1013,6 +1058,7 @@ async fn await_publication<T>(
     future: impl Future<Output = Result<T, ResearchServiceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
     if Instant::now() >= operation_deadline {
@@ -1026,6 +1072,10 @@ async fn await_publication<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = admission.cancellation().cancelled() => {
+            operation.cancel();
+            Err(ServiceError::Unavailable)
+        }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
@@ -1229,6 +1279,9 @@ pub enum ResearchIngestCompositionError {
     /// The expected runtime generation is no longer callable.
     #[error("research provider runtime generation is stale")]
     StaleRuntimeGeneration,
+    /// A replacement cannot publish while its predecessor still admits requests.
+    #[error("research provider runtime generation is still callable")]
+    RuntimeGenerationStillCallable,
     /// The restart-durable source registry rejected registration.
     #[error("research source registration failed: {0}")]
     Registry(#[from] RegistryError),

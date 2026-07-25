@@ -510,6 +510,12 @@ pub(super) fn session_view(
             }
             OnboardingState::SecretReconciliationRequired => OnboardingNextAction::ImportSecret,
             OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RuntimeVerificationPending
+                if lifecycle.active_generation().is_some() =>
+            {
+                OnboardingNextAction::VerifyAndCutover
+            }
+            OnboardingState::RuntimeVerificationPending => OnboardingNextAction::VerifyAndActivate,
             OnboardingState::RenewalRequired => OnboardingNextAction::RenewCredential,
             OnboardingState::RotationPending if credential_stored => {
                 OnboardingNextAction::VerifyAndCutover
