@@ -40,9 +40,12 @@ MAX_ONNX_WORKER_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_VALIDATOR_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
+TRAINING_DRIVER_RECORD_PATH = "../../../bin/market-squawk-train"
+TRAINING_DRIVER_RELEASE_PATH = Path("bin/market-squawk-train")
 RUST_TOOLCHAIN = "1.97.1"
 RUST_TOOLCHAIN_FULL = "1.97.1-aarch64-apple-darwin"
 MACOS_DEPLOYMENT_TARGET = "12.0"
+SOURCE_DATE_EPOCH = "946684800"
 PROJECT_WHEEL_PLATFORM_TAG = (
     f"macosx_{MACOS_DEPLOYMENT_TARGET.replace('.', '_')}_arm64"
 )
@@ -1320,6 +1323,7 @@ def _build_release(
             runtime,
             RuntimeRequirement("market-squawk", "0.1.0"),
             native_prefix="market_squawk/__init__.",
+            require_training_driver=True,
         )
         runtime_distributions = tuple(
             inspect_installed_distribution(release_venv, runtime, requirement)
@@ -1671,6 +1675,7 @@ def _cargo_environment(
         "RANLIB": str(ranlib),
         "RUSTC": str(rustc),
         "SDKROOT": sdk["path"],
+        "SOURCE_DATE_EPOCH": SOURCE_DATE_EPOCH,
         "TMPDIR": str(temporary),
         "TZ": "UTC",
     }
@@ -1932,6 +1937,8 @@ def harden_project_wheel(project_wheel: Path) -> None:
                     if (
                         path.as_posix() != name
                         or "\0" in name
+                        or "__pycache__" in path.parts
+                        or path.suffix in {".pyc", ".pyo"}
                         or member.is_dir()
                         or member.flag_bits & 0x1
                         or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
@@ -2006,6 +2013,7 @@ def inspect_installed_distribution(
     requirement: RuntimeRequirement,
     *,
     native_prefix: str | None = None,
+    require_training_driver: bool = False,
 ) -> InstalledDistribution:
     """Verify one installed distribution and its complete owned file roots."""
 
@@ -2043,7 +2051,10 @@ def inspect_installed_distribution(
         raise ReleaseBuildError("installed distribution has no bounded wheel RECORD")
     record_name = record.relative_to(site_packages).as_posix()
     entries: dict[str, tuple[str, int]] = {}
+    hashed_entries: set[str] = set()
+    checked_hash_bytecode: list[tuple[str, str]] = []
     saw_record = False
+    saw_training_driver = False
     total_size = 0
     try:
         with record.open("r", encoding="utf-8", newline="") as stream:
@@ -2058,14 +2069,51 @@ def inspect_installed_distribution(
                         )
                     saw_record = True
                     continue
-                relative = _safe_record_path(name)
-                path = site_packages / relative
+                is_training_driver = (
+                    require_training_driver and name == TRAINING_DRIVER_RECORD_PATH
+                )
+                if is_training_driver:
+                    if saw_training_driver or not encoded_digest or not encoded_size:
+                        raise ReleaseBuildError(
+                            "installed training driver RECORD entry is invalid"
+                        )
+                    path = release_root / TRAINING_DRIVER_RELEASE_PATH
+                    observed_record_path = os.path.relpath(path, site_packages).replace(
+                        os.sep, "/"
+                    )
+                    if (
+                        observed_record_path != TRAINING_DRIVER_RECORD_PATH
+                        or path.parent.is_symlink()
+                    ):
+                        raise ReleaseBuildError(
+                            "installed training driver path is invalid"
+                        )
+                    saw_training_driver = True
+                else:
+                    relative = _safe_record_path(name)
+                    path = site_packages / relative
                 if path.is_symlink() or not path.is_file():
                     raise ReleaseBuildError("installed distribution file is unavailable")
-                observed_size, observed_sha256 = _file_digest(path)
+                observed_size, observed_sha256, header = (
+                    _inspect_installed_distribution_file(path)
+                )
                 if not encoded_digest and not encoded_size:
+                    source_name = _checked_hash_bytecode_source(name, runtime)
+                    if (
+                        source_name is None
+                        or len(header) != 16
+                        or int.from_bytes(header[4:8], "little") != 0b11
+                    ):
+                        raise ReleaseBuildError(
+                            "installed distribution has an unsafe blank RECORD identity"
+                        )
+                    checked_hash_bytecode.append((name, source_name))
                     size = observed_size
                 else:
+                    if _is_python_bytecode(name):
+                        raise ReleaseBuildError(
+                            "installed distribution contains wheel-authored bytecode"
+                        )
                     if not encoded_digest.startswith("sha256="):
                         raise ReleaseBuildError(
                             "installed distribution RECORD hash is unsupported"
@@ -2087,6 +2135,7 @@ def inspect_installed_distribution(
                         raise ReleaseBuildError(
                             "installed distribution RECORD identity mismatch"
                         )
+                    hashed_entries.add(name)
                 if size < 0 or size > MAX_DISTRIBUTION_FILE_BYTES:
                     raise ReleaseBuildError(
                         "installed distribution file exceeds its byte bound"
@@ -2099,17 +2148,28 @@ def inspect_installed_distribution(
                 entries[name] = (observed_sha256, size)
     except (OSError, UnicodeError, csv.Error) as error:
         raise ReleaseBuildError("installed distribution RECORD is unreadable") from error
-    if not saw_record or not entries:
+    if (
+        not saw_record
+        or not entries
+        or require_training_driver != saw_training_driver
+        or any(
+            source_name not in hashed_entries
+            for _bytecode_name, source_name in checked_hash_bytecode
+        )
+    ):
         raise ReleaseBuildError("installed distribution RECORD is incomplete")
+    internal_entries = {
+        name for name in entries if name != TRAINING_DRIVER_RECORD_PATH
+    }
     roots = tuple(
         sorted(
-            {Path(name).parts[0] for name in entries}
+            {Path(name).parts[0] for name in internal_entries}
             | {Path(record_name).parts[0]}
         )
     )
     if not roots or len(roots) > MAX_DISTRIBUTION_ROOTS:
         raise ReleaseBuildError("installed distribution roots exceed their bound")
-    expected_paths = set(entries)
+    expected_paths = internal_entries
     expected_paths.add(record_name)
     if _installed_paths_under_roots(site_packages, roots) != expected_paths:
         raise ReleaseBuildError("installed distribution contains an unrecorded file")
@@ -2305,6 +2365,87 @@ def _distribution_payload(distribution: InstalledDistribution) -> dict[str, obje
         "roots": list(distribution.roots),
         "version": distribution.version,
     }
+
+
+def _is_python_bytecode(value: str) -> bool:
+    return Path(value).suffix in {".pyc", ".pyo"}
+
+
+def _checked_hash_bytecode_source(
+    value: str,
+    runtime: PythonRuntime,
+) -> str | None:
+    path = _safe_record_path(value)
+    suffix = f".cpython-{runtime.version[0]}{runtime.version[1]}.pyc"
+    if (
+        path.parent.name != "__pycache__"
+        or "__pycache__" in path.parent.parent.parts
+        or not path.name.endswith(suffix)
+    ):
+        return None
+    stem = path.name.removesuffix(suffix)
+    if not stem:
+        return None
+    return (path.parent.parent / f"{stem}.py").as_posix()
+
+
+def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ReleaseBuildError("installed distribution file is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size < 0
+            or before.st_size > MAX_DISTRIBUTION_FILE_BYTES
+        ):
+            raise ReleaseBuildError(
+                "installed distribution file exceeds its byte bound"
+            )
+        digest = hashlib.sha256()
+        header = bytearray()
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > before.st_size:
+                raise ReleaseBuildError(
+                    "installed distribution file changed during inspection"
+                )
+            if len(header) < 16:
+                header.extend(chunk[: 16 - len(header)])
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ReleaseBuildError(
+            "installed distribution file is unreadable"
+        ) from error
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if observed != before.st_size or identity_before != identity_after:
+        raise ReleaseBuildError(
+            "installed distribution file changed during inspection"
+        )
+    return observed, digest.hexdigest(), bytes(header)
 
 
 def _safe_record_path(value: str) -> Path:

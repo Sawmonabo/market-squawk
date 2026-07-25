@@ -87,12 +87,14 @@ impl Drop for QueryArtifactMemoryTestWitness {
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     max_rows: u64,
+    max_inline_bytes: u64,
     max_bytes: u64,
     max_memory_bytes: u64,
     max_partitions: usize,
     max_ast_nodes: usize,
     max_plan_nodes: usize,
     deadline: Duration,
+    operation_deadline: Option<tokio::time::Instant>,
     #[cfg(test)]
     bind_precommit_deadline: Option<tokio::time::Instant>,
 }
@@ -112,8 +114,38 @@ impl QueryLimits {
         max_plan_nodes: usize,
         deadline: Duration,
     ) -> Result<Self, QueryError> {
+        Self::try_new_with_inline_bytes(
+            max_rows,
+            max_bytes.min(INLINE_RESULT_BYTES),
+            max_bytes,
+            max_memory_bytes,
+            max_partitions,
+            max_ast_nodes,
+            max_plan_nodes,
+            deadline,
+        )
+    }
+
+    /// Constructs limits with an explicit inline-result threshold independent of the complete
+    /// result-byte ceiling.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all independent query bounds remain explicit"
+    )]
+    pub fn try_new_with_inline_bytes(
+        max_rows: u64,
+        max_inline_bytes: u64,
+        max_bytes: u64,
+        max_memory_bytes: u64,
+        max_partitions: usize,
+        max_ast_nodes: usize,
+        max_plan_nodes: usize,
+        deadline: Duration,
+    ) -> Result<Self, QueryError> {
         if max_rows == 0
             || max_rows > MAX_ROWS
+            || max_inline_bytes == 0
+            || max_inline_bytes > max_bytes
             || max_bytes == 0
             || max_bytes > MAX_RESULT_BYTES
             || max_memory_bytes < max_bytes
@@ -131,12 +163,14 @@ impl QueryLimits {
         }
         Ok(Self {
             max_rows,
+            max_inline_bytes,
             max_bytes,
             max_memory_bytes,
             max_partitions,
             max_ast_nodes,
             max_plan_nodes,
             deadline,
+            operation_deadline: None,
             #[cfg(test)]
             bind_precommit_deadline: None,
         })
@@ -145,6 +179,28 @@ impl QueryLimits {
     /// Returns the result-byte ceiling also used by durable artifact authority.
     pub const fn max_bytes(self) -> u64 {
         self.max_bytes
+    }
+
+    /// Returns the largest Arrow IPC result that may remain inline.
+    pub const fn max_inline_bytes(self) -> u64 {
+        self.max_inline_bytes
+    }
+
+    pub(crate) fn with_operation_deadline(
+        mut self,
+        operation_deadline: tokio::time::Instant,
+    ) -> Result<Self, QueryError> {
+        let deadline = operation_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if deadline.is_zero() || deadline > self.deadline {
+            return Err(QueryError::DeadlineExceeded);
+        }
+        self.deadline = deadline;
+        self.operation_deadline = Some(operation_deadline);
+        Ok(self)
+    }
+
+    pub(crate) const fn deadline(self) -> Duration {
+        self.deadline
     }
 
     #[cfg(test)]
@@ -228,7 +284,7 @@ impl QueryRequest {
     /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
     pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
         let mut identity = sha2::Sha256::new();
-        identity.update(b"market-squawk/query-artifact-request/v2");
+        identity.update(b"market-squawk/query-artifact-request/v3");
         identity.update(
             u64::try_from(self.manifest.dataset_id().as_str().len())
                 .unwrap_or(u64::MAX)
@@ -252,6 +308,7 @@ impl QueryRequest {
         );
         identity.update(self.sql.as_bytes());
         identity.update(limits.max_rows.to_be_bytes());
+        identity.update(limits.max_inline_bytes.to_be_bytes());
         identity.update(limits.max_bytes.to_be_bytes());
         identity.update(limits.max_memory_bytes.to_be_bytes());
         identity.update(
@@ -275,6 +332,13 @@ impl QueryRequest {
                 .to_be_bytes(),
         );
         EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into())
+    }
+
+    pub(crate) fn retry_without_artifact(&self) -> Result<Self, QueryError> {
+        if self.artifact_reservation.is_some() {
+            return Err(QueryError::ArtifactReservationMismatch);
+        }
+        Self::try_new(self.manifest.clone(), self.sql.clone())
     }
 
     /// Attaches the non-cloneable durable authority receipt required for artifact mode.
@@ -579,9 +643,12 @@ impl ResearchQueryEngine {
         if request.ast_nodes > limits.max_ast_nodes {
             return Err(QueryError::AstLimitExceeded);
         }
-        let deadline_at = tokio::time::Instant::now()
-            .checked_add(limits.deadline)
-            .ok_or(QueryError::InvalidLimits)?;
+        let deadline_at = match limits.operation_deadline {
+            Some(deadline) => deadline,
+            None => tokio::time::Instant::now()
+                .checked_add(limits.deadline)
+                .ok_or(QueryError::InvalidLimits)?,
+        };
         validate_relations(&request.sql, &self.table_name, limits.max_ast_nodes)?;
         let planning_receipt = PlanningReceipt::try_new(
             request.sql.len(),
@@ -731,7 +798,7 @@ impl ResearchQueryEngine {
                     limit: limits.max_bytes,
                 });
             }
-            if byte_count <= INLINE_RESULT_BYTES {
+            if byte_count <= limits.max_inline_bytes {
                 if execution_cancellation.is_cancelled() {
                     return Err(QueryError::Cancelled);
                 }

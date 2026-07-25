@@ -17,6 +17,12 @@ from . import _native
 from .bundle import BundleAuthorityRef, BundleCandidate, BundleReceipt
 from .data import ComponentIdentity, DatasetIntegrityError, DatasetResult, _verify_dataset_receipt
 from .finance import OperationContext
+from ._onnx import (
+    OnnxEncodingError,
+    encode_fitted_model,
+    quantize_fitted_model,
+    quantize_float32,
+)
 
 
 MAX_TRAINING_ROWS = 100_000
@@ -118,17 +124,24 @@ class TrainingRun:
         return self.environment.sha256
 
     def fit_evaluate(
-        self, *, model_kind: str, context: OperationContext
+        self,
+        *,
+        model_kind: str,
+        artifact_format: str = "native",
+        context: OperationContext,
     ) -> TrainingProposal:
         try:
             _verify_dataset_receipt(self.dataset, context)
         except DatasetIntegrityError as error:
             raise TrainingValidationError("training dataset receipt is invalid") from error
-        config = self._validated_config(model_kind)
+        config = self._validated_config(model_kind, artifact_format)
         _admit_operation_context(
             context,
             _training_operation_estimate(
-                self.dataset, len(config["features"]), model_kind
+                self.dataset,
+                len(config["features"]),
+                model_kind,
+                artifact_format,
             ),
         )
         rows, targets, admitted_splits, split_sha256, split_counts, period = _dataset_matrix(
@@ -147,6 +160,26 @@ class TrainingRun:
         except DatasetIntegrityError as error:
             raise TrainingValidationError("dataset receipt failed immediately before fit") from error
         fitted = _fit(model_kind, rows, targets, train, validation, self.seed, context)
+        if artifact_format == "onnx":
+            try:
+                fitted = _quantized_onnx_fit(
+                    fitted,
+                    model_kind,
+                    rows,
+                    targets,
+                    validation,
+                    context,
+                )
+            except OnnxEncodingError as error:
+                raise TrainingValidationError(
+                    "fitted model cannot be represented by finite ONNX float tensors"
+                ) from error
+        output_semantics = (
+            "binary_probability" if model_kind == "logistic" else "regression"
+        )
+        bundle_format = (
+            f"native_{model_kind}" if artifact_format == "native" else "onnx"
+        )
         trial = {
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
@@ -157,7 +190,9 @@ class TrainingRun:
             "label": dict(config["label"]),
             "missing_policy": self.missing_policy,
             "model_id": self.model_id,
-            "model_kind": f"native_{model_kind}",
+            "model_kind": (
+                f"native_{model_kind}" if artifact_format == "native" else model_kind
+            ),
             "seed": self.seed,
             "split_counts": split_counts,
             "split_sha256": split_sha256,
@@ -165,19 +200,23 @@ class TrainingRun:
             "training_period": period,
             "universe_id": self.dataset.universe_id,
         }
+        if artifact_format == "onnx":
+            trial["output_semantics"] = output_semantics
         trial_sha256 = hashlib.sha256(_canonical(trial)).hexdigest()
         metrics = [{"name": fitted.metric_name, "value": fitted.metric_value}]
         run_record = {
-            "schema_version": 2,
+            "schema_version": 2 if artifact_format == "native" else 3,
             "trial": trial,
             "trial_sha256": trial_sha256,
             "validation_metrics": metrics,
         }
         artifact = {
             "schema_version": 1,
-            "format": f"native_{model_kind}",
+            "format": bundle_format,
             "format_version": 1,
-            "feature_semantic_sha256": [feature["semantic_sha256"] for feature in config["features"]],
+            "feature_semantic_sha256": [
+                feature["semantic_sha256"] for feature in config["features"]
+            ],
             "weights": list(fitted.weights),
             "bias": fitted.bias,
             "output_count": 1,
@@ -199,15 +238,17 @@ class TrainingRun:
             else {"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0}
         )
         metadata = {
-            "schema_version": 4,
+            "schema_version": 4 if artifact_format == "native" else 5,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "model_id": self.model_id,
             "artifact": {
-                "path": "artifact.json",
+                "path": (
+                    "artifact.json" if artifact_format == "native" else "model.onnx"
+                ),
                 "sha256": "0" * 64,
                 "size_bytes": 1,
-                "format": f"native_{model_kind}",
+                "format": bundle_format,
                 "format_version": 1,
             },
             "training_run": {
@@ -228,9 +269,24 @@ class TrainingRun:
             "limitations": ["candidate requires independent Rust admission before production use"],
             "fallback": {"policy": "no_action", "reason": "model contract unavailable"},
         }
-        candidate = BundleCandidate(metadata, artifact, run_record)
+        if artifact_format == "onnx":
+            metadata["output_semantics"] = output_semantics
+        if artifact_format == "native":
+            candidate = BundleCandidate(metadata, artifact, run_record)
+        else:
+            try:
+                onnx_artifact = encode_fitted_model(
+                    fitted.weights,
+                    fitted.bias,
+                    model_kind=model_kind,
+                )
+            except OnnxEncodingError as error:
+                raise TrainingValidationError(
+                    "fitted model cannot be encoded as ONNX"
+                ) from error
+            candidate = BundleCandidate.onnx(metadata, onnx_artifact, run_record)
         authority = {
-            "schema_version": 5,
+            "schema_version": 5 if artifact_format == "native" else 6,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
@@ -244,9 +300,13 @@ class TrainingRun:
             "training_environment_sha256": self.environment_sha256,
             "training_run_sha256": candidate.training_run_sha256,
         }
+        if artifact_format == "onnx":
+            authority["output_semantics"] = output_semantics
         return TrainingProposal(candidate, authority, self.dataset)
 
-    def _validated_config(self, model_kind: str) -> dict[str, Any]:
+    def _validated_config(
+        self, model_kind: str, artifact_format: str
+    ) -> dict[str, Any]:
         if not isinstance(self.environment, TrainingEnvironmentReceipt):
             raise TypeError("training environment must be the native builder-authored receipt")
         current_environment = training_environment_receipt()
@@ -258,6 +318,8 @@ class TrainingRun:
             raise TrainingValidationError("training environment changed after receipt admission")
         if model_kind not in {"linear", "logistic"}:
             raise TrainingValidationError("model kind is unsupported")
+        if artifact_format not in {"native", "onnx"}:
+            raise TrainingValidationError("artifact format is unsupported")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool) or not 0 <= self.seed < 2**64:
             raise TrainingValidationError("training seed is invalid")
         if self.missing_policy not in {"reject", "drop_row"}:
@@ -465,6 +527,74 @@ def _fit(
     return _FittedModel(tuple(weights), bias, means, tuple(scales), metric_name, metric)
 
 
+def _quantized_onnx_fit(
+    fitted: _FittedModel,
+    model_kind: str,
+    rows: Sequence[Sequence[float]],
+    targets: Sequence[float],
+    validation: Sequence[int],
+    context: OperationContext,
+) -> _FittedModel:
+    _checkpoint(context)
+    weights, bias = quantize_fitted_model(fitted.weights, fitted.bias)
+    scores = []
+    for position, index in enumerate(validation):
+        if position % CONTROL_CHECK_INTERVAL == 0:
+            _checkpoint(context)
+        normalized = []
+        for column in range(len(weights)):
+            if column % CONTROL_CHECK_INTERVAL == 0:
+                _checkpoint(context)
+            normalized.append(
+                quantize_float32(
+                    (rows[index][column] - fitted.means[column])
+                    / fitted.scales[column]
+                )
+            )
+        score = bias
+        for column, (value, weight) in enumerate(
+            zip(normalized, weights, strict=True)
+        ):
+            if column % CONTROL_CHECK_INTERVAL == 0:
+                _checkpoint(context)
+            contribution = quantize_float32(value * weight)
+            score = quantize_float32(score + contribution)
+        if model_kind == "logistic":
+            if score >= 0.0:
+                score = quantize_float32(1.0 / (1.0 + math.exp(-score)))
+            else:
+                exponential = math.exp(score)
+                score = quantize_float32(exponential / (1.0 + exponential))
+            if not 0.0 <= score <= 1.0:
+                raise OnnxEncodingError(
+                    "logistic ONNX candidate produced a non-probability"
+                )
+        scores.append(score)
+    if model_kind == "linear":
+        metric_name = "mean_squared_error"
+        metric_value = sum(
+            (score - targets[index]) ** 2
+            for score, index in zip(scores, validation, strict=True)
+        ) / len(validation)
+    else:
+        metric_name = "accuracy"
+        metric_value = sum(
+            (score >= 0.5) == bool(targets[index])
+            for score, index in zip(scores, validation, strict=True)
+        ) / len(validation)
+    if not math.isfinite(metric_value):
+        raise OnnxEncodingError("ONNX candidate metric is nonfinite")
+    _checkpoint(context)
+    return _FittedModel(
+        weights,
+        bias,
+        fitted.means,
+        fitted.scales,
+        metric_name,
+        metric_value,
+    )
+
+
 def _linear_fit(
     rows: list[list[float]],
     targets: list[float],
@@ -535,7 +665,10 @@ def _logistic_fit(
 
 
 def _training_operation_estimate(
-    dataset: DatasetResult, feature_count: int, model_kind: str
+    dataset: DatasetResult,
+    feature_count: int,
+    model_kind: str,
+    artifact_format: str,
 ) -> int:
     component_count = len(dataset.components)
     if component_count == 0:
@@ -556,7 +689,14 @@ def _training_operation_estimate(
         fitting = _checked_mul(
             LOGISTIC_EPOCHS, _checked_mul(example_count, per_example)
         )
-    return _checked_add(common, fitting)
+    estimate = _checked_add(common, fitting)
+    if artifact_format == "onnx":
+        per_example = _checked_add(_checked_mul(feature_count, 16), 48)
+        estimate = _checked_add(
+            estimate,
+            _checked_mul(example_count, per_example),
+        )
+    return estimate
 
 
 def _checked_add(left: int, right: int) -> int:

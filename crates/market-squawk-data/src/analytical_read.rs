@@ -406,6 +406,14 @@ impl AnalyticalObservationReadRequest {
         self.knowledge_range
     }
 
+    /// Builds the engine-owned query for this closed observation template.
+    ///
+    /// Callers receive a parsed read-only request rather than unrestricted SQL. The request stays
+    /// bound to the exact manifest, canonical observation relation, and code-owned predicates.
+    pub fn query_request(&self) -> Result<QueryRequest, QueryError> {
+        QueryRequest::try_new(self.manifest.clone(), self.sql())
+    }
+
     fn sql(&self) -> String {
         let mut filters = self
             .template

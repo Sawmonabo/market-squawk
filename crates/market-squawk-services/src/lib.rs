@@ -13,6 +13,7 @@ mod traits;
 pub use artifact::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 pub use contract::{
     ScopeRequirement, ServiceDomain, SourceEvidencePolicy, TOOL_CONFIRMATION_FIELD,

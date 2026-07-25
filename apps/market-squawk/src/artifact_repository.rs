@@ -22,6 +22,7 @@ use market_squawk_platform::ArtifactRoot;
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -298,13 +299,15 @@ impl ControlledArtifactRepository {
             return Err(ArtifactError::InvalidPublication);
         }
         let digest = publication.sha256_hex();
-        let prefix = digest.get(..2).ok_or(ArtifactError::InvalidPublication)?;
-        let parent = format!("{ARTIFACT_NAMESPACE}/{prefix}");
-        let artifact_reference = format!("{parent}/{digest}.json");
+        let coordinate = artifact_coordinate(publication.media_type(), digest)?;
+        let parent = coordinate
+            .path
+            .parent()
+            .ok_or(ArtifactError::InvalidPublication)?;
         let mut nonce = [0_u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| ArtifactError::Unavailable)?;
-        let staging_reference = format!("{parent}/stage-{}.tmp", hex_bytes(&nonce));
-        let artifact_path = Path::new(&artifact_reference);
+        let staging_reference = parent.join(format!("stage-{}.tmp", hex_bytes(&nonce)));
+        let artifact_path = coordinate.path.as_path();
         let staging_path = Path::new(&staging_reference);
         drop(
             self.root
@@ -322,7 +325,7 @@ impl ControlledArtifactRepository {
             .try_clone_directory()
             .map_err(|_| ArtifactError::Unavailable)?;
         directory
-            .create_dir_all(&parent)
+            .create_dir_all(parent)
             .map_err(|_| ArtifactError::Unavailable)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -354,7 +357,7 @@ impl ControlledArtifactRepository {
             return Err(ArtifactError::Unavailable);
         }
         ArtifactReference::try_new(
-            format!("mcp-{digest}"),
+            coordinate.id,
             digest,
             publication.byte_count(),
             publication.media_type(),
@@ -475,9 +478,8 @@ fn read_verified_artifact(
 ) -> Result<ArtifactRead, ArtifactError> {
     ensure_artifact_read_live(context, worker_cancellation)?;
     let reference = request.reference();
-    if reference.id() != format!("mcp-{}", reference.sha256())
-        || reference.media_type() != "application/json"
-    {
+    let coordinate = artifact_coordinate(reference.media_type(), reference.sha256())?;
+    if reference.id() != coordinate.id {
         return Err(ArtifactError::InvalidReference);
     }
     if reference.byte_count() > repository_maximum.get()
@@ -485,12 +487,7 @@ fn read_verified_artifact(
     {
         return Err(ArtifactError::ReadLimitExceeded);
     }
-    let prefix = reference
-        .sha256()
-        .get(..2)
-        .ok_or(ArtifactError::InvalidReference)?;
-    let artifact_reference = format!("{ARTIFACT_NAMESPACE}/{prefix}/{}.json", reference.sha256());
-    let artifact_path = Path::new(&artifact_reference);
+    let artifact_path = coordinate.path.as_path();
     drop(
         root.resolve(artifact_path)
             .map_err(|_| ArtifactError::InvalidReference)?,
@@ -558,6 +555,30 @@ fn read_verified_artifact(
     ArtifactRead::try_new(request.into_reference(), content)
 }
 
+#[derive(Debug)]
+struct ArtifactCoordinate {
+    id: String,
+    path: std::path::PathBuf,
+}
+
+fn artifact_coordinate(
+    media_type: &str,
+    digest: &str,
+) -> Result<ArtifactCoordinate, ArtifactError> {
+    let prefix = digest.get(..2).ok_or(ArtifactError::InvalidReference)?;
+    match media_type {
+        "application/json" => Ok(ArtifactCoordinate {
+            id: format!("mcp-{digest}"),
+            path: format!("{ARTIFACT_NAMESPACE}/{prefix}/{digest}.json").into(),
+        }),
+        PARQUET_ARTIFACT_MEDIA_TYPE => Ok(ArtifactCoordinate {
+            id: format!("mcp-parquet-{digest}"),
+            path: format!("{ARTIFACT_NAMESPACE}/parquet/{prefix}/{digest}.parquet").into(),
+        }),
+        _ => Err(ArtifactError::InvalidReference),
+    }
+}
+
 fn ensure_artifact_read_live(
     context: &ArtifactReadContext,
     worker_cancellation: &CancellationToken,
@@ -606,8 +627,10 @@ fn synchronize_publication_directories(
     artifact_path: &Path,
 ) -> Result<(), ArtifactError> {
     let parent = artifact_path.parent().ok_or(ArtifactError::Unavailable)?;
+    let namespace = parent.parent().ok_or(ArtifactError::Unavailable)?;
     for path in [
         parent,
+        namespace,
         Path::new(ARTIFACT_NAMESPACE),
         Path::new("mcp"),
         Path::new("."),

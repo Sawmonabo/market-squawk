@@ -14,6 +14,9 @@ use super::encode_hex;
 pub(crate) struct TrainingEnvironmentReceipt {
     sha256: String,
     training_code_revision: String,
+    application_sha256: String,
+    onnx_worker_sha256: String,
+    validator_sha256: String,
 }
 
 #[pymethods]
@@ -26,6 +29,21 @@ impl TrainingEnvironmentReceipt {
     #[getter]
     fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    #[getter]
+    fn application_sha256(&self) -> &str {
+        &self.application_sha256
+    }
+
+    #[getter]
+    fn onnx_worker_sha256(&self) -> &str {
+        &self.onnx_worker_sha256
+    }
+
+    #[getter]
+    fn validator_sha256(&self) -> &str {
+        &self.validator_sha256
     }
 }
 
@@ -94,6 +112,9 @@ fn verify_training_environment(
     Ok(TrainingEnvironmentReceipt {
         sha256: encode_hex(verified.receipt_sha256()),
         training_code_revision: verified.training_code_revision().into(),
+        application_sha256: encode_hex(verified.application_sha256()),
+        onnx_worker_sha256: encode_hex(verified.onnx_worker_sha256()),
+        validator_sha256: encode_hex(verified.validator_sha256()),
     })
 }
 

@@ -7,7 +7,8 @@ use market_squawk_data::{CatalogEndpointIdentity, Sha256Digest};
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
     BundleError, BundleMetadataRef, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
-    OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, PythonDatasetAdmissionAuthority,
+    ModelOutputSemantics, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError,
+    PythonDatasetAdmissionAuthority,
 };
 use market_squawk_platform::{BoundedInput, InputFileError, UserAuthorizedInputRoot};
 use serde::Deserialize;
@@ -236,6 +237,8 @@ enum BackendAdmissionDto {
         input_shape: Vec<usize>,
         #[serde(rename = "outputShape")]
         output_shape: Vec<usize>,
+        #[serde(rename = "outputSemantics")]
+        output_semantics: Option<OnnxOutputSemanticsDto>,
         #[serde(rename = "inferenceDeadlineMillis")]
         inference_deadline_millis: u64,
         fallback: OnnxFallbackDto,
@@ -251,17 +254,33 @@ impl BackendAdmissionDto {
                 opset,
                 input_shape,
                 output_shape,
+                output_semantics,
                 inference_deadline_millis,
                 fallback,
             } => {
-                let policy = OnnxModelPolicy::try_new(
-                    digest(&model_sha256)?,
-                    opset,
-                    &input_shape,
-                    &output_shape,
-                    Duration::from_millis(inference_deadline_millis),
-                    fallback.into_domain(),
-                )
+                let model_digest = digest(&model_sha256)?;
+                let inference_deadline = Duration::from_millis(inference_deadline_millis);
+                let fallback = fallback.into_domain();
+                let policy = if let Some(output_semantics) = output_semantics {
+                    OnnxModelPolicy::try_new_with_output_semantics(
+                        model_digest,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        output_semantics.into_domain(),
+                        inference_deadline,
+                        fallback,
+                    )
+                } else {
+                    OnnxModelPolicy::try_new(
+                        model_digest,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        inference_deadline,
+                        fallback,
+                    )
+                }
                 .map_err(CliModelAdmissionError::OnnxPolicy)?;
                 Ok(ModelBackendAdmission::Onnx(policy))
             }
@@ -273,6 +292,22 @@ impl BackendAdmissionDto {
 #[serde(rename_all = "snake_case")]
 enum OnnxFallbackDto {
     NoAction,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OnnxOutputSemanticsDto {
+    Regression,
+    BinaryProbability,
+}
+
+impl OnnxOutputSemanticsDto {
+    const fn into_domain(self) -> ModelOutputSemantics {
+        match self {
+            Self::Regression => ModelOutputSemantics::Regression,
+            Self::BinaryProbability => ModelOutputSemantics::BinaryProbability,
+        }
+    }
 }
 
 impl OnnxFallbackDto {

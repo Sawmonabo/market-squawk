@@ -17,6 +17,7 @@ use datafusion::physical_plan::RecordBatchStream;
 use futures_util::Stream;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Encoding;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 use tokio::sync::mpsc;
@@ -426,8 +427,15 @@ pub(super) fn active_file_receipt(
                     .checked_add(1)
                     .and_then(|value| value.checked_mul(size_of::<i32>()))
                     .and_then(|offsets| {
-                        rows.checked_mul(uncompressed)
-                            .and_then(|values| offsets.checked_add(values))
+                        let values = if column
+                            .encodings()
+                            .all(|encoding| matches!(encoding, Encoding::PLAIN | Encoding::RLE))
+                        {
+                            Some(uncompressed)
+                        } else {
+                            rows.checked_mul(uncompressed)
+                        };
+                        values.and_then(|values| offsets.checked_add(values))
                     }),
                 _ => return Err(QueryError::UnsupportedSourceSchema),
             }

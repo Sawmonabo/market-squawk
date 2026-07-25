@@ -11,10 +11,14 @@ use thiserror::Error;
 use crate::native::decide;
 use crate::{
     InferenceBackend, InferenceError, ModelInput, ModelMetadata, ModelOutput, ModelOutputIdentity,
+    ModelOutputSemantics,
 };
 
 use super::worker::{OnnxWorker, WorkerError};
-use super::{OnnxPolicyError, TractOnnxBackend, normalize_input, worker_inference_error};
+use super::{
+    OnnxPolicyError, TractOnnxBackend, normalize_input, validate_output_score,
+    worker_inference_error,
+};
 
 mod seal;
 
@@ -206,7 +210,11 @@ impl ExternalOnnxRuntimeBackend {
         .map_err(|_| ExternalOnnxRuntimeError::WarmUp)?;
         let tract_warm_up = fallback.evidence.warm_up_score();
         let tolerance = 1.0e-5_f32 * tract_warm_up.abs().max(1.0);
-        if !warm_up.is_finite() || (warm_up - tract_warm_up).abs() > tolerance {
+        if !warm_up.is_finite()
+            || (fallback.policy.output_semantics() == ModelOutputSemantics::BinaryProbability
+                && !(0.0..=1.0).contains(&warm_up))
+            || (warm_up - tract_warm_up).abs() > tolerance
+        {
             return Err(ExternalOnnxRuntimeError::Parity);
         }
         runtime.revalidate()?;
@@ -245,7 +253,9 @@ impl InferenceBackend for ExternalOnnxRuntimeBackend {
                     .infer_normalized_until(fallback_input, deadlines.total);
             }
         };
-        let (decision, confidence) = match decide(score, self.metadata().decision_thresholds()) {
+        let (decision, confidence) = match validate_output_score(self.metadata(), score)
+            .and_then(|()| decide(score, self.metadata().decision_thresholds()))
+        {
             Ok(result) => result,
             Err(_) => {
                 return self

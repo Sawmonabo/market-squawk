@@ -10,13 +10,15 @@ use super::BundleError;
 use crate::native::NativeArtifact;
 use crate::{
     BundleExpectations, DecisionThresholds, FeatureNormalizer, MAX_MODEL_FEATURES,
-    ModelFeatureBinding, ModelFormat, ValidationMetric, ValidationMetricName,
+    ModelFeatureBinding, ModelFormat, ModelOutputSemantics, ValidationMetric, ValidationMetricName,
 };
 
-pub(super) const METADATA_SCHEMA_VERSION: u32 = 4;
+pub(super) const LEGACY_METADATA_SCHEMA_VERSION: u32 = 4;
+pub(super) const METADATA_SCHEMA_VERSION: u32 = 5;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
 pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 2;
+pub(super) const OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION: u32 = 3;
 const MAX_VALIDATION_METRICS: usize = 32;
 const MAX_LIMITATIONS: usize = 32;
 const MAX_PROSE_BYTES: usize = 512;
@@ -30,6 +32,7 @@ pub(super) struct MetadataWire {
     pub(super) bundle_version: u64,
     pub(super) model_id: String,
     pub(super) artifact: ArtifactRefWire,
+    pub(super) output_semantics: Option<String>,
     pub(super) training_run: FileRefWire,
     pub(super) features: Vec<FeatureWire>,
     pub(super) training_dataset: DatasetWire,
@@ -146,6 +149,8 @@ pub(super) struct TrainingTrialWire {
     missing_policy: String,
     model_id: String,
     model_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_semantics: Option<String>,
     seed: u64,
     split_counts: SplitCountsWire,
     split_sha256: String,
@@ -311,8 +316,13 @@ pub(super) fn validate_training_run(
     metadata: &MetadataWire,
     expectations: &BundleExpectations,
     format: ModelFormat,
+    output_semantics: ModelOutputSemantics,
+    output_semantics_bound: bool,
 ) -> Result<(), BundleError> {
-    if run.schema_version != TRAINING_RUN_SCHEMA_VERSION {
+    if !matches!(
+        run.schema_version,
+        TRAINING_RUN_SCHEMA_VERSION | OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION
+    ) {
         return Err(BundleError::UnsupportedTrainingRunVersion);
     }
     let trial_bytes = serde_json::to_vec(&run.trial).map_err(|_| BundleError::TrainingRunSyntax)?;
@@ -323,10 +333,23 @@ pub(super) fn validate_training_run(
     let trial = &run.trial;
     validate_dataset(&trial.dataset, expectations)?;
     validate_label(&trial.label, expectations)?;
-    let expected_kind = match format {
-        ModelFormat::NativeLinear => "native_linear",
-        ModelFormat::NativeLogistic => "native_logistic",
-        ModelFormat::Onnx => "onnx",
+    let (expected_kind, expected_output_semantics) = match run.schema_version {
+        TRAINING_RUN_SCHEMA_VERSION => (
+            match format {
+                ModelFormat::NativeLinear => "native_linear",
+                ModelFormat::NativeLogistic => "native_logistic",
+                ModelFormat::Onnx => "onnx",
+            },
+            None,
+        ),
+        OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION => (
+            match output_semantics {
+                ModelOutputSemantics::Regression => "linear",
+                ModelOutputSemantics::BinaryProbability => "logistic",
+            },
+            Some(output_semantics_name(output_semantics)),
+        ),
+        _ => return Err(BundleError::UnsupportedTrainingRunVersion),
     };
     let relationships_match =
         trial.bundle_id == metadata.bundle_id
@@ -344,6 +367,9 @@ pub(super) fn validate_training_run(
             && trial.label == metadata.label
             && trial.model_id == metadata.model_id
             && trial.model_kind == expected_kind
+            && trial.output_semantics.as_deref() == expected_output_semantics
+            && output_semantics_bound
+                == (run.schema_version == OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION)
             && trial.training_code_revision == metadata.training_code_revision
             && trial.environment_sha256 == metadata.training_environment_sha256
             && trial.training_period == metadata.training_period
@@ -387,7 +413,7 @@ pub(super) fn validate_training_run(
 
 pub(super) fn validate_metrics(
     values: &[MetricWire],
-    format: ModelFormat,
+    output_semantics: ModelOutputSemantics,
 ) -> Result<Vec<ValidationMetric>, BundleError> {
     if values.is_empty() || values.len() > MAX_VALIDATION_METRICS {
         return Err(BundleError::InvalidValidationMetrics);
@@ -419,10 +445,9 @@ pub(super) fn validate_metrics(
         }
         metrics.push(ValidationMetric::new(name, value.value));
     }
-    let required = match format {
-        ModelFormat::NativeLinear => ValidationMetricName::MeanSquaredError,
-        ModelFormat::NativeLogistic => ValidationMetricName::Accuracy,
-        ModelFormat::Onnx => ValidationMetricName::MeanSquaredError,
+    let required = match output_semantics {
+        ModelOutputSemantics::Regression => ValidationMetricName::MeanSquaredError,
+        ModelOutputSemantics::BinaryProbability => ValidationMetricName::Accuracy,
     };
     if !metrics.iter().any(|metric| metric.name() == required) {
         return Err(BundleError::InvalidValidationMetrics);
@@ -432,14 +457,14 @@ pub(super) fn validate_metrics(
 
 pub(super) fn validate_thresholds(
     wire: ThresholdWire,
-    format: ModelFormat,
+    output_semantics: ModelOutputSemantics,
 ) -> Result<DecisionThresholds, BundleError> {
     if !wire.negative_max.is_finite()
         || !wire.positive_min.is_finite()
         || !wire.minimum_confidence.is_finite()
         || wire.negative_max >= wire.positive_min
         || !(0.0..=1.0).contains(&wire.minimum_confidence)
-        || (format == ModelFormat::NativeLogistic
+        || (output_semantics == ModelOutputSemantics::BinaryProbability
             && (!(0.0..=1.0).contains(&wire.negative_max)
                 || !(0.0..=1.0).contains(&wire.positive_min)))
     {
@@ -450,6 +475,55 @@ pub(super) fn validate_thresholds(
         wire.positive_min,
         wire.minimum_confidence,
     ))
+}
+
+pub(super) fn validate_output_semantics(
+    metadata_schema_version: u32,
+    value: Option<&str>,
+    format: ModelFormat,
+    expected: Option<ModelOutputSemantics>,
+) -> Result<(ModelOutputSemantics, bool), BundleError> {
+    let (semantics, bound) = match metadata_schema_version {
+        LEGACY_METADATA_SCHEMA_VERSION if value.is_none() && expected.is_none() => (
+            match format {
+                ModelFormat::NativeLinear | ModelFormat::Onnx => ModelOutputSemantics::Regression,
+                ModelFormat::NativeLogistic => ModelOutputSemantics::BinaryProbability,
+            },
+            false,
+        ),
+        METADATA_SCHEMA_VERSION => {
+            let semantics = match value {
+                Some("regression") => ModelOutputSemantics::Regression,
+                Some("binary_probability") => ModelOutputSemantics::BinaryProbability,
+                _ => return Err(BundleError::InvalidOutputSemantics),
+            };
+            if expected != Some(semantics) {
+                return Err(BundleError::InvalidOutputSemantics);
+            }
+            (semantics, true)
+        }
+        _ => return Err(BundleError::InvalidOutputSemantics),
+    };
+    if matches!(
+        (format, semantics),
+        (
+            ModelFormat::NativeLinear,
+            ModelOutputSemantics::BinaryProbability
+        ) | (
+            ModelFormat::NativeLogistic,
+            ModelOutputSemantics::Regression
+        )
+    ) {
+        return Err(BundleError::InvalidOutputSemantics);
+    }
+    Ok((semantics, bound))
+}
+
+const fn output_semantics_name(value: ModelOutputSemantics) -> &'static str {
+    match value {
+        ModelOutputSemantics::Regression => "regression",
+        ModelOutputSemantics::BinaryProbability => "binary_probability",
+    }
 }
 
 pub(super) fn validate_artifact(

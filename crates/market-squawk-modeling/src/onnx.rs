@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::native::decide;
 use crate::{
     InferenceBackend, InferenceError, ModelBundle, ModelFormat, ModelInput, ModelMetadata,
-    ModelOutput, ModelOutputIdentity,
+    ModelOutput, ModelOutputIdentity, ModelOutputSemantics,
 };
 
 #[cfg(feature = "onnx-runtime")]
@@ -100,6 +100,11 @@ impl TractOnnxBackend {
         if bundle.metadata().format() != ModelFormat::Onnx {
             return Err(OnnxBackendError::UnsupportedBundleFormat);
         }
+        if bundle.metadata().output_semantics() != policy.output_semantics()
+            || bundle.metadata().output_semantics_bound() != policy.output_semantics_bound()
+        {
+            return Err(OnnxBackendError::OutputSemanticsMismatch);
+        }
         let artifact = bundle
             .onnx_artifact_bytes()
             .ok_or(OnnxBackendError::UnsupportedBundleFormat)?;
@@ -124,7 +129,10 @@ impl TractOnnxBackend {
             | WorkerError::Runtime
             | WorkerError::TerminationUncertain => OnnxBackendError::WarmUp,
         })?;
-        if !warm_up.is_finite() {
+        if !warm_up.is_finite()
+            || (policy.output_semantics() == ModelOutputSemantics::BinaryProbability
+                && !(0.0..=1.0).contains(&warm_up))
+        {
             return Err(OnnxBackendError::WarmUp);
         }
         let worker_runtime_semantics_digest = worker.runtime_semantics_digest();
@@ -181,9 +189,7 @@ impl TractOnnxBackend {
                 .execute_until(normalized, absolute_deadline)
                 .map_err(worker_inference_error)?,
         );
-        if !score.is_finite() {
-            return Err(InferenceError::OnnxRuntimeFailure);
-        }
+        validate_output_score(metadata, score)?;
         let (decision, confidence) = decide(score, metadata.decision_thresholds())?;
         Ok(ModelOutput::new(
             Arc::clone(&self.output_identity),
@@ -206,6 +212,16 @@ impl InferenceBackend for TractOnnxBackend {
             .ok_or(InferenceError::OnnxDeadlineExceeded)?;
         self.infer_normalized_until(normalized, deadline)
     }
+}
+
+fn validate_output_score(metadata: &ModelMetadata, score: f64) -> Result<(), InferenceError> {
+    if !score.is_finite()
+        || (metadata.output_semantics() == ModelOutputSemantics::BinaryProbability
+            && !(0.0..=1.0).contains(&score))
+    {
+        return Err(InferenceError::OnnxRuntimeFailure);
+    }
+    Ok(())
 }
 
 fn worker_inference_error(error: WorkerError) -> InferenceError {
@@ -247,6 +263,8 @@ fn normalize_input(
 pub enum OnnxBackendError {
     #[error("ONNX bundle format is unsupported")]
     UnsupportedBundleFormat,
+    #[error("ONNX runtime policy output semantics differ from the admitted bundle")]
+    OutputSemanticsMismatch,
     #[error("ONNX graph failed common preflight: {0}")]
     Policy(OnnxPolicyError),
     #[error("ONNX input shape differs from the Task 13 feature contract")]

@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 const MAXIMUM_ARTIFACT_ID_BYTES: usize = 160;
 const MAXIMUM_MEDIA_TYPE_BYTES: usize = 128;
+/// Closed media type for verified immutable Parquet query results.
+pub const PARQUET_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.apache.parquet";
 
 /// Complete content-addressed publication handed to a capability-confined repository.
 ///
@@ -41,6 +43,30 @@ impl ArtifactPublication {
             sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
             content: content.into(),
             media_type: Arc::from("application/json"),
+        })
+    }
+
+    /// Creates an immutable Parquet publication and derives its content identity.
+    ///
+    /// This is intentionally a closed constructor rather than a caller-selected media type.
+    /// The producing analytical store has already structurally validated the complete object;
+    /// this boundary additionally requires the canonical Parquet leading and trailing magic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidPublication`] when `content` is empty, truncated, or does
+    /// not contain one complete Parquet file envelope.
+    pub fn try_parquet(content: Vec<u8>) -> Result<Self, ArtifactError> {
+        if content.len() < 8
+            || content.get(..4) != Some(b"PAR1")
+            || content.get(content.len().saturating_sub(4)..) != Some(b"PAR1")
+        {
+            return Err(ArtifactError::InvalidPublication);
+        }
+        Ok(Self {
+            sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
+            content: content.into(),
+            media_type: Arc::from(PARQUET_ARTIFACT_MEDIA_TYPE),
         })
     }
 

@@ -46,8 +46,7 @@ fn run() -> Result<String, ()> {
         parse_hex(&arguments.authority_sha256)?,
     )?;
     let dataset_root = controlled_root(&arguments.catalog_root)?;
-    if candidate_path.starts_with(&dataset_root)
-        || dataset_root.starts_with(&candidate_path)
+    if !candidate_root_is_admissible(&candidate_path, &dataset_root)
         || authority_root.starts_with(&dataset_root)
         || dataset_root.starts_with(&authority_root)
     {
@@ -86,6 +85,20 @@ fn run() -> Result<String, ()> {
     )
     .map_err(|_| ())?;
     Ok(arguments.metadata_sha256)
+}
+
+fn candidate_root_is_admissible(candidate: &Path, dataset: &Path) -> bool {
+    if dataset.starts_with(candidate) {
+        return false;
+    }
+    if !candidate.starts_with(dataset) {
+        return true;
+    }
+    let model_root = dataset.join("artifacts").join("models");
+    let Ok(model_root) = controlled_root(&model_root) else {
+        return false;
+    };
+    candidate != model_root && candidate.starts_with(model_root)
 }
 
 fn read_authority(

@@ -26,7 +26,7 @@ use market_squawk::{
     ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderPortalConfig,
     ProviderProfileRegistrationOutcome, ResearchService, ResearchServiceError,
     StartOnboardingRequest,
-    cli::{Cli, Command, IngestCommand},
+    cli::{Cli, Command, IngestCommand, QueryCommand},
     local_product::execute_cli_command,
 };
 use market_squawk_data::{
@@ -708,6 +708,139 @@ async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifet
     ])?;
     let ingested = execute_cli_command(&product, cli.command).await?;
     assert_eq!(ingested.value()["data"]["rowCount"], 1);
+    assert!(
+        product
+            .application()
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .is_complete()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_datafusion_result_returns_one_retrievable_opaque_parquet_reference()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("overflow-input");
+    fs::create_dir_all(&input)?;
+    let mut csv = String::from("id,value\n");
+    for row in 0..1_000 {
+        csv.push_str(&format!("observation-{row:05},123.45\n"));
+    }
+    fs::write(input.join("prices.csv"), csv)?;
+    let input = fs::canonicalize(input)?;
+    let manifest = input.join("manifest.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&json!({
+            "schema_version": 3,
+            "objects": [{
+                "dataset": "overflow-prices",
+                "object_id": "overflow-price-object",
+                "path": "prices.csv",
+                "format": {"kind": "csv", "delimiter": 44},
+                "effective_at": 100,
+                "published_at": 150,
+                "revision": "overflow-price-revision-1",
+                "revision_number": 1,
+                "superseded_at": null,
+                "record_time": {
+                    "effective": {
+                        "schema_version": 2,
+                        "coordinate": {"precision": "exact_timestamp", "value": 100}
+                    },
+                    "published": {
+                        "schema_version": 2,
+                        "coordinate": {"precision": "exact_timestamp", "value": 150}
+                    },
+                    "superseded": null
+                },
+                "instrument_binding": {"kind": "unscoped"},
+                "row_policy": {
+                    "identity_field": "id",
+                    "fields": [{
+                        "source": "value",
+                        "field": "price",
+                        "decimal_scale": 2,
+                        "unit": "USD"
+                    }]
+                }
+            }]
+        }))?,
+    )?;
+    let environment = BTreeMap::<OsString, OsString>::new();
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &environment,
+        ConfigOverrides {
+            data_dir: Some(directory.path().join("overflow-product")),
+            ..ConfigOverrides::default()
+        },
+    ))?;
+    let product = LocalProduct::try_new(config)?;
+    let ingested = execute_cli_command(
+        &product,
+        Command::Ingest {
+            command: IngestCommand::File {
+                manifest,
+                object: "overflow-price-object".to_owned(),
+                dataset: "overflow-prices".to_owned(),
+                confirm: true,
+            },
+        },
+    )
+    .await?;
+    assert_eq!(ingested.value()["data"]["rowCount"], 1_000);
+
+    let query = execute_cli_command(
+        &product,
+        Command::Query {
+            command: QueryCommand::Sql {
+                dataset: "overflow-prices".to_owned(),
+                statement: "SELECT * FROM dataset ORDER BY source_identifier".to_owned(),
+                maximum_rows: 1_000,
+            },
+        },
+    )
+    .await?;
+    let artifact = &query.value()["data"]["artifact"];
+    let artifact_id = artifact["artifactId"]
+        .as_str()
+        .ok_or("overflow query omitted its opaque artifact identifier")?;
+    let sha256 = artifact["sha256"]
+        .as_str()
+        .ok_or("overflow query omitted its artifact digest")?;
+    let byte_count = artifact["byteCount"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("overflow query omitted its artifact byte count")?;
+    assert_eq!(artifact["mediaType"], "application/vnd.apache.parquet");
+    assert!(!artifact_id.contains('/') && !artifact_id.contains('.'));
+    assert_eq!(sha256.len(), 64);
+    assert!(byte_count > 256 * 1024);
+
+    let read = execute_cli_command(
+        &product,
+        Command::Query {
+            command: QueryCommand::Artifact {
+                artifact_id: artifact_id.to_owned(),
+                sha256: sha256.to_owned(),
+                byte_count,
+                media_type: "application/vnd.apache.parquet".to_owned(),
+                offset: 0,
+                maximum_bytes: 32 * 1024,
+            },
+        },
+    )
+    .await?;
+    assert_eq!(read.value()["data"]["artifact"]["artifactId"], artifact_id);
+    assert!(
+        read.value()["data"]["contentBase64"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("UEFSM"))
+    );
+    assert_eq!(read.value()["data"]["complete"], false);
     assert!(
         product
             .application()

@@ -5,12 +5,20 @@ use std::time::{Duration, Instant};
 
 use arrow::json::ArrayWriter;
 use market_squawk_data::{
-    DatasetId, QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine,
+    DatasetId, PinnedArtifactQueryRequest, QueryLimits, QueryRequest, QueryResult,
 };
+use market_squawk_domain::SourceIdentifier;
+use market_squawk_services::{ArtifactError, ArtifactPublication, ArtifactPublicationContext};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{CLI_DEFAULT_MAXIMUM_BYTES, CliProductError, CliProductResult, LocalProduct, hex};
+use super::{
+    CLI_DEFAULT_MAXIMUM_BYTES, CLI_HARD_MAXIMUM_BYTES, CliProductError, CliProductResult,
+    LocalProduct, hex,
+};
+
+const QUERY_ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
+const QUERY_ARTIFACT_OWNER: &str = "market-squawk.cli-query";
 
 pub(super) async fn query_sql(
     product: &LocalProduct,
@@ -33,32 +41,104 @@ pub(super) async fn query_sql(
         .analytical()
         .pinned(&manifest)
         .map_err(|_| CliProductError::RequestShape)?;
-    let engine = ResearchQueryEngine::from_pinned_dataset(
-        pinned,
-        "dataset",
-        research.analytical().object_store(),
-        cancellation.clone(),
-    )
-    .await?;
     let rows = u64::try_from(maximum_rows).map_err(|_| CliProductError::Limits)?;
     let limits = QueryLimits::try_new(
         rows,
-        256 * 1024,
-        64 * 1024 * 1024,
+        u64::try_from(CLI_HARD_MAXIMUM_BYTES).map_err(|_| CliProductError::Limits)?,
+        256 * 1024 * 1024,
         4,
         2_048,
         4_096,
         Duration::from_secs(60),
     )?;
     let request = QueryRequest::try_new(manifest.clone(), statement)?;
-    let QueryResult::Inline {
-        batches,
-        byte_count,
-    } = engine.query(request, limits, cancellation).await?
-    else {
-        return Err(CliProductError::Query(
-            QueryError::ArtifactAuthorityRequired,
-        ));
+    let owner =
+        SourceIdentifier::try_from(QUERY_ARTIFACT_OWNER).map_err(|_| CliProductError::Limits)?;
+    let query = PinnedArtifactQueryRequest::try_new(
+        pinned,
+        "dataset",
+        request,
+        limits,
+        owner,
+        QUERY_ARTIFACT_TTL,
+        cancellation.clone(),
+    )?;
+    let output = research
+        .analytical()
+        .query_pinned_with_artifact_publication(query)
+        .await?;
+    let (batches, byte_count) = match output.result() {
+        QueryResult::Inline {
+            batches,
+            byte_count,
+        } => (batches, byte_count),
+        QueryResult::Artifact {
+            object,
+            artifact,
+            ownership,
+        } => {
+            let publication = research.analytical().query_artifact_publication();
+            let bytes = publication
+                .read_verified_bytes(
+                    object,
+                    artifact,
+                    ownership,
+                    CLI_HARD_MAXIMUM_BYTES,
+                    tokio::time::Instant::from_std(deadline),
+                    &cancellation,
+                )
+                .await?;
+            let publication = ArtifactPublication::try_parquet(bytes)?;
+            let reference = product
+                .artifacts()
+                .publish(
+                    publication.clone(),
+                    ArtifactPublicationContext::new(cancellation, deadline),
+                )
+                .await?;
+            if !reference.matches(&publication) {
+                return Err(CliProductError::Artifact(ArtifactError::InvalidReference));
+            }
+            let returned_rows =
+                usize::try_from(object.row_count()).map_err(|_| CliProductError::Limits)?;
+            return Ok(CliProductResult {
+                summary: "bounded SQL query artifact published",
+                value: json!({
+                    "data": {
+                        "relation": "dataset",
+                        "manifest": {
+                            "dataset": manifest.dataset_id().as_str(),
+                            "version": manifest.manifest_version(),
+                            "schema": manifest.schema().name(),
+                            "schemaVersion": manifest.schema_version().get(),
+                            "contentSha256": hex(&manifest.content_hash().bytes()),
+                        },
+                        "artifact": {
+                            "artifactId": reference.id(),
+                            "sha256": reference.sha256(),
+                            "byteCount": reference.byte_count(),
+                            "mediaType": reference.media_type(),
+                            "rowCount": object.row_count(),
+                            "owner": ownership.owner(),
+                            "expiresAt": ownership.expires_at(),
+                        },
+                    },
+                    "metadata": {
+                        "completeness": "complete",
+                        "returnedItems": returned_rows,
+                        "availableItems": returned_rows,
+                        "sourceCoverage": {
+                            "sourceId": generation.source_id().as_str(),
+                            "manifestPinned": true,
+                        },
+                        "dataQuality": {
+                            "classification": "record_level_provenance",
+                            "executionEligible": false,
+                        },
+                    },
+                }),
+            });
+        }
     };
     let returned_rows = batches.iter().try_fold(0_usize, |total, batch| {
         total

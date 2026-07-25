@@ -10,6 +10,9 @@ requires-python = ">=3.12,<3.14"
 license = "Apache-2.0 OR MIT"
 dependencies = ["pyarrow==25.0.0"]
 
+[project.scripts]
+market-squawk-train = "market_squawk.training_driver:main"
+
 [project.optional-dependencies]
 test = ["pytest==9.1.1"]
 

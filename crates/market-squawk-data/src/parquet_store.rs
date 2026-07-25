@@ -656,6 +656,7 @@ impl ParquetObjectStore {
                 .set_statistics_enabled(EnabledStatistics::Chunk),
             None => properties
                 .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .set_dictionary_enabled(false)
                 .set_statistics_enabled(EnabledStatistics::Chunk),
         }
         .build();
@@ -796,6 +797,142 @@ impl ParquetObjectStore {
             verified.content_hash == object.content_hash
                 && verified.size_bytes == object.size_bytes,
         )
+    }
+
+    pub(crate) async fn read_published_bytes_async(
+        &self,
+        object: &PublishedObject,
+        maximum_bytes: usize,
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, ParquetStoreError> {
+        if maximum_bytes == 0 {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ParquetStoreError::ReadDeadlineExceeded);
+        }
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.blocking_tasks).acquire_owned() => {
+                permit.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => return Err(ParquetStoreError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(ParquetStoreError::ReadDeadlineExceeded);
+            }
+        };
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let object = object.clone();
+        let operation_cancellation = cancellation.child_token();
+        let worker_cancellation = operation_cancellation.clone();
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                store.read_published_bytes(&object, maximum_bytes, &worker_cancellation)
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    ParquetStoreError::BlockingTaskFailed
+                }
+            })?;
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => {
+                supervisor.cancel();
+                Err(ParquetStoreError::Cancelled)
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                supervisor.cancel();
+                Err(ParquetStoreError::ReadDeadlineExceeded)
+            }
+        }
+    }
+
+    fn read_published_bytes(
+        &self,
+        object: &PublishedObject,
+        maximum_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, ParquetStoreError> {
+        if cancellation.is_cancelled()
+            || object.size_bytes == 0
+            || object.size_bytes > self.config.max_staging_bytes
+            || usize::try_from(object.size_bytes)
+                .ok()
+                .is_none_or(|size| size > maximum_bytes)
+        {
+            return Err(if cancellation.is_cancelled() {
+                ParquetStoreError::Cancelled
+            } else {
+                ParquetStoreError::ReadLimitExceeded
+            });
+        }
+        let digest = encode_hex(object.content_hash.bytes());
+        let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
+        if object.relative_reference != expected_reference {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        self.root.resolve(&object.relative_reference)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = self
+            .directory
+            .open_with(&object.relative_reference, &options)?
+            .into_std();
+        let metadata = file.metadata()?;
+        let size = usize::try_from(metadata.len()).map_err(|_| ParquetStoreError::SizeOverflow)?;
+        if !metadata.is_file()
+            || metadata.len() != object.size_bytes
+            || timestamp_from_system_time(metadata.modified()?)? != object.created_at
+            || size > maximum_bytes
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        let mut content = Vec::new();
+        content
+            .try_reserve_exact(size)
+            .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
+        content.resize(size, 0);
+        let mut offset = 0_usize;
+        let mut hash = Sha256::new();
+        while offset < size {
+            if cancellation.is_cancelled() {
+                return Err(ParquetStoreError::Cancelled);
+            }
+            let end = offset
+                .checked_add(64 * 1024)
+                .map(|end| end.min(size))
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            let read = file.read(&mut content[offset..end])?;
+            if read == 0 {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            let read_end = offset
+                .checked_add(read)
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            hash.update(&content[offset..read_end]);
+            offset = read_end;
+        }
+        let mut trailing = [0_u8; 1];
+        if file.read(&mut trailing)? != 0
+            || Sha256Digest::new(hash.finalize().into()) != object.content_hash
+            || content.get(..4) != Some(b"PAR1")
+            || content.get(content.len().saturating_sub(4)..) != Some(b"PAR1")
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok(content)
     }
 
     /// Reads and verifies every object in one immutable generation through the retained root.
@@ -1164,6 +1301,9 @@ pub enum ParquetStoreError {
     /// Recovery exceeded its elapsed-time deadline.
     #[error("Parquet recovery deadline exceeded")]
     RecoveryDeadlineExceeded,
+    /// A bounded immutable-object read exceeded its caller-selected deadline.
+    #[error("Parquet reader deadline exceeded")]
+    ReadDeadlineExceeded,
     /// Artifact reference validation failed.
     #[error("controlled artifact reference is invalid")]
     ArtifactPath(#[from] market_squawk_platform::ArtifactPathError),

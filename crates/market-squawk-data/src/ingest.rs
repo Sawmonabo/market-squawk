@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
@@ -33,7 +33,8 @@ use crate::{
     DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestIdentity, IngestReservation,
     IngestRunState, ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError,
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset,
-    PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch,
+    PinnedQueryOutput, PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput,
+    QueryError, QueryLimits, QueryRequest, ResearchArrowBatch, ResearchQueryEngine,
     RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
@@ -140,6 +141,64 @@ pub struct AnalyticalDataService {
     operation_gate: AnalyticalOperationGate,
 }
 
+/// Complete immutable operation input for one bounded pinned query with durable overflow.
+///
+/// Fields stay private so callers cannot detach the query, owner, expiry, cancellation, or
+/// absolute deadline from the immutable generation they authorize.
+pub struct PinnedArtifactQueryRequest {
+    pinned: PinnedDataset,
+    table_name: String,
+    query: QueryRequest,
+    limits: QueryLimits,
+    owner: SourceIdentifier,
+    artifact_ttl: Duration,
+    cancellation: CancellationToken,
+    operation_deadline: tokio::time::Instant,
+}
+
+impl PinnedArtifactQueryRequest {
+    /// Binds every execution and publication input under one absolute operation deadline.
+    pub fn try_new(
+        pinned: PinnedDataset,
+        table_name: impl Into<String>,
+        query: QueryRequest,
+        limits: QueryLimits,
+        owner: SourceIdentifier,
+        artifact_ttl: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Self, QueryError> {
+        let operation_deadline = tokio::time::Instant::now()
+            .checked_add(limits.deadline())
+            .ok_or(QueryError::InvalidLimits)?;
+        Ok(Self {
+            pinned,
+            table_name: table_name.into(),
+            query,
+            limits,
+            owner,
+            artifact_ttl,
+            cancellation,
+            operation_deadline,
+        })
+    }
+}
+
+impl fmt::Debug for PinnedArtifactQueryRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedArtifactQueryRequest")
+            .field("pinned", &"[IMMUTABLE PIN]")
+            .field("table_name", &self.table_name)
+            .field("query", &"[VALIDATED QUERY]")
+            .field("limits", &self.limits)
+            .field("owner", &"[PUBLICATION OWNER]")
+            .field("artifact_ttl", &self.artifact_ttl)
+            .field("cancellation", &"[CANCELLATION CAPABILITY]")
+            .field("operation_deadline", &self.operation_deadline)
+            .finish()
+    }
+}
+
 /// Non-separable query-result publication authority for one catalog and artifact root.
 pub struct QueryArtifactPublication {
     objects: Arc<ParquetObjectStore>,
@@ -205,6 +264,41 @@ impl QueryArtifactPublication {
         batch: &RecordBatch,
     ) -> Result<QueryArtifactWriterAdmission, ParquetStoreError> {
         self.objects.query_artifact_writer_admission(batch)
+    }
+
+    /// Reads one exact query object only while its durable ownership receipt remains live.
+    ///
+    /// All four independently retained identities—object, catalog artifact, durable ownership,
+    /// and this sealed root/catalog publication capability—must agree before bytes are returned.
+    pub async fn read_verified_bytes(
+        &self,
+        object: &PublishedObject,
+        artifact: &ArtifactRecord,
+        ownership: &crate::QueryArtifactResult,
+        maximum_bytes: usize,
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, QueryError> {
+        let now = system_timestamp().map_err(|_| QueryError::ArtifactAuthorityRequired)?;
+        if ownership.artifact_id() != artifact.artifact_id()
+            || ownership.expires_at() <= now
+            || artifact.relative_reference() != object.relative_reference()
+            || artifact.content_digest().algorithm() != DigestAlgorithm::Sha256
+            || artifact.content_digest().bytes() != object.content_hash().bytes()
+            || artifact.size_bytes() != object.size_bytes()
+            || artifact.created_at() != object.created_at()
+            || usize::try_from(object.size_bytes())
+                .ok()
+                .is_none_or(|size| size > maximum_bytes)
+        {
+            return Err(QueryError::Artifact(
+                ParquetStoreError::ObjectMetadataMismatch,
+            ));
+        }
+        self.objects
+            .read_published_bytes_async(object, maximum_bytes, deadline, cancellation)
+            .await
+            .map_err(map_query_store_error)
     }
 
     #[cfg(test)]
@@ -375,6 +469,7 @@ impl QueryArtifactPublication {
 fn map_query_store_error(error: ParquetStoreError) -> crate::QueryError {
     match error {
         ParquetStoreError::Cancelled => crate::QueryError::Cancelled,
+        ParquetStoreError::ReadDeadlineExceeded => crate::QueryError::DeadlineExceeded,
         ParquetStoreError::BlockingTaskLimitExceeded => {
             crate::QueryError::BlockingTaskLimitExceeded
         }
@@ -388,6 +483,24 @@ fn map_query_catalog_error(error: CatalogError) -> crate::QueryError {
         CatalogError::QueryArtifactDeadlineExceeded => crate::QueryError::DeadlineExceeded,
         error => crate::QueryError::Catalog(error),
     }
+}
+
+fn map_query_reservation_error(error: IngestError) -> QueryError {
+    match error {
+        IngestError::Cancelled => QueryError::Cancelled,
+        IngestError::DeadlineExceeded => QueryError::DeadlineExceeded,
+        IngestError::Catalog(error) => QueryError::Catalog(error),
+        IngestError::Parquet(error) => map_query_store_error(error),
+        _ => QueryError::ArtifactAuthorityRequired,
+    }
+}
+
+fn system_timestamp() -> Result<Timestamp, ()> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ())?;
+    let nanos = i64::try_from(elapsed.as_nanos()).map_err(|_| ())?;
+    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 fn map_recovery_store_error(error: ParquetStoreError) -> IngestError {
@@ -524,6 +637,72 @@ impl AnalyticalDataService {
     /// Returns a cloneable immutable manifest and fixed-template observation read capability.
     pub fn analytical_reader(&self) -> crate::AnalyticalReadCapability {
         crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
+    }
+
+    /// Executes one exact pinned query, reserving durable artifact authority only after the first
+    /// bounded execution proves that the result crossed the inline threshold.
+    ///
+    /// The retry uses the same parsed request, manifest, complete execution limits, and immutable
+    /// object graph. This avoids leaving unused durable reservations for ordinary inline results.
+    pub async fn query_pinned_with_artifact_publication(
+        &self,
+        operation: PinnedArtifactQueryRequest,
+    ) -> Result<PinnedQueryOutput, QueryError> {
+        let PinnedArtifactQueryRequest {
+            pinned,
+            table_name,
+            query,
+            limits,
+            owner,
+            artifact_ttl,
+            cancellation,
+            operation_deadline,
+        } = operation;
+        let retry_query = query.retry_without_artifact()?;
+        let engine = tokio::time::timeout_at(
+            operation_deadline,
+            ResearchQueryEngine::from_pinned_dataset(
+                pinned,
+                table_name,
+                Arc::clone(&self.objects),
+                cancellation.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| QueryError::DeadlineExceeded)??;
+        let limits = remaining_query_limits(limits, operation_deadline)?;
+        match engine
+            .query_pinned(query, limits, cancellation.clone())
+            .await
+        {
+            Ok(output) => Ok(output),
+            Err(QueryError::ArtifactStoreRequired) => {
+                let engine = engine.with_artifact_publication(self.query_artifact_publication())?;
+                let limits = remaining_query_limits(limits, operation_deadline)?;
+                let expires_at = system_timestamp()
+                    .ok()
+                    .zip(i64::try_from(artifact_ttl.as_nanos()).ok())
+                    .and_then(|(now, ttl)| now.checked_add_nanos(ttl).ok())
+                    .ok_or(QueryError::ArtifactAuthorityRequired)?;
+                let reservation_input = QueryArtifactReservationInput::try_new(
+                    owner,
+                    retry_query.artifact_identity(&limits),
+                    limits.max_bytes(),
+                    expires_at,
+                )
+                .map_err(QueryError::Catalog)?;
+                let reservation = tokio::time::timeout_at(
+                    operation_deadline,
+                    self.reserve_query_artifact(reservation_input, &cancellation),
+                )
+                .await
+                .map_err(|_| QueryError::DeadlineExceeded)?
+                .map_err(map_query_reservation_error)?;
+                let query = retry_query.with_artifact_reservation(reservation);
+                engine.query_pinned(query, limits, cancellation).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns fair-value persistence authority over this service's sole catalog writer.
@@ -1051,6 +1230,13 @@ impl AnalyticalDataService {
             .lock()
             .map_err(|_| IngestError::AuthorityLockPoisoned)
     }
+}
+
+fn remaining_query_limits(
+    limits: QueryLimits,
+    deadline: tokio::time::Instant,
+) -> Result<QueryLimits, QueryError> {
+    limits.with_operation_deadline(deadline)
 }
 
 fn map_root_authority_catalog_error(error: CatalogError) -> IngestError {

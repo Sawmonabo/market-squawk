@@ -18,6 +18,7 @@ from . import _native
 
 
 MAX_ARTIFACT_BYTES = 1024 * 1024
+MAX_ONNX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
 MAX_AUTHORITY_BYTES = 256 * 1024
 MAX_VALIDATOR_BYTES = 128 * 1024 * 1024
@@ -79,6 +80,7 @@ class BundleCandidate:
     metadata_bytes: bytes = field(repr=False)
     artifact_bytes: bytes = field(repr=False)
     training_run_bytes: bytes = field(repr=False)
+    artifact_path: str
     metadata_sha256: str
     artifact_sha256: str
     training_run_sha256: str
@@ -90,6 +92,30 @@ class BundleCandidate:
         run_record: Mapping[str, Any],
     ) -> None:
         artifact_bytes = _canonical(artifact, MAX_ARTIFACT_BYTES)
+        self._initialize(metadata, artifact_bytes, run_record, "artifact.json")
+
+    @classmethod
+    def onnx(
+        cls,
+        metadata: Mapping[str, Any],
+        artifact: bytes,
+        run_record: Mapping[str, Any],
+    ) -> BundleCandidate:
+        """Construct a candidate containing one exact code-owned ONNX protobuf."""
+
+        if type(artifact) is not bytes or not artifact or len(artifact) > MAX_ONNX_ARTIFACT_BYTES:
+            raise BundleExportError("ONNX artifact exceeds its closed byte contract")
+        candidate = object.__new__(cls)
+        candidate._initialize(metadata, artifact, run_record, "model.onnx")
+        return candidate
+
+    def _initialize(
+        self,
+        metadata: Mapping[str, Any],
+        artifact_bytes: bytes,
+        run_record: Mapping[str, Any],
+        artifact_path: str,
+    ) -> None:
         training_run_bytes = _canonical(run_record, MAX_METADATA_BYTES)
         artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
         training_run_sha256 = hashlib.sha256(training_run_bytes).hexdigest()
@@ -99,6 +125,21 @@ class BundleCandidate:
             finalized_training_run = dict(finalized_metadata["training_run"])
         except (KeyError, TypeError, ValueError) as error:
             raise BundleExportError("bundle metadata references are invalid") from error
+        expected_format = "onnx" if artifact_path == "model.onnx" else None
+        observed_format = finalized_artifact.get("format")
+        if (
+            finalized_artifact.get("path") != artifact_path
+            or not isinstance(observed_format, str)
+            or (
+                expected_format is not None
+                and observed_format != expected_format
+            )
+            or (
+                expected_format is None
+                and observed_format not in {"native_linear", "native_logistic"}
+            )
+        ):
+            raise BundleExportError("bundle artifact path or format is invalid")
         finalized_artifact["sha256"] = artifact_sha256
         finalized_artifact["size_bytes"] = len(artifact_bytes)
         finalized_training_run["sha256"] = training_run_sha256
@@ -109,6 +150,7 @@ class BundleCandidate:
         object.__setattr__(self, "metadata_bytes", metadata_bytes)
         object.__setattr__(self, "artifact_bytes", artifact_bytes)
         object.__setattr__(self, "training_run_bytes", training_run_bytes)
+        object.__setattr__(self, "artifact_path", artifact_path)
         object.__setattr__(self, "metadata_sha256", hashlib.sha256(metadata_bytes).hexdigest())
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
         object.__setattr__(self, "training_run_sha256", training_run_sha256)
@@ -135,7 +177,7 @@ class BundleCandidate:
             raise BundleExportError("bundle candidate generation already exists")
         temporary = Path(tempfile.mkdtemp(prefix=".candidate-", dir=output_root))
         try:
-            _write_exact(temporary / "artifact.json", self.artifact_bytes)
+            _write_exact(temporary / self.artifact_path, self.artifact_bytes)
             _write_exact(temporary / "bundle.json", self.metadata_bytes)
             _write_exact(temporary / "training-run.json", self.training_run_bytes)
             _fsync_directory(temporary)
@@ -150,7 +192,7 @@ class BundleCandidate:
             return BundleReceipt(
                 root=final,
                 metadata=final / "bundle.json",
-                artifact=final / "artifact.json",
+                artifact=final / self.artifact_path,
                 run_record=final / "training-run.json",
                 metadata_sha256=self.metadata_sha256,
                 artifact_sha256=self.artifact_sha256,

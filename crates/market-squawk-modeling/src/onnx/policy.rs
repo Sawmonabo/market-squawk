@@ -10,6 +10,8 @@ use thiserror::Error;
 use tract_onnx::pb::{AttributeProto, ModelProto, TensorProto, TypeProto, tensor_proto};
 use tract_onnx::prelude::Framework;
 
+use crate::ModelOutputSemantics;
+
 /// Maximum bytes in one self-contained ONNX protobuf.
 pub const MAX_ONNX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum executable nodes in one admitted graph.
@@ -59,6 +61,8 @@ pub struct OnnxModelPolicy {
     opset: u32,
     input_shape: Box<[usize]>,
     output_shape: Box<[usize]>,
+    output_semantics: ModelOutputSemantics,
+    output_semantics_bound: bool,
     inference_deadline: Duration,
     fallback: OnnxFallbackPolicy,
     policy_digest: [u8; 32],
@@ -76,6 +80,62 @@ impl OnnxModelPolicy {
         opset: u32,
         input_shape: &[usize],
         output_shape: &[usize],
+        inference_deadline: Duration,
+        fallback: OnnxFallbackPolicy,
+    ) -> Result<Self, OnnxPolicyError> {
+        Self::try_new_internal(
+            model_digest,
+            opset,
+            input_shape,
+            output_shape,
+            ModelOutputSemantics::Regression,
+            false,
+            inference_deadline,
+            fallback,
+        )
+    }
+
+    /// Constructs a policy that binds the graph's scalar-output interpretation.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same closed graph, shape, resource, and deadline validation as [`Self::try_new`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all independent ONNX authorities remain explicit"
+    )]
+    pub fn try_new_with_output_semantics(
+        model_digest: Sha256Digest,
+        opset: u32,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        output_semantics: ModelOutputSemantics,
+        inference_deadline: Duration,
+        fallback: OnnxFallbackPolicy,
+    ) -> Result<Self, OnnxPolicyError> {
+        Self::try_new_internal(
+            model_digest,
+            opset,
+            input_shape,
+            output_shape,
+            output_semantics,
+            true,
+            inference_deadline,
+            fallback,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all independent ONNX authorities remain explicit"
+    )]
+    fn try_new_internal(
+        model_digest: Sha256Digest,
+        opset: u32,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        output_semantics: ModelOutputSemantics,
+        output_semantics_bound: bool,
         inference_deadline: Duration,
         fallback: OnnxFallbackPolicy,
     ) -> Result<Self, OnnxPolicyError> {
@@ -101,6 +161,7 @@ impl OnnxModelPolicy {
             opset,
             input_shape,
             output_shape,
+            output_semantics_bound.then_some(output_semantics),
             inference_deadline,
             fallback,
         );
@@ -109,6 +170,8 @@ impl OnnxModelPolicy {
             opset,
             input_shape: input_shape.into(),
             output_shape: output_shape.into(),
+            output_semantics,
+            output_semantics_bound,
             inference_deadline,
             fallback,
             policy_digest,
@@ -156,6 +219,18 @@ impl OnnxModelPolicy {
     #[must_use]
     pub fn output_shape(&self) -> &[usize] {
         &self.output_shape
+    }
+
+    /// Returns the scalar-output interpretation used by runtime decision semantics.
+    #[must_use]
+    pub const fn output_semantics(&self) -> ModelOutputSemantics {
+        self.output_semantics
+    }
+
+    /// Returns whether the policy digest and graph preflight explicitly bind output semantics.
+    #[must_use]
+    pub const fn output_semantics_bound(&self) -> bool {
+        self.output_semantics_bound
     }
 
     /// Returns the bounded per-inference deadline.
@@ -231,6 +306,8 @@ pub enum OnnxPolicyError {
     DynamicShape,
     #[error("ONNX graph shape differs from policy")]
     ShapeMismatch,
+    #[error("ONNX graph output link differs from its declared semantics")]
+    OutputSemanticsMismatch,
     #[error("ONNX graph exceeds the node ceiling")]
     NodeLimit,
     #[error("ONNX graph exceeds the tensor ceiling")]
@@ -331,6 +408,26 @@ fn validate_proto(
     )?;
     if input_shape != policy.input_shape.as_ref() || output_shape != policy.output_shape.as_ref() {
         return Err(OnnxPolicyError::ShapeMismatch);
+    }
+    if policy.output_semantics_bound {
+        let output_name = graph.output[0].name.as_str();
+        let mut producers = graph
+            .node
+            .iter()
+            .filter(|node| node.output.iter().any(|value| value == output_name));
+        let producer = producers
+            .next()
+            .ok_or(OnnxPolicyError::OutputSemanticsMismatch)?;
+        if producers.next().is_some()
+            || match policy.output_semantics {
+                ModelOutputSemantics::Regression => {
+                    matches!(producer.op_type.as_str(), "Sigmoid" | "Softmax")
+                }
+                ModelOutputSemantics::BinaryProbability => producer.op_type != "Sigmoid",
+            }
+        {
+            return Err(OnnxPolicyError::OutputSemanticsMismatch);
+        }
     }
     let input_elements = shape_elements(&input_shape)?;
     let output_elements = shape_elements(&output_shape)?;
@@ -465,11 +562,20 @@ fn digest_policy(
     opset: u32,
     input_shape: &[usize],
     output_shape: &[usize],
+    output_semantics: Option<ModelOutputSemantics>,
     deadline: Duration,
     fallback: OnnxFallbackPolicy,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    bind_bytes(&mut digest, b"namespace", b"market-squawk/onnx-policy/v2");
+    bind_bytes(
+        &mut digest,
+        b"namespace",
+        if output_semantics.is_some() {
+            b"market-squawk/onnx-policy/v3"
+        } else {
+            b"market-squawk/onnx-policy/v2"
+        },
+    );
     bind_bytes(
         &mut digest,
         b"wire-admission",
@@ -504,6 +610,16 @@ fn digest_policy(
         for dimension in shape {
             bind_usize(&mut digest, b"dimension", *dimension);
         }
+    }
+    if let Some(output_semantics) = output_semantics {
+        bind_u128(
+            &mut digest,
+            b"output-semantics",
+            u128::from(match output_semantics {
+                ModelOutputSemantics::Regression => 1_u8,
+                ModelOutputSemantics::BinaryProbability => 2_u8,
+            }),
+        );
     }
     bind_u128(&mut digest, b"deadline-nanoseconds", deadline.as_nanos());
     bind_u128(

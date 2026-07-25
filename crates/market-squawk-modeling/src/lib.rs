@@ -35,8 +35,8 @@ pub use input::{
 pub use metadata::{
     BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, MAX_BUNDLE_ID_BYTES,
     MAX_MODEL_FEATURES, MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat,
-    ModelMetadata, ModelMetadataError, TrainingDatasetIdentity, TrainingPeriod, ValidationMetric,
-    ValidationMetricName,
+    ModelMetadata, ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity,
+    TrainingPeriod, ValidationMetric, ValidationMetricName,
 };
 pub use native::{InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend};
 #[cfg(feature = "onnx-runtime")]
@@ -142,6 +142,7 @@ impl ModelFailure {
             #[cfg(feature = "onnx-tract")]
             Self::OnnxBackend(
                 OnnxBackendError::UnsupportedBundleFormat
+                | OnnxBackendError::OutputSemanticsMismatch
                 | OnnxBackendError::FeatureShapeMismatch
                 | OnnxBackendError::RuntimeLoad
                 | OnnxBackendError::IntermediateLimit
@@ -231,6 +232,7 @@ impl From<OnnxBackendError> for ModelFailure {
 const fn onnx_backend_error_code(error: OnnxBackendError) -> u16 {
     match error {
         OnnxBackendError::UnsupportedBundleFormat => 501,
+        OnnxBackendError::OutputSemanticsMismatch => 507,
         OnnxBackendError::Policy(_) => 502,
         OnnxBackendError::FeatureShapeMismatch => 503,
         OnnxBackendError::RuntimeLoad => 504,
@@ -250,6 +252,7 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::MetadataStructureLimit => 7,
         BundleError::MetadataSyntax => 8,
         BundleError::UnsupportedMetadataVersion => 9,
+        BundleError::InvalidOutputSemantics => 48,
         BundleError::ModelIdentityMismatch => 10,
         BundleError::BundleIdentityMismatch => 11,
         BundleError::UnsupportedFormat => 12,

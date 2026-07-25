@@ -643,6 +643,7 @@ const fn policy_error_id(error: OnnxPolicyError) -> u8 {
         OnnxPolicyError::ElementLimit => 14,
         OnnxPolicyError::NonFiniteTensor => 15,
         OnnxPolicyError::UnsupportedGraphState => 16,
+        OnnxPolicyError::OutputSemanticsMismatch => 17,
     }
 }
 

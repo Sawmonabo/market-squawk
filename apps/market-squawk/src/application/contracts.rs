@@ -5,9 +5,9 @@ use std::collections::HashSet;
 use chrono::DateTime;
 use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use market_squawk_services::{
-    ScopeRequirement, ServiceCapabilities, ServiceCapabilityError, ServiceDomain,
-    SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor,
-    ToolEffects, ToolInputError, ToolResultPolicy, ToolScope,
+    PARQUET_ARTIFACT_MEDIA_TYPE, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
+    ServiceDomain, SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract,
+    ToolDescriptor, ToolEffects, ToolInputError, ToolResultPolicy, ToolScope,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -145,7 +145,7 @@ const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
     ),
     ArgumentSpec::required(
         "mediaType",
-        ArgumentKind::Enumeration(&["application/json"]),
+        ArgumentKind::Enumeration(&["application/json", PARQUET_ARTIFACT_MEDIA_TYPE]),
     ),
     ArgumentSpec::required(
         "offset",

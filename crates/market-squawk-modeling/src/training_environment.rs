@@ -24,6 +24,8 @@ const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILES: usize = 8_192;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
 const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
+const TRAINING_DRIVER_RECORD_PATH: &str = "../../../bin/market-squawk-train";
+const TRAINING_DRIVER_RELATIVE_PATH: &str = "bin/market-squawk-train";
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
 const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
@@ -573,6 +575,9 @@ fn verify_distribution(
         .from_reader(record.bytes.as_slice());
     let mut entries = BTreeMap::new();
     let mut saw_record = false;
+    let require_training_driver =
+        distribution.name == "market-squawk" && distribution.version == "0.1.0";
+    let mut saw_training_driver = false;
     let mut total_bytes = 0_u64;
     for row in reader.records() {
         let row = row.map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
@@ -595,19 +600,33 @@ fn verify_distribution(
             saw_record = true;
             continue;
         }
-        let relative = relative_path(name)?;
-        let first = relative
-            .components()
-            .next()
-            .and_then(|value| match value {
-                Component::Normal(value) => value.to_str(),
-                _ => None,
-            })
-            .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
-        if !roots.contains(first) {
-            return Err(TrainingEnvironmentError::InstalledDistribution);
-        }
-        let file = read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?;
+        let is_training_driver = require_training_driver && name == TRAINING_DRIVER_RECORD_PATH;
+        let file = if is_training_driver {
+            if saw_training_driver || digest.is_empty() || size.is_empty() {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+            saw_training_driver = true;
+            read_controlled(
+                root,
+                Path::new(TRAINING_DRIVER_RELATIVE_PATH),
+                MAX_DISTRIBUTION_FILE_BYTES,
+                false,
+            )?
+        } else {
+            let relative = relative_path(name)?;
+            let first = relative
+                .components()
+                .next()
+                .and_then(|value| match value {
+                    Component::Normal(value) => value.to_str(),
+                    _ => None,
+                })
+                .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+            if !roots.contains(first) {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+            read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
+        };
         let size = if digest.is_empty() && size.is_empty() {
             file.size_bytes
         } else {
@@ -636,12 +655,17 @@ fn verify_distribution(
         }
     }
     if !saw_record
+        || require_training_driver != saw_training_driver
         || entries.len() != distribution.file_count
         || record_set_digest(&entries) != parse_hex(&distribution.file_set_sha256)?
     {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
-    let mut expected_paths = entries.keys().cloned().collect::<BTreeSet<_>>();
+    let mut expected_paths = entries
+        .keys()
+        .filter(|name| name.as_str() != TRAINING_DRIVER_RECORD_PATH)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     expected_paths.insert(record_entry);
     if scan_distribution_paths(site_packages, &roots)? != expected_paths {
         return Err(TrainingEnvironmentError::InstalledDistribution);

@@ -169,9 +169,10 @@ impl LocalProduct {
             source_discovery,
             portal_activation,
         )?);
-        let research_domains = ResearchApplicationServices::new(
+        let research_domains = ResearchApplicationServices::new_with_artifacts(
             Arc::clone(&research),
             Arc::clone(&research_ingest) as Arc<_>,
+            Arc::clone(&artifacts),
         );
 
         let portfolio = Arc::new(PortfolioApplicationService::try_new(

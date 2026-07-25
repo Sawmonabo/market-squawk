@@ -8,8 +8,8 @@ use std::time::Duration;
 use market_squawk_data::{CatalogEndpointIdentity, Sha256Digest};
 use market_squawk_domain::{ModelId, Timestamp};
 use market_squawk_modeling::{
-    BundleId, BundleMetadataRef, MAX_MODEL_REGISTRY_GENERATIONS, OnnxFallbackPolicy,
-    OnnxModelPolicy,
+    BundleId, BundleMetadataRef, MAX_MODEL_REGISTRY_GENERATIONS, ModelOutputSemantics,
+    OnnxFallbackPolicy, OnnxModelPolicy,
 };
 use market_squawk_platform::LocalAuthorityStateStore;
 use serde::{Deserialize, Serialize};
@@ -390,6 +390,8 @@ enum RuntimePolicyView<'a> {
         opset: u32,
         input_shape: &'a [usize],
         output_shape: &'a [usize],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_semantics: Option<&'static str>,
         inference_deadline_nanos: u64,
         fallback: &'static str,
         policy_sha256: String,
@@ -408,6 +410,12 @@ impl<'a> From<&'a StoredRuntimePolicy> for RuntimePolicyView<'a> {
                 opset: policy.opset(),
                 input_shape: policy.input_shape(),
                 output_shape: policy.output_shape(),
+                output_semantics: policy.output_semantics_bound().then_some(
+                    match policy.output_semantics() {
+                        ModelOutputSemantics::Regression => "regression",
+                        ModelOutputSemantics::BinaryProbability => "binary_probability",
+                    },
+                ),
                 inference_deadline_nanos: *inference_deadline_nanos,
                 fallback: "no_action",
                 policy_sha256: encode_hex(policy.policy_digest()),
@@ -487,6 +495,7 @@ enum RuntimePolicyWire {
         opset: u32,
         input_shape: Vec<usize>,
         output_shape: Vec<usize>,
+        output_semantics: Option<String>,
         inference_deadline_nanos: u64,
         fallback: String,
         policy_sha256: String,
@@ -505,6 +514,7 @@ impl RuntimePolicyWire {
                 opset,
                 input_shape,
                 output_shape,
+                output_semantics,
                 inference_deadline_nanos,
                 fallback,
                 policy_sha256,
@@ -514,14 +524,36 @@ impl RuntimePolicyWire {
                 {
                     return Err(ModelRuntimeIndexError::InvalidRecord);
                 }
-                let policy = OnnxModelPolicy::try_new(
-                    artifact_sha256,
-                    opset,
-                    &input_shape,
-                    &output_shape,
-                    Duration::from_nanos(inference_deadline_nanos),
-                    OnnxFallbackPolicy::NoAction,
-                )
+                let deadline = Duration::from_nanos(inference_deadline_nanos);
+                let policy = match output_semantics.as_deref() {
+                    None => OnnxModelPolicy::try_new(
+                        artifact_sha256,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        deadline,
+                        OnnxFallbackPolicy::NoAction,
+                    ),
+                    Some("regression") => OnnxModelPolicy::try_new_with_output_semantics(
+                        artifact_sha256,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        ModelOutputSemantics::Regression,
+                        deadline,
+                        OnnxFallbackPolicy::NoAction,
+                    ),
+                    Some("binary_probability") => OnnxModelPolicy::try_new_with_output_semantics(
+                        artifact_sha256,
+                        opset,
+                        &input_shape,
+                        &output_shape,
+                        ModelOutputSemantics::BinaryProbability,
+                        deadline,
+                        OnnxFallbackPolicy::NoAction,
+                    ),
+                    Some(_) => return Err(ModelRuntimeIndexError::InvalidRecord),
+                }
                 .map_err(|_| ModelRuntimeIndexError::InvalidRecord)?;
                 if policy.policy_digest() != decode_hex(&policy_sha256)? {
                     return Err(ModelRuntimeIndexError::InvalidRecord);

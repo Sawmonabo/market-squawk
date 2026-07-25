@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use market_squawk_data::{AnalyticalReadError, QueryError};
 use market_squawk_platform::UserAuthorizedInputRoot;
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceLimits, ToolResultMetadata,
-    TypedToolResult,
+    ArtifactError, JsonStructureLimits, RequestContext, RequestId, ServiceLimits,
+    ToolResultMetadata, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -65,6 +65,9 @@ pub enum CliProductError {
     /// A bounded read-only DataFusion query failed.
     #[error("CLI analytical query failed: {0}")]
     Query(#[from] QueryError),
+    /// Opaque analytical result publication or retrieval failed.
+    #[error("CLI analytical artifact failed: {0}")]
+    Artifact(#[from] ArtifactError),
     /// A point-in-time dataset build failed admission or publication.
     #[error("{0}")]
     Dataset(#[from] cli_dataset::CliDatasetError),

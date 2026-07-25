@@ -102,18 +102,12 @@ Before admission:
 - ONNX admission additionally requires the exact sibling `market-squawk-onnx-worker` beside the
   running application executable.
 
-Two current limitations affect a new operator:
-
-1. The Python training API and the reviewed procedure below are complete, but the repository has
-   no supported production training-driver file or one-command first-use demonstration. A copied
-   fixture or ad hoc notebook is not release evidence.
-2. The Python training API produces native linear or logistic bundles only. The repository has no
-   supported operator demo or producer for an ONNX candidate. ONNX admission is runnable only when
-   an exact conforming candidate and its full evidence already exist.
-
-These are release-closure gaps, not reasons to invent alternate digests, copy fixtures into
-production, relax validation, or fetch/transform a model outside an accepted evidence path. They
-are tracked in the mutable [delivery ledger](../plans/delivery-ledger.md).
+The signed release installs `market-squawk-train`, the supported production driver. It accepts one
+closed, bounded configuration; deterministically fits `linear` or `logistic`; emits either the
+Gemm regression graph or Gemm-plus-Sigmoid binary-probability graph as a self-contained opset-13
+ONNX artifact; validates the candidate with the signed adjacent Rust validator; and invokes only
+the exact signed application and ONNX worker for admission. Model family and artifact format are
+separate authorities: `modelKind` is `linear` or `logistic`, while `artifactFormat` is `onnx`.
 
 ## Prepare the signed Python training release
 
@@ -194,6 +188,106 @@ On a fresh data root, omitting the release produces a truthful empty model inven
 durable model admission exists, omitting or mismatching it makes startup fail with
 `durable model admissions require the configured signed training release`; the product will not
 hide durable models behind an empty inventory.
+
+## Supported ONNX first-use flow
+
+Create a private configuration file containing the exact retained dataset, feature, label, and
+model identities. The schema is closed; placeholders must be replaced with accepted evidence:
+
+```json
+{
+  "schemaVersion": 1,
+  "dataset": {
+    "root": "/absolute/path/to/market-squawk-data",
+    "exportSha256": "<exact-export-sha256>",
+    "asOfUnixNanos": 1753228800000000000,
+    "maximumRows": 100000,
+    "maximumBytes": 268435456
+  },
+  "training": {
+    "features": [{
+      "name": "<registered-feature-name>",
+      "version": 1,
+      "input_schema_sha256": "<exact-input-schema-sha256>",
+      "semantic_sha256": "<exact-feature-semantics-sha256>"
+    }],
+    "label": {
+      "kind": "label",
+      "scope": "instrument",
+      "corporate_action_sensitivity": "requires_adjustment",
+      "name": "<dataset-label-name>",
+      "version": 1
+    },
+    "seed": 17,
+    "missingPolicy": "reject",
+    "modelId": "<lowercase-non-nil-uuid>",
+    "bundleId": "research-linear",
+    "bundleVersion": 1,
+    "modelKind": "linear",
+    "artifactFormat": "onnx"
+  },
+  "operation": {
+    "timeoutMilliseconds": 60000,
+    "maximumOperations": 50000000
+  },
+  "onnx": {
+    "opset": 13,
+    "inferenceDeadlineMilliseconds": 1000,
+    "fallback": "no_action"
+  }
+}
+```
+
+The proposal command trains from the exact point-in-time dataset and exclusively creates the
+canonical authority proposal. Its output path must not already exist:
+
+```bash
+"$TRAINING_RELEASE_ROOT/bin/market-squawk-train" propose \
+  --config /absolute/path/to/training.json \
+  --output /absolute/path/to/review/bundle-authority.proposal.json
+```
+
+Stop here. An independent operator reviews those exact proposal bytes and, if accepted, places
+them unchanged below the disjoint authority root:
+
+```bash
+install -m 600 \
+  /absolute/path/to/review/bundle-authority.proposal.json \
+  "$AUTHORITY_ROOT/research-linear-v1.bundle-authority.json"
+```
+
+Finalize retrains deterministically, rejects any authority-byte mismatch, creates only the named
+relative parent below `$DATA_ROOT/artifacts`, validates the exact `model.onnx`, and exclusively
+writes the closed admission request:
+
+```bash
+"$TRAINING_RELEASE_ROOT/bin/market-squawk-train" finalize \
+  --config /absolute/path/to/training.json \
+  --authority "$AUTHORITY_ROOT/research-linear-v1.bundle-authority.json" \
+  --candidate-parent models/research-linear-v1 \
+  --request /absolute/path/to/review/research-linear-v1.admission.json
+```
+
+The candidate contains `model.onnx`, `bundle.json`, and `training-run.json`. Metadata, training
+run, independent authority, admission policy, and durable runtime index all bind
+`outputSemantics: "regression"` for `linear` or `"binary_probability"` for `logistic`. The latter
+is admitted only when graph preflight proves that the terminal producer is `Sigmoid`; returned
+tract and optional external-runtime scores are checked again for finiteness and the inclusive
+`[0,1]` probability range before decision thresholds are applied.
+
+Admit with the same signed driver. It hashes the application, ONNX worker, and validator before
+invocation, compares them with the signed training-environment receipt, and rechecks them after:
+
+```bash
+"$TRAINING_RELEASE_ROOT/bin/market-squawk-train" admit \
+  --config /absolute/path/to/training.json \
+  --request /absolute/path/to/review/research-linear-v1.admission.json
+```
+
+Retain the proposal, accepted authority, candidate receipt identities, admission request/result,
+dataset receipt, and signed release evidence as one audit set. To train logistic classification,
+change only the reviewed `modelKind` to `logistic` when the exact label is binary; do not relabel a
+linear fit or an ONNX representation after training.
 
 ## Train and export a native candidate
 
@@ -336,12 +430,6 @@ export MARKET_SQUAWK_AUTHORITY_ROOT="$AUTHORITY_ROOT"
 export MARKET_SQUAWK_CANDIDATE_OUTPUT_ROOT="$DATA_ROOT/artifacts/models/research-linear-v1"
 ```
 
-Run the reviewed Python driver with:
-
-```bash
-"$TRAINING_RELEASE_ROOT/bin/python" -I /absolute/path/to/reviewed-training-driver.py
-```
-
 `proposal.export` writes exactly:
 
 ```text
@@ -356,9 +444,9 @@ atomically publishing `candidate`. Retain the `BundleReceipt`, especially metada
 training-run, authority, dataset-export, dataset-selection, and catalog-identity digests, plus
 `validated_by_rust: true`.
 
-The code outline intentionally leaves the operator-owned driver and independent review procedure
-outside the repository's current release demo. Treat that missing supported driver as a release
-gap; do not run a copied test fixture as production evidence.
+For new production ONNX work, use the supported sealed-driver flow above. The lower-level native
+API remains available for reviewed native-only integrations; a copied fixture or ad hoc notebook
+is not release evidence.
 
 ## Prepare an admission request
 
@@ -454,6 +542,7 @@ The same admission sequence applies to an already validated ONNX candidate, with
   "opset": 18,
   "inputShape": [1, 16],
   "outputShape": [1],
+  "outputSemantics": "regression",
   "inferenceDeadlineMillis": 1000,
   "fallback": "no_action"
 }

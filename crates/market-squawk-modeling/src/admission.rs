@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     BundleError, BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot, ModelBundle,
-    TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
+    ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
 };
 
 /// Maximum exact independent authority-document bytes admitted before parsing.
@@ -328,7 +328,13 @@ fn expectations(
     selection: &PythonDatasetSelection,
     environment: Option<&VerifiedTrainingEnvironment>,
 ) -> Result<BundleExpectations, ModelAdmissionError> {
-    if wire.schema_version != 5
+    let output_semantics = match (wire.schema_version, wire.output_semantics.as_deref()) {
+        (5, None) => None,
+        (6, Some("regression")) => Some(ModelOutputSemantics::Regression),
+        (6, Some("binary_probability")) => Some(ModelOutputSemantics::BinaryProbability),
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    if !matches!(wire.schema_version, 5 | 6)
         || wire.label.kind != "label"
         || !dataset_matches_selection(&wire.dataset, selection)?
         || wire.universe_id != selection.identity().universe_id().as_str()
@@ -378,25 +384,54 @@ fn expectations(
         NonZeroU32::new(wire.label.version).ok_or(ModelAdmissionError::InvalidAuthority)?,
     )
     .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
-    BundleExpectations::try_new(
-        ModelId::from_str(&wire.model_id).map_err(|_| ModelAdmissionError::InvalidAuthority)?,
-        BundleId::try_new(&wire.bundle_id).map_err(|_| ModelAdmissionError::InvalidAuthority)?,
-        NonZeroU64::new(wire.bundle_version).ok_or(ModelAdmissionError::InvalidAuthority)?,
-        dataset,
-        identity.universe_id().clone(),
-        TrainingPeriod::try_new(
-            Timestamp::from_unix_nanos(wire.training_period.start_unix_nanos),
-            Timestamp::from_unix_nanos(wire.training_period.end_unix_nanos),
-        )
-        .map_err(|_| ModelAdmissionError::InvalidAuthority)?,
-        label,
-        &wire.training_code_revision,
-        Sha256Digest::new(environment_hash),
-        Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?),
-        Sha256Digest::new(parse_hex(&wire.artifact_sha256)?),
-        Sha256Digest::new(parse_hex(&wire.training_run_sha256)?),
+    let model_id =
+        ModelId::from_str(&wire.model_id).map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+    let bundle_id =
+        BundleId::try_new(&wire.bundle_id).map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+    let bundle_version =
+        NonZeroU64::new(wire.bundle_version).ok_or(ModelAdmissionError::InvalidAuthority)?;
+    let training_period = TrainingPeriod::try_new(
+        Timestamp::from_unix_nanos(wire.training_period.start_unix_nanos),
+        Timestamp::from_unix_nanos(wire.training_period.end_unix_nanos),
     )
-    .map_err(|_| ModelAdmissionError::InvalidAuthority)
+    .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+    let training_environment_hash = Sha256Digest::new(environment_hash);
+    let bundle_metadata_hash = Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?);
+    let artifact_hash = Sha256Digest::new(parse_hex(&wire.artifact_sha256)?);
+    let training_run_hash = Sha256Digest::new(parse_hex(&wire.training_run_sha256)?);
+    let result = if let Some(output_semantics) = output_semantics {
+        BundleExpectations::try_new_with_output_semantics(
+            model_id,
+            bundle_id,
+            bundle_version,
+            dataset,
+            identity.universe_id().clone(),
+            training_period,
+            label,
+            &wire.training_code_revision,
+            training_environment_hash,
+            bundle_metadata_hash,
+            artifact_hash,
+            training_run_hash,
+            output_semantics,
+        )
+    } else {
+        BundleExpectations::try_new(
+            model_id,
+            bundle_id,
+            bundle_version,
+            dataset,
+            identity.universe_id().clone(),
+            training_period,
+            label,
+            &wire.training_code_revision,
+            training_environment_hash,
+            bundle_metadata_hash,
+            artifact_hash,
+            training_run_hash,
+        )
+    };
+    result.map_err(|_| ModelAdmissionError::InvalidAuthority)
 }
 
 fn dataset_matches_selection(
@@ -452,6 +487,7 @@ const fn nibble(value: u8) -> Option<u8> {
 #[serde(deny_unknown_fields)]
 struct ExpectationsWire {
     schema_version: u32,
+    output_semantics: Option<String>,
     model_id: String,
     bundle_id: String,
     bundle_version: u64,

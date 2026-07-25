@@ -13,13 +13,14 @@ use arrow::json::ArrayWriter;
 use async_trait::async_trait;
 use chrono::DateTime;
 use market_squawk_data::{
-    AnalyticalGeneration, AnalyticalObservationOutput, AnalyticalObservationReadRequest,
-    AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadError,
-    AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind, GenerationParentRelation,
-    ManifestCatalogError, QueryError, QueryLimits, QueryResult,
+    AnalyticalGeneration, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
+    AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit, DatasetId,
+    DatasetManifestRef, GenerationKind, GenerationParentRelation, ManifestCatalogError,
+    PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits, QueryResult,
 };
 use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
 };
@@ -54,8 +55,9 @@ const MACRO_GET_VINTAGES: &str = "Macro.GetVintages";
 const MACRO_GET_REVISIONS: &str = "Macro.GetRevisions";
 
 const MAX_ANALYTICAL_PAGE: usize = 64;
-const MAX_INLINE_QUERY_BYTES: usize = 256 * 1024;
 const RESULT_ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
+const QUERY_ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
+const QUERY_ARTIFACT_OWNER: &str = "market-squawk.research-query";
 
 /// Provider extraction and rights-admitted ingestion used by the Research domain.
 ///
@@ -127,12 +129,31 @@ impl ResearchApplicationServices {
     /// Binds one application-owned analytical service and one concrete extraction coordinator.
     #[must_use]
     pub fn new(service: Arc<ResearchService>, ingest: Arc<dyn ResearchIngestCoordinator>) -> Self {
+        Self::compose(service, ingest, None)
+    }
+
+    /// Binds the public application path to the shared controlled opaque-artifact repository.
+    #[must_use]
+    pub fn new_with_artifacts(
+        service: Arc<ResearchService>,
+        ingest: Arc<dyn ResearchIngestCoordinator>,
+        artifacts: Arc<dyn ArtifactRepository>,
+    ) -> Self {
+        Self::compose(service, ingest, Some(artifacts))
+    }
+
+    fn compose(
+        service: Arc<ResearchService>,
+        ingest: Arc<dyn ResearchIngestCoordinator>,
+        artifacts: Option<Arc<dyn ArtifactRepository>>,
+    ) -> Self {
         let reader = service.analytical_reader();
         Self {
             controller: Arc::new(ResearchController {
-                _authority: service,
+                authority: service,
                 reader,
                 ingest,
+                artifacts,
                 lifecycle: DomainLifecycle::new(),
             }),
         }
@@ -317,9 +338,10 @@ impl ApplicationDomainService for MacroDomainService {
 }
 
 struct ResearchController {
-    _authority: Arc<ResearchService>,
+    authority: Arc<ResearchService>,
     reader: AnalyticalReadCapability,
     ingest: Arc<dyn ResearchIngestCoordinator>,
+    artifacts: Option<Arc<dyn ArtifactRepository>>,
     lifecycle: Arc<DomainLifecycle>,
 }
 
@@ -418,17 +440,39 @@ impl ResearchController {
         )
         .map_err(map_read_error)?;
         let query_limits = query_limits(limits, context)?;
+        let query = read.query_request().map_err(map_query_error)?;
+        let pinned = self
+            .authority
+            .analytical()
+            .pinned(generation.manifest())
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let owner = SourceIdentifier::try_from(QUERY_ARTIFACT_OWNER)
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let query = PinnedArtifactQueryRequest::try_new(
+            pinned,
+            "observations",
+            query,
+            query_limits,
+            owner,
+            QUERY_ARTIFACT_TTL,
+            context.cancellation().clone(),
+        )
+        .map_err(map_query_error)?;
         let output = self
-            .reader
-            .read_observations(
-                read,
-                query_limits,
-                context.deadline(),
-                context.cancellation().clone(),
-            )
+            .authority
+            .analytical()
+            .query_pinned_with_artifact_publication(query)
             .await
-            .map_err(map_read_error)?;
-        observation_result(output, limits)
+            .map_err(map_query_error)?;
+        observation_result(
+            generation.source_id(),
+            output,
+            limits,
+            self.artifacts.as_ref(),
+            self.authority.as_ref(),
+            context,
+        )
+        .await
     }
 
     fn begin_shutdown(&self) {
@@ -450,19 +494,27 @@ impl fmt::Debug for ResearchController {
             .field("authority", &"[ANALYTICAL AUTHORITY]")
             .field("reader", &self.reader)
             .field("ingest", &"[EXTRACTION COORDINATOR]")
+            .field(
+                "artifacts",
+                &self.artifacts.as_ref().map(|_| "[OPAQUE REPOSITORY]"),
+            )
             .field("lifecycle", &self.lifecycle)
             .finish()
     }
 }
 
-fn observation_result(
-    output: AnalyticalObservationOutput,
+async fn observation_result(
+    source_id: &market_squawk_domain::SourceId,
+    output: PinnedQueryOutput,
     limits: ServiceLimits,
+    artifacts: Option<&Arc<dyn ArtifactRepository>>,
+    authority: &ResearchService,
+    context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
-    let pinned = output.output();
+    let pinned = &output;
     let manifest = pinned.manifest();
     let coverage = json!({
-        "sourceId": output.source_id(),
+        "sourceId": source_id,
         "manifest": manifest_value(manifest),
         "objectGraphDigest": encode_hex(pinned.object_graph_digest().bytes()),
         "queryIdentity": encode_hex(pinned.query_identity().bytes()),
@@ -476,7 +528,7 @@ fn observation_result(
     let metadata = ToolResultMetadata::try_complete(coverage, quality)
         .map_err(|_error| ServiceError::InvalidResult)?;
     let maximum_json_bytes = limits
-        .maximum_result_bytes()
+        .maximum_inline_bytes()
         .saturating_sub(RESULT_ENVELOPE_RESERVE_BYTES);
     match pinned.result() {
         QueryResult::Inline {
@@ -505,14 +557,43 @@ fn observation_result(
             artifact,
             ownership,
         } => {
+            let artifacts = artifacts.ok_or(ServiceError::ResourceExhausted)?;
+            let publication = authority.analytical().query_artifact_publication();
+            let bytes = publication
+                .read_verified_bytes(
+                    object,
+                    artifact,
+                    ownership,
+                    limits.maximum_result_bytes(),
+                    tokio::time::Instant::from_std(context.deadline()),
+                    context.cancellation(),
+                )
+                .await
+                .map_err(map_query_error)?;
+            let publication =
+                ArtifactPublication::try_parquet(bytes).map_err(map_artifact_error)?;
+            let reference = artifacts
+                .publish(
+                    publication.clone(),
+                    ArtifactPublicationContext::new(
+                        context.cancellation().clone(),
+                        context.deadline(),
+                    ),
+                )
+                .await
+                .map_err(map_artifact_error)?;
+            if !reference.matches(&publication) {
+                return Err(ServiceError::InvalidResult);
+            }
             let returned = usize::try_from(object.row_count())
                 .map_err(|_error| ServiceError::ResourceExhausted)?;
             let content = json!({
                 "manifest": manifest_value(manifest),
                 "artifact": {
-                    "artifactId": artifact.artifact_id(),
-                    "contentDigest": encode_hex(artifact.content_digest().bytes()),
-                    "sizeBytes": artifact.size_bytes(),
+                    "artifactId": reference.id(),
+                    "sha256": reference.sha256(),
+                    "byteCount": reference.byte_count(),
+                    "mediaType": reference.media_type(),
                     "rowCount": object.row_count(),
                     "owner": ownership.owner(),
                     "expiresAt": ownership.expires_at(),
@@ -589,12 +670,36 @@ fn query_limits(
         .min(Duration::from_secs(60));
     let rows = u64::try_from(limits.maximum_result_items())
         .map_err(|_error| ServiceError::InvalidRequest)?;
-    let bytes = limits.maximum_inline_bytes().min(MAX_INLINE_QUERY_BYTES);
+    let inline_bytes = u64::try_from(limits.maximum_inline_bytes())
+        .map_err(|_error| ServiceError::InvalidRequest)?;
+    let bytes = limits.maximum_result_bytes();
     let bytes = u64::try_from(bytes).map_err(|_error| ServiceError::InvalidRequest)?;
     let memory = bytes
         .saturating_mul(4)
         .clamp(1024 * 1024, 1024 * 1024 * 1024);
-    QueryLimits::try_new(rows, bytes, memory, 4, 2_048, 4_096, deadline).map_err(map_query_error)
+    QueryLimits::try_new_with_inline_bytes(
+        rows,
+        inline_bytes,
+        bytes,
+        memory,
+        4,
+        2_048,
+        4_096,
+        deadline,
+    )
+    .map_err(map_query_error)
+}
+
+fn map_artifact_error(error: ArtifactError) -> ServiceError {
+    match error {
+        ArtifactError::Cancelled => ServiceError::Cancelled,
+        ArtifactError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        ArtifactError::ReadLimitExceeded => ServiceError::ResourceExhausted,
+        ArtifactError::InvalidPublication
+        | ArtifactError::InvalidReference
+        | ArtifactError::NotFound
+        | ArtifactError::Unavailable => ServiceError::Unavailable,
+    }
 }
 
 fn required_dataset(request: &TypedToolRequest) -> Result<DatasetId, ServiceError> {
