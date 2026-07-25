@@ -23,6 +23,6 @@ pub use direct::{
     CoinbaseDirectProductEvidence, CoinbaseDirectReceivedLifecycle,
     CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
     CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
-    CoinbaseSignedSubscription,
+    CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
 };
 pub use source::CoinbaseExchangeSource;

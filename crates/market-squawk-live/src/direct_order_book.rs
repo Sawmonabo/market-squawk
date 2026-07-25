@@ -781,21 +781,12 @@ impl OrderBookState {
         let Some(order) = self.orders.get(order_id).cloned() else {
             return Ok(());
         };
-        if price.is_none() && remaining_quantity.is_none() {
-            return Ok(());
-        }
         let (Some(side), Some(price), Some(remaining_quantity)) = (side, price, remaining_quantity)
         else {
             return Err(DirectOrderBookError::InvalidDone);
         };
-        if side != order.side {
-            return Err(DirectOrderBookError::DoneSideMismatch);
-        }
-        if price != order.price {
-            return Err(DirectOrderBookError::DonePriceMismatch);
-        }
-        if remaining_quantity != order.quantity {
-            return Err(DirectOrderBookError::DoneQuantityMismatch);
+        if side != order.side || price != order.price || remaining_quantity != order.quantity {
+            return Err(DirectOrderBookError::InvalidDone);
         }
         if !self.remove_if_known(order_id)? {
             return Err(DirectOrderBookError::AggregateInvariant);
@@ -839,15 +830,6 @@ impl OrderBookState {
                     || previous_quantity.is_none()
                     || new_price.is_none()
                     || new_quantity.is_none()
-                {
-                    return Err(DirectOrderBookError::InvalidChange);
-                }
-            }
-            ProviderOrderChangeReason::TpslTriggered => {
-                if previous_price.is_none()
-                    || previous_quantity.is_some()
-                    || new_price.is_none()
-                    || new_quantity.is_some()
                 {
                     return Err(DirectOrderBookError::InvalidChange);
                 }
@@ -1706,18 +1688,9 @@ pub enum DirectOrderBookError {
     /// A match's price disagreed with the maintained maker order.
     #[error("direct match maker price does not match maintained state")]
     MatchPriceMismatch,
-    /// A done message's side disagreed with the maintained order.
-    #[error("direct done side does not match maintained state")]
-    DoneSideMismatch,
-    /// A potentially book-removing done message omitted required maintained-order evidence.
+    /// A potentially book-removing done omitted or contradicted required maintained-order evidence.
     #[error("direct done message is structurally invalid")]
     InvalidDone,
-    /// A done message's price disagreed with the maintained order.
-    #[error("direct done price does not match maintained state")]
-    DonePriceMismatch,
-    /// A done message's remaining quantity disagreed with the maintained order.
-    #[error("direct done remaining quantity does not match maintained state")]
-    DoneQuantityMismatch,
     /// A change omitted the old-price evidence required for a price replacement.
     #[error("direct order change is structurally invalid")]
     InvalidChange,
@@ -1968,7 +1941,7 @@ mod tests {
                 price: Some(PriceTicks::new(9_900)),
                 remaining_quantity: Some(QuantityLots::new(300)?),
             }),
-            Err(DirectOrderBookError::DoneSideMismatch)
+            Err(DirectOrderBookError::InvalidDone)
         );
         assert_eq!(
             state.apply(&ProviderOrderEventKind::Done {
@@ -1977,7 +1950,7 @@ mod tests {
                 price: Some(PriceTicks::new(9_800)),
                 remaining_quantity: Some(QuantityLots::new(300)?),
             }),
-            Err(DirectOrderBookError::DonePriceMismatch)
+            Err(DirectOrderBookError::InvalidDone)
         );
         assert_eq!(
             state.apply(&ProviderOrderEventKind::Done {
@@ -1986,14 +1959,17 @@ mod tests {
                 price: Some(PriceTicks::new(9_900)),
                 remaining_quantity: Some(QuantityLots::new(200)?),
             }),
-            Err(DirectOrderBookError::DoneQuantityMismatch)
+            Err(DirectOrderBookError::InvalidDone)
         );
-        state.apply(&ProviderOrderEventKind::Done {
-            order_id: id("bid-b")?,
-            side: Some(ProviderBookSide::Bid),
-            price: None,
-            remaining_quantity: None,
-        })?;
+        assert_eq!(
+            state.apply(&ProviderOrderEventKind::Done {
+                order_id: id("bid-b")?,
+                side: Some(ProviderBookSide::Bid),
+                price: None,
+                remaining_quantity: None,
+            }),
+            Err(DirectOrderBookError::InvalidDone)
+        );
         state.apply(&ProviderOrderEventKind::Change {
             order_id: id("received-only")?,
             reason: ProviderOrderChangeReason::SelfTradePrevention,

@@ -575,6 +575,8 @@ pub enum CoinbaseDirectNonBookKind {
     Activate(CoinbaseDirectActivation),
     /// A private received acknowledgement that has not opened a public-book order.
     Received(CoinbaseDirectReceivedLifecycle),
+    /// An owner-only TPSL trigger notification with no public cursor or book authority.
+    TpslTriggered(CoinbaseDirectTpslTriggeredLifecycle),
 }
 
 /// Provider stop classification retained by an `activate` lifecycle control.
@@ -606,6 +608,15 @@ pub struct CoinbaseDirectReceivedLifecycle {
     order_id: SourceIdentifier,
 }
 
+/// Typed owner-only TPSL repricing lifecycle with no public cursor or freshness authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseDirectTpslTriggeredLifecycle {
+    order_id: SourceIdentifier,
+    side: ProviderBookSide,
+    old_price: PriceTicks,
+    new_price: PriceTicks,
+}
+
 impl CoinbaseDirectReceivedLifecycle {
     /// Returns the exact provider product without creating a sequence domain.
     pub const fn product(&self) -> &ProviderProduct {
@@ -615,6 +626,28 @@ impl CoinbaseDirectReceivedLifecycle {
     /// Returns the acknowledged provider order identity.
     pub const fn order_id(&self) -> &SourceIdentifier {
         &self.order_id
+    }
+}
+
+impl CoinbaseDirectTpslTriggeredLifecycle {
+    /// Returns the owner order identity.
+    pub const fn order_id(&self) -> &SourceIdentifier {
+        &self.order_id
+    }
+
+    /// Returns the owner order side reported by Coinbase.
+    pub const fn side(&self) -> ProviderBookSide {
+        self.side
+    }
+
+    /// Returns the instrument-scaled pre-trigger limit price.
+    pub const fn old_price(&self) -> PriceTicks {
+        self.old_price
+    }
+
+    /// Returns the instrument-scaled post-trigger limit price.
+    pub const fn new_price(&self) -> PriceTicks {
+        self.new_price
     }
 }
 
@@ -725,6 +758,11 @@ impl CoinbaseDirectDecoder {
         let kind = required_text(object, "type")?;
         if !object.contains_key("sequence") {
             return self.decode_unsequenced(validated, object, kind);
+        }
+        if kind == "change"
+            && object.get("reason").and_then(Value::as_str) == Some("tpsl_triggered")
+        {
+            return Err(CoinbaseDirectDecodeError::PrivateLifecycleSequence);
         }
         if kind == "activate" {
             return Err(CoinbaseDirectDecodeError::UnknownSequencedMessage);
@@ -1072,29 +1110,6 @@ impl CoinbaseDirectDecoder {
                             }
                             _ => return Err(CoinbaseDirectDecodeError::Schema),
                         },
-                        "tpsl_triggered" => {
-                            if object.contains_key("price")
-                                || object.contains_key("old_size")
-                                || object.contains_key("new_size")
-                                || object.contains_key("old_funds")
-                                || object.contains_key("new_funds")
-                            {
-                                return Err(CoinbaseDirectDecodeError::Schema);
-                            }
-                            (
-                                ProviderOrderChangeReason::TpslTriggered,
-                                Some(normalize_direct_price(
-                                    required_text(object, "old_price")?,
-                                    self.terms,
-                                )?),
-                                None,
-                                Some(normalize_direct_price(
-                                    required_text(object, "new_price")?,
-                                    self.terms,
-                                )?),
-                                None,
-                            )
-                        }
                         _ => return Err(CoinbaseDirectDecodeError::Schema),
                     };
                 ProviderOrderEventKind::Change {
@@ -1145,6 +1160,9 @@ impl CoinbaseDirectDecoder {
             "activate" => CoinbaseDirectNonBookKind::Activate(self.decode_activate(object)?),
             "received" => {
                 CoinbaseDirectNonBookKind::Received(self.decode_private_received(object)?)
+            }
+            "change" if object.get("reason").and_then(Value::as_str) == Some("tpsl_triggered") => {
+                CoinbaseDirectNonBookKind::TpslTriggered(self.decode_tpsl_triggered(object)?)
             }
             "open" | "match" | "done" | "change" => {
                 return Err(CoinbaseDirectDecodeError::UnsequencedBookMutation);
@@ -1260,6 +1278,40 @@ impl CoinbaseDirectDecoder {
         Ok(CoinbaseDirectReceivedLifecycle {
             product: self.product.clone(),
             order_id: parse_order_id(object, "order_id")?,
+        })
+    }
+
+    fn decode_tpsl_triggered(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Result<CoinbaseDirectTpslTriggeredLifecycle, CoinbaseDirectDecodeError> {
+        validate_fields(
+            object,
+            &[
+                "type",
+                "reason",
+                "order_id",
+                "side",
+                "old_price",
+                "new_price",
+            ],
+            &[
+                "type",
+                "reason",
+                "order_id",
+                "side",
+                "old_price",
+                "new_price",
+            ],
+        )?;
+        if required_text(object, "reason")? != "tpsl_triggered" {
+            return Err(CoinbaseDirectDecodeError::Schema);
+        }
+        Ok(CoinbaseDirectTpslTriggeredLifecycle {
+            order_id: parse_order_id(object, "order_id")?,
+            side: parse_direct_side(required_text(object, "side")?)?,
+            old_price: normalize_direct_price(required_text(object, "old_price")?, self.terms)?,
+            new_price: normalize_direct_price(required_text(object, "new_price")?, self.terms)?,
         })
     }
 
@@ -1524,6 +1576,9 @@ pub enum CoinbaseDirectDecodeError {
     /// A new sequenced type may mutate state and forces a fresh snapshot.
     #[error("Coinbase Direct sequenced message type is unknown")]
     UnknownSequencedMessage,
+    /// An owner-only private lifecycle was combined with a public product sequence.
+    #[error("Coinbase Direct private lifecycle cannot carry a public sequence")]
+    PrivateLifecycleSequence,
     /// A lifecycle frame could mutate the public book but carries no advancing public cursor.
     #[error("Coinbase Direct book mutation has no provable public sequence")]
     UnsequencedBookMutation,
@@ -2370,16 +2425,58 @@ mod tests {
             })
         ));
 
-        let unsequenced_change = frames.try_frame(
+        let tpsl_frame = frames.try_frame(
             TransportFrameKind::Text,
             Bytes::from_static(
-                br#"{"type":"change","reason":"modify_order","time":"2026-07-24T21:34:10.603Z","order_id":"private-order","side":"buy","product_id":"BTC-USD","old_size":"1.00","new_size":"1.00","old_price":"100.00","new_price":"99.00","user_id":"user-a","profile_id":"profile-a"}"#,
+                br#"{"new_price":"8245","order_id":"tpsl-a","type":"change","side":"sell","old_price":"9785","reason":"tpsl_triggered"}"#,
+            ),
+        )?;
+        let CoinbaseDirectDecodeOutcome::NonBook(tpsl_event) =
+            decoder.decode(&session.validate_live_frame(&tpsl_frame)?)?
+        else {
+            return Err("TPSL owner lifecycle entered the public sequence path".into());
+        };
+        let CoinbaseDirectNonBookKind::TpslTriggered(tpsl) = tpsl_event.kind() else {
+            return Err("TPSL owner lifecycle was misclassified".into());
+        };
+        assert_eq!(tpsl.order_id(), &id("tpsl-a")?);
+        assert_eq!(tpsl.side(), ProviderBookSide::Ask);
+        assert_eq!(tpsl.old_price(), PriceTicks::new(978_500));
+        assert_eq!(tpsl.new_price(), PriceTicks::new(824_500));
+        assert_eq!(tpsl_event.evidence().frame_id(), tpsl_frame.frame_id());
+
+        let sequenced_tpsl = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"new_price":"8245","order_id":"tpsl-a","type":"change","side":"sell","old_price":"9785","reason":"tpsl_triggered","sequence":13}"#,
             ),
         )?;
         assert_eq!(
-            decoder.decode(&session.validate_live_frame(&unsequenced_change)?),
-            Err(CoinbaseDirectDecodeError::UnsequencedBookMutation)
+            decoder.decode(&session.validate_live_frame(&sequenced_tpsl)?),
+            Err(CoinbaseDirectDecodeError::PrivateLifecycleSequence)
         );
+
+        for payload in [
+            br#"{"type":"change","reason":"modify_order","time":"2026-07-24T21:34:10.603Z","order_id":"private-order","side":"buy","product_id":"BTC-USD","old_size":"1.00","new_size":"1.00","old_price":"100.00","new_price":"99.00","user_id":"user-a","profile_id":"profile-a"}"#
+                .as_slice(),
+            br#"{"type":"change","reason":"STP","time":"2026-07-24T21:34:10.604Z","order_id":"private-order","side":"buy","product_id":"BTC-USD","old_size":"1.00","new_size":"0.50","price":"100.00"}"#
+                .as_slice(),
+            br#"{"type":"open","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","order_id":"private-order","price":"100.00","remaining_size":"1.00","side":"buy"}"#
+                .as_slice(),
+            br#"{"type":"match","trade_id":12,"maker_order_id":"private-order","taker_order_id":"taker-a","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","size":"0.50","price":"100.00","side":"buy"}"#
+                .as_slice(),
+            br#"{"type":"done","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","order_id":"private-order","reason":"canceled","price":"100.00","remaining_size":"0.50","side":"buy"}"#
+                .as_slice(),
+        ] {
+            let frame = frames.try_frame(
+                TransportFrameKind::Text,
+                Bytes::from_static(payload),
+            )?;
+            assert_eq!(
+                decoder.decode(&session.validate_live_frame(&frame)?),
+                Err(CoinbaseDirectDecodeError::UnsequencedBookMutation)
+            );
+        }
         Ok(())
     }
 
@@ -2605,20 +2702,20 @@ mod tests {
             Some(QuantityLots::new(300_000_000)?)
         );
 
-        let tpsl = decode_event(
+        let public_modify = decode_event(
             &decoder,
             &mut frames,
             &session,
-            br#"{"type":"change","reason":"tpsl_triggered","time":"2026-07-24T21:34:10.602Z","sequence":13,"order_id":"bid-a","side":"buy","product_id":"BTC-USD","old_price":"99.50","new_price":"99.25","user_id":"user-a","profile_id":"profile-a"}"#,
+            br#"{"type":"change","reason":"modify_order","time":"2026-07-24T21:34:10.602Z","sequence":13,"order_id":"bid-a","side":"buy","product_id":"BTC-USD","old_size":"3.00","new_size":"3.00","old_price":"99.50","new_price":"99.25"}"#,
         )?;
         assert!(matches!(
-            tpsl.kind(),
+            public_modify.kind(),
             ProviderOrderEventKind::Change {
-                reason: ProviderOrderChangeReason::TpslTriggered,
+                reason: ProviderOrderChangeReason::ModifyOrder,
                 ..
             }
         ));
-        owner.try_apply_live(tpsl)?;
+        owner.try_apply_live(public_modify)?;
         assert_eq!(
             owner
                 .published_book()

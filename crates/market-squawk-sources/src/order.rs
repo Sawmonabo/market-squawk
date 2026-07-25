@@ -78,8 +78,6 @@ pub enum ProviderOrderChangeReason {
     SelfTradePrevention,
     /// A public modify-order event replaced price and remaining size.
     ModifyOrder,
-    /// A triggered take-profit/stop-loss order was publicly repriced.
-    TpslTriggered,
 }
 
 /// One classified level-3 mutation or cursor-only advance.
