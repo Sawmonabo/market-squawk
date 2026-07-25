@@ -16,6 +16,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   point-in-time feature datasets, stable bounded pagination, retained Python export digests, sealed
   application/validator/ONNX-worker release construction, and bounded artifact-read lifecycle
   ownership are now in the release line.
+- The current research/model release candidate closes the two remaining first-use handoffs:
+  verified non-inline DataFusion results are republished as opaque durable content-addressed
+  Parquet for bounded CLI/MCP retrieval, and the signed release installs a deterministic production
+  driver for linear/regression and logistic/binary-probability ONNX proposal, finalization,
+  Rust validation, admission, and tract inference.
 - Shared release composition is integrated at `3ef05dc`: one controlled path-free artifact
   repository serves application, CLI, and MCP; `Analysis.ReadArtifact` exposes digest-bound
   32 KiB chunks; the model domain admits the signed application and ONNX worker; and configured
@@ -98,10 +103,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   metadata prune are complete.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
-  workflows and clean-machine evidence, the public analytical-query overflow publisher, a supported
-  production training driver, an ONNX candidate producer/demo, prerequisite-issue reconciliation,
-  and Task 20's integrated demonstration, performance/fuzz/security evidence, final grouped review,
-  exact-head gate, publication, and cleanup.
+  workflows and clean-machine evidence, prerequisite-issue reconciliation, and Task 20's integrated
+  demonstration, performance/fuzz/security evidence, final grouped review, exact-head gate,
+  publication, and cleanup.
 
 ## Documentation candidate and accepted-head truth
 
@@ -118,8 +122,8 @@ for documentation writers:
 - Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
   and training components, immutable model bundles, native and tract ONNX inference, governed
   backtesting, portfolio accounting/analytics, realistic paper execution, and fair-value analysis
-  are implemented product capabilities at the source head. Their missing public first-use handoffs
-  remain explicit below.
+  are implemented product capabilities at the source head. Query-overflow retrieval and the sealed
+  model driver now provide their public first-use handoffs.
 - SEC, BLS, and Treasury Fiscal Data have evidence-bound onboarding and adapter-activation
   implementations. Only Treasury Fiscal Data is release-available at this head. SEC and BLS require
   refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine Task 19A
@@ -135,15 +139,19 @@ Subsequent source-derived review established the current first-use handoff state
 - `source discover` now returns bounded exact provider objects without minting authority; confirmed
   ingestion independently discovers the selected object and consumes its process-local receipt.
 - `feature build` and `dataset build` now populate the durable public feature-dataset registry and
-  return `pythonExportSha256`; the remaining model first-use gap is the supported production
-  training driver and accepted demonstration.
-- The Python release builder now builds and signs the application, validator, and ONNX worker.
-  No supported production training driver or supported ONNX candidate producer/demo exists.
+  return `pythonExportSha256`; `market-squawk-train` consumes that exact export through a closed
+  configuration and emits authority-bound ONNX admission requests.
+- The Python release builder builds and signs the application, validator, and ONNX worker and
+  installs the supported production training driver. Its code-owned producer emits deterministic
+  static-shape linear and logistic graphs, with terminal `Sigmoid` required for
+  `binary_probability`.
 - Optional external ONNX Runtime support exists at library/evidence level but is not selectable by
   the current product composition; required tract inference remains the shipping ONNX path.
-- MCP overflow-artifact publication is retrievable through typed, bounded
-  `Analysis.ReadArtifact`; the public analytical query paths still do not compose query artifact
-  publication authority.
+- Operator SQL and fixed-template application/MCP query services compose transient publication
+  authority, verify oversized query output, and republish it into the shared terminal repository as
+  `application/vnd.apache.parquet`. The opaque reference is retrievable through `query artifact` or
+  typed bounded `Analysis.ReadArtifact`; transient reservation owner/expiry are not public terminal
+  fields.
 - The reviewed `LocalProduct` composes OS-keyring-first routing with a code-owned, initially locked
   encrypted-file fallback and explicit foreground portal unlock/lock. The remaining onboarding
   blocker is provider release availability and the clean-machine acceptance demonstration.

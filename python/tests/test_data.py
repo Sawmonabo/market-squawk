@@ -49,7 +49,12 @@ def _fixed(values, width: int) -> pa.Array:
     return pa.array(encoded, type=pa.binary(width))
 
 
-def _fixture(root: Path, *, corrupt_split: bool = False) -> str:
+def _fixture(
+    root: Path,
+    *,
+    corrupt_split: bool = False,
+    label_mantissas: tuple[int, ...] | None = None,
+) -> str:
     for directory in ("artifacts", "control", "journal"):
         (root / directory).mkdir()
     metadata = {
@@ -86,7 +91,13 @@ def _fixture(root: Path, *, corrupt_split: bool = False) -> str:
     cutoffs = [100, 120, 140, 160, 300, 320]
     splits = ["train"] * 4 + ["validation"] * 2
     feature_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
-    label_mantissas = [-5, 25, 35, 65, 75, 105]
+    label_mantissas = (
+        (-5, 25, 35, 65, 75, 105)
+        if label_mantissas is None
+        else label_mantissas
+    )
+    if len(label_mantissas) != len(example_ids):
+        raise ValueError("fixture labels must match the deterministic example set")
     lineages = [bytes([index]) * 32 for index in range(1, 13)]
     table = pa.Table.from_arrays(
         [

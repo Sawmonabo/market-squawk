@@ -103,15 +103,25 @@ command result and local log.
 | `dataset manifest <DATASET>` | Dataset identity is positional | `Research.GetManifest` |
 | `dataset build <REQUEST> --confirm` | Closed point-in-time build request, at most 8 MiB | Research dataset builder and immutable publication |
 | `query dataset <DATASET>` | `--maximum-rows <USIZE>` defaults to `1000` | `Research.GetHistory` with the requested result-count ceiling |
-| `query artifact --artifact-id <ID> --sha256 <HEX> --byte-count <N>` | Optional `--media-type application/json`, `--offset 0`, and `--maximum-bytes 32768` | `Analysis.ReadArtifact` over the shared path-free controlled-artifact authority |
+| `query artifact --artifact-id <ID> --sha256 <HEX> --byte-count <N>` | Optional `--media-type application/json`, `--offset 0`, and `--maximum-bytes 32768`; pass the returned `application/vnd.apache.parquet` media type for query overflow | `Analysis.ReadArtifact` over the shared path-free controlled-artifact authority |
 | `query sql --dataset <DATASET> <STATEMENT>` | `--maximum-rows <USIZE>` defaults to `1000` | CLI-only bounded read-only DataFusion over the latest pinned immutable generation |
 | `feature list` | Optional `--after-dataset <DATASET>` stable cursor | `Analysis.GetFeatureDatasets` |
 | `feature build <REQUEST> --confirm` | Same closed point-in-time build contract as `dataset build` | Research dataset builder and immutable publication |
 
 The SQL command is deliberately absent from MCP. Its fixed query ceilings are 64 KiB SQL text,
-256 KiB Arrow result bytes, 64 MiB admitted query memory, four partitions, 2,048 AST nodes, 4,096
-plan nodes, and 60 seconds. The JSON-rendered result must also remain within the CLI's 16 MiB result
-ceiling.
+256 KiB inline Arrow IPC, 64 MiB for the complete result, 256 MiB of admitted query memory, four
+partitions, 2,048 AST nodes, 4,096 plan nodes, and 60 seconds. A result above the inline ceiling and
+within the complete-result ceiling becomes one opaque durable content-addressed Parquet reference.
+Its exact fields are `artifactId`, `sha256`, `byteCount`, `mediaType`, and `rowCount`, with
+`mediaType: "application/vnd.apache.parquet"`. Retrieve it through `query artifact`; the reference
+has no public owner, expiry, or path.
+
+Fixed-template application queries use a different limit source: their inline and complete-result
+ceilings are the caller's admitted `ServiceLimits`, their query-memory ceiling is four times the
+complete-result ceiling within the code-owned clamp, and the same partition/node/at-most-60-second
+bounds apply. The CLI `query dataset` request admits 16 MiB for both inline and complete result, so
+that command returns inline or fails at its complete ceiling; production MCP can use the wider
+caller-admitted band described in the [MCP reference](mcp.md).
 
 ### Models and backtests
 
@@ -199,9 +209,12 @@ limits:
 | Maximum items in one JSON array | 100,000 |
 | Maximum entries in one JSON object | 10,000 |
 
-`query dataset` replaces the default item ceiling with `--maximum-rows`. `portfolio import` uses an
-8 MiB result ceiling. Individual application descriptors may impose narrower instrument, time,
-source-coverage, schema, work, or retained-memory limits.
+`query dataset` replaces the default item ceiling with `--maximum-rows` and retains the 16 MiB
+default byte ceiling for both inline and complete fixed-template query output. `query sql` instead
+uses its dedicated 256 KiB inline and 64 MiB complete-result ceilings and returns only its small
+terminal reference when it republishes Parquet. `portfolio import` uses an 8 MiB result ceiling.
+Individual application descriptors may impose narrower instrument, time, source-coverage, schema,
+work, or retained-memory limits.
 
 The standard local-product result envelope is:
 
@@ -266,9 +279,11 @@ Clap command
   -> bounded result envelope
 ```
 
-CLI-only DataFusion SQL receives only a pinned dataset generation and a read-only query engine. The
-CLI confines file inputs to declared capability roots; credential resolution, approval authority,
-database publication, and order dispatch remain with their dedicated application services.
+CLI-only DataFusion SQL receives only a pinned dataset generation, a read-only query engine, and
+bounded transient query-publication authority. Verified overflow is transferred into the shared
+terminal repository before a path-free reference is returned. The CLI confines file inputs to
+declared capability roots; credential resolution, approval authority, unrelated database
+publication, and order dispatch remain with their dedicated application services.
 
 ## Related documentation and code
 

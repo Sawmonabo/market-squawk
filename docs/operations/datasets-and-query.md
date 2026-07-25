@@ -72,9 +72,9 @@ data and report `executionEligible: false`.
 - Generic SQL is deliberately absent from MCP. Remote/agent callers use the typed MCP operations
   documented in [MCP reference](../reference/mcp.md); only the local CLI owns the bounded SQL
   surface.
-- Do not edit catalog rows, Parquet objects, query-artifact ownership, or Python admission rows by
-  hand. Use exact retries, a new immutable generation, or the supported backup-and-restore
-  procedure.
+- Do not edit catalog rows, Parquet objects, transient query reservations, terminal artifact
+  objects, or Python admission rows by hand. Use exact retries, a new immutable generation, or the
+  supported backup-and-restore procedure.
 
 ## Preconditions
 
@@ -585,12 +585,18 @@ pins its exact manifest, and reads canonical observations using `Research.GetHis
 does not expose the typed service's instrument or knowledge-time filters, so reduce
 `--maximum-rows` when inspecting an unfamiliar dataset.
 
-The bounded engine uses a 60-second deadline, a 256 KiB inline Arrow result target, four
-partitions, and bounded planning/memory. The reviewed public composition returns only inline `rows`
-plus `arrowIpcBytes`. Although the engine has an authority-gated controlled-artifact mode, this
-application path does not compose its publication and reservation authorities. A result that
-cannot fit inline therefore fails closed; narrow the requested row count and retry. The missing
-public artifact workflow is tracked in the [delivery ledger](../plans/delivery-ledger.md).
+This command uses the fixed-template application query path. That path derives its query
+inline-byte and complete-result ceilings from the caller's admitted service limits, admits four
+partitions, 2,048 syntax-tree nodes, 4,096 plan nodes, and at most 60 seconds, and gives the query
+four times its complete-result ceiling in memory within the code-owned clamp. The CLI supplies a
+16 MiB inline and complete-result ceiling, so `query dataset` itself has no overflow band: it
+returns `rows` plus `arrowIpcBytes` or fails closed at that limit.
+
+The same fixed-template service over production MCP starts with a 64 KiB inline ceiling and a
+64 MiB hard complete-result ceiling; the requested `resultLimits.maximumBytes` may narrow the
+latter. When the admitted inline ceiling is lower than the complete-result ceiling, the service
+verifies an oversized result and republishes it as opaque `application/vnd.apache.parquet` for
+retrieval through `Analysis.ReadArtifact`. MCP does not expose general SQL.
 
 For a successful inline result retain:
 
@@ -623,15 +629,31 @@ relation is literally named `dataset`. The statement:
 - may call only `abs`, `avg`, `coalesce`, `count`, `date_trunc`, `lower`, `max`, `min`, `round`,
   `sum`, `upper`, and the SQL syntax admitted by the pinned DataFusion implementation.
 
-The caller's `--maximum-rows` defaults to 1,000. Execution is additionally bounded to a 256 KiB
-Arrow IPC result, 64 MiB memory, four partitions, 2,048 AST nodes, 4,096 plan nodes, 60 seconds,
-and the CLI's 16 MiB JSON output ceiling.
+The caller's `--maximum-rows` defaults to 1,000. Execution is additionally bounded to 256 KiB of
+inline Arrow IPC, 64 MiB for the complete result, 256 MiB of query memory, four partitions,
+2,048 AST nodes, 4,096 plan nodes, and 60 seconds. An inline success includes the pinned manifest,
+`relation: "dataset"`, `arrowIpcBytes`, rows, source coverage, and
+`executionEligible: false`.
 
-Like `query dataset`, SQL has no controlled-artifact fallback in the current public composition. If
-the result cannot be returned inline, it fails because artifact publication authority is
-unavailable. Narrow the projection, predicate, grouping, or row ceiling and retry. The success
-output includes the pinned manifest, `relation: "dataset"`,
-`arrowIpcBytes`, rows, source coverage, and `executionEligible: false`.
+A verified result above 256 KiB and at most 64 MiB is republished into the shared terminal
+repository as durable content-addressed Parquet. The command returns one `artifact` object with
+`artifactId`, `sha256`, `byteCount`, `mediaType`, and `rowCount`; its media type is exactly
+`application/vnd.apache.parquet`. It intentionally contains no internal reservation owner or
+expiry. Retrieve bounded chunks using the complete returned identity:
+
+```bash
+market-squawk \
+  --data-dir "$DATA_ROOT" \
+  --output json \
+  query artifact \
+  --artifact-id <ARTIFACT_ID> \
+  --sha256 <SHA256> \
+  --byte-count <BYTE_COUNT> \
+  --media-type application/vnd.apache.parquet
+```
+
+Use `--offset` and `--maximum-bytes` to continue from `nextOffset` until `complete` is true. MCP
+clients use the same identity with `Analysis.ReadArtifact`.
 
 ## Success evidence
 
@@ -672,9 +694,10 @@ operation:
 - If the catalog/object store is damaged or displaced, stop writers and follow
   [Backup and recovery](backup-and-recovery.md). Do not copy only `catalog.sqlite3` or only the
   Parquet objects.
-- If a query exceeds the inline result boundary, narrow the projection, predicate, grouping, or
-  row ceiling and rerun against the same still-current generation. If latest has changed, the new
-  result is not the same reproduction; compare the returned manifest first.
+- If a query returns an artifact reference, retain the complete identity and read verified chunks
+  from the terminal repository. If it exceeds the complete-result ceiling, narrow the projection,
+  predicate, grouping, or row ceiling and rerun. If latest has changed, the new result is not the
+  same reproduction; compare the returned manifest first.
 
 ## Failure modes
 
@@ -690,7 +713,7 @@ operation:
 | Built dataset absent from `feature list` | The generation is not a valid durable Python-admitted feature dataset, the wrong data root is selected, or the page cursor excludes it | Verify the build receipt/data root, request the exact dataset or continue pagination, and preserve any catalog-corruption error |
 | Query limit/resource exhausted | Row, byte, memory, AST, plan, or deadline ceiling was reached | Narrow the read or SQL; do not increase beyond fixed ceilings |
 | SQL statement/relation/function rejected | It is outside the read-only allowlist | Rewrite it as one bounded query over `dataset` using admitted functions |
-| Dataset or SQL query reports resource exhaustion or required artifact authority | Result exceeded an inline boundary and the current public path has no artifact publication authority | Reduce projection, predicates, grouping, or rows; both public query paths are inline-only |
+| Dataset or SQL query reports resource exhaustion | The complete-result, row, memory, planning, or deadline ceiling was reached, or terminal publication/readback could not be verified | Reduce projection, predicates, grouping, or rows; never reconstruct a path or weaken artifact verification |
 
 ## Local state locations
 
@@ -700,11 +723,13 @@ All paths are relative to the selected data root:
 | --- | --- | --- |
 | `catalog.sqlite3` and active `catalog.sqlite3-wal`/`catalog.sqlite3-shm` | Manifests, lineage, build admissions, and Python dataset admissions | Treat as one SQLite consistency domain; never edit manually |
 | `artifacts/objects/sha256/<first-two-hex>/<sha256>.parquet` | Immutable ingested and derived dataset objects | Content addressed; never rename, edit, or delete manually |
+| `artifacts/mcp/v1/parquet/<first-two-hex>/<sha256>.parquet` | Terminal query-overflow objects retrievable by opaque reference | Durable and content addressed; retain and recover with the data root, and never infer this path from the public ID |
 | The retained build request outside the data root | User-owned authority and exact build specification input | Keep with the success receipt and source evidence |
 
-The data library's controlled query-artifact mode uses the same content-addressed object store when
-a caller supplies publication and reservation authority. The reviewed public product paths do not,
-so the entries above do not imply a runnable public query-artifact workflow.
+The query engine first uses an internal bounded reservation while producing overflow. The public
+composition verifies that object and republishes its exact bytes into the terminal repository.
+Internal owner and expiry coordinates govern only that transient handoff; they are not public
+fields and do not define terminal repository retention.
 
 ## Related documentation, code, and evidence
 

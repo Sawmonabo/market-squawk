@@ -60,7 +60,9 @@ work is bound by the single canonical
   point-in-time availability filtering. The leakage-bounded feature/label dataset builder composes
   exact input generations, source-authored historical-universe evidence, revision selection,
   corporate-action policy, chronological splits, controlled output publication, and replay-safe
-  application authority.
+  application authority. Verified query results that cross an admitted inline ceiling are
+  republished as opaque, durable, content-addressed Parquet in the shared artifact repository and
+  remain retrievable through `query artifact` or `Analysis.ReadArtifact` without exposing a path.
 - Complete pure-Rust batch analytics for returns, risk, regression, fundamentals, macro, exposure,
   attribution, and scenarios. Exact-rate and monetary-basis contracts isolate accounting values
   from statistical floating-point calculations, while cadence-aware series and typed statistical
@@ -89,13 +91,16 @@ work is bound by the single canonical
   candidates; and validates publication through an exact, digest-bound Rust validator. Final model
   metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
   identities are bound before external authority is accepted. The sealed builder verifies the
-  370-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
+  complete exact source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
   project wheel; builds and signs the application, validator, and ONNX worker; and then installs and
   tests without network access. A native package-root initializer verifies the signed Market Squawk,
   PyArrow, interpreter, and native-library file sets before any shipped mutable Python module
   executes. Dataset publication now returns the exact Python export digest and registers the
-  durable feature dataset for point-in-time selection. A supported repository-owned production
-  training driver and ONNX candidate demonstration remain missing below.
+  durable feature dataset for point-in-time selection. The installed, repository-owned
+  `market-squawk-train` driver deterministically proposes, authority-finalizes, Rust-validates, and
+  admits sealed linear/regression and logistic/binary-probability ONNX candidates. Logistic graphs
+  bind a terminal `Sigmoid`; the signed application constructs the tract backend before durable
+  admission, and inference remains finite, bounded, and fail-closed.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -186,17 +191,15 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
 | `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery and OS-keyring-first encrypted fallback are implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
 | `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
-| `Missing` | complete analytical-query overflow publication | Opaque MCP artifacts are now retrievable through bounded `Analysis.ReadArtifact` chunks, but the public DataFusion query compositions still omit the engine's artifact-publication authority and therefore reject non-inline query results | Issue `#25` / Task 20 |
-| `Missing` | supported end-to-end model release demonstration | Dataset export identity, durable feature-dataset selection, and the signed application/validator/ONNX-worker release are composed, but the repository has no supported production training driver or supported ONNX candidate producer/demo | Issue `#25` / Task 20 |
 | `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |
 
 This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
 not endorsed or certified by the Federal Reserve Bank of St. Louis.
 
 Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
-execution-qualification verticals remain release-blocking above. The tracked Python package and
-sealed-release components have accepted focused evidence, while the supported first-use
-application handoff remains release-blocking above. Python files under `scripts/` remain build,
+execution-qualification verticals remain release-blocking above. The tracked Python package,
+sealed-release components, production training driver, ONNX producer, and signed application
+handoff form the supported model first-use path. Python files under `scripts/` remain build,
 verification, and protocol-smoke utilities rather than financial product APIs.
 
 ## Release blocked until implemented
@@ -262,7 +265,10 @@ PY
 For point-in-time dataset access and visualization, see `python/examples/pit_research.py`; it
 requires an existing locally admitted Task 11 dataset root and exact export SHA-256. Training uses
 the same admitted dataset receipt and returns a finalized model proposal that must match an external
-authority file before the digest-bound Rust validator will publish it.
+authority file before the digest-bound Rust validator will publish it. The signed release's
+`market-squawk-train` command owns the supported `propose`, `finalize`, and `admit` handoff; follow
+the [model training and inference runbook](docs/operations/model-inference.md) rather than calling
+training internals or constructing an admission request by hand.
 
 ## Diagnostic foundation quick start
 

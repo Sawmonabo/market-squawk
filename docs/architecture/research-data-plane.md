@@ -196,12 +196,21 @@ read-only `SELECT`, common-table-expression, subquery, and `EXPLAIN` forms after
 relation validation. It applies explicit limits to SQL bytes, result rows and bytes, retained
 memory, partitions, syntax-tree nodes, plan nodes, elapsed time, and cancellation.
 
-General read-only DataFusion SQL is a CLI-only operator capability. MCP exposes typed application
-operations with closed schemas and bounded results; it does not expose a general SQL operation.
-The query engine has an authority-gated artifact-publication mode for large results. The reviewed
-public CLI and fixed-template application/MCP query compositions do not supply that authority:
-they return inline results within their configured bounds and reject a result that would require
-artifact publication.
+General read-only DataFusion SQL is a CLI-only operator capability. Its fixed ceilings are 64 KiB
+of SQL, 256 KiB inline Arrow IPC, 64 MiB for the complete result, 256 MiB of admitted query memory,
+four partitions, 2,048 syntax-tree nodes, 4,096 plan nodes, and 60 seconds. MCP exposes typed
+fixed-template application operations rather than general SQL. Those queries derive their inline
+and complete-result ceilings from the caller's admitted `ServiceLimits`; query memory is four times
+the complete-result ceiling, clamped to the code-owned range, and the four-partition, node, and
+at-most-60-second bounds still apply.
+
+Both compositions supply the engine's transient publication authority. A result above the
+applicable inline ceiling but within its complete-result ceiling is verified and republished into
+the shared terminal repository as opaque `application/vnd.apache.parquet`. That terminal object is
+durable and SHA-256 content-addressed; its public reference contains only artifact identity, digest,
+byte count, media type, and row count. The internal reservation owner and expiry do not become
+terminal retention claims. CLI consumers use `query artifact`; MCP consumers use
+`Analysis.ReadArtifact`.
 
 ### Python
 

@@ -142,6 +142,7 @@ subdirectories, and retains directory capabilities.
 ├── artifacts/                      immutable analytical and result artifacts
 │   ├── Parquet dataset objects and authority records
 │   ├── Python dataset exports and other authority-published results
+│   ├── mcp/v1/ durable content-addressed terminal result artifacts
 │   ├── portfolio import evidence
 │   ├── paper-checkpoints/v1/
 │   ├── governed backtest artifacts
@@ -162,11 +163,14 @@ empty installation. A service creates its namespace when it first obtains that a
 Artifact names are relative, portable references under an already-open root capability. A caller
 must supply a reference that validates within that retained capability.
 
-The analytical query engine supports controlled export only when its caller supplies publication
-and reservation authority. The reviewed public CLI and fixed-template application/MCP query paths
-do not compose that authority, so they remain inline-only and fail closed when a result would
-require an artifact. The layout above therefore does not claim a currently runnable public query-
-export workflow.
+The operator SQL and fixed-template application/MCP query compositions supply bounded transient
+publication authority. When a verified result crosses its admitted inline ceiling but remains
+within the complete-result ceiling, the composition reads it back through the analytical authority
+and republishes it under `artifacts/mcp/v1/` as opaque
+`application/vnd.apache.parquet`. This terminal repository is durable and SHA-256
+content-addressed. Its public reference does not expose a path, transient owner, or reservation
+expiry; consumers retrieve bounded verified chunks through `query artifact` or
+`Analysis.ReadArtifact`.
 
 Configuration files are operator-selected and need not live under the data root. Effective
 configuration retains the origin of each value and redacts secret references from reports.

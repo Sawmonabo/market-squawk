@@ -595,8 +595,6 @@ async fn observation_result(
                     "byteCount": reference.byte_count(),
                     "mediaType": reference.media_type(),
                     "rowCount": object.row_count(),
-                    "owner": ownership.owner(),
-                    "expiresAt": ownership.expires_at(),
                 },
             });
             TypedToolResult::try_new(content, returned.max(1), metadata, limits).map_err(Into::into)

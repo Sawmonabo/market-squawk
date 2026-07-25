@@ -30,8 +30,9 @@ use market_squawk_modeling::{
 ))]
 use market_squawk_modeling::{ExternalOnnxRuntimeError, optional_onnx_runtime_policy_digest};
 use market_squawk_modeling::{
-    InferenceBackend, MAX_ONNX_MODEL_BYTES, ModelFeatureValue, ModelInput, OnnxBackendError,
-    OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram, TractOnnxBackend,
+    InferenceBackend, MAX_ONNX_MODEL_BYTES, ModelFeatureValue, ModelInput, ModelOutputSemantics,
+    OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram,
+    TractOnnxBackend,
 };
 use prost::Message;
 use serde::Deserialize;
@@ -88,6 +89,19 @@ fn onnx_policy_rejects_hostile_graphs_before_runtime_load() -> TestResult {
     let admitted = golden_policy.preflight(&golden)?;
     assert_eq!(admitted.node_count(), 1);
     assert_eq!(admitted.tensor_count(), 4);
+    let binary_policy = OnnxModelPolicy::try_new_with_output_semantics(
+        Sha256Digest::new(Sha256::digest(&golden).into()),
+        13,
+        &[1, 2],
+        &[1, 1],
+        ModelOutputSemantics::BinaryProbability,
+        Duration::from_millis(250),
+        OnnxFallbackPolicy::NoAction,
+    )?;
+    assert_eq!(
+        binary_policy.preflight(&golden),
+        Err(OnnxPolicyError::OutputSemanticsMismatch)
+    );
 
     let proto = ModelProto::decode(golden.as_slice())?;
     let mut cases = Vec::new();

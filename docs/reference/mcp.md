@@ -283,6 +283,21 @@ All four use Data scope and require source evidence.
 
 All four use Data scope and require source evidence.
 
+`Research.GetHistory`, `Research.GetAlternativeData`, the Fundamental reads, and the Macro reads
+execute closed DataFusion templates over one pinned generation. Their query inline and
+complete-result byte ceilings come from the caller's admitted service limits. In the production
+MCP composition that means a 64 KiB inline ceiling and at most the 64 MiB hard result ceiling,
+narrowed by `resultLimits.maximumBytes`; query memory is four times the admitted complete-result
+ceiling within the code-owned clamp. Execution also admits four partitions, 2,048 syntax-tree
+nodes, 4,096 plan nodes, and no more than 60 seconds (the production MCP request deadline is
+30 seconds).
+
+When such a query crosses its inline ceiling but fits its complete-result ceiling, the application
+verifies the engine object and republishes it into the terminal repository as
+`application/vnd.apache.parquet`. The tool result contains an `artifact` object with exactly
+`artifactId`, `sha256`, `byteCount`, `mediaType`, and `rowCount`. It has no public reservation owner,
+expiry, or filesystem path. Read it with `Analysis.ReadArtifact` using the returned identity.
+
 ### Portfolio — 6 tools
 
 | Tool | Specific arguments | Effect | Purpose |
@@ -425,13 +440,16 @@ returns:
 ```
 
 The artifact is SHA-256 content-addressed, capped at 64 MiB, staged through private no-follow files,
-durably synchronized, re-read, and digest-verified before publication. The example illustrates a
-valid local-result shape; a source-derived artifact carries actual coverage and quality evidence.
-The reference ID begins with an ASCII alphanumeric byte, contains only ASCII alphanumerics, `_`,
-and `-`, and is at most 160 bytes. The digest is exactly 64 lowercase hexadecimal characters,
-`byteCount` is positive, and the media type is a bounded 1–128-byte token. The reference is
-path-free and must be treated as opaque. Clients cannot translate it into a filesystem path or
-`resources/read` URI.
+durably synchronized, re-read, and digest-verified before publication. The terminal repository
+retains it durably by content identity; the public contract does not invent a TTL or expose
+transient query-reservation coordinates. The example illustrates a valid local-result shape; a
+source-derived artifact carries actual coverage and quality evidence. Fixed-template query overflow
+uses the same terminal repository but retains Parquet bytes and the five-field application
+reference described above rather than this generic JSON-overflow envelope. The reference ID begins
+with an ASCII alphanumeric byte, contains only ASCII alphanumerics, `_`, and `-`, and is at most
+160 bytes. The digest is exactly 64 lowercase hexadecimal characters, `byteCount` is positive, and
+the media type is a bounded 1–128-byte token. The reference is path-free and must be treated as
+opaque. Clients cannot translate it into a filesystem path or `resources/read` URI.
 
 Retrieve the artifact only through `Analysis.ReadArtifact`. Supply the complete returned reference,
 an `offset` from `0` through the declared `byteCount`, and `maximumBytes` from `1` through `32768`.

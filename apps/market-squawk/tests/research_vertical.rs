@@ -804,7 +804,13 @@ async fn oversized_datafusion_result_returns_one_retrievable_opaque_parquet_refe
         },
     )
     .await?;
-    let artifact = &query.value()["data"]["artifact"];
+    let artifact = query.value()["data"]["artifact"]
+        .as_object()
+        .ok_or("overflow query omitted its terminal artifact reference")?;
+    assert_eq!(artifact.len(), 5);
+    assert!(!artifact.contains_key("owner"));
+    assert!(!artifact.contains_key("expiresAt"));
+    assert_eq!(artifact["rowCount"], 1_000);
     let artifact_id = artifact["artifactId"]
         .as_str()
         .ok_or("overflow query omitted its opaque artifact identifier")?;

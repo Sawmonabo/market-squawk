@@ -6,6 +6,7 @@ from dataclasses import replace
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import stat
 import subprocess
@@ -21,11 +22,20 @@ from market_squawk.data import UtcNanoseconds, open_dataset
 from market_squawk.finance import feature_contracts
 from market_squawk.finance import OperationContext
 from market_squawk.training import TrainingRun, TrainingValidationError
-from market_squawk.training_driver import finalize_candidate, write_proposal
+from market_squawk.training_driver import (
+    admit_candidate,
+    finalize_candidate,
+    write_proposal,
+)
 from test_data import _fixture
 
 
-def _run(dataset) -> TrainingRun:
+def _run(
+    dataset,
+    *,
+    model_id: str = "018f3c2a-91ab-7ccd-b3de-123456789abc",
+    bundle_id: str = "fixture-linear",
+) -> TrainingRun:
     feature = next(
         value
         for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
@@ -39,10 +49,108 @@ def _run(dataset) -> TrainingRun:
         seed=17,
         missing_policy="reject",
         environment=training_environment_receipt(),
-        model_id="018f3c2a-91ab-7ccd-b3de-123456789abc",
-        bundle_id="fixture-linear",
+        model_id=model_id,
+        bundle_id=bundle_id,
         bundle_version=1,
     )
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")),
+        encoding="ascii",
+    )
+
+
+def _driver_config(
+    data_root: Path,
+    digest: str,
+    dataset,
+    *,
+    model_kind: str,
+    model_id: str,
+    bundle_id: str,
+) -> dict[str, object]:
+    feature = next(
+        value
+        for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
+        if value["name"] == "research.price-return"
+    )
+    label = next(value for value in dataset.components if value.kind == "label")
+    return {
+        "schemaVersion": 1,
+        "dataset": {
+            "root": str(data_root.resolve()),
+            "exportSha256": digest,
+            "asOfUnixNanos": 600,
+            "maximumRows": 32,
+            "maximumBytes": 256 * 1024 * 1024,
+        },
+        "training": {
+            "features": [feature],
+            "label": dict(label.mapping()),
+            "seed": 17,
+            "missingPolicy": "reject",
+            "modelId": model_id,
+            "bundleId": bundle_id,
+            "bundleVersion": 1,
+            "modelKind": model_kind,
+            "artifactFormat": "onnx",
+        },
+        "operation": {
+            "timeoutMilliseconds": 60_000,
+            "maximumOperations": 1_000_000,
+        },
+        "onnx": {
+            "opset": 13,
+            "inferenceDeadlineMilliseconds": 250,
+            "fallback": "no_action",
+        },
+    }
+
+
+def _signed_prediction(
+    data_root: Path,
+    request_root: Path,
+    *,
+    model_id: str,
+    bundle_id: str,
+) -> float:
+    request = request_root / "prediction.json"
+    _write_json(
+        request,
+        {
+            "modelId": model_id,
+            "input": {
+                "bundleId": bundle_id,
+                "bundleVersion": 1,
+                "featureValues": [0.25],
+            },
+        },
+    )
+    release_root = Path(sys.prefix).resolve(strict=True)
+    application = release_root / "bin" / "market-squawk"
+    completed = subprocess.run(
+        [
+            str(application),
+            "--data-dir",
+            str(data_root),
+            "--training-release-root",
+            str(release_root),
+            "--output",
+            "json",
+            "model",
+            "predict",
+            str(request),
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=70,
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
+    )
+    value = json.loads(completed.stdout.decode("ascii"))
+    return value["data"]["score"]
 
 
 class TrainingBundleContracts(unittest.TestCase):
@@ -299,117 +407,136 @@ class TrainingBundleContracts(unittest.TestCase):
             self.assertEqual(list(Path(output_root).iterdir()), [])
 
     def test_sealed_driver_produces_deterministic_onnx_and_exact_admission_request(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as data_root,
-            tempfile.TemporaryDirectory() as authority_root,
-            tempfile.TemporaryDirectory() as request_root,
-        ):
-            digest = _fixture(Path(data_root))
-            dataset = open_dataset(
-                Path(data_root),
-                digest,
-                UtcNanoseconds(600),
-                max_rows=32,
-                context=OperationContext(60_000, 1_000_000),
-            )
-            first = _run(dataset).fit_evaluate(
-                model_kind="linear",
-                artifact_format="onnx",
-                context=OperationContext(60_000, 1_000_000),
-            )
-            second = _run(dataset).fit_evaluate(
-                model_kind="linear",
-                artifact_format="onnx",
-                context=OperationContext(60_000, 1_000_000),
-            )
-            self.assertEqual(first.authority_bytes, second.authority_bytes)
-            self.assertEqual(first.candidate.artifact_bytes, second.candidate.artifact_bytes)
-            self.assertEqual(first.candidate.metadata_bytes, second.candidate.metadata_bytes)
+        cases = (
+            (
+                "linear",
+                "regression",
+                "018f3c2a-91ab-7ccd-b3de-123456789abc",
+                "fixture-linear",
+                None,
+                False,
+            ),
+            (
+                "logistic",
+                "binary_probability",
+                "018f3c2a-91ab-7ccd-b3de-223456789abc",
+                "fixture-logistic",
+                (0, 10, 0, 10, 0, 10),
+                True,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as release_proof_root:
+            for case in cases:
+                (
+                    model_kind,
+                    output_semantics,
+                    model_id,
+                    bundle_id,
+                    label_mantissas,
+                    terminal_sigmoid,
+                ) = case
+                with self.subTest(model_kind=model_kind):
+                    case_root = Path(release_proof_root) / bundle_id
+                    data_root = case_root / "data"
+                    authority_root = case_root / "authority"
+                    request_root = case_root / "requests"
+                    for path in (data_root, authority_root, request_root):
+                        path.mkdir(parents=True)
+                    digest = _fixture(data_root, label_mantissas=label_mantissas)
+                    dataset = open_dataset(
+                        data_root,
+                        digest,
+                        UtcNanoseconds(600),
+                        max_rows=32,
+                        context=OperationContext(60_000, 1_000_000),
+                    )
+                    run = _run(dataset, model_id=model_id, bundle_id=bundle_id)
+                    first = run.fit_evaluate(
+                        model_kind=model_kind,
+                        artifact_format="onnx",
+                        context=OperationContext(60_000, 1_000_000),
+                    )
+                    second = run.fit_evaluate(
+                        model_kind=model_kind,
+                        artifact_format="onnx",
+                        context=OperationContext(60_000, 1_000_000),
+                    )
+                    self.assertEqual(
+                        (
+                            first.authority_bytes,
+                            first.candidate.artifact_bytes,
+                            first.candidate.metadata_bytes,
+                            first.candidate.training_run_bytes,
+                        ),
+                        (
+                            second.authority_bytes,
+                            second.candidate.artifact_bytes,
+                            second.candidate.metadata_bytes,
+                            second.candidate.training_run_bytes,
+                        ),
+                    )
+                    self.assertEqual(
+                        b"Sigmoid" in first.candidate.artifact_bytes,
+                        terminal_sigmoid,
+                    )
 
-            feature = next(
-                value
-                for value in feature_contracts(
-                    context=OperationContext(60_000, 1_000_000)
-                )
-                if value["name"] == "research.price-return"
-            )
-            label = next(value for value in dataset.components if value.kind == "label")
-            config_path = Path(request_root) / "training.json"
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "dataset": {
-                            "root": str(Path(data_root).resolve()),
-                            "exportSha256": digest,
-                            "asOfUnixNanos": 600,
-                            "maximumRows": 32,
-                            "maximumBytes": 256 * 1024 * 1024,
-                        },
-                        "training": {
-                            "features": [feature],
-                            "label": dict(label.mapping()),
-                            "seed": 17,
-                            "missingPolicy": "reject",
-                            "modelId": "018f3c2a-91ab-7ccd-b3de-123456789abc",
-                            "bundleId": "fixture-linear",
-                            "bundleVersion": 1,
-                            "modelKind": "linear",
-                            "artifactFormat": "onnx",
-                        },
-                        "operation": {
-                            "timeoutMilliseconds": 60_000,
-                            "maximumOperations": 1_000_000,
-                        },
-                        "onnx": {
-                            "opset": 13,
-                            "inferenceDeadlineMilliseconds": 250,
-                            "fallback": "no_action",
-                        },
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                encoding="ascii",
-            )
-            proposal_path = Path(request_root) / "proposal.json"
-            proposal = write_proposal(config_path, proposal_path)
-            self.assertEqual(proposal["authoritySha256"], first.authority_sha256)
-            self.assertEqual(proposal_path.read_bytes(), first.authority_bytes)
+                    config_path = request_root / "training.json"
+                    _write_json(
+                        config_path,
+                        _driver_config(
+                            data_root,
+                            digest,
+                            dataset,
+                            model_kind=model_kind,
+                            model_id=model_id,
+                            bundle_id=bundle_id,
+                        ),
+                    )
+                    proposal_path = request_root / "proposal.json"
+                    write_proposal(config_path, proposal_path)
+                    self.assertEqual(proposal_path.read_bytes(), first.authority_bytes)
 
-            authority_path = Path(authority_root) / "bundle-authority.json"
-            authority_path.write_bytes(proposal_path.read_bytes())
-            request_path = Path(request_root) / "admission.json"
-            finalized = finalize_candidate(
-                config_path,
-                authority_path,
-                "models/fixture-linear-v1",
-                request_path,
-            )
-            request = json.loads(request_path.read_text(encoding="ascii"))
-            self.assertEqual(finalized["admissionRequest"], str(request_path.resolve()))
-            self.assertEqual(request["schemaVersion"], 1)
-            self.assertEqual(
-                request["candidateDirectory"],
-                "models/fixture-linear-v1/candidate",
-            )
-            self.assertEqual(request["metadata"]["relativePath"], "bundle.json")
-            self.assertEqual(request["authority"]["path"], str(authority_path.resolve()))
-            self.assertEqual(request["dataset"]["exportSha256"], digest)
-            self.assertEqual(request["dataset"]["asOfUnixNanos"], 600)
-            self.assertEqual(request["backend"]["kind"], "onnx")
-            self.assertEqual(request["backend"]["opset"], 13)
-            self.assertEqual(request["backend"]["inputShape"], [1, 1])
-            self.assertEqual(request["backend"]["outputShape"], [1, 1])
-            candidate = (
-                Path(data_root)
-                / "artifacts"
-                / "models"
-                / "fixture-linear-v1"
-                / "candidate"
-            )
-            self.assertEqual((candidate / "model.onnx").read_bytes(), first.candidate.artifact_bytes)
-            self.assertFalse((candidate / "artifact.json").exists())
+                    authority_path = authority_root / "bundle-authority.json"
+                    authority_path.write_bytes(proposal_path.read_bytes())
+                    request_path = request_root / "admission.json"
+                    finalize_candidate(
+                        config_path,
+                        authority_path,
+                        f"models/{bundle_id}-v1",
+                        request_path,
+                    )
+                    request = json.loads(request_path.read_text(encoding="ascii"))
+                    self.assertEqual(
+                        [
+                            json.loads(first.candidate.metadata_bytes)[
+                                "output_semantics"
+                            ],
+                            json.loads(first.authority_bytes)["output_semantics"],
+                            request["backend"]["outputSemantics"],
+                        ],
+                        [output_semantics] * 3,
+                    )
+                    self.assertEqual(
+                        request["backend"]["modelSha256"],
+                        first.candidate.artifact_sha256,
+                    )
+
+                    admitted = admit_candidate(config_path, request_path)
+                    self.assertIn(
+                        admitted["data"]["disposition"],
+                        {"inserted", "already_admitted"},
+                    )
+
+                    if model_kind == "logistic":
+                        score = _signed_prediction(
+                            data_root,
+                            request_root,
+                            model_id=model_id,
+                            bundle_id=bundle_id,
+                        )
+                        self.assertNotIsInstance(score, bool)
+                        self.assertTrue(math.isfinite(score))
+                        self.assertTrue(0.0 <= score <= 1.0)
 
 
 if __name__ == "__main__":

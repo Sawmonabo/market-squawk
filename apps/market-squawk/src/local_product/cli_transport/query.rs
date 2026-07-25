@@ -119,8 +119,6 @@ pub(super) async fn query_sql(
                             "byteCount": reference.byte_count(),
                             "mediaType": reference.media_type(),
                             "rowCount": object.row_count(),
-                            "owner": ownership.owner(),
-                            "expiresAt": ownership.expires_at(),
                         },
                     },
                     "metadata": {
