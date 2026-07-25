@@ -3450,9 +3450,11 @@ dependencies = [
 name = "market-squawk-adapter-coinbase"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "futures-util",
+ "hmac",
  "market-squawk-domain",
  "market-squawk-live",
  "market-squawk-sources",

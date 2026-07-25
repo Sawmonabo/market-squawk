@@ -11,15 +11,18 @@ keywords = ["finance", "market-data", "trading", "websocket"]
 categories = ["finance", "network-programming"]
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-live.workspace = true
 market-squawk-sources.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -27,7 +30,6 @@ tokio-tungstenite.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 static_assertions.workspace = true
 
 [lints]

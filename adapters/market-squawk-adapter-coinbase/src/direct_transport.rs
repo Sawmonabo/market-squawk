@@ -13,16 +13,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
-use market_squawk_domain::{ConnectionGeneration, SequenceNumber, Timestamp};
-use market_squawk_live::{DirectOrderBook, DirectOrderBookError, DirectPublishedBook};
+use market_squawk_domain::{
+    ConnectionGeneration, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
+    InstrumentExecutionTerms, LiveEventClass, SequenceNumber, SnapshotApplicability,
+    SourceIdentifier, Timestamp,
+};
+use market_squawk_live::{
+    DirectOrderBook, DirectOrderBookError, DirectPublishedBook, DirectPublishedLevel,
+};
 use market_squawk_sources::{
-    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, HttpCaptureMethod,
-    LiveSourceGeneration, NetworkAccessPolicy, RawMarketSink, SegmentedHttpCaptureError,
-    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SharedProviderBudget, SinkError,
-    SourceError, SourceMetadata, SourceMetadataProvider, TlsProviderCapability, TransportFrameKind,
+    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, ChecksumValidationProfile,
+    DecodedProviderBatch, DecoderEvidence, HttpCaptureMethod, LiveSourceGeneration,
+    NetworkAccessPolicy, ProviderBookLevel, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink,
+    SegmentedHttpCaptureError, SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt,
+    SequenceValidationProfile, SharedProviderBudget, SinkError, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceProtocolProfile, TlsProviderCapability, TransportFrameKind,
     apply_http_retry_after,
 };
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
@@ -47,8 +58,11 @@ use crate::{
 /// market events, order authority, or execution eligibility.
 #[derive(Clone, Copy, Debug)]
 pub struct CoinbaseDirectBookUpdate<'a> {
+    config: &'a CoinbaseDirectConfig,
     sequence: SequenceNumber,
     source_timestamp: Timestamp,
+    decoder_evidence: &'a DecoderEvidence,
+    subscription_evidence: &'a ExactPayloadEvidence,
     snapshot_receipt: &'a SegmentedHttpResponseReceipt,
     book: DirectPublishedBook<'a>,
 }
@@ -69,10 +83,179 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
         self.snapshot_receipt
     }
 
+    /// Returns the exact validated subscription acknowledgement evidence for this generation.
+    pub const fn subscription_evidence(self) -> &'a ExactPayloadEvidence {
+        self.subscription_evidence
+    }
+
     /// Returns an allocation-free bounded-depth view of the session-owned book.
     pub const fn book(self) -> DirectPublishedBook<'a> {
         self.book
     }
+
+    /// Converts this non-forgeable synchronized-book view into one ordinary captured quote batch.
+    ///
+    /// The returned value remains unqualified. The application must still bind the exact raw-frame
+    /// capture receipt and pass the batch through the source registry, live processor, strategy,
+    /// central risk service, and execution dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale or transplanted snapshot/frame authority, a missing best side, profile-rule
+    /// mismatch, or an exact financial conversion that cannot be represented.
+    pub fn try_quote_batch(self) -> Result<DecodedProviderBatch, CoinbaseDirectPublicationError> {
+        self.decoder_evidence
+            .currentness_lease()
+            .validate_current()
+            .map_err(|_error| CoinbaseDirectPublicationError::StaleAuthority)?;
+        self.snapshot_receipt
+            .currentness_lease()
+            .validate_current()
+            .map_err(|_error| CoinbaseDirectPublicationError::StaleAuthority)?;
+        if !self
+            .decoder_evidence
+            .binding()
+            .shares_allocation_with(self.snapshot_receipt.binding())
+            || !self
+                .decoder_evidence
+                .currentness_lease()
+                .shares_authority_with(self.snapshot_receipt.currentness_lease())
+            || self.decoder_evidence.binding().source_id() != self.config.metadata().source_id()
+            || self.decoder_evidence.binding().metadata_revision()
+                != self.config.metadata().revision()
+            || self.snapshot_receipt.connection_generation()
+                != self.decoder_evidence.binding().connection_generation()
+        {
+            return Err(CoinbaseDirectPublicationError::EvidenceMismatch);
+        }
+        let SourceProtocolProfile::Live(protocol) = self.config.metadata().protocol_profile()
+        else {
+            return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+        };
+        let sequence_rule = match protocol.sequence() {
+            SequenceValidationProfile::Provided { rule, .. } => rule.clone(),
+            SequenceValidationProfile::Unsupported { .. } => {
+                return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+            }
+        };
+        let checksum_rule = match protocol.checksum() {
+            ChecksumValidationProfile::Unsupported { rule } => rule.clone(),
+            ChecksumValidationProfile::Provided { .. } => {
+                return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+            }
+        };
+        let snapshot_rule = self
+            .config
+            .metadata()
+            .coverage()
+            .live()
+            .and_then(|coverage| coverage.rule_for(LiveEventClass::Quote, None))
+            .and_then(|rule| match rule.snapshot_applicability() {
+                SnapshotApplicability::NotApplicable { metadata_rule } => {
+                    Some(metadata_rule.clone())
+                }
+                SnapshotApplicability::Required => None,
+            })
+            .ok_or(CoinbaseDirectPublicationError::ProfileMismatch)?;
+        let terms = self.config.execution_terms();
+        let book = self.book();
+        let bid = book
+            .bids()
+            .next()
+            .map(|level| provider_level(level, terms))
+            .transpose()?;
+        let ask = book
+            .asks()
+            .next()
+            .map(|level| provider_level(level, terms))
+            .transpose()?;
+        let payload = ProviderObservationPayload::quote(bid, ask)
+            .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+        let source_identifier = direct_book_identifier(self.sequence, self.snapshot_receipt)?;
+        let observation = ProviderNormalizedObservation::try_new(
+            source_identifier,
+            self.config.venue().clone(),
+            self.config.instrument(),
+            ProviderTimestampEvidence::Provided {
+                value: self.source_timestamp,
+                rule: protocol.timestamp_rule().clone(),
+            },
+            ProviderSequenceEvidence::Provided {
+                value: self.sequence,
+                rule: sequence_rule,
+            },
+            ProviderSnapshotEvidence::NotApplicable(snapshot_rule),
+            ProviderChecksumEvidence::Unsupported {
+                rule: checksum_rule,
+            },
+            payload,
+        )
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+        DecodedProviderBatch::try_new(self.decoder_evidence.clone(), vec![observation])
+            .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)
+    }
+}
+
+/// Failure to bind one synchronized Direct book to the ordinary captured live-ingress contract.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CoinbaseDirectPublicationError {
+    /// Snapshot or frame currentness was revoked before publication.
+    #[error("Coinbase Direct publication authority is stale")]
+    StaleAuthority,
+    /// Snapshot and last-frame evidence do not share one exact source generation.
+    #[error("Coinbase Direct publication evidence is inconsistent")]
+    EvidenceMismatch,
+    /// Immutable metadata no longer exposes the Direct quote profile.
+    #[error("Coinbase Direct publication profile is inconsistent")]
+    ProfileMismatch,
+    /// A synchronized best level cannot be converted exactly using the configured terms.
+    #[error("Coinbase Direct publication numeric evidence is invalid")]
+    InvalidNumeric,
+    /// The bounded normalized observation could not be constructed.
+    #[error("Coinbase Direct publication observation is invalid")]
+    InvalidObservation,
+}
+
+fn provider_level(
+    level: DirectPublishedLevel,
+    terms: InstrumentExecutionTerms,
+) -> Result<ProviderBookLevel, CoinbaseDirectPublicationError> {
+    let mut price = level
+        .price()
+        .checked_to_decimal(terms.price_tick())
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidNumeric)?;
+    price.rescale(terms.price_tick().as_decimal().scale());
+    let mut quantity = level
+        .quantity()
+        .checked_to_decimal(terms.lot_size())
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidNumeric)?;
+    quantity.rescale(terms.lot_size().as_decimal().scale());
+    let price = ProviderDecimalLexeme::try_new(&price.to_string())
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidNumeric)?;
+    let quantity = ProviderDecimalLexeme::try_new(&quantity.to_string())
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidNumeric)?;
+    Ok(ProviderBookLevel::new(
+        ProviderPrice::new(price),
+        ProviderQuantity::new(quantity),
+    ))
+}
+
+fn direct_book_identifier(
+    sequence: SequenceNumber,
+    snapshot: &SegmentedHttpResponseReceipt,
+) -> Result<SourceIdentifier, CoinbaseDirectPublicationError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = snapshot.body_digest().bytes();
+    let mut identifier = format!("coinbase-direct-book-{}-", sequence.get());
+    identifier
+        .try_reserve_exact(digest.len().saturating_mul(2))
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+    for byte in digest {
+        identifier.push(char::from(HEX[usize::from(byte >> 4)]));
+        identifier.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    SourceIdentifier::try_from(identifier)
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)
 }
 
 /// Nonblocking application boundary for one Coinbase Direct generation.
@@ -89,6 +272,12 @@ pub trait CoinbaseDirectOutput: RawMarketSink {
 
     /// Accepts one private lifecycle event that carries no public cursor or book authority.
     fn try_publish_non_book(&mut self, event: CoinbaseDirectNonBookEvent) -> Result<(), SinkError>;
+
+    /// Retains capture admission for the exact sequenced frame that now backs the Direct book.
+    ///
+    /// Queueing may call this repeatedly before the first published book. Implementations must
+    /// replace the prior retained sequenced-frame receipt rather than accumulating receipts.
+    fn try_retain_sequenced_frame(&mut self, evidence: &DecoderEvidence) -> Result<(), SinkError>;
 
     /// Accepts one borrowed read-only view after healthy handoff or a contiguous live successor.
     fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError>;
@@ -139,6 +328,9 @@ pub enum CoinbaseDirectSessionError {
     /// HTTP response segmentation exceeded the configured count ceiling.
     #[error("Coinbase Direct HTTP response exceeded its segment ceiling")]
     HttpSegmentLimit,
+    /// The bounded product/status refresh deadline could not be represented.
+    #[error("Coinbase Direct product refresh deadline is invalid")]
+    ProductRefreshDeadline,
     /// A cancellation close handshake failed or exceeded its bound.
     #[error("Coinbase Direct WebSocket shutdown failed")]
     Shutdown,
@@ -155,7 +347,10 @@ pub struct CoinbaseDirectSession {
     http: Arc<dyn CoinbaseDirectHttpTransport>,
     http_timeout: Duration,
     book: DirectOrderBook,
+    acknowledgement_evidence: Option<ExactPayloadEvidence>,
+    last_sequenced_evidence: Option<DecoderEvidence>,
     snapshot_receipt: Option<SegmentedHttpResponseReceipt>,
+    next_product_refresh: Option<Instant>,
     generation_started: bool,
 }
 
@@ -215,7 +410,10 @@ impl CoinbaseDirectSession {
             http,
             http_timeout: Duration::from_nanos(bounds.total_timeout_nanos()),
             book,
+            acknowledgement_evidence: None,
+            last_sequenced_evidence: None,
             snapshot_receipt: None,
+            next_product_refresh: None,
             generation_started: false,
         })
     }
@@ -429,17 +627,30 @@ impl CoinbaseDirectSession {
     {
         let product_url = self.config.product_url().to_owned();
         let product_response = self
-            .fetch_while_queueing(socket, output, cancellation, &product_url)
+            .fetch_while_processing(
+                socket,
+                output,
+                cancellation,
+                &product_url,
+                InboundMode::Queueing,
+            )
             .await?;
         let product_capture = self.finish_http_capture(&product_url, product_response)?;
         let product_evidence = self.config.decode_product_evidence(&product_capture)?;
         output
             .try_publish_product(product_evidence)
             .map_err(SourceError::Sink)?;
+        self.schedule_product_refresh()?;
 
         let snapshot_url = self.config.snapshot_url().to_owned();
         let snapshot_response = self
-            .fetch_while_queueing(socket, output, cancellation, &snapshot_url)
+            .fetch_while_processing(
+                socket,
+                output,
+                cancellation,
+                &snapshot_url,
+                InboundMode::Queueing,
+            )
             .await?;
         let snapshot_capture = self.finish_http_capture(&snapshot_url, snapshot_response)?;
         let snapshot_receipt = snapshot_capture.receipt().clone();
@@ -463,17 +674,56 @@ impl CoinbaseDirectSession {
         self.publish_book(output)?;
 
         loop {
-            let message = read_with_deadline(
+            let refresh_at = self
+                .next_product_refresh
+                .ok_or(CoinbaseDirectSessionError::ProductRefreshDeadline)?;
+            match read_with_refresh_deadline(
                 socket,
                 output,
                 cancellation,
                 self.config.limits().websocket().io_timeout(),
+                refresh_at,
+            )
+            .await?
+            {
+                LiveRead::Message(message) => {
+                    let _disposition = self
+                        .handle_message(socket, message, output, cancellation, InboundMode::Live)
+                        .await?;
+                }
+                LiveRead::RefreshProduct => {
+                    self.refresh_product_while_live(socket, output, cancellation)
+                        .await?;
+                }
+            }
+        }
+    }
+
+    async fn refresh_product_while_live<S>(
+        &mut self,
+        socket: &mut WebSocketStream<S>,
+        output: &mut dyn CoinbaseDirectOutput,
+        cancellation: &CancellationToken,
+    ) -> Result<(), CoinbaseDirectSessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let product_url = self.config.product_url().to_owned();
+        let response = self
+            .fetch_while_processing(
+                socket,
+                output,
+                cancellation,
+                &product_url,
+                InboundMode::Live,
             )
             .await?;
-            let _disposition = self
-                .handle_message(socket, message, output, cancellation, InboundMode::Live)
-                .await?;
-        }
+        let capture = self.finish_http_capture(&product_url, response)?;
+        let evidence = self.config.decode_product_evidence(&capture)?;
+        output
+            .try_publish_product(evidence)
+            .map_err(SourceError::Sink)?;
+        self.schedule_product_refresh()
     }
 
     async fn await_handoff_frontier<S>(
@@ -519,12 +769,13 @@ impl CoinbaseDirectSession {
         }
     }
 
-    async fn fetch_while_queueing<S>(
+    async fn fetch_while_processing<S>(
         &mut self,
         socket: &mut WebSocketStream<S>,
         output: &mut dyn CoinbaseDirectOutput,
         cancellation: &CancellationToken,
         url: &str,
+        mode: InboundMode,
     ) -> Result<CoinbaseDirectHttpResponse, CoinbaseDirectSessionError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -558,7 +809,7 @@ impl CoinbaseDirectSession {
                             message,
                             output,
                             cancellation,
-                            InboundMode::Queueing,
+                            mode,
                         )
                         .await?;
                 }
@@ -707,6 +958,14 @@ impl CoinbaseDirectSession {
             self.config.limits().websocket().max_frame_bytes(),
         )?;
         let frame = self.authority.frames_mut()?.try_frame(transport, payload)?;
+        let acknowledgement_evidence = if mode == InboundMode::AwaitingAck {
+            let digest: [u8; 32] = Sha256::digest(frame.payload()).into();
+            Some(ExactPayloadEvidence::from_content_digest(
+                EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
+            ))
+        } else {
+            None
+        };
         let decoded = {
             let validated = self.authority.validate_live_frame(&frame)?;
             if mode == InboundMode::AwaitingAck {
@@ -730,19 +989,27 @@ impl CoinbaseDirectSession {
         };
         output.try_publish(frame).map_err(SourceError::Sink)?;
         let Some(decoded) = decoded? else {
+            self.acknowledgement_evidence = acknowledgement_evidence;
             return Ok(MessageDisposition::Acknowledged);
         };
         match decoded {
-            CoinbaseDirectDecodeOutcome::Sequenced(event) => match mode {
-                InboundMode::Queueing => self.book.try_queue(event)?,
-                InboundMode::Live => {
-                    self.book.try_apply_live(event)?;
+            CoinbaseDirectDecodeOutcome::Sequenced(event) => {
+                let evidence = event.evidence().clone();
+                match mode {
+                    InboundMode::Queueing => self.book.try_queue(event)?,
+                    InboundMode::Live => self.book.try_apply_live(event)?,
+                    InboundMode::AwaitingAck => {
+                        return Err(CoinbaseDirectSessionError::Subscription);
+                    }
+                }
+                output
+                    .try_retain_sequenced_frame(&evidence)
+                    .map_err(SourceError::Sink)?;
+                self.last_sequenced_evidence = Some(evidence);
+                if mode == InboundMode::Live {
                     self.publish_book(output)?;
                 }
-                InboundMode::AwaitingAck => {
-                    return Err(CoinbaseDirectSessionError::Subscription);
-                }
-            },
+            }
             CoinbaseDirectDecodeOutcome::NonBook(event) => {
                 output
                     .try_publish_non_book(event)
@@ -784,14 +1051,25 @@ impl CoinbaseDirectSession {
             .snapshot_receipt
             .as_ref()
             .ok_or(DirectOrderBookError::SnapshotReceiptRequired)?;
+        let decoder_evidence = self
+            .last_sequenced_evidence
+            .as_ref()
+            .ok_or(CoinbaseDirectSessionError::WebSocketProtocol)?;
+        let subscription_evidence = self
+            .acknowledgement_evidence
+            .as_ref()
+            .ok_or(CoinbaseDirectSessionError::Subscription)?;
         let book = self
             .book
             .published_book()
             .ok_or(DirectOrderBookError::WrongPhase)?;
         output
             .try_publish_book(CoinbaseDirectBookUpdate {
+                config: &self.config,
                 sequence,
                 source_timestamp,
+                decoder_evidence,
+                subscription_evidence,
                 snapshot_receipt,
                 book,
             })
@@ -827,6 +1105,15 @@ impl CoinbaseDirectSession {
         }
     }
 
+    fn schedule_product_refresh(&mut self) -> Result<(), CoinbaseDirectSessionError> {
+        self.next_product_refresh = Some(
+            Instant::now()
+                .checked_add(self.config.limits().product_refresh_interval())
+                .ok_or(CoinbaseDirectSessionError::ProductRefreshDeadline)?,
+        );
+        Ok(())
+    }
+
     fn begin_generation(&mut self) -> Result<(), SourceError> {
         if self.generation_started {
             return Err(SourceError::InvalidProtocolState);
@@ -841,7 +1128,10 @@ impl CoinbaseDirectSession {
     ) -> Result<(), CoinbaseDirectSessionError> {
         if outcome.is_err() {
             self.book.invalidate_generation();
+            self.acknowledgement_evidence = None;
+            self.last_sequenced_evidence = None;
             self.snapshot_receipt = None;
+            self.next_product_refresh = None;
         }
         outcome
     }
@@ -930,6 +1220,12 @@ enum MessageDisposition {
     Data,
 }
 
+#[derive(Clone, Debug)]
+enum LiveRead {
+    Message(Message),
+    RefreshProduct,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubscriptionAck {
@@ -1013,6 +1309,33 @@ where
         result = socket.next() => result,
     };
     map_next_message(next)
+}
+
+async fn read_with_refresh_deadline<S>(
+    socket: &mut WebSocketStream<S>,
+    output: &mut dyn CoinbaseDirectOutput,
+    cancellation: &CancellationToken,
+    transport_timeout: Duration,
+    refresh_at: Instant,
+) -> Result<LiveRead, CoinbaseDirectSessionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let receive_deadline = ReceiveDeadline::strictest(output, transport_timeout)?;
+    if refresh_at >= receive_deadline.at {
+        return read_with_deadline(socket, output, cancellation, transport_timeout)
+            .await
+            .map(LiveRead::Message);
+    }
+
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(SourceError::Cancelled.into()),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)) => {
+            Ok(LiveRead::RefreshProduct)
+        }
+        message = socket.next() => map_next_message(message).map(LiveRead::Message),
+    }
 }
 
 fn map_next_message(
