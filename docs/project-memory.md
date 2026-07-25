@@ -681,9 +681,8 @@ separate acceptance evidence exists. Work resumes with Tasks 19/19A, then Task 2
 
 ## 2026-07-24 research/model first-use and shared-release checkpoint
 
-The pushed release head is
-`3ef05dc8724ec2be808f98543e0bc695f2ae0937`; the local and origin release refs match. Research/model
-first-use authority is integrated through merge head `92f2b72`. The accepted lane supplies durable
+Research/model first-use authority is integrated through merge head `92f2b72`. The accepted lane
+supplies durable
 point-in-time feature datasets, stable bounded pagination, retained Python export digests, signed
 application/validator/ONNX-worker release construction, and bounded artifact-read worker ownership.
 
@@ -704,21 +703,21 @@ Clippy with warnings denied; formatting; and diff integrity. A services-only Cli
 and corrected an undeclared Serde `rc` feature dependency before the commit was pushed.
 
 The accepted research worktree target removed 8.3 GiB, after which the worktree, merged local
-branch, origin branch, and stale refs were deleted. The root target is approximately 5.4 GiB. The
-only remaining feature worktree is `feature/coinbase-direct-market-data`, approximately 0.9 GiB and
-below its 10 GiB ceiling.
+branch, origin branch, and stale refs were deleted.
 
-Coinbase direct-market-data core candidate
-`09f289ff27e1f4fac5f68343bd4a6e53b3b4dba6` is clean and in independent exact-head review. Its
-focused direct tests passed 4/4 without warnings, but it is not integrated release authority. Its
-remaining product boundary is application credential activation, rights and onboarding
-reconciliation, central live qualification, and an authorized unchanged-head trace.
+Coinbase Direct integrity candidate `6182da007312023ef5fa78a0537ccb273d63a24f` completed final
+independent review with zero Critical, Important, or Minor findings and is integrated at release
+merge `4cb6e02124a3f730430e4e152b1b1f29e7e0f9fe`. The merged tree passed focused order-book,
+decoder, segmented HTTP-receipt, allocation-accounting, strict affected-package Clippy, formatting,
+and diff gates. The completed 970.7 MiB target, worktree, merged local branch, and stale refs were
+removed; no matching origin feature branch existed. The remaining product boundary is
+application-owned credential activation, authenticated transport supervision, rights and
+onboarding reconciliation, central qualification, strategy/risk/paper composition, and an
+authorized unchanged-head trace. Issue `#7` therefore remains open and In Progress.
 
-PR `#26` and issue `#24` contain the current checkpoint. GitHub Actions run `30131065227` at
-`3ef05dc` created `verify`, `macos`, and `windows` jobs with empty step lists; no workflow step
-executed. This remains an external Actions account billing/spending-state blocker rather than a
-code-owned failure. Project 5 keeps `#24` and `#31` In Progress and `#25` Todo. The next barrier is
-Coinbase exact-head review/integration, followed by provider/onboarding closure and Task 20.
+GitHub Actions run `30131065227` at `3ef05dc` created `verify`, `macos`, and `windows` jobs with
+empty step lists; no workflow step executed. This was an external Actions account
+billing/spending-state blocker rather than a code-owned failure.
 
 ## 2026-07-24 release-truth reconciliation and active product lanes
 
@@ -735,19 +734,21 @@ present at the reviewed product head:
 These corrections removed false release blockers without product-code changes, Cargo commands,
 new tests, checkers, generators, or scripts.
 
-The independent Coinbase review rejected candidate `09f289f` before integration with zero Critical
-and seven Important findings: auction authority, trusted observation time, generation/frame/receipt
-binding, current modify-order price semantics, bounded live publication, secret zeroization, and
-focused proof of those exact invariants. Remediation remains in the existing
-`feature/coinbase-direct-market-data` worktree; no rejected code is on the release branch.
+The independent Coinbase review rejected initial candidate `09f289f` before integration with zero
+Critical and seven Important findings: auction authority, trusted observation time,
+generation/frame/receipt binding, current modify-order price semantics, bounded live publication,
+secret zeroization, and focused proof of those exact invariants. Subsequent exact-head reviews
+rejected two remaining lifecycle-authority defects and accepted `6182da0` only after both were
+closed. No rejected intermediate was integrated.
 
 One grouped non-conflicting `feature/research-model-release` lane owns both public analytical-query
 overflow publication and the supported production training/ONNX candidate workflow. It is based on
 the pushed `241599a` product/documentation checkpoint and cannot push or integrate before focused
 verification and independent review.
 
-Generated Cargo state is approximately 5.4 GiB in the root and 0.9 GiB in the Coinbase lane; the
-research/model lane has not created a target tree. All remain below the 20 GiB root and 10 GiB lane
-ceilings. Project 5 keeps `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
-Actions run `30132539779` at `3c2cfe5` again created three jobs with empty step lists, so no
-repository checkout or code-owned CI step ran.
+Generated Cargo state is approximately 6.1 GiB in the root and 8.4 GiB in the sole active
+research/model lane. Both remain below the 20 GiB root and 10 GiB lane ceilings. Project 5 keeps
+`#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
+Actions run `30136930407` at Coinbase integration head `4cb6e02` again created three jobs with
+empty step lists. Each check reported that recent account payments failed or the spending limit
+must be increased; no repository checkout or code-owned CI step ran.

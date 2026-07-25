@@ -165,10 +165,13 @@ work is bound by the single canonical
 The app-local Coinbase reader remains a compatibility path. Its app-local `QualityState::Valid` is
 not canonical `DataQuality::DirectVerified` and cannot authorize an order. The MCP command uses the
 sole hardened application MCP composition over that authority-free diagnostic state; there is no
-second legacy MCP server or unchecked application-local handler. The separately composed production
-Coinbase source can enter the production live runtime only at its declared `DirectUnverified`
-ceiling; Coinbase and Kraken therefore remain execution-ineligible. All fills remain local paper
-simulation; no broker adapter or live order authority is enabled.
+second legacy MCP server or unchecked application-local handler. The integrated Coinbase Direct
+integrity core supplies bounded snapshot evidence, order-level ownership, closed sequence domains,
+contiguous replay, currentness evidence, and fail-closed quarantine. It is not yet composed as an
+authenticated production transport or central qualification path. The separately composed
+compatibility source can enter the live runtime only at its declared `DirectUnverified` ceiling;
+Coinbase and Kraken therefore remain execution-ineligible. All fills remain local paper simulation;
+no broker adapter or live order authority is enabled.
 
 ## Required but missing
 
@@ -177,7 +180,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path and controlled book-imbalance strategy are runnable, but the integrated Coinbase source remains capped at `DirectUnverified` and cannot satisfy the execution gate | Task 2 |
+| `Missing` | Coinbase direct-source qualification | The accepted integrity core implements bounded snapshot/replay, order ownership, sequence/currentness evidence, and quarantine, but authenticated transport, credential activation, central qualification, strategy/risk/paper composition, and an authorized unchanged-head trace are not complete; no Coinbase source can publish `DirectVerified` authority | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |

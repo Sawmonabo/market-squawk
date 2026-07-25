@@ -9,8 +9,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current pushed release head: `3ef05dc8724ec2be808f98543e0bc695f2ae0937`;
-  local and `origin/release/market-squawk-v0.1.0` match.
+- Latest integrated product-capability merge: `4cb6e02124a3f730430e4e152b1b1f29e7e0f9fe`
+  (`merge: integrate Coinbase Direct market data core`). The release branch is pushed through the
+  status commit containing this record.
 - Research/model first-use authority is integrated through merge head `92f2b72`. Durable
   point-in-time feature datasets, stable bounded pagination, retained Python export digests, sealed
   application/validator/ONNX-worker release construction, and bounded artifact-read lifecycle
@@ -23,15 +24,22 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Fresh focused evidence at `3ef05dc`: exact production MCP composition, production paper
   composition, and merged point-in-time backtest tests passed; affected services/application/MCP/
   modeling Clippy passed with warnings denied; formatting and diff checks passed.
-- The accepted research worktree target (8.3 GiB), worktree, local branch, origin branch, and stale
-  refs are removed. The active root target is approximately 5.4 GiB. The only feature worktree is
-  `feature/coinbase-direct-market-data`, approximately 0.9 GiB.
-- Coinbase direct-market-data core candidate
-  `09f289ff27e1f4fac5f68343bd4a6e53b3b4dba6` is clean and under exact-head independent review; it
-  is not integrated or runnable release authority yet.
-- Hosted Actions run `30131065227` at `3ef05dc` created three jobs with empty step lists. No
-  checkout, build, lint, or test step ran; the external Actions billing/spending-state blocker
-  remains recorded on PR `#26`.
+- Coinbase Direct integrity candidate `6182da007312023ef5fa78a0537ccb273d63a24f` passed final
+  independent review with zero Critical, Important, or Minor findings and is integrated at
+  `4cb6e02`. The merged tree passed the focused order-book, decoder, HTTP-receipt,
+  allocation-accounting, strict affected-package Clippy, formatting, and diff gates. The core now
+  provides bounded segmented snapshot evidence, level-3 ownership and replay, closed sequence
+  domains, currentness and provider-consistency evidence, and fail-closed quarantine. It is not a
+  runnable authenticated source or `DirectVerified` release authority: credential activation,
+  transport supervision, central qualification, strategy/risk/paper composition, and an authorized
+  unchanged-head trace remain open under issue `#7`.
+- The completed Coinbase target (970.7 MiB), worktree, merged local branch, and stale refs are
+  removed; no matching origin feature branch existed. The active root target is approximately
+  6.1 GiB. The only feature worktree is `feature/research-model-release`, approximately 8.4 GiB and
+  below its 10 GiB lane ceiling.
+- Hosted Actions run `30136930407` at `4cb6e02` created three jobs with empty step lists. No
+  checkout, build, lint, or test step ran; each check reported the external account
+  payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
 - Documentation execution source head:
   `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release

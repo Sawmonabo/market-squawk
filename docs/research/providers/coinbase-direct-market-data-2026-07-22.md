@@ -6,7 +6,7 @@
 - Candidate endpoint: `wss://ws-direct.exchange.coinbase.com`
 - Candidate channel: authenticated `full`
 - Intended coverage: one Coinbase Exchange venue and explicitly configured products
-- Decision status: blocked production design; not qualification or release evidence
+- Decision status: integrity core integrated; transport, qualification, and release evidence blocked
 
 ## Question
 
@@ -27,21 +27,35 @@ sequence numbers and documents the required snapshot/replay algorithm: queue str
 obtain a level-3 snapshot, discard queued messages at or below the snapshot sequence, and replay
 the rest. Sequence gaps can therefore invalidate the generation and require a new snapshot.
 
-The 2026-07-24 blocker review found that this evidence is not sufficient to begin with the
-repository's current frame and decoded-payload contracts. A live official BTC-USD level-3 snapshot
-was 6,691,816 bytes and contained 108,522 order rows; the corresponding level-2 snapshot still
-contained 44,102 aggregate price levels. Both exceed current capture or decoded-item bounds.
-Coinbase also documents authentication for `level2` and `full`, a source `time` on REST book
-snapshots, and sequence caveats for authenticated-only messages. The production implementation
-therefore requires bounded segmented HTTP capture, streaming level-3 ownership, a replay phase,
-cursor-only sequence advancement, and an authorized trace proving which authenticated messages
-belong to the public-book sequence domain.
+The 2026-07-24 blocker review established that the original frame and decoded-payload contracts
+could not safely admit this feed. A live official BTC-USD level-3 snapshot was 6,691,816 bytes and
+contained 108,522 order rows; the corresponding level-2 snapshot still contained 44,102 aggregate
+price levels. Both exceeded the original capture or decoded-item bounds. Coinbase also documents
+authentication for `level2` and `full`, a source `time` on REST book snapshots, and sequence
+caveats for authenticated-only messages.
+
+The accepted integrity core is integrated at release merge `4cb6e02`. It adds segmented,
+digest-bound HTTP snapshot receipts; bounded level-3 order ownership; snapshot and contiguous
+replay state; closed public and private sequence domains; source-time freshness; currentness and
+provider-consistency evidence; crossed-book quarantine; and explicit separation between owner-only
+TPSL lifecycle messages and public sequenced `modify_order` mutations. The final exact-head review
+of candidate `6182da0` reported zero Critical, Important, or Minor findings. Focused order-book,
+decoder, snapshot-receipt, allocation-accounting, strict affected-package Clippy, formatting, and
+diff gates passed on the merged release tree.
+
+This is not yet a runnable authenticated source. Application-owned credential activation,
+WebSocket and REST transport supervision, central qualification, strategy/risk/paper composition,
+and an authorized unchanged-head trace remain mandatory release blockers. Until those boundaries
+are composed and proven, the canonical source remains execution-ineligible.
 
 Qualification still requires an authorized live run at the exact release candidate proving every
 source, sequence, snapshot, timestamp, freshness, status, precision, rights, and coverage
 predicate.
 
-## 2026-07-24 implementation blockers
+## 2026-07-24 implementation audit
+
+Items 1–5 below drove the accepted integrity-core implementation. Items 6–7 and the production
+transport, composition, and release-proof requirements remain open.
 
 1. Coinbase has required authentication for Exchange `level2`, `level3`, and `full`
    subscriptions since 2023-08-01. The existing unauthenticated `ws-feed` `level2` fallback is
@@ -164,6 +178,7 @@ Reviewed 2026-07-24:
 - [Get product book](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-book)
 - [Get single product](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-single-product)
 - [Coinbase Exchange REST authentication](https://docs.cdp.coinbase.com/exchange/rest-api/authentication)
+- [Coinbase Exchange TPSL order messages](https://docs.cdp.coinbase.com/exchange/fix-api/order-entry-messages/tpsl-orders)
 - [Coinbase Exchange WebSocket rate limits](https://docs.cdp.coinbase.com/exchange/websocket-feed/rate-limits)
 - [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data)
 - [Live official BTC-USD level-3 endpoint used for the boundedness observation](https://api.exchange.coinbase.com/products/BTC-USD/book?level=3)
