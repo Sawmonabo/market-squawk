@@ -3454,14 +3454,17 @@ dependencies = [
  "chrono",
  "futures-util",
  "market-squawk-domain",
+ "market-squawk-live",
  "market-squawk-sources",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "static_assertions",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "zeroize",
 ]
 
 [[package]]

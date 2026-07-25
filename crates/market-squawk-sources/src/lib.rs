@@ -11,9 +11,11 @@ mod checksum;
 mod decoder;
 mod extraction;
 mod health;
+mod http_capture;
 mod live;
 mod metadata;
 mod onboarding;
+mod order;
 mod policy;
 mod registry;
 mod tls;
@@ -74,6 +76,11 @@ pub use health::{
     MarketFreshness, SourceHealthError, SourceHealthSnapshot, SourceTimestampFreshness,
     TransportFreshness,
 };
+pub use http_capture::{
+    HttpCaptureMethod, HttpResponseSegmentReceipt, SegmentedHttpCaptureError,
+    SegmentedHttpResponseBuilder, SegmentedHttpResponseCapture, SegmentedHttpResponseReader,
+    SegmentedHttpResponseReceipt,
+};
 pub use live::{
     FrameId, FrameSessionBinding, LiveMarketSource, MAX_RAW_FRAME_BYTES, RawMarketFrame,
     RawMarketSink, SessionId, SinkError, SourceError, SourceMetadataProvider, TransportFrameKind,
@@ -103,6 +110,10 @@ pub use onboarding::{
     RuntimeProviderCapability, SetupMode, VerificationProbe, ZeroFeeStatus,
     built_in_provider_profiles,
 };
+pub use order::{
+    ProviderCursorOnlyReason, ProviderOrderChangeReason, ProviderOrderEvent,
+    ProviderOrderEventError, ProviderOrderEventKind, ProviderOrderRecord,
+};
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
     BudgetPoolError, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
@@ -117,11 +128,12 @@ pub use registry::{
     CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthReporter,
     CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
     CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey, ExtractionAuthority,
-    InstrumentUniverseAttestation, LiveSourceGeneration, ProviderBackoffAuthority,
-    ProviderBackoffDecision, ProviderBackoffError, RawFrameFactory, RegisteredSource,
-    RegistryAuthorityState, RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
-    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
-    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
+    FrameSessionLease, InstrumentUniverseAttestation, LiveSourceGeneration,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, RawFrameFactory,
+    RegisteredSource, RegistryAuthorityState, RegistryError, SessionControlDisposition,
+    SessionIgnoredDisposition, SessionQuarantineDisposition, SessionRecoveryDisposition,
+    ValidatedCurrentSourceAuthority, ValidatedLiveScope, ValidatedSessionDecodeOutcome,
+    ValidatedSourceSession,
 };
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 

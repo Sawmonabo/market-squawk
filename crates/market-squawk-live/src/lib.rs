@@ -4,6 +4,7 @@ mod action;
 mod authority;
 mod book;
 mod cross_venue;
+mod direct_order_book;
 mod features;
 mod integrity;
 mod normalization;
@@ -29,6 +30,10 @@ pub use book::{BookError, BookSide, DepthLimit, LevelUpdate, MAX_BOOK_MESSAGE_IT
 pub use cross_venue::{
     CrossVenueFeatureError, CrossVenueFeatureHub, CrossVenueFeatureSnapshot, CrossVenueUpdate,
     CrossVenueVenueSnapshot,
+};
+pub use direct_order_book::{
+    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
+    DirectPublishedLevel, DirectSyncPhase,
 };
 pub use features::{FeatureInvalidationReason, RouteFeatureError, RouteFeatureState};
 pub use integrity::{

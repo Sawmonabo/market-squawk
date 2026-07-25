@@ -7,6 +7,7 @@
 
 mod config;
 mod decoder;
+mod direct;
 mod source;
 
 pub use config::{
@@ -14,4 +15,14 @@ pub use config::{
     CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 pub use decoder::CoinbaseExchangeDecoder;
+pub use direct::{
+    COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectActivation, CoinbaseDirectAuthentication,
+    CoinbaseDirectCaptureError, CoinbaseDirectConfig, CoinbaseDirectDecodeError,
+    CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectLimits,
+    CoinbaseDirectNonBookEvent, CoinbaseDirectNonBookKind, CoinbaseDirectProductError,
+    CoinbaseDirectProductEvidence, CoinbaseDirectReceivedLifecycle,
+    CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
+    CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
+    CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
+};
 pub use source::CoinbaseExchangeSource;

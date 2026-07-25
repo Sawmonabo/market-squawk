@@ -199,14 +199,20 @@ impl RawFrameReceipt {
 pub struct ValidatedRawMarketFrame<'a> {
     frame: &'a RawMarketFrame,
     receipt: &'a TrustedReceiptObservation,
+    currentness: crate::FrameSessionLease,
 }
 
 impl<'a> ValidatedRawMarketFrame<'a> {
     pub(crate) const fn new(
         frame: &'a RawMarketFrame,
         receipt: &'a TrustedReceiptObservation,
+        currentness: crate::FrameSessionLease,
     ) -> Self {
-        Self { frame, receipt }
+        Self {
+            frame,
+            receipt,
+            currentness,
+        }
     }
 
     /// Returns the exact bounded frame after current-session validation.
@@ -216,6 +222,10 @@ impl<'a> ValidatedRawMarketFrame<'a> {
 
     pub(crate) const fn trusted_receipt(&self) -> &'a TrustedReceiptObservation {
         self.receipt
+    }
+
+    pub(crate) const fn currentness_lease(&self) -> &crate::FrameSessionLease {
+        &self.currentness
     }
 }
 

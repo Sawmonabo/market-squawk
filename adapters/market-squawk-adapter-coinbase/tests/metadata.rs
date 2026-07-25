@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use common::{TestResult, config, config_with_channels};
 use market_squawk_adapter_coinbase::{COINBASE_EXCHANGE_ENDPOINT, CoinbaseChannel};
 use market_squawk_domain::{ChecksumCapability, CoverageDelay, DataQuality, SequenceCapability};
+use market_squawk_sources::AuthorizationMode;
 
 #[test]
 fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> TestResult {
@@ -12,6 +13,10 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
     let metadata = config.metadata();
 
     assert_eq!(config.endpoint(), COINBASE_EXCHANGE_ENDPOINT);
+    assert_eq!(
+        metadata.authorization().mode(),
+        AuthorizationMode::PublicInterface
+    );
     assert_eq!(metadata.quality_ceiling(), DataQuality::DirectUnverified);
     assert!(metadata.coverage().topology().is_single_venue());
     assert!(!metadata.coverage().topology().is_consolidated());

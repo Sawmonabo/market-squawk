@@ -63,7 +63,7 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
             .into_text()?;
         assert_eq!(
             subscription,
-            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["level2","matches","heartbeat"]}"#
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["level2_batch","matches","heartbeat"]}"#
         );
         socket
             .send(Message::Text(

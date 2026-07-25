@@ -394,6 +394,8 @@ pub struct QueryParameterRule {
     max_value_bytes: u16,
     allow_multiple: bool,
     sensitivity: QuerySensitivity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exact_public_value: Option<SourceIdentifier>,
 }
 
 impl QueryParameterRule {
@@ -408,7 +410,45 @@ impl QueryParameterRule {
         allow_multiple: bool,
         sensitivity: QuerySensitivity,
     ) -> Result<Self, NetworkPolicyError> {
+        Self::try_new_inner(key, max_value_bytes, allow_multiple, sensitivity, None)
+    }
+
+    /// Constructs a single-valued public query rule that admits only one decoded value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects delimiters in the key or an exact value outside the bounded public identity
+    /// grammar.
+    pub fn try_new_exact_public(
+        key: SourceIdentifier,
+        exact_public_value: SourceIdentifier,
+    ) -> Result<Self, NetworkPolicyError> {
+        let max_value_bytes = u16::try_from(exact_public_value.as_str().len())
+            .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?;
+        Self::try_new_inner(
+            key,
+            max_value_bytes,
+            false,
+            QuerySensitivity::Public,
+            Some(exact_public_value),
+        )
+    }
+
+    fn try_new_inner(
+        key: SourceIdentifier,
+        max_value_bytes: u16,
+        allow_multiple: bool,
+        sensitivity: QuerySensitivity,
+        exact_public_value: Option<SourceIdentifier>,
+    ) -> Result<Self, NetworkPolicyError> {
         if max_value_bytes == 0 || max_value_bytes > 8_192 || key.as_str().contains(['&', '=']) {
+            return Err(NetworkPolicyError::InvalidRequestBounds);
+        }
+        if exact_public_value.as_ref().is_some_and(|value| {
+            sensitivity != QuerySensitivity::Public
+                || allow_multiple
+                || value.as_str().len() != usize::from(max_value_bytes)
+        }) {
             return Err(NetworkPolicyError::InvalidRequestBounds);
         }
         Ok(Self {
@@ -416,6 +456,7 @@ impl QueryParameterRule {
             max_value_bytes,
             allow_multiple,
             sensitivity,
+            exact_public_value,
         })
     }
 }
@@ -427,6 +468,8 @@ struct QueryParameterRuleWire {
     max_value_bytes: u16,
     allow_multiple: bool,
     sensitivity: QuerySensitivity,
+    #[serde(default)]
+    exact_public_value: Option<SourceIdentifier>,
 }
 
 impl<'de> Deserialize<'de> for QueryParameterRule {
@@ -435,11 +478,12 @@ impl<'de> Deserialize<'de> for QueryParameterRule {
         D: Deserializer<'de>,
     {
         let wire = QueryParameterRuleWire::deserialize(deserializer)?;
-        Self::try_new(
+        Self::try_new_inner(
             wire.key,
             wire.max_value_bytes,
             wire.allow_multiple,
             wire.sensitivity,
+            wire.exact_public_value,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -621,8 +665,25 @@ impl ApiEndpointRule {
                     reason: EndpointDenialReason::QueryBound,
                 });
             }
+            if rule
+                .exact_public_value
+                .as_ref()
+                .is_some_and(|expected| expected.as_str() != value.as_ref())
+            {
+                return Err(NetworkPolicyError::EndpointDenied {
+                    reason: EndpointDenialReason::QueryBound,
+                });
+            }
             contains_secret |= rule.sensitivity == QuerySensitivity::Secret;
             seen.push(key.into_owned());
+        }
+        if self.query_rules.as_slice().iter().any(|rule| {
+            rule.exact_public_value.is_some()
+                && !seen.iter().any(|seen_key| seen_key == rule.key.as_str())
+        }) {
+            return Err(NetworkPolicyError::EndpointDenied {
+                reason: EndpointDenialReason::QueryBound,
+            });
         }
         Ok(contains_secret)
     }
