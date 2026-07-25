@@ -25,8 +25,8 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
-    LiveSourceGeneration, NetworkPolicyError, ProviderBudgetPolicy, SourceError, SourceMetadata,
-    SourceMetadataError,
+    LiveSourceGeneration, NetworkPolicyError, ProviderBudgetPolicy, ProviderRateAuthority,
+    SourceError, SourceMetadata, SourceMetadataError,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::super::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
+use super::super::provider_rate::open_provider_rate_authority;
 use super::instruments::ProductionInstrumentSet;
 use super::kraken::{ProductionKrakenProfile, ProductionKrakenProfileError};
 use super::provider::{ProductionProviderError, ProductionSourceProfile, ProductionSourceProvider};
@@ -66,6 +67,7 @@ pub struct ProductionLiveSourceComposition {
     config: AppConfig,
     profile: ProductionSourceProfile,
     routes: Vec<LiveRouteConfig>,
+    provider_rate: ProviderRateAuthority,
 }
 
 impl ProductionLiveSourceComposition {
@@ -93,6 +95,17 @@ impl ProductionLiveSourceComposition {
         routes: Vec<LiveRouteConfig>,
         provider: ProductionSourceProvider,
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        let paths = LocalPaths::prepare(config.data_dir())?;
+        let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
+        Self::try_for_provider_with_rate_authority(config, routes, provider, provider_rate)
+    }
+
+    pub(crate) fn try_for_provider_with_rate_authority(
+        config: AppConfig,
+        routes: Vec<LiveRouteConfig>,
+        provider: ProductionSourceProvider,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
         let profile = match provider {
             ProductionSourceProvider::Coinbase => {
                 let source = config
@@ -116,6 +129,7 @@ impl ProductionLiveSourceComposition {
             config,
             profile,
             routes,
+            provider_rate,
         })
     }
 
@@ -305,7 +319,7 @@ impl ProductionLiveSourceComposition {
             .iter()
             .map(|route| route.route().clone())
             .collect();
-        let supervisor = match ProductionSourceSupervisor::try_new(
+        let supervisor = match ProductionSourceSupervisor::try_new_with_provider_rate(
             &self.config,
             self.profile,
             paths,
@@ -313,6 +327,7 @@ impl ProductionLiveSourceComposition {
             live.production_ingress(),
             routes,
             route_buffer_limits,
+            self.provider_rate,
         ) {
             Ok(supervisor) => supervisor,
             Err(source) => {
@@ -857,6 +872,10 @@ pub enum ProductionLiveSourceCompositionError {
     Provider(#[from] ProductionProviderError),
     #[error("production provider route identity is invalid")]
     RouteIdentity(#[from] IdentityError),
+    #[error(transparent)]
+    Paths(#[from] PathError),
+    #[error(transparent)]
+    ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
 }
 
 /// Production live-source startup or coordinated shutdown failure.

@@ -8,8 +8,10 @@ use std::{
 
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
 use market_squawk_sources::{
-    BudgetWindowSemantics, ProbeTransport, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderProfileRegistry, RatePolicyDescriptor,
+    BudgetDecision, BudgetPermit, BudgetUnavailableReason, BudgetWindowSemantics, ProbeTransport,
+    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderOnboardingProfile, ProviderProfileRegistry,
+    ProviderRateAuthority, ProviderRateDeclaration, RatePolicyDescriptor, SharedProviderBudget,
+    apply_http_retry_after,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +29,7 @@ struct ProbeRateScopeKey {
 #[derive(Debug)]
 pub(super) struct ProbeRateAuthority {
     policies: BTreeMap<SourceIdentifier, ProbeRateBinding>,
+    provider_rate: Option<ProviderRateAuthority>,
 }
 
 #[derive(Debug)]
@@ -60,9 +63,20 @@ struct ProbeRateWindowState {
 
 #[derive(Debug)]
 pub(super) struct ProbeRatePermit {
-    scope: Arc<ProbeRateScope>,
-    _concurrency: OwnedSemaphorePermit,
+    authority: ProbeRatePermitAuthority,
     pub(super) deadline: Instant,
+}
+
+#[derive(Debug)]
+enum ProbeRatePermitAuthority {
+    Legacy {
+        scope: Arc<ProbeRateScope>,
+        _concurrency: OwnedSemaphorePermit,
+    },
+    Aggregate {
+        budget: SharedProviderBudget,
+        _permit: BudgetPermit,
+    },
 }
 
 impl ProbeRateAuthority {
@@ -123,12 +137,26 @@ impl ProbeRateAuthority {
                 return Err(ProviderOnboardingError::InvalidProfile);
             }
         }
-        Ok(Self { policies })
+        Ok(Self {
+            policies,
+            provider_rate: None,
+        })
+    }
+
+    pub(super) fn try_new_with_provider_rate(
+        profiles: &ProviderProfileRegistry,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProviderOnboardingError> {
+        let mut authority = Self::try_new(profiles)?;
+        authority.provider_rate = Some(provider_rate);
+        Ok(authority)
     }
 
     pub(super) async fn acquire(
         &self,
+        profile: &ProviderOnboardingProfile,
         descriptor: &RatePolicyDescriptor,
+        authorization_subject: Option<&SourceIdentifier>,
         cancellation: CancellationToken,
     ) -> Result<ProbeRatePermit, ProviderOnboardingError> {
         let binding = self
@@ -137,6 +165,30 @@ impl ProbeRateAuthority {
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
         if binding.descriptor != *descriptor {
             return Err(ProviderOnboardingError::InvalidProfile);
+        }
+        if let Some(provider_rate) = &self.provider_rate {
+            let policy = descriptor
+                .enforcement_policy()
+                .cloned()
+                .ok_or(ProviderOnboardingError::InvalidProfile)?;
+            let declaration = match policy.scope().authorization_account() {
+                Some(_) => ProviderRateDeclaration::try_for_authorization_subject(
+                    policy,
+                    authorization_subject.ok_or(ProviderOnboardingError::InvalidProfile)?,
+                ),
+                None => ProviderRateDeclaration::try_for_endpoint(
+                    policy,
+                    profile
+                        .probe()
+                        .endpoint_policy()
+                        .ok_or(ProviderOnboardingError::InvalidProfile)?,
+                ),
+            }
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+            let budget = provider_rate
+                .register_budget(declaration)
+                .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+            return acquire_aggregate_budget(budget, cancellation).await;
         }
         binding.scope.acquire(cancellation).await
     }
@@ -226,8 +278,10 @@ impl ProbeRateScope {
             }
             state.admit(now)?;
             return Ok(ProbeRatePermit {
-                scope: Arc::clone(self),
-                _concurrency: permit,
+                authority: ProbeRatePermitAuthority::Legacy {
+                    scope: Arc::clone(self),
+                    _concurrency: permit,
+                },
                 deadline,
             });
         }
@@ -309,25 +363,104 @@ impl ProbeRatePermit {
         &self,
         retry_after: Option<&[u8]>,
     ) -> Result<(), ProviderOnboardingError> {
-        if !self.scope.refresh_on_http_429 {
-            return Err(ProviderOnboardingError::InvalidProfile);
+        match &self.authority {
+            ProbeRatePermitAuthority::Legacy { scope, .. } => {
+                if !scope.refresh_on_http_429 {
+                    return Err(ProviderOnboardingError::InvalidProfile);
+                }
+                let maximum = Duration::from_nanos(scope.policy.backoff().maximum_nanos());
+                let delay = retry_after
+                    .and_then(parse_retry_after_seconds)
+                    .map(Duration::from_secs)
+                    .filter(|delay| !delay.is_zero())
+                    .map_or(maximum, |delay| delay.min(maximum));
+                let cooldown = Instant::now()
+                    .checked_add(delay)
+                    .ok_or(ProviderOnboardingError::Clock)?;
+                let mut state = scope.state.lock().await;
+                state.cooldown_until = Some(
+                    state
+                        .cooldown_until
+                        .map_or(cooldown, |current| current.max(cooldown)),
+                );
+                Ok(())
+            }
+            ProbeRatePermitAuthority::Aggregate { budget, .. } => {
+                match apply_http_retry_after(budget, retry_after, 0) {
+                    BudgetDecision::WaitUntil(_) => Ok(()),
+                    BudgetDecision::Unavailable(
+                        BudgetUnavailableReason::RetryAfterExceedsPolicy,
+                    ) => Ok(()),
+                    BudgetDecision::Unavailable(_) | BudgetDecision::Ready(_) => {
+                        Err(ProviderOnboardingError::ProbeRateLimited)
+                    }
+                }
+            }
         }
-        let maximum = Duration::from_nanos(self.scope.policy.backoff().maximum_nanos());
-        let delay = retry_after
-            .and_then(parse_retry_after_seconds)
-            .map(Duration::from_secs)
-            .filter(|delay| !delay.is_zero())
-            .map_or(maximum, |delay| delay.min(maximum));
-        let cooldown = Instant::now()
-            .checked_add(delay)
-            .ok_or(ProviderOnboardingError::Clock)?;
-        let mut state = self.scope.state.lock().await;
-        state.cooldown_until = Some(
-            state
-                .cooldown_until
-                .map_or(cooldown, |current| current.max(cooldown)),
-        );
-        Ok(())
+    }
+
+    pub(super) fn record_success(&self) -> Result<(), ProviderOnboardingError> {
+        match &self.authority {
+            ProbeRatePermitAuthority::Legacy { .. } => Ok(()),
+            ProbeRatePermitAuthority::Aggregate { budget, .. } => budget
+                .record_success()
+                .map_err(|_| ProviderOnboardingError::ProbeRateLimited),
+        }
+    }
+}
+
+async fn acquire_aggregate_budget(
+    budget: SharedProviderBudget,
+    cancellation: CancellationToken,
+) -> Result<ProbeRatePermit, ProviderOnboardingError> {
+    const CONCURRENCY_RECHECK: Duration = Duration::from_millis(25);
+
+    let deadline = Instant::now()
+        .checked_add(PROBE_OPERATION_DURATION)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    loop {
+        match budget.try_acquire() {
+            BudgetDecision::Ready(permit) => {
+                return Ok(ProbeRatePermit {
+                    authority: ProbeRatePermitAuthority::Aggregate {
+                        budget,
+                        _permit: permit,
+                    },
+                    deadline,
+                });
+            }
+            BudgetDecision::WaitUntil(blocked_until) => {
+                let wait = budget
+                    .remaining_wait(blocked_until)
+                    .map_err(|_| ProviderOnboardingError::ProbeRateLimited)?;
+                wait_for_aggregate_rate(wait, deadline, &cancellation).await?;
+            }
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted) => {
+                wait_for_aggregate_rate(CONCURRENCY_RECHECK, deadline, &cancellation).await?;
+            }
+            BudgetDecision::Unavailable(_) => {
+                return Err(ProviderOnboardingError::ProbeRateLimited);
+            }
+        }
+    }
+}
+
+async fn wait_for_aggregate_rate(
+    wait: Duration,
+    operation_deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ProviderOnboardingError> {
+    let now = Instant::now();
+    let wake = now
+        .checked_add(wait)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    if now >= operation_deadline || wake >= operation_deadline {
+        return Err(ProviderOnboardingError::ProbeRateLimited);
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ProviderOnboardingError::OperationCancelled),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => Ok(()),
     }
 }
 

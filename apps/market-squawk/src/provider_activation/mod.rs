@@ -26,7 +26,9 @@ use crate::{
     ProductionLiveSourceComposition, ProductionSourceProvider, ProviderActivationLease,
     ProviderOnboardingError, ProviderOnboardingService,
 };
-use market_squawk_sources::DataUseOperation;
+use market_squawk_sources::{
+    AuthorizationMode, DataUseOperation, ProviderRateAuthority, SourceMetadata,
+};
 
 pub use specs::{
     BlsAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
@@ -50,6 +52,7 @@ pub struct ProviderAdapterActivation {
     onboarding: Arc<ProviderOnboardingService>,
     research: Arc<ProductionResearchIngestCoordinator>,
     app_config: AppConfig,
+    provider_rate: ProviderRateAuthority,
 }
 
 impl ProviderAdapterActivation {
@@ -59,11 +62,13 @@ impl ProviderAdapterActivation {
         onboarding: Arc<ProviderOnboardingService>,
         research: Arc<ProductionResearchIngestCoordinator>,
         app_config: AppConfig,
+        provider_rate: ProviderRateAuthority,
     ) -> Self {
         Self {
             onboarding,
             research,
             app_config,
+            provider_rate,
         }
     }
 
@@ -182,6 +187,7 @@ impl ProviderAdapterActivation {
         }
         let lease = self.onboarding.activation_lease(session_id)?;
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
+        self.bind_authorization_subject(&lease, candidate.metadata())?;
         let prepared = match request {
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
@@ -318,10 +324,11 @@ impl ProviderAdapterActivation {
             KRAKEN_SURFACE => ProductionSourceProvider::Kraken,
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
-        let composition = ProductionLiveSourceComposition::try_for_provider(
+        let composition = ProductionLiveSourceComposition::try_for_provider_with_rate_authority(
             self.app_config.clone(),
             routes,
             provider,
+            self.provider_rate.clone(),
         )?;
         Ok(LiveProviderActivation { lease, composition })
     }
@@ -498,6 +505,7 @@ impl ProviderAdapterActivation {
     {
         let profile = lease.surface_id().clone();
         let generation = runtime_generation(&lease, source.metadata().clone(), rights.clone())?;
+        self.bind_authorization_subject(&lease, generation.metadata())?;
         self.research
             .register_provider_source(generation.clone(), source, rights)?;
         Ok(ActivatedResearchProvider {
@@ -505,6 +513,26 @@ impl ProviderAdapterActivation {
             profile,
             generation,
         })
+    }
+
+    fn bind_authorization_subject(
+        &self,
+        lease: &ProviderActivationLease,
+        metadata: &SourceMetadata,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        let authorization = metadata.authorization();
+        match authorization.mode() {
+            AuthorizationMode::UserAuthorized | AuthorizationMode::Licensed => {
+                let subject = authorization_subject(lease)?;
+                self.provider_rate.bind_authorization_subject(
+                    authorization.mode(),
+                    authorization.evidence().content_digest(),
+                    &subject,
+                )?;
+            }
+            AuthorizationMode::PublicInterface | AuthorizationMode::UserOwnedLocal => {}
+        }
+        Ok(())
     }
 }
 
@@ -640,6 +668,13 @@ fn require_surface(
     }
 }
 
+fn authorization_subject(
+    lease: &ProviderActivationLease,
+) -> Result<SourceIdentifier, ProviderAdapterActivationError> {
+    SourceIdentifier::try_from(format!("provider-session-{}", lease.session_id().simple()))
+        .map_err(|_| ProviderAdapterActivationError::SourceBinding)
+}
+
 fn provider_research_rights(
     lease: &ProviderActivationLease,
     source_id: &SourceId,
@@ -677,6 +712,7 @@ fn runtime_generation(
         lease.capability_digest(),
         lease.generation(),
         lease.secret_reference().cloned(),
+        lease.authority_effective_at(),
         metadata,
         rights,
     )

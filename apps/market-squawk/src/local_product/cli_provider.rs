@@ -612,9 +612,11 @@ fn build_research_activation(
     evidence: &LoadedActivationEvidence,
 ) -> Result<ProviderAdapterActivationRequest, CliProviderActivationError> {
     let activation_evidence = activation_evidence(request_bytes, lease);
-    let metadata_effective =
-        EffectiveInterval::new(lease.issued_at(), lease.verification_expires_at())
-            .map_err(|_| CliProviderActivationError::InvalidRights)?;
+    let metadata_effective = EffectiveInterval::new(
+        lease.authority_effective_at(),
+        lease.verification_expires_at(),
+    )
+    .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let activation = match request.provider {
         ProviderRequest::Sec => {
             let metadata = metadata(
@@ -760,6 +762,7 @@ fn activation_result(profile: &SourceIdentifier, lease: &ProviderActivationLease
         "verificationExpiresAtUnixNanos": lease
             .verification_expires_at()
             .map(Timestamp::unix_nanos),
+        "authorityEffectiveAtUnixNanos": lease.authority_effective_at().unix_nanos(),
         "issuedAtUnixNanos": lease.issued_at().unix_nanos(),
     })
 }
@@ -1211,14 +1214,10 @@ fn update_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
 }
 
 fn source_id(
-    provider: &str,
-    evidence: EvidenceDigest,
+    source_tag: &str,
+    surface: &SourceIdentifier,
 ) -> Result<SourceId, CliProviderActivationError> {
-    let digest = lower_hex(&evidence.bytes());
-    let short = digest
-        .get(..24)
-        .ok_or(CliProviderActivationError::InvalidRequest)?;
-    SourceId::try_from(format!("{provider}-{short}"))
+    SourceId::try_from(format!("{source_tag}-{}", surface.as_str()))
         .map_err(|_| CliProviderActivationError::InvalidRequest)
 }
 
@@ -1239,7 +1238,7 @@ fn metadata(
     network: EndpointPolicy,
     budget: ProviderBudgetPolicy,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
-    let source_id = source_id(source_tag, evidence)?;
+    let source_id = source_id(source_tag, lease.surface_id())?;
     let digest = lower_hex(&evidence.bytes());
     let short = digest
         .get(..24)

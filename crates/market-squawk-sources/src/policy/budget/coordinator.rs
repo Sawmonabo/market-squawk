@@ -25,13 +25,22 @@ impl BudgetAvailabilityLease {
                 .durability
                 .as_ref()
                 .is_none_or(|binding| binding.session.is_available())
-            && self.allocation.availability_generation.load(Ordering::Acquire) == self.generation
+            && self
+                .allocation
+                .availability_generation
+                .load(Ordering::Acquire)
+                == self.generation
             && !self.allocation.state.is_poisoned()
             && !self.allocation.terminal.load(Ordering::Acquire)
     }
 
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        let state_dynamic = self.allocation.state.lock().ok()?.dynamic_retained_bytes()?;
+        let state_dynamic = self
+            .allocation
+            .state
+            .lock()
+            .ok()?
+            .dynamic_retained_bytes()?;
         std::mem::size_of::<BudgetAllocation>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 BudgetAllocation,
@@ -43,9 +52,7 @@ impl BudgetAvailabilityLease {
                     .and_then(|dynamic| bytes.checked_add(dynamic))
             })
             .and_then(|bytes| bytes.checked_add(state_dynamic))
-            .and_then(|bytes| {
-                bytes.checked_add(self.allocation.clock.shared_allocation_charge())
-            })
+            .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
     }
 }
 
@@ -60,19 +67,13 @@ impl SharedProviderBudget {
         let observation = match self.allocation.clock.observation() {
             Ok(observation) => observation,
             Err(_reason) => {
-                return self.terminal_fail(
-                    BudgetUnavailableReason::ClockUnavailable,
-                    &operation,
-                );
+                return self.terminal_fail(BudgetUnavailableReason::ClockUnavailable, &operation);
             }
         };
         let mut state = match self.allocation.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                return self.terminal_fail(
-                    BudgetUnavailableReason::StatePoisoned,
-                    &operation,
-                );
+                return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
             }
         };
         if state.disabled {
@@ -95,12 +96,9 @@ impl SharedProviderBudget {
             );
         }
         state.unavailable_until = None;
-        let availability = evaluate_budget_windows(
-            self.policy(),
-            &mut state,
-            observation.monotonic,
-        )
-        .map_err(|reason| self.terminal_fault(reason, &operation))?;
+        let availability =
+            evaluate_budget_windows(self.policy(), &mut state, observation.monotonic)
+                .map_err(|reason| self.terminal_fault(reason, &operation))?;
         if availability.blocker.is_some() {
             return self.revoke_persist_and_fail(
                 &state,
@@ -110,10 +108,7 @@ impl SharedProviderBudget {
             );
         }
         if state.in_flight > self.policy().max_concurrent() {
-            return self.terminal_fail(
-                BudgetUnavailableReason::StateCorrupt,
-                &operation,
-            );
+            return self.terminal_fail(BudgetUnavailableReason::StateCorrupt, &operation);
         }
         if state.in_flight == self.policy().max_concurrent() {
             return self.revoke_persist_and_fail(
@@ -136,10 +131,7 @@ impl SharedProviderBudget {
         if lease.is_available() {
             Ok(lease)
         } else if !self.durability_is_available() {
-            self.terminal_fail(
-                BudgetUnavailableReason::PersistenceUnavailable,
-                &operation,
-            )
+            self.terminal_fail(BudgetUnavailableReason::PersistenceUnavailable, &operation)
         } else if self.allocation.terminal.load(Ordering::Acquire) {
             Err(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         } else {
@@ -150,9 +142,9 @@ impl SharedProviderBudget {
 
 #[path = "coordinator/durability.rs"]
 mod durability;
-pub use durability::{BudgetPermit, BudgetPoolError};
 pub(in crate::policy) use durability::CleanShutdownProof;
 pub(crate) use durability::ProviderBudgetPool;
+pub use durability::{BudgetPermit, BudgetPoolError};
 
 pub(super) trait BudgetClock: Send + Sync {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason>;
@@ -161,12 +153,12 @@ pub(super) trait BudgetClock: Send + Sync {
 }
 
 #[derive(Debug)]
-struct SystemBudgetClock {
+pub(in crate::policy) struct SystemBudgetClock {
     origin: Instant,
 }
 
 impl SystemBudgetClock {
-    fn new() -> Self {
+    pub(in crate::policy) fn new() -> Self {
         Self {
             origin: Instant::now(),
         }

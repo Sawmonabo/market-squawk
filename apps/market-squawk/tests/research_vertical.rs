@@ -196,6 +196,7 @@ async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_re
         capability_digest,
         Some(generation_one),
         Some(reference_one),
+        Timestamp::from_unix_nanos(0),
         metadata.clone(),
         rights.clone(),
     )?;
@@ -213,6 +214,7 @@ async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_re
         capability_digest,
         Some(generation_two),
         Some(reference_two),
+        Timestamp::from_unix_nanos(0),
         metadata,
         rights.clone(),
     )?;

@@ -7,13 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 
 use super::{LocalSecretStoreError, SecretKey};
 
 const SECRET_REFERENCE_VERSION: u16 = 1;
+const SECRET_MUTATION_PLAN_VERSION: u16 = 1;
 const MAX_OPERATION_OWNER_BYTES: usize = 128;
 const MAX_RETRY_BUDGET: u8 = 8;
 const OPAQUE_LOCATOR_BYTES: usize = 64;
+const SECRET_PLAN_KEY_DOMAIN: &[u8] = b"market-squawk-secret-plan-key-v1\0";
 
 /// Concrete local backend named by an opaque secret reference.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -135,6 +139,264 @@ impl From<SecretRef> for SecretRefWire {
             generation: reference.generation,
         }
     }
+}
+
+/// Exact local mutation described by a durable non-secret plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SecretMutationKind {
+    /// Creates a generation without replacing an existing generation.
+    Create,
+    /// Retains an exact current generation while preparing its successor.
+    Replace {
+        /// Exact generation that must remain present while the candidate is prepared.
+        current: SecretRef,
+    },
+}
+
+/// Durable non-secret identity for one exact secret mutation.
+///
+/// A plan freezes backend selection before credential bytes can be written. Its key binding is a
+/// domain-separated digest and its debug representation does not expose that digest or the opaque
+/// locator.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SecretMutationPlanWire", into = "SecretMutationPlanWire")]
+pub struct SecretMutationPlan {
+    kind: SecretMutationKind,
+    key_binding: [u8; 32],
+    target: SecretRef,
+}
+
+impl SecretMutationPlan {
+    pub(super) fn create(
+        key: &SecretKey,
+        backend: SecretBackend,
+        generation: SecretGeneration,
+    ) -> Result<Self, LocalSecretStoreError> {
+        Self::try_new(
+            key,
+            SecretMutationKind::Create,
+            SecretRef::from_key(key, backend, generation)?,
+        )
+    }
+
+    pub(super) fn replace(
+        key: &SecretKey,
+        current: SecretRef,
+        candidate_generation: SecretGeneration,
+    ) -> Result<Self, LocalSecretStoreError> {
+        let target = SecretRef::from_key(key, current.backend(), candidate_generation)?;
+        Self::try_new(key, SecretMutationKind::Replace { current }, target)
+    }
+
+    fn try_new(
+        key: &SecretKey,
+        kind: SecretMutationKind,
+        target: SecretRef,
+    ) -> Result<Self, LocalSecretStoreError> {
+        let plan = Self {
+            kind,
+            key_binding: secret_key_binding(key)?,
+            target,
+        };
+        plan.validate_for(key)?;
+        Ok(plan)
+    }
+
+    /// Returns the exact mutation class.
+    pub const fn kind(&self) -> &SecretMutationKind {
+        &self.kind
+    }
+
+    /// Returns the exact backend, opaque locator, and generation selected before mutation.
+    pub const fn target(&self) -> &SecretRef {
+        &self.target
+    }
+
+    pub(super) fn validate_for(&self, key: &SecretKey) -> Result<(), LocalSecretStoreError> {
+        if self.key_binding != secret_key_binding(key)?
+            || self.target
+                != SecretRef::from_key(key, self.target.backend(), self.target.generation())?
+        {
+            return Err(LocalSecretStoreError::InvalidReference);
+        }
+        match &self.kind {
+            SecretMutationKind::Create => Ok(()),
+            SecretMutationKind::Replace { current } => {
+                if current.backend() != self.target.backend()
+                    || current.generation() >= self.target.generation()
+                    || *current
+                        != SecretRef::from_key(key, current.backend(), current.generation())?
+                {
+                    Err(LocalSecretStoreError::Conflict)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for SecretMutationPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretMutationPlan")
+            .field("kind", &self.kind)
+            .field("key_binding", &"[BOUND]")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecretMutationPlanWire {
+    version: u16,
+    kind: SecretMutationKind,
+    key_binding: [u8; 32],
+    target: SecretRef,
+}
+
+impl TryFrom<SecretMutationPlanWire> for SecretMutationPlan {
+    type Error = LocalSecretStoreError;
+
+    fn try_from(wire: SecretMutationPlanWire) -> Result<Self, Self::Error> {
+        if wire.version != SECRET_MUTATION_PLAN_VERSION || wire.key_binding == [0; 32] {
+            return Err(LocalSecretStoreError::InvalidReference);
+        }
+        match &wire.kind {
+            SecretMutationKind::Create => {}
+            SecretMutationKind::Replace { current } => {
+                if current.backend() != wire.target.backend()
+                    || current.generation() >= wire.target.generation()
+                {
+                    return Err(LocalSecretStoreError::InvalidReference);
+                }
+            }
+        }
+        Ok(Self {
+            kind: wire.kind,
+            key_binding: wire.key_binding,
+            target: wire.target,
+        })
+    }
+}
+
+impl From<SecretMutationPlan> for SecretMutationPlanWire {
+    fn from(plan: SecretMutationPlan) -> Self {
+        Self {
+            version: SECRET_MUTATION_PLAN_VERSION,
+            kind: plan.kind,
+            key_binding: plan.key_binding,
+            target: plan.target,
+        }
+    }
+}
+
+/// Whether a failed planned mutation is known to have had no effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretMutationEffect {
+    /// The backend was not mutated.
+    NoEffect,
+    /// The exact target may have been mutated and must be reconciled.
+    MayHaveApplied,
+}
+
+/// Successful exact planned-store disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretMutationDisposition {
+    /// The exact target was written and verified.
+    Stored,
+    /// The exact target already contained the submitted value.
+    AlreadyMatches,
+}
+
+/// Non-secret observation used to reconcile an interrupted planned mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretReconciliationObservation {
+    /// The exact target is absent.
+    Absent,
+    /// The exact target exists but no submitted value was available for comparison.
+    PresentUnverified,
+    /// The exact target exists and matches the resubmitted value.
+    Matches,
+    /// The exact target exists but differs from the resubmitted value.
+    Mismatch,
+}
+
+/// Successful exact planned-deletion disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretDeletionDisposition {
+    /// The exact target was deleted.
+    Deleted,
+    /// The exact target was already absent.
+    AlreadyAbsent,
+}
+
+/// Planned mutation failure with explicit external-effect classification.
+#[derive(Debug, Error)]
+#[error("planned secret mutation failed")]
+pub struct SecretMutationFailure {
+    effect: SecretMutationEffect,
+    #[source]
+    error: LocalSecretStoreError,
+}
+
+impl SecretMutationFailure {
+    pub(super) const fn no_effect(error: LocalSecretStoreError) -> Self {
+        Self {
+            effect: SecretMutationEffect::NoEffect,
+            error,
+        }
+    }
+
+    pub(super) const fn may_have_applied(error: LocalSecretStoreError) -> Self {
+        Self {
+            effect: SecretMutationEffect::MayHaveApplied,
+            error,
+        }
+    }
+
+    pub(super) const fn from_store_error(error: LocalSecretStoreError) -> Self {
+        if matches!(
+            error,
+            LocalSecretStoreError::IndeterminateCompletion
+                | LocalSecretStoreError::CleanupRequired
+                | LocalSecretStoreError::PublicationFailed
+                | LocalSecretStoreError::RotationRecoveryRequired
+                | LocalSecretStoreError::RotationFinalizationPending
+                | LocalSecretStoreError::AuthorityRecoveryRequired
+                | LocalSecretStoreError::AuthorityFinalizationPending
+        ) {
+            Self::may_have_applied(error)
+        } else {
+            Self::no_effect(error)
+        }
+    }
+
+    /// Returns whether exact reconciliation is required.
+    pub const fn effect(&self) -> SecretMutationEffect {
+        self.effect
+    }
+
+    /// Returns the redacted backend error.
+    pub const fn error(&self) -> &LocalSecretStoreError {
+        &self.error
+    }
+
+    /// Consumes the classification and returns the redacted backend error.
+    pub fn into_error(self) -> LocalSecretStoreError {
+        self.error
+    }
+}
+
+fn secret_key_binding(key: &SecretKey) -> Result<[u8; 32], LocalSecretStoreError> {
+    let token = key.token()?;
+    let mut hasher = Sha256::new();
+    hasher.update(SECRET_PLAN_KEY_DOMAIN);
+    hasher.update((token.len() as u64).to_be_bytes());
+    hasher.update(token.as_bytes());
+    Ok(hasher.finalize().into())
 }
 
 /// Whether the caller permits an operating-system interaction prompt.

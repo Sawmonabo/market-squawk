@@ -21,6 +21,7 @@ pub mod paper_bot;
 pub mod portfolio_application;
 pub mod provider_activation;
 pub mod provider_onboarding;
+mod provider_rate;
 pub mod quality;
 pub mod replay;
 pub mod research_service;

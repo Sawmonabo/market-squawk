@@ -60,6 +60,7 @@ struct ProductionPaperRecovery {
     quarantined: bool,
 }
 
+pub(crate) use defaults::local_paper_bot_with_provider_rate;
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
 #[cfg(test)]
 pub(crate) use defaults::{

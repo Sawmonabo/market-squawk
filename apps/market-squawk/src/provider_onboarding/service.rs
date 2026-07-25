@@ -18,18 +18,18 @@ use market_squawk_data::{
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
-    SecretCancellation, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
+    SecretCancellation, SecretDeletionDisposition, SecretInteractionPolicy, SecretKey,
+    SecretMutationEffect, SecretOperationControl, SecretReconciliationObservation, SecretStore,
     SecretValue,
 };
 use market_squawk_sources::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
     CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
     ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
-    ProviderProfileRegistry, ProviderPublicConfiguration, built_in_provider_profiles,
-    install_ring_tls_provider,
+    ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
+    SecretStoreClearOutcome, built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
@@ -134,6 +134,34 @@ impl ProviderOnboardingService {
     where
         S: SecretStore + 'static,
     {
+        Self::try_new_inner(catalog, secrets, None)
+    }
+
+    /// Constructs the production service with one product-wide durable provider-rate authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when profiles, TLS, durable rate admission, or startup reconciliation cannot
+    /// be established.
+    pub fn try_new_with_provider_rate<S>(
+        catalog: OnboardingCatalogCapability,
+        secrets: Arc<S>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProviderOnboardingError>
+    where
+        S: SecretStore + 'static,
+    {
+        Self::try_new_inner(catalog, secrets, Some(provider_rate))
+    }
+
+    fn try_new_inner<S>(
+        catalog: OnboardingCatalogCapability,
+        secrets: Arc<S>,
+        provider_rate: Option<ProviderRateAuthority>,
+    ) -> Result<Self, ProviderOnboardingError>
+    where
+        S: SecretStore + 'static,
+    {
         let _tls = install_ring_tls_provider()?;
         let client = reqwest::Client::builder()
             .https_only(true)
@@ -154,7 +182,12 @@ impl ProviderOnboardingService {
             .build()
             .map_err(|_| ProviderOnboardingError::ClientConfiguration)?;
         let profiles = built_in_provider_profiles()?;
-        let probe_rates = ProbeRateAuthority::try_new(&profiles)?;
+        let probe_rates = match provider_rate {
+            Some(provider_rate) => {
+                ProbeRateAuthority::try_new_with_provider_rate(&profiles, provider_rate)?
+            }
+            None => ProbeRateAuthority::try_new(&profiles)?,
+        };
         let service = Self {
             profiles,
             catalog,
@@ -352,13 +385,16 @@ impl ProviderOnboardingService {
         secret: SecretValue,
         cancellation: SecretCancellation,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let mut resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let profile = self.current_profile_for(&resumed)?;
-        let replacing = resumed.lifecycle().active_generation().is_some();
         if profile.release_state() == ProfileReleaseState::RightsBlocked
             || !matches!(
                 resumed.lifecycle().state(),
-                OnboardingState::UserActionRequired | OnboardingState::RotationPending
+                OnboardingState::UserActionRequired
+                    | OnboardingState::CredentialImportedUnverified
+                    | OnboardingState::RotationPending
+                    | OnboardingState::SecretReconciliationRequired
+                    | OnboardingState::CleanupRequired
             )
         {
             return Err(ProviderOnboardingError::SecretImportUnavailable);
@@ -368,18 +404,6 @@ impl ProviderOnboardingService {
             .lifecycle()
             .candidate_generation()
             .ok_or(ProviderOnboardingError::InvalidSessionState)?;
-        let reservation = resumed.reservation().clone();
-        let mut sequence = resumed.next_sequence();
-        self.append(
-            &reservation,
-            sequence,
-            OnboardingEvent::CredentialImported {
-                generation,
-                evidence_digest: event_digest(b"credential-imported", session_id, Some(generation)),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
-
         let secret_key = SecretKey::try_new(
             "provider-onboarding",
             &format!("{}.{}", profile.id(), session_id.simple()),
@@ -394,131 +418,150 @@ impl ProviderOnboardingService {
             SecretInteractionPolicy::AllowPlatformPrompt,
             cancellation,
         )?;
-        let expected = SecretValue::new(secret.expose_secret().to_owned())
-            .map_err(|_| ProviderOnboardingError::InvalidSecretShape)?;
-        let stored = if let Some(active_generation) = resumed.lifecycle().active_generation() {
+        if let Some(plan) = resumed
+            .lifecycle()
+            .generation_store_plan(generation)
+            .cloned()
+        {
+            match self
+                .secrets
+                .matches_planned(&secret_key, &plan, &secret, &control)?
+            {
+                SecretReconciliationObservation::Matches => {
+                    self.append(
+                        resumed.reservation(),
+                        resumed.next_sequence(),
+                        OnboardingEvent::CredentialStored {
+                            reference: plan.target().clone(),
+                        },
+                    )?;
+                    return self.resume(session_id);
+                }
+                SecretReconciliationObservation::Absent => {
+                    self.append(
+                        resumed.reservation(),
+                        resumed.next_sequence(),
+                        OnboardingEvent::SecretStoreCleared {
+                            generation,
+                            reference: plan.target().clone(),
+                            outcome: SecretStoreClearOutcome::Absent,
+                        },
+                    )?;
+                }
+                SecretReconciliationObservation::Mismatch
+                | SecretReconciliationObservation::PresentUnverified => {
+                    let deletion = self.secrets.delete_planned(&secret_key, &plan, &control);
+                    match deletion {
+                        Ok(disposition) => {
+                            self.append(
+                                resumed.reservation(),
+                                resumed.next_sequence(),
+                                OnboardingEvent::SecretStoreCleared {
+                                    generation,
+                                    reference: plan.target().clone(),
+                                    outcome: match disposition {
+                                        SecretDeletionDisposition::Deleted => {
+                                            SecretStoreClearOutcome::Deleted
+                                        }
+                                        SecretDeletionDisposition::AlreadyAbsent => {
+                                            SecretStoreClearOutcome::Absent
+                                        }
+                                    },
+                                },
+                            )?;
+                        }
+                        Err(failure) => {
+                            let error = failure.into_error();
+                            self.append(
+                                resumed.reservation(),
+                                resumed.next_sequence(),
+                                OnboardingEvent::CleanupRequired {
+                                    generation: Some(generation),
+                                    evidence_digest: event_digest(
+                                        b"planned-secret-delete-indeterminate",
+                                        session_id,
+                                        Some(generation),
+                                    ),
+                                },
+                            )?;
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+            resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        }
+        if resumed.lifecycle().generation_state(generation)
+            != Some(CredentialGenerationState::Reserved)
+        {
+            return Err(ProviderOnboardingError::SecretImportUnavailable);
+        }
+        let plan = if let Some(active_generation) = resumed.lifecycle().active_generation() {
             let current = resumed
                 .lifecycle()
                 .generation_reference(active_generation)
                 .ok_or(ProviderOnboardingError::InvalidSessionState)?;
             self.secrets
-                .replace(&secret_key, current, generation, secret, &control)
+                .plan_replace(&secret_key, current, generation, &control)?
         } else {
             self.secrets
-                .create(&secret_key, generation, secret, &control)
+                .plan_create(&secret_key, generation, &control)?
         };
-        let reference = match stored {
-            Ok(reference) => reference,
-            Err(LocalSecretStoreError::IndeterminateCompletion) => {
+        self.append(
+            resumed.reservation(),
+            resumed.next_sequence(),
+            OnboardingEvent::SecretStorePlanned {
+                plan: plan.clone(),
+                evidence_digest: event_digest(
+                    b"secret-store-planned",
+                    session_id,
+                    Some(generation),
+                ),
+            },
+        )?;
+        let stored = self
+            .secrets
+            .execute_planned(&secret_key, &plan, secret, &control);
+        match stored {
+            Ok(_disposition) => {
+                let resumed = self.catalog.resume_provider_onboarding(session_id)?;
                 self.append(
-                    &reservation,
-                    sequence,
-                    OnboardingEvent::CleanupRequired {
-                        generation: Some(generation),
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::CredentialStored {
+                        reference: plan.target().clone(),
+                    },
+                )?;
+                self.resume(session_id)
+            }
+            Err(failure) => {
+                let effect = failure.effect();
+                let error = failure.into_error();
+                let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+                let event = if effect == SecretMutationEffect::MayHaveApplied
+                    || !matches!(
+                        self.secrets.inspect_planned(&secret_key, &plan, &control),
+                        Ok(SecretReconciliationObservation::Absent)
+                    ) {
+                    OnboardingEvent::SecretStoreReconciliationRequired {
+                        generation,
                         evidence_digest: event_digest(
-                            b"secret-store-indeterminate",
+                            b"secret-store-reconciliation-required",
                             session_id,
                             Some(generation),
                         ),
-                    },
-                )?;
-                return self.resume(session_id);
-            }
-            Err(error) => {
-                if !replacing {
-                    self.append(
-                        &reservation,
-                        sequence,
-                        OnboardingEvent::Cancelled {
-                            evidence_digest: event_digest(
-                                b"secret-store-rejected",
-                                session_id,
-                                Some(generation),
-                            ),
-                        },
-                    )?;
-                }
-                return Err(error.into());
-            }
-        };
-        let readback_matches =
-            self.secrets
-                .read(&reference, &control)
-                .ok()
-                .is_some_and(|readback| {
-                    let left = readback.expose_secret().as_bytes();
-                    let right = expected.expose_secret().as_bytes();
-                    left.len() == right.len() && bool::from(left.ct_eq(right))
-                });
-        if !readback_matches {
-            let deleted = self.secrets.delete(&reference, &control).is_ok();
-            let cleanup_event = if deleted && !replacing {
-                OnboardingEvent::Cancelled {
-                    evidence_digest: event_digest(
-                        b"secret-readback-failed-clean",
-                        session_id,
-                        Some(generation),
-                    ),
-                }
-            } else {
-                OnboardingEvent::CleanupRequired {
-                    generation: Some(generation),
-                    evidence_digest: event_digest(
-                        b"secret-readback-failed-cleanup",
-                        session_id,
-                        Some(generation),
-                    ),
-                }
-            };
-            self.append(&reservation, sequence, cleanup_event)?;
-            return Err(ProviderOnboardingError::SecretVerificationFailed);
-        }
-        let stored_event = OnboardingEvent::CredentialStored {
-            reference: reference.clone(),
-        };
-        if let Err(catalog_error) = self.append(&reservation, sequence, stored_event) {
-            let recorded = self
-                .catalog
-                .resume_provider_onboarding(session_id)
-                .ok()
-                .is_some_and(|resumed_after_error| {
-                    resumed_after_error
-                        .lifecycle()
-                        .generation_reference(generation)
-                        == Some(&reference)
-                });
-            if !recorded {
-                let deletion_failed = self.secrets.delete(&reference, &control).is_err();
-                if let Ok(resumed_after_error) = self.catalog.resume_provider_onboarding(session_id)
-                {
-                    let event = if deletion_failed || replacing {
-                        OnboardingEvent::CleanupRequired {
-                            generation: Some(generation),
-                            evidence_digest: event_digest(
-                                b"catalog-store-reconciliation",
-                                session_id,
-                                Some(generation),
-                            ),
-                        }
-                    } else {
-                        OnboardingEvent::Cancelled {
-                            evidence_digest: event_digest(
-                                b"catalog-store-rolled-back",
-                                session_id,
-                                Some(generation),
-                            ),
-                        }
-                    };
-                    let _ignored = self.append(
-                        resumed_after_error.reservation(),
-                        resumed_after_error.next_sequence(),
-                        event,
-                    );
-                }
-                return Err(catalog_error);
+                    }
+                } else {
+                    OnboardingEvent::SecretStoreCleared {
+                        generation,
+                        reference: plan.target().clone(),
+                        outcome: SecretStoreClearOutcome::Absent,
+                    }
+                };
+                self.append(resumed.reservation(), resumed.next_sequence(), event)?;
+                Err(error.into())
             }
         }
-        self.resume(session_id)
     }
 
     /// Verifies one stored credential against its exact provider, admits the retained authority
@@ -533,154 +576,182 @@ impl ProviderOnboardingService {
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let _activation = self.activation.lock().await;
-        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        let profile = self.current_profile_for(&resumed)?;
-        if resumed
-            .lifecycle()
-            .active_generation()
-            .is_some_and(|generation| resumed.lifecycle().generation_is_active_scoped(generation))
-            && resumed.lifecycle().candidate_generation().is_none()
-        {
-            return self.lease_from_resumed(&resumed, profile);
-        }
-        match profile.release_state() {
-            ProfileReleaseState::RightsBlocked => {
-                return Err(ProviderOnboardingError::RightsBlocked);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(ProviderOnboardingError::OperationCancelled);
             }
-            ProfileReleaseState::RefreshRequired => {
-                return Err(ProviderOnboardingError::EvidenceRefreshRequired);
+            let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+            let profile = self.current_profile_for(&resumed)?;
+            if resumed
+                .lifecycle()
+                .active_generation()
+                .is_some_and(|generation| {
+                    resumed.lifecycle().generation_is_active_scoped(generation)
+                })
+                && resumed.lifecycle().candidate_generation().is_none()
+            {
+                return self.lease_from_resumed(&resumed, profile);
             }
-            ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
-        }
-        let generation = resumed
-            .lifecycle()
-            .candidate_generation()
-            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
-        if resumed.lifecycle().generation_state(generation)
-            != Some(CredentialGenerationState::StoredUnverified)
-            || !matches!(
-                resumed.lifecycle().state(),
-                OnboardingState::StoredUnverified | OnboardingState::RotationPending
-            )
-        {
-            return Err(ProviderOnboardingError::ActivationUnavailable);
-        }
-        let reference = resumed
-            .lifecycle()
-            .generation_reference(generation)
-            .cloned()
-            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
-        let secrets = Arc::clone(&self.secrets);
-        let secret = await_blocking_secret_operation(
-            Arc::clone(&self.secret_operations),
-            cancellation.clone(),
-            move |operation| {
-                read_secret_reference(
-                    secrets.as_ref(),
-                    session_id,
-                    &reference,
-                    operation,
-                    SecretInteractionPolicy::AllowPlatformPrompt,
+            match profile.release_state() {
+                ProfileReleaseState::RightsBlocked => {
+                    return Err(ProviderOnboardingError::RightsBlocked);
+                }
+                ProfileReleaseState::RefreshRequired => {
+                    return Err(ProviderOnboardingError::EvidenceRefreshRequired);
+                }
+                ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
+            }
+            let generation = resumed
+                .lifecycle()
+                .candidate_generation()
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+            match resumed.lifecycle().generation_state(generation) {
+                Some(CredentialGenerationState::StoredUnverified) => {
+                    let reference = resumed
+                        .lifecycle()
+                        .generation_reference(generation)
+                        .cloned()
+                        .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+                    let secrets = Arc::clone(&self.secrets);
+                    let secret = await_blocking_secret_operation(
+                        Arc::clone(&self.secret_operations),
+                        cancellation.clone(),
+                        move |operation| {
+                            read_secret_reference(
+                                secrets.as_ref(),
+                                session_id,
+                                &reference,
+                                operation,
+                                SecretInteractionPolicy::AllowPlatformPrompt,
+                            )
+                        },
+                    )
+                    .await?;
+                    let response_evidence = self
+                        .run_credential_probe(profile, session_id, &secret, cancellation.clone())
+                        .await?;
+                    let verified_at = system_timestamp()?;
+                    let verification_expires_at = if profile.id() == "bls.v2-registered" {
+                        Some(Timestamp::from_unix_nanos(
+                            verified_at
+                                .unix_nanos()
+                                .checked_add(BLS_REGISTRATION_VALIDITY_NANOS)
+                                .ok_or(ProviderOnboardingError::Clock)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    let requested = resumed.lifecycle().requested_authority().clone();
+                    let verification = AuthorityVerification::try_new(
+                        profile.capability(),
+                        AuthorityVerificationInput {
+                            requested: requested.clone(),
+                            observed: requested,
+                            restrictions_digest: profile.rights_decision_digest(),
+                            bindings: AuthorityBindings::new(
+                                None,
+                                None,
+                                None,
+                                Some(resumed.reservation().public_configuration_digest()),
+                            ),
+                            verified_at,
+                            expires_at: verification_expires_at,
+                            verifier_revision: profile.capability().verifier_revision().clone(),
+                            assurance_limitation: credential_assurance(profile)?,
+                            evidence_digest: response_evidence,
+                        },
+                    )
+                    .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+                    self.append(
+                        resumed.reservation(),
+                        resumed.next_sequence(),
+                        OnboardingEvent::AuthorityVerified {
+                            verification: Box::new(verification),
+                        },
+                    )?;
+                }
+                Some(CredentialGenerationState::VerifiedLeastPrivilege) => {
+                    let verification = resumed
+                        .lifecycle()
+                        .generation_verification(generation)
+                        .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+                    if resumed
+                        .lifecycle()
+                        .generation_rights_digest(generation)
+                        .is_none()
+                    {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RightsAdmitted {
+                                generation: Some(generation),
+                                decision_digest: profile.rights_decision_digest(),
+                            },
+                        )?;
+                    } else if resumed
+                        .lifecycle()
+                        .generation_rate_policy_digest(generation)
+                        .is_none()
+                    {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RatePolicyAdmitted {
+                                generation: Some(generation),
+                                policy_digest: profile.capability().rate_policy().evidence_digest(),
+                            },
+                        )?;
+                    } else if resumed
+                        .lifecycle()
+                        .generation_runtime_digest(generation)
+                        .is_none()
+                    {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::RuntimeVerified {
+                                generation: Some(generation),
+                                evidence_digest: derived_evidence_digest(
+                                    b"credential-runtime",
+                                    session_id,
+                                    generation,
+                                    verification.evidence_digest(),
+                                ),
+                            },
+                        )?;
+                    } else if let Some(prior_generation) = resumed.lifecycle().active_generation() {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::Cutover {
+                                prior_generation,
+                                candidate_generation: generation,
+                            },
+                        )?;
+                    } else {
+                        self.append(
+                            resumed.reservation(),
+                            resumed.next_sequence(),
+                            OnboardingEvent::Activate {
+                                generation: Some(generation),
+                            },
+                        )?;
+                    }
+                }
+                Some(
+                    CredentialGenerationState::Reserved
+                    | CredentialGenerationState::StorePlanned
+                    | CredentialGenerationState::StoreReconciliationRequired
+                    | CredentialGenerationState::ActiveScoped
+                    | CredentialGenerationState::SupersededRetained
+                    | CredentialGenerationState::Retired
+                    | CredentialGenerationState::Tombstoned
+                    | CredentialGenerationState::AbandonedNoEffect
+                    | CredentialGenerationState::CleanupRequired,
                 )
-            },
-        )
-        .await?;
-        let response_evidence = self
-            .run_credential_probe(profile, &secret, cancellation.clone())
-            .await?;
-        let verified_at = system_timestamp()?;
-        let verification_expires_at = if profile.id() == "bls.v2-registered" {
-            Some(Timestamp::from_unix_nanos(
-                verified_at
-                    .unix_nanos()
-                    .checked_add(BLS_REGISTRATION_VALIDITY_NANOS)
-                    .ok_or(ProviderOnboardingError::Clock)?,
-            ))
-        } else {
-            None
-        };
-        let requested = resumed.lifecycle().requested_authority().clone();
-        let verification = AuthorityVerification::try_new(
-            profile.capability(),
-            AuthorityVerificationInput {
-                requested: requested.clone(),
-                observed: requested,
-                restrictions_digest: profile.rights_decision_digest(),
-                bindings: AuthorityBindings::new(
-                    None,
-                    None,
-                    None,
-                    Some(resumed.reservation().public_configuration_digest()),
-                ),
-                verified_at,
-                expires_at: verification_expires_at,
-                verifier_revision: profile.capability().verifier_revision().clone(),
-                assurance_limitation: credential_assurance(profile)?,
-                evidence_digest: response_evidence,
-            },
-        )
-        .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
-        let reservation = resumed.reservation();
-        let mut sequence = resumed.next_sequence();
-        self.append(
-            reservation,
-            sequence,
-            OnboardingEvent::AuthorityVerified {
-                verification: Box::new(verification),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
-        self.append(
-            reservation,
-            sequence,
-            OnboardingEvent::RightsAdmitted {
-                generation: Some(generation),
-                decision_digest: profile.rights_decision_digest(),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
-        self.append(
-            reservation,
-            sequence,
-            OnboardingEvent::RatePolicyAdmitted {
-                generation: Some(generation),
-                policy_digest: profile.capability().rate_policy().evidence_digest(),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
-        self.append(
-            reservation,
-            sequence,
-            OnboardingEvent::RuntimeVerified {
-                generation: Some(generation),
-                evidence_digest: derived_evidence_digest(
-                    b"credential-runtime",
-                    session_id,
-                    generation,
-                    response_evidence,
-                ),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
-        if let Some(prior_generation) = resumed.lifecycle().active_generation() {
-            self.append(
-                reservation,
-                sequence,
-                OnboardingEvent::Cutover {
-                    prior_generation,
-                    candidate_generation: generation,
-                },
-            )?;
-        } else {
-            self.append(
-                reservation,
-                sequence,
-                OnboardingEvent::Activate {
-                    generation: Some(generation),
-                },
-            )?;
+                | None => return Err(ProviderOnboardingError::ActivationUnavailable),
+            }
         }
-        self.activation_lease(session_id)
     }
 
     /// Recovers immutable adapter-construction authority for an active durable session.
@@ -820,7 +891,12 @@ impl ProviderOnboardingService {
         policy.authorize_request(endpoint)?;
         let rate_permit = self
             .probe_rates
-            .acquire(profile.capability().rate_policy(), cancellation.clone())
+            .acquire(
+                profile,
+                profile.capability().rate_policy(),
+                None,
+                cancellation.clone(),
+            )
             .await?;
         let request = match probe.transport() {
             ProbeTransport::HttpGet => self.client.get(endpoint),
@@ -844,6 +920,7 @@ impl ProviderOnboardingService {
             .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
         validate_probe_semantics(profile.id(), &body)?;
+        rate_permit.record_success()?;
         Ok(EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             Sha256::digest(&body).into(),
@@ -853,6 +930,7 @@ impl ProviderOnboardingService {
     async fn run_credential_probe(
         &self,
         profile: &ProviderOnboardingProfile,
+        session_id: Uuid,
         secret: &SecretValue,
         cancellation: CancellationToken,
     ) -> Result<EvidenceDigest, ProviderOnboardingError> {
@@ -869,9 +947,15 @@ impl ProviderOnboardingService {
             .endpoint_policy()
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
         policy.authorize_request(endpoint)?;
+        let authorization_subject = provider_authorization_subject(session_id)?;
         let rate_permit = self
             .probe_rates
-            .acquire(profile.capability().rate_policy(), cancellation.clone())
+            .acquire(
+                profile,
+                profile.capability().rate_policy(),
+                Some(&authorization_subject),
+                cancellation.clone(),
+            )
             .await?;
         let mut body: serde_json::Value = serde_json::from_str(
             probe
@@ -902,6 +986,7 @@ impl ProviderOnboardingService {
             .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
         validate_probe_semantics(profile.id(), &response)?;
+        rate_permit.record_success()?;
         Ok(EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             Sha256::digest(&response).into(),
@@ -1037,7 +1122,7 @@ impl ProviderOnboardingService {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
         let issued_at = system_timestamp()?;
-        let (generation, secret_reference, verification_expires_at) =
+        let (generation, secret_reference, verification_expires_at, authority_effective_at) =
             if let Some(generation) = lifecycle.active_generation() {
                 if !lifecycle.generation_is_active_scoped(generation) {
                     return Err(ProviderOnboardingError::InvalidSessionState);
@@ -1056,10 +1141,18 @@ impl ProviderOnboardingService {
                 {
                     return Err(ProviderOnboardingError::ActivationExpired);
                 }
-                (Some(generation), Some(reference), verification.expires_at())
+                (
+                    Some(generation),
+                    Some(reference),
+                    verification.expires_at(),
+                    verification.verified_at(),
+                )
             } else {
-                (None, None, None)
+                (None, None, None, resumed.reservation().created_at())
             };
+        if authority_effective_at > issued_at {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
         Ok(ProviderActivationLease::new(ProviderActivationLeaseInput {
             session_id: resumed.reservation().session_id(),
             surface_id: lifecycle.surface_id().clone(),
@@ -1073,6 +1166,7 @@ impl ProviderOnboardingService {
             generation,
             secret_reference,
             verification_expires_at,
+            authority_effective_at,
             issued_at,
         }))
     }
@@ -1617,6 +1711,13 @@ fn system_timestamp() -> Result<Timestamp, ProviderOnboardingError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
+fn provider_authorization_subject(
+    session_id: Uuid,
+) -> Result<SourceIdentifier, ProviderOnboardingError> {
+    SourceIdentifier::try_from(format!("provider-session-{}", session_id.simple()))
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)
+}
+
 fn wall_deadline(duration: Duration) -> Result<Timestamp, ProviderOnboardingError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1626,12 +1727,6 @@ fn wall_deadline(duration: Duration) -> Result<Timestamp, ProviderOnboardingErro
         .ok_or(ProviderOnboardingError::Clock)?;
     let nanos = i64::try_from(deadline.as_nanos()).map_err(|_| ProviderOnboardingError::Clock)?;
     Ok(Timestamp::from_unix_nanos(nanos))
-}
-
-fn checked_next(sequence: u64) -> Result<u64, ProviderOnboardingError> {
-    sequence
-        .checked_add(1)
-        .ok_or(ProviderOnboardingError::InvalidSessionState)
 }
 
 fn valid_optional_contact(value: Option<&str>, email: bool) -> bool {

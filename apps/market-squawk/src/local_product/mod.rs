@@ -24,7 +24,7 @@ use market_squawk_domain::RoundingPolicy;
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
 use market_squawk_services::{ArtifactError, ArtifactRepository};
-use market_squawk_sources::AuthoritativeSourceRegistry;
+use market_squawk_sources::{AuthoritativeSourceRegistry, AuthorizationSubjectResolver};
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
 
@@ -65,6 +65,7 @@ use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServi
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
+use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError, ProviderAdapterActivation, ProviderOnboardingError,
@@ -113,6 +114,7 @@ impl LocalProduct {
             .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
         let artifacts =
             controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
+        let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
         let source_store = LocalAuthorityStateStore::try_open(
             paths
@@ -120,7 +122,14 @@ impl LocalProduct {
                 .root()
                 .join(SOURCE_AUTHORITY_DIRECTORY),
         )?;
-        let source_registry = AuthoritativeSourceRegistry::try_new_durable(source_store)?;
+        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
+            Arc::new(provider_rate.clone());
+        let source_registry =
+            AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+                source_store,
+                authorization_subject_resolver,
+                provider_rate.clone(),
+            )?;
         let research_ingest = Arc::new(ProductionResearchIngestCoordinator::new(
             source_registry,
             Arc::clone(&research),
@@ -133,14 +142,16 @@ impl LocalProduct {
                 paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY),
             )?,
         );
-        let onboarding = Arc::new(ProviderOnboardingService::try_new(
+        let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
             research.onboarding_catalog(),
             secrets,
+            provider_rate.clone(),
         )?);
         let provider_activation = Arc::new(ProviderAdapterActivation::new(
             Arc::clone(&onboarding),
             Arc::clone(&research_ingest),
             config.clone(),
+            provider_rate.clone(),
         ));
         let provider_activation_state =
             DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
@@ -160,7 +171,11 @@ impl LocalProduct {
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
         )?);
-        let paper = PaperApplicationServices::new(config.clone(), Arc::clone(&live_fair_value));
+        let paper = PaperApplicationServices::new(
+            config.clone(),
+            Arc::clone(&live_fair_value),
+            provider_rate,
+        );
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
@@ -472,6 +487,9 @@ pub enum LocalProductError {
     /// Durable source-registry recovery failed.
     #[error(transparent)]
     SourceRegistry(#[from] market_squawk_sources::RegistryError),
+    /// Product-wide provider-rate authority could not be opened or reconciled.
+    #[error(transparent)]
+    ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
     /// Preferred local secret-store construction failed.
     #[error(transparent)]
     Secrets(#[from] market_squawk_platform::LocalSecretStoreError),

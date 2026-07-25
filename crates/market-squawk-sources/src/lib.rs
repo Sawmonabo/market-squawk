@@ -107,8 +107,8 @@ pub use onboarding::{
     ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
     ProviderPublicConfiguration, PublicConfigurationError, RatePolicyDescriptor,
     RemoteRevocationOutcome, Requirement, RightsAdmissionState, RuntimeCapabilityObservation,
-    RuntimeProviderCapability, SetupMode, VerificationProbe, ZeroFeeStatus,
-    built_in_provider_profiles,
+    RuntimeProviderCapability, SecretStoreClearOutcome, SetupMode, VerificationProbe,
+    ZeroFeeStatus, built_in_provider_profiles,
 };
 pub use order::{
     ProviderCursorOnlyReason, ProviderOrderChangeReason, ProviderOrderEvent,
@@ -118,8 +118,11 @@ pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
     BudgetPoolError, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
     EndpointDenialReason, EndpointPolicy, HttpClientProfile, HttpRequestBounds, MonotonicInstant,
-    NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, QueryParameterRule,
-    QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
+    NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
+    ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId, ProviderRatePermitId,
+    ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+    QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
     apply_http_retry_after,
 };
 pub use registry::{

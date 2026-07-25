@@ -38,10 +38,7 @@ pub(in crate::policy) struct ClockObservation {
 }
 
 impl ClockObservation {
-    pub(in crate::policy) const fn new(
-        wall_clock: Timestamp,
-        monotonic: MonotonicInstant,
-    ) -> Self {
+    pub(in crate::policy) const fn new(wall_clock: Timestamp, monotonic: MonotonicInstant) -> Self {
         Self {
             wall_clock,
             monotonic,
@@ -171,9 +168,7 @@ impl BudgetState {
     }
 }
 
-fn preallocated_sliding_releases(
-    window: ProviderBudgetWindow,
-) -> VecDeque<MonotonicInstant> {
+fn preallocated_sliding_releases(window: ProviderBudgetWindow) -> VecDeque<MonotonicInstant> {
     if window.semantics() == BudgetWindowSemantics::Sliding {
         VecDeque::with_capacity(
             usize::try_from(window.requests_per_window()).map_or(0, std::convert::identity),
@@ -190,6 +185,7 @@ pub(in crate::policy) struct BudgetAllocation {
     pub(in crate::policy) availability_generation: AtomicU64,
     pub(in crate::policy) terminal: AtomicBool,
     pub(in crate::policy) durability: Option<BudgetDurabilityBinding>,
+    pub(in crate::policy) provider_rate: Option<ProviderRateBinding>,
 }
 
 #[derive(Clone)]

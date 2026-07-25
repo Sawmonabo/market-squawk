@@ -951,6 +951,9 @@ fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &Onboard
         event,
         OnboardingEvent::Cancelled { .. }
             | OnboardingEvent::RefreshRequired { .. }
+            | OnboardingEvent::SecretStoreReconciliationRequired { .. }
+            | OnboardingEvent::SecretStoreCleared { .. }
+            | OnboardingEvent::CandidateCancelledNoEffect { .. }
             | OnboardingEvent::IndeterminateRemoteState { .. }
             | OnboardingEvent::CleanupRequired { .. }
             | OnboardingEvent::RemoteRevocation { .. }
@@ -968,6 +971,7 @@ fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &Onboard
         ) | (
             OnboardingState::RotationPending,
             OnboardingEvent::CredentialImported { .. }
+                | OnboardingEvent::SecretStorePlanned { .. }
                 | OnboardingEvent::ProtocolValidated { .. }
                 | OnboardingEvent::CredentialStored { .. }
                 | OnboardingEvent::AuthorityVerified { .. }
@@ -983,6 +987,15 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
     match event.kind() {
         market_squawk_sources::OnboardingEventKind::CredentialImported => {
             "provider-onboarding.credential-imported"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStorePlanned => {
+            "provider-onboarding.secret-store-planned"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStoreReconciliationRequired => {
+            "provider-onboarding.secret-store-reconciliation-required"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStoreCleared => {
+            "provider-onboarding.secret-store-cleared"
         }
         market_squawk_sources::OnboardingEventKind::ProtocolValidated => {
             "provider-onboarding.protocol-validated"
@@ -1008,6 +1021,9 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
         }
         market_squawk_sources::OnboardingEventKind::BeginRotation => {
             "provider-onboarding.rotation-begun"
+        }
+        market_squawk_sources::OnboardingEventKind::CandidateCancelledNoEffect => {
+            "provider-onboarding.candidate-cancelled-no-effect"
         }
         market_squawk_sources::OnboardingEventKind::Cutover => "provider-onboarding.cutover",
         market_squawk_sources::OnboardingEventKind::RemoteRevocation => {

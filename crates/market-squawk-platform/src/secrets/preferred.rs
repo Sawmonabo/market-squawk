@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     EncryptedFileSecretStore, LocalSecretStoreError, OsKeyringSecretStore, SecretBackend,
-    SecretGeneration, SecretKey, SecretOperationControl, SecretRef, SecretStore,
-    SecretStoreCapabilities,
+    SecretDeletionDisposition, SecretGeneration, SecretKey, SecretMutationDisposition,
+    SecretMutationFailure, SecretMutationPlan, SecretOperationControl,
+    SecretReconciliationObservation, SecretRef, SecretStore, SecretStoreCapabilities,
 };
 use crate::SecretValue;
 
@@ -179,6 +180,20 @@ impl ConfiguredEncryptedFileFallback {
             .lock()
             .map_err(|_error| LocalSecretStoreError::WriterUnavailable)?;
         operation(store.as_ref().ok_or(LocalSecretStoreError::Locked)?)
+    }
+
+    fn with_ready_mutation<T>(
+        &self,
+        operation: impl FnOnce(&EncryptedFileSecretStore) -> Result<T, SecretMutationFailure>,
+    ) -> Result<T, SecretMutationFailure> {
+        let store = self.store.lock().map_err(|_error| {
+            SecretMutationFailure::no_effect(LocalSecretStoreError::WriterUnavailable)
+        })?;
+        operation(
+            store
+                .as_ref()
+                .ok_or_else(|| SecretMutationFailure::no_effect(LocalSecretStoreError::Locked))?,
+        )
     }
 }
 
@@ -357,6 +372,122 @@ impl SecretStore for PreferredSecretStore {
                 None => Err(error),
             },
             Err(error) => Err(error),
+        }
+    }
+
+    fn plan_create(
+        &self,
+        key: &SecretKey,
+        generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
+        match self.primary.plan_create(key, generation, control) {
+            Ok(plan) => Ok(plan),
+            Err(error) if keyring_is_unavailable(&error) => match self.fallback.as_ref() {
+                Some(fallback) => {
+                    fallback.with_ready(|store| store.plan_create(key, generation, control))
+                }
+                None => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    fn plan_replace(
+        &self,
+        key: &SecretKey,
+        current: &SecretRef,
+        candidate_generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
+        match current.backend() {
+            SecretBackend::AppleKeychain
+            | SecretBackend::WindowsCredentialManager
+            | SecretBackend::SecretService => {
+                self.primary
+                    .plan_replace(key, current, candidate_generation, control)
+            }
+            SecretBackend::EncryptedFile => self.encrypted_reference(current, |store| {
+                store.plan_replace(key, current, candidate_generation, control)
+            }),
+        }
+    }
+
+    fn execute_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationDisposition, SecretMutationFailure> {
+        match plan.target().backend() {
+            SecretBackend::AppleKeychain
+            | SecretBackend::WindowsCredentialManager
+            | SecretBackend::SecretService => {
+                self.primary.execute_planned(key, plan, value, control)
+            }
+            SecretBackend::EncryptedFile => self
+                .fallback
+                .as_ref()
+                .ok_or_else(|| {
+                    SecretMutationFailure::no_effect(LocalSecretStoreError::InvalidReference)
+                })?
+                .with_ready_mutation(|store| store.execute_planned(key, plan, value, control)),
+        }
+    }
+
+    fn inspect_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+        match plan.target().backend() {
+            SecretBackend::AppleKeychain
+            | SecretBackend::WindowsCredentialManager
+            | SecretBackend::SecretService => self.primary.inspect_planned(key, plan, control),
+            SecretBackend::EncryptedFile => self.encrypted_reference(plan.target(), |store| {
+                store.inspect_planned(key, plan, control)
+            }),
+        }
+    }
+
+    fn matches_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        expected: &SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+        match plan.target().backend() {
+            SecretBackend::AppleKeychain
+            | SecretBackend::WindowsCredentialManager
+            | SecretBackend::SecretService => {
+                self.primary.matches_planned(key, plan, expected, control)
+            }
+            SecretBackend::EncryptedFile => self.encrypted_reference(plan.target(), |store| {
+                store.matches_planned(key, plan, expected, control)
+            }),
+        }
+    }
+
+    fn delete_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretDeletionDisposition, SecretMutationFailure> {
+        match plan.target().backend() {
+            SecretBackend::AppleKeychain
+            | SecretBackend::WindowsCredentialManager
+            | SecretBackend::SecretService => self.primary.delete_planned(key, plan, control),
+            SecretBackend::EncryptedFile => self
+                .fallback
+                .as_ref()
+                .ok_or_else(|| {
+                    SecretMutationFailure::no_effect(LocalSecretStoreError::InvalidReference)
+                })?
+                .with_ready_mutation(|store| store.delete_planned(key, plan, control)),
         }
     }
 

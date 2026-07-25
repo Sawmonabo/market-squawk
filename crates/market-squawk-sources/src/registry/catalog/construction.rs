@@ -61,6 +61,23 @@ impl AuthoritativeSourceRegistry {
         )
     }
 
+    /// Opens a restart-durable registry whose provider requests share one product-owned aggregate
+    /// rate authority with onboarding and other live/research registries.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on either registry persistence or aggregate rate-authority registration.
+    pub fn try_new_durable_with_provider_rate(
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        provider_rate: crate::ProviderRateAuthority,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            provider_rate,
+        )
+    }
+
     /// Opens the restart-durable registry with trusted account-subject resolution.
     ///
     /// # Errors
@@ -72,6 +89,26 @@ impl AuthoritativeSourceRegistry {
     ) -> Result<Self, RegistryError> {
         let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
         Self::try_new_durable_with_store_and_authorization_subject_resolver(store, resolver)
+    }
+
+    /// Opens a restart-durable registry with both trusted account resolution and product-wide rate
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on persistence, restore, subject resolution, or aggregate registration.
+    pub fn try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: crate::ProviderRateAuthority,
+    ) -> Result<Self, RegistryError> {
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            resolver,
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            Some(provider_rate),
+        )
     }
 
     pub(crate) fn try_new_durable_with_store_and_authorization_subject_resolver(
@@ -87,6 +124,17 @@ impl AuthoritativeSourceRegistry {
         store: Arc<dyn crate::policy::AuthorityStateStore>,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         raw_clock: Arc<dyn RawRegistryClockSource>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store, resolver, raw_clock, None,
+        )
+    }
+
+    fn try_new_durable_with_store_resolver_clock_and_provider_rate(
+        store: Arc<dyn crate::policy::AuthorityStateStore>,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        raw_clock: Arc<dyn RawRegistryClockSource>,
+        provider_rate: Option<crate::ProviderRateAuthority>,
     ) -> Result<Self, RegistryError> {
         let clock = Arc::new(SealedRegistryClock::new(raw_clock));
         let now = clock.observe()?.wall();
@@ -111,6 +159,7 @@ impl AuthoritativeSourceRegistry {
                 clock,
                 resolver,
                 Arc::clone(&durability),
+                provider_rate,
             )
         })();
         match construction {
@@ -265,6 +314,7 @@ impl AuthoritativeSourceRegistry {
         clock: Arc<SealedRegistryClock>,
         authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         durability: Arc<AuthorityDurabilitySession>,
+        provider_rate: Option<crate::ProviderRateAuthority>,
     ) -> Result<Self, RegistryError> {
         let mut resolved_groups = Vec::new();
         let mut flattened = Vec::new();
@@ -293,7 +343,13 @@ impl AuthoritativeSourceRegistry {
                 current.checked_add(1)
             })
             .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
-        let mut budgets = ProviderBudgetPool::new_durable(Arc::clone(&durability));
+        let mut budgets = match provider_rate {
+            Some(provider_rate) => ProviderBudgetPool::new_durable_with_provider_rate(
+                Arc::clone(&durability),
+                provider_rate,
+            ),
+            None => ProviderBudgetPool::new_durable(Arc::clone(&durability)),
+        };
         budgets
             .restore_durable(resolved_groups)
             .map_err(|_| RegistryError::BudgetCoordinator)?;

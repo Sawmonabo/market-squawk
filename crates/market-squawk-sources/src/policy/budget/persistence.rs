@@ -2,10 +2,10 @@
 
 use super::*;
 
-#[path = "persistence/terminal.rs"]
-mod terminal;
 #[path = "persistence/lifecycle.rs"]
 pub(in crate::policy) mod lifecycle;
+#[path = "persistence/terminal.rs"]
+mod terminal;
 
 pub(crate) const MAX_DURABLE_AUTHORITY_STATE_BYTES: usize = 8 * 1024 * 1024;
 const DURABLE_AUTHORITY_FORMAT_VERSION: u16 = 2;
@@ -45,8 +45,7 @@ pub(crate) enum AuthorityStateStoreError {
 
 impl AuthorityStateStore for market_squawk_platform::LocalAuthorityStateStore {
     fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
-        market_squawk_platform::LocalAuthorityStateStore::load(self)
-            .map_err(map_local_store_error)
+        market_squawk_platform::LocalAuthorityStateStore::load(self).map_err(map_local_store_error)
     }
 
     fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
@@ -149,9 +148,7 @@ struct PersistedProviderBudgetPolicyV1 {
 }
 
 impl PersistedProviderBudgetPolicyV1 {
-    fn into_current(
-        self,
-    ) -> Result<PersistedProviderBudgetPolicy, AuthorityPersistenceError> {
+    fn into_current(self) -> Result<PersistedProviderBudgetPolicy, AuthorityPersistenceError> {
         PersistedProviderBudgetPolicy::try_new(
             self.policy.into_current()?,
             self.endpoint_policy,
@@ -275,10 +272,8 @@ impl DurableAuthorityEnvelopeV1 {
             .map(|group| canonical_json_bytes(&group).map(|key| (key, group)))
             .collect::<Result<Vec<_>, _>>()?;
         keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        self.budgets = BoundedVec::try_new(
-            keyed.into_iter().map(|(_key, group)| group).collect(),
-        )
-        .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        self.budgets = BoundedVec::try_new(keyed.into_iter().map(|(_key, group)| group).collect())
+            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
         Ok(())
     }
 
@@ -376,8 +371,7 @@ impl BudgetWindowCheckpointState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BudgetCheckpointState {
-    pub(super) windows:
-        BoundedVec<BudgetWindowCheckpointState, MAX_PROVIDER_BUDGET_WINDOWS>,
+    pub(super) windows: BoundedVec<BudgetWindowCheckpointState, MAX_PROVIDER_BUDGET_WINDOWS>,
     pub(super) in_flight: u16,
     pub(super) unavailable_until_wall: Option<Timestamp>,
     pub(super) disabled: bool,
@@ -412,8 +406,8 @@ impl BudgetCheckpointState {
         for window in &mut windows {
             window.shift_wall_anchor(delta)?;
         }
-        self.windows = BoundedVec::try_new(windows)
-            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        self.windows =
+            BoundedVec::try_new(windows).map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
         self.unavailable_until_wall = self
             .unavailable_until_wall
             .map(|deadline| deadline.checked_add_nanos(delta))
@@ -477,9 +471,7 @@ impl DurableBudgetGroup {
             .declarations
             .as_slice()
             .iter()
-            .map(|declaration| {
-                canonical_json_bytes(&declaration).map(|key| (key, declaration))
-            })
+            .map(|declaration| canonical_json_bytes(&declaration).map(|key| (key, declaration)))
             .collect::<Result<Vec<_>, _>>()?;
         keyed.sort_by(|left, right| left.0.cmp(&right.0));
         if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -532,13 +524,8 @@ impl DurableAuthorityEnvelope {
             .map(|group| canonical_json_bytes(&group).map(|key| (key, group)))
             .collect::<Result<Vec<_>, _>>()?;
         keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        self.budgets = BoundedVec::try_new(
-            keyed
-                .into_iter()
-                .map(|(_key, group)| group)
-                .collect(),
-        )
-        .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        self.budgets = BoundedVec::try_new(keyed.into_iter().map(|(_key, group)| group).collect())
+            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
         Ok(())
     }
 
@@ -567,9 +554,7 @@ impl DurableAuthorityEnvelope {
                 .as_slice()
                 .iter()
                 .skip(1)
-                .any(|declaration| {
-                    !first.policy().has_same_limits_as(declaration.policy())
-                })
+                .any(|declaration| !first.policy().has_same_limits_as(declaration.policy()))
             {
                 return Err(AuthorityPersistenceError::InvalidState);
             }
@@ -879,9 +864,7 @@ impl AuthorityDurabilitySession {
         result
     }
 
-    fn rollback_unpublished_open(
-        self: &Arc<Self>,
-    ) -> Result<(), AuthorityPersistenceError> {
+    fn rollback_unpublished_open(self: &Arc<Self>) -> Result<(), AuthorityPersistenceError> {
         if self.recovered_unclean {
             return Err(AuthorityPersistenceError::SessionUnavailable);
         }

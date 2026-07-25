@@ -239,6 +239,7 @@ pub struct ProviderPortalActivationView {
     public_configuration_digest: EvidenceDigest,
     credential_generation: Option<u64>,
     verification_expires_at: Option<Timestamp>,
+    authority_effective_at: Timestamp,
     issued_at: Timestamp,
 }
 
@@ -254,6 +255,7 @@ impl ProviderPortalActivationView {
             public_configuration_digest: lease.public_configuration_digest(),
             credential_generation: lease.generation().map(SecretGeneration::get),
             verification_expires_at: lease.verification_expires_at(),
+            authority_effective_at: lease.authority_effective_at(),
             issued_at: lease.issued_at(),
         }
     }
@@ -311,6 +313,7 @@ pub struct ProviderActivationLease {
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
     verification_expires_at: Option<Timestamp>,
+    authority_effective_at: Timestamp,
     issued_at: Timestamp,
 }
 
@@ -329,6 +332,7 @@ impl ProviderActivationLease {
             generation: input.generation,
             secret_reference: input.secret_reference,
             verification_expires_at: input.verification_expires_at,
+            authority_effective_at: input.authority_effective_at,
             issued_at: input.issued_at,
         }
     }
@@ -395,6 +399,11 @@ impl ProviderActivationLease {
         self.verification_expires_at
     }
 
+    /// Returns the durable instant from which this exact activation authority is effective.
+    pub const fn authority_effective_at(&self) -> Timestamp {
+        self.authority_effective_at
+    }
+
     /// Returns the trusted local instant when the lease was issued.
     pub const fn issued_at(&self) -> Timestamp {
         self.issued_at
@@ -412,6 +421,7 @@ impl std::fmt::Debug for ProviderActivationLease {
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
+            .field("authority_effective_at", &self.authority_effective_at)
             .field("issued_at", &self.issued_at)
             .finish()
     }
@@ -430,6 +440,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
     pub verification_expires_at: Option<Timestamp>,
+    pub authority_effective_at: Timestamp,
     pub issued_at: Timestamp,
 }
 
@@ -492,6 +503,12 @@ pub(super) fn session_view(
     } else {
         match lifecycle.state() {
             OnboardingState::UserActionRequired => OnboardingNextAction::ImportSecret,
+            OnboardingState::SecretReconciliationRequired
+                if lifecycle.active_generation().is_some() =>
+            {
+                OnboardingNextAction::ImportReplacement
+            }
+            OnboardingState::SecretReconciliationRequired => OnboardingNextAction::ImportSecret,
             OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
             OnboardingState::RenewalRequired => OnboardingNextAction::RenewCredential,
             OnboardingState::RotationPending if credential_stored => {

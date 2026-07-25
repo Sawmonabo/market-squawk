@@ -288,4 +288,7 @@ pub enum ProviderAdapterActivationError {
     /// Live source configuration or route binding was invalid.
     #[error(transparent)]
     Live(#[from] crate::ProductionLiveSourceCompositionError),
+    /// Durable provider authorization-subject admission was unavailable or inconsistent.
+    #[error(transparent)]
+    ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
 }

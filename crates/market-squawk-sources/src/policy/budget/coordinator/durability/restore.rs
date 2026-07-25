@@ -90,9 +90,7 @@ fn combine_connected_public_declarations(
         combined
             .merge_public_authorities(declaration.collision_key())
             .map_err(|error| match error {
-                BudgetCollisionMergeError::Capacity => {
-                    BudgetPoolError::CanonicalAuthorityCapacity
-                }
+                BudgetCollisionMergeError::Capacity => BudgetPoolError::CanonicalAuthorityCapacity,
                 BudgetCollisionMergeError::Allocation => {
                     BudgetPoolError::CanonicalAuthorityAllocation
                 }

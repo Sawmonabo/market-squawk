@@ -5,11 +5,12 @@ use std::{sync::Arc, time::Instant};
 use market_squawk_data::CatalogLimit;
 use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::{
-    LocalSecretStoreError, SecretInteractionPolicy, SecretOperationControl,
+    LocalSecretStoreError, SecretCancellation, SecretInteractionPolicy, SecretKey,
+    SecretOperationControl, SecretReconciliationObservation,
 };
 use market_squawk_sources::{
     AuthorityVerification, CredentialGenerationState, LocalDeletionOutcome, OnboardingEvent,
-    OnboardingState, ProfileReleaseState, RemoteRevocationOutcome,
+    OnboardingState, ProfileReleaseState, RemoteRevocationOutcome, SecretStoreClearOutcome,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -65,6 +66,55 @@ impl ProviderOnboardingService {
             profile = self.profile_for(&resumed)?;
         }
         if capability_is_current
+            && let Some(generation) = resumed.lifecycle().candidate_generation()
+            && resumed.lifecycle().generation_state(generation)
+                == Some(CredentialGenerationState::StorePlanned)
+            && let Some(plan) = resumed
+                .lifecycle()
+                .generation_store_plan(generation)
+                .cloned()
+        {
+            let key = SecretKey::try_new(
+                "provider-onboarding",
+                &format!("{}.{}", profile.id(), session_id.simple()),
+            )?;
+            let deadline = Instant::now()
+                .checked_add(SECRET_OPERATION_DURATION)
+                .ok_or(ProviderOnboardingError::Clock)?;
+            let control = SecretOperationControl::try_new(
+                format!("provider-startup-reconcile-{session_id}"),
+                deadline,
+                0,
+                SecretInteractionPolicy::Forbid,
+                SecretCancellation::new(),
+            )?;
+            let event = match self.secrets.inspect_planned(&key, &plan, &control) {
+                Ok(SecretReconciliationObservation::Absent) => {
+                    OnboardingEvent::SecretStoreCleared {
+                        generation,
+                        reference: plan.target().clone(),
+                        outcome: SecretStoreClearOutcome::Absent,
+                    }
+                }
+                Ok(
+                    SecretReconciliationObservation::PresentUnverified
+                    | SecretReconciliationObservation::Matches
+                    | SecretReconciliationObservation::Mismatch,
+                )
+                | Err(_) => OnboardingEvent::SecretStoreReconciliationRequired {
+                    generation,
+                    evidence_digest: event_digest(
+                        b"startup-secret-store-reconciliation",
+                        session_id,
+                        Some(generation),
+                    ),
+                },
+            };
+            self.append(resumed.reservation(), resumed.next_sequence(), event)?;
+            resumed = self.catalog.resume_provider_onboarding(session_id)?;
+            profile = self.profile_for(&resumed)?;
+        }
+        if capability_is_current
             && resumed.lifecycle().state() == OnboardingState::ActiveScoped
             && let Some(generation) = resumed.lifecycle().active_generation()
             && let Some(expires_at) = resumed
@@ -96,19 +146,57 @@ impl ProviderOnboardingService {
                 .rotation_deadline_at()
                 .is_some_and(|deadline| deadline <= observed_at)
         {
-            let generation = resumed.lifecycle().candidate_generation();
-            self.append(
-                resumed.reservation(),
-                resumed.next_sequence(),
-                OnboardingEvent::CleanupRequired {
-                    generation,
-                    evidence_digest: event_digest(
-                        b"rotation-deadline-cleanup-required",
-                        session_id,
+            let generation = resumed
+                .lifecycle()
+                .candidate_generation()
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+            let generation_state = resumed
+                .lifecycle()
+                .generation_state(generation)
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+            let event = match generation_state {
+                CredentialGenerationState::Reserved => {
+                    OnboardingEvent::CandidateCancelledNoEffect {
                         generation,
-                    ),
-                },
-            )?;
+                        evidence_digest: event_digest(
+                            b"rotation-deadline-cancelled-no-effect",
+                            session_id,
+                            Some(generation),
+                        ),
+                    }
+                }
+                CredentialGenerationState::StorePlanned
+                | CredentialGenerationState::StoreReconciliationRequired => {
+                    OnboardingEvent::SecretStoreReconciliationRequired {
+                        generation,
+                        evidence_digest: event_digest(
+                            b"rotation-deadline-store-reconciliation",
+                            session_id,
+                            Some(generation),
+                        ),
+                    }
+                }
+                CredentialGenerationState::StoredUnverified
+                | CredentialGenerationState::VerifiedLeastPrivilege => {
+                    OnboardingEvent::CleanupRequired {
+                        generation: Some(generation),
+                        evidence_digest: event_digest(
+                            b"rotation-deadline-cleanup-required",
+                            session_id,
+                            Some(generation),
+                        ),
+                    }
+                }
+                CredentialGenerationState::ActiveScoped
+                | CredentialGenerationState::SupersededRetained
+                | CredentialGenerationState::Retired
+                | CredentialGenerationState::Tombstoned
+                | CredentialGenerationState::AbandonedNoEffect
+                | CredentialGenerationState::CleanupRequired => {
+                    return Err(ProviderOnboardingError::InvalidSessionState);
+                }
+            };
+            self.append(resumed.reservation(), resumed.next_sequence(), event)?;
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
             profile = self.profile_for(&resumed)?;
         }
@@ -247,7 +335,7 @@ impl ProviderOnboardingService {
                 Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
             ) {
                 let reference = lifecycle
-                    .generation_reference(generation)
+                    .generation_cleanup_reference(generation)
                     .cloned()
                     .ok_or(ProviderOnboardingError::SecretCleanupUnavailable)?;
                 let secrets = Arc::clone(&self.secrets);

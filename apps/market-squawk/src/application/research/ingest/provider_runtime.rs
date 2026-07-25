@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
 use serde::Serialize;
@@ -23,6 +23,7 @@ pub struct ResearchProviderRuntimeGeneration {
     capability_digest: EvidenceDigest,
     credential_generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
+    authority_effective_at: Timestamp,
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
 }
@@ -40,6 +41,7 @@ impl ResearchProviderRuntimeGeneration {
         capability_digest: EvidenceDigest,
         credential_generation: Option<SecretGeneration>,
         secret_reference: Option<SecretRef>,
+        authority_effective_at: Timestamp,
         metadata: SourceMetadata,
         rights: ResearchRightsAuthority,
     ) -> Result<Self, ResearchIngestCompositionError> {
@@ -53,6 +55,7 @@ impl ResearchProviderRuntimeGeneration {
             || capability_digest.bytes() == [0; 32]
             || !secret_binding_valid
             || metadata.source_id() != &rights.source_id
+            || !metadata.is_effective_at(authority_effective_at)
         {
             return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
         }
@@ -63,6 +66,7 @@ impl ResearchProviderRuntimeGeneration {
             capability_digest,
             credential_generation,
             secret_reference,
+            authority_effective_at,
             metadata,
             rights,
         })
@@ -93,17 +97,42 @@ impl ResearchProviderRuntimeGeneration {
         &self.metadata
     }
 
-    /// Returns a canonical digest of every non-secret runtime authority dimension.
-    pub fn identity_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+    /// Returns the durable instant from which this exact generation is effective.
+    pub const fn authority_effective_at(&self) -> Timestamp {
+        self.authority_effective_at
+    }
+
+    /// Returns the stable callable slot shared by legitimate generations of one provider source.
+    pub fn slot_identity_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct RuntimeSlotWire<'a> {
+            profile: &'a SourceIdentifier,
+            source_id: &'a market_squawk_domain::SourceId,
+        }
+
+        digest_runtime_wire(
+            b"market-squawk/research-provider-runtime-slot/v1\0",
+            &RuntimeSlotWire {
+                profile: &self.profile,
+                source_id: self.metadata.source_id(),
+            },
+        )
+    }
+
+    /// Returns a canonical digest of every non-secret exact-generation authority dimension.
+    pub fn generation_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
         #[derive(Serialize)]
         #[serde(deny_unknown_fields)]
         struct RuntimeGenerationWire<'a> {
+            slot_identity_digest: EvidenceDigest,
             profile: &'a SourceIdentifier,
             session_id: Uuid,
             capability_revision: ProviderCapabilityRevision,
             capability_digest: EvidenceDigest,
             credential_generation: Option<SecretGeneration>,
             secret_reference: Option<&'a SecretRef>,
+            authority_effective_at: Timestamp,
             metadata: &'a SourceMetadata,
             rights_source_id: &'a market_squawk_domain::SourceId,
             rights_basis_reference: &'a str,
@@ -113,35 +142,51 @@ impl ResearchProviderRuntimeGeneration {
             rights_authorization_expires_at: Option<market_squawk_domain::Timestamp>,
         }
 
-        let bytes = serde_json::to_vec(&RuntimeGenerationWire {
-            profile: &self.profile,
-            session_id: self.session_id,
-            capability_revision: self.capability_revision,
-            capability_digest: self.capability_digest,
-            credential_generation: self.credential_generation,
-            secret_reference: self.secret_reference.as_ref(),
-            metadata: &self.metadata,
-            rights_source_id: &self.rights.source_id,
-            rights_basis_reference: self.rights.basis.reference(),
-            rights_basis_digest: self.rights.basis.digest(),
-            rights_root_identity_digest: self.rights.basis.root_identity_digest(),
-            rights_authorization_evidence: self.rights.authorization_evidence,
-            rights_authorization_expires_at: self.rights.authorization_expires_at,
-        })
-        .map_err(|_| ResearchIngestCompositionError::InvalidRuntimeGeneration)?;
-        Ok(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(bytes).into(),
-        ))
+        digest_runtime_wire(
+            b"market-squawk/research-provider-runtime-generation/v2\0",
+            &RuntimeGenerationWire {
+                slot_identity_digest: self.slot_identity_digest()?,
+                profile: &self.profile,
+                session_id: self.session_id,
+                capability_revision: self.capability_revision,
+                capability_digest: self.capability_digest,
+                credential_generation: self.credential_generation,
+                secret_reference: self.secret_reference.as_ref(),
+                authority_effective_at: self.authority_effective_at,
+                metadata: &self.metadata,
+                rights_source_id: &self.rights.source_id,
+                rights_basis_reference: self.rights.basis.reference(),
+                rights_basis_digest: self.rights.basis.digest(),
+                rights_root_identity_digest: self.rights.basis.root_identity_digest(),
+                rights_authorization_evidence: self.rights.authorization_evidence,
+                rights_authorization_expires_at: self.rights.authorization_expires_at,
+            },
+        )
     }
 
-    fn is_exact_successor_of(&self, expected: &Self) -> bool {
-        self.profile == expected.profile
-            && self.session_id == expected.session_id
-            && self.capability_revision == expected.capability_revision
+    /// Compatibility alias for the exact generation digest.
+    pub fn identity_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+        self.generation_digest()
+    }
+
+    fn is_exact_successor_of(
+        &self,
+        expected: &Self,
+    ) -> Result<bool, ResearchIngestCompositionError> {
+        if self.profile != expected.profile
+            || self.metadata.source_id() != expected.metadata.source_id()
+            || self.slot_identity_digest()? != expected.slot_identity_digest()?
+            || self.generation_digest()? == expected.generation_digest()?
+            || self.authority_effective_at <= expected.authority_effective_at
+            || self.capability_revision < expected.capability_revision
+        {
+            return Ok(false);
+        }
+        if self.session_id != expected.session_id {
+            return Ok(true);
+        }
+        Ok(self.capability_revision == expected.capability_revision
             && self.capability_digest == expected.capability_digest
-            && self.metadata == expected.metadata
-            && self.rights == expected.rights
             && match (
                 expected.credential_generation,
                 self.credential_generation,
@@ -161,8 +206,23 @@ impl ResearchProviderRuntimeGeneration {
                         && prior_reference != candidate_reference
                 }
                 _ => false,
-            }
+            })
     }
+}
+
+fn digest_runtime_wire<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| ResearchIngestCompositionError::InvalidRuntimeGeneration)?;
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 /// Fully constructed replacement held outside the callable runtime until exact commit.
@@ -196,6 +256,7 @@ impl PreparedResearchProviderReplacement {
             .authority
             .lock()
             .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        let authority = &mut *authority;
         if self.coordinator.lifecycle.shutdown_token().is_cancelled()
             || authority.registry.is_none()
         {
@@ -208,16 +269,28 @@ impl PreparedResearchProviderReplacement {
             .sources
             .get(&self.profile)
             .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-        if current.generation.as_ref() != Some(&self.expected)
-            || current.metadata != self.candidate.metadata
-            || current.rights != self.candidate.rights
-        {
+        if current.generation.as_ref() != Some(&self.expected) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
         let candidate_source = self
             .candidate_source
             .take()
             .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
+        let replacement_registration = if current.metadata == self.candidate.metadata {
+            None
+        } else {
+            let registered_at = super::system_timestamp()
+                .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+            let registry = authority
+                .registry
+                .as_mut()
+                .ok_or(ResearchIngestCompositionError::ShuttingDown)?;
+            Some(registry.replace_metadata(
+                &current.registration,
+                self.candidate.metadata.clone(),
+                registered_at,
+            )?)
+        };
         let removed = authority.pending_replacements.remove(&self.profile);
         if removed != Some(self.token) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
@@ -227,6 +300,11 @@ impl PreparedResearchProviderReplacement {
             .get_mut(&self.profile)
             .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
         current.source = candidate_source;
+        current.metadata = self.candidate.metadata.clone();
+        if let Some(registration) = replacement_registration {
+            current.registration = registration;
+        }
+        current.rights = self.candidate.rights.clone();
         current.generation = Some(self.candidate.clone());
         self.committed = true;
         Ok(self.candidate.clone())
@@ -321,7 +399,7 @@ impl ProductionResearchIngestCoordinator {
         S: ManagedResearchExtractionSource,
     {
         if self.lifecycle.shutdown_token().is_cancelled()
-            || !candidate.is_exact_successor_of(&expected)
+            || !candidate.is_exact_successor_of(&expected)?
             || source.metadata() != candidate.metadata()
             || rights != candidate.rights
         {
@@ -345,8 +423,8 @@ impl ProductionResearchIngestCoordinator {
             .get(&profile)
             .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
         if current.generation.as_ref() != Some(&expected)
-            || current.metadata != candidate.metadata
-            || current.rights != candidate.rights
+            || current.metadata != expected.metadata
+            || current.rights != expected.rights
         {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
