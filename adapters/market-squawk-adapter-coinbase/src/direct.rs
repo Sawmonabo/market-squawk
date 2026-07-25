@@ -3,7 +3,9 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::DateTime;
+use hmac::{Hmac, Mac as _};
 use market_squawk_domain::{
     AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     EffectiveInterval, ExactPayloadEvidence, InstrumentExecutionTerms, IntegrityRule,
@@ -31,6 +33,7 @@ use market_squawk_sources::{
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -44,9 +47,11 @@ const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const DIRECT_CHANNEL: &str = "full";
 const WEBSOCKET_AUTH_PATH: &str = "/users/self/verify";
 const MAX_SIGNING_FIELD_BYTES: usize = 1_024;
+const MAX_SIGNING_SECRET_BYTES: usize = 1_024;
 const MAX_SIGNED_SUBSCRIPTION_BYTES: usize = 16 * 1024;
 const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
+const MAX_DIRECT_PRODUCT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 2;
 const MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW: u32 = 3;
 
@@ -56,6 +61,7 @@ pub struct CoinbaseDirectLimits {
     websocket: CoinbaseTransportLimits,
     max_snapshot_bytes: u64,
     max_snapshot_segments: usize,
+    product_refresh_interval: std::time::Duration,
     book: DirectBookLimits,
 }
 
@@ -69,6 +75,7 @@ impl CoinbaseDirectLimits {
         websocket: CoinbaseTransportLimits,
         max_snapshot_bytes: u64,
         max_snapshot_segments: usize,
+        product_refresh_interval: std::time::Duration,
         book: DirectBookLimits,
     ) -> Result<Self, CoinbaseConfigError> {
         let segment_capacity = max_snapshot_segments
@@ -80,6 +87,8 @@ impl CoinbaseDirectLimits {
             || max_snapshot_segments == 0
             || max_snapshot_segments > MAX_DIRECT_SNAPSHOT_SEGMENTS
             || max_snapshot_bytes > segment_capacity
+            || product_refresh_interval.is_zero()
+            || product_refresh_interval > MAX_DIRECT_PRODUCT_REFRESH_INTERVAL
         {
             return Err(CoinbaseConfigError::InvalidDirectLimits);
         }
@@ -87,6 +96,7 @@ impl CoinbaseDirectLimits {
             websocket,
             max_snapshot_bytes,
             max_snapshot_segments,
+            product_refresh_interval,
             book,
         })
     }
@@ -106,6 +116,11 @@ impl CoinbaseDirectLimits {
         self.max_snapshot_segments
     }
 
+    /// Returns the bounded interval between current product/status/precision refreshes.
+    pub const fn product_refresh_interval(self) -> std::time::Duration {
+        self.product_refresh_interval
+    }
+
     /// Returns the instrument-owned order-map, replay, and publication limits.
     pub const fn book(self) -> DirectBookLimits {
         self.book
@@ -117,6 +132,7 @@ impl CoinbaseDirectLimits {
 pub struct CoinbaseDirectConfig {
     metadata: SourceMetadata,
     mapping: CoinbaseProductMapping,
+    venue: VenueId,
     terms: InstrumentExecutionTerms,
     limits: CoinbaseDirectLimits,
     snapshot_url: Box<str>,
@@ -177,10 +193,18 @@ impl CoinbaseDirectConfig {
         let timestamp_rule = direct_rule("coinbase-exchange-direct-rfc3339-time")?;
         let sequence_rule = direct_rule("coinbase-exchange-direct-product-sequence")?;
         let checksum_rule = direct_rule("coinbase-exchange-direct-checksum-unsupported")?;
+        let quote_snapshot_rule = direct_rule("coinbase-exchange-direct-quote-snapshot-na-v1")?;
         let live = LiveCoverageDeclaration::try_new(
             mapping.product().clone(),
             ProviderChannel::new(SourceIdentifier::try_from(DIRECT_CHANNEL)?),
             vec![
+                LiveCoverageRule::try_new(
+                    LiveEventClass::Quote,
+                    None,
+                    SnapshotApplicability::NotApplicable {
+                        metadata_rule: quote_snapshot_rule,
+                    },
+                )?,
                 LiveCoverageRule::try_new(
                     LiveEventClass::BookSnapshot,
                     Some(MarketDepth::PriceLevel),
@@ -193,11 +217,12 @@ impl CoinbaseDirectConfig {
                 )?,
             ],
         )?;
+        let venue = VenueId::try_from(COINBASE_VENUE)?;
         let coverage = SourceCoverage::try_instrument(
             coverage_evidence,
             effective,
             vec![AssetClass::Crypto],
-            CoverageTopology::single_venue(VenueId::try_from(COINBASE_VENUE)?),
+            CoverageTopology::single_venue(venue.clone()),
             InstrumentCoverage::enumerated(vec![mapping.instrument()])?,
             Some(live),
             CoverageDelay::RealTime,
@@ -246,6 +271,7 @@ impl CoinbaseDirectConfig {
         Ok(Self {
             metadata,
             mapping,
+            venue,
             terms,
             limits,
             snapshot_url: snapshot_url.into_boxed_str(),
@@ -281,6 +307,11 @@ impl CoinbaseDirectConfig {
     /// Returns the stable mapped instrument.
     pub const fn instrument(&self) -> market_squawk_domain::InstrumentId {
         self.mapping.instrument()
+    }
+
+    /// Returns the direct venue bound into coverage and every derived quote.
+    pub const fn venue(&self) -> &VenueId {
+        &self.venue
     }
 
     /// Returns the immutable instrument terms used for exact Direct normalization.
@@ -459,6 +490,94 @@ pub trait CoinbaseDirectSigningCapability: fmt::Debug + Send + Sync {
     ) -> Result<CoinbaseDirectAuthentication, CoinbaseDirectSigningError>;
 }
 
+/// Local Coinbase Exchange HMAC-SHA256 signing capability with zeroized credential ownership.
+///
+/// The provider's Base64-encoded secret is decoded exactly once at construction. Debug output is
+/// redacted, the signer is not cloneable, and every owned credential buffer is zeroized on drop.
+pub struct CoinbaseDirectHmacSigner {
+    key: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
+    secret: Zeroizing<Vec<u8>>,
+}
+
+impl CoinbaseDirectHmacSigner {
+    /// Imports one bounded Coinbase Exchange API credential.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, oversized, control-bearing, or non-Base64 credential fields.
+    pub fn try_new(
+        key: String,
+        passphrase: String,
+        secret_base64: String,
+    ) -> Result<Self, CoinbaseDirectSigningError> {
+        let key = Zeroizing::new(key);
+        let passphrase = Zeroizing::new(passphrase);
+        let secret_base64 = Zeroizing::new(secret_base64);
+        if !valid_signing_field(&key)
+            || !valid_signing_field(&passphrase)
+            || secret_base64.is_empty()
+            || secret_base64.len() > MAX_SIGNING_FIELD_BYTES
+            || secret_base64.chars().any(char::is_control)
+        {
+            return Err(CoinbaseDirectSigningError::InvalidAuthentication);
+        }
+        let secret = Zeroizing::new(
+            BASE64_STANDARD
+                .decode(secret_base64.as_bytes())
+                .map_err(|_error| CoinbaseDirectSigningError::InvalidAuthentication)?,
+        );
+        if secret.is_empty() || secret.len() > MAX_SIGNING_SECRET_BYTES {
+            return Err(CoinbaseDirectSigningError::InvalidAuthentication);
+        }
+        Ok(Self {
+            key,
+            passphrase,
+            secret,
+        })
+    }
+}
+
+impl CoinbaseDirectSigningCapability for CoinbaseDirectHmacSigner {
+    fn sign(
+        &self,
+        request: CoinbaseDirectSigningRequest<'_>,
+    ) -> Result<CoinbaseDirectAuthentication, CoinbaseDirectSigningError> {
+        if request.timestamp().is_empty()
+            || request.timestamp().len() > 32
+            || !request
+                .timestamp()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return Err(CoinbaseDirectSigningError::InvalidTimestamp);
+        }
+        let mut authentication = Hmac::<Sha256>::new_from_slice(&self.secret)
+            .map_err(|_error| CoinbaseDirectSigningError::Capability)?;
+        authentication.update(request.timestamp().as_bytes());
+        authentication.update(request.method().as_bytes());
+        authentication.update(request.path().as_bytes());
+        let signature = BASE64_STANDARD.encode(authentication.finalize().into_bytes());
+        CoinbaseDirectAuthentication::try_new(
+            self.key.to_string(),
+            self.passphrase.to_string(),
+            signature,
+        )
+    }
+}
+
+impl fmt::Debug for CoinbaseDirectHmacSigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CoinbaseDirectHmacSigner([REDACTED])")
+    }
+}
+
+fn valid_signing_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SIGNING_FIELD_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 /// Bounded authentication fields. Debug output never reveals any field.
 pub struct CoinbaseDirectAuthentication {
     key: Zeroizing<String>,
@@ -477,10 +596,7 @@ impl CoinbaseDirectAuthentication {
         let passphrase = Zeroizing::new(passphrase);
         let signature = Zeroizing::new(signature);
         for value in [key.as_str(), passphrase.as_str(), signature.as_str()] {
-            if value.is_empty()
-                || value.len() > MAX_SIGNING_FIELD_BYTES
-                || value.chars().any(char::is_control)
-            {
+            if !valid_signing_field(value) {
                 return Err(CoinbaseDirectSigningError::InvalidAuthentication);
             }
         }
@@ -2106,16 +2222,41 @@ mod tests {
     use crate::{
         COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError, CoinbaseDirectAuthentication,
         CoinbaseDirectConfig, CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome,
-        CoinbaseDirectDecoder, CoinbaseDirectLimits, CoinbaseDirectNonBookKind,
-        CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
-        CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
-        CoinbaseProductMapping, CoinbaseTransportLimits,
+        CoinbaseDirectDecoder, CoinbaseDirectHmacSigner, CoinbaseDirectLimits,
+        CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
+        CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
+        CoinbaseDirectStopType, CoinbaseProductMapping, CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     static_assertions::assert_not_impl_any!(CoinbaseDirectAuthentication: Clone);
+    static_assertions::assert_not_impl_any!(CoinbaseDirectHmacSigner: Clone);
     static_assertions::assert_not_impl_any!(super::CoinbaseSignedSubscription: Clone);
+
+    #[test]
+    fn production_signer_decodes_and_zeroizes_the_exchange_secret_boundary() -> TestResult {
+        let signer = CoinbaseDirectHmacSigner::try_new(
+            "fixture-key".to_owned(),
+            "fixture-passphrase".to_owned(),
+            "dGVzdC1zZWNyZXQ=".to_owned(),
+        )?;
+        let authentication = signer.sign(CoinbaseDirectSigningRequest {
+            timestamp: "1721847600",
+        })?;
+
+        assert_eq!(authentication.key(), "fixture-key");
+        assert_eq!(authentication.passphrase(), "fixture-passphrase");
+        assert_eq!(
+            authentication.signature(),
+            "A5aXA9/etj7poRg/4b7U0odFyG7J5MlveUG2uOAZlP0="
+        );
+        assert_eq!(
+            format!("{signer:?}"),
+            "CoinbaseDirectHmacSigner([REDACTED])"
+        );
+        Ok(())
+    }
 
     fn id(value: &str) -> TestResult<SourceIdentifier> {
         Ok(SourceIdentifier::try_from(value)?)
@@ -2200,6 +2341,7 @@ mod tests {
                 )?,
                 16 * 1024 * 1024,
                 8,
+                Duration::from_secs(1),
                 DirectBookLimits::try_new(128, 64, 32, 512 * 1024, 8)?,
             )?,
         ))

@@ -17,10 +17,11 @@ use market_squawk_live::{DirectBookLimits, DirectSyncPhase};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetDecision, BudgetScope, BudgetUnavailableReason, FreshnessPolicy, LiveSourceGeneration,
-    ProviderBudgetPolicy, ProviderDecimalLexeme, RawMarketFrame, RawMarketSink, SessionId,
-    SinkError, SourceError,
+    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecoderEvidence, FreshnessPolicy,
+    LiveSourceGeneration, ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload,
+    RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
 use tokio_tungstenite::{
@@ -203,6 +204,9 @@ fn successful_http_response(url: &str, body: &'static [u8]) -> CoinbaseDirectHtt
 struct RecordedBook {
     sequence: u64,
     snapshot_url: String,
+    source_identifier: String,
+    bid: Option<(String, String)>,
+    ask: Option<(String, String)>,
     bids: Vec<(i64, i64)>,
     asks: Vec<(i64, i64)>,
 }
@@ -254,11 +258,45 @@ impl CoinbaseDirectOutput for RecordingOutput {
         Ok(())
     }
 
+    fn try_retain_sequenced_frame(&mut self, evidence: &DecoderEvidence) -> Result<(), SinkError> {
+        if self
+            .frames
+            .last()
+            .is_none_or(|frame| frame.frame_id() != evidence.frame_id())
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        Ok(())
+    }
+
     fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError> {
+        let quote = update
+            .try_quote_batch()
+            .map_err(|_error| SinkError::CaptureIncomplete)?;
+        let observation = quote
+            .observations()
+            .first()
+            .ok_or(SinkError::CaptureIncomplete)?;
+        let ProviderObservationPayload::Quote { bid, ask } = observation.payload() else {
+            return Err(SinkError::CaptureIncomplete);
+        };
         let book = update.book();
         self.books.push(RecordedBook {
             sequence: update.sequence().get(),
             snapshot_url: update.snapshot_receipt().final_url().to_owned(),
+            source_identifier: observation.source_identifier().as_str().to_owned(),
+            bid: bid.as_ref().map(|level| {
+                (
+                    level.price().value().as_str().to_owned(),
+                    level.quantity().value().as_str().to_owned(),
+                )
+            }),
+            ask: ask.as_ref().map(|level| {
+                (
+                    level.price().value().as_str().to_owned(),
+                    level.quantity().value().as_str().to_owned(),
+                )
+            }),
             bids: book
                 .bids()
                 .map(|level| (level.price().get(), level.quantity().get()))
@@ -415,12 +453,18 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             RecordedBook {
                 sequence: 103,
                 snapshot_url: config.snapshot_url().to_owned(),
+                source_identifier: snapshot_identity(103),
+                bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
+                ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
             },
             RecordedBook {
                 sequence: 104,
                 snapshot_url: config.snapshot_url().to_owned(),
+                source_identifier: snapshot_identity(104),
+                bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
+                ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
             },
@@ -571,6 +615,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
             )?,
             16 * 1024 * 1024,
             8,
+            Duration::from_secs(1),
             DirectBookLimits::try_new(128, 64, 32, 512 * 1024, 8)?,
         )?,
     )
@@ -586,4 +631,13 @@ fn evidence(byte: u8) -> ExactPayloadEvidence {
         DigestAlgorithm::Sha256,
         [byte; 32],
     ))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn snapshot_identity(sequence: u64) -> String {
+    let digest: [u8; 32] = Sha256::digest(SNAPSHOT_BODY).into();
+    format!("coinbase-direct-book-{sequence}-{}", hex_digest(&digest))
 }
