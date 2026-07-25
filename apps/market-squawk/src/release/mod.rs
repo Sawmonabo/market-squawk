@@ -1,5 +1,7 @@
 //! Exact-head release evidence and deterministic local demonstration.
 
+#[cfg(feature = "release-evidence")]
+mod benchmark;
 mod close;
 mod fuzz;
 mod identity;
@@ -9,8 +11,8 @@ mod process;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::cli::{ReleaseCommand, ReleaseEvidenceCommand};
 use crate::AppConfig;
+use crate::cli::{ReleaseCommand, ReleaseEvidenceCommand};
 
 /// Executes one production release-evidence operation outside the live event path.
 pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand) -> Result<Value> {
@@ -22,7 +24,23 @@ pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand)
             command: ReleaseEvidenceCommand::Close(arguments),
         } => close::run(arguments),
         ReleaseCommand::Evidence {
-            command: ReleaseEvidenceCommand::Benchmark(_) | ReleaseEvidenceCommand::Providers(_),
+            command: ReleaseEvidenceCommand::Benchmark(arguments),
+        } => {
+            #[cfg(feature = "release-evidence")]
+            {
+                benchmark::run(config, arguments).await
+            }
+            #[cfg(not(feature = "release-evidence"))]
+            {
+                drop(config);
+                drop(arguments);
+                anyhow::bail!(
+                    "release benchmark requires a build with the release-evidence feature"
+                )
+            }
+        }
+        ReleaseCommand::Evidence {
+            command: ReleaseEvidenceCommand::Providers(_),
         }
         | ReleaseCommand::Demonstrate(_) => {
             drop(config);

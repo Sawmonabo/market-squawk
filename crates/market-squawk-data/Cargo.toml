@@ -8,6 +8,10 @@ description = "Durable local control and analytical catalog for Market Squawk"
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
+[features]
+default = []
+release-evidence = []
+
 [dependencies]
 async-trait = { workspace = true }
 arrow = { workspace = true }

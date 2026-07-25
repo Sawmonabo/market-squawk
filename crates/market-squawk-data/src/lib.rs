@@ -92,6 +92,10 @@ pub use manifest::{
     MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, ManifestObject,
     ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
+#[cfg(feature = "release-evidence")]
+pub use manifest::{
+    ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
+};
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
 };

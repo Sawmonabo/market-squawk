@@ -24,6 +24,11 @@ pub use admission::{
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
     recover_model_candidate, verify_model_candidate,
 };
+#[cfg(feature = "release-evidence")]
+pub use bundle::benchmark_support::{
+    ReleaseEvidenceInferenceError, ReleaseEvidenceInferenceFixture,
+    ReleaseEvidenceInferenceIdentity,
+};
 #[cfg(feature = "fuzzing")]
 pub use bundle::fuzz_parse_bundle_metadata;
 pub use bundle::{

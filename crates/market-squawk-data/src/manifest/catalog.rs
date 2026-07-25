@@ -1,5 +1,9 @@
 //! SQLite-backed immutable analytical generation storage.
 
+#[cfg(feature = "release-evidence")]
+#[path = "../benchmark_support.rs"]
+pub(super) mod benchmark_support;
+
 use std::fmt;
 use std::fmt::Write as _;
 use std::mem::size_of;

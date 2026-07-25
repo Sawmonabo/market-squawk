@@ -1,5 +1,9 @@
 //! Capability-rooted bundle reads and closed fail-closed validation.
 
+#[cfg(feature = "release-evidence")]
+#[path = "benchmark_support.rs"]
+pub(crate) mod benchmark_support;
+
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::path::Path;

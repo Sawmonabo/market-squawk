@@ -3405,6 +3405,7 @@ dependencies = [
  "market-squawk-services",
  "market-squawk-sources",
  "market-squawk-valuation",
+ "memory-stats",
  "parking_lot",
  "reqwest",
  "rust_decimal",
