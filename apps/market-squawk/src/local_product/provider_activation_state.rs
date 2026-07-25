@@ -110,26 +110,34 @@ impl DurableProviderActivationState {
     pub(super) fn startup_runtime_admissions(
         &self,
     ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
-        let entries = RESTORABLE_RESEARCH_SURFACES
-            .into_iter()
-            .filter_map(|surface_id| match self.load_recipe(surface_id) {
-                Ok(DurableActivationRecipeState::Desired(recipe)) => Some(
-                    SourceIdentifier::try_from(surface_id)
-                        .map(|surface_id| (surface_id, recipe.session_id)),
-                ),
+        let mut entries = Vec::new();
+        for surface_id in RESTORABLE_RESEARCH_SURFACES {
+            let recovered = match self.load_recipe(surface_id) {
+                Ok(DurableActivationRecipeState::Desired(recipe)) => {
+                    vec![recipe.session_id]
+                }
                 Ok(DurableActivationRecipeState::Staged(recipe)) => {
-                    recipe.staged_predecessor.map(|predecessor| {
-                        SourceIdentifier::try_from(surface_id)
-                            .map(|surface_id| (surface_id, predecessor.session_id))
-                    })
+                    let mut sessions = vec![recipe.session_id];
+                    if let Some(predecessor) = recipe.staged_predecessor
+                        && predecessor.session_id != recipe.session_id
+                    {
+                        sessions.push(predecessor.session_id);
+                    }
+                    sessions
                 }
                 Ok(
                     DurableActivationRecipeState::Missing
                     | DurableActivationRecipeState::Quarantined(_),
                 )
-                | Err(_) => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                | Err(_) => Vec::new(),
+            };
+            let surface_id = SourceIdentifier::try_from(surface_id)?;
+            entries.extend(
+                recovered
+                    .into_iter()
+                    .map(|session_id| (surface_id.clone(), session_id)),
+            );
+        }
         ProviderRuntimeStartupAdmissions::try_new(entries)
     }
 

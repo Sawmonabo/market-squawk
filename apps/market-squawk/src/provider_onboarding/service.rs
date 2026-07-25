@@ -1,6 +1,6 @@
 //! Transport-neutral provider onboarding application service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -129,16 +129,16 @@ pub struct ProviderOnboardingService {
 /// Exact durable runtime-session authority admitted during startup reconciliation.
 #[derive(Debug, Default)]
 pub(crate) struct ProviderRuntimeStartupAdmissions {
-    sessions: BTreeMap<SourceIdentifier, Uuid>,
+    sessions: BTreeMap<SourceIdentifier, BTreeSet<Uuid>>,
 }
 
 impl ProviderRuntimeStartupAdmissions {
     pub(crate) fn try_new(
         entries: impl IntoIterator<Item = (SourceIdentifier, Uuid)>,
     ) -> Result<Self, ProviderOnboardingError> {
-        let mut sessions = BTreeMap::new();
+        let mut sessions: BTreeMap<SourceIdentifier, BTreeSet<Uuid>> = BTreeMap::new();
         for (surface_id, session_id) in entries {
-            if session_id.is_nil() || sessions.insert(surface_id, session_id).is_some() {
+            if session_id.is_nil() || !sessions.entry(surface_id).or_default().insert(session_id) {
                 return Err(ProviderOnboardingError::InvalidSessionState);
             }
         }
@@ -146,7 +146,9 @@ impl ProviderRuntimeStartupAdmissions {
     }
 
     fn admits(&self, surface_id: &SourceIdentifier, session_id: Uuid) -> bool {
-        self.sessions.get(surface_id) == Some(&session_id)
+        self.sessions
+            .get(surface_id)
+            .is_some_and(|sessions| sessions.contains(&session_id))
     }
 }
 
@@ -864,6 +866,30 @@ impl ProviderOnboardingService {
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
         }
         Ok(session_view(profile, &resumed))
+    }
+
+    /// Returns whether one exact session has durably lost all activation authority.
+    pub(crate) fn activation_recipe_is_invalidated(
+        &self,
+        session_id: Uuid,
+    ) -> Result<bool, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let _profile = self.profile_for(&resumed)?;
+        let lifecycle = resumed.lifecycle();
+        Ok(matches!(
+            lifecycle.state(),
+            OnboardingState::Blocked | OnboardingState::CleanupRequired
+        ) && lifecycle.active_generation().is_none()
+            && lifecycle.candidate_generation().is_none()
+            && lifecycle.generation_states().all(|(_generation, state)| {
+                matches!(
+                    state,
+                    CredentialGenerationState::CleanupRequired
+                        | CredentialGenerationState::Retired
+                        | CredentialGenerationState::Tombstoned
+                        | CredentialGenerationState::AbandonedNoEffect
+                )
+            }))
     }
 
     /// Revokes durable authority and completes deterministic local credential cleanup.

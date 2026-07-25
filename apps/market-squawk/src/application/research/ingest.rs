@@ -45,8 +45,9 @@ mod provider_runtime;
 mod selection;
 
 use provider_runtime::ResearchProviderAdmission;
-pub use provider_runtime::{
-    PreparedResearchProviderReplacement, ResearchProviderRuntimeGeneration,
+pub use provider_runtime::ResearchProviderRuntimeGeneration;
+pub(crate) use provider_runtime::{
+    CommittedResearchProviderReplacement, PreparedResearchProviderReplacement,
 };
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
@@ -448,7 +449,10 @@ impl ProductionResearchIngestCoordinator {
         if authority.registry.is_none() {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
-        Ok(authority.sources.contains_key(profile))
+        Ok(authority
+            .sources
+            .get(profile)
+            .is_some_and(|source| source.admission.ensure_live().is_ok()))
     }
 
     /// Lists exact source objects from one registered provider without minting receipts.

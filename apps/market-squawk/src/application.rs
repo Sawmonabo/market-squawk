@@ -40,13 +40,15 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub use paper::PaperApplicationServices;
+pub(crate) use research::{
+    CommittedResearchProviderReplacement, PreparedResearchProviderReplacement,
+};
 pub use research::{
-    ManagedResearchExtractionSource, PreparedResearchProviderReplacement,
-    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
-    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscovery,
-    ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
-    ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
+    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
+    ResearchIngestCoordinator, ResearchProviderRuntimeGeneration, ResearchRevisionPlanError,
+    ResearchRightsAuthority, ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator,
+    ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
 };
 pub use source::{
     SourceApplicationError, SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshot,

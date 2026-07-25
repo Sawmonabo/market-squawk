@@ -30,12 +30,14 @@ use crate::ResearchService;
 
 mod ingest;
 
+pub(crate) use ingest::{
+    CommittedResearchProviderReplacement, PreparedResearchProviderReplacement,
+};
 pub use ingest::{
-    ManagedResearchExtractionSource, PreparedResearchProviderReplacement,
-    ProductionResearchIngestCoordinator, ResearchExtractionLimits, ResearchIngestCompositionError,
-    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
-    ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
-    ResearchSourceObjectListing,
+    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
+    ResearchIngestCompositionError, ResearchProviderRuntimeGeneration, ResearchRevisionPlanError,
+    ResearchRightsAuthority, ResearchSourceDiscovery, ResearchSourceDiscoveryObject,
+    ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
 };
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";

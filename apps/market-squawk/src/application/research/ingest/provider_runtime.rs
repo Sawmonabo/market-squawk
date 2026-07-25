@@ -252,9 +252,10 @@ pub(super) struct ResearchProviderAdmission {
     cancellation: CancellationToken,
 }
 
-const ADMISSION_ACTIVE: u8 = 0;
-const ADMISSION_REVOKING: u8 = 1;
-const ADMISSION_DRAINED: u8 = 2;
+const ADMISSION_PENDING: u8 = 0;
+const ADMISSION_ACTIVE: u8 = 1;
+const ADMISSION_REVOKING: u8 = 2;
+const ADMISSION_DRAINED: u8 = 3;
 
 #[derive(Debug)]
 struct ResearchProviderAdmissionState {
@@ -294,12 +295,25 @@ impl ResearchProviderAdmission {
     pub(super) fn new(
         generation: Option<&ResearchProviderRuntimeGeneration>,
     ) -> Result<Self, ResearchIngestCompositionError> {
+        Self::with_phase(generation, ADMISSION_ACTIVE)
+    }
+
+    fn new_pending(
+        generation: &ResearchProviderRuntimeGeneration,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        Self::with_phase(Some(generation), ADMISSION_PENDING)
+    }
+
+    fn with_phase(
+        generation: Option<&ResearchProviderRuntimeGeneration>,
+        phase: u8,
+    ) -> Result<Self, ResearchIngestCompositionError> {
         Ok(Self {
             generation_digest: generation
                 .map(ResearchProviderRuntimeGeneration::generation_digest)
                 .transpose()?,
             state: Arc::new(ResearchProviderAdmissionState {
-                phase: AtomicU8::new(ADMISSION_ACTIVE),
+                phase: AtomicU8::new(phase),
                 publication_barrier: Arc::new(RwLock::new(())),
             }),
             cancellation: CancellationToken::new(),
@@ -325,13 +339,35 @@ impl ResearchProviderAdmission {
     }
 
     fn begin_revocation(&self) {
-        let _phase = self.state.phase.compare_exchange(
-            ADMISSION_ACTIVE,
-            ADMISSION_REVOKING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut phase = self.state.phase.load(Ordering::Acquire);
+        while matches!(phase, ADMISSION_PENDING | ADMISSION_ACTIVE) {
+            match self.state.phase.compare_exchange(
+                phase,
+                ADMISSION_REVOKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => phase = current,
+            }
+        }
         self.cancellation.cancel();
+    }
+
+    fn ensure_pending(&self) -> Result<(), ResearchIngestCompositionError> {
+        if self.cancellation.is_cancelled()
+            || self.state.phase.load(Ordering::Acquire) != ADMISSION_PENDING
+        {
+            Err(ResearchIngestCompositionError::StaleRuntimeGeneration)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn activate_pending(&self) {
+        debug_assert!(!self.cancellation.is_cancelled());
+        let prior = self.state.phase.swap(ADMISSION_ACTIVE, Ordering::AcqRel);
+        debug_assert_eq!(prior, ADMISSION_PENDING);
     }
 
     pub(super) async fn acquire_publication_lease(
@@ -366,8 +402,8 @@ impl ResearchProviderAdmission {
     }
 }
 
-/// Fully constructed replacement held outside the callable runtime until exact commit.
-pub struct PreparedResearchProviderReplacement {
+/// Fully constructed replacement held outside the callable runtime until exact finalization.
+pub(crate) struct PreparedResearchProviderReplacement {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
     profile: SourceIdentifier,
     token: Uuid,
@@ -375,24 +411,53 @@ pub struct PreparedResearchProviderReplacement {
     candidate: ResearchProviderRuntimeGeneration,
     candidate_source: Option<Arc<dyn ManagedResearchExtractionSource>>,
     candidate_admission: ResearchProviderAdmission,
-    committed: bool,
+    completed: bool,
 }
 
 impl PreparedResearchProviderReplacement {
     /// Returns the exact expected old runtime identity.
-    pub const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
+    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
         &self.expected
     }
 
-    /// Returns the fully validated candidate runtime identity.
-    pub const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
-        &self.candidate
+    /// Revokes and drains only the token-bound predecessor retained by this transaction.
+    pub(crate) async fn revoke_predecessor(
+        &mut self,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let admission = {
+            let mut authority = self
+                .coordinator
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            let current = authority
+                .sources
+                .get(&self.profile)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation.as_ref() != Some(&self.expected)
+                || current.metadata != self.expected.metadata
+                || current.rights != self.expected.rights
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.revoke();
+            let admission = current.admission.clone();
+            authority.selections.revoke_profile(&self.profile);
+            admission
+        };
+        admission.revoke_and_drain().await;
+        Ok(())
     }
 
-    /// Publishes the prebuilt source in one serialized in-memory swap.
-    pub fn commit(
+    /// Restores the exact predecessor retained by this token without publishing the candidate.
+    pub(crate) fn rollback(
         mut self,
     ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
         let mut authority = self
             .coordinator
             .authority
@@ -407,53 +472,89 @@ impl PreparedResearchProviderReplacement {
         if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
+        let replacement_admission = {
+            let current = authority
+                .sources
+                .get(&self.profile)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation.as_ref() != Some(&self.expected)
+                || current.metadata != self.expected.metadata
+                || current.rights != self.expected.rights
+                || current.registration.source_id() != current.metadata.source_id()
+                || current.registration.revision() != current.metadata.revision()
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            if current.admission.revocation_drained() {
+                Some(ResearchProviderAdmission::new(Some(&self.expected))?)
+            } else {
+                current.admission.ensure_live()?;
+                None
+            }
+        };
+        self.candidate_admission.revoke();
+        if let Some(admission) = replacement_admission {
+            let current = authority
+                .sources
+                .get_mut(&self.profile)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            current.admission = admission;
+        }
+        let removed = authority.pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.completed = true;
+        Ok(self.expected.clone())
+    }
+
+    /// Transfers the validated candidate into a still-non-callable committed capability.
+    pub(crate) fn commit(
+        &mut self,
+    ) -> Result<CommittedResearchProviderReplacement, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
         let current = authority
             .sources
             .get(&self.profile)
             .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-        if current.generation.as_ref() != Some(&self.expected) {
+        if current.generation.as_ref() != Some(&self.expected)
+            || current.metadata != self.expected.metadata
+            || current.rights != self.expected.rights
+            || current.registration.source_id() != current.metadata.source_id()
+            || current.registration.revision() != current.metadata.revision()
+        {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
         if !current.admission.revocation_drained() {
             return Err(ResearchIngestCompositionError::RuntimeGenerationStillCallable);
         }
+        drop(authority);
         let candidate_source = self
             .candidate_source
             .take()
             .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
-        let replacement_registration = if current.metadata == self.candidate.metadata {
-            None
-        } else {
-            let registered_at = super::system_timestamp()
-                .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
-            let registry = authority
-                .registry
-                .as_mut()
-                .ok_or(ResearchIngestCompositionError::ShuttingDown)?;
-            Some(registry.replace_metadata(
-                &current.registration,
-                self.candidate.metadata.clone(),
-                registered_at,
-            )?)
-        };
-        let removed = authority.pending_replacements.remove(&self.profile);
-        if removed != Some(self.token) {
-            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
-        }
-        let current = authority
-            .sources
-            .get_mut(&self.profile)
-            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-        current.source = candidate_source;
-        current.metadata = self.candidate.metadata.clone();
-        if let Some(registration) = replacement_registration {
-            current.registration = registration;
-        }
-        current.rights = self.candidate.rights.clone();
-        current.generation = Some(self.candidate.clone());
-        current.admission = self.candidate_admission.clone();
-        self.committed = true;
-        Ok(self.candidate.clone())
+        self.completed = true;
+        Ok(CommittedResearchProviderReplacement {
+            coordinator: Arc::clone(&self.coordinator),
+            profile: self.profile.clone(),
+            token: self.token,
+            expected: self.expected.clone(),
+            candidate: self.candidate.clone(),
+            candidate_source: Some(candidate_source),
+            candidate_admission: self.candidate_admission.clone(),
+            completed: false,
+        })
     }
 }
 
@@ -470,9 +571,10 @@ impl std::fmt::Debug for PreparedResearchProviderReplacement {
 
 impl Drop for PreparedResearchProviderReplacement {
     fn drop(&mut self) {
-        if self.committed {
+        if self.completed {
             return;
         }
+        self.candidate_admission.revoke();
         let Ok(mut authority) = self.coordinator.authority.lock() else {
             tracing::error!(
                 profile = self.profile.as_str(),
@@ -486,9 +588,172 @@ impl Drop for PreparedResearchProviderReplacement {
     }
 }
 
+/// Token-bound candidate retained pending until higher-level durable authority is exact.
+pub(crate) struct CommittedResearchProviderReplacement {
+    coordinator: Arc<ProductionResearchIngestCoordinator>,
+    profile: SourceIdentifier,
+    token: Uuid,
+    expected: ResearchProviderRuntimeGeneration,
+    candidate: ResearchProviderRuntimeGeneration,
+    candidate_source: Option<Arc<dyn ManagedResearchExtractionSource>>,
+    candidate_admission: ResearchProviderAdmission,
+    completed: bool,
+}
+
+impl CommittedResearchProviderReplacement {
+    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.expected
+    }
+
+    pub(crate) const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.candidate
+    }
+
+    /// Cancels the pending candidate and re-admits the exact retained predecessor.
+    pub(crate) fn rollback(
+        mut self,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let predecessor_admission = ResearchProviderAdmission::new(Some(&self.expected))?;
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let current = authority
+            .sources
+            .get_mut(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation.as_ref() != Some(&self.expected)
+            || current.metadata != self.expected.metadata
+            || current.rights != self.expected.rights
+            || current.registration.source_id() != current.metadata.source_id()
+            || current.registration.revision() != current.metadata.revision()
+            || !current.admission.revocation_drained()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.candidate_admission.revoke();
+        current.admission = predecessor_admission;
+        let removed = authority.pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.completed = true;
+        Ok(self.expected.clone())
+    }
+
+    /// Publishes and activates the candidate after higher-level durable authority is exact.
+    pub(crate) fn finalize(
+        &mut self,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let super::CoordinatorAuthority {
+            registry,
+            sources,
+            pending_replacements,
+            selections: _,
+        } = &mut *authority;
+        let current = sources
+            .get_mut(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation.as_ref() != Some(&self.expected)
+            || current.metadata != self.expected.metadata
+            || current.rights != self.expected.rights
+            || current.registration.source_id() != current.metadata.source_id()
+            || current.registration.revision() != current.metadata.revision()
+            || !current.admission.revocation_drained()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let candidate_source = self
+            .candidate_source
+            .take()
+            .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
+        let replacement_registration = if current.metadata == self.candidate.metadata {
+            None
+        } else {
+            let registered_at = super::system_timestamp()
+                .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+            Some(
+                registry
+                    .as_mut()
+                    .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+                    .replace_metadata(
+                        &current.registration,
+                        self.candidate.metadata.clone(),
+                        registered_at,
+                    )?,
+            )
+        };
+        current.source = candidate_source;
+        current.metadata = self.candidate.metadata.clone();
+        if let Some(registration) = replacement_registration {
+            current.registration = registration;
+        }
+        current.rights = self.candidate.rights.clone();
+        current.generation = Some(self.candidate.clone());
+        current.admission = self.candidate_admission.clone();
+        let removed = pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.candidate_admission.activate_pending();
+        self.completed = true;
+        Ok(self.candidate.clone())
+    }
+}
+
+impl std::fmt::Debug for CommittedResearchProviderReplacement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommittedResearchProviderReplacement")
+            .field("profile", &self.profile)
+            .field("expected", &self.expected)
+            .field("candidate", &self.candidate)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CommittedResearchProviderReplacement {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.candidate_admission.revoke();
+        let Ok(mut authority) = self.coordinator.authority.lock() else {
+            tracing::error!(
+                profile = self.profile.as_str(),
+                "committed provider replacement could not be failed closed"
+            );
+            return;
+        };
+        if authority.pending_replacements.get(&self.profile) == Some(&self.token) {
+            let _removed = authority.pending_replacements.remove(&self.profile);
+        }
+    }
+}
+
 impl ProductionResearchIngestCoordinator {
     /// Registers one provider adapter bound to an exact onboarding/runtime generation.
-    pub fn register_provider_source<S>(
+    pub(crate) fn register_provider_source<S>(
         &self,
         generation: ResearchProviderRuntimeGeneration,
         source: S,
@@ -526,6 +791,9 @@ impl ProductionResearchIngestCoordinator {
         let Some(source) = authority.sources.get(profile) else {
             return Ok(None);
         };
+        if source.admission.ensure_live().is_err() {
+            return Ok(None);
+        }
         source
             .generation
             .clone()
@@ -534,7 +802,7 @@ impl ProductionResearchIngestCoordinator {
     }
 
     /// Prepares an exact expected-old to exact-new adapter replacement without publishing it.
-    pub fn prepare_provider_replacement<S>(
+    pub(crate) fn prepare_provider_replacement<S>(
         self: &Arc<Self>,
         expected: ResearchProviderRuntimeGeneration,
         candidate: ResearchProviderRuntimeGeneration,
@@ -554,7 +822,7 @@ impl ProductionResearchIngestCoordinator {
         let profile = candidate.profile().clone();
         let token = Uuid::new_v4();
         let candidate_source: Arc<dyn ManagedResearchExtractionSource> = Arc::new(source);
-        let candidate_admission = ResearchProviderAdmission::new(Some(&candidate))?;
+        let candidate_admission = ResearchProviderAdmission::new_pending(&candidate)?;
         let mut authority = self
             .authority
             .lock()
@@ -586,12 +854,12 @@ impl ProductionResearchIngestCoordinator {
             candidate,
             candidate_source: Some(candidate_source),
             candidate_admission,
-            committed: false,
+            completed: false,
         })
     }
 
     /// Revokes exactly one callable generation and every retained receipt minted from it.
-    pub async fn revoke_provider_generation(
+    pub(crate) async fn revoke_provider_generation(
         &self,
         profile: &SourceIdentifier,
         expected: &ResearchProviderRuntimeGeneration,
@@ -615,40 +883,6 @@ impl ProductionResearchIngestCoordinator {
         };
         admission.revoke_and_drain().await;
         Ok(())
-    }
-
-    /// Restores request admission for an unchanged exact generation after an aborted replacement.
-    pub fn restore_provider_generation(
-        &self,
-        profile: &SourceIdentifier,
-        expected: &ResearchProviderRuntimeGeneration,
-    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
-        let mut authority = self
-            .authority
-            .lock()
-            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        if self.lifecycle.shutdown_token().is_cancelled() || authority.registry.is_none() {
-            return Err(ResearchIngestCompositionError::ShuttingDown);
-        }
-        if authority.pending_replacements.contains_key(profile) {
-            return Err(ResearchIngestCompositionError::ReplacementInProgress);
-        }
-        let current = authority
-            .sources
-            .get_mut(profile)
-            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-        if current.generation.as_ref() != Some(expected)
-            || current.metadata != expected.metadata
-            || current.rights != expected.rights
-        {
-            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
-        }
-        if current.admission.revocation_drained() {
-            current.admission = ResearchProviderAdmission::new(Some(expected))?;
-        } else {
-            current.admission.ensure_live()?;
-        }
-        Ok(expected.clone())
     }
 }
 

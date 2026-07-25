@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::{
-    ManagedResearchExtractionSource, PreparedResearchProviderReplacement,
-    ProductionResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
-    ResearchRightsAuthority,
+    CommittedResearchProviderReplacement, ManagedResearchExtractionSource,
+    PreparedResearchProviderReplacement, ProductionResearchIngestCoordinator,
+    ResearchProviderRuntimeGeneration, ResearchRightsAuthority,
 };
 use crate::{
     ProductionLiveSourceComposition, ProductionSourceProvider, ProviderActivationLease,
@@ -165,16 +165,65 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
-    /// Re-admits one unchanged runtime only while its exact onboarding lease remains active.
-    pub(crate) fn restore_research_runtime(
+    /// Returns whether one exact runtime still has the current onboarding activation lease.
+    pub(crate) fn research_runtime_lease_is_current(
         &self,
         expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<bool, ProviderAdapterActivationError> {
+        match self.onboarding.activation_lease(expected.session_id()) {
+            Ok(lease) => Ok(require_runtime_lease(expected, &lease).is_ok()),
+            Err(ProviderOnboardingError::ActivationUnavailable) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Rolls back a prepared candidate only while the predecessor lease remains exactly current.
+    pub(crate) fn rollback_prepared_research_replacement(
+        &self,
+        prepared: PreparedProviderAdapterReplacement,
     ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
-        let lease = self.onboarding.activation_lease(expected.session_id())?;
-        require_runtime_lease(expected, &lease)?;
-        self.research
-            .restore_provider_generation(expected.profile(), expected)
-            .map_err(Into::into)
+        if self.research_runtime_lease_is_current(prepared.candidate())? {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(prepared.expected().session_id())?;
+        require_runtime_lease(prepared.expected(), &lease)?;
+        prepared.rollback()
+    }
+
+    /// Rolls back a committed candidate only while the predecessor lease remains exactly current.
+    pub(crate) fn rollback_committed_research_replacement(
+        &self,
+        committed: CommittedProviderAdapterReplacement,
+    ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        if self.research_runtime_lease_is_current(committed.candidate())? {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(committed.expected().session_id())?;
+        require_runtime_lease(committed.expected(), &lease)?;
+        committed.rollback()
+    }
+
+    /// Publishes a committed candidate only while its exact onboarding lease remains current.
+    pub(crate) fn finalize_research_replacement(
+        &self,
+        committed: &mut CommittedProviderAdapterReplacement,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        if committed.expected().session_id() != committed.candidate().session_id()
+            && !self
+                .onboarding
+                .activation_recipe_is_invalidated(committed.expected().session_id())?
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let lease = self
+            .onboarding
+            .activation_lease(committed.candidate().session_id())?;
+        require_runtime_lease(committed.candidate(), &lease)?;
+        committed.finalize(lease)
     }
 
     /// Derives the exact non-secret runtime identity before adapter publication.
@@ -654,24 +703,41 @@ pub(crate) struct PreparedProviderAdapterReplacement {
 }
 
 impl PreparedProviderAdapterReplacement {
+    /// Returns the exact predecessor generation held by this transaction.
+    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
+        self.prepared.expected()
+    }
+
     /// Returns the exact replacement generation bound to durable desired state.
     pub(crate) const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
         &self.candidate
     }
 
-    /// Atomically publishes the prebuilt adapter after durable state agrees.
+    /// Drains the exact predecessor without exposing a general re-admission operation.
+    pub(crate) async fn revoke_predecessor(
+        &mut self,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        self.prepared.revoke_predecessor().await.map_err(Into::into)
+    }
+
+    fn rollback(self) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        self.prepared.rollback().map_err(Into::into)
+    }
+
+    /// Transfers the prebuilt adapter into a still-non-callable committed capability.
     pub(crate) fn commit(
-        self,
-    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
-        let profile = self.lease.surface_id().clone();
+        &mut self,
+    ) -> Result<CommittedProviderAdapterReplacement, ProviderAdapterActivationError> {
         let committed = self.prepared.commit()?;
-        if committed != self.candidate {
+        if committed.candidate() != &self.candidate
+            || committed.expected() != self.prepared.expected()
+        {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
-        Ok(ActivatedResearchProvider {
-            lease: self.lease,
-            profile,
-            generation: committed,
+        Ok(CommittedProviderAdapterReplacement {
+            lease: self.lease.clone(),
+            candidate: self.candidate.clone(),
+            committed,
         })
     }
 }
@@ -681,6 +747,55 @@ impl fmt::Debug for PreparedProviderAdapterReplacement {
         formatter
             .debug_struct("PreparedProviderAdapterReplacement")
             .field("surface_id", self.lease.surface_id())
+            .field("candidate", &self.candidate)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact candidate held non-callable until onboarding and durable state jointly authorize it.
+pub(crate) struct CommittedProviderAdapterReplacement {
+    lease: ProviderActivationLease,
+    candidate: ResearchProviderRuntimeGeneration,
+    committed: CommittedResearchProviderReplacement,
+}
+
+impl CommittedProviderAdapterReplacement {
+    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
+        self.committed.expected()
+    }
+
+    pub(crate) const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.candidate
+    }
+
+    fn rollback(self) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        self.committed.rollback().map_err(Into::into)
+    }
+
+    fn finalize(
+        &mut self,
+        lease: ProviderActivationLease,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        require_runtime_lease(&self.candidate, &lease)?;
+        let profile = lease.surface_id().clone();
+        let generation = self.committed.finalize()?;
+        if generation != self.candidate {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(ActivatedResearchProvider {
+            lease,
+            profile,
+            generation,
+        })
+    }
+}
+
+impl fmt::Debug for CommittedProviderAdapterReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedProviderAdapterReplacement")
+            .field("surface_id", self.lease.surface_id())
+            .field("expected", self.committed.expected())
             .field("candidate", &self.candidate)
             .finish_non_exhaustive()
     }
