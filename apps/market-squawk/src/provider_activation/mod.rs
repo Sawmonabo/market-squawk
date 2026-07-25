@@ -165,6 +165,18 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
+    /// Re-admits one unchanged runtime only while its exact onboarding lease remains active.
+    pub(crate) fn restore_research_runtime(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        let lease = self.onboarding.activation_lease(expected.session_id())?;
+        require_runtime_lease(expected, &lease)?;
+        self.research
+            .restore_provider_generation(expected.profile(), expected)
+            .map_err(Into::into)
+    }
+
     /// Derives the exact non-secret runtime identity before adapter publication.
     pub(crate) fn runtime_generation_for_request(
         &self,
@@ -224,6 +236,29 @@ impl ProviderAdapterActivation {
                     rights,
                 )?
             }
+            ProviderAdapterActivationRequest::Treasury(spec) => {
+                let matches = matches!(
+                    (lease.surface_id().as_str(), &spec.config),
+                    (
+                        TREASURY_FISCAL_SURFACE,
+                        TreasurySourceConfig::AverageInterestRates(_)
+                    ) | (
+                        TREASURY_XML_SURFACE,
+                        TreasurySourceConfig::DailyParYieldCurve { .. }
+                    )
+                );
+                if !matches {
+                    return Err(ProviderAdapterActivationError::SurfaceMismatch);
+                }
+                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let source = TreasurySource::try_new(spec.metadata, spec.config)?;
+                self.research.prepare_provider_replacement(
+                    expected,
+                    candidate.clone(),
+                    source,
+                    rights,
+                )?
+            }
             ProviderAdapterActivationRequest::Fred(spec) => {
                 require_surface(&lease, FRED_SURFACE)?;
                 let secret = self
@@ -242,7 +277,6 @@ impl ProviderAdapterActivation {
             }
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::Sec(_)
-            | ProviderAdapterActivationRequest::Treasury(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
             | ProviderAdapterActivationRequest::Portfolio(_) => {
                 return Err(ProviderAdapterActivationError::SourceBinding);
@@ -681,6 +715,25 @@ fn require_surface(
         Ok(())
     } else {
         Err(ProviderAdapterActivationError::SurfaceMismatch)
+    }
+}
+
+fn require_runtime_lease(
+    runtime: &ResearchProviderRuntimeGeneration,
+    lease: &ProviderActivationLease,
+) -> Result<(), ProviderAdapterActivationError> {
+    if runtime.profile() == lease.surface_id()
+        && runtime.session_id() == lease.session_id()
+        && runtime.capability_revision() == lease.capability_revision()
+        && runtime.capability_digest() == lease.capability_digest()
+        && runtime.credential_generation() == lease.generation()
+        && runtime.secret_reference() == lease.secret_reference()
+        && runtime.authority_effective_at() == lease.authority_effective_at()
+        && runtime.rights_authorization_evidence() == lease.rights_decision_digest()
+    {
+        Ok(())
+    } else {
+        Err(ProviderAdapterActivationError::SourceBinding)
     }
 }
 

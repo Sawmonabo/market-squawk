@@ -97,6 +97,10 @@ impl ProductionSourceSupervisor {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent live-plane dependencies stay explicit at supervisor composition"
+    )]
     pub(super) fn try_new_with_provider_rate(
         config: &AppConfig,
         profile: ProductionSourceProfile,

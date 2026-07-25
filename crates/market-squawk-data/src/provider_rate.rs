@@ -666,6 +666,8 @@ struct LoadedGroup {
     version: i64,
 }
 
+type ProviderRateGroupRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RateState {
@@ -1229,7 +1231,7 @@ fn load_group(
     transaction: &Transaction<'_>,
     registration: ProviderRateRegistration,
 ) -> Result<LoadedGroup, ProviderRateStoreError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)> = transaction
+    let row: Option<ProviderRateGroupRow> = transaction
         .query_row(
             "SELECT policy_digest, policy_json, state_json, state_digest, state_version
              FROM provider_rate_groups WHERE group_id = ?1",

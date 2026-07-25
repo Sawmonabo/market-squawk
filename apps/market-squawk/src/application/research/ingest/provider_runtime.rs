@@ -91,9 +91,19 @@ impl ResearchProviderRuntimeGeneration {
         self.capability_revision
     }
 
+    /// Returns the exact canonical capability evidence.
+    pub const fn capability_digest(&self) -> EvidenceDigest {
+        self.capability_digest
+    }
+
     /// Returns the exact credential generation, when this surface uses one.
     pub const fn credential_generation(&self) -> Option<SecretGeneration> {
         self.credential_generation
+    }
+
+    /// Returns the opaque exact-generation secret reference, when credential-backed.
+    pub const fn secret_reference(&self) -> Option<&SecretRef> {
+        self.secret_reference.as_ref()
     }
 
     /// Returns the exact source metadata retained by this adapter.
@@ -104,6 +114,11 @@ impl ResearchProviderRuntimeGeneration {
     /// Returns the durable instant from which this exact generation is effective.
     pub const fn authority_effective_at(&self) -> Timestamp {
         self.authority_effective_at
+    }
+
+    /// Returns the exact admitted rights decision bound into this generation.
+    pub const fn rights_authorization_evidence(&self) -> EvidenceDigest {
+        self.rights.authorization_evidence
     }
 
     /// Returns the stable callable slot shared by legitimate generations of one provider source.
@@ -600,6 +615,40 @@ impl ProductionResearchIngestCoordinator {
         };
         admission.revoke_and_drain().await;
         Ok(())
+    }
+
+    /// Restores request admission for an unchanged exact generation after an aborted replacement.
+    pub fn restore_provider_generation(
+        &self,
+        profile: &SourceIdentifier,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        let mut authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.lifecycle.shutdown_token().is_cancelled() || authority.registry.is_none() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        if authority.pending_replacements.contains_key(profile) {
+            return Err(ResearchIngestCompositionError::ReplacementInProgress);
+        }
+        let current = authority
+            .sources
+            .get_mut(profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation.as_ref() != Some(expected)
+            || current.metadata != expected.metadata
+            || current.rights != expected.rights
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        if current.admission.revocation_drained() {
+            current.admission = ResearchProviderAdmission::new(Some(expected))?;
+        } else {
+            current.admission.ensure_live()?;
+        }
+        Ok(expected.clone())
     }
 }
 

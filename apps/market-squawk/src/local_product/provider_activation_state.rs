@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::provider_onboarding::{ProviderOnboardingError, ProviderRuntimeStartupAdmissions};
 pub(super) use evidence::ActivationEvidenceCandidate;
 
-const RECIPE_SCHEMA_VERSION: u16 = 3;
+const RECIPE_SCHEMA_VERSION: u16 = 4;
+const PREDECESSOR_RECIPE_SCHEMA_VERSION: u16 = 3;
 const LEGACY_RECIPE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
@@ -50,6 +51,8 @@ pub(super) struct DurableActivationRecipe {
     pub(super) runtime_generation_digest: EvidenceDigest,
     pub(super) predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     pub(super) state_digest: EvidenceDigest,
+    encoded_state: Box<[u8]>,
+    pub(super) staged_predecessor: Option<Box<DurableActivationRecipe>>,
 }
 
 /// Closed restart disposition for one durable provider activation surface.
@@ -114,9 +117,14 @@ impl DurableProviderActivationState {
                     SourceIdentifier::try_from(surface_id)
                         .map(|surface_id| (surface_id, recipe.session_id)),
                 ),
+                Ok(DurableActivationRecipeState::Staged(recipe)) => {
+                    recipe.staged_predecessor.map(|predecessor| {
+                        SourceIdentifier::try_from(surface_id)
+                            .map(|surface_id| (surface_id, predecessor.session_id))
+                    })
+                }
                 Ok(
                     DurableActivationRecipeState::Missing
-                    | DurableActivationRecipeState::Staged(_)
                     | DurableActivationRecipeState::Quarantined(_),
                 )
                 | Err(_) => None,
@@ -207,6 +215,88 @@ impl DurableProviderActivationState {
         )
     }
 
+    /// Stages a cross-session replacement while retaining the exact predecessor envelope.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent replacement authority dimensions stay explicit for exact CAS"
+    )]
+    pub(super) fn publish_staged_replacement(
+        &self,
+        surface_id: &str,
+        predecessor: &DurableActivationRecipe,
+        session_id: Uuid,
+        request_bytes: &[u8],
+        evidence_digests: &[String],
+        runtime_generation_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        if predecessor.session_id == session_id
+            || predecessor.staged_predecessor.is_some()
+            || digest_bytes(&predecessor.encoded_state) != predecessor.state_digest
+        {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        }
+        let DurableActivationRecipeState::Desired(decoded_predecessor) =
+            decode_recipe(surface_id, &predecessor.encoded_state, false)?
+        else {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        };
+        if decoded_predecessor.state_digest != predecessor.state_digest
+            || decoded_predecessor.runtime_generation_digest
+                != predecessor.runtime_generation_digest
+        {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        }
+        let key = surface_key(surface_id)?;
+        let (encoded, state_digest) = encode_recipe(
+            surface_id,
+            session_id,
+            request_bytes,
+            evidence_digests,
+            runtime_generation_digest,
+            Some(predecessor.runtime_generation_digest),
+            RecipePublicationState::Staged,
+            Some(&predecessor.encoded_state),
+        )?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store
+            .load()?
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        if digest_bytes(&current) != predecessor.state_digest
+            || current.as_slice() != predecessor.encoded_state.as_ref()
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&encoded)?;
+        Ok(state_digest)
+    }
+
+    /// Restores the exact predecessor retained by one unchanged staged replacement.
+    pub(super) fn restore_staged_predecessor(
+        &self,
+        surface_id: &str,
+        expected_staged_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        let DurableActivationRecipeState::Staged(staged) = self.load_recipe(surface_id)? else {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        };
+        if staged.state_digest != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let predecessor = staged
+            .staged_predecessor
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        let key = surface_key(surface_id)?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store
+            .load()?
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        if digest_bytes(&current) != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&predecessor.encoded_state)?;
+        Ok(predecessor.state_digest)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "independent authority dimensions stay explicit for review and exact CAS"
@@ -231,6 +321,7 @@ impl DurableProviderActivationState {
             runtime_generation_digest,
             predecessor_runtime_generation_digest,
             publication_state,
+            None,
         )?;
         let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
         let current = store.load()?;
@@ -262,6 +353,7 @@ impl DurableProviderActivationState {
             recipe.runtime_generation_digest,
             recipe.predecessor_runtime_generation_digest,
             RecipePublicationState::Desired,
+            None,
         )?;
         let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
         let current = store
@@ -293,6 +385,7 @@ impl DurableProviderActivationState {
             runtime_generation_digest,
             predecessor_runtime_generation_digest,
             RecipePublicationState::Desired,
+            None,
         )
         .map(|(_encoded, digest)| digest)
     }
@@ -318,7 +411,6 @@ impl DurableProviderActivationState {
         else {
             return Ok(DurableActivationRecipeState::Missing);
         };
-        let state_digest = digest_bytes(&encoded);
         if let Ok(quarantine) = serde_json::from_slice::<QuarantineWire>(&encoded) {
             if quarantine.schema_version != QUARANTINE_SCHEMA_VERSION
                 || quarantine.record_kind != QUARANTINE_RECORD_KIND
@@ -342,58 +434,7 @@ impl DurableProviderActivationState {
                 },
             ));
         }
-        let recipe: RecipeWire = serde_json::from_slice(&encoded)
-            .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
-        if !matches!(
-            recipe.schema_version,
-            RECIPE_SCHEMA_VERSION | LEGACY_RECIPE_SCHEMA_VERSION
-        ) || recipe.surface_id != surface_id
-            || recipe.request_json.is_empty()
-            || recipe.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
-            || !strictly_ordered(&recipe.evidence_digests)
-        {
-            return Err(DurableProviderActivationStateError::InvalidRecipe);
-        }
-        for digest in &recipe.evidence_digests {
-            validate_sha256(digest)?;
-        }
-        let runtime_generation_digest = digest_from_lower_hex(&recipe.runtime_generation_sha256)?;
-        let predecessor_runtime_generation_digest = recipe
-            .predecessor_runtime_generation_sha256
-            .as_deref()
-            .map(digest_from_lower_hex)
-            .transpose()?;
-        if predecessor_runtime_generation_digest == Some(runtime_generation_digest) {
-            return Err(DurableProviderActivationStateError::InvalidRecipe);
-        }
-        let publication_state = recipe.publication_state;
-        let request_bytes = recipe.request_json.into_bytes();
-        if sha256_bytes(&request_bytes) != recipe.request_sha256
-            || bundle_digest(
-                recipe.schema_version,
-                publication_state,
-                surface_id,
-                recipe.session_id,
-                &request_bytes,
-                &recipe.evidence_digests,
-                runtime_generation_digest,
-                predecessor_runtime_generation_digest,
-            )? != recipe.bundle_sha256
-        {
-            return Err(DurableProviderActivationStateError::Integrity);
-        }
-        let recipe = DurableActivationRecipe {
-            session_id: recipe.session_id,
-            request_bytes: request_bytes.into_boxed_slice(),
-            evidence_digests: recipe.evidence_digests,
-            runtime_generation_digest,
-            predecessor_runtime_generation_digest,
-            state_digest,
-        };
-        Ok(match publication_state {
-            RecipePublicationState::Desired => DurableActivationRecipeState::Desired(recipe),
-            RecipePublicationState::Staged => DurableActivationRecipeState::Staged(recipe),
-        })
+        decode_recipe(surface_id, &encoded, true)
     }
 
     /// Replaces unreadable or superseded activation state with an explicit disabled record.
@@ -449,6 +490,9 @@ impl DurableProviderActivationState {
                 DurableActivationRecipeState::Desired(recipe)
                 | DurableActivationRecipeState::Staged(recipe) => {
                     referenced.extend(recipe.evidence_digests);
+                    if let Some(predecessor) = recipe.staged_predecessor {
+                        referenced.extend(predecessor.evidence_digests);
+                    }
                 }
                 DurableActivationRecipeState::Quarantined(quarantine) => {
                     referenced.extend(quarantine.evidence_digests);
@@ -546,6 +590,8 @@ struct RecipeWire {
     request_json: String,
     #[serde(default)]
     publication_state: RecipePublicationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predecessor_recipe_json: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -580,6 +626,97 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
     }
 }
 
+fn decode_recipe(
+    surface_id: &str,
+    encoded: &[u8],
+    allow_staged_predecessor: bool,
+) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
+    let recipe: RecipeWire = serde_json::from_slice(encoded)
+        .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
+    if !matches!(
+        recipe.schema_version,
+        RECIPE_SCHEMA_VERSION | PREDECESSOR_RECIPE_SCHEMA_VERSION | LEGACY_RECIPE_SCHEMA_VERSION
+    ) || recipe.surface_id != surface_id
+        || recipe.request_json.is_empty()
+        || recipe.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
+        || !strictly_ordered(&recipe.evidence_digests)
+        || recipe.schema_version == LEGACY_RECIPE_SCHEMA_VERSION
+            && recipe.publication_state != RecipePublicationState::Desired
+        || recipe.schema_version != RECIPE_SCHEMA_VERSION
+            && recipe.predecessor_recipe_json.is_some()
+        || recipe.publication_state == RecipePublicationState::Desired
+            && recipe.predecessor_recipe_json.is_some()
+        || !allow_staged_predecessor && recipe.predecessor_recipe_json.is_some()
+    {
+        return Err(DurableProviderActivationStateError::InvalidRecipe);
+    }
+    for digest in &recipe.evidence_digests {
+        validate_sha256(digest)?;
+    }
+    let runtime_generation_digest = digest_from_lower_hex(&recipe.runtime_generation_sha256)?;
+    let predecessor_runtime_generation_digest = recipe
+        .predecessor_runtime_generation_sha256
+        .as_deref()
+        .map(digest_from_lower_hex)
+        .transpose()?;
+    if predecessor_runtime_generation_digest == Some(runtime_generation_digest) {
+        return Err(DurableProviderActivationStateError::InvalidRecipe);
+    }
+    let predecessor_bytes = recipe.predecessor_recipe_json.as_deref().map(str::as_bytes);
+    let request_bytes = recipe.request_json.as_bytes();
+    if sha256_bytes(request_bytes) != recipe.request_sha256
+        || bundle_digest(
+            recipe.schema_version,
+            recipe.publication_state,
+            surface_id,
+            recipe.session_id,
+            request_bytes,
+            &recipe.evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+            predecessor_bytes,
+        )? != recipe.bundle_sha256
+    {
+        return Err(DurableProviderActivationStateError::Integrity);
+    }
+    let staged_predecessor = match recipe.predecessor_recipe_json {
+        Some(predecessor_json) => {
+            let DurableActivationRecipeState::Desired(predecessor) =
+                decode_recipe(surface_id, predecessor_json.as_bytes(), false)?
+            else {
+                return Err(DurableProviderActivationStateError::InvalidRecipe);
+            };
+            if predecessor.session_id == recipe.session_id
+                || Some(predecessor.runtime_generation_digest)
+                    != predecessor_runtime_generation_digest
+            {
+                return Err(DurableProviderActivationStateError::InvalidRecipe);
+            }
+            Some(Box::new(predecessor))
+        }
+        None => None,
+    };
+    let publication_state = recipe.publication_state;
+    let recipe = DurableActivationRecipe {
+        session_id: recipe.session_id,
+        request_bytes: recipe.request_json.into_bytes().into_boxed_slice(),
+        evidence_digests: recipe.evidence_digests,
+        runtime_generation_digest,
+        predecessor_runtime_generation_digest,
+        state_digest: digest_bytes(encoded),
+        encoded_state: encoded.to_vec().into_boxed_slice(),
+        staged_predecessor,
+    };
+    Ok(match publication_state {
+        RecipePublicationState::Desired => DurableActivationRecipeState::Desired(recipe),
+        RecipePublicationState::Staged => DurableActivationRecipeState::Staged(recipe),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent recipe schema and integrity inputs stay explicit"
+)]
 fn encode_recipe(
     surface_id: &str,
     session_id: Uuid,
@@ -588,10 +725,14 @@ fn encode_recipe(
     runtime_generation_digest: EvidenceDigest,
     predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     publication_state: RecipePublicationState,
+    predecessor_recipe: Option<&[u8]>,
 ) -> Result<(Vec<u8>, EvidenceDigest), DurableProviderActivationStateError> {
     if request_bytes.is_empty()
         || runtime_generation_digest.bytes() == [0; 32]
         || predecessor_runtime_generation_digest == Some(runtime_generation_digest)
+        || predecessor_recipe.is_some()
+            && (publication_state != RecipePublicationState::Staged
+                || predecessor_runtime_generation_digest.is_none())
     {
         return Err(DurableProviderActivationStateError::InvalidRecipe);
     }
@@ -607,6 +748,13 @@ fn encode_recipe(
     for digest in &evidence_digests {
         validate_sha256(digest)?;
     }
+    let predecessor_recipe_json = predecessor_recipe
+        .map(|encoded| {
+            std::str::from_utf8(encoded)
+                .map(str::to_owned)
+                .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)
+        })
+        .transpose()?;
     let recipe = RecipeWire {
         schema_version: RECIPE_SCHEMA_VERSION,
         surface_id: surface_id.to_owned(),
@@ -624,10 +772,12 @@ fn encode_recipe(
             &evidence_digests,
             runtime_generation_digest,
             predecessor_runtime_generation_digest,
+            predecessor_recipe,
         )?,
         evidence_digests,
         request_json,
         publication_state,
+        predecessor_recipe_json,
     };
     let encoded = serde_json::to_vec(&recipe)
         .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
@@ -639,6 +789,10 @@ fn digest_bytes(bytes: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent digest schema and integrity inputs stay explicit"
+)]
 fn bundle_digest(
     schema_version: u16,
     publication_state: RecipePublicationState,
@@ -648,14 +802,22 @@ fn bundle_digest(
     evidence_digests: &[String],
     runtime_generation_digest: EvidenceDigest,
     predecessor_runtime_generation_digest: Option<EvidenceDigest>,
+    predecessor_recipe: Option<&[u8]>,
 ) -> Result<String, DurableProviderActivationStateError> {
     let mut hasher = Sha256::new();
     match schema_version {
         LEGACY_RECIPE_SCHEMA_VERSION => {
             hasher.update(b"market-squawk:durable-provider-activation:v2");
         }
-        RECIPE_SCHEMA_VERSION => {
+        PREDECESSOR_RECIPE_SCHEMA_VERSION => {
             hasher.update(b"market-squawk:durable-provider-activation:v3");
+            hasher.update([match publication_state {
+                RecipePublicationState::Staged => 0,
+                RecipePublicationState::Desired => 1,
+            }]);
+        }
+        RECIPE_SCHEMA_VERSION => {
+            hasher.update(b"market-squawk:durable-provider-activation:v4");
             hasher.update([match publication_state {
                 RecipePublicationState::Staged => 0,
                 RecipePublicationState::Desired => 1,
@@ -679,6 +841,17 @@ fn bundle_digest(
     hasher.update(count.to_be_bytes());
     for digest in evidence_digests {
         hash_field(&mut hasher, digest.as_bytes())?;
+    }
+    if schema_version == RECIPE_SCHEMA_VERSION {
+        match predecessor_recipe {
+            Some(encoded) => {
+                hasher.update([1]);
+                hash_field(&mut hasher, encoded)?;
+            }
+            None => hasher.update([0]),
+        }
+    } else if predecessor_recipe.is_some() {
+        return Err(DurableProviderActivationStateError::InvalidRecipe);
     }
     Ok(lower_hex(&hasher.finalize()))
 }

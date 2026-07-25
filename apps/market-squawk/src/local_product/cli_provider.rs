@@ -302,6 +302,32 @@ async fn publish_research_activation(
         .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
 
     if let Some(expected) = current_runtime {
+        let cross_session = expected.session_id() != lease.session_id();
+        let predecessor_recipe = if cross_session {
+            match state.load_recipe(surface_id) {
+                Ok(DurableActivationRecipeState::Desired(recipe))
+                    if recipe.session_id == expected.session_id()
+                        && recipe.runtime_generation_digest
+                            == predecessor_runtime_digest
+                                .ok_or(CliProviderActivationError::ProviderConfiguration)?
+                        && current_state_digest == Some(recipe.state_digest) =>
+                {
+                    Some(recipe)
+                }
+                Ok(
+                    DurableActivationRecipeState::Missing
+                    | DurableActivationRecipeState::Desired(_)
+                    | DurableActivationRecipeState::Staged(_)
+                    | DurableActivationRecipeState::Quarantined(_),
+                )
+                | Err(_) => return Err(CliProviderActivationError::ProviderConfiguration),
+            }
+        } else {
+            None
+        };
+        let predecessor_state_digest = predecessor_recipe
+            .as_ref()
+            .map(|recipe| recipe.state_digest);
         let prepared = activation_authority
             .prepare_research_replacement(lease.clone(), request, expected.clone(), cancellation)
             .await
@@ -309,8 +335,17 @@ async fn publish_research_activation(
         if prepared.candidate() != &candidate {
             return Err(CliProviderActivationError::ProviderConfiguration);
         }
-        let published = state
-            .publish_staged_recipe(
+        let published = if let Some(predecessor) = predecessor_recipe.as_ref() {
+            state.publish_staged_replacement(
+                surface_id,
+                predecessor,
+                lease.session_id(),
+                request_bytes,
+                &evidence_digests,
+                candidate_runtime_digest,
+            )
+        } else {
+            state.publish_staged_recipe(
                 surface_id,
                 current_state_digest,
                 lease.session_id(),
@@ -319,131 +354,152 @@ async fn publish_research_activation(
                 candidate_runtime_digest,
                 predecessor_runtime_digest,
             )
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+        }
+        .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
         if let Err(error) = evidence.persist(state) {
-            quarantine_failed_candidate(
+            drop(prepared);
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 published,
                 DurableActivationQuarantineReason::StateInvalid,
-            )?;
+            )
+            .await?;
             return Err(error);
         }
         if let Err(error) = activation_authority
             .revoke_research_runtime(&expected)
             .await
         {
-            quarantine_failed_candidate(
+            drop(prepared);
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 published,
                 DurableActivationQuarantineReason::AdapterRejected,
-            )?;
+            )
+            .await?;
             return Err(CliProviderActivationError::Activation(error));
         }
-        if expected.session_id() != lease.session_id()
+        if cross_session
             && let Err(error) =
                 onboarding.invalidate_activation_recipe(expected.session_id(), published)
         {
-            quarantine_failed_candidate(
+            drop(prepared);
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 published,
                 DurableActivationQuarantineReason::AuthorityInvalidated,
-            )?;
+            )
+            .await?;
             return Err(CliProviderActivationError::Onboarding(error));
         }
         let active = match onboarding.commit_prepared_activation(lease).await {
             Ok(active) => active,
             Err(error) => {
-                quarantine_failed_candidate(
+                drop(prepared);
+                reconcile_failed_replacement(
                     state,
+                    activation_authority,
                     onboarding,
-                    surface_id,
-                    lease.session_id(),
+                    &expected,
+                    &candidate,
+                    predecessor_state_digest,
                     published,
                     DurableActivationQuarantineReason::AuthorityInvalidated,
-                )?;
+                )
+                .await?;
                 return Err(CliProviderActivationError::Onboarding(error));
             }
         };
         if let Err(error) = require_same_activation_lease(&active, lease) {
-            quarantine_failed_candidate(
+            drop(prepared);
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 published,
                 DurableActivationQuarantineReason::AuthorityInvalidated,
-            )?;
+            )
+            .await?;
             return Err(error);
         }
         let activated = match prepared.commit() {
             Ok(activated) => activated,
             Err(error) => {
-                quarantine_failed_candidate(
+                reconcile_failed_replacement(
                     state,
+                    activation_authority,
                     onboarding,
-                    surface_id,
-                    lease.session_id(),
+                    &expected,
+                    &candidate,
+                    predecessor_state_digest,
                     published,
                     DurableActivationQuarantineReason::AdapterRejected,
-                )?;
+                )
+                .await?;
                 return Err(CliProviderActivationError::Activation(error));
             }
         };
         if activated.generation() != &candidate {
-            activation_authority
-                .revoke_research_runtime(&candidate)
-                .await
-                .map_err(CliProviderActivationError::Activation)?;
-            quarantine_failed_candidate(
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 published,
                 DurableActivationQuarantineReason::AdapterRejected,
-            )?;
+            )
+            .await?;
             return Err(CliProviderActivationError::ProviderConfiguration);
         }
         let desired = match state.promote_staged_recipe(surface_id, published) {
             Ok(desired) => desired,
             Err(_error) => {
-                activation_authority
-                    .revoke_research_runtime(&candidate)
-                    .await
-                    .map_err(CliProviderActivationError::Activation)?;
-                quarantine_failed_candidate(
+                reconcile_failed_replacement(
                     state,
+                    activation_authority,
                     onboarding,
-                    surface_id,
-                    lease.session_id(),
+                    &expected,
+                    &candidate,
+                    predecessor_state_digest,
                     published,
                     DurableActivationQuarantineReason::StateInvalid,
-                )?;
+                )
+                .await?;
                 return Err(CliProviderActivationError::StateUnavailable);
             }
         };
         if desired != candidate_state_digest {
-            activation_authority
-                .revoke_research_runtime(&candidate)
-                .await
-                .map_err(CliProviderActivationError::Activation)?;
-            quarantine_failed_candidate(
+            reconcile_failed_replacement(
                 state,
+                activation_authority,
                 onboarding,
-                surface_id,
-                lease.session_id(),
+                &expected,
+                &candidate,
+                predecessor_state_digest,
                 desired,
                 DurableActivationQuarantineReason::StateInvalid,
-            )?;
+            )
+            .await?;
             return Err(CliProviderActivationError::StateUnavailable);
         }
         state
@@ -590,6 +646,171 @@ fn runtime_generation_digest(
         .map_err(CliProviderActivationError::Activation)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent runtime, durable-state, and onboarding authority identities stay explicit"
+)]
+async fn reconcile_failed_replacement(
+    state: &DurableProviderActivationState,
+    activation_authority: &ProviderAdapterActivation,
+    onboarding: &ProviderOnboardingService,
+    expected: &ResearchProviderRuntimeGeneration,
+    candidate: &ResearchProviderRuntimeGeneration,
+    predecessor_state_digest: Option<EvidenceDigest>,
+    candidate_state_digest: EvidenceDigest,
+    reason: DurableActivationQuarantineReason,
+) -> Result<(), CliProviderActivationError> {
+    if expected.profile() != candidate.profile() {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    if expected.session_id() == candidate.session_id() {
+        let mut reconciled = true;
+        match activation_authority.research_runtime_generation(expected.profile()) {
+            Ok(Some(current)) if current == *expected || current == *candidate => {
+                if activation_authority
+                    .revoke_research_runtime(&current)
+                    .await
+                    .is_err()
+                {
+                    reconciled = false;
+                }
+            }
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => reconciled = false,
+        }
+        if quarantine_failed_candidate(
+            state,
+            onboarding,
+            candidate.profile().as_str(),
+            candidate.session_id(),
+            candidate_state_digest,
+            reason,
+        )
+        .is_err()
+        {
+            reconciled = false;
+            let _cleanup = onboarding
+                .invalidate_activation_recipe(candidate.session_id(), candidate_state_digest);
+        }
+        return if reconciled {
+            Ok(())
+        } else {
+            Err(CliProviderActivationError::StateUnavailable)
+        };
+    }
+    let predecessor_state_digest =
+        predecessor_state_digest.ok_or(CliProviderActivationError::ProviderConfiguration)?;
+    let expected_runtime_digest = runtime_generation_digest(expected)?;
+
+    let predecessor_current = activation_authority
+        .research_runtime_generation(expected.profile())
+        .map_err(CliProviderActivationError::Activation)?
+        .as_ref()
+        == Some(expected);
+    if predecessor_current {
+        let restored_runtime = activation_authority.restore_research_runtime(expected);
+        if matches!(restored_runtime, Ok(ref restored) if restored == expected) {
+            let candidate_invalidated = onboarding
+                .invalidate_activation_recipe(candidate.session_id(), candidate_state_digest);
+            if candidate_invalidated.is_ok() {
+                let restored_state = state.restore_staged_predecessor(
+                    expected.profile().as_str(),
+                    candidate_state_digest,
+                );
+                if matches!(
+                    restored_state,
+                    Ok(restored) if restored == predecessor_state_digest
+                ) && matches!(
+                    state.load_recipe(expected.profile().as_str()),
+                    Ok(DurableActivationRecipeState::Desired(recipe))
+                        if recipe.session_id == expected.session_id()
+                            && recipe.runtime_generation_digest == expected_runtime_digest
+                            && recipe.state_digest == predecessor_state_digest
+                ) {
+                    return state
+                        .reconcile_evidence_objects()
+                        .map_err(|_error| CliProviderActivationError::StateUnavailable);
+                }
+            }
+        }
+    }
+
+    let mut reconciled = true;
+    match activation_authority.research_runtime_generation(expected.profile()) {
+        Ok(Some(current)) if current == *expected || current == *candidate => {
+            if activation_authority
+                .revoke_research_runtime(&current)
+                .await
+                .is_err()
+            {
+                reconciled = false;
+            }
+        }
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => reconciled = false,
+    }
+    if onboarding
+        .invalidate_activation_recipe(expected.session_id(), candidate_state_digest)
+        .is_err()
+    {
+        reconciled = false;
+    }
+    let surface_id = candidate.profile().as_str();
+    let quarantine_digest =
+        match state.quarantine_recipe_if_current(surface_id, candidate_state_digest, reason) {
+            Ok(true) => match state.load_recipe(surface_id) {
+                Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
+                    Some(quarantine.state_digest)
+                }
+                Ok(
+                    DurableActivationRecipeState::Missing
+                    | DurableActivationRecipeState::Desired(_)
+                    | DurableActivationRecipeState::Staged(_),
+                )
+                | Err(_) => None,
+            },
+            Ok(false) => match state.load_recipe(surface_id) {
+                Ok(DurableActivationRecipeState::Desired(recipe))
+                    if recipe.session_id == expected.session_id()
+                        && recipe.runtime_generation_digest == expected_runtime_digest
+                        && recipe.state_digest == predecessor_state_digest =>
+                {
+                    state.quarantine_recipe(surface_id, reason).ok()
+                }
+                Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
+                    Some(quarantine.state_digest)
+                }
+                Ok(
+                    DurableActivationRecipeState::Missing
+                    | DurableActivationRecipeState::Desired(_)
+                    | DurableActivationRecipeState::Staged(_),
+                )
+                | Err(_) => None,
+            },
+            Err(_) => None,
+        };
+    if quarantine_digest.is_none() {
+        reconciled = false;
+    }
+    if onboarding
+        .invalidate_activation_recipe(
+            candidate.session_id(),
+            quarantine_digest.unwrap_or(candidate_state_digest),
+        )
+        .is_err()
+    {
+        reconciled = false;
+    }
+    if state.reconcile_evidence_objects().is_err() {
+        reconciled = false;
+    }
+    if reconciled {
+        Ok(())
+    } else {
+        Err(CliProviderActivationError::StateUnavailable)
+    }
+}
+
 fn quarantine_failed_candidate(
     state: &DurableProviderActivationState,
     onboarding: &ProviderOnboardingService,
@@ -732,6 +953,7 @@ pub(super) fn restore_research_providers(
         );
     }
     for surface_id in RESTORABLE_RESEARCH_SURFACES {
+        let mut replacement_recovery = None;
         let recipe = match state.load_recipe(surface_id) {
             Ok(DurableActivationRecipeState::Missing) => continue,
             Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
@@ -745,14 +967,81 @@ pub(super) fn restore_research_providers(
                 continue;
             }
             Ok(DurableActivationRecipeState::Staged(recipe)) => {
-                quarantine_failed_recovery(
-                    onboarding,
-                    state,
-                    surface_id,
-                    Some(recipe.session_id),
-                    DurableActivationQuarantineReason::StateInvalid,
-                );
-                continue;
+                let candidate_session = recipe.session_id;
+                let staged_digest = recipe.state_digest;
+                let Some(predecessor) = recipe.staged_predecessor else {
+                    quarantine_failed_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        Some(candidate_session),
+                        DurableActivationQuarantineReason::StateInvalid,
+                    );
+                    continue;
+                };
+                let predecessor_session = predecessor.session_id;
+                let predecessor_runtime_digest = predecessor.runtime_generation_digest;
+                let predecessor_state_digest = predecessor.state_digest;
+                let restored = state.restore_staged_predecessor(surface_id, staged_digest);
+                if !matches!(
+                    restored,
+                    Ok(restored_digest) if restored_digest == predecessor_state_digest
+                ) {
+                    quarantine_failed_replacement_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        predecessor_session,
+                        candidate_session,
+                        staged_digest,
+                        DurableActivationQuarantineReason::StateInvalid,
+                    );
+                    continue;
+                }
+                if onboarding
+                    .invalidate_activation_recipe(candidate_session, staged_digest)
+                    .is_err()
+                {
+                    quarantine_failed_replacement_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        predecessor_session,
+                        candidate_session,
+                        staged_digest,
+                        DurableActivationQuarantineReason::AuthorityInvalidated,
+                    );
+                    continue;
+                }
+                replacement_recovery =
+                    Some((predecessor_session, candidate_session, staged_digest));
+                match state.load_recipe(surface_id) {
+                    Ok(DurableActivationRecipeState::Desired(recipe))
+                        if recipe.session_id == predecessor_session
+                            && recipe.runtime_generation_digest == predecessor_runtime_digest
+                            && recipe.state_digest == predecessor_state_digest =>
+                    {
+                        recipe
+                    }
+                    Ok(
+                        DurableActivationRecipeState::Missing
+                        | DurableActivationRecipeState::Desired(_)
+                        | DurableActivationRecipeState::Staged(_)
+                        | DurableActivationRecipeState::Quarantined(_),
+                    )
+                    | Err(_) => {
+                        quarantine_failed_replacement_recovery(
+                            onboarding,
+                            state,
+                            surface_id,
+                            predecessor_session,
+                            candidate_session,
+                            staged_digest,
+                            DurableActivationQuarantineReason::StateInvalid,
+                        );
+                        continue;
+                    }
+                }
             }
             Ok(DurableActivationRecipeState::Desired(recipe)) => recipe,
             Err(_error) => {
@@ -778,19 +1067,44 @@ pub(super) fn restore_research_providers(
         match restored {
             Ok(ResearchProviderRecovery::Restored) => {}
             Ok(ResearchProviderRecovery::ResumeRequired) => {
-                tracing::warn!(
-                    surface_id,
-                    "provider activation remains disabled until an explicit user resume"
-                );
+                if let Some((predecessor, candidate, staged_digest)) = replacement_recovery {
+                    quarantine_failed_replacement_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        predecessor,
+                        candidate,
+                        staged_digest,
+                        DurableActivationQuarantineReason::AuthorityInvalidated,
+                    );
+                } else {
+                    tracing::warn!(
+                        surface_id,
+                        "provider activation remains disabled until an explicit user resume"
+                    );
+                }
             }
             Err(error) => {
-                quarantine_failed_recovery(
-                    onboarding,
-                    state,
-                    surface_id,
-                    Some(session_id),
-                    recovery_quarantine_reason(&error),
-                );
+                let reason = recovery_quarantine_reason(&error);
+                if let Some((predecessor, candidate, staged_digest)) = replacement_recovery {
+                    quarantine_failed_replacement_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        predecessor,
+                        candidate,
+                        staged_digest,
+                        reason,
+                    );
+                } else {
+                    quarantine_failed_recovery(
+                        onboarding,
+                        state,
+                        surface_id,
+                        Some(session_id),
+                        reason,
+                    );
+                }
             }
         }
     }
@@ -874,6 +1188,46 @@ fn recovery_requires_explicit_resume(error: &ProviderAdapterActivationError) -> 
                 | LocalSecretStoreError::DeadlineExceeded
         ))
     )
+}
+
+fn quarantine_failed_replacement_recovery(
+    onboarding: &crate::ProviderOnboardingService,
+    state: &DurableProviderActivationState,
+    surface_id: &str,
+    predecessor_session: Uuid,
+    candidate_session: Uuid,
+    replacement_state_digest: EvidenceDigest,
+    reason: DurableActivationQuarantineReason,
+) {
+    let state_digest = match state.quarantine_recipe(surface_id, reason) {
+        Ok(state_digest) => state_digest,
+        Err(_error) => {
+            tracing::error!(
+                surface_id,
+                reason = ?reason,
+                "provider replacement recovery failed closed; durable quarantine could not be recorded"
+            );
+            replacement_state_digest
+        }
+    };
+    for session_id in [predecessor_session, candidate_session] {
+        if onboarding
+            .invalidate_activation_recipe(session_id, state_digest)
+            .is_err()
+        {
+            tracing::warn!(
+                surface_id,
+                session_id = %session_id,
+                "provider replacement recovery retained onboarding cleanup debt"
+            );
+        }
+    }
+    if state.reconcile_evidence_objects().is_err() {
+        tracing::warn!(
+            surface_id,
+            "provider replacement quarantine retained unreconciled evidence debt"
+        );
+    }
 }
 
 fn quarantine_failed_recovery(
@@ -2129,4 +2483,229 @@ pub enum CliProviderActivationError {
     Onboarding(crate::ProviderOnboardingError),
     #[error(transparent)]
     Activation(crate::ProviderAdapterActivationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::time::{Duration, Instant};
+
+    use market_squawk_data::OnboardingReservationRequest;
+    use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
+    use market_squawk_sources::{
+        OnboardingEvent, OnboardingState, ProviderPublicConfiguration, built_in_provider_profiles,
+    };
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn post_staging_failure_restores_callable_predecessor_and_quarantines_candidate()
+    -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let product = crate::LocalProduct::try_new(config)?;
+        let predecessor_lease = prepared_treasury_lease(&product, "predecessor").await?;
+        let (predecessor_bytes, predecessor_evidence, predecessor_request) =
+            treasury_activation(&product, &predecessor_lease)?;
+        publish_research_activation(
+            product.provider_activation_state(),
+            product.provider_activation().as_ref(),
+            product.provider_onboarding().as_ref(),
+            &predecessor_lease,
+            &predecessor_bytes,
+            &predecessor_evidence,
+            predecessor_request,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("predecessor publication failed: {error:?}"))
+        })?;
+        let state = product.provider_activation_state();
+        let DurableActivationRecipeState::Desired(predecessor_recipe) =
+            state.load_recipe(TREASURY_FISCAL_SURFACE)?
+        else {
+            return Err("predecessor activation was not restart-desired".into());
+        };
+        let predecessor = product
+            .provider_activation()
+            .research_runtime_generation(predecessor_lease.surface_id())?
+            .ok_or("predecessor runtime was not published")?;
+
+        let candidate_lease = prepared_treasury_lease(&product, "candidate").await?;
+        let (candidate_bytes, candidate_evidence, candidate_request) =
+            treasury_activation(&product, &candidate_lease)?;
+        let candidate = product
+            .provider_activation()
+            .runtime_generation_for_request(&candidate_lease, &candidate_request)?;
+        let prepared = product
+            .provider_activation()
+            .prepare_research_replacement(
+                candidate_lease.clone(),
+                candidate_request,
+                predecessor.clone(),
+                CancellationToken::new(),
+            )
+            .await?;
+        let staged = state
+            .publish_staged_replacement(
+                TREASURY_FISCAL_SURFACE,
+                &predecessor_recipe,
+                candidate_lease.session_id(),
+                &candidate_bytes,
+                &candidate_evidence.digests(),
+                runtime_generation_digest(&candidate)?,
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("replacement staging failed: {error:?}"))
+            })?;
+        let predecessor_state_digest = predecessor_recipe.state_digest;
+        drop(prepared);
+
+        reconcile_failed_replacement(
+            state,
+            product.provider_activation().as_ref(),
+            product.provider_onboarding().as_ref(),
+            &predecessor,
+            &candidate,
+            Some(predecessor_state_digest),
+            staged,
+            DurableActivationQuarantineReason::StateInvalid,
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("replacement reconciliation failed: {error:?}"))
+        })?;
+
+        assert!(matches!(
+            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == predecessor_lease.session_id()
+                    && recipe.request_bytes == predecessor_bytes
+                    && recipe.runtime_generation_digest
+                        == runtime_generation_digest(&predecessor)?
+                    && recipe.state_digest == predecessor_state_digest
+        ));
+        assert_eq!(
+            product
+                .provider_activation()
+                .research_runtime_generation(predecessor.profile())?,
+            Some(predecessor.clone())
+        );
+        assert_eq!(
+            product
+                .provider_activation()
+                .restore_research_runtime(&predecessor)?,
+            predecessor
+        );
+        require_same_activation_lease(
+            &product
+                .provider_onboarding()
+                .activation_lease(predecessor_lease.session_id())?,
+            &predecessor_lease,
+        )?;
+        assert_eq!(
+            product
+                .provider_onboarding()
+                .resume(candidate_lease.session_id())?
+                .state(),
+            OnboardingState::Blocked
+        );
+        assert!(
+            product
+                .provider_onboarding()
+                .activation_lease(candidate_lease.session_id())
+                .is_err()
+        );
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        Ok(())
+    }
+
+    async fn prepared_treasury_lease(
+        product: &crate::LocalProduct,
+        operation: &str,
+    ) -> Result<ProviderActivationLease, Box<dyn std::error::Error>> {
+        let profiles = built_in_provider_profiles()?;
+        let profile = profiles
+            .get(TREASURY_FISCAL_SURFACE)
+            .ok_or("Treasury onboarding profile is missing")?;
+        let catalog = product.research().onboarding_catalog();
+        catalog.register_provider_capability(profile.capability())?;
+        let request = OnboardingReservationRequest::try_new(
+            profile.capability(),
+            ProviderPublicConfiguration::default(),
+            profile.capability().maximum_authority().clone(),
+            SourceIdentifier::try_from("provider-replacement-regression")?,
+            SourceIdentifier::try_from(operation)?,
+            Timestamp::from_unix_nanos(i64::MAX),
+            0,
+        )?;
+        let reservation = catalog.reserve_provider_onboarding(&request)?;
+        for (sequence, event) in [1_u64, 2, 3].into_iter().zip([
+            OnboardingEvent::RightsAdmitted {
+                generation: None,
+                decision_digest: profile.rights_decision_digest(),
+            },
+            OnboardingEvent::RatePolicyAdmitted {
+                generation: None,
+                policy_digest: profile.capability().rate_policy().evidence_digest(),
+            },
+            OnboardingEvent::RuntimeVerified {
+                generation: None,
+                evidence_digest: profile.rights_decision_digest(),
+            },
+        ]) {
+            catalog.append_provider_onboarding_event(&reservation, sequence, event)?;
+        }
+        Ok(product
+            .provider_onboarding()
+            .prepare_activation(reservation.session_id(), CancellationToken::new())
+            .await?)
+    }
+
+    fn treasury_activation(
+        product: &crate::LocalProduct,
+        lease: &ProviderActivationLease,
+    ) -> Result<
+        (
+            Box<[u8]>,
+            LoadedActivationEvidence,
+            ProviderAdapterActivationRequest,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (provider, evidence) = portal_provider_request(
+            lease.session_id(),
+            ProviderPortalActivationRequest::TreasuryFiscal {
+                first_record_date: CalendarDate::new(2025, 1, 1)?,
+                last_record_date: CalendarDate::new(2025, 1, 31)?,
+                page_size: 100,
+            },
+        )?;
+        let request = ActivationRequest {
+            schema_version: REQUEST_SCHEMA_VERSION,
+            session_id: lease.session_id(),
+            provider,
+        };
+        let request_bytes = serde_json::to_vec(&request)?.into_boxed_slice();
+        let activation =
+            build_research_activation(product.paths(), lease, &request_bytes, request, &evidence)?;
+        Ok((request_bytes, evidence, activation))
+    }
 }
