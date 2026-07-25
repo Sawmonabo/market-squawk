@@ -862,6 +862,9 @@ pub enum ProductionLiveSourceCompositionError {
 /// Production live-source startup or coordinated shutdown failure.
 #[derive(Debug, Error)]
 pub enum ProductionLiveSourceRuntimeError {
+    #[cfg(feature = "release-evidence")]
+    #[error("release-performance diagnostic source failed: {0}")]
+    ReleaseBenchmark(String),
     #[error("production source supervisor exited before startup completed")]
     SupervisorExitedBeforeStartup,
     #[error("production source supervisor exceeded its shutdown deadline")]

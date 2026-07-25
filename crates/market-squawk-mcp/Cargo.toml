@@ -8,6 +8,10 @@ description = "Bounded local Model Context Protocol transport for Market Squawk"
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
+[features]
+default = []
+fuzzing = []
+
 [dependencies]
 async-trait.workspace = true
 market-squawk-services = { path = "../market-squawk-services", version = "=0.1.0" }

@@ -11,6 +11,10 @@ use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
 
+#[cfg(feature = "release-evidence")]
+pub use self::catalog::benchmark_support::{
+    ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
+};
 pub use self::catalog::{
     AnalyticalManifestCatalog, GenerationKind, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
     MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, PinnedDataset,

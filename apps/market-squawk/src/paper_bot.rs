@@ -6,6 +6,8 @@
 //! paper execution.
 
 mod audit;
+#[cfg(feature = "release-evidence")]
+mod benchmark_support;
 mod defaults;
 mod supervisor;
 
@@ -41,8 +43,9 @@ use market_squawk_execution::{
     RecoveredDispatchOrder, RiskLimits, RiskService, RiskServiceConfig, RiskServiceError, Strategy,
 };
 use market_squawk_live::{
-    ActionAuthorityIssueLimit, LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader,
-    RouteActionHook, RouteActionHookError, RouteQualifiedMarketExport, ShardKey,
+    ActionAuthorityIssueLimit, LiveActionHook, LiveRouteConfig, LiveRuntimeConfig,
+    LiveSnapshotReader, RouteActionHook, RouteActionHookError, RouteQualifiedMarketExport,
+    ShardKey,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +54,12 @@ use crate::{
     ProductionLiveSourceComposition, ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError,
 };
 use supervisor::{PaperFinancialSupervisor, PaperFinancialSupervisorShutdown};
+
+#[cfg(feature = "release-evidence")]
+pub(crate) use benchmark_support::{
+    ReleaseLatencyDistribution, ReleaseMeasuredOutcomeLedger, ReleasePaperBotBenchmarkComposition,
+    ReleasePaperBotBenchmarkResult,
+};
 
 const PRODUCTION_EXECUTION_TASK_CAPACITY: usize = 3;
 
@@ -117,10 +126,33 @@ impl ProductionPaperBotRoute {
 /// Validated, pre-network production paper-bot composition.
 #[derive(Debug)]
 pub struct ProductionPaperBotComposition {
-    source: ProductionLiveSourceComposition,
+    source: PaperBotSourceComposition,
     runtime_config: LiveRuntimeConfig,
     execution: ProductionPaperBotExecutionConfig,
     strategies: Vec<ProductionPaperBotRoute>,
+}
+
+#[derive(Debug)]
+enum PaperBotSourceComposition {
+    Production(Box<ProductionLiveSourceComposition>),
+    #[cfg(feature = "release-evidence")]
+    ReleaseBenchmark(Vec<LiveRouteConfig>),
+}
+
+impl PaperBotSourceComposition {
+    fn routes(&self) -> &[LiveRouteConfig] {
+        match self {
+            Self::Production(source) => source.routes(),
+            #[cfg(feature = "release-evidence")]
+            Self::ReleaseBenchmark(routes) => routes,
+        }
+    }
+}
+
+enum PaperBotStartMode {
+    Production(Option<Vec<RouteQualifiedMarketExport>>),
+    #[cfg(feature = "release-evidence")]
+    ReleaseBenchmark(Arc<benchmark_support::ReleaseBenchmarkObserver>),
 }
 
 impl ProductionPaperBotComposition {
@@ -132,6 +164,35 @@ impl ProductionPaperBotComposition {
     /// paper and risk account bootstraps.
     pub fn try_new(
         source: ProductionLiveSourceComposition,
+        runtime_config: LiveRuntimeConfig,
+        execution: ProductionPaperBotExecutionConfig,
+        strategies: Vec<ProductionPaperBotRoute>,
+    ) -> Result<Self, ProductionPaperBotCompositionError> {
+        Self::try_new_inner(
+            PaperBotSourceComposition::Production(Box::new(source)),
+            runtime_config,
+            execution,
+            strategies,
+        )
+    }
+
+    #[cfg(feature = "release-evidence")]
+    fn try_new_release_benchmark(
+        routes: Vec<LiveRouteConfig>,
+        runtime_config: LiveRuntimeConfig,
+        execution: ProductionPaperBotExecutionConfig,
+        strategies: Vec<ProductionPaperBotRoute>,
+    ) -> Result<Self, ProductionPaperBotCompositionError> {
+        Self::try_new_inner(
+            PaperBotSourceComposition::ReleaseBenchmark(routes),
+            runtime_config,
+            execution,
+            strategies,
+        )
+    }
+
+    fn try_new_inner(
+        source: PaperBotSourceComposition,
         runtime_config: LiveRuntimeConfig,
         execution: ProductionPaperBotExecutionConfig,
         strategies: Vec<ProductionPaperBotRoute>,
@@ -164,7 +225,12 @@ impl ProductionPaperBotComposition {
         mut self,
         endpoint: &str,
     ) -> Result<Self, crate::ProductionLiveSourceCompositionError> {
-        self.source = self.source.with_local_kraken_endpoint_for_test(endpoint)?;
+        let PaperBotSourceComposition::Production(source) = self.source else {
+            return Err(crate::ProductionLiveSourceCompositionError::RouteSetMismatch);
+        };
+        self.source = PaperBotSourceComposition::Production(Box::new(
+            (*source).with_local_kraken_endpoint_for_test(endpoint)?,
+        ));
         Ok(self)
     }
 
@@ -178,7 +244,10 @@ impl ProductionPaperBotComposition {
         self,
         cancellation: CancellationToken,
     ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
-        self.start_inner(None, cancellation).await
+        Ok(self
+            .start_inner(PaperBotStartMode::Production(None), cancellation)
+            .await?
+            .runtime)
     }
 
     /// Starts the complete paper path with one bounded qualified-market export per live route.
@@ -196,18 +265,26 @@ impl ProductionPaperBotComposition {
         qualified_market_exports: Vec<RouteQualifiedMarketExport>,
         cancellation: CancellationToken,
     ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
-        self.source
+        let PaperBotSourceComposition::Production(source) = &self.source else {
+            return Err(ProductionPaperBotStartError::InvalidRecoveryOwnership);
+        };
+        source
             .validate_qualified_market_export_routes(&qualified_market_exports)
             .map_err(ProductionPaperBotStartError::Source)?;
-        self.start_inner(Some(qualified_market_exports), cancellation)
-            .await
+        Ok(self
+            .start_inner(
+                PaperBotStartMode::Production(Some(qualified_market_exports)),
+                cancellation,
+            )
+            .await?
+            .runtime)
     }
 
     async fn start_inner(
         self,
-        qualified_market_exports: Option<Vec<RouteQualifiedMarketExport>>,
+        mode: PaperBotStartMode,
         cancellation: CancellationToken,
-    ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
+    ) -> Result<StartedPaperBotRuntime, ProductionPaperBotStartError> {
         let Self {
             source,
             runtime_config,
@@ -579,6 +656,11 @@ impl ProductionPaperBotComposition {
                 return Err(with_rollback(startup, rollback));
             }
         };
+        #[cfg(feature = "release-evidence")]
+        let benchmark_observer = match &mode {
+            PaperBotStartMode::Production(_) => None,
+            PaperBotStartMode::ReleaseBenchmark(observer) => Some(Arc::clone(observer)),
+        };
         let mut action_hooks = Vec::new();
         if action_hooks.try_reserve_exact(strategies.len()).is_err() {
             let startup = ProductionPaperBotStartError::Allocation;
@@ -641,45 +723,76 @@ impl ProductionPaperBotComposition {
                     return Err(with_rollback(startup, rollback));
                 }
             };
-            let route_hook = match RouteActionHook::try_new(
-                route.route,
-                Box::new(hook),
-                route.required_features,
-            ) {
-                Ok(hook) => hook,
-                Err(error) => {
-                    let startup = ProductionPaperBotStartError::RouteHook(error);
-                    drop(execution_audit);
-                    let rollback = rollback_execution_with_audit(
-                        Some(dispatcher),
-                        Some(supervisor),
-                        paper,
-                        task_reaper,
-                        execution.paper_control_timeout,
-                        audit_service,
-                    )
-                    .await;
-                    return Err(with_rollback(startup, rollback));
+            let hook: Box<dyn LiveActionHook> = {
+                #[cfg(feature = "release-evidence")]
+                if let Some(observer) = benchmark_observer.as_ref() {
+                    Box::new(benchmark_support::ObservedExecutionHook::new(
+                        hook,
+                        Arc::clone(observer),
+                    ))
+                } else {
+                    Box::new(hook)
+                }
+                #[cfg(not(feature = "release-evidence"))]
+                {
+                    Box::new(hook)
                 }
             };
+            let route_hook =
+                match RouteActionHook::try_new(route.route, hook, route.required_features) {
+                    Ok(hook) => hook,
+                    Err(error) => {
+                        let startup = ProductionPaperBotStartError::RouteHook(error);
+                        drop(execution_audit);
+                        let rollback = rollback_execution_with_audit(
+                            Some(dispatcher),
+                            Some(supervisor),
+                            paper,
+                            task_reaper,
+                            execution.paper_control_timeout,
+                            audit_service,
+                        )
+                        .await;
+                        return Err(with_rollback(startup, rollback));
+                    }
+                };
             action_hooks.push(route_hook);
         }
-        let live_result = match qualified_market_exports {
-            Some(qualified_market_exports) => {
-                source
-                    .start_with_action_hooks_and_qualified_market_exports(
-                        runtime_config,
-                        action_hooks,
-                        qualified_market_exports,
-                        cancellation,
-                    )
-                    .await
-            }
-            None => {
-                source
-                    .start_with_action_hooks(runtime_config, action_hooks, cancellation)
-                    .await
-            }
+        let live_result = match (source, mode) {
+            (
+                PaperBotSourceComposition::Production(source),
+                PaperBotStartMode::Production(Some(exports)),
+            ) => (*source)
+                .start_with_action_hooks_and_qualified_market_exports(
+                    runtime_config,
+                    action_hooks,
+                    exports,
+                    cancellation,
+                )
+                .await
+                .map(StartedPaperBotLiveRuntime::production),
+            (
+                PaperBotSourceComposition::Production(source),
+                PaperBotStartMode::Production(None),
+            ) => (*source)
+                .start_with_action_hooks(runtime_config, action_hooks, cancellation)
+                .await
+                .map(StartedPaperBotLiveRuntime::production),
+            #[cfg(feature = "release-evidence")]
+            (
+                PaperBotSourceComposition::ReleaseBenchmark(routes),
+                PaperBotStartMode::ReleaseBenchmark(observer),
+            ) => benchmark_support::ReleaseBenchmarkLiveRuntime::start(
+                runtime_config,
+                routes,
+                action_hooks,
+                observer,
+                cancellation,
+            )
+            .await
+            .map(StartedPaperBotLiveRuntime::release_benchmark),
+            #[allow(unreachable_patterns)]
+            _ => Err(ProductionLiveSourceRuntimeError::QualifiedMarketExportRouteSetMismatch),
         };
         let live = match live_result {
             Ok(live) => live,
@@ -698,25 +811,39 @@ impl ProductionPaperBotComposition {
                 return Err(with_rollback(startup, rollback));
             }
         };
-        Ok(ProductionPaperBotRuntime {
-            live,
-            dispatcher,
-            accounts,
-            account_ids,
-            supervisor,
-            paper,
-            checkpoint_repository,
-            task_reaper,
-            paper_control_timeout: execution.paper_control_timeout,
-            audit_service,
+        #[cfg(feature = "release-evidence")]
+        let benchmark_producer = live.benchmark_producer;
+        let live = live.live;
+        Ok(StartedPaperBotRuntime {
+            runtime: ProductionPaperBotRuntime {
+                live,
+                dispatcher,
+                accounts,
+                account_ids,
+                supervisor,
+                paper,
+                checkpoint_repository,
+                task_reaper,
+                paper_control_timeout: execution.paper_control_timeout,
+                audit_service,
+            },
+            #[cfg(feature = "release-evidence")]
+            benchmark_producer,
         })
     }
+}
+
+#[derive(Debug)]
+struct StartedPaperBotRuntime {
+    runtime: ProductionPaperBotRuntime,
+    #[cfg(feature = "release-evidence")]
+    benchmark_producer: Option<benchmark_support::ReleaseBenchmarkProducer>,
 }
 
 /// Sole owner of all workers in one production paper-bot run.
 #[derive(Debug)]
 pub struct ProductionPaperBotRuntime {
-    live: ProductionLiveSourceRuntime,
+    live: PaperBotLiveRuntime,
     dispatcher: Arc<ExecutionDispatcher>,
     accounts: Arc<AccountRiskCoordinator>,
     account_ids: Vec<market_squawk_domain::AccountId>,
@@ -726,6 +853,61 @@ pub struct ProductionPaperBotRuntime {
     task_reaper: ExecutionTaskReaper,
     paper_control_timeout: Duration,
     audit_service: ProductionAuditService,
+}
+
+#[derive(Debug)]
+enum PaperBotLiveRuntime {
+    Production(ProductionLiveSourceRuntime),
+    #[cfg(feature = "release-evidence")]
+    ReleaseBenchmark(benchmark_support::ReleaseBenchmarkLiveRuntime),
+}
+
+#[derive(Debug)]
+struct StartedPaperBotLiveRuntime {
+    live: PaperBotLiveRuntime,
+    #[cfg(feature = "release-evidence")]
+    benchmark_producer: Option<benchmark_support::ReleaseBenchmarkProducer>,
+}
+
+impl StartedPaperBotLiveRuntime {
+    fn production(runtime: ProductionLiveSourceRuntime) -> Self {
+        Self {
+            live: PaperBotLiveRuntime::Production(runtime),
+            #[cfg(feature = "release-evidence")]
+            benchmark_producer: None,
+        }
+    }
+
+    #[cfg(feature = "release-evidence")]
+    fn release_benchmark(
+        (runtime, producer): (
+            benchmark_support::ReleaseBenchmarkLiveRuntime,
+            benchmark_support::ReleaseBenchmarkProducer,
+        ),
+    ) -> Self {
+        Self {
+            live: PaperBotLiveRuntime::ReleaseBenchmark(runtime),
+            benchmark_producer: Some(producer),
+        }
+    }
+}
+
+impl PaperBotLiveRuntime {
+    fn snapshots(&self) -> LiveSnapshotReader {
+        match self {
+            Self::Production(runtime) => runtime.snapshots(),
+            #[cfg(feature = "release-evidence")]
+            Self::ReleaseBenchmark(runtime) => runtime.snapshots(),
+        }
+    }
+
+    async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
+        match self {
+            Self::Production(runtime) => runtime.shutdown().await,
+            #[cfg(feature = "release-evidence")]
+            Self::ReleaseBenchmark(runtime) => runtime.shutdown().await,
+        }
+    }
 }
 
 impl ProductionPaperBotRuntime {

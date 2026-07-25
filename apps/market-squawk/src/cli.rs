@@ -161,6 +161,13 @@ pub enum Command {
         command: FairValueCommand,
     },
 
+    /// Produce and close exact-head release evidence.
+    Release {
+        /// Release operation.
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+
     /// Run the local stdio MCP server.
     Mcp {
         /// MCP operation. Omitting it retains the v0.1 `mcp` compatibility form.
@@ -587,6 +594,155 @@ pub enum FairValueCommand {
 pub enum McpCommand {
     /// Serve the bounded local stdio protocol.
     Serve,
+}
+
+/// Exact-head release operation.
+#[derive(Debug, Subcommand)]
+pub enum ReleaseCommand {
+    /// Produce or close one class of machine-readable release evidence.
+    Evidence {
+        /// Evidence operation.
+        #[command(subcommand)]
+        command: ReleaseEvidenceCommand,
+    },
+    /// Run the deterministic local all-vertical demonstration.
+    Demonstrate(ReleaseDemonstrateArguments),
+}
+
+/// Release-evidence operation.
+#[derive(Debug, Subcommand)]
+pub enum ReleaseEvidenceCommand {
+    /// Run the closed parser, protocol, model, and MCP fuzz campaign.
+    Fuzz(ReleaseFuzzArguments),
+    /// Measure the production live and analytical-storage paths.
+    Benchmark(ReleaseBenchmarkArguments),
+    /// Execute one parent-supervised benchmark worker without publishing evidence.
+    #[command(hide = true)]
+    BenchmarkWorker(ReleaseBenchmarkArguments),
+    /// Collect authorized evidence from configured provider interfaces.
+    Providers(ReleaseProviderArguments),
+    /// Validate and seal a complete exact-head evidence directory.
+    Close(ReleaseCloseArguments),
+}
+
+/// Repository identity optionally asserted by a provisional producer.
+#[derive(Debug, Args)]
+pub struct ReleaseRepositoryArguments {
+    /// Exact Git commit expected at command start and completion.
+    #[arg(long)]
+    pub head: Option<String>,
+    /// Exact Git tree expected at command start and completion.
+    #[arg(long)]
+    pub tree: Option<String>,
+}
+
+/// Fuzz-campaign arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseFuzzArguments {
+    /// Repository identity asserted for exact-head evidence.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Pinned fuzz-only Rust toolchain.
+    #[arg(long, default_value = "nightly-2026-07-15")]
+    pub toolchain: String,
+    /// Maximum campaign duration for each target.
+    #[arg(long, default_value_t = 120)]
+    pub seconds_per_target: u64,
+    /// Maximum resident memory for each complete target process tree.
+    #[arg(long, default_value_t = 2_048)]
+    pub rss_limit_mib: u64,
+    /// New no-clobber JSON evidence file.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+/// Performance-evidence arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseBenchmarkArguments {
+    /// Repository identity asserted for exact-head evidence.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Untimed live-path warm-up event count.
+    #[arg(long, default_value_t = 1_000_000)]
+    pub warm_up_events: u64,
+    /// Measured live-path event count.
+    #[arg(long, default_value_t = 60_000_000)]
+    pub events: u64,
+    /// Measured analytical-storage row count.
+    #[arg(long, default_value_t = 10_000_000)]
+    pub storage_rows: u64,
+    /// Maximum post-warm-up resident-memory growth.
+    #[arg(long, default_value_t = 32)]
+    pub max_tail_growth_mib: u64,
+    /// Maximum post-warm-up resident-memory growth as an integer percentage.
+    #[arg(long, default_value_t = 1)]
+    pub max_tail_growth_percent: u64,
+    /// Minimum accepted complete live-path throughput.
+    #[arg(long, default_value_t = 100_000)]
+    pub min_events_per_second: u64,
+    /// Strict upper bound for warmed complete live-path p99 latency.
+    #[arg(long, default_value_t = 999_999)]
+    pub max_warmed_p99_ns: u64,
+    /// New no-clobber JSON evidence file.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+/// Authorized provider-evidence arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseProviderArguments {
+    /// Repository identity asserted for exact-head evidence.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Closed provider set to exercise.
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub providers: Vec<String>,
+    /// Require one authorized source to drive a verified risk-approved paper action.
+    #[arg(long)]
+    pub require_direct_verified_action: bool,
+    /// Require admitted FRED and ALFRED persistence and training rights.
+    #[arg(long)]
+    pub require_fred_alfred_rights: bool,
+    /// New empty directory that will own provider evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+/// Evidence-closure arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseCloseArguments {
+    /// Exact clean repository identity all evidence must bind.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Complete HEAD-keyed release-evidence directory.
+    #[arg(long)]
+    pub evidence_dir: PathBuf,
+    /// Exact release executable represented by the evidence.
+    #[arg(long)]
+    pub binary: PathBuf,
+    /// New no-clobber closed-manifest file inside the evidence directory.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+/// Deterministic local all-vertical demonstration arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseDemonstrateArguments {
+    /// Repository identity asserted for exact-head evidence.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Require the demonstration to deny all external networking.
+    #[arg(long)]
+    pub offline: bool,
+    /// Authorized provider-evidence directory.
+    #[arg(long)]
+    pub provider_evidence: PathBuf,
+    /// Sealed Python release-manifest evidence.
+    #[arg(long)]
+    pub python_evidence: PathBuf,
+    /// New no-clobber JSON evidence file.
+    #[arg(long)]
+    pub output: PathBuf,
 }
 
 /// Diagnostic mock-feed arguments.

@@ -10,6 +10,8 @@ mod contracts;
 mod csv;
 mod database;
 mod excel;
+#[cfg(feature = "fuzzing")]
+mod fuzzing;
 mod json;
 mod manifest;
 mod manifest_bounds;
@@ -23,6 +25,8 @@ pub use clock::{
     ExtractionClock, ExtractionClockError, ExtractionClockReading, SystemExtractionClock,
 };
 pub use contracts::{ExtractionLimits, ExtractionLimitsInput, FileAdapterError, ParserLimit};
+#[cfg(feature = "fuzzing")]
+pub use fuzzing::{FuzzFileFormat, fuzz_parse_bytes};
 pub use source::FileExtractionSource;
 
 pub(crate) use contracts::{CellValue, ParseBudget, ParsedRow};

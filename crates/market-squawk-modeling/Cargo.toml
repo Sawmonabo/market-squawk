@@ -11,8 +11,10 @@ autotests = false
 
 [features]
 default = []
+fuzzing = []
 onnx-tract = ["dep:tract-onnx"]
 onnx-runtime = ["onnx-tract", "dep:ort"]
+release-evidence = ["onnx-tract"]
 
 [dependencies]
 cap-std.workspace = true

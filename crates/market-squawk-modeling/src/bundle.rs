@@ -1,5 +1,9 @@
 //! Capability-rooted bundle reads and closed fail-closed validation.
 
+#[cfg(feature = "release-evidence")]
+#[path = "benchmark_support.rs"]
+pub(crate) mod benchmark_support;
+
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -38,6 +42,18 @@ pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 pub const MAX_ONNX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum exact training-run provenance bytes admitted before parsing.
 pub const MAX_TRAINING_RUN_BYTES: usize = 256 * 1024;
+
+/// Exercises the production bundle-metadata structural and wire decoders.
+///
+/// Invalid metadata is a normal fuzz input. This entry point retains no decoded value and exists
+/// only with the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_bundle_metadata(bytes: &[u8]) {
+    if bytes.len() > MAX_METADATA_BYTES || validate_json_structure(bytes).is_err() {
+        return;
+    }
+    let _metadata = serde_json::from_slice::<MetadataWire>(bytes);
+}
 
 /// Exact metadata object expected beneath a controlled model root.
 #[derive(Clone, Debug, Eq, PartialEq)]

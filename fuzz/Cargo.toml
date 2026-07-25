@@ -1,0 +1,108 @@
+[package]
+name = "market-squawk-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = []
+capture = [
+    "dep:market-squawk-platform",
+    "dep:market-squawk-sources",
+    "dep:serde_json",
+]
+coinbase = [
+    "dep:bytes",
+    "dep:market-squawk-adapter-coinbase",
+    "dep:market-squawk-domain",
+    "dep:market-squawk-sources",
+]
+kraken = [
+    "dep:market-squawk-adapter-kraken",
+    "dep:market-squawk-domain",
+]
+mcp = ["dep:market-squawk-mcp"]
+model = [
+    "dep:market-squawk-data",
+    "dep:market-squawk-modeling",
+    "dep:sha2",
+]
+research = [
+    "dep:market-squawk-adapter-files",
+    "dep:market-squawk-adapter-sec",
+    "dep:market-squawk-domain",
+]
+
+[dependencies]
+bytes = { version = "1.10", optional = true }
+libfuzzer-sys = "=0.4.13"
+market-squawk-adapter-coinbase = { path = "../adapters/market-squawk-adapter-coinbase", optional = true }
+market-squawk-adapter-files = { path = "../adapters/market-squawk-adapter-files", features = ["fuzzing"], optional = true }
+market-squawk-adapter-kraken = { path = "../adapters/market-squawk-adapter-kraken", optional = true }
+market-squawk-adapter-sec = { path = "../adapters/market-squawk-adapter-sec", optional = true }
+market-squawk-data = { path = "../crates/market-squawk-data", optional = true }
+market-squawk-domain = { path = "../crates/market-squawk-domain", optional = true }
+market-squawk-mcp = { path = "../crates/market-squawk-mcp", features = ["fuzzing"], optional = true }
+market-squawk-modeling = { path = "../crates/market-squawk-modeling", optional = true, features = [
+    "fuzzing",
+    "onnx-tract",
+] }
+market-squawk-platform = { path = "../crates/market-squawk-platform", optional = true }
+market-squawk-sources = { path = "../crates/market-squawk-sources", optional = true }
+serde_json = { version = "1.0", features = ["arbitrary_precision"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "coinbase_decoder"
+path = "fuzz_targets/coinbase_decoder.rs"
+test = false
+doc = false
+bench = false
+required-features = ["coinbase"]
+
+[[bin]]
+name = "kraken_decoder"
+path = "fuzz_targets/kraken_decoder.rs"
+test = false
+doc = false
+bench = false
+required-features = ["kraken"]
+
+[[bin]]
+name = "research_document_parsers"
+path = "fuzz_targets/research_document_parsers.rs"
+test = false
+doc = false
+bench = false
+required-features = ["research"]
+
+[[bin]]
+name = "capture_records"
+path = "fuzz_targets/capture_records.rs"
+test = false
+doc = false
+bench = false
+required-features = ["capture"]
+
+[[bin]]
+name = "mcp_requests"
+path = "fuzz_targets/mcp_requests.rs"
+test = false
+doc = false
+bench = false
+required-features = ["mcp"]
+
+[[bin]]
+name = "model_artifacts"
+path = "fuzz_targets/model_artifacts.rs"
+test = false
+doc = false
+bench = false
+required-features = ["model"]

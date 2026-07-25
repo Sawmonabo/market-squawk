@@ -90,10 +90,11 @@ pub fn local_paper_bot(
     let source = configured_source(&config, provider)?;
     build_local_paper_bot(
         config,
-        provider,
+        PaperBotBuildSource::Production(provider),
         source,
         initial_cash,
         fee_basis_points,
+        0,
         controlled_paper_strategy,
     )
 }
@@ -118,6 +119,13 @@ struct ConfiguredPaperSource {
     retained_depth: usize,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PaperBotBuildSource {
+    Production(ProductionSourceProvider),
+    #[cfg(feature = "release-evidence")]
+    ReleaseBenchmark,
 }
 
 fn configured_source(
@@ -156,10 +164,11 @@ fn configured_source(
 
 fn build_local_paper_bot<F>(
     config: AppConfig,
-    provider: ProductionSourceProvider,
+    build_source: PaperBotBuildSource,
     source_profile: ConfiguredPaperSource,
     initial_cash: Decimal,
     fee_basis_points: u32,
+    action_hook_overhead_bytes: usize,
     mut strategy_for_route: F,
 ) -> Result<ProductionPaperBotComposition>
 where
@@ -289,7 +298,9 @@ where
             &risk_limits,
             dispatcher,
             market_sink_retained_bytes,
-        )?;
+        )?
+        .checked_add(action_hook_overhead_bytes)
+        .ok_or_else(|| anyhow!("paper action-hook retained bytes overflowed"))?;
         let route_retained_bytes = RouteActionHook::retained_bytes_for_composition(
             route.route(),
             LOCAL_PAPER_REQUIRED_FEATURES.len(),
@@ -310,7 +321,7 @@ where
         maximum_action_hook_bytes_per_route,
     )?;
     let risk_policy = bound_risk_policy(
-        provider,
+        build_source,
         maximum_action_hook_bytes_per_route,
         runtime_peak_bytes.get(),
     )?;
@@ -343,13 +354,53 @@ where
         paper_accounts: vec![paper_account],
         paper_control_timeout: Duration::from_secs(5),
     };
-    let source = ProductionLiveSourceComposition::try_for_provider(config, routes, provider)?;
-    Ok(ProductionPaperBotComposition::try_new(
-        source,
-        runtime_config,
-        execution,
-        strategies,
-    )?)
+    match build_source {
+        PaperBotBuildSource::Production(provider) => {
+            let source =
+                ProductionLiveSourceComposition::try_for_provider(config, routes, provider)?;
+            Ok(ProductionPaperBotComposition::try_new(
+                source,
+                runtime_config,
+                execution,
+                strategies,
+            )?)
+        }
+        #[cfg(feature = "release-evidence")]
+        PaperBotBuildSource::ReleaseBenchmark => {
+            Ok(ProductionPaperBotComposition::try_new_release_benchmark(
+                routes,
+                runtime_config,
+                execution,
+                strategies,
+            )?)
+        }
+    }
+}
+
+#[cfg(feature = "release-evidence")]
+pub(super) fn release_benchmark_paper_bot<F>(
+    config: AppConfig,
+    definition: InstrumentDefinition,
+    action_hook_overhead_bytes: usize,
+    strategy_for_route: F,
+) -> Result<ProductionPaperBotComposition>
+where
+    F: FnMut(&LiveRouteConfig) -> Result<Box<dyn Strategy>>,
+{
+    build_local_paper_bot(
+        config,
+        PaperBotBuildSource::ReleaseBenchmark,
+        ConfiguredPaperSource {
+            definitions: vec![definition],
+            retained_depth: 10,
+            maximum_message_bytes: 16 * 1024 * 1024,
+            freshness_nanos: 60_000_000_000,
+        },
+        Decimal::new(1_000_000, 0),
+        0,
+        action_hook_overhead_bytes,
+        strategy_for_route,
+    )
 }
 
 fn paper_sandbox_portfolio_capability(
@@ -500,10 +551,11 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
     let mut strategy = Some(strategy);
     build_local_paper_bot(
         config,
-        provider,
+        PaperBotBuildSource::Production(provider),
         source,
         initial_cash,
         fee_basis_points,
+        0,
         |_route| {
             strategy
                 .take()
@@ -513,13 +565,19 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
 }
 
 fn bound_risk_policy(
-    provider: ProductionSourceProvider,
+    build_source: PaperBotBuildSource,
     maximum_action_hook_bytes_per_route: usize,
     runtime_peak_bytes: u64,
 ) -> Result<RiskPolicyIdentity> {
-    let base = match provider {
-        ProductionSourceProvider::Coinbase => "local-coinbase-paper-risk",
-        ProductionSourceProvider::Kraken => "local-kraken-paper-risk",
+    let base = match build_source {
+        PaperBotBuildSource::Production(ProductionSourceProvider::Coinbase) => {
+            "local-coinbase-paper-risk"
+        }
+        PaperBotBuildSource::Production(ProductionSourceProvider::Kraken) => {
+            "local-kraken-paper-risk"
+        }
+        #[cfg(feature = "release-evidence")]
+        PaperBotBuildSource::ReleaseBenchmark => "release-benchmark-paper-risk",
     };
     let identity = SourceIdentifier::try_from(format!(
         "{base}-hook-{maximum_action_hook_bytes_per_route}-peak-{runtime_peak_bytes}"
@@ -644,7 +702,7 @@ fn paper_config(
     })?)
 }
 
-fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<dyn Strategy>> {
+pub(super) fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<dyn Strategy>> {
     let order_uuid = Uuid::new_v4();
     let config =
         BookImbalancePaperStrategyConfig::try_new(BookImbalancePaperStrategyConfigInput {

@@ -9,10 +9,14 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
-    cli::{Cli, Command, ConfigCommand, McpCommand, OutputFormat, SourceCommand},
+    cli::{
+        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
+        ReleaseEvidenceCommand, SourceCommand,
+    },
     local_product::execute_cli_command,
     mcp::LocalMcpComposition,
     paper_bot::local_paper_bot,
+    release::execute_release_command,
     replay::replay_coinbase_journal,
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
@@ -169,6 +173,21 @@ async fn main() -> Result<()> {
                 product.artifacts(),
             )?;
             let _exit = composition.serve_stdio(CancellationToken::new()).await?;
+        }
+        Command::Release { command } => {
+            let benchmark_worker = matches!(
+                &command,
+                ReleaseCommand::Evidence {
+                    command: ReleaseEvidenceCommand::BenchmarkWorker(_)
+                }
+            );
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            let result = execute_release_command(config, command).await?;
+            if benchmark_worker {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                emit_result(output, "release operation completed", &result)?;
+            }
         }
         Command::Replay(arguments) => {
             let source = arguments.source;
