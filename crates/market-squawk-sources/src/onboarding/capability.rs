@@ -9,6 +9,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::ProviderBudgetPolicy;
+
 const MAX_AUTHORITIES: usize = 64;
 const MAX_EVIDENCE_BINDINGS: usize = 32;
 const MAX_PROVIDER_SURFACES: usize = 64;
@@ -181,10 +183,27 @@ pub struct RatePolicyDescriptor {
     policy_id: SourceIdentifier,
     evidence_digest: EvidenceDigest,
     unknown_is_conservative: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enforcement: Option<RateEnforcementContract>,
+}
+
+/// Serialized request authority consumed unchanged by portal disclosure and runtime enforcement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RateEnforcementContract {
+    policy_revision: ProviderCapabilityRevision,
+    endpoint_class: SourceIdentifier,
+    scope_evidence_digest: EvidenceDigest,
+    budget: ProviderBudgetPolicy,
+    refresh_on_http_429: bool,
 }
 
 impl RatePolicyDescriptor {
-    /// Constructs a rate-policy descriptor.
+    /// Constructs a legacy identity-only descriptor for exact revision replay.
+    ///
+    /// Identity-only descriptors are not operational rate authority. New current capabilities
+    /// must use [`Self::try_new_enforced`]; the onboarding service rejects a current capability
+    /// without the explicit serialized enforcement dimensions.
     pub fn try_new(
         policy_id: SourceIdentifier,
         evidence_digest: EvidenceDigest,
@@ -194,6 +213,38 @@ impl RatePolicyDescriptor {
             policy_id,
             evidence_digest,
             unknown_is_conservative,
+            enforcement: None,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    /// Constructs one sealed, versioned rate contract used by both disclosure and enforcement.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "serialized rate-policy evidence remains explicit at the provider boundary"
+    )]
+    pub fn try_new_enforced(
+        policy_id: SourceIdentifier,
+        evidence_digest: EvidenceDigest,
+        unknown_is_conservative: bool,
+        policy_revision: ProviderCapabilityRevision,
+        endpoint_class: SourceIdentifier,
+        scope_evidence_digest: EvidenceDigest,
+        budget: ProviderBudgetPolicy,
+        refresh_on_http_429: bool,
+    ) -> Result<Self, ProviderCapabilityError> {
+        let descriptor = Self {
+            policy_id,
+            evidence_digest,
+            unknown_is_conservative,
+            enforcement: Some(RateEnforcementContract {
+                policy_revision,
+                endpoint_class,
+                scope_evidence_digest,
+                budget,
+                refresh_on_http_429,
+            }),
         };
         descriptor.validate()?;
         Ok(descriptor)
@@ -209,12 +260,65 @@ impl RatePolicyDescriptor {
         self.evidence_digest
     }
 
-    fn validate(&self) -> Result<(), ProviderCapabilityError> {
-        if self.unknown_is_conservative && nonzero_digest(self.evidence_digest) {
-            Ok(())
-        } else {
-            Err(ProviderCapabilityError::InvalidRecord)
+    /// Returns whether an unclassified provider dimension must remain conservatively bounded.
+    pub const fn unknown_is_conservative(&self) -> bool {
+        self.unknown_is_conservative
+    }
+
+    /// Returns the explicit enforcement revision, or `None` for a retained legacy descriptor.
+    pub const fn enforcement_revision(&self) -> Option<ProviderCapabilityRevision> {
+        match &self.enforcement {
+            Some(enforcement) => Some(enforcement.policy_revision),
+            None => None,
         }
+    }
+
+    /// Returns the exact endpoint class governed by this contract.
+    pub const fn endpoint_class(&self) -> Option<&SourceIdentifier> {
+        match &self.enforcement {
+            Some(enforcement) => Some(&enforcement.endpoint_class),
+            None => None,
+        }
+    }
+
+    /// Returns evidence binding the non-secret provider/account collision scope.
+    pub const fn scope_evidence_digest(&self) -> Option<EvidenceDigest> {
+        match &self.enforcement {
+            Some(enforcement) => Some(enforcement.scope_evidence_digest),
+            None => None,
+        }
+    }
+
+    /// Returns the same typed policy serialized into this descriptor.
+    pub const fn enforcement_policy(&self) -> Option<&ProviderBudgetPolicy> {
+        match &self.enforcement {
+            Some(enforcement) => Some(&enforcement.budget),
+            None => None,
+        }
+    }
+
+    /// Returns whether an HTTP 429 invalidates current rate observations and applies cooldown.
+    pub const fn refresh_on_http_429(&self) -> Option<bool> {
+        match &self.enforcement {
+            Some(enforcement) => Some(enforcement.refresh_on_http_429),
+            None => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProviderCapabilityError> {
+        if !self.unknown_is_conservative || !nonzero_digest(self.evidence_digest) {
+            return Err(ProviderCapabilityError::InvalidRecord);
+        }
+        if let Some(enforcement) = &self.enforcement
+            && (!nonzero_digest(enforcement.scope_evidence_digest)
+                || enforcement.endpoint_class.as_str().is_empty()
+                || enforcement.budget.window_count() == 0
+                || enforcement.budget.max_concurrent() == 0
+                || enforcement.budget.backoff().maximum_nanos() == 0)
+        {
+            return Err(ProviderCapabilityError::InvalidRecord);
+        }
+        Ok(())
     }
 }
 

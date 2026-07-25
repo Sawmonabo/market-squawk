@@ -1,5 +1,7 @@
 //! Evidence-reviewed built-in onboarding profiles.
 
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+
 use market_squawk_domain::{DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 
 use super::{
@@ -13,9 +15,15 @@ use crate::onboarding::profile::{
     ProviderOnboardingProfileInput, ProviderProfileError, ProviderProfileRegistry, Requirement,
     VerificationProbe, ZeroFeeStatus,
 };
+use crate::{
+    BackoffPolicy, BudgetScope, BudgetWindowSemantics, ProviderBudgetPolicy, ProviderBudgetWindow,
+};
 
 const REVIEW_DATE: &str = "2026-07-23";
 const PROJECT_HANDOFF: &str = "https://github.com/Sawmonabo/market-squawk";
+const SECOND_NANOS: u64 = 1_000_000_000;
+const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
+const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
 const REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
     [
@@ -291,53 +299,34 @@ pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderP
 }
 
 fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
-    let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
-    let authority = spec.authority.map(SourceIdentifier::try_from).transpose()?;
-    let minimum_authority =
-        AuthoritySet::try_new(authority.clone().into_iter().collect::<Vec<_>>())?;
-    let maximum_authority = AuthoritySet::try_new(authority.into_iter().collect::<Vec<_>>())?;
-    let capability = ProviderCapability::try_new(ProviderCapabilityInput {
-        surface_id: SourceIdentifier::try_from(spec.id)?,
-        revision: ProviderCapabilityRevision::new(1)?,
-        setup_mode: if credentialed {
-            SetupMode::ManualApiKeyImport
-        } else {
-            SetupMode::NoCredential
-        },
-        official_entry_uri: spec.official_entry.to_owned(),
-        human_boundary: if credentialed {
-            HumanBoundary::ProviderControlled
-        } else {
-            HumanBoundary::None
-        },
-        credential_kind: if credentialed {
-            CredentialKind::ApiKey
-        } else {
-            CredentialKind::None
-        },
-        minimum_authority,
-        maximum_authority,
-        verifier_revision: SourceIdentifier::try_from(format!("{}.probe.v1", spec.id))?,
-        rate_policy: RatePolicyDescriptor::try_new(
+    let legacy_capability = build_capability(
+        &spec,
+        ProviderCapabilityRevision::new(1)?,
+        RatePolicyDescriptor::try_new(
             SourceIdentifier::try_from(spec.rate_policy)?,
             REPORT_DIGEST,
             true,
         )?,
-        rights_state: spec.rights_state,
-        lifecycle_support: if spec.id == "bls.v2-registered" {
-            LifecycleSupport::new(true, false, true)
-        } else {
-            LifecycleSupport::new(false, false, false)
-        },
-        evidence: vec![EvidenceBinding::new(
-            SourceIdentifier::try_from("MSQ-ONBOARDING-REPORT-2026-07-23")?,
+    )?;
+    let capability = build_capability(
+        &spec,
+        ProviderCapabilityRevision::new(2)?,
+        RatePolicyDescriptor::try_new_enforced(
+            SourceIdentifier::try_from(spec.rate_policy)?,
             REPORT_DIGEST,
-        )],
-        refresh_trigger: SourceIdentifier::try_from(spec.refresh_trigger)?,
-    })?;
+            true,
+            ProviderCapabilityRevision::new(1)?,
+            SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+            REPORT_DIGEST,
+            built_in_budget(&spec)?,
+            spec.probe.transport() != ProbeTransport::Local,
+        )?,
+    )?;
+    let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
     ProviderOnboardingProfile::try_new(ProviderOnboardingProfileInput {
         id: spec.id,
         display_name: spec.display_name,
+        historical_capabilities: vec![legacy_capability],
         capability,
         zero_fee: spec.zero_fee,
         account: spec.account,
@@ -363,6 +352,144 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
         recovery: spec.recovery,
         evidence: spec.evidence,
     })
+}
+
+fn build_capability(
+    spec: &BuiltInSpec,
+    revision: ProviderCapabilityRevision,
+    rate_policy: RatePolicyDescriptor,
+) -> Result<ProviderCapability, ProviderProfileError> {
+    let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
+    let authority = spec.authority.map(SourceIdentifier::try_from).transpose()?;
+    let minimum_authority =
+        AuthoritySet::try_new(authority.clone().into_iter().collect::<Vec<_>>())?;
+    let maximum_authority = AuthoritySet::try_new(authority.into_iter().collect::<Vec<_>>())?;
+    Ok(ProviderCapability::try_new(ProviderCapabilityInput {
+        surface_id: SourceIdentifier::try_from(spec.id)?,
+        revision,
+        setup_mode: if credentialed {
+            SetupMode::ManualApiKeyImport
+        } else {
+            SetupMode::NoCredential
+        },
+        official_entry_uri: spec.official_entry.to_owned(),
+        human_boundary: if credentialed {
+            HumanBoundary::ProviderControlled
+        } else {
+            HumanBoundary::None
+        },
+        credential_kind: if credentialed {
+            CredentialKind::ApiKey
+        } else {
+            CredentialKind::None
+        },
+        minimum_authority,
+        maximum_authority,
+        verifier_revision: SourceIdentifier::try_from(format!("{}.probe.v1", spec.id))?,
+        rate_policy,
+        rights_state: spec.rights_state,
+        lifecycle_support: if spec.id == "bls.v2-registered" {
+            LifecycleSupport::new(true, false, true)
+        } else {
+            LifecycleSupport::new(false, false, false)
+        },
+        evidence: vec![EvidenceBinding::new(
+            SourceIdentifier::try_from("MSQ-ONBOARDING-REPORT-2026-07-23")?,
+            REPORT_DIGEST,
+        )],
+        refresh_trigger: SourceIdentifier::try_from(spec.refresh_trigger)?,
+    })?)
+}
+
+fn built_in_budget(spec: &BuiltInSpec) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let backoff =
+        BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?;
+    match spec.id {
+        "sec.edgar-public" => simple_budget("us-sec-edgar", None, 8, SECOND_NANOS, 4, backoff),
+        "bls.v1-unregistered" => bls_budget(None, 25, backoff),
+        "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 500, backoff),
+        "fred-alfred.api-v1-v2" => simple_budget(
+            "fred",
+            Some("fred.onboarding-rights-blocked"),
+            120,
+            MINUTE_NANOS,
+            2,
+            backoff,
+        ),
+        "treasury.daily-rates-xml" | "treasury.fiscal-data" => {
+            simple_budget("us-treasury", None, 100, MINUTE_NANOS, 2, backoff)
+        }
+        "coinbase.public-market-data" => {
+            simple_budget("coinbase", None, 1, MINUTE_NANOS, 1, backoff)
+        }
+        "kraken.spot-public-market-data" => {
+            simple_budget("kraken", None, 1, MINUTE_NANOS, 1, backoff)
+        }
+        "local.files" | "local.portfolio-imports" | "local.paper-execution" => {
+            simple_budget("market-squawk-local", None, 1, SECOND_NANOS, 1, backoff)
+        }
+        _ => Err(ProviderProfileError::InvalidProfile),
+    }
+}
+
+fn simple_budget(
+    provider: &str,
+    account: Option<&str>,
+    requests: u32,
+    window_nanos: u64,
+    concurrency: u16,
+    backoff: BackoffPolicy,
+) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let provider = SourceIdentifier::try_from(provider)?;
+    let scope = match account {
+        Some(account) => {
+            BudgetScope::with_authorization_account(provider, SourceIdentifier::try_from(account)?)
+        }
+        None => BudgetScope::new(provider),
+    };
+    Ok(ProviderBudgetPolicy::try_new(
+        scope,
+        NonZeroU32::new(requests).ok_or(ProviderProfileError::InvalidProfile)?,
+        nonzero_u64(window_nanos)?,
+        NonZeroU16::new(concurrency).ok_or(ProviderProfileError::InvalidProfile)?,
+        backoff,
+    )?)
+}
+
+fn bls_budget(
+    account: Option<&str>,
+    daily_requests: u32,
+    backoff: BackoffPolicy,
+) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let provider = SourceIdentifier::try_from("us-bls")?;
+    let scope = match account {
+        Some(account) => {
+            BudgetScope::with_authorization_account(provider, SourceIdentifier::try_from(account)?)
+        }
+        None => BudgetScope::new(provider),
+    };
+    let windows = [
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(50).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(10 * SECOND_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(daily_requests).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(DAY_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+    ];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        scope,
+        &windows,
+        NonZeroU16::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
+        backoff,
+    )?)
+}
+
+fn nonzero_u64(value: u64) -> Result<NonZeroU64, ProviderProfileError> {
+    NonZeroU64::new(value).ok_or(ProviderProfileError::InvalidProfile)
 }
 
 fn coinbase() -> Result<BuiltInSpec, ProviderProfileError> {

@@ -11,7 +11,8 @@ use super::{
 };
 use crate::onboarding::capability::nonzero_digest;
 
-const MAX_RETAINED_GENERATIONS: usize = 4;
+const MAX_RETAINED_GENERATIONS: usize = 256;
+const MAX_OPERATION_RETRY_BUDGET: u8 = 8;
 
 /// Non-secret issuer, audience, resource, and account bindings observed by a verifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -285,6 +286,8 @@ pub enum OnboardingState {
     RuntimeVerificationPending,
     /// The exact active generation is admitted for scoped use.
     ActiveScoped,
+    /// The active credential reached its provider-verification renewal boundary.
+    RenewalRequired,
     /// Evidence change invalidated activation until review.
     RefreshRequired,
     /// A candidate generation is being prepared while the prior remains active.
@@ -313,6 +316,7 @@ impl OnboardingState {
             Self::RightsAdmissionPending => "rights_admission_pending",
             Self::RuntimeVerificationPending => "runtime_verification_pending",
             Self::ActiveScoped => "active_scoped",
+            Self::RenewalRequired => "renewal_required",
             Self::RefreshRequired => "refresh_required",
             Self::RotationPending => "rotation_pending",
             Self::RevocationUnconfirmed => "revocation_unconfirmed",
@@ -395,6 +399,8 @@ pub enum OnboardingEventKind {
     RuntimeVerified,
     /// The exact generation or anonymous surface became active.
     Activate,
+    /// The active credential reached its verified renewal boundary.
+    RenewalRequired,
     /// A higher candidate generation was reserved.
     BeginRotation,
     /// Authority moved atomically to the prepared candidate.
@@ -433,6 +439,7 @@ impl OnboardingEventKind {
             Self::RatePolicyAdmitted => "rate_policy_admitted",
             Self::RuntimeVerified => "runtime_verified",
             Self::Activate => "activate",
+            Self::RenewalRequired => "renewal_required",
             Self::BeginRotation => "begin_rotation",
             Self::Cutover => "cutover",
             Self::RemoteRevocation => "remote_revocation",
@@ -503,10 +510,28 @@ pub enum OnboardingEvent {
         /// `None` identifies a no-secret surface.
         generation: Option<SecretGeneration>,
     },
+    /// Records the exact expiry that suspended active credential authority.
+    RenewalRequired {
+        /// Exact active generation requiring replacement.
+        generation: SecretGeneration,
+        /// Exclusive expiry retained by its authority verification.
+        expires_at: Timestamp,
+        /// Digest of the non-secret renewal decision.
+        evidence_digest: EvidenceDigest,
+    },
     /// Reserves a higher candidate while retaining active authority.
     BeginRotation {
         /// Exact next credential generation.
         candidate_generation: SecretGeneration,
+        /// Unique owner of the bounded rotation operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_owner: Option<SourceIdentifier>,
+        /// Fixed wall-clock counterpart to the operation's monotonic runtime deadline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_at: Option<Timestamp>,
+        /// Maximum retry count for this exact operation.
+        #[serde(default)]
+        retry_budget: u8,
     },
     /// Moves authority to a fully admitted candidate.
     Cutover {
@@ -589,6 +614,7 @@ impl OnboardingEvent {
             Self::RatePolicyAdmitted { .. } => OnboardingEventKind::RatePolicyAdmitted,
             Self::RuntimeVerified { .. } => OnboardingEventKind::RuntimeVerified,
             Self::Activate { .. } => OnboardingEventKind::Activate,
+            Self::RenewalRequired { .. } => OnboardingEventKind::RenewalRequired,
             Self::BeginRotation { .. } => OnboardingEventKind::BeginRotation,
             Self::Cutover { .. } => OnboardingEventKind::Cutover,
             Self::RemoteRevocation { .. } => OnboardingEventKind::RemoteRevocation,
@@ -625,7 +651,8 @@ impl OnboardingEvent {
             | Self::RemoteRevocation { generation, .. }
             | Self::LocalDeletion { generation, .. }
             | Self::Retire { generation }
-            | Self::Tombstone { generation } => Some(*generation),
+            | Self::Tombstone { generation }
+            | Self::RenewalRequired { generation, .. } => Some(*generation),
             Self::CredentialStored { reference } => Some(reference.generation()),
             Self::AuthorityVerified { .. } => None,
             Self::RightsAdmitted { generation, .. }
@@ -636,6 +663,9 @@ impl OnboardingEvent {
             | Self::CleanupRequired { generation, .. } => *generation,
             Self::BeginRotation {
                 candidate_generation,
+                operation_owner: _,
+                deadline_at: _,
+                retry_budget: _,
             } => Some(*candidate_generation),
             Self::Cutover {
                 candidate_generation,
@@ -711,6 +741,10 @@ pub struct OnboardingLifecycle {
     generations: Vec<GenerationRecord>,
     active_generation: Option<SecretGeneration>,
     candidate_generation: Option<SecretGeneration>,
+    rotation_operation_owner: Option<SourceIdentifier>,
+    rotation_deadline_at: Option<Timestamp>,
+    rotation_retry_budget: u8,
+    rotation_started_from_renewal: bool,
     anonymous_rights_digest: Option<EvidenceDigest>,
     anonymous_rate_policy_digest: Option<EvidenceDigest>,
     anonymous_runtime_digest: Option<EvidenceDigest>,
@@ -759,6 +793,10 @@ impl OnboardingLifecycle {
             generations,
             active_generation: None,
             candidate_generation,
+            rotation_operation_owner: None,
+            rotation_deadline_at: None,
+            rotation_retry_budget: 0,
+            rotation_started_from_renewal: false,
             anonymous_rights_digest: None,
             anonymous_rate_policy_digest: None,
             anonymous_runtime_digest: None,
@@ -773,9 +811,18 @@ impl OnboardingLifecycle {
         observed_at: Timestamp,
     ) -> Result<OnboardingState, OnboardingStateError> {
         self.ensure_capability(capability)?;
+        if self.state == OnboardingState::RotationPending
+            && rotation_progress_event(&event)
+            && self
+                .rotation_deadline_at
+                .is_some_and(|deadline| observed_at >= deadline)
+        {
+            return Err(OnboardingStateError::DeadlineExceeded);
+        }
         if matches!(
             self.state,
-            OnboardingState::RefreshRequired
+            OnboardingState::RenewalRequired
+                | OnboardingState::RefreshRequired
                 | OnboardingState::Unavailable
                 | OnboardingState::IndeterminateRemoteState
                 | OnboardingState::CleanupRequired
@@ -792,6 +839,8 @@ impl OnboardingLifecycle {
                 | OnboardingEvent::LocalDeletion { .. }
                 | OnboardingEvent::Retire { .. }
                 | OnboardingEvent::Tombstone { .. }
+                | OnboardingEvent::BeginRotation { .. }
+                | OnboardingEvent::RenewalRequired { .. }
         ) {
             return Err(OnboardingStateError::InvalidTransition);
         }
@@ -948,12 +997,41 @@ impl OnboardingLifecycle {
                 }
                 self.state = OnboardingState::ActiveScoped;
             }
+            OnboardingEvent::RenewalRequired {
+                generation,
+                expires_at,
+                evidence_digest,
+            } => {
+                require_digest(evidence_digest)?;
+                let verification = self
+                    .generation_verification(generation)
+                    .ok_or(OnboardingStateError::InvalidTransition)?;
+                if self.state != OnboardingState::ActiveScoped
+                    || self.active_generation != Some(generation)
+                    || verification.expires_at() != Some(expires_at)
+                    || observed_at < expires_at
+                {
+                    return Err(OnboardingStateError::InvalidTransition);
+                }
+                self.state = OnboardingState::RenewalRequired;
+            }
             OnboardingEvent::BeginRotation {
                 candidate_generation,
+                operation_owner,
+                deadline_at,
+                retry_budget,
             } => {
+                let started_from_renewal = self.state == OnboardingState::RenewalRequired;
                 if !capability.lifecycle_support().rotation()
-                    || self.state != OnboardingState::ActiveScoped
+                    || !matches!(
+                        self.state,
+                        OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
+                    )
                     || self.candidate_generation.is_some()
+                    || retry_budget > MAX_OPERATION_RETRY_BUDGET
+                    || deadline_at.is_some_and(|deadline| deadline <= observed_at)
+                    || capability.rate_policy().enforcement_policy().is_some()
+                        && (operation_owner.is_none() || deadline_at.is_none())
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -977,6 +1055,10 @@ impl OnboardingLifecycle {
                 self.generations
                     .push(GenerationRecord::reserved(candidate_generation));
                 self.candidate_generation = Some(candidate_generation);
+                self.rotation_operation_owner = operation_owner;
+                self.rotation_deadline_at = deadline_at;
+                self.rotation_retry_budget = retry_budget;
+                self.rotation_started_from_renewal = started_from_renewal;
                 self.state = OnboardingState::RotationPending;
             }
             OnboardingEvent::Cutover {
@@ -1010,6 +1092,7 @@ impl OnboardingLifecycle {
                     CredentialGenerationState::ActiveScoped;
                 self.active_generation = Some(candidate_generation);
                 self.candidate_generation = None;
+                self.clear_rotation_operation();
                 self.state = OnboardingState::ActiveScoped;
             }
             OnboardingEvent::RemoteRevocation {
@@ -1019,7 +1102,10 @@ impl OnboardingLifecycle {
             } => {
                 require_digest(evidence_digest)?;
                 let supports_remote_revocation = capability.lifecycle_support().remote_revocation();
-                if !supports_remote_revocation && outcome != RemoteRevocationOutcome::Unsupported {
+                if (!supports_remote_revocation && outcome != RemoteRevocationOutcome::Unsupported)
+                    || (supports_remote_revocation
+                        && outcome == RemoteRevocationOutcome::Unsupported)
+                {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 let generation_state = self.generation(generation)?.state;
@@ -1067,10 +1153,10 @@ impl OnboardingLifecycle {
                         (RemoteRevocationOutcome::Unsupported, _) if supports_remote_revocation => {
                             OnboardingState::RefreshRequired
                         }
-                        (
-                            RemoteRevocationOutcome::Unsupported | RemoteRevocationOutcome::Failed,
-                            _,
-                        ) => OnboardingState::RevocationUnconfirmed,
+                        (RemoteRevocationOutcome::Unsupported, _) => OnboardingState::ActiveScoped,
+                        (RemoteRevocationOutcome::Failed, _) => {
+                            OnboardingState::RevocationUnconfirmed
+                        }
                     };
                 }
             }
@@ -1098,9 +1184,9 @@ impl OnboardingLifecycle {
                 } else {
                     record.state = CredentialGenerationState::SupersededRetained;
                     self.state = match record.remote_revocation {
-                        Some(
-                            RemoteRevocationOutcome::Unsupported | RemoteRevocationOutcome::Failed,
-                        ) => OnboardingState::RevocationUnconfirmed,
+                        Some(RemoteRevocationOutcome::Failed) => {
+                            OnboardingState::RevocationUnconfirmed
+                        }
                         Some(RemoteRevocationOutcome::Indeterminate) => {
                             OnboardingState::IndeterminateRemoteState
                         }
@@ -1115,7 +1201,14 @@ impl OnboardingLifecycle {
                         record.local_deletion,
                         Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
                     )
-                    || record.remote_revocation.is_none()
+                    || !matches!(
+                        record.remote_revocation,
+                        Some(
+                            RemoteRevocationOutcome::Confirmed
+                                | RemoteRevocationOutcome::NotFound
+                                | RemoteRevocationOutcome::Unsupported
+                        )
+                    )
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -1127,6 +1220,22 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 record.state = CredentialGenerationState::Tombstoned;
+                if self.candidate_generation == Some(generation) {
+                    let renewal_required = self.rotation_started_from_renewal;
+                    self.candidate_generation = None;
+                    self.clear_rotation_operation();
+                    self.state = if self.active_generation.is_some() {
+                        if renewal_required {
+                            OnboardingState::RenewalRequired
+                        } else {
+                            OnboardingState::ActiveScoped
+                        }
+                    } else {
+                        OnboardingState::Blocked
+                    };
+                } else if self.active_generation.is_some() {
+                    self.state = OnboardingState::ActiveScoped;
+                }
             }
             OnboardingEvent::RefreshRequired { evidence_digest } => {
                 require_digest(evidence_digest)?;
@@ -1206,6 +1315,38 @@ impl OnboardingLifecycle {
         self.candidate_generation
     }
 
+    /// Returns the next contiguous credential generation without reserving it.
+    pub fn next_generation(&self) -> Result<SecretGeneration, OnboardingStateError> {
+        let next = match self.generations.last() {
+            Some(record) => record
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or(OnboardingStateError::ResourceLimit)?,
+            None => 1,
+        };
+        SecretGeneration::new(next).map_err(|_| OnboardingStateError::ResourceLimit)
+    }
+
+    /// Returns the current rotation-operation owner.
+    pub const fn rotation_operation_owner(&self) -> Option<&SourceIdentifier> {
+        self.rotation_operation_owner.as_ref()
+    }
+
+    /// Returns the fixed wall-clock deadline for the current rotation.
+    pub const fn rotation_deadline_at(&self) -> Option<Timestamp> {
+        self.rotation_deadline_at
+    }
+
+    /// Returns the bounded retry ceiling for the current rotation.
+    pub const fn rotation_retry_budget(&self) -> Option<u8> {
+        if self.candidate_generation.is_some() {
+            Some(self.rotation_retry_budget)
+        } else {
+            None
+        }
+    }
+
     /// Returns the retained state for one exact generation.
     pub fn generation_state(
         &self,
@@ -1236,6 +1377,37 @@ impl OnboardingLifecycle {
             .and_then(|record| record.verification.as_ref())
     }
 
+    /// Returns the latest separately retained remote-revocation result.
+    pub fn generation_remote_revocation(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<RemoteRevocationOutcome> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.remote_revocation)
+    }
+
+    /// Returns the latest separately retained exact local-deletion result.
+    pub fn generation_local_deletion(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<LocalDeletionOutcome> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.local_deletion)
+    }
+
+    /// Iterates every retained generation and state in ascending generation order.
+    pub fn generation_states(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (SecretGeneration, CredentialGenerationState)> + '_ {
+        self.generations
+            .iter()
+            .map(|record| (record.generation, record.state))
+    }
+
     /// Returns the exact rights-decision digest retained for the active authority.
     pub fn admitted_rights_digest(&self) -> Option<EvidenceDigest> {
         if let Some(generation) = self.active_generation {
@@ -1253,6 +1425,7 @@ impl OnboardingLifecycle {
         !matches!(
             self.state,
             OnboardingState::Unavailable
+                | OnboardingState::RenewalRequired
                 | OnboardingState::RefreshRequired
                 | OnboardingState::IndeterminateRemoteState
                 | OnboardingState::Blocked
@@ -1342,6 +1515,13 @@ impl OnboardingLifecycle {
             OnboardingState::RightsAdmissionPending
         }
     }
+
+    fn clear_rotation_operation(&mut self) {
+        self.rotation_operation_owner = None;
+        self.rotation_deadline_at = None;
+        self.rotation_retry_budget = 0;
+        self.rotation_started_from_renewal = false;
+    }
 }
 
 /// Provider onboarding validation or transition failure.
@@ -1371,6 +1551,9 @@ pub enum OnboardingStateError {
     /// The event is not legal from the current state.
     #[error("provider onboarding transition is invalid")]
     InvalidTransition,
+    /// The bounded rotation operation elapsed before this transition.
+    #[error("provider onboarding operation deadline elapsed")]
+    DeadlineExceeded,
     /// A bounded state or event ceiling was exceeded.
     #[error("provider onboarding resource limit was exceeded")]
     ResourceLimit,
@@ -1404,4 +1587,19 @@ fn require_digest(digest: EvidenceDigest) -> Result<(), OnboardingStateError> {
     } else {
         Err(OnboardingStateError::InvalidEvidence)
     }
+}
+
+fn rotation_progress_event(event: &OnboardingEvent) -> bool {
+    matches!(
+        event,
+        OnboardingEvent::CredentialImported { .. }
+            | OnboardingEvent::ProtocolValidated { .. }
+            | OnboardingEvent::CredentialStored { .. }
+            | OnboardingEvent::AuthorityVerified { .. }
+            | OnboardingEvent::RightsAdmitted { .. }
+            | OnboardingEvent::RatePolicyAdmitted { .. }
+            | OnboardingEvent::RuntimeVerified { .. }
+            | OnboardingEvent::Activate { .. }
+            | OnboardingEvent::Cutover { .. }
+    )
 }

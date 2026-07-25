@@ -30,6 +30,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::{
     ResearchIngestCoordinator, ResearchSourceDiscoveryCoordinator, encode_hex, manifest_value,
@@ -40,8 +41,12 @@ use super::super::domain_support::DomainLifecycle;
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
 
+mod provider_runtime;
 mod selection;
 
+pub use provider_runtime::{
+    PreparedResearchProviderReplacement, ResearchProviderRuntimeGeneration,
+};
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceObjectListing,
@@ -317,11 +322,13 @@ struct RegisteredExtractionSource {
     metadata: SourceMetadata,
     registration: RegisteredSource,
     rights: ResearchRightsAuthority,
+    generation: Option<ResearchProviderRuntimeGeneration>,
 }
 
 struct CoordinatorAuthority {
     registry: Option<AuthoritativeSourceRegistry>,
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
+    pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
     selections: RetainedDiscoverySelections,
 }
 
@@ -348,6 +355,7 @@ impl ProductionResearchIngestCoordinator {
             authority: Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
                 sources: BTreeMap::new(),
+                pending_replacements: BTreeMap::new(),
                 selections: RetainedDiscoverySelections::new(),
             }),
         }
@@ -367,6 +375,19 @@ impl ProductionResearchIngestCoordinator {
         profile: SourceIdentifier,
         source: S,
         rights: ResearchRightsAuthority,
+    ) -> Result<(), ResearchIngestCompositionError>
+    where
+        S: ManagedResearchExtractionSource,
+    {
+        self.register_source_inner(profile, source, rights, None)
+    }
+
+    fn register_source_inner<S>(
+        &self,
+        profile: SourceIdentifier,
+        source: S,
+        rights: ResearchRightsAuthority,
+        generation: Option<ResearchProviderRuntimeGeneration>,
     ) -> Result<(), ResearchIngestCompositionError>
     where
         S: ManagedResearchExtractionSource,
@@ -402,6 +423,7 @@ impl ProductionResearchIngestCoordinator {
                 metadata,
                 registration,
                 rights,
+                generation,
             },
         );
         Ok(())
@@ -769,6 +791,7 @@ impl ProductionResearchIngestCoordinator {
                 .lock()
                 .map_err(|_error| ServiceError::Unavailable)?;
             authority.selections.clear();
+            authority.pending_replacements.clear();
             authority.sources.clear();
             authority.registry.take()
         };
@@ -1191,6 +1214,21 @@ pub enum ResearchIngestCompositionError {
     /// In-process source authority serialization is unavailable.
     #[error("research extraction authority is unavailable")]
     AuthorityUnavailable,
+    /// A provider adapter is not bound to a complete non-secret runtime generation.
+    #[error("research provider runtime generation is invalid")]
+    InvalidRuntimeGeneration,
+    /// A registered source does not expose generation-bound provider authority.
+    #[error("research provider runtime generation is unavailable")]
+    RuntimeGenerationUnavailable,
+    /// A provider replacement is not an exact, fully constructed successor.
+    #[error("research provider runtime replacement is invalid")]
+    InvalidRuntimeReplacement,
+    /// Another replacement already owns the exact provider publication slot.
+    #[error("research provider runtime replacement is already in progress")]
+    ReplacementInProgress,
+    /// The expected runtime generation is no longer callable.
+    #[error("research provider runtime generation is stale")]
+    StaleRuntimeGeneration,
     /// The restart-durable source registry rejected registration.
     #[error("research source registration failed: {0}")]
     Registry(#[from] RegistryError),

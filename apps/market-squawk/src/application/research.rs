@@ -31,8 +31,9 @@ use crate::ResearchService;
 mod ingest;
 
 pub use ingest::{
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ManagedResearchExtractionSource, PreparedResearchProviderReplacement,
+    ProductionResearchIngestCoordinator, ResearchExtractionLimits, ResearchIngestCompositionError,
+    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };

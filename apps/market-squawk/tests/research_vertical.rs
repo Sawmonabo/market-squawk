@@ -15,10 +15,10 @@ use clap::Parser;
 use futures_util::future::BoxFuture;
 use market_squawk::application::{
     ApplicationDomainService, ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
-    ResearchExtractionLimits, ResearchIngestCoordinator, ResearchRevisionPlanError,
-    ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator, SourceDomainService,
-    SourceRuntimeRequest, SourceRuntimeSnapshotBatch, SourceRuntimeView, SourceRuntimeViewError,
-    application_capabilities,
+    ResearchExtractionLimits, ResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
+    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator,
+    SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshotBatch, SourceRuntimeView,
+    SourceRuntimeViewError, application_capabilities,
 };
 use market_squawk::{
     LocalProduct, ProviderOnboardingPortal, ProviderOnboardingService,
@@ -42,7 +42,8 @@ use market_squawk_domain::{
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileFallbackStatus,
     EncryptedFileSecretStore, LocalAuthorityStateStore, LocalPaths, PreferredSecretStore,
-    SecretValue,
+    SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
+    SecretOperationControl, SecretStore, SecretValue,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -53,8 +54,9 @@ use market_squawk_sources::{
     CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
     ExtractionRecord, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
     ExtractionSourceError, FreshnessPolicy, HistoricalCapability, MAX_DISCOVERY_OBJECTS,
-    NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
+    NetworkAccessPolicy, ProviderCapabilityRevision, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
+    SourceProtocolProfile,
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use rust_decimal::Decimal;
@@ -118,6 +120,138 @@ fn research_service_reopens_the_exact_local_catalog_and_artifact_authority()
         ))
     ));
     drop(reopened?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_bls_runtime_cutover_is_generation_exact_and_rejects_stale_replay()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let research = Arc::new(ResearchService::initialize(
+        &paths,
+        CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?,
+        8,
+        ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+    )?);
+    let registry = market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable(
+        LocalAuthorityStateStore::try_open(
+            paths.control_root()?.root().join("bls-runtime-authority"),
+        )?,
+    )?;
+    let coordinator = Arc::new(ProductionResearchIngestCoordinator::new(
+        registry,
+        research,
+        ResearchExtractionLimits::standard(),
+    ));
+    let secrets = EncryptedFileSecretStore::try_open(
+        directory.path().join("bls-runtime-secrets"),
+        SecretValue::new("bls runtime unlock".to_owned())?,
+    )?;
+    let control = SecretOperationControl::try_new(
+        "bls-runtime-cutover",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let key = SecretKey::try_new("provider-onboarding", "bls-runtime-cutover")?;
+    let generation_one = SecretGeneration::new(1)?;
+    let reference_one = secrets.create(
+        &key,
+        generation_one,
+        SecretValue::new("bls-generation-one".to_owned())?,
+        &control,
+    )?;
+    let generation_two = SecretGeneration::new(2)?;
+    let reference_two = secrets.replace(
+        &key,
+        &reference_one,
+        generation_two,
+        SecretValue::new("bls-generation-two".to_owned())?,
+        &control,
+    )?;
+    let profile = SourceIdentifier::try_from("bls.v2-registered")?;
+    let dataset = SourceIdentifier::try_from("bls-series")?;
+    let session_id = Uuid::new_v4();
+    let capability_revision = ProviderCapabilityRevision::new(2)?;
+    let capability_digest = evidence(91);
+    let old_source = DiscoveryFixtureSource::try_new(
+        "bls-runtime-fixture",
+        "bls-object-generation-one",
+        FixtureDiscovery::Repeated,
+        FixtureExtraction::Observation,
+    )?;
+    let metadata = old_source.metadata().clone();
+    let rights = fixture_rights(metadata.source_id().clone(), 92)?;
+    let old = ResearchProviderRuntimeGeneration::try_new(
+        profile.clone(),
+        session_id,
+        capability_revision,
+        capability_digest,
+        Some(generation_one),
+        Some(reference_one),
+        metadata.clone(),
+        rights.clone(),
+    )?;
+    coordinator.register_provider_source(old.clone(), old_source, rights.clone())?;
+    let new_source = DiscoveryFixtureSource::try_new(
+        "bls-runtime-fixture",
+        "bls-object-generation-two",
+        FixtureDiscovery::Repeated,
+        FixtureExtraction::Observation,
+    )?;
+    let candidate = ResearchProviderRuntimeGeneration::try_new(
+        profile.clone(),
+        session_id,
+        capability_revision,
+        capability_digest,
+        Some(generation_two),
+        Some(reference_two),
+        metadata,
+        rights.clone(),
+    )?;
+    let prepared = coordinator.prepare_provider_replacement(
+        old.clone(),
+        candidate.clone(),
+        new_source,
+        rights.clone(),
+    )?;
+    let context = long_context("bls-runtime-cutover", Duration::from_secs(60))?;
+    assert_eq!(
+        coordinator
+            .list_registered_objects(&profile, &dataset, None, NonZeroU16::MIN, &context,)
+            .await?
+            .objects()[0]
+            .object_id()
+            .as_str(),
+        "bls-object-generation-one"
+    );
+    assert_eq!(prepared.commit()?, candidate);
+    assert_eq!(
+        coordinator
+            .list_registered_objects(&profile, &dataset, None, NonZeroU16::MIN, &context,)
+            .await?
+            .objects()[0]
+            .object_id()
+            .as_str(),
+        "bls-object-generation-two"
+    );
+    let stale_source = DiscoveryFixtureSource::try_new(
+        "bls-runtime-fixture",
+        "bls-object-stale-replay",
+        FixtureDiscovery::Repeated,
+        FixtureExtraction::Observation,
+    )?;
+    assert!(matches!(
+        coordinator.prepare_provider_replacement(old, candidate, stale_source, rights),
+        Err(market_squawk::application::ResearchIngestCompositionError::StaleRuntimeGeneration)
+    ));
     Ok(())
 }
 

@@ -367,7 +367,9 @@ impl CatalogAuthority {
             return Err(CatalogError::OnboardingSequenceConflict);
         }
         let occurred_at = trusted_catalog_now(&transaction)?;
-        if occurred_at >= reservation.deadline_at() && !event_allowed_after_deadline(&event) {
+        if occurred_at >= reservation.deadline_at()
+            && !event_allowed_after_deadline(&resumed.lifecycle, &event)
+        {
             return Err(CatalogError::OnboardingDeadlineExceeded);
         }
         let resulting_state =
@@ -944,16 +946,36 @@ fn lifecycle_created_at(
         .map_err(Into::into)
 }
 
-fn event_allowed_after_deadline(event: &OnboardingEvent) -> bool {
+fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &OnboardingEvent) -> bool {
     matches!(
         event,
         OnboardingEvent::Cancelled { .. }
+            | OnboardingEvent::RefreshRequired { .. }
             | OnboardingEvent::IndeterminateRemoteState { .. }
             | OnboardingEvent::CleanupRequired { .. }
             | OnboardingEvent::RemoteRevocation { .. }
             | OnboardingEvent::LocalDeletion { .. }
             | OnboardingEvent::Retire { .. }
             | OnboardingEvent::Tombstone { .. }
+    ) || matches!(
+        (lifecycle.state(), event),
+        (
+            OnboardingState::ActiveScoped,
+            OnboardingEvent::RenewalRequired { .. } | OnboardingEvent::BeginRotation { .. }
+        ) | (
+            OnboardingState::RenewalRequired,
+            OnboardingEvent::BeginRotation { .. }
+        ) | (
+            OnboardingState::RotationPending,
+            OnboardingEvent::CredentialImported { .. }
+                | OnboardingEvent::ProtocolValidated { .. }
+                | OnboardingEvent::CredentialStored { .. }
+                | OnboardingEvent::AuthorityVerified { .. }
+                | OnboardingEvent::RightsAdmitted { .. }
+                | OnboardingEvent::RatePolicyAdmitted { .. }
+                | OnboardingEvent::RuntimeVerified { .. }
+                | OnboardingEvent::Cutover { .. }
+        )
     )
 }
 
@@ -981,6 +1003,9 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
             "provider-onboarding.runtime-verified"
         }
         market_squawk_sources::OnboardingEventKind::Activate => "provider-onboarding.activated",
+        market_squawk_sources::OnboardingEventKind::RenewalRequired => {
+            "provider-onboarding.renewal-required"
+        }
         market_squawk_sources::OnboardingEventKind::BeginRotation => {
             "provider-onboarding.rotation-begun"
         }

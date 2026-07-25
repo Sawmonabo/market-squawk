@@ -42,6 +42,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::application::ResearchProviderRuntimeGeneration;
 use crate::{
     BlsAdapterActivation, FredAdapterActivation, ProviderActivationLease,
     ProviderActivationOutcome, ProviderAdapterActivation, ProviderAdapterActivationError,
@@ -140,73 +141,178 @@ impl ProviderResearchActivationService {
         let activation =
             build_research_activation(&self.paths, &lease, &request_bytes, request, &evidence)?;
         evidence.persist(&self.state)?;
-        let candidate_digest = self
-            .state
-            .recipe_digest(&surface_id, session_id, &request_bytes, &evidence.digests())
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        if self
-            .activation
-            .is_research_profile_active(lease.surface_id())
-            .map_err(CliProviderActivationError::Activation)?
-        {
-            if self
-                .state
-                .desired_recipe_matches(&surface_id, candidate_digest)
-                .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+        publish_research_activation(
+            &self.state,
+            &self.activation,
+            &lease,
+            &request_bytes,
+            &evidence.digests(),
+            activation,
+            cancellation.clone(),
+        )
+        .await?;
+        self.onboarding
+            .reconcile_cleanup(session_id, cancellation)
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        Ok(ProviderPortalActivationView::from_lease(
+            lease.surface_id().clone(),
+            &lease,
+        ))
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "durable recipe, runtime candidate, and cancellation authority remain explicit"
+)]
+async fn publish_research_activation(
+    state: &DurableProviderActivationState,
+    activation_authority: &ProviderAdapterActivation,
+    lease: &ProviderActivationLease,
+    request_bytes: &[u8],
+    evidence_digests: &[String],
+    request: ProviderAdapterActivationRequest,
+    cancellation: CancellationToken,
+) -> Result<(), CliProviderActivationError> {
+    let surface_id = lease.surface_id().as_str();
+    let candidate = activation_authority
+        .runtime_generation_for_request(lease, &request)
+        .map_err(CliProviderActivationError::Activation)?;
+    let candidate_runtime_digest = runtime_generation_digest(&candidate)?;
+    let current_runtime = activation_authority
+        .research_runtime_generation(lease.surface_id())
+        .map_err(CliProviderActivationError::Activation)?;
+    let current_state_digest = state
+        .current_state_digest(surface_id)
+        .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+
+    if current_runtime.as_ref() == Some(&candidate) {
+        return match state.load_recipe(surface_id) {
+            Ok(DurableActivationRecipeState::Desired(recipe))
+                if recipe.session_id == lease.session_id()
+                    && recipe.request_bytes.as_ref() == request_bytes
+                    && recipe.evidence_digests == evidence_digests
+                    && recipe.runtime_generation_digest == candidate_runtime_digest
+                    && recipe.predecessor_runtime_generation_digest
+                        != Some(candidate_runtime_digest)
+                    && current_state_digest == Some(recipe.state_digest) =>
             {
-                return Ok(ProviderPortalActivationView::from_lease(
-                    lease.surface_id().clone(),
-                    &lease,
-                ));
+                Ok(())
             }
+            Ok(DurableActivationRecipeState::Missing)
+            | Ok(DurableActivationRecipeState::Quarantined(_))
+            | Ok(DurableActivationRecipeState::Desired(_))
+            | Err(_) => Err(CliProviderActivationError::ProviderConfiguration),
+        };
+    }
+
+    let predecessor_runtime_digest = current_runtime
+        .as_ref()
+        .map(runtime_generation_digest)
+        .transpose()?;
+    let candidate_state_digest = state
+        .recipe_digest(
+            surface_id,
+            lease.session_id(),
+            request_bytes,
+            evidence_digests,
+            candidate_runtime_digest,
+            predecessor_runtime_digest,
+        )
+        .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+
+    if let Some(expected) = current_runtime {
+        let prepared = activation_authority
+            .prepare_research_replacement(lease.session_id(), request, expected, cancellation)
+            .await
+            .map_err(CliProviderActivationError::Activation)?;
+        if prepared.candidate() != &candidate {
             return Err(CliProviderActivationError::ProviderConfiguration);
         }
-        let published_digest = self
-            .state
-            .persist_recipe(&surface_id, session_id, &request_bytes, &evidence.digests())
+        let published = state
+            .publish_recipe(
+                surface_id,
+                current_state_digest,
+                lease.session_id(),
+                request_bytes,
+                evidence_digests,
+                candidate_runtime_digest,
+                predecessor_runtime_digest,
+            )
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        if published_digest != candidate_digest {
+        if published != candidate_state_digest {
             return Err(CliProviderActivationError::StateUnavailable);
         }
-        let outcome = match self
-            .activation
-            .activate_ready_profile(session_id, activation, cancellation)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if !self
-                    .state
-                    .quarantine_recipe_if_current(
-                        &surface_id,
-                        candidate_digest,
-                        DurableActivationQuarantineReason::AdapterRejected,
-                    )
-                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?
-                {
-                    return Err(CliProviderActivationError::StateUnavailable);
-                }
-                return Err(CliProviderActivationError::Activation(error));
-            }
-        };
-        let ProviderActivationOutcome::Research(activated) = outcome else {
-            if !self
-                .state
-                .quarantine_recipe_if_current(
-                    &surface_id,
-                    candidate_digest,
-                    DurableActivationQuarantineReason::AdapterRejected,
-                )
-                .map_err(|_error| CliProviderActivationError::StateUnavailable)?
-            {
-                return Err(CliProviderActivationError::StateUnavailable);
-            }
+        let activated = prepared
+            .commit()
+            .map_err(CliProviderActivationError::Activation)?;
+        if activated.generation() != &candidate {
             return Err(CliProviderActivationError::ProviderConfiguration);
-        };
-        Ok(ProviderPortalActivationView::from_lease(
-            activated.profile().clone(),
-            activated.lease(),
-        ))
+        }
+        return Ok(());
+    }
+
+    let published = state
+        .publish_recipe(
+            surface_id,
+            current_state_digest,
+            lease.session_id(),
+            request_bytes,
+            evidence_digests,
+            candidate_runtime_digest,
+            None,
+        )
+        .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+    if published != candidate_state_digest {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    let outcome = match activation_authority
+        .activate_exact_research_profile(&candidate, request, cancellation)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            quarantine_rejected_candidate(state, surface_id, candidate_state_digest)?;
+            return Err(CliProviderActivationError::Activation(error));
+        }
+    };
+    let ProviderActivationOutcome::Research(activated) = outcome else {
+        quarantine_rejected_candidate(state, surface_id, candidate_state_digest)?;
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    if activated.generation() != &candidate {
+        quarantine_rejected_candidate(state, surface_id, candidate_state_digest)?;
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    Ok(())
+}
+
+fn runtime_generation_digest(
+    generation: &ResearchProviderRuntimeGeneration,
+) -> Result<EvidenceDigest, CliProviderActivationError> {
+    generation
+        .identity_digest()
+        .map_err(ProviderAdapterActivationError::from)
+        .map_err(CliProviderActivationError::Activation)
+}
+
+fn quarantine_rejected_candidate(
+    state: &DurableProviderActivationState,
+    surface_id: &str,
+    candidate_state_digest: EvidenceDigest,
+) -> Result<(), CliProviderActivationError> {
+    if state
+        .quarantine_recipe_if_current(
+            surface_id,
+            candidate_state_digest,
+            DurableActivationQuarantineReason::AdapterRejected,
+        )
+        .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+    {
+        Ok(())
+    } else {
+        Err(CliProviderActivationError::StateUnavailable)
     }
 }
 
@@ -266,77 +372,22 @@ pub(super) async fn activate_research_provider(
         return Err(CliProviderActivationError::Cancelled);
     }
     evidence.persist(product.provider_activation_state())?;
-    let candidate_digest = product
-        .provider_activation_state()
-        .recipe_digest(
-            &surface_id,
-            session_id,
-            input.as_bytes(),
-            &evidence.digests(),
-        )
-        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-    if product
-        .provider_activation()
-        .is_research_profile_active(lease.surface_id())
-        .map_err(CliProviderActivationError::Activation)?
-    {
-        if product
-            .provider_activation_state()
-            .desired_recipe_matches(&surface_id, candidate_digest)
-            .map_err(|_| CliProviderActivationError::StateUnavailable)?
-        {
-            return Ok(activation_result(lease.surface_id(), &lease));
-        }
-        return Err(CliProviderActivationError::ProviderConfiguration);
-    }
-    let published_digest = product
-        .provider_activation_state()
-        .persist_recipe(
-            &surface_id,
-            session_id,
-            input.as_bytes(),
-            &evidence.digests(),
-        )
-        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
-    if published_digest != candidate_digest {
-        return Err(CliProviderActivationError::StateUnavailable);
-    }
-    let outcome = match product
-        .provider_activation()
-        .activate_ready_profile(session_id, activation, cancellation)
+    publish_research_activation(
+        product.provider_activation_state(),
+        product.provider_activation().as_ref(),
+        &lease,
+        input.as_bytes(),
+        &evidence.digests(),
+        activation,
+        cancellation.clone(),
+    )
+    .await?;
+    product
+        .provider_onboarding()
+        .reconcile_cleanup(session_id, cancellation)
         .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if !product
-                .provider_activation_state()
-                .quarantine_recipe_if_current(
-                    &surface_id,
-                    candidate_digest,
-                    DurableActivationQuarantineReason::AdapterRejected,
-                )
-                .map_err(|_| CliProviderActivationError::StateUnavailable)?
-            {
-                return Err(CliProviderActivationError::StateUnavailable);
-            }
-            return Err(CliProviderActivationError::Activation(error));
-        }
-    };
-    let ProviderActivationOutcome::Research(activated) = outcome else {
-        if !product
-            .provider_activation_state()
-            .quarantine_recipe_if_current(
-                &surface_id,
-                candidate_digest,
-                DurableActivationQuarantineReason::AdapterRejected,
-            )
-            .map_err(|_| CliProviderActivationError::StateUnavailable)?
-        {
-            return Err(CliProviderActivationError::StateUnavailable);
-        }
-        return Err(CliProviderActivationError::ProviderConfiguration);
-    };
-    Ok(activation_result(activated.profile(), activated.lease()))
+        .map_err(CliProviderActivationError::Onboarding)?;
+    Ok(activation_result(lease.surface_id(), &lease))
 }
 
 pub(super) fn restore_research_providers(
@@ -436,6 +487,12 @@ fn restore_research_provider(
     }
     let adapter =
         build_research_activation(paths, &lease, &recipe.request_bytes, request, &evidence)?;
+    let candidate = activation_authority
+        .runtime_generation_for_request(&lease, &adapter)
+        .map_err(CliProviderActivationError::Activation)?;
+    if runtime_generation_digest(&candidate)? != recipe.runtime_generation_digest {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
     let outcome = match activation_authority.restore_active_profile(recipe.session_id, adapter) {
         Ok(outcome) => outcome,
         Err(error) if recovery_requires_explicit_resume(&error) => {
@@ -443,7 +500,10 @@ fn restore_research_provider(
         }
         Err(error) => return Err(CliProviderActivationError::Activation(error)),
     };
-    if !matches!(outcome, ProviderActivationOutcome::Research(_)) {
+    let ProviderActivationOutcome::Research(activated) = outcome else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    if activated.generation() != &candidate {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
     Ok(ResearchProviderRecovery::Restored)

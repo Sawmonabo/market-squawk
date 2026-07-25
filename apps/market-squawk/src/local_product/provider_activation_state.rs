@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-const RECIPE_SCHEMA_VERSION: u16 = 1;
+const RECIPE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_SCHEMA_VERSION: u16 = 1;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
 const MAXIMUM_EVIDENCE_OBJECTS: usize = 1_024;
@@ -32,6 +32,8 @@ pub(super) struct DurableActivationRecipe {
     pub(super) session_id: Uuid,
     pub(super) request_bytes: Box<[u8]>,
     pub(super) evidence_digests: Vec<String>,
+    pub(super) runtime_generation_digest: EvidenceDigest,
+    pub(super) predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     pub(super) state_digest: EvidenceDigest,
 }
 
@@ -139,19 +141,35 @@ impl DurableProviderActivationState {
         })
     }
 
-    pub(super) fn persist_recipe(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent authority dimensions stay explicit for review and exact CAS"
+    )]
+    pub(super) fn publish_recipe(
         &self,
         surface_id: &str,
+        expected_state_digest: Option<EvidenceDigest>,
         session_id: Uuid,
         request_bytes: &[u8],
         evidence_digests: &[String],
+        runtime_generation_digest: EvidenceDigest,
+        predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
         let key = surface_key(surface_id)?;
-        let (encoded, state_digest) =
-            encode_recipe(surface_id, session_id, request_bytes, evidence_digests)?;
-        LocalAuthorityStateStore::try_open(self.recipe_root(key))?
-            .store(&encoded)
-            .map_err(DurableProviderActivationStateError::from)?;
+        let (encoded, state_digest) = encode_recipe(
+            surface_id,
+            session_id,
+            request_bytes,
+            evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+        )?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store.load()?;
+        if current.as_deref().map(digest_bytes) != expected_state_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&encoded)?;
         Ok(state_digest)
     }
 
@@ -162,10 +180,31 @@ impl DurableProviderActivationState {
         session_id: Uuid,
         request_bytes: &[u8],
         evidence_digests: &[String],
+        runtime_generation_digest: EvidenceDigest,
+        predecessor_runtime_generation_digest: Option<EvidenceDigest>,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
         surface_key(surface_id)?;
-        encode_recipe(surface_id, session_id, request_bytes, evidence_digests)
-            .map(|(_encoded, digest)| digest)
+        encode_recipe(
+            surface_id,
+            session_id,
+            request_bytes,
+            evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+        )
+        .map(|(_encoded, digest)| digest)
+    }
+
+    /// Returns the digest of the exact state envelope currently occupying one surface slot.
+    pub(super) fn current_state_digest(
+        &self,
+        surface_id: &str,
+    ) -> Result<Option<EvidenceDigest>, DurableProviderActivationStateError> {
+        let key = surface_key(surface_id)?;
+        LocalAuthorityStateStore::try_open(self.recipe_root(key))?
+            .load()
+            .map(|encoded| encoded.as_deref().map(digest_bytes))
+            .map_err(Into::into)
     }
 
     pub(super) fn load_recipe(
@@ -208,6 +247,15 @@ impl DurableProviderActivationState {
         for digest in &recipe.evidence_digests {
             validate_sha256(digest)?;
         }
+        let runtime_generation_digest = digest_from_lower_hex(&recipe.runtime_generation_sha256)?;
+        let predecessor_runtime_generation_digest = recipe
+            .predecessor_runtime_generation_sha256
+            .as_deref()
+            .map(digest_from_lower_hex)
+            .transpose()?;
+        if predecessor_runtime_generation_digest == Some(runtime_generation_digest) {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        }
         let request_bytes = recipe.request_json.into_bytes();
         if sha256_bytes(&request_bytes) != recipe.request_sha256
             || bundle_digest(
@@ -215,6 +263,8 @@ impl DurableProviderActivationState {
                 recipe.session_id,
                 &request_bytes,
                 &recipe.evidence_digests,
+                runtime_generation_digest,
+                predecessor_runtime_generation_digest,
             )? != recipe.bundle_sha256
         {
             return Err(DurableProviderActivationStateError::Integrity);
@@ -224,6 +274,8 @@ impl DurableProviderActivationState {
                 session_id: recipe.session_id,
                 request_bytes: request_bytes.into_boxed_slice(),
                 evidence_digests: recipe.evidence_digests,
+                runtime_generation_digest,
+                predecessor_runtime_generation_digest,
                 state_digest,
             },
         ))
@@ -266,17 +318,6 @@ impl DurableProviderActivationState {
         }
         quarantine_encoded(&store, surface_id, reason, &encoded)?;
         Ok(true)
-    }
-
-    pub(super) fn desired_recipe_matches(
-        &self,
-        surface_id: &str,
-        expected: EvidenceDigest,
-    ) -> Result<bool, DurableProviderActivationStateError> {
-        Ok(matches!(
-            self.load_recipe(surface_id)?,
-            DurableActivationRecipeState::Desired(recipe) if recipe.state_digest == expected
-        ))
     }
 
     fn recipe_root(&self, key: &str) -> PathBuf {
@@ -353,6 +394,8 @@ struct RecipeWire {
     session_id: Uuid,
     request_sha256: String,
     evidence_digests: Vec<String>,
+    runtime_generation_sha256: String,
+    predecessor_runtime_generation_sha256: Option<String>,
     bundle_sha256: String,
     request_json: String,
 }
@@ -385,8 +428,13 @@ fn encode_recipe(
     session_id: Uuid,
     request_bytes: &[u8],
     evidence_digests: &[String],
+    runtime_generation_digest: EvidenceDigest,
+    predecessor_runtime_generation_digest: Option<EvidenceDigest>,
 ) -> Result<(Vec<u8>, EvidenceDigest), DurableProviderActivationStateError> {
-    if request_bytes.is_empty() {
+    if request_bytes.is_empty()
+        || runtime_generation_digest.bytes() == [0; 32]
+        || predecessor_runtime_generation_digest == Some(runtime_generation_digest)
+    {
         return Err(DurableProviderActivationStateError::InvalidRecipe);
     }
     let request_json = std::str::from_utf8(request_bytes)
@@ -406,7 +454,17 @@ fn encode_recipe(
         surface_id: surface_id.to_owned(),
         session_id,
         request_sha256: sha256_bytes(request_bytes),
-        bundle_sha256: bundle_digest(surface_id, session_id, request_bytes, &evidence_digests)?,
+        runtime_generation_sha256: lower_hex(&runtime_generation_digest.bytes()),
+        predecessor_runtime_generation_sha256: predecessor_runtime_generation_digest
+            .map(|digest| lower_hex(&digest.bytes())),
+        bundle_sha256: bundle_digest(
+            surface_id,
+            session_id,
+            request_bytes,
+            &evidence_digests,
+            runtime_generation_digest,
+            predecessor_runtime_generation_digest,
+        )?,
         evidence_digests,
         request_json,
     };
@@ -425,12 +483,22 @@ fn bundle_digest(
     session_id: Uuid,
     request_bytes: &[u8],
     evidence_digests: &[String],
+    runtime_generation_digest: EvidenceDigest,
+    predecessor_runtime_generation_digest: Option<EvidenceDigest>,
 ) -> Result<String, DurableProviderActivationStateError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk:durable-provider-activation:v1");
+    hasher.update(b"market-squawk:durable-provider-activation:v2");
     hash_field(&mut hasher, surface_id.as_bytes())?;
     hasher.update(session_id.as_bytes());
     hash_field(&mut hasher, request_bytes)?;
+    hasher.update(runtime_generation_digest.bytes());
+    match predecessor_runtime_generation_digest {
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest.bytes());
+        }
+        None => hasher.update([0]),
+    }
     let count = u16::try_from(evidence_digests.len())
         .map_err(|_| DurableProviderActivationStateError::ResourceExhausted)?;
     hasher.update(count.to_be_bytes());
@@ -521,6 +589,8 @@ pub(super) enum DurableProviderActivationStateError {
     Integrity,
     #[error("provider activation state exceeded its resource contract")]
     ResourceExhausted,
+    #[error("provider activation state changed before exact publication")]
+    StaleState,
     #[error(transparent)]
     Store(#[from] LocalAuthorityStateStoreError),
 }
@@ -537,6 +607,10 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn generation_digest(value: u8) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [value; 32])
+    }
+
     #[test]
     fn quarantined_recipe_is_disabled_until_an_exact_replacement_is_persisted() -> TestResult {
         let temporary = tempfile::tempdir()?;
@@ -544,7 +618,15 @@ mod tests {
         let surface_id = "treasury.fiscal-data";
         let session_id = Uuid::new_v4();
         let legacy_request = br#"{"schema_version":1}"#;
-        state.persist_recipe(surface_id, session_id, legacy_request, &[])?;
+        state.publish_recipe(
+            surface_id,
+            None,
+            session_id,
+            legacy_request,
+            &[],
+            generation_digest(1),
+            None,
+        )?;
 
         let evidence = state.quarantine_recipe(
             surface_id,
@@ -560,12 +642,24 @@ mod tests {
         ));
 
         let current_request = br#"{"schema_version":2}"#;
-        state.persist_recipe(surface_id, session_id, current_request, &[])?;
+        let quarantined_state = state.current_state_digest(surface_id)?;
+        state.publish_recipe(
+            surface_id,
+            quarantined_state,
+            session_id,
+            current_request,
+            &[],
+            generation_digest(2),
+            Some(generation_digest(1)),
+        )?;
         assert!(matches!(
             state.load_recipe(surface_id)?,
             DurableActivationRecipeState::Desired(recipe)
                 if recipe.session_id == session_id
                     && recipe.request_bytes.as_ref() == current_request
+                    && recipe.runtime_generation_digest == generation_digest(2)
+                    && recipe.predecessor_runtime_generation_digest
+                        == Some(generation_digest(1))
         ));
         Ok(())
     }
@@ -575,15 +669,39 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let state = DurableProviderActivationState::new(temporary.path().to_path_buf());
         let surface_id = "treasury.fiscal-data";
-        let first = state.persist_recipe(
+        let first = state.publish_recipe(
             surface_id,
+            None,
             Uuid::new_v4(),
             br#"{"schema_version":2,"candidate":1}"#,
             &[],
+            generation_digest(1),
+            None,
         )?;
         let second_session = Uuid::new_v4();
         let second_request = br#"{"schema_version":2,"candidate":2}"#;
-        let second = state.persist_recipe(surface_id, second_session, second_request, &[])?;
+        let second = state.publish_recipe(
+            surface_id,
+            Some(first),
+            second_session,
+            second_request,
+            &[],
+            generation_digest(2),
+            Some(generation_digest(1)),
+        )?;
+
+        assert!(matches!(
+            state.publish_recipe(
+                surface_id,
+                Some(first),
+                Uuid::new_v4(),
+                br#"{"schema_version":2,"candidate":3}"#,
+                &[],
+                generation_digest(3),
+                Some(generation_digest(1)),
+            ),
+            Err(DurableProviderActivationStateError::StaleState)
+        ));
 
         assert!(!state.quarantine_recipe_if_current(
             surface_id,
@@ -628,11 +746,14 @@ mod tests {
                 .is_complete()
         );
         drop(initial);
-        state.persist_recipe(
+        state.publish_recipe(
             "treasury.fiscal-data",
+            None,
             Uuid::new_v4(),
             br#"{"schema_version":1}"#,
             &[],
+            generation_digest(1),
+            None,
         )?;
 
         drop(crate::LocalProduct::try_new(config)?);

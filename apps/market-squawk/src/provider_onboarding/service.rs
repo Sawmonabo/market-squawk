@@ -22,10 +22,11 @@ use market_squawk_platform::{
     SecretValue,
 };
 use market_squawk_sources::{
-    AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, OnboardingEvent,
-    OnboardingState, ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile,
-    ProviderProfileError, ProviderProfileRegistry, ProviderPublicConfiguration,
-    built_in_provider_profiles, install_ring_tls_provider,
+    AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
+    CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
+    ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
+    ProviderProfileRegistry, ProviderPublicConfiguration, built_in_provider_profiles,
+    install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -47,8 +48,14 @@ const MAXIMUM_PENDING_SECRET_REAPS: usize = 64;
 const _: () = assert!(MAXIMUM_PENDING_SECRET_REAPS <= Semaphore::MAX_PERMITS);
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
+const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
+
+mod lifecycle_runtime;
+mod rate_runtime;
+
+use rate_runtime::{ProbeRateAuthority, ProbeRatePermit};
 
 struct SecretOperationTask<T: Send + 'static> {
     cancellation: SecretCancellation,
@@ -113,6 +120,7 @@ pub struct ProviderOnboardingService {
     catalog: OnboardingCatalogCapability,
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
+    probe_rates: ProbeRateAuthority,
     activation: AsyncMutex<()>,
     secret_operations: Arc<Semaphore>,
 }
@@ -145,14 +153,22 @@ impl ProviderOnboardingService {
             .user_agent("market-squawk/0.1 provider-onboarding")
             .build()
             .map_err(|_| ProviderOnboardingError::ClientConfiguration)?;
-        Ok(Self {
-            profiles: built_in_provider_profiles()?,
+        let profiles = built_in_provider_profiles()?;
+        let probe_rates = ProbeRateAuthority::try_new(&profiles)?;
+        let service = Self {
+            profiles,
             catalog,
             secrets,
             client,
+            probe_rates,
             activation: AsyncMutex::new(()),
             secret_operations: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_SECRET_OPERATIONS)),
-        })
+        };
+        for profile in service.profiles.iter() {
+            let _registration = service.register_profile_capabilities(profile)?;
+        }
+        service.reconcile_startup(CatalogLimit::new(32)?)?;
+        Ok(service)
     }
 
     /// Returns every built-in profile in stable identity order.
@@ -220,9 +236,7 @@ impl ProviderOnboardingService {
             .profiles
             .get(surface_id)
             .ok_or(ProviderOnboardingError::UnknownProfile)?;
-        let outcome = self
-            .catalog
-            .register_provider_capability(profile.capability())?;
+        let outcome = self.register_profile_capabilities(profile)?;
         Ok(ProviderProfileRegistration::new(profile.into(), outcome))
     }
 
@@ -241,7 +255,10 @@ impl ProviderOnboardingService {
         limit: CatalogLimit,
     ) -> Result<Vec<OnboardingSessionView>, ProviderOnboardingError> {
         let sessions = self.catalog.current_provider_onboarding_sessions(limit)?;
-        self.session_views(sessions)
+        sessions
+            .into_iter()
+            .map(|session| self.resume(session.reservation().session_id()))
+            .collect()
     }
 
     /// Starts a durable session and completes every safe automatic step.
@@ -256,8 +273,7 @@ impl ProviderOnboardingService {
             .ok_or(ProviderOnboardingError::UnknownProfile)?;
         validate_declared_contact(profile, &request)?;
         let public_configuration = provider_public_configuration(profile, &request)?;
-        self.catalog
-            .register_provider_capability(profile.capability())?;
+        self.register_profile_capabilities(profile)?;
         let deadline_at = wall_deadline(SESSION_DURATION)?;
         let operation_id = Uuid::new_v4();
         let reservation_request = OnboardingReservationRequest::try_new(
@@ -337,9 +353,13 @@ impl ProviderOnboardingService {
         cancellation: SecretCancellation,
     ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        let profile = self.profile_for(&resumed)?;
+        let profile = self.current_profile_for(&resumed)?;
+        let replacing = resumed.lifecycle().active_generation().is_some();
         if profile.release_state() == ProfileReleaseState::RightsBlocked
-            || resumed.lifecycle().state() != OnboardingState::UserActionRequired
+            || !matches!(
+                resumed.lifecycle().state(),
+                OnboardingState::UserActionRequired | OnboardingState::RotationPending
+            )
         {
             return Err(ProviderOnboardingError::SecretImportUnavailable);
         }
@@ -376,10 +396,18 @@ impl ProviderOnboardingService {
         )?;
         let expected = SecretValue::new(secret.expose_secret().to_owned())
             .map_err(|_| ProviderOnboardingError::InvalidSecretShape)?;
-        let reference = match self
-            .secrets
-            .create(&secret_key, generation, secret, &control)
-        {
+        let stored = if let Some(active_generation) = resumed.lifecycle().active_generation() {
+            let current = resumed
+                .lifecycle()
+                .generation_reference(active_generation)
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+            self.secrets
+                .replace(&secret_key, current, generation, secret, &control)
+        } else {
+            self.secrets
+                .create(&secret_key, generation, secret, &control)
+        };
+        let reference = match stored {
             Ok(reference) => reference,
             Err(LocalSecretStoreError::IndeterminateCompletion) => {
                 self.append(
@@ -397,17 +425,19 @@ impl ProviderOnboardingService {
                 return self.resume(session_id);
             }
             Err(error) => {
-                self.append(
-                    &reservation,
-                    sequence,
-                    OnboardingEvent::Cancelled {
-                        evidence_digest: event_digest(
-                            b"secret-store-rejected",
-                            session_id,
-                            Some(generation),
-                        ),
-                    },
-                )?;
+                if !replacing {
+                    self.append(
+                        &reservation,
+                        sequence,
+                        OnboardingEvent::Cancelled {
+                            evidence_digest: event_digest(
+                                b"secret-store-rejected",
+                                session_id,
+                                Some(generation),
+                            ),
+                        },
+                    )?;
+                }
                 return Err(error.into());
             }
         };
@@ -421,7 +451,8 @@ impl ProviderOnboardingService {
                     left.len() == right.len() && bool::from(left.ct_eq(right))
                 });
         if !readback_matches {
-            let cleanup_event = if self.secrets.delete(&reference, &control).is_ok() {
+            let deleted = self.secrets.delete(&reference, &control).is_ok();
+            let cleanup_event = if deleted && !replacing {
                 OnboardingEvent::Cancelled {
                     evidence_digest: event_digest(
                         b"secret-readback-failed-clean",
@@ -460,7 +491,7 @@ impl ProviderOnboardingService {
                 let deletion_failed = self.secrets.delete(&reference, &control).is_err();
                 if let Ok(resumed_after_error) = self.catalog.resume_provider_onboarding(session_id)
                 {
-                    let event = if deletion_failed {
+                    let event = if deletion_failed || replacing {
                         OnboardingEvent::CleanupRequired {
                             generation: Some(generation),
                             evidence_digest: event_digest(
@@ -503,8 +534,13 @@ impl ProviderOnboardingService {
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let _activation = self.activation.lock().await;
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        let profile = self.profile_for(&resumed)?;
-        if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
+        let profile = self.current_profile_for(&resumed)?;
+        if resumed
+            .lifecycle()
+            .active_generation()
+            .is_some_and(|generation| resumed.lifecycle().generation_is_active_scoped(generation))
+            && resumed.lifecycle().candidate_generation().is_none()
+        {
             return self.lease_from_resumed(&resumed, profile);
         }
         match profile.release_state() {
@@ -516,13 +552,19 @@ impl ProviderOnboardingService {
             }
             ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
         }
-        if resumed.lifecycle().state() != OnboardingState::StoredUnverified {
-            return Err(ProviderOnboardingError::ActivationUnavailable);
-        }
         let generation = resumed
             .lifecycle()
             .candidate_generation()
             .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        if resumed.lifecycle().generation_state(generation)
+            != Some(CredentialGenerationState::StoredUnverified)
+            || !matches!(
+                resumed.lifecycle().state(),
+                OnboardingState::StoredUnverified | OnboardingState::RotationPending
+            )
+        {
+            return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
         let reference = resumed
             .lifecycle()
             .generation_reference(generation)
@@ -543,10 +585,20 @@ impl ProviderOnboardingService {
             },
         )
         .await?;
-        let verified_at = system_timestamp()?;
         let response_evidence = self
-            .run_credential_probe(profile, &secret, cancellation)
+            .run_credential_probe(profile, &secret, cancellation.clone())
             .await?;
+        let verified_at = system_timestamp()?;
+        let verification_expires_at = if profile.id() == "bls.v2-registered" {
+            Some(Timestamp::from_unix_nanos(
+                verified_at
+                    .unix_nanos()
+                    .checked_add(BLS_REGISTRATION_VALIDITY_NANOS)
+                    .ok_or(ProviderOnboardingError::Clock)?,
+            ))
+        } else {
+            None
+        };
         let requested = resumed.lifecycle().requested_authority().clone();
         let verification = AuthorityVerification::try_new(
             profile.capability(),
@@ -561,7 +613,7 @@ impl ProviderOnboardingService {
                     Some(resumed.reservation().public_configuration_digest()),
                 ),
                 verified_at,
-                expires_at: None,
+                expires_at: verification_expires_at,
                 verifier_revision: profile.capability().verifier_revision().clone(),
                 assurance_limitation: credential_assurance(profile)?,
                 evidence_digest: response_evidence,
@@ -610,13 +662,24 @@ impl ProviderOnboardingService {
             },
         )?;
         sequence = checked_next(sequence)?;
-        self.append(
-            reservation,
-            sequence,
-            OnboardingEvent::Activate {
-                generation: Some(generation),
-            },
-        )?;
+        if let Some(prior_generation) = resumed.lifecycle().active_generation() {
+            self.append(
+                reservation,
+                sequence,
+                OnboardingEvent::Cutover {
+                    prior_generation,
+                    candidate_generation: generation,
+                },
+            )?;
+        } else {
+            self.append(
+                reservation,
+                sequence,
+                OnboardingEvent::Activate {
+                    generation: Some(generation),
+                },
+            )?;
+        }
         self.activation_lease(session_id)
     }
 
@@ -626,7 +689,7 @@ impl ProviderOnboardingService {
         session_id: Uuid,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        let profile = self.profile_for(&resumed)?;
+        let profile = self.current_profile_for(&resumed)?;
         self.lease_from_resumed(&resumed, profile)
     }
 
@@ -651,33 +714,6 @@ impl ProviderOnboardingService {
                 OnboardingEvent::Blocked { evidence_digest },
             )?;
             resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        }
-        Ok(session_view(profile, &resumed))
-    }
-
-    /// Replays one exact durable session, closes safe refresh recovery, and returns status.
-    pub fn resume(
-        &self,
-        session_id: Uuid,
-    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
-        let mut resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        let mut profile = self.profile_for(&resumed)?;
-        if profile.release_state() == ProfileReleaseState::RefreshRequired
-            && resumed.lifecycle().state() == OnboardingState::AnonymousAvailable
-        {
-            self.append(
-                resumed.reservation(),
-                resumed.next_sequence(),
-                OnboardingEvent::RefreshRequired {
-                    evidence_digest: event_digest(
-                        b"refresh-required",
-                        session_id,
-                        resumed.lifecycle().candidate_generation(),
-                    ),
-                },
-            )?;
-            resumed = self.catalog.resume_provider_onboarding(session_id)?;
-            profile = self.profile_for(&resumed)?;
         }
         Ok(session_view(profile, &resumed))
     }
@@ -782,6 +818,10 @@ impl ProviderOnboardingService {
             .endpoint_policy()
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
         policy.authorize_request(endpoint)?;
+        let rate_permit = self
+            .probe_rates
+            .acquire(profile.capability().rate_policy(), cancellation.clone())
+            .await?;
         let request = match probe.transport() {
             ProbeTransport::HttpGet => self.client.get(endpoint),
             ProbeTransport::HttpPostJson => self
@@ -801,7 +841,7 @@ impl ProviderOnboardingService {
             request
         };
         let body = self
-            .collect_probe_response(request, policy, cancellation)
+            .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
         validate_probe_semantics(profile.id(), &body)?;
         Ok(EvidenceDigest::new(
@@ -829,6 +869,10 @@ impl ProviderOnboardingService {
             .endpoint_policy()
             .ok_or(ProviderOnboardingError::InvalidProfile)?;
         policy.authorize_request(endpoint)?;
+        let rate_permit = self
+            .probe_rates
+            .acquire(profile.capability().rate_policy(), cancellation.clone())
+            .await?;
         let mut body: serde_json::Value = serde_json::from_str(
             probe
                 .body()
@@ -855,7 +899,7 @@ impl ProviderOnboardingService {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
         let response = self
-            .collect_probe_response(request, policy, cancellation)
+            .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
         validate_probe_semantics(profile.id(), &response)?;
         Ok(EvidenceDigest::new(
@@ -868,14 +912,31 @@ impl ProviderOnboardingService {
         &self,
         request: reqwest::RequestBuilder,
         policy: &market_squawk_sources::EndpointPolicy,
+        rate_permit: &ProbeRatePermit,
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, ProviderOnboardingError> {
+        let request_deadline = tokio::time::Instant::from_std(rate_permit.deadline);
         let response = tokio::select! {
+            biased;
             () = cancellation.cancelled() => {
                 return Err(ProviderOnboardingError::OperationCancelled);
             }
+            () = tokio::time::sleep_until(request_deadline) => {
+                return Err(ProviderOnboardingError::ProbeDeadlineExceeded);
+            }
             response = request.send() => response.map_err(|_| ProviderOnboardingError::ProbeUnavailable)?,
         };
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            rate_permit
+                .observe_http_429(
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .map(reqwest::header::HeaderValue::as_bytes),
+                )
+                .await?;
+            return Err(ProviderOnboardingError::ProbeRateLimited);
+        }
         if !response.status().is_success() {
             return Err(ProviderOnboardingError::ProbeUnavailable);
         }
@@ -889,8 +950,12 @@ impl ProviderOnboardingService {
         let mut stream = response.bytes_stream();
         loop {
             let next = tokio::select! {
+                biased;
                 () = cancellation.cancelled() => {
                     return Err(ProviderOnboardingError::OperationCancelled);
+                }
+                () = tokio::time::sleep_until(request_deadline) => {
+                    return Err(ProviderOnboardingError::ProbeDeadlineExceeded);
                 }
                 next = stream.next() => next,
             };
@@ -953,7 +1018,9 @@ impl ProviderOnboardingService {
         profile: &ProviderOnboardingProfile,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let lifecycle = resumed.lifecycle();
-        if lifecycle.state() != OnboardingState::ActiveScoped {
+        if lifecycle.active_generation().is_none()
+            && lifecycle.state() != OnboardingState::ActiveScoped
+        {
             return Err(ProviderOnboardingError::ActivationUnavailable);
         }
         match profile.release_state() {
@@ -1021,6 +1088,17 @@ impl ProviderOnboardingService {
         Ok(())
     }
 
+    fn register_profile_capabilities(
+        &self,
+        profile: &ProviderOnboardingProfile,
+    ) -> Result<CapabilityRegistrationOutcome, ProviderOnboardingError> {
+        let mut current = None;
+        for capability in profile.capability_history() {
+            current = Some(self.catalog.register_provider_capability(capability)?);
+        }
+        current.ok_or(ProviderOnboardingError::InvalidProfile)
+    }
+
     fn profile_for<'a>(
         &'a self,
         resumed: &ResumedProviderOnboarding,
@@ -1029,12 +1107,29 @@ impl ProviderOnboardingService {
             .profiles
             .get(resumed.lifecycle().surface_id().as_str())
             .ok_or(ProviderOnboardingError::UnknownProfile)?;
-        if profile.capability().revision() != resumed.lifecycle().capability_revision()
-            || profile.capability().content_digest() != resumed.lifecycle().capability_digest()
+        if profile
+            .capability_at(
+                resumed.lifecycle().capability_revision(),
+                resumed.lifecycle().capability_digest(),
+            )
+            .is_none()
         {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
         validate_recovered_public_configuration(profile, resumed.public_configuration())?;
+        Ok(profile)
+    }
+
+    fn current_profile_for<'a>(
+        &'a self,
+        resumed: &ResumedProviderOnboarding,
+    ) -> Result<&'a ProviderOnboardingProfile, ProviderOnboardingError> {
+        let profile = self.profile_for(resumed)?;
+        if profile.capability().revision() != resumed.lifecycle().capability_revision()
+            || profile.capability().content_digest() != resumed.lifecycle().capability_digest()
+        {
+            return Err(ProviderOnboardingError::EvidenceRefreshRequired);
+        }
         Ok(profile)
     }
 
@@ -1570,6 +1665,9 @@ pub enum ProviderOnboardingError {
     /// The current session/profile gate does not accept a secret.
     #[error("provider onboarding secret import is unavailable")]
     SecretImportUnavailable,
+    /// The current generation or capability does not admit a replacement operation.
+    #[error("provider onboarding renewal is unavailable")]
+    RenewalUnavailable,
     /// Code-owned official evidence must be refreshed before activation can be attempted.
     #[error("provider onboarding evidence must be refreshed before activation")]
     EvidenceRefreshRequired,
@@ -1585,6 +1683,12 @@ pub enum ProviderOnboardingError {
     /// Exact secure-store readback did not reproduce the submitted value.
     #[error("provider onboarding secret-store verification failed")]
     SecretVerificationFailed,
+    /// Exact local deletion or retirement remains unresolved.
+    #[error("provider onboarding secret cleanup is unavailable")]
+    SecretCleanupUnavailable,
+    /// A supported provider-side revocation requires adapter reconciliation.
+    #[error("provider onboarding remote revocation requires reconciliation")]
+    RemoteReconciliationRequired,
     /// Submitted secret material did not match the provider's documented shape.
     #[error("provider onboarding secret shape is invalid")]
     InvalidSecretShape,
@@ -1597,6 +1701,12 @@ pub enum ProviderOnboardingError {
     /// The bounded verification request failed or returned an unexpected schema.
     #[error("provider onboarding verification is unavailable")]
     ProbeUnavailable,
+    /// The shared provider/account budget cannot admit this verification within its fixed bound.
+    #[error("provider onboarding verification is rate limited")]
+    ProbeRateLimited,
+    /// The admitted verification exceeded its fixed end-to-end deadline.
+    #[error("provider onboarding verification deadline elapsed")]
+    ProbeDeadlineExceeded,
     /// Cooperative cancellation completed before activation.
     #[error("provider onboarding operation was cancelled")]
     OperationCancelled,

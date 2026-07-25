@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::{
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchRightsAuthority,
+    ManagedResearchExtractionSource, PreparedResearchProviderReplacement,
+    ProductionResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
+    ResearchRightsAuthority,
 };
 use crate::{
     ProductionLiveSourceComposition, ProductionSourceProvider, ProviderActivationLease,
@@ -98,6 +100,25 @@ impl ProviderAdapterActivation {
         self.activate_with_lease(lease, request, cancellation).await
     }
 
+    /// Activates a research adapter only when current onboarding authority still matches the
+    /// exact generation already selected for durable publication.
+    pub(crate) async fn activate_exact_research_profile(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+        request: ProviderAdapterActivationRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
+        if cancellation.is_cancelled() {
+            return Err(ProviderAdapterActivationError::Cancelled);
+        }
+        let lease = self.onboarding.activation_lease(expected.session_id())?;
+        let candidate = self.runtime_generation_for_request(&lease, &request)?;
+        if &candidate != expected {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        self.activate_with_lease(lease, request, cancellation).await
+    }
+
     /// Reconstructs an adapter only from an already-active durable onboarding lease.
     ///
     /// Unlike [`Self::activate_ready_profile`], restart recovery never performs provider
@@ -117,14 +138,107 @@ impl ProviderAdapterActivation {
         self.restore_with_lease(lease, request)
     }
 
-    /// Returns whether this process already owns the exact research profile.
-    pub(crate) fn is_research_profile_active(
+    /// Returns the exact provider generation currently published into the research runtime.
+    pub(crate) fn research_runtime_generation(
         &self,
         profile: &SourceIdentifier,
-    ) -> Result<bool, ProviderAdapterActivationError> {
+    ) -> Result<Option<ResearchProviderRuntimeGeneration>, ProviderAdapterActivationError> {
         self.research
-            .is_profile_registered(profile)
+            .provider_runtime_generation(profile)
             .map_err(Into::into)
+    }
+
+    /// Derives the exact non-secret runtime identity before adapter publication.
+    pub(crate) fn runtime_generation_for_request(
+        &self,
+        lease: &ProviderActivationLease,
+        request: &ProviderAdapterActivationRequest,
+    ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        let metadata = match request {
+            ProviderAdapterActivationRequest::Sec(spec) => &spec.metadata,
+            ProviderAdapterActivationRequest::Bls(spec) => &spec.metadata,
+            ProviderAdapterActivationRequest::Treasury(spec) => &spec.metadata,
+            ProviderAdapterActivationRequest::Fred(spec) => &spec.metadata,
+            ProviderAdapterActivationRequest::Live(_)
+            | ProviderAdapterActivationRequest::LocalFiles(_)
+            | ProviderAdapterActivationRequest::Portfolio(_) => {
+                return Err(ProviderAdapterActivationError::SourceBinding);
+            }
+        };
+        let rights = provider_research_rights(lease, metadata.source_id())?;
+        runtime_generation(lease, metadata.clone(), rights)
+    }
+
+    /// Fully constructs and reserves an exact credential-generation replacement.
+    pub(crate) async fn prepare_research_replacement(
+        &self,
+        session_id: Uuid,
+        request: ProviderAdapterActivationRequest,
+        expected: ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedProviderAdapterReplacement, ProviderAdapterActivationError> {
+        if cancellation.is_cancelled() {
+            return Err(ProviderAdapterActivationError::Cancelled);
+        }
+        let lease = self.onboarding.activation_lease(session_id)?;
+        let candidate = self.runtime_generation_for_request(&lease, &request)?;
+        let prepared = match request {
+            ProviderAdapterActivationRequest::Bls(spec) => {
+                require_surface(&lease, BLS_REGISTERED_SURFACE)?;
+                let secret = self
+                    .onboarding
+                    .read_active_secret_for_request(&lease, cancellation.clone())
+                    .await?;
+                let authorization = BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
+                    secret.expose_secret().to_owned(),
+                )?);
+                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let config = BlsSourceConfig::try_new(
+                    authorization,
+                    spec.series,
+                    spec.start_year,
+                    spec.end_year,
+                )?;
+                let source = BlsSource::try_new(spec.metadata, config)?;
+                self.research.prepare_provider_replacement(
+                    expected,
+                    candidate.clone(),
+                    source,
+                    rights,
+                )?
+            }
+            ProviderAdapterActivationRequest::Fred(spec) => {
+                require_surface(&lease, FRED_SURFACE)?;
+                let secret = self
+                    .onboarding
+                    .read_active_secret_for_request(&lease, cancellation.clone())
+                    .await?;
+                let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
+                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
+                self.research.prepare_provider_replacement(
+                    expected,
+                    candidate.clone(),
+                    source,
+                    rights,
+                )?
+            }
+            ProviderAdapterActivationRequest::Live(_)
+            | ProviderAdapterActivationRequest::Sec(_)
+            | ProviderAdapterActivationRequest::Treasury(_)
+            | ProviderAdapterActivationRequest::LocalFiles(_)
+            | ProviderAdapterActivationRequest::Portfolio(_) => {
+                return Err(ProviderAdapterActivationError::SourceBinding);
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(ProviderAdapterActivationError::Cancelled);
+        }
+        Ok(PreparedProviderAdapterReplacement {
+            lease,
+            candidate,
+            prepared,
+        })
     }
 
     async fn activate_with_lease(
@@ -383,9 +497,14 @@ impl ProviderAdapterActivation {
         S: ManagedResearchExtractionSource,
     {
         let profile = lease.surface_id().clone();
+        let generation = runtime_generation(&lease, source.metadata().clone(), rights.clone())?;
         self.research
-            .register_source(profile.clone(), source, rights)?;
-        Ok(ActivatedResearchProvider { lease, profile })
+            .register_provider_source(generation.clone(), source, rights)?;
+        Ok(ActivatedResearchProvider {
+            lease,
+            profile,
+            generation,
+        })
     }
 }
 
@@ -429,6 +548,7 @@ impl LiveProviderActivation {
 pub struct ActivatedResearchProvider {
     lease: ProviderActivationLease,
     profile: SourceIdentifier,
+    generation: ResearchProviderRuntimeGeneration,
 }
 
 impl ActivatedResearchProvider {
@@ -440,6 +560,51 @@ impl ActivatedResearchProvider {
     /// Returns the exact coordinator profile identity.
     pub const fn profile(&self) -> &SourceIdentifier {
         &self.profile
+    }
+
+    /// Returns the exact generation published into the research runtime.
+    pub const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+}
+
+/// Fully constructed credential replacement awaiting one serialized runtime publication.
+pub(crate) struct PreparedProviderAdapterReplacement {
+    lease: ProviderActivationLease,
+    candidate: ResearchProviderRuntimeGeneration,
+    prepared: PreparedResearchProviderReplacement,
+}
+
+impl PreparedProviderAdapterReplacement {
+    /// Returns the exact replacement generation bound to durable desired state.
+    pub(crate) const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.candidate
+    }
+
+    /// Atomically publishes the prebuilt adapter after durable state agrees.
+    pub(crate) fn commit(
+        self,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        let profile = self.lease.surface_id().clone();
+        let committed = self.prepared.commit()?;
+        if committed != self.candidate {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(ActivatedResearchProvider {
+            lease: self.lease,
+            profile,
+            generation: committed,
+        })
+    }
+}
+
+impl fmt::Debug for PreparedProviderAdapterReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProviderAdapterReplacement")
+            .field("surface_id", self.lease.surface_id())
+            .field("candidate", &self.candidate)
+            .finish_non_exhaustive()
     }
 }
 
@@ -496,6 +661,24 @@ fn provider_research_rights(
         basis,
         lease.rights_decision_digest(),
         lease.verification_expires_at(),
+    )
+    .map_err(Into::into)
+}
+
+fn runtime_generation(
+    lease: &ProviderActivationLease,
+    metadata: market_squawk_sources::SourceMetadata,
+    rights: ResearchRightsAuthority,
+) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+    ResearchProviderRuntimeGeneration::try_new(
+        lease.surface_id().clone(),
+        lease.session_id(),
+        lease.capability_revision(),
+        lease.capability_digest(),
+        lease.generation(),
+        lease.secret_reference().cloned(),
+        metadata,
+        rights,
     )
     .map_err(Into::into)
 }
