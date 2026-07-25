@@ -379,7 +379,7 @@ fn coinbase() -> Result<BuiltInSpec, ProviderProfileError> {
         authority: None,
         permissions: &[],
         coverage: "Coinbase Advanced Trade public products and market data; not consolidated",
-        quality: DataQuality::DirectVerified,
+        quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network(
             ProbeTransport::HttpGet,
             "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD",
@@ -412,7 +412,7 @@ fn kraken() -> Result<BuiltInSpec, ProviderProfileError> {
         authority: None,
         permissions: &[],
         coverage: "Kraken Spot venue public instruments and books; not consolidated",
-        quality: DataQuality::DirectVerified,
+        quality: DataQuality::DirectUnverified,
         probe: VerificationProbe::network(
             ProbeTransport::HttpGet,
             "https://api.kraken.com/0/public/SystemStatus",
