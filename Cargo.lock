@@ -3368,6 +3368,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow",
+ "atomicwrites",
  "async-trait",
  "base64",
  "bytes",

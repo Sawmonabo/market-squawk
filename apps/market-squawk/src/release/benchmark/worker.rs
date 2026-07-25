@@ -77,7 +77,7 @@ pub(super) struct WorkerBinding {
     argv_count: u64,
     supervisor_timeout_millis: u64,
     supervisor_rss_bytes: u64,
-    supervisor_process_tree_rss_sample_interval_millis: u64,
+    supervisor_process_tree_rss_configured_poll_sleep_millis: u64,
 }
 
 impl WorkerBinding {
@@ -113,8 +113,8 @@ impl WorkerBinding {
                 .context("release benchmark argv count exceeds u64")?,
             supervisor_timeout_millis: supervisor_timeout_millis(),
             supervisor_rss_bytes: SUPERVISOR_RSS_BYTES,
-            supervisor_process_tree_rss_sample_interval_millis:
-                process::process_tree_rss_sample_interval_millis(),
+            supervisor_process_tree_rss_configured_poll_sleep_millis:
+                process::process_tree_rss_poll_sleep_millis(),
         })
     }
 }

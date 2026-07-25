@@ -47,6 +47,7 @@ path = "src/bin/market-squawk-capture-helper.rs"
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
+atomicwrites = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }

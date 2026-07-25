@@ -46,7 +46,7 @@ pub(super) struct ProcessLimits {
 #[serde(deny_unknown_fields)]
 pub(super) struct ProcessEvidence {
     pub(super) elapsed_millis: u64,
-    pub(super) observed_peak_process_tree_rss_bytes: u64,
+    pub(super) process_tree_rss_observation: ProcessTreeRssObservation,
     pub(super) exit_code: i32,
     pub(super) stdout_sha256: String,
     pub(super) stdout_bytes: u64,
@@ -54,6 +54,27 @@ pub(super) struct ProcessEvidence {
     pub(super) stderr_sha256: String,
     pub(super) stderr_bytes: u64,
     pub(super) stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessTreeRssObservation {
+    pub(super) observed_maximum_rss_bytes: Option<u64>,
+    pub(super) successful_sample_count: u64,
+    pub(super) observation_window_millis: u64,
+    pub(super) configured_poll_sleep_millis: u64,
+}
+
+impl ProcessTreeRssObservation {
+    pub(super) fn admitted_observed_maximum_rss_bytes(&self) -> Result<u64> {
+        if self.successful_sample_count == 0
+            || self.configured_poll_sleep_millis != process_tree_rss_poll_sleep_millis()
+        {
+            bail!("process-tree RSS observation does not satisfy its sampling contract");
+        }
+        self.observed_maximum_rss_bytes
+            .context("process-tree RSS observation contains no successful sample")
+    }
 }
 
 pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
@@ -93,7 +114,10 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         .ok_or_else(|| anyhow::anyhow!("bounded process stderr is unavailable"))?;
     let stdout_reader = spawn_reader(stdout);
     let stderr_reader = spawn_reader(stderr);
-    let mut observed_peak_rss = 0_u64;
+    let mut observed_maximum_rss = None;
+    let mut successful_rss_samples = 0_u64;
+    let mut first_rss_sample_started_at = None;
+    let mut last_rss_sample_completed_at = None;
     let mut primary_error: Option<anyhow::Error> = None;
     let status = loop {
         if let Some(status) = child
@@ -102,9 +126,18 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         {
             break Some(status);
         }
+        let sample_started_at = Instant::now();
+        first_rss_sample_started_at.get_or_insert(sample_started_at);
         match process_group_rss_bytes(process_id) {
             Ok(rss) => {
-                observed_peak_rss = observed_peak_rss.max(rss);
+                observed_maximum_rss =
+                    Some(observed_maximum_rss.map_or(rss, |current: u64| current.max(rss)));
+                let Some(sample_count) = successful_rss_samples.checked_add(1) else {
+                    primary_error = Some(anyhow::anyhow!("process-tree RSS sample count overflow"));
+                    break None;
+                };
+                successful_rss_samples = sample_count;
+                last_rss_sample_completed_at = Some(Instant::now());
                 if rss > request.limits.rss_bytes {
                     primary_error = Some(anyhow::anyhow!(
                         "bounded process observed a resident-memory sample above its limit"
@@ -142,10 +175,21 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
     }
     let elapsed_millis = u64::try_from(started.elapsed().as_millis())
         .context("bounded process elapsed time overflow")?;
+    let observation_window_millis =
+        match (first_rss_sample_started_at, last_rss_sample_completed_at) {
+            (Some(first), Some(last)) => u64::try_from(last.duration_since(first).as_millis())
+                .context("process-tree RSS observation window overflow")?,
+            _ => 0,
+        };
     Ok(ProcessOutput {
         evidence: ProcessEvidence {
             elapsed_millis,
-            observed_peak_process_tree_rss_bytes: observed_peak_rss,
+            process_tree_rss_observation: ProcessTreeRssObservation {
+                observed_maximum_rss_bytes: observed_maximum_rss,
+                successful_sample_count: successful_rss_samples,
+                observation_window_millis,
+                configured_poll_sleep_millis: process_tree_rss_poll_sleep_millis(),
+            },
             exit_code: final_status.code().unwrap_or_default(),
             stdout_sha256: stdout.sha256,
             stdout_bytes: stdout.byte_count,
@@ -337,7 +381,7 @@ pub(super) struct ProcessOutput {
     pub(super) stdout: Vec<u8>,
 }
 
-pub(super) fn process_tree_rss_sample_interval_millis() -> u64 {
+pub(super) fn process_tree_rss_poll_sleep_millis() -> u64 {
     u64::try_from(POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX)
 }
 

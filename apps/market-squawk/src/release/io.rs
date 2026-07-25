@@ -11,6 +11,9 @@ use sha2::{Digest as _, Sha256};
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORT_BYTES: usize = 64 * 1024 * 1024;
+const PENDING_CREATION_ATTEMPTS: usize = 8;
+const PENDING_REPORT_PREFIX: &str = ".market-squawk-release-evidence-";
+const PENDING_REPORT_SUFFIX: &str = ".pending";
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +43,7 @@ pub(super) fn publish_report<T: Serialize>(
     if let Err(error) = pending.write_and_sync(&bytes) {
         return Err(pending.fail(error));
     }
-    Ok(pending.commit())
+    pending.publish()
 }
 
 pub(super) fn publish_report_with_identity_barrier<T, F>(
@@ -60,11 +63,11 @@ where
         return Err(pending.fail(error));
     }
     if let Err(error) =
-        revalidate().context("release-evidence post-publication identity barrier failed")
+        revalidate().context("release-evidence post-preparation identity barrier failed")
     {
         return Err(pending.fail(error));
     }
-    Ok(pending.commit())
+    pending.publish()
 }
 
 fn report_bytes<T: Serialize>(kind: &'static str, payload: &T) -> Result<Vec<u8>> {
@@ -94,9 +97,11 @@ fn report_bytes<T: Serialize>(kind: &'static str, payload: &T) -> Result<Vec<u8>
 struct PendingReport {
     file: Option<File>,
     identity: Option<ReportFileIdentity>,
-    path: PathBuf,
+    pending_path: PathBuf,
+    final_path: PathBuf,
     expected_sha256: String,
     expected_size: usize,
+    remove_final_on_cleanup: bool,
     committed: bool,
     cleanup_complete: bool,
 }
@@ -104,39 +109,52 @@ struct PendingReport {
 impl PendingReport {
     fn create(output: &Path, bytes: &[u8]) -> Result<Self> {
         ensure_transactional_report_supported()?;
-        let path = normalized_new_file(output)?;
+        let final_path = normalized_final_file(output)?;
         let expected_sha256 = sha256_bytes(bytes);
         let expected_size = bytes.len();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        configure_private_report_creation(&mut options);
-        let file = options
-            .open(&path)
-            .context("release-evidence output could not be created")?;
-        let mut pending = Self {
-            file: Some(file),
-            identity: None,
-            path,
-            expected_sha256,
-            expected_size,
-            committed: false,
-            cleanup_complete: false,
-        };
-        let identity = match pending.file.as_ref().map(report_file_identity) {
-            Some(Ok(identity)) => identity,
-            Some(Err(error)) => {
-                let original = anyhow::Error::from(error)
-                    .context("release-evidence opened-file identity could not be established");
-                return Err(pending.fail(original));
+        for _attempt in 0..PENDING_CREATION_ATTEMPTS {
+            let pending_path = new_pending_path(&final_path)?;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            configure_private_report_creation(&mut options);
+            match options.open(&pending_path) {
+                Ok(file) => {
+                    let mut pending = Self {
+                        file: Some(file),
+                        identity: None,
+                        pending_path,
+                        final_path,
+                        expected_sha256,
+                        expected_size,
+                        remove_final_on_cleanup: false,
+                        committed: false,
+                        cleanup_complete: false,
+                    };
+                    let identity = match pending.file.as_ref().map(report_file_identity) {
+                        Some(Ok(identity)) => identity,
+                        Some(Err(error)) => {
+                            let original = anyhow::Error::from(error).context(
+                                "release-evidence pending-file identity could not be established",
+                            );
+                            return Err(pending.fail(original));
+                        }
+                        None => {
+                            return Err(pending.fail(anyhow::anyhow!(
+                                "release-evidence pending file is unavailable after creation"
+                            )));
+                        }
+                    };
+                    pending.identity = Some(identity);
+                    return Ok(pending);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .context("release-evidence pending file could not be created");
+                }
             }
-            None => {
-                return Err(pending.fail(anyhow::anyhow!(
-                    "release-evidence opened file is unavailable after creation"
-                )));
-            }
-        };
-        pending.identity = Some(identity);
-        Ok(pending)
+        }
+        bail!("release-evidence pending filename attempts were exhausted")
     }
 
     fn write_and_sync(&mut self, bytes: &[u8]) -> Result<()> {
@@ -175,26 +193,92 @@ impl PendingReport {
             bail!("release-evidence output differs from the encoded report");
         }
         if report_file_identity(file)? != identity
-            || !path_has_report_identity(&identity, &self.path)?
+            || !path_has_report_identity(&identity, &self.pending_path)?
         {
-            bail!("release-evidence output identity changed during publication");
-        }
-        sync_parent(&self.path)?;
-        if !path_has_report_identity(&identity, &self.path)? {
-            bail!("release-evidence output identity changed after parent synchronization");
+            bail!("release-evidence pending-file identity changed during preparation");
         }
         Ok(())
     }
 
-    fn commit(mut self) -> PublishedReport {
+    fn publish(mut self) -> Result<PublishedReport> {
+        let Some(identity) = self.identity else {
+            return Err(self.fail(anyhow::anyhow!(
+                "release-evidence pending file identity is unavailable"
+            )));
+        };
+        if let Err(error) = ensure_path_absent(&self.final_path, "release-evidence final output") {
+            return Err(self.fail(error));
+        }
+        match path_has_report_identity(&identity, &self.pending_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(self.fail(anyhow::anyhow!(
+                    "release-evidence pending-file identity changed before atomic publication"
+                )));
+            }
+            Err(error) => {
+                let original = anyhow::Error::from(error)
+                    .context("release-evidence pending-file identity check failed");
+                return Err(self.fail(original));
+            }
+        }
+        match move_report_atomic(&self.pending_path, &self.final_path) {
+            Ok(()) => {
+                self.remove_final_on_cleanup = true;
+            }
+            Err(error) => {
+                self.remove_final_on_cleanup = matches!(
+                    path_has_report_identity(&identity, &self.final_path),
+                    Ok(true)
+                );
+                let original = anyhow::Error::from(error)
+                    .context("release-evidence atomic no-clobber publication failed");
+                return Err(self.fail(original));
+            }
+        }
+        if let Err(error) = self.verify_published(identity) {
+            return Err(self.fail(error));
+        }
         let published = PublishedReport {
-            path: self.path.clone(),
+            path: self.final_path.clone(),
             sha256: self.expected_sha256.clone(),
             byte_count: self.expected_size,
         };
         drop(self.file.take());
         self.committed = true;
-        published
+        self.cleanup_complete = true;
+        Ok(published)
+    }
+
+    fn verify_published(&mut self, identity: ReportFileIdentity) -> Result<()> {
+        let expected_size = u64::try_from(self.expected_size)
+            .context("release-evidence output size exceeds u64")?;
+        let file = self
+            .file
+            .as_mut()
+            .context("release-evidence retained file is unavailable after publication")?;
+        if report_file_identity(file)? != identity
+            || !path_has_report_identity(&identity, &self.final_path)?
+        {
+            bail!("release-evidence final output does not have the prepared file identity");
+        }
+        match fs::symlink_metadata(&self.pending_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("release-evidence pending name survived atomic publication"),
+        }
+        file.seek(SeekFrom::Start(0))
+            .context("release-evidence published output rewind failed")?;
+        let written = hash_pass(file, expected_size)
+            .context("release-evidence published output verification failed")?;
+        if written.byte_count != expected_size || written.sha256 != self.expected_sha256 {
+            bail!("release-evidence published output differs from the prepared report");
+        }
+        if report_file_identity(file)? != identity
+            || !path_has_report_identity(&identity, &self.final_path)?
+        {
+            bail!("release-evidence final output identity changed during verification");
+        }
+        Ok(())
     }
 
     fn fail(mut self, original: anyhow::Error) -> anyhow::Error {
@@ -230,10 +314,10 @@ impl PendingReport {
 
         let Some(identity) = self.identity else {
             failures.push(
-                "exact opened-file identity is unavailable; refusing to remove the named path"
+                "exact pending-file identity is unavailable; refusing named-path removal"
                     .to_owned(),
             );
-            if let Err(error) = sync_parent(&self.path) {
+            if let Err(error) = sync_parent(&self.pending_path) {
                 failures.push(format!("parent fail-closed sync failed: {error:#}"));
             }
             bail!(
@@ -242,19 +326,16 @@ impl PendingReport {
             );
         };
 
-        match path_has_report_identity(&identity, &self.path) {
-            Ok(true) => match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => failures.push(format!("exact output removal failed: {error}")),
-            },
-            Ok(false) => {
-                failures.push("refusing to remove a path with a different identity".to_owned());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(format!("named-file identity check failed: {error}")),
+        remove_exact_report_name(
+            &identity,
+            &self.pending_path,
+            "pending output",
+            &mut failures,
+        );
+        if self.remove_final_on_cleanup {
+            remove_exact_report_name(&identity, &self.final_path, "final output", &mut failures);
         }
-        if let Err(error) = sync_parent(&self.path) {
+        if let Err(error) = sync_parent(&self.pending_path) {
             failures.push(format!("parent cleanup sync failed: {error:#}"));
         }
 
@@ -275,6 +356,28 @@ impl Drop for PendingReport {
         if !self.committed && !self.cleanup_complete {
             let _ignored = self.cleanup();
         }
+    }
+}
+
+fn remove_exact_report_name(
+    identity: &ReportFileIdentity,
+    path: &Path,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    match path_has_report_identity(identity, path) {
+        Ok(true) => match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("exact {label} removal failed: {error}")),
+        },
+        Ok(false) => {
+            failures.push(format!(
+                "refusing to remove {label} with a different identity"
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!("{label} identity check failed: {error}")),
     }
 }
 
@@ -413,6 +516,25 @@ fn path_has_report_identity(
     Ok(false)
 }
 
+#[cfg(any(unix, windows))]
+fn move_report_atomic(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    if source.parent() != destination.parent() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release-evidence pending and final paths do not share one parent",
+        ));
+    }
+    atomicwrites::move_atomic(source, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn move_report_atomic(_source: &Path, _destination: &Path) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "release-evidence atomic publication is unsupported",
+    ))
+}
+
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -501,6 +623,9 @@ pub(super) fn read_report(
     maximum_bytes: u64,
     expected_kind: &str,
 ) -> Result<VerifiedReport> {
+    if is_pending_report_path(path) {
+        bail!("release-evidence pending files cannot be read as published reports");
+    }
     let file = hash_stable_file(path, maximum_bytes)?;
     let bytes = read_stable_bytes(path, maximum_bytes)?;
     if file.byte_count != u64::try_from(bytes.len())? || file.sha256 != sha256_bytes(&bytes) {
@@ -575,7 +700,10 @@ pub(super) struct VerifiedReport {
     pub(super) payload: Value,
 }
 
-fn normalized_new_file(path: &Path) -> Result<PathBuf> {
+fn normalized_final_file(path: &Path) -> Result<PathBuf> {
+    if is_pending_report_path(path) {
+        bail!("release-evidence final output uses the reserved pending-file namespace");
+    }
     let filename = path
         .file_name()
         .filter(|name| !name.is_empty())
@@ -603,10 +731,34 @@ fn normalized_new_file(path: &Path) -> Result<PathBuf> {
         bail!("release-evidence output parent is not a directory");
     }
     let candidate = canonical_parent.join(filename);
-    if fs::symlink_metadata(&candidate).is_ok() {
-        bail!("release-evidence output already exists");
-    }
+    ensure_path_absent(&candidate, "release-evidence output")?;
     Ok(candidate)
+}
+
+fn new_pending_path(final_path: &Path) -> Result<PathBuf> {
+    let parent = final_path
+        .parent()
+        .context("release-evidence final output has no parent")?;
+    Ok(parent.join(format!(
+        "{PENDING_REPORT_PREFIX}{}{PENDING_REPORT_SUFFIX}",
+        uuid::Uuid::new_v4().as_simple()
+    )))
+}
+
+fn is_pending_report_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(PENDING_REPORT_PREFIX) && name.ends_with(PENDING_REPORT_SUFFIX)
+        })
+}
+
+fn ensure_path_absent(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!("{label} already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("{label} state could not be determined")),
+    }
 }
 
 pub(super) fn sha256_bytes(bytes: &[u8]) -> String {

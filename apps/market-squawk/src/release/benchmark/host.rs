@@ -1,12 +1,13 @@
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::EvidenceAuthority;
 
-const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const MEMORY_POLL_SLEEP: Duration = Duration::from_millis(10);
+const MEMORY_OBSERVATION_SAMPLES: u64 = 5;
 const MAXIMUM_PROBE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -152,17 +153,52 @@ fn command_output_optional(program: &str, arguments: &[&str]) -> Result<Option<S
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
-pub(super) fn rss_plateau() -> Result<u64> {
-    let mut maximum = 0_usize;
-    for _ in 0..5 {
-        maximum = maximum.max(current_rss()?);
-        std::thread::sleep(MEMORY_SAMPLE_INTERVAL);
-    }
-    u64::try_from(maximum).context("resident-memory plateau exceeds the report representation")
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CurrentProcessRssObservation {
+    pub(super) observed_maximum_rss_bytes: Option<u64>,
+    pub(super) successful_sample_count: u64,
+    pub(super) observation_window_millis: u64,
+    pub(super) configured_poll_sleep_millis: u64,
 }
 
-pub(super) fn memory_sample_interval_millis() -> u64 {
-    u64::try_from(MEMORY_SAMPLE_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+impl CurrentProcessRssObservation {
+    pub(super) fn admitted_observed_maximum_rss_bytes(&self) -> Result<u64> {
+        if self.successful_sample_count != MEMORY_OBSERVATION_SAMPLES
+            || self.configured_poll_sleep_millis
+                != u64::try_from(MEMORY_POLL_SLEEP.as_millis()).unwrap_or(u64::MAX)
+        {
+            bail!("current-process RSS observation does not match its fixed sampling contract");
+        }
+        self.observed_maximum_rss_bytes
+            .context("current-process RSS observation contains no successful sample")
+    }
+}
+
+pub(super) fn observe_current_process_rss() -> Result<CurrentProcessRssObservation> {
+    let started = Instant::now();
+    let mut observed_maximum_rss = None;
+    let mut successful_sample_count = 0_u64;
+    for index in 0..MEMORY_OBSERVATION_SAMPLES {
+        let rss = u64::try_from(current_rss()?)
+            .context("resident-memory sample exceeds the report representation")?;
+        observed_maximum_rss =
+            Some(observed_maximum_rss.map_or(rss, |current: u64| current.max(rss)));
+        successful_sample_count = successful_sample_count
+            .checked_add(1)
+            .context("resident-memory sample count overflow")?;
+        if index + 1 < MEMORY_OBSERVATION_SAMPLES {
+            std::thread::sleep(MEMORY_POLL_SLEEP);
+        }
+    }
+    Ok(CurrentProcessRssObservation {
+        observed_maximum_rss_bytes: observed_maximum_rss,
+        successful_sample_count,
+        observation_window_millis: u64::try_from(started.elapsed().as_millis())
+            .context("resident-memory observation window overflow")?,
+        configured_poll_sleep_millis: u64::try_from(MEMORY_POLL_SLEEP.as_millis())
+            .unwrap_or(u64::MAX),
+    })
 }
 
 fn current_rss() -> Result<usize> {

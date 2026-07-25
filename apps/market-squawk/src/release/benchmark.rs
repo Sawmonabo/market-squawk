@@ -20,7 +20,7 @@ use super::io::{
     PublishedReport, StableFileIdentity, hash_stable_file, hex_digest,
     publish_report_with_identity_barrier, sha256_bytes,
 };
-use super::process::{ProcessEvidence, process_tree_rss_sample_interval_millis};
+use super::process::{ProcessEvidence, ProcessTreeRssObservation};
 use crate::AppConfig;
 use crate::cli::ReleaseBenchmarkArguments;
 use crate::paper_bot::{ReleasePaperBotBenchmarkComposition, ReleasePaperBotBenchmarkResult};
@@ -127,23 +127,20 @@ struct IntegratedLiveEvidence {
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryEvidence {
-    warm_plateau_rss_bytes: u64,
-    post_measurement_rss_bytes: u64,
-    observed_peak_process_tree_rss_bytes: u64,
+    warm_window_current_process_rss_observation: host::CurrentProcessRssObservation,
+    post_measurement_window_current_process_rss_observation: host::CurrentProcessRssObservation,
+    supervised_worker_process_tree_rss_observation: ProcessTreeRssObservation,
     tail_growth_bytes: u64,
     permitted_tail_growth_bytes: u64,
-    current_process_plateau_sample_interval_millis: u64,
-    process_tree_rss_sample_interval_millis: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerMemoryEvidence {
-    warm_plateau_rss_bytes: u64,
-    post_measurement_rss_bytes: u64,
+    warm_window_current_process_rss_observation: host::CurrentProcessRssObservation,
+    post_measurement_window_current_process_rss_observation: host::CurrentProcessRssObservation,
     tail_growth_bytes: u64,
     permitted_tail_growth_bytes: u64,
-    current_process_plateau_sample_interval_millis: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,8 +239,10 @@ pub(super) async fn run(
         bail!("release benchmark worker returned a failed threshold decision");
     }
     let process_completed = supervised.process.exit_code == 0;
-    let process_observed_rss_passed =
-        supervised.process.observed_peak_process_tree_rss_bytes <= worker::supervisor_rss_bytes();
+    let process_rss_observation = &supervised.process.process_tree_rss_observation;
+    let process_observed_rss_passed = process_rss_observation
+        .admitted_observed_maximum_rss_bytes()?
+        <= worker::supervisor_rss_bytes();
     if !process_completed || !process_observed_rss_passed {
         bail!("release benchmark worker process did not satisfy its fixed observed limits");
     }
@@ -265,16 +264,16 @@ pub(super) async fn run(
         integrated_live_path,
         analytical_storage,
         memory: MemoryEvidence {
-            warm_plateau_rss_bytes: memory.warm_plateau_rss_bytes,
-            post_measurement_rss_bytes: memory.post_measurement_rss_bytes,
-            observed_peak_process_tree_rss_bytes: supervised
+            warm_window_current_process_rss_observation: memory
+                .warm_window_current_process_rss_observation,
+            post_measurement_window_current_process_rss_observation: memory
+                .post_measurement_window_current_process_rss_observation,
+            supervised_worker_process_tree_rss_observation: supervised
                 .process
-                .observed_peak_process_tree_rss_bytes,
+                .process_tree_rss_observation
+                .clone(),
             tail_growth_bytes: memory.tail_growth_bytes,
             permitted_tail_growth_bytes: memory.permitted_tail_growth_bytes,
-            current_process_plateau_sample_interval_millis: memory
-                .current_process_plateau_sample_interval_millis,
-            process_tree_rss_sample_interval_millis: process_tree_rss_sample_interval_millis(),
         },
         worker_process: supervised.process,
         threshold_decision: ThresholdDecision {
@@ -375,15 +374,18 @@ async fn collect_worker_measurements(
         .context("production paper-bot benchmark failed to start")?;
     let measurement = async {
         live.warm_up(arguments.warm_up_events).await?;
-        let warm_plateau = host::rss_plateau()?;
+        let warm_observation = host::observe_current_process_rss()?;
         live.measure(arguments.events).await?;
-        let post_measurement = host::rss_plateau()?;
-        Ok::<_, anyhow::Error>((warm_plateau, post_measurement))
+        let post_measurement_observation = host::observe_current_process_rss()?;
+        Ok::<_, anyhow::Error>((warm_observation, post_measurement_observation))
     }
     .await;
     let close = live.finish().await;
-    let ((warm_plateau, post_measurement), live_result) =
+    let ((warm_observation, post_measurement_observation), live_result) =
         reconcile_live_measurement(measurement, close)?;
+    let warm_observed_maximum = warm_observation.admitted_observed_maximum_rss_bytes()?;
+    let post_measurement_observed_maximum =
+        post_measurement_observation.admitted_observed_maximum_rss_bytes()?;
     drop(live_scratch);
     let integrated_live_path = integrated_live(live_result);
 
@@ -397,12 +399,12 @@ async fn collect_worker_measurements(
             .context("production analytical-storage measurement failed")?;
     drop(storage_scratch);
 
-    let tail_growth = post_measurement.saturating_sub(warm_plateau);
+    let tail_growth = post_measurement_observed_maximum.saturating_sub(warm_observed_maximum);
     let configured_tail_bytes = arguments
         .max_tail_growth_mib
         .checked_mul(1024 * 1024)
         .context("tail-growth byte limit overflow")?;
-    let percentage_tail_bytes = warm_plateau
+    let percentage_tail_bytes = warm_observed_maximum
         .checked_mul(arguments.max_tail_growth_percent)
         .and_then(|value| value.checked_div(100))
         .context("tail-growth percentage limit overflow")?;
@@ -441,11 +443,10 @@ async fn collect_worker_measurements(
         integrated_live_path,
         analytical_storage,
         memory: WorkerMemoryEvidence {
-            warm_plateau_rss_bytes: warm_plateau,
-            post_measurement_rss_bytes: post_measurement,
+            warm_window_current_process_rss_observation: warm_observation,
+            post_measurement_window_current_process_rss_observation: post_measurement_observation,
             tail_growth_bytes: tail_growth,
             permitted_tail_growth_bytes: permitted_tail_growth,
-            current_process_plateau_sample_interval_millis: host::memory_sample_interval_millis(),
         },
         threshold_decision,
         started_at,
@@ -557,10 +558,10 @@ fn isolated_config(config: AppConfig, data_dir: PathBuf) -> Result<AppConfig> {
         .context("isolated release benchmark configuration is invalid")
 }
 
-fn reconcile_live_measurement(
-    measurement: Result<(u64, u64)>,
+fn reconcile_live_measurement<T>(
+    measurement: Result<T>,
     close: Result<ReleasePaperBotBenchmarkResult>,
-) -> Result<((u64, u64), ReleasePaperBotBenchmarkResult)> {
+) -> Result<(T, ReleasePaperBotBenchmarkResult)> {
     match (measurement, close) {
         (Ok(memory), Ok(result)) => Ok((memory, result)),
         (Err(error), Ok(_result)) => Err(error),
