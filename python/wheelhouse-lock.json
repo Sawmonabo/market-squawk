@@ -82,8 +82,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "248656965324ffd234901df51ebdae449335381d812c32ec3c28821080ce5533",
-      "size_bytes": 180825
+      "sha256": "76fadfbb9f7798935d559adfca370ccd1db8fe47bfcf36bf0f0b1bafd3819cbf",
+      "size_bytes": 180837
     },
     {
       "path": "Cargo.toml",
@@ -147,8 +147,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/Cargo.toml",
-      "sha256": "54a9daba3263f4a8ec60e8561614915beb0cd8b1be7d353149cb8663aad71e91",
-      "size_bytes": 938
+      "sha256": "75353716ef630dd9ca67babd43a827601f90f07348b24f317892ed28d9246d5c",
+      "size_bytes": 963
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/fixtures/snapshot.json",
@@ -162,8 +162,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/config.rs",
-      "sha256": "7d922e5026df544e8e58a5f563d566b12565aa4a22c73590d9f7c72c56d7c951",
-      "size_bytes": 16584
+      "sha256": "6ef5720ca9fbc0311be817239b07541b3b5089fc42f6101b4718de1b4425b701",
+      "size_bytes": 16777
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/decoder.rs",
@@ -172,13 +172,28 @@
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/direct.rs",
-      "sha256": "9cad9b83fefe9d11fde1644f4eabab4d52b50f51cc57c6145d335a6f92b227f7",
-      "size_bytes": 109376
+      "sha256": "7e63abc36058b05c01fe14713211ac18dd14d5104e6d662c1b404a6574355be9",
+      "size_bytes": 111427
+    },
+    {
+      "path": "adapters/market-squawk-adapter-coinbase/src/direct_transport.rs",
+      "sha256": "2bbe62d6a04800c5b9d8205334b6bef658d16ce1af4132029c1518b0cdcd5b67",
+      "size_bytes": 42328
+    },
+    {
+      "path": "adapters/market-squawk-adapter-coinbase/src/direct_transport/http.rs",
+      "sha256": "69e15d2339d797b273ad77f80f8921fcd70fa75c033a63850e902a9d45c20159",
+      "size_bytes": 10540
+    },
+    {
+      "path": "adapters/market-squawk-adapter-coinbase/src/direct_transport/tests.rs",
+      "sha256": "a0f86d8098c99efb39be165009fe56ab295d669d7aeb00baa60a77cba081568d",
+      "size_bytes": 22757
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/lib.rs",
-      "sha256": "2a1a5b686b0afa618520816b39621f6cb3113067a4ca55dde7004ce8a471061e",
-      "size_bytes": 1377
+      "sha256": "b0e456648305f76e29b23e78624e6e03d22315ab1e06b281060be67d1f6ae0d8",
+      "size_bytes": 1638
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/source.rs",
@@ -3722,8 +3737,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/registry/authority.rs",
-      "sha256": "9fbac3578f499b2e82138c2ce85652caa1658b10ae6f87d662b64e9257ca4b6c",
-      "size_bytes": 45648
+      "sha256": "ed9ee0082a9592f71d9a6c23f8804cba949a384de16efc1d1e093a1deebe31fa",
+      "size_bytes": 47322
     },
     {
       "path": "crates/market-squawk-sources/src/registry/authority/live_scope.rs",
@@ -3782,8 +3797,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/registry/tests.rs",
-      "sha256": "194ba2e21720d56aa18a716e3eac905f372b0408f72a375c75ec860e4a7dda82",
-      "size_bytes": 31668
+      "sha256": "f6c19111e469ae64a716836cc066785dd6f8ac6c9d22d3cc1230d60184c71803",
+      "size_bytes": 33405
     },
     {
       "path": "crates/market-squawk-sources/src/registry/tests/extraction_authority.rs",
