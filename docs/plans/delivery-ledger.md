@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `2e6d6c6faca8bd23e5496a717787a043068dc517`
-  (`build: bind Coinbase Direct release sources`), tree
-  `eadc19e1d02324a0af2eef1a0596f4945a9eb239`.
+  `620d212ea4f28b8b50130fb5f430a42947e41cd4`
+  (`merge: integrate release performance evidence`), tree
+  `596d9b33ef6415741b19e230a91a416fd907b77c`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -48,13 +48,26 @@ evidence; it does not replace the README capability truth or the canonical relea
   central qualification, strategy/risk/paper authority, and an authorized unchanged-head trace
   remain open under issue `#7`; the integrated transport alone cannot publish `DirectVerified`
   authority.
+- Release-source admission is integrated through `c8ceb82`: authenticated Coinbase Direct release
+  sources carry the required transport authority while the public Coinbase and Kraken compatibility
+  sources retain `DirectUnverified` ceilings. No compatibility source can be promoted to
+  execution-eligible quality by composition.
+- Release-performance evidence candidate
+  `afd9a58c7f8e36be7448543d61da2b0e6f36be10` passed focused check and strict Clippy and was
+  independently accepted with no material blocker. Merge head `620d212` preserves finite RSS
+  observation semantics and publishes evidence only after executable/repository identity
+  validation through an atomic no-clobber commit. The focused integrated application check,
+  formatting, and diff integrity passed. Exact-head production measurements and final Task 20
+  evidence remain open.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
-  branch is deleted, no matching origin branch existed, and metadata is pruned. Active generated
-  targets are approximately 6.1 GiB in root and 5.0 GiB in the sole provider-onboarding lane, both
-  below their enforced ceilings.
-- Hosted Actions run `30144094932` at `2e6d6c6` created three jobs with empty step lists. No
+  branch is deleted, no matching origin branch existed, and metadata is pruned. The completed
+  performance-evidence worktree, its 1.0 GiB generated target, both merged local branches, and the
+  remaining origin feature branch are also removed and pruned. Active generated targets are
+  approximately 7.1 GiB in root and 6.9 GiB in the sole provider-onboarding lane, both below their
+  enforced ceilings with zero-byte incremental caches.
+- Hosted Actions run `30179378256` at `620d212` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
   payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
 - Documentation execution source head:
@@ -168,10 +181,11 @@ Subsequent source-derived review established the current first-use handoff state
   encrypted-file fallback and explicit foreground portal unlock/lock. The remaining onboarding
   blocker is provider release availability and the clean-machine acceptance demonstration.
 
-As verified through GitHub on 2026-07-25, Task 4 issue `#9` is closed and its Project 5 item is
-`Done` at accepted head `37b6641`. Issues `#7`, `#10`, `#11`, `#24`, `#25`, and `#31` remain open.
-Project 5 marks `#7`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo. The next product
-barriers remain Tasks 19/19A and Task 20.
+As verified through GitHub on 2026-07-25, Task 4 issue `#9` and Task 6 issue `#11` are closed and
+their Project 5 items are `Done`. Issues `#7`, `#10`, `#24`, `#25`, and `#31` remain open. Project
+5 marks Task 19A issue `#31` and Task 20 issue `#25` In Progress. The active product barriers are
+provider onboarding acceptance, the Coinbase Direct application vertical, remaining release
+prerequisite reconciliation, and Task 20's exact-head acceptance.
 
 ## Product delivery closeout and next barrier
 

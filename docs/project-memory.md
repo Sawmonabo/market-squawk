@@ -768,3 +768,28 @@ is `Done`; `#7`, `#10`, `#11`, `#24`, and `#31` remain In Progress, and `#25` re
 Actions run `30144094932` at integrated Coinbase head `2e6d6c6` created three jobs with empty step
 lists. Each check reported that recent account payments failed or the spending limit must be
 increased; no repository checkout or code-owned CI step ran.
+
+## 2026-07-25 release-source and performance-evidence checkpoint
+
+The moving release head is `620d212ea4f28b8b50130fb5f430a42947e41cd4`, tree
+`596d9b33ef6415741b19e230a91a416fd907b77c`. Release-source authority is integrated through
+`c8ceb82`: authenticated Coinbase Direct transport remains distinct from the public Coinbase and
+Kraken compatibility sources, whose declared quality ceilings remain `DirectUnverified`.
+
+Release-performance candidate `afd9a58c7f8e36be7448543d61da2b0e6f36be10` was accepted by an
+independent exact-head review and merged at `620d212`. Its evidence publisher keeps the final path
+absent until post-measurement executable/repository identity validation, then performs an atomic
+no-clobber commit with exact transaction-owned cleanup. RSS results now report only finite
+observations with optional maxima, sample counts, and observation windows. Focused release-evidence
+application check, formatting, and diff integrity passed at the integrated head.
+
+The completed performance lane, its 1.0 GiB target, both merged local branches, and the remaining
+origin feature branch were removed and pruned. The root target is 7.1 GiB and the sole active
+provider-onboarding lane target is 6.9 GiB; both incremental caches are 0 bytes and approximately
+113 GiB is free. GitHub Actions run `30179378256` created three empty-step jobs and reported the
+account-level payment/spending-limit annotation, so it contains no code-owned CI failure.
+
+Task 6 issue `#11` is closed and its Project 5 item is `Done`. The open issues are `#7`, `#10`,
+`#24`, `#25`, and `#31`; Tasks 19A and 20 are In Progress. The provider-onboarding remediation is
+the sole active feature worktree. Exact-head production measurements and the remaining product
+acceptance work keep the release blocked.
