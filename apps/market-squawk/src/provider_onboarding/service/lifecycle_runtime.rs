@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use super::{
     OnboardingSessionView, ProviderOnboardingError, ProviderOnboardingService,
-    SECRET_OPERATION_DURATION, SESSION_DURATION, await_blocking_secret_operation, event_digest,
-    session_view, system_timestamp, wall_deadline,
+    ProviderRuntimeStartupAdmissions, SECRET_OPERATION_DURATION, SESSION_DURATION,
+    await_blocking_secret_operation, event_digest, session_view, system_timestamp, wall_deadline,
 };
 
 impl ProviderOnboardingService {
@@ -287,6 +287,7 @@ impl ProviderOnboardingService {
     pub(super) fn reconcile_startup(
         &self,
         limit: CatalogLimit,
+        runtime_admissions: &ProviderRuntimeStartupAdmissions,
     ) -> Result<(), ProviderOnboardingError> {
         let mut after = None;
         loop {
@@ -314,8 +315,9 @@ impl ProviderOnboardingService {
                 });
                 let exact_lifecycle_support =
                     exact_capability.map(|capability| capability.lifecycle_support());
-                let current_runtime_admitted =
-                    profile
+                let current_runtime_admitted = runtime_admissions
+                    .admits(resumed.lifecycle().surface_id(), *session_id)
+                    && profile
                         .zip(exact_capability)
                         .is_some_and(|(profile, capability)| {
                             public_configuration_valid
@@ -533,6 +535,10 @@ impl ProviderOnboardingService {
                 )?;
                 continue;
             }
+            if startup_remote_cleanup_unresolved(lifecycle.generation_remote_revocation(generation))
+            {
+                return Ok(());
+            }
             if !matches!(
                 lifecycle.generation_local_deletion(generation),
                 Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
@@ -748,5 +754,30 @@ impl ProviderOnboardingService {
                 OnboardingEvent::Retire { generation },
             )?;
         }
+    }
+}
+
+const fn startup_remote_cleanup_unresolved(outcome: Option<RemoteRevocationOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(RemoteRevocationOutcome::Failed | RemoteRevocationOutcome::Indeterminate)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_unresolved_remote_revocation_stops_cleanup() {
+        for outcome in [
+            RemoteRevocationOutcome::Failed,
+            RemoteRevocationOutcome::Indeterminate,
+        ] {
+            assert!(startup_remote_cleanup_unresolved(Some(outcome)));
+        }
+        assert!(!startup_remote_cleanup_unresolved(Some(
+            RemoteRevocationOutcome::Confirmed
+        )));
     }
 }

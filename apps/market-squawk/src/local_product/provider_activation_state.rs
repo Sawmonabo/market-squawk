@@ -5,7 +5,7 @@ mod evidence;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+use crate::provider_onboarding::{ProviderOnboardingError, ProviderRuntimeStartupAdmissions};
 pub(super) use evidence::ActivationEvidenceCandidate;
 
 const RECIPE_SCHEMA_VERSION: u16 = 3;
@@ -100,6 +101,28 @@ impl DurableProviderActivationState {
             root: control_root.join(ACTIVATION_STATE_DIRECTORY),
             activation_gate: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Returns the one exact desired runtime session for every durable research surface.
+    pub(super) fn startup_runtime_admissions(
+        &self,
+    ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
+        let entries = RESTORABLE_RESEARCH_SURFACES
+            .into_iter()
+            .filter_map(|surface_id| match self.load_recipe(surface_id) {
+                Ok(DurableActivationRecipeState::Desired(recipe)) => Some(
+                    SourceIdentifier::try_from(surface_id)
+                        .map(|surface_id| (surface_id, recipe.session_id)),
+                ),
+                Ok(
+                    DurableActivationRecipeState::Missing
+                    | DurableActivationRecipeState::Staged(_)
+                    | DurableActivationRecipeState::Quarantined(_),
+                )
+                | Err(_) => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ProviderRuntimeStartupAdmissions::try_new(entries)
     }
 
     /// Serializes every activation that can mutate the shared runtime or evidence index.

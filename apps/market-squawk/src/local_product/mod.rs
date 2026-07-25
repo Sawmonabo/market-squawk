@@ -142,19 +142,23 @@ impl LocalProduct {
                 paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY),
             )?,
         );
-        let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
-            research.onboarding_catalog(),
-            secrets,
-            provider_rate.clone(),
-        )?);
+        let provider_activation_state =
+            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
+        let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;
+        let onboarding = Arc::new(
+            ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
+                research.onboarding_catalog(),
+                secrets,
+                provider_rate.clone(),
+                runtime_admissions,
+            )?,
+        );
         let provider_activation = Arc::new(ProviderAdapterActivation::new(
             Arc::clone(&onboarding),
             Arc::clone(&research_ingest),
             config.clone(),
             provider_rate.clone(),
         ));
-        let provider_activation_state =
-            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
         cli_provider::restore_research_providers(
             &paths,
             &onboarding,

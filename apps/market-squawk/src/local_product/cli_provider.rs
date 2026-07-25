@@ -345,6 +345,20 @@ async fn publish_research_activation(
             )?;
             return Err(CliProviderActivationError::Activation(error));
         }
+        if expected.session_id() != lease.session_id()
+            && let Err(error) =
+                onboarding.invalidate_activation_recipe(expected.session_id(), published)
+        {
+            quarantine_failed_candidate(
+                state,
+                onboarding,
+                surface_id,
+                lease.session_id(),
+                published,
+                DurableActivationQuarantineReason::AuthorityInvalidated,
+            )?;
+            return Err(CliProviderActivationError::Onboarding(error));
+        }
         let active = match onboarding.commit_prepared_activation(lease).await {
             Ok(active) => active,
             Err(error) => {
@@ -359,7 +373,17 @@ async fn publish_research_activation(
                 return Err(CliProviderActivationError::Onboarding(error));
             }
         };
-        require_same_activation_lease(&active, lease)?;
+        if let Err(error) = require_same_activation_lease(&active, lease) {
+            quarantine_failed_candidate(
+                state,
+                onboarding,
+                surface_id,
+                lease.session_id(),
+                published,
+                DurableActivationQuarantineReason::AuthorityInvalidated,
+            )?;
+            return Err(error);
+        }
         let activated = match prepared.commit() {
             Ok(activated) => activated,
             Err(error) => {
@@ -464,7 +488,17 @@ async fn publish_research_activation(
             return Err(CliProviderActivationError::Onboarding(error));
         }
     };
-    require_same_activation_lease(&active, lease)?;
+    if let Err(error) = require_same_activation_lease(&active, lease) {
+        quarantine_failed_candidate(
+            state,
+            onboarding,
+            surface_id,
+            lease.session_id(),
+            published,
+            DurableActivationQuarantineReason::AuthorityInvalidated,
+        )?;
+        return Err(error);
+    }
     let outcome = match activation_authority
         .activate_exact_research_profile(&candidate, request, cancellation)
         .await

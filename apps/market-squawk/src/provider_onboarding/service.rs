@@ -126,6 +126,30 @@ pub struct ProviderOnboardingService {
     secret_operations: Arc<Semaphore>,
 }
 
+/// Exact durable runtime-session authority admitted during startup reconciliation.
+#[derive(Debug, Default)]
+pub(crate) struct ProviderRuntimeStartupAdmissions {
+    sessions: BTreeMap<SourceIdentifier, Uuid>,
+}
+
+impl ProviderRuntimeStartupAdmissions {
+    pub(crate) fn try_new(
+        entries: impl IntoIterator<Item = (SourceIdentifier, Uuid)>,
+    ) -> Result<Self, ProviderOnboardingError> {
+        let mut sessions = BTreeMap::new();
+        for (surface_id, session_id) in entries {
+            if session_id.is_nil() || sessions.insert(surface_id, session_id).is_some() {
+                return Err(ProviderOnboardingError::InvalidSessionState);
+            }
+        }
+        Ok(Self { sessions })
+    }
+
+    fn admits(&self, surface_id: &SourceIdentifier, session_id: Uuid) -> bool {
+        self.sessions.get(surface_id) == Some(&session_id)
+    }
+}
+
 impl ProviderOnboardingService {
     /// Constructs the production service with one product-wide durable provider-rate authority.
     ///
@@ -141,13 +165,31 @@ impl ProviderOnboardingService {
     where
         S: SecretStore + 'static,
     {
-        Self::try_new_inner(catalog, secrets, provider_rate)
+        Self::try_new_inner(
+            catalog,
+            secrets,
+            provider_rate,
+            ProviderRuntimeStartupAdmissions::default(),
+        )
+    }
+
+    pub(crate) fn try_new_with_provider_rate_and_runtime_admissions<S>(
+        catalog: OnboardingCatalogCapability,
+        secrets: Arc<S>,
+        provider_rate: ProviderRateAuthority,
+        runtime_admissions: ProviderRuntimeStartupAdmissions,
+    ) -> Result<Self, ProviderOnboardingError>
+    where
+        S: SecretStore + 'static,
+    {
+        Self::try_new_inner(catalog, secrets, provider_rate, runtime_admissions)
     }
 
     fn try_new_inner<S>(
         catalog: OnboardingCatalogCapability,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
+        runtime_admissions: ProviderRuntimeStartupAdmissions,
     ) -> Result<Self, ProviderOnboardingError>
     where
         S: SecretStore + 'static,
@@ -185,7 +227,7 @@ impl ProviderOnboardingService {
         for profile in service.profiles.iter() {
             let _registration = service.register_profile_capabilities(profile)?;
         }
-        service.reconcile_startup(CatalogLimit::new(32)?)?;
+        service.reconcile_startup(CatalogLimit::new(32)?, &runtime_admissions)?;
         Ok(service)
     }
 
@@ -2031,6 +2073,17 @@ mod tests {
     use crate::ResearchService;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn startup_runtime_admission_is_exact_to_surface_and_session() -> TestResult {
+        let surface = SourceIdentifier::try_from("bls.v2-registered")?;
+        let predecessor = Uuid::new_v4();
+        let desired = Uuid::new_v4();
+        let admissions = ProviderRuntimeStartupAdmissions::try_new([(surface.clone(), desired)])?;
+        assert!(!admissions.admits(&surface, predecessor));
+        assert!(admissions.admits(&surface, desired));
+        Ok(())
+    }
 
     #[test]
     fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
