@@ -496,15 +496,21 @@ impl CoinbaseDirectSession {
                 io_timeout,
             )
             .await?;
+            let mut matching_pong_seen = false;
             loop {
                 let message = read_with_deadline(socket, output, cancellation, io_timeout).await?;
                 if matches!(&message, Message::Pong(payload) if payload == &frontier) {
                     self.validate_generation()?;
-                    return Ok(());
+                    matching_pong_seen = true;
+                    continue;
                 }
-                let _disposition = self
+                let disposition = self
                     .handle_message(socket, message, output, cancellation, InboundMode::Queueing)
                     .await?;
+                if matching_pong_seen && disposition == MessageDisposition::Data {
+                    self.validate_generation()?;
+                    return Ok(());
+                }
             }
         };
         match tokio::time::timeout(io_timeout, operation).await {

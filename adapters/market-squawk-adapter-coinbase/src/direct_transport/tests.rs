@@ -23,7 +23,16 @@ use market_squawk_sources::{
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
-use tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async, client_async,
+    tungstenite::{
+        Message,
+        protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
+    },
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -328,7 +337,15 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .send(())
             .map_err(|_| "snapshot request was dropped")?;
 
-        socket.send(Message::Text(SEQUENCE_103.into())).await?;
+        let (sequence_103_head, sequence_103_tail) =
+            SEQUENCE_103.as_bytes().split_at(SEQUENCE_103.len() / 2);
+        socket
+            .send(Message::Frame(Frame::message(
+                Bytes::copy_from_slice(sequence_103_head),
+                OpCode::Data(Data::Text),
+                false,
+            )))
+            .await?;
         let frontier = socket
             .next()
             .await
@@ -338,6 +355,13 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         };
         assert_eq!(frontier.len(), 56);
         socket.send(Message::Pong(frontier)).await?;
+        socket
+            .send(Message::Frame(Frame::message(
+                Bytes::copy_from_slice(sequence_103_tail),
+                OpCode::Data(Data::Continue),
+                true,
+            )))
+            .await?;
 
         first_book.notified().await;
         socket.send(Message::Text(SEQUENCE_104.into())).await?;
