@@ -741,14 +741,26 @@ secret zeroization, and focused proof of those exact invariants. Subsequent exac
 rejected two remaining lifecycle-authority defects and accepted `6182da0` only after both were
 closed. No rejected intermediate was integrated.
 
-One grouped non-conflicting `feature/research-model-release` lane owns both public analytical-query
-overflow publication and the supported production training/ONNX candidate workflow. It is based on
-the pushed `241599a` product/documentation checkpoint and cannot push or integrate before focused
-verification and independent review.
+The grouped `feature/research-model-release` lane completed public analytical-query overflow and the
+supported production training/ONNX candidate workflow at exact accepted head
+`37b664111ff8f3342a9851b411f5fe6b6f16dc97`, tree
+`bda7c091a19fdbda58c365df74aaeb8125fa37d5`. Independent final review reported zero Critical,
+Important, or Minor findings. Strict app Clippy, formatting, source-lock admission, and the exact
+787-file closure passed.
 
-Generated Cargo state is approximately 6.1 GiB in the root and 8.4 GiB in the sole active
-research/model lane. Both remain below the 20 GiB root and 10 GiB lane ceilings. Project 5 keeps
-`#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
-Actions run `30136930407` at Coinbase integration head `4cb6e02` again created three jobs with
-empty step lists. Each check reported that recent account payments failed or the spending limit
-must be increased; no repository checkout or code-owned CI step ran.
+The direct sealed release matrix passed 11 tests and 2 training subtests on each of CPython 3.12.12
+and 3.13.7. It exercised signed linear and logistic candidate production/admission and bounded
+logistic prediction. The release-manifest, evidence, and wheel SHA-256 identities are respectively
+`f0409fe78a8bafbb188b625abb03a468a0772ffb9b9c7ca571b5f11aa21e8d72`,
+`69b8ae141694f360e8917c3d7649b05034b0a8c5c5e1387ecf595c871aa9d714`, and
+`f972e8bdcf3fd0bb35aa6835db6df1935fcecb2cefb28af93d350e1a59632da6`.
+The release branch fast-forwarded unchanged to that candidate. Its 9.0 GiB generated target,
+worktree, and merged local branch were removed; no matching origin branch existed.
+
+Generated Cargo state is approximately 6.1 GiB in root, 5.0 GiB in the active onboarding lane, and
+0.9 GiB in the accepted Coinbase lane. All remain below their enforced ceilings. Task 4 issue `#9`
+is closed and its Project 5 item is `Done`; `#7`, `#10`, `#11`, `#24`, and `#31` remain In Progress,
+and `#25` remains Todo.
+Actions run `30143890262` at accepted research head `37b6641` created three jobs with empty step
+lists. Each check reported that recent account payments failed or the spending limit must be
+increased; no repository checkout or code-owned CI step ran.

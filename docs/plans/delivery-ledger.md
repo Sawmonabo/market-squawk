@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -9,18 +9,26 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Latest integrated product-capability merge: `4cb6e02124a3f730430e4e152b1b1f29e7e0f9fe`
-  (`merge: integrate Coinbase Direct market data core`). The release branch is pushed through the
-  status commit containing this record.
-- Research/model first-use authority is integrated through merge head `92f2b72`. Durable
-  point-in-time feature datasets, stable bounded pagination, retained Python export digests, sealed
-  application/validator/ONNX-worker release construction, and bounded artifact-read lifecycle
-  ownership are now in the release line.
-- The current research/model release candidate closes the two remaining first-use handoffs:
-  verified non-inline DataFusion results are republished as opaque durable content-addressed
-  Parquet for bounded CLI/MCP retrieval, and the signed release installs a deterministic production
-  driver for linear/regression and logistic/binary-probability ONNX proposal, finalization,
+- Latest integrated product-capability head:
+  `37b664111ff8f3342a9851b411f5fe6b6f16dc97`
+  (`fix(research): preserve bounded MCP overflow`), tree
+  `bda7c091a19fdbda58c365df74aaeb8125fa37d5`.
+- Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
+  are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
+  results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
+  reach MCP's controlled opaque-overflow publisher. The signed release installs the deterministic
+  `market-squawk-train` driver for linear/regression and logistic/binary-probability ONNX proposal,
   Rust validation, admission, and tract inference.
+- Independent review accepted the exact source candidate with zero Critical, Important, or Minor
+  findings. Strict production-app Clippy, formatting, diff integrity, JSON/source-lock admission,
+  and the 787-of-787 release source closure passed.
+- The sealed offline matrix passed on both CPython 3.12.12 and 3.13.7 with 11 tests and 2 training
+  subtests per interpreter. The signed foundation SHA-256 is
+  `50a48460a41c0c0f581a3eeeed1543937a994874f1fc26880814bff50a24340a`; release-manifest
+  SHA-256 is `f0409fe78a8bafbb188b625abb03a468a0772ffb9b9c7ca571b5f11aa21e8d72`;
+  evidence SHA-256 is `69b8ae141694f360e8917c3d7649b05034b0a8c5c5e1387ecf595c871aa9d714`;
+  and the sealed wheel SHA-256 is
+  `f972e8bdcf3fd0bb35aa6835db6df1935fcecb2cefb28af93d350e1a59632da6`.
 - Shared release composition is integrated at `3ef05dc`: one controlled path-free artifact
   repository serves application, CLI, and MCP; `Analysis.ReadArtifact` exposes digest-bound
   32 KiB chunks; the model domain admits the signed application and ONNX worker; and configured
@@ -38,11 +46,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   runnable authenticated source or `DirectVerified` release authority: credential activation,
   transport supervision, central qualification, strategy/risk/paper composition, and an authorized
   unchanged-head trace remain open under issue `#7`.
-- The completed Coinbase target (970.7 MiB), worktree, merged local branch, and stale refs are
-  removed; no matching origin feature branch existed. The active root target is approximately
-  6.1 GiB. The only feature worktree is `feature/research-model-release`, approximately 8.4 GiB and
-  below its 10 GiB lane ceiling.
-- Hosted Actions run `30136930407` at `4cb6e02` created three jobs with empty step lists. No
+- The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
+  local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
+  is pruned. Active generated targets are approximately 6.1 GiB in root, 5.0 GiB in the provider
+  onboarding lane, and 0.9 GiB in the accepted Coinbase lane, all below their enforced ceilings.
+- Hosted Actions run `30143890262` at `37b6641` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
   payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
 - Documentation execution source head:
@@ -156,10 +164,10 @@ Subsequent source-derived review established the current first-use handoff state
   encrypted-file fallback and explicit foreground portal unlock/lock. The remaining onboarding
   blocker is provider release availability and the clean-machine acceptance demonstration.
 
-As verified through GitHub on 2026-07-23, issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31`
-remain open. Project 5 marks `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
-They remain open until exact closing evidence is reconciled. The documentation barrier is closed;
-the next product barriers remain Tasks 19/19A and Task 20.
+As verified through GitHub on 2026-07-25, Task 4 issue `#9` is closed and its Project 5 item is
+`Done` at accepted head `37b6641`. Issues `#7`, `#10`, `#11`, `#24`, `#25`, and `#31` remain open.
+Project 5 marks `#7`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo. The next product
+barriers remain Tasks 19/19A and Task 20.
 
 ## Product delivery closeout and next barrier
 
