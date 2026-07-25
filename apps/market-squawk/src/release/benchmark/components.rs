@@ -24,7 +24,7 @@ use market_squawk_sources::{
     ProviderBookLevel, ProviderDecimalLexeme, ProviderPrice, ProviderQuantity,
     ProviderSequenceEvidence, SequenceValidationProfile, kraken_v2_crc32,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const MAXIMUM_COMPONENT_SAMPLES: u64 = 100_000;
 const MAXIMUM_ONNX_SAMPLES: u64 = 10_000;
@@ -37,7 +37,7 @@ pub(super) fn kraken_fixture() -> &'static [u8] {
     KRAKEN_FIXTURE
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ComponentEvidence {
     kraken_decoder_and_checksum: ComponentLatencyDistribution,
@@ -50,7 +50,7 @@ pub(super) struct ComponentEvidence {
     onnx_inference: ComponentLatencyDistribution,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ComponentLatencyDistribution {
     operations: u64,
@@ -62,7 +62,7 @@ struct ComponentLatencyDistribution {
     maximum_nanos: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct QueueEvidence {
     latency: ComponentLatencyDistribution,
@@ -75,8 +75,8 @@ struct QueueEvidence {
     queue_private_storage_bytes: Option<usize>,
     fixed_capture_bytes: Option<usize>,
     total_accounted_bytes: Option<usize>,
-    transport: &'static str,
-    private_storage_accounting: &'static str,
+    transport: String,
+    private_storage_accounting: String,
     real_full_refusal_verified: bool,
 }
 
@@ -242,8 +242,8 @@ fn measure_queue(iterations: u64) -> Result<QueueEvidence> {
         queue_private_storage_bytes: reconciliation.queue_private_storage_bytes(),
         fixed_capture_bytes: reconciliation.fixed_capture_bytes(),
         total_accounted_bytes: reconciliation.total_accounted_bytes(),
-        transport: benchmark_transport_identity(),
-        private_storage_accounting: benchmark_private_storage_accounting(),
+        transport: benchmark_transport_identity().to_owned(),
+        private_storage_accounting: benchmark_private_storage_accounting().to_owned(),
         real_full_refusal_verified: true,
     })
 }

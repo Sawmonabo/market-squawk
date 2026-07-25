@@ -1,19 +1,21 @@
 //! Closed Arrow, Parquet, DataFusion, and typed Python-handoff release runner.
 
+#[path = "benchmark_support/python_admission.rs"]
+mod python_admission;
+
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, UInt64Array};
 use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest,
-    InstrumentId, PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
     ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -22,8 +24,8 @@ use super::{GenerationKind, PinnedDataset, PinnedManifestObject, pinned_dataset_
 use crate::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan,
-    ObjectStoreConfig, PythonDatasetRow, PythonDatasetValue, QueryLimits, QueryRequest,
-    QueryResult, ResearchArrowBatch, ResearchQueryEngine, Sha256Digest,
+    ObjectStoreConfig, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch,
+    ResearchQueryEngine, Sha256Digest,
 };
 
 const MAX_PHYSICAL_ROWS: usize = 4_096;
@@ -32,7 +34,7 @@ const MAX_QUERY_ITERATIONS: u64 = 64;
 const MIN_QUERY_ITERATIONS: u64 = 8;
 
 /// Bounded distribution for one exact storage operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StorageLatency {
     operations: u64,
@@ -46,7 +48,7 @@ struct StorageLatency {
 }
 
 /// Complete real-storage measurement result.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseEvidenceStorageResult {
     requested_rows: u64,
@@ -59,7 +61,12 @@ pub struct ReleaseEvidenceStorageResult {
     parquet_publication: StorageLatency,
     parquet_read: StorageLatency,
     datafusion_query: StorageLatency,
-    python_typed_handoff: StorageLatency,
+    python_verified_rows: u64,
+    python_selected_rows_per_verification: u64,
+    python_export_sha256: [u8; 32],
+    python_catalog_identity: [u8; 32],
+    python_selection_sha256: [u8; 32],
+    python_dataset_admission_revalidation: StorageLatency,
 }
 
 /// Release storage fixture or operation failure.
@@ -333,44 +340,16 @@ pub async fn run_release_evidence_storage(
     }
     let query_elapsed = nanos(query_started.elapsed());
 
-    let instrument = InstrumentId::from_str("018f0000-0000-7000-8000-000000000091")
-        .map_err(|_| ReleaseEvidenceStorageError::InvalidFixture)?;
-    let instrument_bytes = *instrument.as_uuid().as_bytes();
-    let mut python_samples = Vec::new();
-    python_samples
-        .try_reserve_exact(
-            usize::try_from(repetitions)
-                .map_err(|_| ReleaseEvidenceStorageError::InvalidFixture)?,
-        )
+    drop(engine);
+    drop(pinned);
+    drop(store);
+    drop(service);
+    let python = python_admission::measure(&root.join("python-admission"), requested_rows)
+        .await
         .map_err(|_| ReleaseEvidenceStorageError::PythonHandoff)?;
-    let python_started = Instant::now();
-    for repetition in 0..repetitions {
-        let started = Instant::now();
-        for row in 0..physical_rows {
-            let identity = format!("release-example-{repetition}-{row}");
-            let admitted = PythonDatasetRow::try_new(
-                &identity,
-                instrument_bytes,
-                Timestamp::from_unix_nanos(100),
-                1,
-                1,
-                "release-feature",
-                1,
-                PythonDatasetValue::Decimal {
-                    mantissa: i128::try_from(row)
-                        .map_err(|_| ReleaseEvidenceStorageError::PythonHandoff)?,
-                    scale: 2,
-                },
-                Some("ratio"),
-                None,
-                [91; 32],
-            )
-            .map_err(|_| ReleaseEvidenceStorageError::PythonHandoff)?;
-            std::hint::black_box(admitted);
-        }
-        python_samples.push(nanos(started.elapsed()));
+    if python.requested_rows != requested_rows {
+        return Err(ReleaseEvidenceStorageError::PythonHandoff);
     }
-    let python_elapsed = nanos(python_started.elapsed());
 
     Ok(ReleaseEvidenceStorageResult {
         requested_rows,
@@ -393,7 +372,16 @@ pub async fn run_release_evidence_storage(
                 .ok_or(ReleaseEvidenceStorageError::InvalidFixture)?,
             query_elapsed,
         )?,
-        python_typed_handoff: distribution(python_samples, measured_rows, python_elapsed)?,
+        python_verified_rows: python.measured_rows,
+        python_selected_rows_per_verification: python.selected_rows_per_verification,
+        python_export_sha256: python.export_sha256,
+        python_catalog_identity: python.catalog_identity,
+        python_selection_sha256: python.selection_sha256,
+        python_dataset_admission_revalidation: distribution(
+            python.samples,
+            python.measured_rows,
+            python.elapsed_nanos,
+        )?,
     })
 }
 

@@ -1,23 +1,20 @@
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::EvidenceAuthority;
 
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const MAXIMUM_PROBE_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HostEvidence {
     operating_system: String,
     kernel: String,
-    architecture: &'static str,
+    architecture: String,
     logical_cpus: usize,
     cpu_model: String,
     physical_memory_bytes: u64,
@@ -26,12 +23,12 @@ pub(super) struct HostEvidence {
     thermal_state: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ToolchainEvidence {
     rustc_verbose: String,
     cargo_version: String,
-    stable_release_required: &'static str,
+    stable_release_required: String,
 }
 
 pub(super) fn toolchain_evidence(authority: EvidenceAuthority) -> Result<ToolchainEvidence> {
@@ -47,7 +44,7 @@ pub(super) fn toolchain_evidence(authority: EvidenceAuthority) -> Result<Toolcha
     Ok(ToolchainEvidence {
         rustc_verbose: rustc,
         cargo_version: cargo,
-        stable_release_required: "1.97.1",
+        stable_release_required: "1.97.1".to_owned(),
     })
 }
 
@@ -62,7 +59,7 @@ pub(super) fn host_evidence() -> Result<HostEvidence> {
     Ok(HostEvidence {
         operating_system: state.operating_system,
         kernel: state.kernel,
-        architecture: std::env::consts::ARCH,
+        architecture: std::env::consts::ARCH.to_owned(),
         logical_cpus,
         cpu_model: state.cpu_model,
         physical_memory_bytes: state.physical_memory_bytes,
@@ -153,67 +150,6 @@ fn command_output_optional(program: &str, arguments: &[&str]) -> Result<Option<S
     let value = String::from_utf8(output.stdout).context("host probe output is not UTF-8")?;
     let value = value.trim();
     Ok((!value.is_empty()).then(|| value.to_owned()))
-}
-
-pub(super) struct MemorySampler {
-    stop: Arc<AtomicBool>,
-    peak: Arc<AtomicUsize>,
-    worker: Option<JoinHandle<Result<()>>>,
-}
-
-impl MemorySampler {
-    pub(super) fn start() -> Result<Self> {
-        let initial = current_rss()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicUsize::new(initial));
-        let worker_stop = Arc::clone(&stop);
-        let worker_peak = Arc::clone(&peak);
-        let worker = std::thread::Builder::new()
-            .name("release-rss-sampler".to_owned())
-            .spawn(move || {
-                while !worker_stop.load(Ordering::Acquire) {
-                    worker_peak.fetch_max(current_rss()?, Ordering::AcqRel);
-                    std::thread::sleep(MEMORY_SAMPLE_INTERVAL);
-                }
-                Ok(())
-            })
-            .context("resident-memory sampler could not start")?;
-        Ok(Self {
-            stop,
-            peak,
-            worker: Some(worker),
-        })
-    }
-
-    pub(super) fn reset_peak(&mut self, baseline: u64) -> Result<()> {
-        self.peak.store(
-            usize::try_from(baseline).context("RSS baseline exceeds addressable memory")?,
-            Ordering::Release,
-        );
-        Ok(())
-    }
-
-    pub(super) fn finish(&mut self) -> Result<u64> {
-        self.stop.store(true, Ordering::Release);
-        let worker = self
-            .worker
-            .take()
-            .context("resident-memory sampler was already stopped")?;
-        worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("resident-memory sampler panicked"))??;
-        u64::try_from(self.peak.load(Ordering::Acquire))
-            .context("peak RSS exceeds the report representation")
-    }
-}
-
-impl Drop for MemorySampler {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
-        }
-    }
 }
 
 pub(super) fn rss_plateau() -> Result<u64> {

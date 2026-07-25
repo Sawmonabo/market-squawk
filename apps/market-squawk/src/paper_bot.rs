@@ -57,7 +57,8 @@ use supervisor::{PaperFinancialSupervisor, PaperFinancialSupervisorShutdown};
 
 #[cfg(feature = "release-evidence")]
 pub(crate) use benchmark_support::{
-    ReleaseLatencyDistribution, ReleasePaperBotBenchmarkComposition, ReleasePaperBotBenchmarkResult,
+    ReleaseLatencyDistribution, ReleaseMeasuredOutcomeLedger, ReleasePaperBotBenchmarkComposition,
+    ReleasePaperBotBenchmarkResult,
 };
 
 const PRODUCTION_EXECUTION_TASK_CAPACITY: usize = 3;

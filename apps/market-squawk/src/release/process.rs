@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::io::hex_digest;
@@ -16,6 +16,17 @@ use super::io::hex_digest;
 const OUTPUT_RETAINED_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+pub(super) const REMOVED_BUILD_ENVIRONMENT: [&str; 9] = [
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "RUSTC",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_WRAPPER",
+    "RUSTDOC",
+    "RUSTDOCFLAGS",
+    "RUSTFLAGS",
+];
 
 pub(super) struct ProcessRequest<'a> {
     pub(super) program: &'a OsStr,
@@ -31,7 +42,7 @@ pub(super) struct ProcessLimits {
     pub(super) rss_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ProcessEvidence {
     pub(super) elapsed_millis: u64,
@@ -61,17 +72,7 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         .stderr(Stdio::piped())
         .envs(request.environment.iter().map(|(key, value)| (key, value)))
         .env("CARGO_INCREMENTAL", "0");
-    for variable in [
-        "CARGO_BUILD_RUSTC_WRAPPER",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_TARGET_DIR",
-        "RUSTC",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "RUSTC_WRAPPER",
-        "RUSTDOC",
-        "RUSTDOCFLAGS",
-        "RUSTFLAGS",
-    ] {
+    for variable in REMOVED_BUILD_ENVIRONMENT {
         command.env_remove(variable);
     }
     #[cfg(unix)]

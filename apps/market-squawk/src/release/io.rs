@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceEnvelope<'a, T> {
     schema_version: u32,
@@ -188,7 +188,7 @@ fn hash_pass(file: &mut File, maximum_bytes: u64) -> Result<HashPass> {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StableFileIdentity {
     #[serde(skip)]

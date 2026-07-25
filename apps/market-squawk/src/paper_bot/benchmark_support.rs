@@ -8,15 +8,16 @@ use anyhow::{Context as _, Result, bail};
 use market_squawk_adapter_paper::PaperOrderState;
 use market_squawk_execution::Strategy;
 use market_squawk_live::{LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::{PaperBotStartMode, ProductionPaperBotComposition, ProductionPaperBotRuntime};
 use crate::{AppConfig, LiveRuntimeComposition, ProductionLiveSourceRuntimeError};
+pub(crate) use observer::ReleaseMeasuredOutcomeLedger;
 pub(super) use observer::{ObservedExecutionHook, ReleaseBenchmarkObserver};
 use observer::{ObservedStrategy, PHASE_DISPATCH, PHASE_IDLE, PHASE_MEASURE};
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseLatencyDistribution {
     pub(crate) operations: u64,
@@ -28,17 +29,18 @@ pub(crate) struct ReleaseLatencyDistribution {
     pub(crate) maximum_nanos: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleasePaperBotBenchmarkResult {
     pub(crate) event_count: u64,
+    pub(crate) measured_outcomes: ReleaseMeasuredOutcomeLedger,
     pub(crate) strategy_decision: ReleaseLatencyDistribution,
     pub(crate) complete_action_disposition: ReleaseLatencyDistribution,
     pub(crate) dispatch_strategy_decision_nanos: u64,
     pub(crate) dispatch_action_disposition_nanos: u64,
     pub(crate) event_to_observed_paper_terminal_nanos: u64,
-    pub(crate) dispatch_disposition: &'static str,
-    pub(crate) paper_terminal_state: &'static str,
+    pub(crate) dispatch_disposition: String,
+    pub(crate) paper_terminal_state: String,
     pub(crate) paper_order_count: usize,
     pub(crate) paper_fill_count: usize,
     pub(crate) mailbox_capacity: usize,
@@ -156,6 +158,10 @@ impl ReleasePaperBotBenchmarkRuntime {
         let elapsed = self
             .measurement_elapsed_nanos
             .context("release benchmark elapsed time is unavailable")?;
+        let measured_outcomes = self.observer.measurement_outcomes(events)?;
+        if !measured_outcomes.is_exact_non_signal_success() {
+            bail!("release benchmark measured outcome ledger did not reconcile exactly");
+        }
         let strategy_decision = self.observer.strategy_distribution(elapsed)?;
         let complete_action_disposition = self.observer.action_distribution(elapsed)?;
         if strategy_decision.operations != events
@@ -165,13 +171,14 @@ impl ReleasePaperBotBenchmarkRuntime {
         }
         Ok(ReleasePaperBotBenchmarkResult {
             event_count: events,
+            measured_outcomes,
             strategy_decision,
             complete_action_disposition,
             dispatch_strategy_decision_nanos: self.observer.dispatch_strategy_nanos(),
             dispatch_action_disposition_nanos: self.observer.dispatch_action_nanos(),
             event_to_observed_paper_terminal_nanos: terminal.elapsed_nanos,
-            dispatch_disposition: self.observer.dispatch_disposition(),
-            paper_terminal_state: terminal.state,
+            dispatch_disposition: self.observer.dispatch_disposition().to_owned(),
+            paper_terminal_state: terminal.state.to_owned(),
             paper_order_count: terminal.order_count,
             paper_fill_count: terminal.fill_count,
             mailbox_capacity: self.mailbox_capacity,

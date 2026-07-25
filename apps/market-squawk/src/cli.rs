@@ -616,6 +616,9 @@ pub enum ReleaseEvidenceCommand {
     Fuzz(ReleaseFuzzArguments),
     /// Measure the production live and analytical-storage paths.
     Benchmark(ReleaseBenchmarkArguments),
+    /// Execute one parent-supervised benchmark worker without publishing evidence.
+    #[command(hide = true)]
+    BenchmarkWorker(ReleaseBenchmarkArguments),
     /// Collect authorized evidence from configured provider interfaces.
     Providers(ReleaseProviderArguments),
     /// Validate and seal a complete exact-head evidence directory.

@@ -12,6 +12,7 @@ use market_squawk_live::{
     ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
     LiveActionHook, LiveActionHookError,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use super::ReleaseLatencyDistribution;
@@ -88,7 +89,7 @@ impl Strategy for ObservedStrategy {
         event: &MarketEvent,
     ) -> Result<BoundedOrderIntents, StrategyError> {
         let result = self.inner.on_market_event(context, event);
-        self.observer.record_strategy();
+        self.observer.record_strategy(result.is_ok());
         result
     }
 
@@ -114,6 +115,12 @@ pub(crate) struct ReleaseBenchmarkObserver {
     phase: AtomicU8,
     strategy: LatencyHistogram,
     action: LatencyHistogram,
+    strategy_successful: AtomicU64,
+    strategy_failed: AtomicU64,
+    action_no_action: AtomicU64,
+    action_suppressed: AtomicU64,
+    action_dispatched: AtomicU64,
+    action_failed: AtomicU64,
     dispatch_strategy_nanos: AtomicU64,
     dispatch_action_nanos: AtomicU64,
     dispatch_disposition: AtomicU8,
@@ -130,6 +137,12 @@ impl ReleaseBenchmarkObserver {
             phase: AtomicU8::new(PHASE_IDLE),
             strategy: LatencyHistogram::try_new()?,
             action: LatencyHistogram::try_new()?,
+            strategy_successful: AtomicU64::new(0),
+            strategy_failed: AtomicU64::new(0),
+            action_no_action: AtomicU64::new(0),
+            action_suppressed: AtomicU64::new(0),
+            action_dispatched: AtomicU64::new(0),
+            action_failed: AtomicU64::new(0),
             dispatch_strategy_nanos: AtomicU64::new(0),
             dispatch_action_nanos: AtomicU64::new(0),
             dispatch_disposition: AtomicU8::new(0),
@@ -151,6 +164,12 @@ impl ReleaseBenchmarkObserver {
     pub(super) fn reset_measurement(&self) {
         self.strategy.reset();
         self.action.reset();
+        self.strategy_successful.store(0, Ordering::Release);
+        self.strategy_failed.store(0, Ordering::Release);
+        self.action_no_action.store(0, Ordering::Release);
+        self.action_suppressed.store(0, Ordering::Release);
+        self.action_dispatched.store(0, Ordering::Release);
+        self.action_failed.store(0, Ordering::Release);
     }
 
     pub(super) fn begin_batch(&self, events: u64) -> Result<u64> {
@@ -194,6 +213,43 @@ impl ReleaseBenchmarkObserver {
         self.action.distribution(elapsed_nanos)
     }
 
+    pub(super) fn measurement_outcomes(
+        &self,
+        expected_events: u64,
+    ) -> Result<ReleaseMeasuredOutcomeLedger> {
+        let strategy_successful = self.strategy_successful.load(Ordering::Acquire);
+        let strategy_failed = self.strategy_failed.load(Ordering::Acquire);
+        let action_no_action = self.action_no_action.load(Ordering::Acquire);
+        let action_suppressed = self.action_suppressed.load(Ordering::Acquire);
+        let action_dispatched = self.action_dispatched.load(Ordering::Acquire);
+        let action_failed = self.action_failed.load(Ordering::Acquire);
+        let observed_strategies = strategy_successful
+            .checked_add(strategy_failed)
+            .context("release benchmark strategy outcome count overflowed")?;
+        let observed_actions = action_no_action
+            .checked_add(action_suppressed)
+            .and_then(|value| value.checked_add(action_dispatched))
+            .and_then(|value| value.checked_add(action_failed))
+            .context("release benchmark action outcome count overflowed")?;
+        let strategy_unobserved = expected_events
+            .checked_sub(observed_strategies)
+            .context("release benchmark observed too many strategy outcomes")?;
+        let action_unobserved = expected_events
+            .checked_sub(observed_actions)
+            .context("release benchmark observed too many action outcomes")?;
+        Ok(ReleaseMeasuredOutcomeLedger {
+            expected_events,
+            strategy_successful,
+            strategy_failed,
+            strategy_unobserved,
+            action_no_action,
+            action_suppressed,
+            action_dispatched,
+            action_failed,
+            action_unobserved,
+        })
+    }
+
     pub(super) fn dispatch_strategy_nanos(&self) -> u64 {
         self.dispatch_strategy_nanos.load(Ordering::Acquire)
     }
@@ -212,10 +268,16 @@ impl ReleaseBenchmarkObserver {
         }
     }
 
-    fn record_strategy(&self) {
+    fn record_strategy(&self, successful: bool) {
         let elapsed = self.batch_elapsed_nanos();
         match self.phase.load(Ordering::Acquire) {
-            PHASE_MEASURE => self.strategy.record(elapsed),
+            PHASE_MEASURE if successful => {
+                self.strategy_successful.fetch_add(1, Ordering::Relaxed);
+                self.strategy.record(elapsed);
+            }
+            PHASE_MEASURE => {
+                self.strategy_failed.fetch_add(1, Ordering::Relaxed);
+            }
             PHASE_DISPATCH => self
                 .dispatch_strategy_nanos
                 .store(elapsed, Ordering::Release),
@@ -226,7 +288,21 @@ impl ReleaseBenchmarkObserver {
     fn record_action(&self, disposition: ActionHookDisposition) {
         let elapsed = self.batch_elapsed_nanos();
         match self.phase.load(Ordering::Acquire) {
-            PHASE_MEASURE => self.action.record(elapsed),
+            PHASE_MEASURE => match disposition {
+                ActionHookDisposition::NoAction => {
+                    self.action_no_action.fetch_add(1, Ordering::Relaxed);
+                    self.action.record(elapsed);
+                }
+                ActionHookDisposition::Suppressed => {
+                    self.action_suppressed.fetch_add(1, Ordering::Relaxed);
+                }
+                ActionHookDisposition::Dispatched => {
+                    self.action_dispatched.fetch_add(1, Ordering::Relaxed);
+                }
+                ActionHookDisposition::Failed => {
+                    self.action_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
             PHASE_DISPATCH => {
                 self.dispatch_action_nanos.store(elapsed, Ordering::Release);
                 self.dispatch_disposition
@@ -247,6 +323,33 @@ impl ReleaseBenchmarkObserver {
 
     fn now_nanos(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseMeasuredOutcomeLedger {
+    pub(crate) expected_events: u64,
+    pub(crate) strategy_successful: u64,
+    pub(crate) strategy_failed: u64,
+    pub(crate) strategy_unobserved: u64,
+    pub(crate) action_no_action: u64,
+    pub(crate) action_suppressed: u64,
+    pub(crate) action_dispatched: u64,
+    pub(crate) action_failed: u64,
+    pub(crate) action_unobserved: u64,
+}
+
+impl ReleaseMeasuredOutcomeLedger {
+    pub(super) const fn is_exact_non_signal_success(self) -> bool {
+        self.strategy_successful == self.expected_events
+            && self.strategy_failed == 0
+            && self.strategy_unobserved == 0
+            && self.action_no_action == self.expected_events
+            && self.action_suppressed == 0
+            && self.action_dispatched == 0
+            && self.action_failed == 0
+            && self.action_unobserved == 0
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod components;
 mod host;
+mod worker;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,13 +12,14 @@ use chrono::{SecondsFormat, Utc};
 use market_squawk_data::{ReleaseEvidenceStorageResult, run_release_evidence_storage};
 use market_squawk_modeling::{ReleaseEvidenceInferenceFixture, ReleaseEvidenceInferenceIdentity};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::identity::RepositoryIdentity;
 use super::io::{
     PublishedReport, StableFileIdentity, hash_stable_file, hex_digest, publish_report, sha256_bytes,
 };
+use super::process::ProcessEvidence;
 use crate::AppConfig;
 use crate::cli::ReleaseBenchmarkArguments;
 use crate::paper_bot::{ReleasePaperBotBenchmarkComposition, ReleasePaperBotBenchmarkResult};
@@ -43,8 +45,8 @@ struct PerformanceEvidence {
     onnx_worker_binary: StableFileIdentity,
     cargo_lock: StableFileIdentity,
     rust_toolchain_file: StableFileIdentity,
-    application_version: &'static str,
-    compiled_features: [&'static str; 1],
+    application_version: String,
+    compiled_features: Vec<String>,
     host: host::HostEvidence,
     toolchain: host::ToolchainEvidence,
     fixtures: FixtureEvidence,
@@ -53,19 +55,22 @@ struct PerformanceEvidence {
     integrated_live_path: IntegratedLiveEvidence,
     analytical_storage: ReleaseEvidenceStorageResult,
     memory: MemoryEvidence,
+    worker_process: ProcessEvidence,
     threshold_decision: ThresholdDecision,
+    worker_started_at: String,
+    worker_completed_at: String,
     started_at: String,
     completed_at: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum EvidenceAuthority {
     Provisional,
     ExactHead,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureEvidence {
     kraken_snapshot_sha256: String,
@@ -80,7 +85,7 @@ struct FixtureEvidence {
     onnx_backend_retained_bytes: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConfiguredEvidence {
     warm_up_events: u64,
@@ -90,22 +95,25 @@ struct ConfiguredEvidence {
     maximum_warmed_p99_nanos: u64,
     maximum_tail_growth_bytes: u64,
     maximum_tail_growth_percent: u64,
+    worker_timeout_millis: u64,
+    worker_rss_limit_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct IntegratedLiveEvidence {
-    latency_boundary: &'static str,
-    fixture_scope: &'static str,
-    production_path: &'static str,
+    latency_boundary: String,
+    fixture_scope: String,
+    production_path: String,
     event_count: u64,
+    measured_outcomes: crate::paper_bot::ReleaseMeasuredOutcomeLedger,
     strategy_decision: crate::paper_bot::ReleaseLatencyDistribution,
     complete_action_disposition: crate::paper_bot::ReleaseLatencyDistribution,
     dispatch_strategy_decision_nanos: u64,
     dispatch_action_disposition_nanos: u64,
     event_to_observed_paper_terminal_nanos: u64,
-    dispatch_disposition: &'static str,
-    paper_terminal_state: &'static str,
+    dispatch_disposition: String,
+    paper_terminal_state: String,
     paper_order_count: usize,
     paper_fill_count: usize,
     mailbox_capacity: usize,
@@ -119,9 +127,17 @@ struct IntegratedLiveEvidence {
 struct MemoryEvidence {
     warm_plateau_rss_bytes: u64,
     post_measurement_rss_bytes: u64,
-    live_peak_rss_bytes: u64,
-    storage_peak_rss_bytes: u64,
-    complete_peak_rss_bytes: u64,
+    peak_process_tree_rss_bytes: u64,
+    tail_growth_bytes: u64,
+    permitted_tail_growth_bytes: u64,
+    sample_interval_millis: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerMemoryEvidence {
+    warm_plateau_rss_bytes: u64,
+    post_measurement_rss_bytes: u64,
     tail_growth_bytes: u64,
     permitted_tail_growth_bytes: u64,
     sample_interval_millis: u64,
@@ -136,6 +152,40 @@ struct ThresholdDecision {
     live_tail_growth_passed: bool,
     live_queue_bound_passed: bool,
     storage_completed: bool,
+    worker_process_completed: bool,
+    worker_process_rss_passed: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerThresholdDecision {
+    passed: bool,
+    live_throughput_passed: bool,
+    live_p99_passed: bool,
+    live_tail_growth_passed: bool,
+    live_queue_bound_passed: bool,
+    storage_completed: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerMeasurements {
+    onnx_worker_binary: StableFileIdentity,
+    cargo_lock: StableFileIdentity,
+    rust_toolchain_file: StableFileIdentity,
+    application_version: String,
+    compiled_features: Vec<String>,
+    host: host::HostEvidence,
+    toolchain: host::ToolchainEvidence,
+    fixtures: FixtureEvidence,
+    configured: ConfiguredEvidence,
+    components: components::ComponentEvidence,
+    integrated_live_path: IntegratedLiveEvidence,
+    analytical_storage: ReleaseEvidenceStorageResult,
+    memory: WorkerMemoryEvidence,
+    threshold_decision: WorkerThresholdDecision,
+    started_at: String,
+    completed_at: String,
 }
 
 pub(super) async fn run(
@@ -145,10 +195,133 @@ pub(super) async fn run(
     let authority = validate_arguments(&arguments)?;
     let repository = RepositoryIdentity::admit(&arguments.repository)?;
     let started_at = now();
-    let application_binary = hash_stable_file(
-        &std::env::current_exe().context("running executable path is unavailable")?,
-        MAXIMUM_EXECUTABLE_BYTES,
+    let executable = std::env::current_exe().context("running executable path is unavailable")?;
+    let application_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+    let child_arguments = worker::child_arguments()?;
+    let expected_binding = worker::WorkerBinding::capture(
+        authority,
+        &repository,
+        &arguments,
+        &config,
+        &application_binary,
+        &child_arguments,
     )?;
+    let supervised = worker::supervise(
+        &executable,
+        &repository,
+        &child_arguments,
+        &expected_binding,
+    )?;
+    let final_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+    if final_binary != application_binary {
+        bail!("release benchmark executable changed while its worker was supervised");
+    }
+    repository.verify_unchanged()?;
+    let WorkerMeasurements {
+        onnx_worker_binary,
+        cargo_lock,
+        rust_toolchain_file,
+        application_version,
+        compiled_features,
+        host,
+        toolchain,
+        fixtures,
+        configured,
+        components,
+        integrated_live_path,
+        analytical_storage,
+        memory,
+        threshold_decision,
+        started_at: worker_started_at,
+        completed_at: worker_completed_at,
+    } = supervised.measurements;
+    if !threshold_decision.passed {
+        bail!("release benchmark worker returned a failed threshold decision");
+    }
+    let process_completed = supervised.process.exit_code == 0;
+    let process_rss_passed =
+        supervised.process.peak_process_tree_rss_bytes <= worker::supervisor_rss_bytes();
+    if !process_completed || !process_rss_passed {
+        bail!("release benchmark worker process did not satisfy its fixed limits");
+    }
+    let payload = PerformanceEvidence {
+        repository,
+        evidence_authority: authority,
+        application_binary,
+        onnx_worker_binary,
+        cargo_lock,
+        rust_toolchain_file,
+        application_version,
+        compiled_features,
+        host,
+        toolchain,
+        fixtures,
+        configured,
+        components,
+        integrated_live_path,
+        analytical_storage,
+        memory: MemoryEvidence {
+            warm_plateau_rss_bytes: memory.warm_plateau_rss_bytes,
+            post_measurement_rss_bytes: memory.post_measurement_rss_bytes,
+            peak_process_tree_rss_bytes: supervised.process.peak_process_tree_rss_bytes,
+            tail_growth_bytes: memory.tail_growth_bytes,
+            permitted_tail_growth_bytes: memory.permitted_tail_growth_bytes,
+            sample_interval_millis: memory.sample_interval_millis,
+        },
+        worker_process: supervised.process,
+        threshold_decision: ThresholdDecision {
+            passed: threshold_decision.passed && process_completed && process_rss_passed,
+            live_throughput_passed: threshold_decision.live_throughput_passed,
+            live_p99_passed: threshold_decision.live_p99_passed,
+            live_tail_growth_passed: threshold_decision.live_tail_growth_passed,
+            live_queue_bound_passed: threshold_decision.live_queue_bound_passed,
+            storage_completed: threshold_decision.storage_completed,
+            worker_process_completed: process_completed,
+            worker_process_rss_passed: process_rss_passed,
+        },
+        worker_started_at,
+        worker_completed_at,
+        started_at,
+        completed_at: now(),
+    };
+    let published = publish_report(&arguments.output, REPORT_KIND, &payload)?;
+    Ok(publication_value(&published))
+}
+
+pub(super) async fn run_worker(
+    config: AppConfig,
+    arguments: ReleaseBenchmarkArguments,
+) -> Result<serde_json::Value> {
+    let authority = validate_arguments(&arguments)?;
+    let repository = RepositoryIdentity::admit(&arguments.repository)?;
+    let executable = std::env::current_exe().context("running executable path is unavailable")?;
+    let application_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+    let current_arguments = worker::current_arguments();
+    let binding = worker::WorkerBinding::capture(
+        authority,
+        &repository,
+        &arguments,
+        &config,
+        &application_binary,
+        &current_arguments,
+    )?;
+    let measurements =
+        collect_worker_measurements(config, &arguments, authority, &repository).await?;
+    let final_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+    if final_binary != application_binary {
+        bail!("release benchmark worker executable changed during measurement");
+    }
+    repository.verify_unchanged()?;
+    worker::canonical_value(&worker::WorkerEnvelope::new(binding, measurements))
+}
+
+async fn collect_worker_measurements(
+    config: AppConfig,
+    arguments: &ReleaseBenchmarkArguments,
+    authority: EvidenceAuthority,
+    repository: &RepositoryIdentity,
+) -> Result<WorkerMeasurements> {
+    let started_at = now();
     let worker_path = onnx_worker_path()?;
     let onnx_worker_binary = hash_stable_file(&worker_path, MAXIMUM_EXECUTABLE_BYTES)?;
     let worker_digest = decode_digest(&onnx_worker_binary.sha256)?;
@@ -181,7 +354,6 @@ pub(super) async fn run(
         .context("live benchmark scratch directory could not be created")?;
     let isolated_config = isolated_config(config, live_scratch.path().join("data"))?;
     let cancellation = CancellationToken::new();
-    let mut live_memory = host::MemorySampler::start()?;
     let mut live = ReleasePaperBotBenchmarkComposition::try_new(isolated_config)?
         .start(cancellation)
         .await
@@ -189,20 +361,17 @@ pub(super) async fn run(
     let measurement = async {
         live.warm_up(arguments.warm_up_events).await?;
         let warm_plateau = host::rss_plateau()?;
-        live_memory.reset_peak(warm_plateau)?;
         live.measure(arguments.events).await?;
         let post_measurement = host::rss_plateau()?;
         Ok::<_, anyhow::Error>((warm_plateau, post_measurement))
     }
     .await;
     let close = live.finish().await;
-    let live_peak = live_memory.finish()?;
     let ((warm_plateau, post_measurement), live_result) =
         reconcile_live_measurement(measurement, close)?;
     drop(live_scratch);
     let integrated_live_path = integrated_live(live_result);
 
-    let mut storage_memory = host::MemorySampler::start()?;
     let storage_scratch = tempfile::Builder::new()
         .prefix("market-squawk-release-storage-")
         .tempdir()
@@ -211,7 +380,6 @@ pub(super) async fn run(
         run_release_evidence_storage(storage_scratch.path(), arguments.storage_rows)
             .await
             .context("production analytical-storage measurement failed")?;
-    let storage_peak = storage_memory.finish()?;
     drop(storage_scratch);
 
     let tail_growth = post_measurement.saturating_sub(warm_plateau);
@@ -224,26 +392,22 @@ pub(super) async fn run(
         .and_then(|value| value.checked_div(100))
         .context("tail-growth percentage limit overflow")?;
     let permitted_tail_growth = configured_tail_bytes.max(percentage_tail_bytes);
-    let threshold_decision = threshold_decision(
+    let threshold_decision = worker_threshold_decision(
         &integrated_live_path,
         tail_growth,
         permitted_tail_growth,
-        &arguments,
+        arguments,
     );
     if !threshold_decision.passed {
         bail!("release-performance thresholds were not satisfied");
     }
 
-    repository.verify_unchanged()?;
-    let payload = PerformanceEvidence {
-        repository,
-        evidence_authority: authority,
-        application_binary,
+    Ok(WorkerMeasurements {
         onnx_worker_binary,
         cargo_lock,
         rust_toolchain_file,
-        application_version: env!("CARGO_PKG_VERSION"),
-        compiled_features: ["release-evidence"],
+        application_version: env!("CARGO_PKG_VERSION").to_owned(),
+        compiled_features: vec!["release-evidence".to_owned()],
         host: host_evidence,
         toolchain,
         fixtures: fixture_evidence(inference_identity),
@@ -255,16 +419,15 @@ pub(super) async fn run(
             maximum_warmed_p99_nanos: arguments.max_warmed_p99_ns,
             maximum_tail_growth_bytes: configured_tail_bytes,
             maximum_tail_growth_percent: arguments.max_tail_growth_percent,
+            worker_timeout_millis: worker::supervisor_timeout_millis(),
+            worker_rss_limit_bytes: worker::supervisor_rss_bytes(),
         },
         components: component_evidence,
         integrated_live_path,
         analytical_storage,
-        memory: MemoryEvidence {
+        memory: WorkerMemoryEvidence {
             warm_plateau_rss_bytes: warm_plateau,
             post_measurement_rss_bytes: post_measurement,
-            live_peak_rss_bytes: live_peak,
-            storage_peak_rss_bytes: storage_peak,
-            complete_peak_rss_bytes: live_peak.max(storage_peak),
             tail_growth_bytes: tail_growth,
             permitted_tail_growth_bytes: permitted_tail_growth,
             sample_interval_millis: host::memory_sample_interval_millis(),
@@ -272,9 +435,7 @@ pub(super) async fn run(
         threshold_decision,
         started_at,
         completed_at: now(),
-    };
-    let published = publish_report(&arguments.output, REPORT_KIND, &payload)?;
-    Ok(publication_value(&published))
+    })
 }
 
 fn validate_arguments(arguments: &ReleaseBenchmarkArguments) -> Result<EvidenceAuthority> {
@@ -312,10 +473,15 @@ fn validate_arguments(arguments: &ReleaseBenchmarkArguments) -> Result<EvidenceA
 
 fn integrated_live(result: ReleasePaperBotBenchmarkResult) -> IntegratedLiveEvidence {
     IntegratedLiveEvidence {
-        latency_boundary: "bounded_ingress_attempt_to_observed_strategy_and_action_completion",
-        fixture_scope: "sealed_feature_gated_diagnostic_source_not_provider_qualification",
-        production_path: "live_actor_to_strategy_to_central_risk_to_dispatcher_to_realistic_paper_adapter",
+        latency_boundary: "bounded_ingress_attempt_to_observed_strategy_and_action_completion"
+            .to_owned(),
+        fixture_scope: "sealed_feature_gated_diagnostic_source_not_provider_qualification"
+            .to_owned(),
+        production_path:
+            "live_actor_to_strategy_to_central_risk_to_dispatcher_to_realistic_paper_adapter"
+                .to_owned(),
         event_count: result.event_count,
+        measured_outcomes: result.measured_outcomes,
         strategy_decision: result.strategy_decision,
         complete_action_disposition: result.complete_action_disposition,
         dispatch_strategy_decision_nanos: result.dispatch_strategy_decision_nanos,
@@ -333,18 +499,18 @@ fn integrated_live(result: ReleasePaperBotBenchmarkResult) -> IntegratedLiveEvid
     }
 }
 
-fn threshold_decision(
+fn worker_threshold_decision(
     live: &IntegratedLiveEvidence,
     tail_growth: u64,
     permitted_tail_growth: u64,
     arguments: &ReleaseBenchmarkArguments,
-) -> ThresholdDecision {
+) -> WorkerThresholdDecision {
     let throughput =
         live.complete_action_disposition.operations_per_second >= arguments.min_events_per_second;
     let p99 = live.complete_action_disposition.p99_nanos <= arguments.max_warmed_p99_ns;
     let tail = tail_growth <= permitted_tail_growth;
     let queue = live.producer_observed_maximum_in_flight_batches <= live.mailbox_capacity;
-    ThresholdDecision {
+    WorkerThresholdDecision {
         passed: throughput && p99 && tail && queue,
         live_throughput_passed: throughput,
         live_p99_passed: p99,

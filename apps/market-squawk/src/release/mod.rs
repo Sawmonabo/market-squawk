@@ -40,6 +40,22 @@ pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand)
             }
         }
         ReleaseCommand::Evidence {
+            command: ReleaseEvidenceCommand::BenchmarkWorker(arguments),
+        } => {
+            #[cfg(feature = "release-evidence")]
+            {
+                benchmark::run_worker(config, arguments).await
+            }
+            #[cfg(not(feature = "release-evidence"))]
+            {
+                drop(config);
+                drop(arguments);
+                anyhow::bail!(
+                    "release benchmark worker requires a build with the release-evidence feature"
+                )
+            }
+        }
+        ReleaseCommand::Evidence {
             command: ReleaseEvidenceCommand::Providers(_),
         }
         | ReleaseCommand::Demonstrate(_) => {
