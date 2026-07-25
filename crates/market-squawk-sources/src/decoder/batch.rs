@@ -469,17 +469,18 @@ mod tests {
             session: SourceIdentifier,
             decoder: SourceIdentifier,
         ) -> TestResult<DecoderEvidence> {
+            let binding = FrameSessionBinding::new(
+                source,
+                MetadataRevision::new(revision),
+                SessionId::new(session),
+                ConnectionGeneration::new(1)?,
+            );
+            let receipt = trusted_test_receipt(Timestamp::from_unix_nanos(1), 1)?;
             Ok(DecoderEvidence {
-                binding: FrameSessionBinding::new(
-                    source,
-                    MetadataRevision::new(revision),
-                    SessionId::new(session),
-                    ConnectionGeneration::new(1)?,
-                ),
-                frame_id: FrameId::new(
-                    NonZeroU64::new(1).ok_or("frame fixture must be nonzero")?,
-                ),
-                receipt: trusted_test_receipt(Timestamp::from_unix_nanos(1), 1)?,
+                currentness: crate::FrameSessionLease::current_for_test(binding.clone(), &receipt),
+                binding,
+                frame_id: FrameId::new(NonZeroU64::new(1).ok_or("frame fixture must be nonzero")?),
+                receipt,
                 frame_bytes: 1,
                 payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
                 decoder_rule: IntegrityRule::new(decoder, RuleVersion::new(1)?),

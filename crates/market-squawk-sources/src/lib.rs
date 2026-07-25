@@ -111,8 +111,8 @@ pub use onboarding::{
     built_in_provider_profiles,
 };
 pub use order::{
-    ProviderCursorOnlyReason, ProviderOrderEvent, ProviderOrderEventError, ProviderOrderEventKind,
-    ProviderOrderRecord,
+    ProviderCursorOnlyReason, ProviderOrderChangeReason, ProviderOrderEvent,
+    ProviderOrderEventError, ProviderOrderEventKind, ProviderOrderRecord,
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
@@ -128,11 +128,12 @@ pub use registry::{
     CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthReporter,
     CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
     CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey, ExtractionAuthority,
-    InstrumentUniverseAttestation, LiveSourceGeneration, ProviderBackoffAuthority,
-    ProviderBackoffDecision, ProviderBackoffError, RawFrameFactory, RegisteredSource,
-    RegistryAuthorityState, RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
-    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
-    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
+    FrameSessionLease, InstrumentUniverseAttestation, LiveSourceGeneration,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, RawFrameFactory,
+    RegisteredSource, RegistryAuthorityState, RegistryError, SessionControlDisposition,
+    SessionIgnoredDisposition, SessionQuarantineDisposition, SessionRecoveryDisposition,
+    ValidatedCurrentSourceAuthority, ValidatedLiveScope, ValidatedSessionDecodeOutcome,
+    ValidatedSourceSession,
 };
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 

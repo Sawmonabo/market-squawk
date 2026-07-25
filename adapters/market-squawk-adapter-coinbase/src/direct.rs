@@ -22,8 +22,8 @@ use market_squawk_sources::{
     HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration,
     LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBookSide,
     ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
-    ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord, ProviderPrice,
-    ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
+    ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
+    ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
     SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
     SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
     SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
@@ -540,7 +540,137 @@ pub enum CoinbaseDirectSigningError {
     Capability,
 }
 
-/// Exact classifier for sequenced Coinbase `full` messages.
+/// One decoded Coinbase Direct frame classified by its actual cursor semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoinbaseDirectDecodeOutcome {
+    /// A proven public product-sequence event eligible for contiguous book processing.
+    Sequenced(ProviderOrderEvent),
+    /// A validated lifecycle control that carries no public cursor or book authority.
+    NonBook(CoinbaseDirectNonBookEvent),
+}
+
+/// A validated Coinbase lifecycle control that cannot advance public state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseDirectNonBookEvent {
+    kind: CoinbaseDirectNonBookKind,
+    evidence: DecoderEvidence,
+}
+
+impl CoinbaseDirectNonBookEvent {
+    /// Returns the typed lifecycle-control payload.
+    pub const fn kind(&self) -> &CoinbaseDirectNonBookKind {
+        &self.kind
+    }
+
+    /// Returns exact captured-frame evidence without granting cursor authority.
+    pub const fn evidence(&self) -> &DecoderEvidence {
+        &self.evidence
+    }
+}
+
+/// Closed non-book lifecycle controls supported by the pinned Direct grammar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoinbaseDirectNonBookKind {
+    /// A private stop activation notification; it never advances public sequence or freshness.
+    Activate(CoinbaseDirectActivation),
+    /// A private received acknowledgement that has not opened a public-book order.
+    Received(CoinbaseDirectReceivedLifecycle),
+}
+
+/// Provider stop classification retained by an `activate` lifecycle control.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CoinbaseDirectStopType {
+    /// The provider emitted an entry-stop activation.
+    Entry,
+}
+
+/// Fully typed, unsequenced Coinbase stop activation evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseDirectActivation {
+    product: ProviderProduct,
+    provider_timestamp: ProviderDecimalLexeme,
+    user_id: SourceIdentifier,
+    profile_id: SourceIdentifier,
+    order_id: SourceIdentifier,
+    stop_type: CoinbaseDirectStopType,
+    side: ProviderBookSide,
+    stop_price: PriceTicks,
+    size: QuantityLots,
+    funds: ProviderDecimalLexeme,
+}
+
+/// Typed private received acknowledgement with no public cursor or freshness authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseDirectReceivedLifecycle {
+    product: ProviderProduct,
+    order_id: SourceIdentifier,
+}
+
+impl CoinbaseDirectReceivedLifecycle {
+    /// Returns the exact provider product without creating a sequence domain.
+    pub const fn product(&self) -> &ProviderProduct {
+        &self.product
+    }
+
+    /// Returns the acknowledged provider order identity.
+    pub const fn order_id(&self) -> &SourceIdentifier {
+        &self.order_id
+    }
+}
+
+impl CoinbaseDirectActivation {
+    /// Returns the exact provider product without creating a sequence domain.
+    pub const fn product(&self) -> &ProviderProduct {
+        &self.product
+    }
+
+    /// Returns the provider decimal timestamp lexeme; it is not public price freshness.
+    pub const fn provider_timestamp(&self) -> &ProviderDecimalLexeme {
+        &self.provider_timestamp
+    }
+
+    /// Returns the authenticated provider user identity.
+    pub const fn user_id(&self) -> &SourceIdentifier {
+        &self.user_id
+    }
+
+    /// Returns the authenticated provider profile identity.
+    pub const fn profile_id(&self) -> &SourceIdentifier {
+        &self.profile_id
+    }
+
+    /// Returns the stop-order identity.
+    pub const fn order_id(&self) -> &SourceIdentifier {
+        &self.order_id
+    }
+
+    /// Returns the provider stop classification.
+    pub const fn stop_type(&self) -> CoinbaseDirectStopType {
+        self.stop_type
+    }
+
+    /// Returns the stop's book side.
+    pub const fn side(&self) -> ProviderBookSide {
+        self.side
+    }
+
+    /// Returns the instrument-scaled stop price.
+    pub const fn stop_price(&self) -> PriceTicks {
+        self.stop_price
+    }
+
+    /// Returns the instrument-scaled stop size.
+    pub const fn size(&self) -> QuantityLots {
+        self.size
+    }
+
+    /// Returns the exact nonnegative provider funds lexeme.
+    pub const fn funds(&self) -> &ProviderDecimalLexeme {
+        &self.funds
+    }
+}
+
+/// Exact classifier for cursor-bearing and documented non-book Coinbase `full` messages.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectDecoder {
     source_id: SourceId,
@@ -570,14 +700,14 @@ impl CoinbaseDirectDecoder {
         })
     }
 
-    /// Decodes one already-captured text frame into a sequenced level-3 event.
+    /// Decodes one already-captured text frame by its actual public-cursor semantics.
     ///
     /// Unknown sequenced types and every schema/invariant violation return an error that requires
     /// a completely fresh snapshot/generation.
     pub fn decode(
         &self,
         validated: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<ProviderOrderEvent, CoinbaseDirectDecodeError> {
+    ) -> Result<CoinbaseDirectDecodeOutcome, CoinbaseDirectDecodeError> {
         let frame = validated.frame();
         if frame.source_id() != &self.source_id
             || frame.metadata_revision() != &self.metadata_revision
@@ -593,6 +723,12 @@ impl CoinbaseDirectDecoder {
             serde_json::from_slice(payload).map_err(|_| CoinbaseDirectDecodeError::Schema)?;
         let object = value.as_object().ok_or(CoinbaseDirectDecodeError::Schema)?;
         let kind = required_text(object, "type")?;
+        if !object.contains_key("sequence") {
+            return self.decode_unsequenced(validated, object, kind);
+        }
+        if kind == "activate" {
+            return Err(CoinbaseDirectDecodeError::UnknownSequencedMessage);
+        }
         let event_kind = match kind {
             "received" => {
                 validate_fields(
@@ -723,6 +859,11 @@ impl CoinbaseDirectDecoder {
                 validate_optional_nonnegative_decimal(object, "maker_fee_rate")?;
                 ProviderOrderEventKind::Match {
                     maker_order_id: parse_order_id(object, "maker_order_id")?,
+                    maker_side: parse_direct_side(required_text(object, "side")?)?,
+                    maker_price: normalize_direct_price(
+                        required_text(object, "price")?,
+                        self.terms,
+                    )?,
                     quantity: normalize_direct_quantity(
                         required_text(object, "size")?,
                         self.terms,
@@ -769,8 +910,50 @@ impl CoinbaseDirectDecoder {
                 if reason != "canceled" && object.contains_key("cancel_reason") {
                     return Err(CoinbaseDirectDecodeError::Schema);
                 }
+                let is_market = object
+                    .get("order_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|order_type| order_type == "market");
+                let has_price = object.contains_key("price");
+                let has_remaining = object.contains_key("remaining_size");
+                let has_side = object.contains_key("side");
+                if (is_market && (has_price || has_remaining))
+                    || (has_price != has_remaining)
+                    || ((has_price || has_remaining) && !has_side)
+                {
+                    return Err(CoinbaseDirectDecodeError::Schema);
+                }
                 ProviderOrderEventKind::Done {
                     order_id: parse_order_id(object, "order_id")?,
+                    side: object
+                        .get("side")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .ok_or(CoinbaseDirectDecodeError::Schema)
+                                .and_then(parse_direct_side)
+                        })
+                        .transpose()?,
+                    price: object
+                        .get("price")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .ok_or(CoinbaseDirectDecodeError::Schema)
+                                .and_then(|value| normalize_direct_price(value, self.terms))
+                        })
+                        .transpose()?,
+                    remaining_quantity: object
+                        .get("remaining_size")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .ok_or(CoinbaseDirectDecodeError::Schema)
+                                .and_then(|value| {
+                                    normalize_direct_delta_quantity(value, self.terms)
+                                })
+                        })
+                        .transpose()?,
                 }
             }
             "change" => {
@@ -804,9 +987,9 @@ impl CoinbaseDirectDecoder {
                         "side",
                     ],
                 )?;
-                parse_direct_side(required_text(object, "side")?)?;
+                let side = parse_direct_side(required_text(object, "side")?)?;
                 validate_authenticated_identity(object)?;
-                let (previous_price, new_price, new_quantity) =
+                let (reason, previous_price, previous_quantity, new_price, new_quantity) =
                     match required_text(object, "reason")? {
                         "modify_order" => {
                             if object.contains_key("price")
@@ -823,7 +1006,7 @@ impl CoinbaseDirectDecoder {
                                 required_text(object, "new_price")?,
                                 self.terms,
                             )?;
-                            let _old_quantity = normalize_direct_quantity(
+                            let previous_quantity = normalize_direct_quantity(
                                 required_text(object, "old_size")?,
                                 self.terms,
                             )?;
@@ -831,7 +1014,13 @@ impl CoinbaseDirectDecoder {
                                 required_text(object, "new_size")?,
                                 self.terms,
                             )?;
-                            (Some(previous_price), Some(new_price), Some(new_quantity))
+                            (
+                                ProviderOrderChangeReason::ModifyOrder,
+                                Some(previous_price),
+                                Some(previous_quantity),
+                                Some(new_price),
+                                Some(new_quantity),
+                            )
                         }
                         "STP" => match (
                             object.get("old_size"),
@@ -847,7 +1036,7 @@ impl CoinbaseDirectDecoder {
                                     required_text(object, "price")?,
                                     self.terms,
                                 )?;
-                                normalize_direct_quantity(
+                                let previous_quantity = normalize_direct_quantity(
                                     old_size.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
                                     self.terms,
                                 )?;
@@ -855,7 +1044,16 @@ impl CoinbaseDirectDecoder {
                                     new_size.as_str().ok_or(CoinbaseDirectDecodeError::Schema)?,
                                     self.terms,
                                 )?;
-                                (Some(previous_price), None, Some(new_quantity))
+                                if new_quantity > previous_quantity {
+                                    return Err(CoinbaseDirectDecodeError::Numeric);
+                                }
+                                (
+                                    ProviderOrderChangeReason::SelfTradePrevention,
+                                    Some(previous_price),
+                                    Some(previous_quantity),
+                                    None,
+                                    Some(new_quantity),
+                                )
                             }
                             (None, None, Some(old_funds), Some(new_funds))
                                 if !object.contains_key("old_price")
@@ -864,15 +1062,47 @@ impl CoinbaseDirectDecoder {
                             {
                                 parse_nonnegative_decimal_value(old_funds)?;
                                 parse_nonnegative_decimal_value(new_funds)?;
-                                (None, None, None)
+                                (
+                                    ProviderOrderChangeReason::SelfTradePrevention,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
                             }
                             _ => return Err(CoinbaseDirectDecodeError::Schema),
                         },
+                        "tpsl_triggered" => {
+                            if object.contains_key("price")
+                                || object.contains_key("old_size")
+                                || object.contains_key("new_size")
+                                || object.contains_key("old_funds")
+                                || object.contains_key("new_funds")
+                            {
+                                return Err(CoinbaseDirectDecodeError::Schema);
+                            }
+                            (
+                                ProviderOrderChangeReason::TpslTriggered,
+                                Some(normalize_direct_price(
+                                    required_text(object, "old_price")?,
+                                    self.terms,
+                                )?),
+                                None,
+                                Some(normalize_direct_price(
+                                    required_text(object, "new_price")?,
+                                    self.terms,
+                                )?),
+                                None,
+                            )
+                        }
                         _ => return Err(CoinbaseDirectDecodeError::Schema),
                     };
                 ProviderOrderEventKind::Change {
                     order_id: parse_order_id(object, "order_id")?,
+                    reason,
+                    side,
                     previous_price,
+                    previous_quantity,
                     new_price,
                     new_quantity,
                 }
@@ -900,7 +1130,148 @@ impl CoinbaseDirectDecoder {
             self.terms,
             DecoderEvidence::from_validated_frame(validated, self.decoder_rule.clone()),
         )
+        .map(CoinbaseDirectDecodeOutcome::Sequenced)
         .map_err(|_| CoinbaseDirectDecodeError::FrameTooLarge)
+    }
+
+    fn decode_unsequenced(
+        &self,
+        validated: &ValidatedRawMarketFrame<'_>,
+        object: &Map<String, Value>,
+        kind: &str,
+    ) -> Result<CoinbaseDirectDecodeOutcome, CoinbaseDirectDecodeError> {
+        let evidence = DecoderEvidence::from_validated_frame(validated, self.decoder_rule.clone());
+        let kind = match kind {
+            "activate" => CoinbaseDirectNonBookKind::Activate(self.decode_activate(object)?),
+            "received" => {
+                CoinbaseDirectNonBookKind::Received(self.decode_private_received(object)?)
+            }
+            "open" | "match" | "done" | "change" => {
+                return Err(CoinbaseDirectDecodeError::UnsequencedBookMutation);
+            }
+            _ => return Err(CoinbaseDirectDecodeError::UnsupportedMessage),
+        };
+        Ok(CoinbaseDirectDecodeOutcome::NonBook(
+            CoinbaseDirectNonBookEvent { kind, evidence },
+        ))
+    }
+
+    fn decode_activate(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Result<CoinbaseDirectActivation, CoinbaseDirectDecodeError> {
+        validate_fields(
+            object,
+            &[
+                "type",
+                "product_id",
+                "timestamp",
+                "user_id",
+                "profile_id",
+                "order_id",
+                "stop_type",
+                "side",
+                "stop_price",
+                "size",
+                "funds",
+                "private",
+            ],
+            &[
+                "type",
+                "product_id",
+                "timestamp",
+                "user_id",
+                "profile_id",
+                "order_id",
+                "stop_type",
+                "side",
+                "stop_price",
+                "size",
+                "funds",
+                "private",
+            ],
+        )?;
+        self.validate_product_text(object)?;
+        let provider_timestamp =
+            ProviderDecimalLexeme::try_new(required_text(object, "timestamp")?)
+                .map_err(|_| CoinbaseDirectDecodeError::Timestamp)?;
+        if provider_timestamp.decimal().is_sign_negative()
+            || object.get("private").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(CoinbaseDirectDecodeError::Schema);
+        }
+        let stop_type = match required_text(object, "stop_type")? {
+            "entry" => CoinbaseDirectStopType::Entry,
+            _ => return Err(CoinbaseDirectDecodeError::Schema),
+        };
+        let funds = ProviderDecimalLexeme::try_new(required_text(object, "funds")?)
+            .map_err(|_| CoinbaseDirectDecodeError::Numeric)?;
+        if funds.decimal().is_sign_negative() {
+            return Err(CoinbaseDirectDecodeError::Numeric);
+        }
+        Ok(CoinbaseDirectActivation {
+            product: self.product.clone(),
+            provider_timestamp,
+            user_id: parse_order_id(object, "user_id")?,
+            profile_id: parse_order_id(object, "profile_id")?,
+            order_id: parse_order_id(object, "order_id")?,
+            stop_type,
+            side: parse_direct_side(required_text(object, "side")?)?,
+            stop_price: normalize_direct_price(required_text(object, "stop_price")?, self.terms)?,
+            size: normalize_direct_quantity(required_text(object, "size")?, self.terms)?,
+            funds,
+        })
+    }
+
+    fn decode_private_received(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Result<CoinbaseDirectReceivedLifecycle, CoinbaseDirectDecodeError> {
+        validate_fields(
+            object,
+            &[
+                "type",
+                "time",
+                "product_id",
+                "order_id",
+                "order_type",
+                "size",
+                "price",
+                "side",
+                "funds",
+                "client_oid",
+                "user_id",
+                "profile_id",
+            ],
+            &["type", "time", "product_id", "order_id", "order_type"],
+        )?;
+        if !object.contains_key("user_id") && !object.contains_key("profile_id") {
+            return Err(CoinbaseDirectDecodeError::UnsequencedBookMutation);
+        }
+        self.validate_product_text(object)?;
+        let _provider_time = parse_direct_timestamp(required_text(object, "time")?)?;
+        validate_optional_enum(object, "order_type", &["limit", "market"])?;
+        validate_optional_price(object, "price", self.terms)?;
+        validate_optional_quantity(object, "size", self.terms, false)?;
+        validate_optional_side(object, "side")?;
+        validate_optional_nonnegative_decimal(object, "funds")?;
+        validate_optional_identifier(object, "client_oid")?;
+        validate_authenticated_identity(object)?;
+        Ok(CoinbaseDirectReceivedLifecycle {
+            product: self.product.clone(),
+            order_id: parse_order_id(object, "order_id")?,
+        })
+    }
+
+    fn validate_product_text(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Result<(), CoinbaseDirectDecodeError> {
+        if required_text(object, "product_id")? == self.product.as_source_identifier().as_str() {
+            Ok(())
+        } else {
+            Err(CoinbaseDirectDecodeError::WrongProduct)
+        }
     }
 }
 
@@ -1153,6 +1524,9 @@ pub enum CoinbaseDirectDecodeError {
     /// A new sequenced type may mutate state and forces a fresh snapshot.
     #[error("Coinbase Direct sequenced message type is unknown")]
     UnknownSequencedMessage,
+    /// A lifecycle frame could mutate the public book but carries no advancing public cursor.
+    #[error("Coinbase Direct book mutation has no provable public sequence")]
+    UnsequencedBookMutation,
     /// An unsequenced message is outside this order-event decoder.
     #[error("Coinbase Direct message type is unsupported")]
     UnsupportedMessage,
@@ -1469,7 +1843,8 @@ fn validate_http_capture(
     max_segments: usize,
 ) -> Result<(), CoinbaseDirectCaptureError> {
     let receipt = capture.receipt();
-    if receipt.source_id() != expected_source
+    if receipt.currentness_lease().validate_current().is_err()
+        || receipt.source_id() != expected_source
         || receipt.metadata_revision() != expected_revision
         || receipt.method() != HttpCaptureMethod::Get
         || receipt.status() != 200
@@ -1648,17 +2023,18 @@ mod tests {
     use market_squawk_sources::{
         AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
         AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-        BudgetScope, CurrentSourceSession, FreshnessPolicy, HttpCaptureMethod,
-        ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderOrderEventKind, RawFrameFactory,
-        SessionId, TransportFrameKind,
+        BudgetScope, CurrentSourceSession, FreshnessPolicy, HttpCaptureMethod, ProviderBookSide,
+        ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderOrderChangeReason,
+        ProviderOrderEventKind, RawFrameFactory, SessionId, TransportFrameKind,
     };
     use sha2::Digest as _;
 
     use crate::{
         COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectAuthentication, CoinbaseDirectConfig,
-        CoinbaseDirectDecodeError, CoinbaseDirectDecoder, CoinbaseDirectLimits,
-        CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
-        CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseProductMapping,
+        CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
+        CoinbaseDirectLimits, CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability,
+        CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
+        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseProductMapping,
         CoinbaseTransportLimits,
     };
 
@@ -1809,7 +2185,12 @@ mod tests {
         payload: &'static [u8],
     ) -> TestResult<market_squawk_sources::ProviderOrderEvent> {
         let frame = frames.try_frame(TransportFrameKind::Text, Bytes::from_static(payload))?;
-        Ok(decoder.decode(&session.validate_live_frame(&frame)?)?)
+        match decoder.decode(&session.validate_live_frame(&frame)?)? {
+            CoinbaseDirectDecodeOutcome::Sequenced(event) => Ok(event),
+            CoinbaseDirectDecodeOutcome::NonBook(_) => {
+                Err("expected a sequenced direct event".into())
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -1905,7 +2286,12 @@ mod tests {
             ),
         )?;
         let validated = session.validate_live_frame(&received_frame)?;
-        let received = decoder.decode(&validated)?;
+        let received = match decoder.decode(&validated)? {
+            CoinbaseDirectDecodeOutcome::Sequenced(event) => event,
+            CoinbaseDirectDecodeOutcome::NonBook(_) => {
+                return Err("received message was not sequenced".into());
+            }
+        };
         assert!(matches!(
             received.kind(),
             ProviderOrderEventKind::CursorOnly(_)
@@ -1945,13 +2331,82 @@ mod tests {
             decoder.decode(&session.validate_live_frame(&unknown_frame)?),
             Err(CoinbaseDirectDecodeError::UnknownSequencedMessage)
         );
+
+        let activate_frame = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"activate","product_id":"BTC-USD","timestamp":"1483736448.299000","user_id":"user-a","profile_id":"profile-a","order_id":"stop-a","stop_type":"entry","side":"buy","stop_price":"80.00","size":"2.00","funds":"50.00","private":true}"#,
+            ),
+        )?;
+        let CoinbaseDirectDecodeOutcome::NonBook(activate) =
+            decoder.decode(&session.validate_live_frame(&activate_frame)?)?
+        else {
+            return Err("activate message entered the sequenced path".into());
+        };
+        let CoinbaseDirectNonBookKind::Activate(activation) = activate.kind() else {
+            return Err("activate message was misclassified".into());
+        };
+        assert_eq!(activation.stop_type(), CoinbaseDirectStopType::Entry);
+        assert_eq!(activation.side(), ProviderBookSide::Bid);
+        assert_eq!(activation.stop_price(), PriceTicks::new(8_000));
+        assert_eq!(activation.size(), QuantityLots::new(200_000_000)?);
+        assert_eq!(
+            activation.provider_timestamp().as_str(),
+            "1483736448.299000"
+        );
+        assert_eq!(activate.evidence().frame_id(), activate_frame.frame_id());
+
+        let private_received_frame = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00","price":"100.00","side":"buy","user_id":"user-a","profile_id":"profile-a"}"#,
+            ),
+        )?;
+        assert!(matches!(
+            decoder.decode(&session.validate_live_frame(&private_received_frame)?)?,
+            CoinbaseDirectDecodeOutcome::NonBook(super::CoinbaseDirectNonBookEvent {
+                kind: CoinbaseDirectNonBookKind::Received(_),
+                ..
+            })
+        ));
+
+        let unsequenced_change = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"change","reason":"modify_order","time":"2026-07-24T21:34:10.603Z","order_id":"private-order","side":"buy","product_id":"BTC-USD","old_size":"1.00","new_size":"1.00","old_price":"100.00","new_price":"99.00","user_id":"user-a","profile_id":"profile-a"}"#,
+            ),
+        )?;
+        assert_eq!(
+            decoder.decode(&session.validate_live_frame(&unsequenced_change)?),
+            Err(CoinbaseDirectDecodeError::UnsequencedBookMutation)
+        );
         Ok(())
     }
 
     #[test]
     fn snapshot_streams_orders_and_required_time_into_non_authoritative_owner() -> TestResult {
         let config = config()?;
-        let (_registry, session, mut frames) = capture_authority(&config, 1)?;
+        let (mut registry, session, mut frames) = capture_authority(&config, 1)?;
+        let crossed_capture = capture(
+            &mut frames,
+            config.snapshot_url(),
+            br#"{"sequence":9,"bids":[["101.00","1.00","crossed-bid"]],"asks":[["101.00","1.00","crossed-ask"]],"time":"2026-07-24T21:34:10.596119497Z","auction_mode":false}"#,
+        )?;
+        let mut crossed_owner = DirectOrderBook::try_new(
+            ConnectionGeneration::new(1)?,
+            config.product().clone(),
+            config.execution_terms(),
+            config.limits().book(),
+        )?;
+        assert_eq!(
+            CoinbaseDirectSnapshotDecoder::try_new(&config)?
+                .decode_into(&crossed_capture, &mut crossed_owner),
+            Err(CoinbaseDirectSnapshotError::Owner(
+                market_squawk_live::DirectOrderBookError::CrossedBook
+            ))
+        );
+        assert_eq!(crossed_owner.phase(), DirectSyncPhase::Quarantined);
+
         let body = br#"{"sequence":10,"bids":[["100.00","5.00","bid-a"]],"asks":[["101.00","4.00","ask-a"]],"time":"2026-07-24T21:34:10.596119498Z","auction_mode":false}"#;
         let capture = capture(&mut frames, config.snapshot_url(), body)?;
         let mut owner = DirectOrderBook::try_new(
@@ -1982,6 +2437,32 @@ mod tests {
         owner.finish_replay()?;
         assert_eq!(owner.phase(), DirectSyncPhase::Healthy);
         assert!(owner.published_book().is_some());
+
+        let mut mutation_owner = DirectOrderBook::try_new(
+            ConnectionGeneration::new(1)?,
+            config.product().clone(),
+            config.execution_terms(),
+            config.limits().book(),
+        )?;
+        CoinbaseDirectSnapshotDecoder::try_new(&config)?
+            .decode_into(&capture, &mut mutation_owner)?;
+        mutation_owner.begin_replay()?;
+        mutation_owner.finish_replay()?;
+        let crossing_open = decode_event(
+            &CoinbaseDirectDecoder::try_new(&config)?,
+            &mut frames,
+            &session,
+            br#"{"type":"open","time":"2026-07-24T21:34:10.600Z","product_id":"BTC-USD","sequence":11,"order_id":"crossing-open","price":"101.00","remaining_size":"1.00","side":"buy"}"#,
+        )?;
+        assert_eq!(
+            mutation_owner.try_apply_live(crossing_open),
+            Err(market_squawk_live::DirectOrderBookError::CrossedBook)
+        );
+        assert_eq!(mutation_owner.phase(), DirectSyncPhase::Quarantined);
+
+        registry.end_session(&session, Timestamp::from_unix_nanos(2))?;
+        assert!(owner.published_book().is_none());
+        assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
         Ok(())
     }
 
@@ -2115,22 +2596,71 @@ mod tests {
             matched.kind(),
             ProviderOrderEventKind::Match { .. }
         ));
+        owner.try_apply_live(matched)?;
+        assert_eq!(
+            owner
+                .published_book()
+                .and_then(|book| book.bids().next())
+                .map(|level| level.quantity()),
+            Some(QuantityLots::new(300_000_000)?)
+        );
+
+        let tpsl = decode_event(
+            &decoder,
+            &mut frames,
+            &session,
+            br#"{"type":"change","reason":"tpsl_triggered","time":"2026-07-24T21:34:10.602Z","sequence":13,"order_id":"bid-a","side":"buy","product_id":"BTC-USD","old_price":"99.50","new_price":"99.25","user_id":"user-a","profile_id":"profile-a"}"#,
+        )?;
+        assert!(matches!(
+            tpsl.kind(),
+            ProviderOrderEventKind::Change {
+                reason: ProviderOrderChangeReason::TpslTriggered,
+                ..
+            }
+        ));
+        owner.try_apply_live(tpsl)?;
+        assert_eq!(
+            owner
+                .published_book()
+                .and_then(|book| book.bids().next())
+                .map(|level| level.price()),
+            Some(PriceTicks::new(9_925))
+        );
+
         let done = decode_event(
             &decoder,
             &mut frames,
             &session,
-            br#"{"type":"done","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":13,"order_id":"bid-a","reason":"canceled","price":"99.50","remaining_size":"4.00","side":"buy","user_id":"user-a","profile_id":"profile-a","cancel_reason":"101"}"#,
+            br#"{"type":"done","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":14,"order_id":"bid-a","reason":"canceled","price":"99.25","remaining_size":"3.00","side":"buy","user_id":"user-a","profile_id":"profile-a","cancel_reason":"101"}"#,
         )?;
         assert!(matches!(done.kind(), ProviderOrderEventKind::Done { .. }));
+        owner.try_apply_live(done)?;
+        assert!(
+            owner
+                .published_book()
+                .is_some_and(|book| book.bids().next().is_none())
+        );
+
         let invalid_match = frames.try_frame(
             TransportFrameKind::Text,
             Bytes::from_static(
-                br#"{"type":"match","trade_id":14,"sequence":14,"maker_order_id":"bid-a","taker_order_id":"taker-a","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","size":"1.00","price":"99.50","side":"buy","maker_fee_rate":[]}"#,
+                br#"{"type":"match","trade_id":15,"sequence":15,"maker_order_id":"bid-a","taker_order_id":"taker-a","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","size":"1.00","price":"99.50","side":"buy","maker_fee_rate":[]}"#,
             ),
         )?;
         assert_eq!(
             decoder.decode(&session.validate_live_frame(&invalid_match)?),
             Err(CoinbaseDirectDecodeError::Schema)
+        );
+
+        let invalid_stp = frames.try_frame(
+            TransportFrameKind::Text,
+            Bytes::from_static(
+                br#"{"type":"change","reason":"STP","time":"2026-07-24T21:34:10.605Z","sequence":16,"order_id":"bid-a","side":"buy","product_id":"BTC-USD","price":"99.25","old_size":"3.00","new_size":"4.00"}"#,
+            ),
+        )?;
+        assert_eq!(
+            decoder.decode(&session.validate_live_frame(&invalid_stp)?),
+            Err(CoinbaseDirectDecodeError::Numeric)
         );
         Ok(())
     }

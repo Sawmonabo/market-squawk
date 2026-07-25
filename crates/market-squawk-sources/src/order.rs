@@ -71,6 +71,17 @@ pub enum ProviderCursorOnlyReason {
     DocumentedNoBookMutation,
 }
 
+/// Closed provider reason for a structurally validated order change.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderOrderChangeReason {
+    /// Self-trade prevention reduced the maintained remaining size.
+    SelfTradePrevention,
+    /// A public modify-order event replaced price and remaining size.
+    ModifyOrder,
+    /// A triggered take-profit/stop-loss order was publicly repriced.
+    TpslTriggered,
+}
+
 /// One classified level-3 mutation or cursor-only advance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderOrderEventKind {
@@ -82,6 +93,10 @@ pub enum ProviderOrderEventKind {
     Match {
         /// Exact maker order identity.
         maker_order_id: SourceIdentifier,
+        /// Provider-reported maker side.
+        maker_side: ProviderBookSide,
+        /// Provider-reported scaled maker price.
+        maker_price: PriceTicks,
         /// Instrument-scaled executed quantity.
         quantity: QuantityLots,
     },
@@ -89,14 +104,29 @@ pub enum ProviderOrderEventKind {
     Done {
         /// Exact provider order identity.
         order_id: SourceIdentifier,
+        /// Provider-reported side when present for a maintained limit order.
+        side: Option<ProviderBookSide>,
+        /// Provider-reported scaled price when present for a maintained limit order.
+        price: Option<PriceTicks>,
+        /// Provider-reported scaled remaining size when present.
+        remaining_quantity: Option<QuantityLots>,
     },
-    /// Replace the remaining size of a known order. Unknown received-only orders are no-ops.
+    /// Change a known order under one documented closed reason.
+    ///
+    /// Unknown received-only orders remain cursor-only no-ops. Known orders require all evidence
+    /// implied by `reason` to agree with maintained state before any mutation is applied.
     Change {
         /// Exact provider order identity.
         order_id: SourceIdentifier,
+        /// Closed documented change reason.
+        reason: ProviderOrderChangeReason,
+        /// Provider-reported order-book side.
+        side: ProviderBookSide,
         /// Provider-reported scaled price before a limit-order change.
         previous_price: Option<PriceTicks>,
-        /// Scaled replacement price for a documented modify-order change.
+        /// Provider-reported scaled remaining size before a size change.
+        previous_quantity: Option<QuantityLots>,
+        /// Scaled replacement price for a documented modify-order or TPSL repricing.
         new_price: Option<PriceTicks>,
         /// New remaining size when the message describes a maintained limit order. `None` is a
         /// documented non-book funds change.

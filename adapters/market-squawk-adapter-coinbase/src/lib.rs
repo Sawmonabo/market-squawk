@@ -16,10 +16,13 @@ pub use config::{
 };
 pub use decoder::CoinbaseExchangeDecoder;
 pub use direct::{
-    COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectAuthentication, CoinbaseDirectCaptureError,
-    CoinbaseDirectConfig, CoinbaseDirectDecodeError, CoinbaseDirectDecoder, CoinbaseDirectLimits,
-    CoinbaseDirectProductError, CoinbaseDirectProductEvidence, CoinbaseDirectSigningCapability,
-    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
-    CoinbaseDirectSnapshotError, CoinbaseSignedSubscription,
+    COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectActivation, CoinbaseDirectAuthentication,
+    CoinbaseDirectCaptureError, CoinbaseDirectConfig, CoinbaseDirectDecodeError,
+    CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectLimits,
+    CoinbaseDirectNonBookEvent, CoinbaseDirectNonBookKind, CoinbaseDirectProductError,
+    CoinbaseDirectProductEvidence, CoinbaseDirectReceivedLifecycle,
+    CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
+    CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
+    CoinbaseSignedSubscription,
 };
 pub use source::CoinbaseExchangeSource;

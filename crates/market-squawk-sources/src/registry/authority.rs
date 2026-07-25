@@ -382,6 +382,79 @@ pub struct CurrentSourceSession {
     started_at: TrustedRegistryTime,
 }
 
+/// Opaque O(1)-clone currentness lease retained with decoded frame and HTTP receipt evidence.
+///
+/// Value-equal reconstructed session identity cannot mint this lease. Consumers revalidate it at
+/// state handoff, mutation, and publication boundaries so rollover cannot leave stale authority
+/// healthy.
+#[derive(Clone, Debug)]
+pub struct FrameSessionLease {
+    binding: FrameSessionBinding,
+    lease: Arc<SessionLeaseState>,
+}
+
+impl FrameSessionLease {
+    fn new(binding: FrameSessionBinding, lease: Arc<SessionLeaseState>) -> Self {
+        Self { binding, lease }
+    }
+
+    /// Revalidates the exact registry generation without acquiring a lock.
+    ///
+    /// # Errors
+    ///
+    /// Fails after session rollover, revocation, termination, or trusted-time discontinuity.
+    pub fn validate_current(&self) -> Result<(), crate::SourceError> {
+        if self.lease.is_current() {
+            Ok(())
+        } else {
+            Err(crate::SourceError::SessionNotCurrent)
+        }
+    }
+
+    /// Returns whether two leases retain the same registry-issued session allocation.
+    pub fn shares_authority_with(&self, other: &Self) -> bool {
+        self.binding.shares_allocation_with(&other.binding)
+            && Arc::ptr_eq(&self.lease, &other.lease)
+    }
+
+    /// Returns the immutable frame-session binding carried by this currentness lease.
+    pub const fn binding(&self) -> &FrameSessionBinding {
+        &self.binding
+    }
+
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        market_squawk_domain::checked_arc_value_allocation_bytes::<SessionLeaseState>(0).ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_for_test(
+        binding: FrameSessionBinding,
+        receipt: &TrustedReceiptObservation,
+    ) -> Self {
+        let lease = Arc::new(SessionLeaseState {
+            current: AtomicBool::new(true),
+            terminal: AtomicBool::new(false),
+            live_qualified: AtomicBool::new(false),
+            health_epoch: AtomicU64::new(0),
+            valid_from_nanos: AtomicI64::new(i64::MAX),
+            valid_until_nanos: AtomicI64::new(i64::MIN),
+            last_health_observed_nanos: AtomicI64::new(i64::MIN),
+            frame_ordinal: AtomicU64::new(0),
+            continuity: receipt.continuity().clone(),
+            started_at: receipt.time(),
+        });
+        Self::new(binding, lease)
+    }
+}
+
+impl PartialEq for FrameSessionLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_authority_with(other)
+    }
+}
+
+impl Eq for FrameSessionLease {}
+
 impl CurrentSourceSession {
     /// Returns the source identity bound to the session.
     pub fn source_id(&self) -> &SourceId {
@@ -450,7 +523,12 @@ impl CurrentSourceSession {
             .trusted_receipt()
             .ok_or(RegistryError::TrustedReceiptContinuityMismatch)?;
         self.lease.validate_receipt(receipt)?;
-        Ok(crate::ValidatedRawMarketFrame::new(frame, receipt))
+        self.validate_current_lease()?;
+        Ok(crate::ValidatedRawMarketFrame::new(
+            frame,
+            receipt,
+            FrameSessionLease::new(self.binding.clone(), Arc::clone(&self.lease)),
+        ))
     }
 }
 
@@ -498,8 +576,10 @@ impl HttpResponseReceiptAuthority {
 
     pub(crate) fn observe(
         self,
-    ) -> Result<(FrameSessionBinding, TrustedReceiptObservation), crate::SegmentedHttpCaptureError>
-    {
+    ) -> Result<
+        (FrameSessionBinding, TrustedReceiptObservation, FrameSessionLease),
+        crate::SegmentedHttpCaptureError,
+    > {
         match self.0 {
             HttpResponseReceiptAuthorityInner::Live {
                 binding,
@@ -515,13 +595,21 @@ impl HttpResponseReceiptAuthority {
                 lease
                     .validate_receipt(&observation)
                     .map_err(|_error| crate::SegmentedHttpCaptureError::AuthorityUnavailable)?;
-                Ok((binding, observation))
+                if !lease.is_current() {
+                    return Err(crate::SegmentedHttpCaptureError::AuthorityUnavailable);
+                }
+                let currentness = FrameSessionLease::new(binding.clone(), Arc::clone(&lease));
+                Ok((binding, observation, currentness))
             }
             #[cfg(test)]
             HttpResponseReceiptAuthorityInner::Fixed {
                 binding,
                 observation,
-            } => Ok((binding, observation)),
+            } => {
+                let currentness =
+                    FrameSessionLease::current_for_test(binding.clone(), &observation);
+                Ok((binding, observation, currentness))
+            }
         }
     }
 }
@@ -610,13 +698,17 @@ impl RawFrameFactory {
         self.lease
             .validate_receipt(&receipt)
             .map_err(|_error| crate::SourceError::TrustedTimeDiscontinuity)?;
-        crate::RawMarketFrame::try_from_parts(
+        let frame = crate::RawMarketFrame::try_from_parts(
             self.binding.clone(),
             self.lease.next_frame_id()?,
             receipt,
             transport,
             payload,
-        )
+        )?;
+        if !self.lease.is_current() {
+            return Err(crate::SourceError::SessionNotCurrent);
+        }
+        Ok(frame)
     }
 }
 

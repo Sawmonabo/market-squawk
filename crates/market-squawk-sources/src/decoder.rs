@@ -36,6 +36,7 @@ const MAX_DECIMAL_LEXEME_BYTES: usize = 128;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecoderEvidence {
     binding: FrameSessionBinding,
+    currentness: crate::FrameSessionLease,
     frame_id: FrameId,
     receipt: TrustedReceiptObservation,
     frame_bytes: usize,
@@ -53,6 +54,7 @@ impl DecoderEvidence {
         let bytes: [u8; 32] = Sha256::digest(frame.payload()).into();
         Self {
             binding: frame.binding().clone(),
+            currentness: validated.currentness_lease().clone(),
             frame_id: frame.frame_id(),
             receipt: validated.trusted_receipt().clone(),
             frame_bytes: frame.payload().len(),
@@ -64,6 +66,11 @@ impl DecoderEvidence {
     /// Returns the O(1)-clone shared session binding.
     pub const fn binding(&self) -> &FrameSessionBinding {
         &self.binding
+    }
+
+    /// Returns the opaque registry lease that must still be current at downstream use.
+    pub const fn currentness_lease(&self) -> &crate::FrameSessionLease {
+        &self.currentness
     }
 
     /// Returns exact frame receive time.
@@ -109,6 +116,7 @@ impl DecoderEvidence {
                         .ok()?,
                 )
             })
+            .and_then(|bytes| bytes.checked_add(self.currentness.shared_allocation_charge()?))
             .and_then(|bytes| bytes.checked_add(self.decoder_rule.provider_rule().retained_bytes()))
             .ok_or(DecodeError::RetainedSizeOverflow)
     }

@@ -55,6 +55,7 @@ impl HttpResponseSegmentReceipt {
 pub struct SegmentedHttpResponseReceipt {
     binding: FrameSessionBinding,
     observation: TrustedReceiptObservation,
+    currentness: crate::FrameSessionLease,
     method: HttpCaptureMethod,
     final_url: Box<str>,
     status: u16,
@@ -93,6 +94,13 @@ impl SegmentedHttpResponseReceipt {
     /// Returns the registry-trusted local observation after the complete body was captured.
     pub const fn received_at(&self) -> Timestamp {
         self.observation.received_at()
+    }
+
+    /// Returns the process-local registry currentness lease retained by a live capture.
+    ///
+    /// Reconstructed value-only evidence cannot mint this process-local lease.
+    pub const fn currentness_lease(&self) -> &crate::FrameSessionLease {
+        &self.currentness
     }
 
     /// Returns the exact request method.
@@ -330,12 +338,13 @@ impl SegmentedHttpResponseBuilder {
         {
             return Err(SegmentedHttpCaptureError::Incomplete);
         }
-        let (binding, observation) = self.authority.observe()?;
+        let (binding, observation, currentness) = self.authority.observe()?;
         let body_digest: [u8; 32] = self.body_hasher.finalize().into();
         Ok(SegmentedHttpResponseCapture {
             receipt: SegmentedHttpResponseReceipt {
                 binding,
                 observation,
+                currentness,
                 method: self.method,
                 final_url: self.final_url,
                 status: self.status,
