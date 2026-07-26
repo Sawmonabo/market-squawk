@@ -29,6 +29,6 @@ pub use direct::{
 };
 pub use direct_transport::{
     CoinbaseDirectBookUpdate, CoinbaseDirectOutput, CoinbaseDirectPublicationError,
-    CoinbaseDirectSession, CoinbaseDirectSessionError,
+    CoinbaseDirectPublicationKind, CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
 pub use source::CoinbaseExchangeSource;

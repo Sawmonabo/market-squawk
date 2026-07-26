@@ -22,13 +22,13 @@ use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
     CoverageTopology, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
     HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration,
-    LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBookSide,
-    ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
-    ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
-    ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
-    SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
+    LiveCoverageRule, LiveProtocolProfile, MAX_DECODED_BOOK_ITEMS, NetworkAccessPolicy, PathScope,
+    ProviderBookSide, ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme,
+    ProviderNumericPolicy, ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind,
+    ProviderOrderRecord, ProviderPrice, ProviderQuantity, QueryParameterRule,
+    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,8 @@ impl CoinbaseDirectLimits {
     ///
     /// # Errors
     ///
-    /// Rejects zero/excessive snapshot limits or a byte limit impossible under the segment count.
+    /// Rejects zero/excessive snapshot limits, a byte limit impossible under the segment count,
+    /// or publication depth whose worst-case full-image delta exceeds the canonical batch bound.
     pub fn try_new(
         websocket: CoinbaseTransportLimits,
         max_snapshot_bytes: u64,
@@ -94,6 +95,7 @@ impl CoinbaseDirectLimits {
             || max_snapshot_bytes > segment_capacity
             || product_refresh_interval.is_zero()
             || product_refresh_interval > MAX_DIRECT_PRODUCT_REFRESH_INTERVAL
+            || book.published_depth() > MAX_DECODED_BOOK_ITEMS / 4
         {
             return Err(CoinbaseConfigError::InvalidDirectLimits);
         }
