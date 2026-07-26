@@ -996,3 +996,32 @@ This checkpoint removes an internal Task 19A implementation defect but does not 
 acceptance predicates: SEC/BLS evidence refresh, FRED/ALFRED durable-use authority, Treasury daily
 XML durable-use authority, the authorized Coinbase Direct trace, and the clean-machine provider
 evidence run remain open.
+
+## 2026-07-26 exact-head evidence-authority invariant
+
+Task 20 release authority is executable behavior, not a log-content or prose-marker convention.
+Only the exact selected release binary may produce `full-gate.json`, and it must itself
+parent-supervise the checked-in `scripts/verify.sh` under fixed timeout, process-tree RSS,
+process-group cleanup, log-size, no-clobber, repository-identity, immutable-input, and target-disk
+bounds. A separately executed gate or prewritten `full-gate.log` has diagnostic value only and
+cannot be promoted into terminal evidence.
+
+The final closer treats every report as untrusted input. Fuzz, performance, provider,
+demonstration, Python, and gate reports require strict typed schemas and semantic reconciliation.
+Reported rates and pass flags are insufficient: the closer recomputes fixed workload cardinality,
+throughput, latency ordering, queue accounting, memory growth, process bounds, storage/Python row
+relationships, fixture identities, and time ordering. The signed Python release must identify the
+same application binary. Closure publication must revalidate the exact root topology, entire
+artifact inventory, repository, executable, verification script, and gate log before pending-file
+creation and again before atomic publication.
+
+The Python release lock must contain the complete source closure used to build the shipping
+application and Python product. Any source change requires a deterministic refresh of only the
+`sources` identities and successful execution of the existing source-closure admission test;
+artifact, interpreter, and platform lock semantics must remain unchanged. At capability commit
+`ca3d6b6162f4488da8af8224f983ef2f4a7993e2`, the admitted closure contains 842 files.
+
+These authority corrections are focused Task 20 preparation, not final release approval. Exact-head
+provider evidence, production fuzz/performance evidence, the supervised full gate, the closed
+manifest, grouped Quarter 4 review, publication, and the remaining external provider predicates
+must still close against one unchanged candidate.

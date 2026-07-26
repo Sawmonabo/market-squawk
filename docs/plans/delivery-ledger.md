@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `2a8e9ab473203949cbf1fb18648f0bc1fb4c9dee`
-  (`feat(onboarding): complete guided provider setup`), tree
-  `eaff305b5146c4ef54134ccfbde9325cfa00efd9`.
+  `ca3d6b6162f4488da8af8224f983ef2f4a7993e2`
+  (`Harden exact-head release evidence authority`), tree
+  `e4ac5a66f7ec1d5bb6f801db421280faa5405e98`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -575,3 +575,46 @@ one unchanged release candidate. Focused work continues with `CARGO_INCREMENTAL=
 may run the broad workspace gate. The root target remains capped at 20 GiB, and every completed
 feature lane must reclaim its generated target and delete its clean local/origin branch and
 worktree.
+
+## 2026-07-26 Task 20 release-evidence authority checkpoint
+
+Capability commit `ca3d6b6162f4488da8af8224f983ef2f4a7993e2`, tree
+`e4ac5a66f7ec1d5bb6f801db421280faa5405e98`, closes the internal evidence-authority findings found
+before the exact candidate freeze. The selected release executable now parent-supervises the sole
+checked-in `scripts/verify.sh` gate with an eight-hour deadline, a 16 GiB sampled process-tree RSS
+ceiling, log-only 64 MiB file-size enforcement, process-group cleanup, no-clobber output, immutable
+input revalidation, and an in-process 20 GiB target-tree measurement. A prewritten log can no
+longer manufacture a successful full-gate receipt.
+
+The terminal closer now admits strict fuzz, performance, and full-gate schemas instead of trusting
+opaque JSON objects or prose markers. It recomputes workload sizes, operation rates, latency
+relationships, queue accounting, memory growth, process bounds, threshold outcomes, storage and
+Python row counts, exact fixture/file identities, and ordered timestamps. It also binds the signed
+Python release to the selected application binary and revalidates the complete evidence topology,
+artifact inventory, executable, verification script, log, and clean repository on both sides of
+pending-manifest preparation. Task `19A` is explicitly represented in the ownership map and blocks
+Task 20 closure.
+
+Focused verification passed:
+
+```text
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk --lib --bin market-squawk \
+  --features release-evidence --locked -- -D warnings
+CARGO_INCREMENTAL=0 cargo check -p market-squawk --lib --bin market-squawk \
+  --no-default-features --locked
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --lib \
+  --features release-evidence --locked closing_contract
+result: 2 passed
+sealed Python source closure: 842 of 842 paths admitted
+cargo fmt --all --check; diff and ownership JSON integrity: passed
+```
+
+No new integration-test executable, worktree, or duplicate Cargo target was created. Root generated
+state is `10,332,448 KiB`, below both the 10 GiB focused-lane budget and the 20 GiB release ceiling;
+`.worktrees` is empty and incremental compilation remained disabled.
+
+This checkpoint does not close issues `#7`, `#25`, or `#31`. The authorized Coinbase Direct
+credential/network trace, provider terms confirmation, unresolved FRED/ALFRED durable-use release
+contract, exact-head provider evidence, final fuzz/performance/full-gate evidence, grouped Quarter
+4 review, and release publication remain open. Hosted Actions remains externally blocked before
+checkout by the GitHub account billing/spending state; it has not exposed a code-owned CI failure.
