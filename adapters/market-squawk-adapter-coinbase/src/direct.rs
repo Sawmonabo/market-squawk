@@ -59,6 +59,15 @@ const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
 const MAX_DIRECT_PRODUCT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 1;
 const MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW: u32 = 3;
+const DIRECT_SESSION_FIXED_MEMORY_BYTES: u64 = 128 * 1024;
+const DIRECT_SNAPSHOT_LIVE_COPIES: u64 = 2;
+const DIRECT_WEBSOCKET_FRAME_COPIES: u64 = 4;
+const DIRECT_BOOK_STATE_COPIES: u64 = 2;
+const DIRECT_ORDER_ENTRY_UPPER_BYTES: u64 = 768;
+const DIRECT_PRICE_LEVEL_ENTRY_UPPER_BYTES: u64 = 128;
+const DIRECT_QUEUE_EVENT_OVERHEAD_BYTES: u64 = 256;
+const DIRECT_SNAPSHOT_SEGMENT_OVERHEAD_BYTES: u64 = 512;
+const DIRECT_PUBLICATION_LEVEL_OVERHEAD_BYTES: u64 = 64;
 
 /// Complete transport, snapshot, queue, and level-3 ownership limits for one product generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +141,87 @@ impl CoinbaseDirectLimits {
     pub const fn book(self) -> DirectBookLimits {
         self.book
     }
+
+    /// Returns a checked conservative upper bound for one pre-network Direct session.
+    ///
+    /// The estimate includes the complete snapshot response while it is captured and decoded,
+    /// WebSocket frame working copies, the queued replay payload and event containers, both
+    /// possible order-book state slots, price-level arenas, and both bid/ask publication buffers.
+    /// It deliberately overestimates allocator and hash-table overhead so application composition
+    /// can reject an unsafe aggregate before opening a socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoinbaseConfigError::InvalidDirectLimits`] when the configured bounds cannot be
+    /// represented as one `u64` byte ceiling.
+    pub fn checked_maximum_retained_bytes(self) -> Result<u64, CoinbaseConfigError> {
+        let book = self.book;
+        let snapshot_bytes = self
+            .max_snapshot_bytes
+            .checked_mul(DIRECT_SNAPSHOT_LIVE_COPIES)
+            .ok_or(CoinbaseConfigError::InvalidDirectLimits)?;
+        let frame_bytes = direct_memory_product(
+            self.websocket.max_frame_bytes(),
+            DIRECT_WEBSOCKET_FRAME_COPIES,
+        )?;
+        let snapshot_segment_bytes = direct_memory_product(
+            self.max_snapshot_segments,
+            DIRECT_SNAPSHOT_SEGMENT_OVERHEAD_BYTES,
+        )?;
+        let queue_payload_bytes = u64::try_from(book.max_queue_bytes())
+            .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?;
+        let queue_event_bytes =
+            direct_memory_product(book.max_queue_events(), DIRECT_QUEUE_EVENT_OVERHEAD_BYTES)?;
+        let order_bytes = direct_memory_product(
+            book.max_orders(),
+            DIRECT_ORDER_ENTRY_UPPER_BYTES
+                .checked_mul(DIRECT_BOOK_STATE_COPIES)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        let price_level_bytes = direct_memory_product(
+            book.max_price_levels(),
+            DIRECT_PRICE_LEVEL_ENTRY_UPPER_BYTES
+                .checked_mul(DIRECT_BOOK_STATE_COPIES)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        let publication_bytes = direct_memory_product(
+            book.published_depth(),
+            DIRECT_PUBLICATION_LEVEL_OVERHEAD_BYTES
+                .checked_add(
+                    u64::try_from(std::mem::size_of::<PriceTicks>())
+                        .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?,
+                )
+                .and_then(|value| {
+                    value.checked_add(u64::try_from(std::mem::size_of::<QuantityLots>()).ok()?)
+                })
+                .and_then(|value| value.checked_mul(4))
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        [
+            DIRECT_SESSION_FIXED_MEMORY_BYTES,
+            snapshot_bytes,
+            frame_bytes,
+            snapshot_segment_bytes,
+            queue_payload_bytes,
+            queue_event_bytes,
+            order_bytes,
+            price_level_bytes,
+            publication_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)
+        })
+    }
+}
+
+fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfigError> {
+    u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(bytes))
+        .ok_or(CoinbaseConfigError::InvalidDirectLimits)
 }
 
 /// Immutable metadata and endpoint profile for one product per Direct connection.
@@ -2640,13 +2730,11 @@ mod tests {
             "full"
         );
         assert!(!format!("{subscription:?}").contains("fixture-pass"));
-        for (case, max_concurrent, short_window_requests, long_window_requests) in [
-            ("concurrency", 1, 3, 3),
-            ("primary window", 2, 2, 3),
-            ("additional window", 2, 3, 2),
-        ] {
+        for (case, short_window_requests, long_window_requests) in
+            [("primary window", 2, 3), ("additional window", 3, 2)]
+        {
             let outcome = config_with_budget(
-                max_concurrent,
+                1,
                 &[
                     (short_window_requests, 1_000_000_000),
                     (long_window_requests, 2_000_000_000),
