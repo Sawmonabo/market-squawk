@@ -28,13 +28,17 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
 use super::source::SourceRuntimeView;
 use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
-    AppConfig, ProductionSourceProvider,
-    paper_bot::{ProductionPaperBotRuntime, local_paper_bot_with_provider_rate},
+    AppConfig, ProductionSourceProvider, ProviderAdapterActivation,
+    paper_bot::{
+        ProductionPaperBotRuntime, local_coinbase_direct_paper_bot_with_activation,
+        local_paper_bot_with_provider_rate,
+    },
 };
 
 const BOT_GET_STATUS: &str = "Bot.GetStatus";
@@ -58,9 +62,15 @@ impl PaperApplicationServices {
         config: AppConfig,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
         provider_rate: ProviderRateAuthority,
+        provider_activation: Arc<ProviderAdapterActivation>,
     ) -> Self {
         Self {
-            controller: Arc::new(PaperController::new(config, live_fair_value, provider_rate)),
+            controller: Arc::new(PaperController::new(
+                config,
+                live_fair_value,
+                provider_rate,
+                provider_activation,
+            )),
         }
     }
 
@@ -223,6 +233,7 @@ struct PaperController {
     config: AppConfig,
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
     provider_rate: ProviderRateAuthority,
+    provider_activation: Arc<ProviderAdapterActivation>,
     accepting: AtomicBool,
     lifecycle: CancellationToken,
     state: Mutex<PaperState>,
@@ -234,12 +245,14 @@ impl PaperController {
         config: AppConfig,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
         provider_rate: ProviderRateAuthority,
+        provider_activation: Arc<ProviderAdapterActivation>,
     ) -> Self {
         let (changed, _initial_receiver) = watch::channel(0);
         Self {
             config,
             live_fair_value,
             provider_rate,
+            provider_activation,
             accepting: AtomicBool::new(true),
             lifecycle: CancellationToken::new(),
             state: Mutex::new(PaperState::Stopped {
@@ -257,11 +270,21 @@ impl PaperController {
                 "state": "stopped",
                 "lastShutdownComplete": last_complete,
             })),
-            PaperState::Starting => Ok(json!({"state": "starting"})),
+            PaperState::Starting { .. } => Ok(json!({"state": "starting"})),
             PaperState::Stopping => Ok(json!({"state": "stopping"})),
             PaperState::Running {
-                runtime, exports, ..
+                provider,
+                runtime,
+                exports,
+                cancellation,
             } => {
+                if cancellation.is_cancelled() || !runtime.source_is_healthy() {
+                    return Ok(json!({
+                        "state": "failed",
+                        "provider": provider.name(),
+                        "requiresStop": true,
+                    }));
+                }
                 if !exports.is_healthy() {
                     return Err(ServiceError::Unavailable);
                 }
@@ -292,11 +315,7 @@ impl PaperController {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ServiceError::Unavailable);
         }
-        let provider = match required_string(request, "provider")? {
-            "coinbase" => ProductionSourceProvider::Coinbase,
-            "kraken" => ProductionSourceProvider::Kraken,
-            _ => return Err(ServiceError::InvalidRequest),
-        };
+        let provider = PaperProvider::from_request(request)?;
         let initial_cash = required_string(request, "initialCash")?
             .parse::<Decimal>()
             .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -306,84 +325,151 @@ impl PaperController {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .ok_or(ServiceError::InvalidRequest)?;
+        let run_id = Uuid::new_v4();
+        let run_cancellation = self.lifecycle.child_token();
         {
             let mut state =
                 bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
             if !matches!(*state, PaperState::Stopped { .. }) {
                 return Err(ServiceError::InvalidRequest);
             }
-            *state = PaperState::Starting;
+            *state = PaperState::Starting {
+                run_id,
+                cancellation: run_cancellation.clone(),
+            };
         }
         self.signal_change();
 
-        let composition = match local_paper_bot_with_provider_rate(
-            self.config.clone(),
-            provider,
-            initial_cash,
-            fee_basis_points,
-            self.provider_rate.clone(),
-        ) {
+        let composition = match provider {
+            PaperProvider::Public(provider) => local_paper_bot_with_provider_rate(
+                self.config.clone(),
+                provider,
+                initial_cash,
+                fee_basis_points,
+                self.provider_rate.clone(),
+            )
+            .map_err(|_error| ServiceError::Unavailable),
+            PaperProvider::CoinbaseDirect {
+                provider_session_id,
+            } => {
+                tokio::select! {
+                    biased;
+                    () = context.cancellation().cancelled() => Err(ServiceError::Cancelled),
+                    () = tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(context.deadline())
+                    ) => Err(ServiceError::DeadlineExceeded),
+                    result = local_coinbase_direct_paper_bot_with_activation(
+                        self.config.clone(),
+                        provider_session_id,
+                        initial_cash,
+                        fee_basis_points,
+                        self.provider_activation.as_ref(),
+                        run_cancellation.clone(),
+                    ) => result.map_err(|_error| ServiceError::Unavailable),
+                }
+            }
+        };
+        let composition = match composition {
             Ok(composition) => composition,
-            Err(_error) => {
-                self.set_stopped(None).await;
-                return Err(ServiceError::Unavailable);
-            }
-        };
-        let run_cancellation = self.lifecycle.child_token();
-        let (qualified_market_exports, export_drains) = match LiveFairValueExportDrains::try_start(
-            composition.live_routes(),
-            composition.maximum_message_bytes(),
-            Arc::clone(&self.live_fair_value),
-            run_cancellation.clone(),
-            context.deadline(),
-        )
-        .await
-        {
-            Ok(exports) => exports,
-            Err(_error) => {
+            Err(error) => {
                 run_cancellation.cancel();
                 self.set_stopped(None).await;
-                return Err(ServiceError::Unavailable);
+                return Err(error);
             }
         };
-        let result = tokio::select! {
-            biased;
-            () = context.cancellation().cancelled() => {
-                run_cancellation.cancel();
-                Err(ServiceError::Cancelled)
+        let (result, exports) = match provider {
+            PaperProvider::Public(_) => {
+                let (qualified_market_exports, export_drains) =
+                    match LiveFairValueExportDrains::try_start(
+                        composition.live_routes(),
+                        composition.maximum_message_bytes(),
+                        Arc::clone(&self.live_fair_value),
+                        run_cancellation.clone(),
+                        context.deadline(),
+                    )
+                    .await
+                    {
+                        Ok(exports) => exports,
+                        Err(_error) => {
+                            run_cancellation.cancel();
+                            self.set_stopped(None).await;
+                            return Err(ServiceError::Unavailable);
+                        }
+                    };
+                let result = tokio::select! {
+                    biased;
+                    () = context.cancellation().cancelled() => {
+                        run_cancellation.cancel();
+                        Err(ServiceError::Cancelled)
+                    }
+                    () = tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(context.deadline())
+                    ) => {
+                        run_cancellation.cancel();
+                        Err(ServiceError::DeadlineExceeded)
+                    }
+                    result = composition.start_with_qualified_market_exports(
+                        qualified_market_exports,
+                        run_cancellation.clone(),
+                    ) => result.map_err(|_error| ServiceError::Unavailable)
+                };
+                (result, PaperRuntimeExports::QualifiedMarket(export_drains))
             }
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(context.deadline())) => {
-                run_cancellation.cancel();
-                Err(ServiceError::DeadlineExceeded)
-            }
-            result = composition.start_with_qualified_market_exports(
-                qualified_market_exports,
-                run_cancellation.clone(),
-            ) => {
-                result.map_err(|_error| ServiceError::Unavailable)
+            PaperProvider::CoinbaseDirect { .. } => {
+                let result = tokio::select! {
+                    biased;
+                    () = context.cancellation().cancelled() => {
+                        run_cancellation.cancel();
+                        Err(ServiceError::Cancelled)
+                    }
+                    () = tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(context.deadline())
+                    ) => {
+                        run_cancellation.cancel();
+                        Err(ServiceError::DeadlineExceeded)
+                    }
+                    result = composition.start(run_cancellation.clone()) => {
+                        result.map_err(|_error| ServiceError::Unavailable)
+                    }
+                };
+                (result, PaperRuntimeExports::DirectExecutionOnly)
             }
         };
         match result {
-            Ok(runtime) if self.accepting.load(Ordering::Acquire) => {
-                let mut state = self.state.lock().await;
-                *state = PaperState::Running {
-                    provider,
-                    runtime: Box::new(runtime),
-                    exports: export_drains,
-                };
-                self.signal_change();
-                Ok(json!({
-                    "state": "running",
-                    "provider": provider_name(provider),
-                }))
-            }
             Ok(runtime) => {
                 let mut state = self.state.lock().await;
-                *state = PaperState::Stopping;
+                let current_start = matches!(
+                    &*state,
+                    PaperState::Starting {
+                        run_id: current,
+                        ..
+                    } if *current == run_id
+                );
+                if current_start
+                    && self.accepting.load(Ordering::Acquire)
+                    && !run_cancellation.is_cancelled()
+                    && runtime.source_is_healthy()
+                {
+                    *state = PaperState::Running {
+                        provider,
+                        runtime: Box::new(runtime),
+                        exports,
+                        cancellation: run_cancellation,
+                    };
+                    drop(state);
+                    self.signal_change();
+                    return Ok(json!({
+                        "state": "running",
+                        "provider": provider.name(),
+                    }));
+                }
+                if current_start {
+                    *state = PaperState::Stopping;
+                }
                 drop(state);
                 let shutdown = bounded_runtime_shutdown(
                     runtime,
-                    export_drains,
+                    exports,
                     context.deadline(),
                     context.cancellation(),
                 )
@@ -395,15 +481,12 @@ impl PaperController {
             }
             Err(error) => {
                 run_cancellation.cancel();
-                export_drains.begin_shutdown();
+                exports.begin_shutdown();
                 let cleanup = CancellationToken::new();
                 let cleanup_deadline = Instant::now()
                     .checked_add(self.config.source_shutdown())
                     .ok_or(ServiceError::Unavailable)?;
-                let drains_complete = export_drains
-                    .finish_before(cleanup_deadline, &cleanup)
-                    .await
-                    .is_ok();
+                let drains_complete = exports.finish_before(cleanup_deadline, &cleanup).await;
                 self.set_stopped(Some(drains_complete)).await;
                 if drains_complete {
                     Err(error)
@@ -473,12 +556,15 @@ impl PaperController {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
         let PaperState::Running {
-            runtime, exports, ..
+            runtime,
+            exports,
+            cancellation,
+            ..
         } = &*state
         else {
             return Err(ServiceError::Unavailable);
         };
-        if !exports.is_healthy() {
+        if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy() {
             return Err(ServiceError::Unavailable);
         }
         runtime
@@ -495,12 +581,15 @@ impl PaperController {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
         let PaperState::Running {
-            runtime, exports, ..
+            runtime,
+            exports,
+            cancellation,
+            ..
         } = &*state
         else {
             return Err(ServiceError::Unavailable);
         };
-        if !exports.is_healthy() {
+        if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy() {
             return Err(ServiceError::Unavailable);
         }
         runtime
@@ -513,12 +602,15 @@ impl PaperController {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
         let PaperState::Running {
-            runtime, exports, ..
+            runtime,
+            exports,
+            cancellation,
+            ..
         } = &*state
         else {
             return Err(ServiceError::Unavailable);
         };
-        if !exports.is_healthy() {
+        if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy() {
             return Err(ServiceError::Unavailable);
         }
         runtime
@@ -556,8 +648,12 @@ impl PaperController {
                     return Ok(last_complete.unwrap_or(true));
                 }
                 PaperState::Running {
-                    runtime, exports, ..
+                    runtime,
+                    exports,
+                    cancellation: run_cancellation,
+                    ..
                 } => {
+                    run_cancellation.cancel();
                     drop(state);
                     let complete =
                         bounded_runtime_shutdown(*runtime, exports, deadline, cancellation).await;
@@ -565,9 +661,14 @@ impl PaperController {
                         .await;
                     return complete;
                 }
-                PaperState::Starting => {
-                    *state = PaperState::Starting;
+                PaperState::Starting {
+                    cancellation: run_cancellation,
+                    ..
+                } => {
+                    run_cancellation.cancel();
+                    *state = PaperState::Stopping;
                     drop(state);
+                    self.signal_change();
                     wait_changed(&mut changes, deadline, cancellation).await?;
                 }
                 PaperState::Stopping => {
@@ -613,18 +714,22 @@ enum PaperState {
     Stopped {
         last_complete: Option<bool>,
     },
-    Starting,
+    Starting {
+        run_id: Uuid,
+        cancellation: CancellationToken,
+    },
     Running {
-        provider: ProductionSourceProvider,
+        provider: PaperProvider,
         runtime: Box<ProductionPaperBotRuntime>,
-        exports: LiveFairValueExportDrains,
+        exports: PaperRuntimeExports,
+        cancellation: CancellationToken,
     },
     Stopping,
 }
 
 async fn bounded_runtime_shutdown(
     runtime: ProductionPaperBotRuntime,
-    exports: LiveFairValueExportDrains,
+    exports: PaperRuntimeExports,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<bool, ServiceError> {
@@ -637,12 +742,75 @@ async fn bounded_runtime_shutdown(
         }
         shutdown = runtime.shutdown() => {
             let runtime_complete = shutdown.is_complete();
-            let exports_complete = exports
-                .finish_before(deadline, cancellation)
-                .await
-                .is_ok();
+            let exports_complete = exports.finish_before(deadline, cancellation).await;
             Ok(runtime_complete && exports_complete)
         },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PaperProvider {
+    Public(ProductionSourceProvider),
+    CoinbaseDirect { provider_session_id: Uuid },
+}
+
+impl PaperProvider {
+    fn from_request(request: &TypedToolRequest) -> Result<Self, ServiceError> {
+        let session = request
+            .arguments()
+            .get("providerSessionId")
+            .and_then(Value::as_str);
+        match required_string(request, "provider")? {
+            "coinbase" if session.is_none() => Ok(Self::Public(ProductionSourceProvider::Coinbase)),
+            "kraken" if session.is_none() => Ok(Self::Public(ProductionSourceProvider::Kraken)),
+            "coinbase-direct" => {
+                let provider_session_id = session
+                    .ok_or(ServiceError::InvalidRequest)?
+                    .parse()
+                    .map_err(|_error| ServiceError::InvalidRequest)?;
+                Ok(Self::CoinbaseDirect {
+                    provider_session_id,
+                })
+            }
+            _ => Err(ServiceError::InvalidRequest),
+        }
+    }
+
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Public(ProductionSourceProvider::Coinbase) => "coinbase",
+            Self::Public(ProductionSourceProvider::Kraken) => "kraken",
+            Self::CoinbaseDirect { .. } => "coinbase-direct",
+        }
+    }
+}
+
+enum PaperRuntimeExports {
+    QualifiedMarket(LiveFairValueExportDrains),
+    DirectExecutionOnly,
+}
+
+impl PaperRuntimeExports {
+    fn is_healthy(&self) -> bool {
+        match self {
+            Self::QualifiedMarket(exports) => exports.is_healthy(),
+            Self::DirectExecutionOnly => true,
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        if let Self::QualifiedMarket(exports) = self {
+            exports.begin_shutdown();
+        }
+    }
+
+    async fn finish_before(self, deadline: Instant, cancellation: &CancellationToken) -> bool {
+        match self {
+            Self::QualifiedMarket(exports) => {
+                exports.finish_before(deadline, cancellation).await.is_ok()
+            }
+            Self::DirectExecutionOnly => true,
+        }
     }
 }
 
@@ -764,13 +932,6 @@ const fn map_adapter_error(error: ExecutionAdapterError) -> ServiceError {
         ExecutionAdapterError::KnownFailure
         | ExecutionAdapterError::UncertainOutcome
         | ExecutionAdapterError::ReconciliationRequired => ServiceError::Unavailable,
-    }
-}
-
-const fn provider_name(provider: ProductionSourceProvider) -> &'static str {
-    match provider {
-        ProductionSourceProvider::Coinbase => "coinbase",
-        ProductionSourceProvider::Kraken => "kraken",
     }
 }
 

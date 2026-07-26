@@ -151,12 +151,16 @@ impl PaperController {
             let state =
                 bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
             let PaperState::Running {
-                runtime, exports, ..
+                runtime,
+                exports,
+                cancellation,
+                ..
             } = &*state
             else {
                 return Err(ServiceError::Unavailable);
             };
-            if !exports.is_healthy() {
+            if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy()
+            {
                 return Err(ServiceError::Unavailable);
             }
             runtime.snapshots()

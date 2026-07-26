@@ -51,7 +51,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ProductionLiveSourceComposition, ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError,
+    CoinbaseDirectAccountActivation, CoinbaseDirectLiveRuntime, ProductionLiveSourceComposition,
+    ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError,
 };
 use supervisor::{PaperFinancialSupervisor, PaperFinancialSupervisorShutdown};
 
@@ -69,7 +70,9 @@ struct ProductionPaperRecovery {
     quarantined: bool,
 }
 
-pub(crate) use defaults::local_paper_bot_with_provider_rate;
+pub(crate) use defaults::{
+    local_coinbase_direct_paper_bot_with_activation, local_paper_bot_with_provider_rate,
+};
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
 #[cfg(test)]
 pub(crate) use defaults::{
@@ -136,6 +139,10 @@ pub struct ProductionPaperBotComposition {
 #[derive(Debug)]
 enum PaperBotSourceComposition {
     Production(Box<ProductionLiveSourceComposition>),
+    CoinbaseDirect {
+        activation: Box<CoinbaseDirectAccountActivation>,
+        routes: Vec<LiveRouteConfig>,
+    },
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark(Vec<LiveRouteConfig>),
 }
@@ -144,6 +151,7 @@ impl PaperBotSourceComposition {
     fn routes(&self) -> &[LiveRouteConfig] {
         match self {
             Self::Production(source) => source.routes(),
+            Self::CoinbaseDirect { routes, .. } => routes,
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(routes) => routes,
         }
@@ -154,13 +162,16 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
+                Self::CoinbaseDirect { .. } => None,
                 Self::ReleaseBenchmark(_) => None,
             }
         }
         #[cfg(not(feature = "release-evidence"))]
         {
-            let Self::Production(source) = self;
-            Some(source)
+            match self {
+                Self::Production(source) => Some(source),
+                Self::CoinbaseDirect { .. } => None,
+            }
         }
     }
 
@@ -170,13 +181,16 @@ impl PaperBotSourceComposition {
         {
             match self {
                 Self::Production(source) => Some(source),
+                Self::CoinbaseDirect { .. } => None,
                 Self::ReleaseBenchmark(_) => None,
             }
         }
         #[cfg(not(feature = "release-evidence"))]
         {
-            let Self::Production(source) = self;
-            Some(source)
+            match self {
+                Self::Production(source) => Some(source),
+                Self::CoinbaseDirect { .. } => None,
+            }
         }
     }
 }
@@ -202,6 +216,36 @@ impl ProductionPaperBotComposition {
     ) -> Result<Self, ProductionPaperBotCompositionError> {
         Self::try_new_inner(
             PaperBotSourceComposition::Production(Box::new(source)),
+            runtime_config,
+            execution,
+            strategies,
+        )
+    }
+
+    pub(crate) fn try_new_coinbase_direct(
+        activation: CoinbaseDirectAccountActivation,
+        runtime_config: LiveRuntimeConfig,
+        execution: ProductionPaperBotExecutionConfig,
+        strategies: Vec<ProductionPaperBotRoute>,
+    ) -> Result<Self, ProductionPaperBotCompositionError> {
+        let mut routes = Vec::new();
+        routes
+            .try_reserve_exact(activation.product_count())
+            .map_err(|_error| ProductionPaperBotCompositionError::Allocation)?;
+        for index in 0..activation.product_count() {
+            routes.push(
+                activation
+                    .product(index)
+                    .ok_or(ProductionPaperBotCompositionError::SourceTopology)?
+                    .route()
+                    .clone(),
+            );
+        }
+        Self::try_new_inner(
+            PaperBotSourceComposition::CoinbaseDirect {
+                activation: Box::new(activation),
+                routes,
+            },
             runtime_config,
             execution,
             strategies,
@@ -812,6 +856,14 @@ impl ProductionPaperBotComposition {
                 .start_with_action_hooks(runtime_config, action_hooks, cancellation)
                 .await
                 .map(StartedPaperBotLiveRuntime::production),
+            (
+                PaperBotSourceComposition::CoinbaseDirect { activation, .. },
+                PaperBotStartMode::Production(None),
+            ) => (*activation)
+                .start_live_with_action_hooks(runtime_config, action_hooks, cancellation)
+                .await
+                .map(StartedPaperBotLiveRuntime::coinbase_direct)
+                .map_err(Into::into),
             #[cfg(feature = "release-evidence")]
             (
                 PaperBotSourceComposition::ReleaseBenchmark(routes),
@@ -892,6 +944,7 @@ pub struct ProductionPaperBotRuntime {
 #[derive(Debug)]
 enum PaperBotLiveRuntime {
     Production(ProductionLiveSourceRuntime),
+    CoinbaseDirect(CoinbaseDirectLiveRuntime),
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark(benchmark_support::ReleaseBenchmarkLiveRuntime),
 }
@@ -912,6 +965,14 @@ impl StartedPaperBotLiveRuntime {
         }
     }
 
+    fn coinbase_direct(runtime: CoinbaseDirectLiveRuntime) -> Self {
+        Self {
+            live: PaperBotLiveRuntime::CoinbaseDirect(runtime),
+            #[cfg(feature = "release-evidence")]
+            benchmark_producer: None,
+        }
+    }
+
     #[cfg(feature = "release-evidence")]
     fn release_benchmark(
         (runtime, producer): (
@@ -927,9 +988,19 @@ impl StartedPaperBotLiveRuntime {
 }
 
 impl PaperBotLiveRuntime {
+    fn is_healthy(&self) -> bool {
+        match self {
+            Self::Production(_) => true,
+            Self::CoinbaseDirect(runtime) => runtime.is_healthy(),
+            #[cfg(feature = "release-evidence")]
+            Self::ReleaseBenchmark(_) => true,
+        }
+    }
+
     fn snapshots(&self) -> LiveSnapshotReader {
         match self {
             Self::Production(runtime) => runtime.snapshots(),
+            Self::CoinbaseDirect(runtime) => runtime.snapshots(),
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(runtime) => runtime.snapshots(),
         }
@@ -938,6 +1009,7 @@ impl PaperBotLiveRuntime {
     async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
         match self {
             Self::Production(runtime) => runtime.shutdown().await,
+            Self::CoinbaseDirect(runtime) => runtime.shutdown().await.map_err(Into::into),
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(runtime) => runtime.shutdown().await,
         }
@@ -948,6 +1020,11 @@ impl ProductionPaperBotRuntime {
     /// Returns authority-free immutable market snapshots.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
+    }
+
+    /// Reports whether the owned live source still has a current supervisor.
+    pub fn source_is_healthy(&self) -> bool {
+        self.live.is_healthy()
     }
 
     /// Reports whether durable paper state and account-risk authority share one current sequence.
@@ -1256,6 +1333,10 @@ pub enum ProductionPaperBotCompositionError {
     ZeroPaperControlTimeout,
     #[error("risk and paper account bootstraps do not describe the same canonical state")]
     AccountBootstrapMismatch,
+    #[error("production paper bot source topology is incomplete")]
+    SourceTopology,
+    #[error("production paper bot bounded allocation failed")]
+    Allocation,
 }
 
 /// Production paper-bot startup failure with inspected rollback when workers had started.

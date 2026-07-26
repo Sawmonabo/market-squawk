@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use market_squawk_platform::JournalFileFormat;
 use rust_decimal::Decimal;
-
-use crate::ProductionSourceProvider;
+use uuid::Uuid;
 
 /// Market Squawk's complete local command-line surface.
 #[derive(Debug, Parser)]
@@ -765,6 +764,9 @@ pub struct PaperBotArguments {
     /// Configured direct source.
     #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
     pub provider: ProductionSourceArgument,
+    /// Exact active provider-onboarding session; required only for Coinbase Direct.
+    #[arg(long, required_if_eq("provider", "coinbase-direct"))]
+    pub provider_session_id: Option<Uuid>,
     /// Stop after this many seconds; omit to run until interrupted.
     #[arg(long)]
     pub seconds: Option<u64>,
@@ -810,15 +812,8 @@ impl From<JournalFormatArgument> for JournalFileFormat {
 pub enum ProductionSourceArgument {
     /// Coinbase Exchange.
     Coinbase,
+    /// Authenticated Coinbase Exchange Direct Market Data.
+    CoinbaseDirect,
     /// Kraken book-v2.
     Kraken,
-}
-
-impl From<ProductionSourceArgument> for ProductionSourceProvider {
-    fn from(value: ProductionSourceArgument) -> Self {
-        match value {
-            ProductionSourceArgument::Coinbase => Self::Coinbase,
-            ProductionSourceArgument::Kraken => Self::Kraken,
-        }
-    }
 }

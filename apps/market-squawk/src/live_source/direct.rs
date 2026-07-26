@@ -10,7 +10,10 @@ mod output;
 mod product;
 
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use market_squawk_adapter_coinbase::{CoinbaseDirectHmacSigner, CoinbaseDirectSigningError};
@@ -45,12 +48,18 @@ type ProductJoinOutcome = Option<Result<ProductTaskOutput, JoinError>>;
 #[derive(Debug)]
 pub struct CoinbaseDirectLiveRuntime {
     supervisor_cancellation: SupervisorDropCancellation,
+    supervisor_live: Arc<AtomicBool>,
     live: LiveRuntimeComposition,
     supervisor: tokio::task::JoinHandle<Result<(), CoinbaseDirectSupervisorError>>,
     shutdown_deadline: Duration,
 }
 
 impl CoinbaseDirectLiveRuntime {
+    /// Reports whether the account supervisor still owns a live Direct product set.
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.supervisor_live.load(Ordering::Acquire)
+    }
+
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
@@ -207,8 +216,12 @@ async fn start_on_live_runtime(
     let shutdown_deadline = app_config.source_shutdown();
     let (startup_sender, startup_receiver) = oneshot::channel();
     let supervisor_cancellation = cancellation.clone();
+    let terminal_cancellation = cancellation.clone();
+    let supervisor_live = Arc::new(AtomicBool::new(true));
+    let task_supervisor_live = Arc::clone(&supervisor_live);
     let mut supervisor = tokio::spawn(async move {
-        run_account(
+        let _liveness = SupervisorLiveness::new(task_supervisor_live);
+        let outcome = run_account(
             activation,
             specs,
             signer,
@@ -220,12 +233,15 @@ async fn start_on_live_runtime(
             supervisor_cancellation,
             startup_sender,
         )
-        .await
+        .await;
+        terminal_cancellation.cancel();
+        outcome
     });
     tokio::select! {
         startup = startup_receiver => match startup {
             Ok(()) => Ok(CoinbaseDirectLiveRuntime {
                 supervisor_cancellation: SupervisorDropCancellation::new(cancellation),
+                supervisor_live,
                 live,
                 supervisor,
                 shutdown_deadline,
@@ -239,6 +255,22 @@ async fn start_on_live_runtime(
             let startup = map_supervisor_outcome(outcome);
             rollback_live_start(startup, live).await
         }
+    }
+}
+
+struct SupervisorLiveness {
+    live: Arc<AtomicBool>,
+}
+
+impl SupervisorLiveness {
+    const fn new(live: Arc<AtomicBool>) -> Self {
+        Self { live }
+    }
+}
+
+impl Drop for SupervisorLiveness {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
     }
 }
 

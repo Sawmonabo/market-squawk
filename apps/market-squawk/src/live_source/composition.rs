@@ -899,6 +899,8 @@ pub enum ProductionLiveSourceRuntimeError {
     #[error(transparent)]
     LiveRuntime(#[from] LiveRuntimeCompositionError),
     #[error(transparent)]
+    CoinbaseDirect(#[from] super::CoinbaseDirectSupervisorError),
+    #[error(transparent)]
     Supervisor(#[from] ProductionSupervisorError),
     #[error("production source supervisor task failed: {0}")]
     SupervisorTask(#[from] tokio::task::JoinError),

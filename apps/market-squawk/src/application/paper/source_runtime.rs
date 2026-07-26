@@ -7,7 +7,7 @@ use market_squawk_domain::SourceIdentifier;
 use market_squawk_live::{ShardLifecycleSnapshot, SnapshotCompleteness, SnapshotReadError};
 use market_squawk_services::ServiceError;
 
-use super::{PaperController, PaperState, bounded_lock};
+use super::{PaperController, PaperProvider, PaperState, bounded_lock};
 use crate::{
     ProductionSourceProvider,
     application::source::{
@@ -17,6 +17,7 @@ use crate::{
 };
 
 const COINBASE_SURFACE_ID: &str = "coinbase.public-market-data";
+const COINBASE_DIRECT_SURFACE_ID: &str = "coinbase.exchange-direct-market-data";
 const KRAKEN_SURFACE_ID: &str = "kraken.spot-public-market-data";
 
 /// Read-only view sharing the paper controller's sole live-runtime owner.
@@ -48,15 +49,19 @@ impl SourceRuntimeView for PaperSourceRuntimeView {
             .map_err(map_lock_error)?;
             match &*state {
                 PaperState::Stopped { .. } => None,
-                PaperState::Starting | PaperState::Stopping => {
+                PaperState::Starting { .. } | PaperState::Stopping => {
                     return Err(SourceRuntimeViewError::Unavailable);
                 }
                 PaperState::Running {
                     provider,
                     runtime,
                     exports,
+                    cancellation,
                 } => {
-                    if !exports.is_healthy() {
+                    if cancellation.is_cancelled()
+                        || !runtime.source_is_healthy()
+                        || !exports.is_healthy()
+                    {
                         return Err(SourceRuntimeViewError::Unavailable);
                     }
                     Some((*provider, runtime.snapshots()))
@@ -125,12 +130,11 @@ fn matches_filter(record: &SourceRuntimeSnapshot, filters: &[SourceIdentifier]) 
     })
 }
 
-fn surface_id(
-    provider: ProductionSourceProvider,
-) -> Result<SourceIdentifier, SourceRuntimeViewError> {
+fn surface_id(provider: PaperProvider) -> Result<SourceIdentifier, SourceRuntimeViewError> {
     SourceIdentifier::try_from(match provider {
-        ProductionSourceProvider::Coinbase => COINBASE_SURFACE_ID,
-        ProductionSourceProvider::Kraken => KRAKEN_SURFACE_ID,
+        PaperProvider::Public(ProductionSourceProvider::Coinbase) => COINBASE_SURFACE_ID,
+        PaperProvider::Public(ProductionSourceProvider::Kraken) => KRAKEN_SURFACE_ID,
+        PaperProvider::CoinbaseDirect { .. } => COINBASE_DIRECT_SURFACE_ID,
     })
     .map_err(|_error| SourceRuntimeViewError::InvalidSnapshot)
 }

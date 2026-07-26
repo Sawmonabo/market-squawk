@@ -204,6 +204,7 @@ impl LocalProduct {
             config.clone(),
             Arc::clone(&live_fair_value),
             provider_rate,
+            Arc::clone(&provider_activation),
         );
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
