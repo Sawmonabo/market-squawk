@@ -183,7 +183,7 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
     assert_eq!(bridge.state(), KrakenDecoderState::Healthy);
     assert!(first_session.validate_live_frame(&sink.frames[1]).is_err());
 
-    let refusal = tokio_tungstenite::tungstenite::Error::Http(
+    let refusal = tokio_tungstenite::tungstenite::Error::Http(Box::new(
         tokio_tungstenite::tungstenite::http::Response::builder()
             .status(429)
             .header(
@@ -191,7 +191,7 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
                 "1",
             )
             .body(None)?,
-    );
+    ));
     let returned_deadline = match super::map_connect_error(refusal, &budget) {
         SourceError::BudgetWaitUntil { deadline } => deadline,
         error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),

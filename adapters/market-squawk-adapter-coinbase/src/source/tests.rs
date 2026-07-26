@@ -122,7 +122,7 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
         DecodeOutcome::Data(_)
     ));
 
-    let refusal = WebSocketError::Http(
+    let refusal = WebSocketError::Http(Box::new(
         tokio_tungstenite::tungstenite::http::Response::builder()
             .status(429)
             .header(
@@ -130,7 +130,7 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
                 "0",
             )
             .body(None)?,
-    );
+    ));
     let deadline = match super::map_connect_error(refusal, &source.budget) {
         SourceError::BudgetWaitUntil { deadline } => deadline,
         error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),
