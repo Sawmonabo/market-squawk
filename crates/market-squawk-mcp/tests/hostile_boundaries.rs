@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
-    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase,
-    AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
+    AuditPhase, AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer,
     MutationAuditBundle, MutationAuditReservation, ServerExit,
 };
 use market_squawk_services::{
@@ -41,6 +41,19 @@ impl CountingAudit {
         self.0
             .lock()
             .map(|events| events.iter().filter_map(AuditEvent::result_class).collect())
+            .map_err(|_| AuditError::Unavailable)
+    }
+
+    fn tool_result_classes(&self) -> Result<Vec<AuditResultClass>, AuditError> {
+        self.0
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| matches!(event.operation(), AuditOperation::CallTool { .. }))
+                    .filter_map(AuditEvent::result_class)
+                    .collect()
+            })
             .map_err(|_| AuditError::Unavailable)
     }
 }
@@ -368,6 +381,23 @@ fn boundary_schema(source_evidence: SourceEvidencePolicy) -> Value {
     }
 }
 
+fn boundary_output_schema(name: &str) -> Value {
+    let (field, schema) = match name {
+        "test.large" => ("privatePayload", json!({"type":"string"})),
+        "test.loose" => ("items", json!({"type":"array","items":{"type":"string"}})),
+        "test.invalid-evidence" => ("invalid", json!({"type":"boolean"})),
+        "test.invalid-output" => ("expected", json!({"type":"boolean"})),
+        "test.block" | "test.failure" => return json!({"type":"null"}),
+        _ => return json!({"type":"null"}),
+    };
+    json!({
+        "type":"object",
+        "properties":{(field):schema},
+        "required":[field],
+        "additionalProperties":false
+    })
+}
+
 fn admit_boundary_scope(
     arguments: &serde_json::Map<String, Value>,
     source_evidence: SourceEvidencePolicy,
@@ -409,14 +439,25 @@ impl BoundaryService {
                 "Return a result that violates its declared source-evidence policy.",
                 SourceEvidencePolicy::Required,
             ),
+            (
+                "test.failure",
+                "Return one bounded test-only runtime failure after dispatch.",
+                SourceEvidencePolicy::NotApplicable,
+            ),
+            (
+                "test.invalid-output",
+                "Return a result that violates its descriptor-owned output schema.",
+                SourceEvidencePolicy::NotApplicable,
+            ),
         ]
         .into_iter()
         .filter_map(|(name, description, source_evidence)| {
-            ToolDescriptor::try_new(
+            ToolDescriptor::try_new_with_output(
                 name,
                 "1",
                 description,
                 boundary_schema(source_evidence),
+                boundary_output_schema(name),
                 boundary_contract(source_evidence),
                 ToolEffects::read_only_closed_world(),
                 move |arguments: &serde_json::Map<String, Value>| {
@@ -478,6 +519,14 @@ impl ToolServices for BoundaryService {
                 context.limits(),
             )
             .map_err(Into::into),
+            "test.failure" => Err(ServiceError::Unavailable),
+            "test.invalid-output" => TypedToolResult::try_new(
+                json!({"unexpected": true}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into),
             _ => Err(ServiceError::NotFound),
         }
     }
@@ -516,7 +565,7 @@ impl ToolServices for KillSwitchService {
     fn capabilities(&self) -> ServiceCapabilities {
         let effects = ToolEffects::try_new(false, true, false, false);
         let descriptor = effects.ok().and_then(|effects| {
-            ToolDescriptor::try_new(
+            ToolDescriptor::try_new_with_output(
                 "test.kill-switch",
                 "1",
                 "Irreversibly trigger the test-only kill switch.",
@@ -524,6 +573,12 @@ impl ToolServices for KillSwitchService {
                     "type":"object",
                     "properties":{"confirm":{"type":"boolean","const":true}},
                     "required":["confirm"],
+                    "additionalProperties":false
+                }),
+                json!({
+                    "type":"object",
+                    "properties":{"triggered":{"type":"boolean"}},
+                    "required":["triggered"],
                     "additionalProperties":false
                 }),
                 confirmed_mutation_contract(),
@@ -567,7 +622,7 @@ impl ToolServices for KillSwitchService {
 #[async_trait]
 impl ToolServices for TraceService {
     fn capabilities(&self) -> ServiceCapabilities {
-        let descriptor = ToolDescriptor::try_new(
+        let descriptor = ToolDescriptor::try_new_with_output(
             "test.trace",
             "1",
             "Echo a test sentinel through the bounded result path.",
@@ -575,6 +630,12 @@ impl ToolServices for TraceService {
                 "type":"object",
                 "properties":{"secret":{"type":"string"}},
                 "required":["secret"],
+                "additionalProperties":false
+            }),
+            json!({
+                "type":"object",
+                "properties":{"echo":{"type":"string"}},
+                "required":["echo"],
                 "additionalProperties":false
             }),
             boundary_contract(SourceEvidencePolicy::NotApplicable),
@@ -870,7 +931,7 @@ impl Drop for CancellationDropProbe {
 #[async_trait]
 impl ToolServices for NonCooperativeService {
     fn capabilities(&self) -> ServiceCapabilities {
-        let descriptor = ToolDescriptor::try_new(
+        let descriptor = ToolDescriptor::try_new_with_output(
             "test.owned-work",
             "1",
             "Exercise bounded host work ownership.",
@@ -879,6 +940,22 @@ impl ToolServices for NonCooperativeService {
                 "properties":{"artifact":{"type":"boolean"}},
                 "required":["artifact"],
                 "additionalProperties":false
+            }),
+            json!({
+                "oneOf":[
+                    {
+                        "type":"object",
+                        "properties":{"payload":{"type":"string"}},
+                        "required":["payload"],
+                        "additionalProperties":false
+                    },
+                    {
+                        "type":"object",
+                        "properties":{"released":{"type":"boolean"}},
+                        "required":["released"],
+                        "additionalProperties":false
+                    }
+                ]
             }),
             boundary_contract(SourceEvidencePolicy::NotApplicable),
             ToolEffects::read_only_closed_world(),
@@ -1044,7 +1121,7 @@ async fn exact_limit_crlf_survives_a_fragmented_delimiter() -> Result<(), Box<dy
         ..McpLimitSpec::default()
     };
     let server = McpServer::try_new(
-        Arc::new(BoundaryService::default()),
+        Arc::new(TraceService),
         McpLimits::try_from(spec)?,
         Arc::new(CountingAudit::default()),
         Arc::new(RecordingArtifacts::default()),
@@ -1086,6 +1163,85 @@ async fn rejected_completion_audit_releases_no_response_bytes() -> Result<(), Bo
     let read = tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line)).await??;
     assert_eq!(read, 0, "completion audit failure leaked: {line}");
     assert_eq!(task.await??, ServerExit::AuditFailed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatched_service_failure_is_a_redacted_tool_error_and_audited_as_failure()
+-> Result<(), Box<dyn Error>> {
+    let audit = Arc::new(CountingAudit::default());
+    let server = McpServer::try_new(
+        Arc::new(BoundaryService::default()),
+        McpLimits::try_from(McpLimitSpec::default())?,
+        audit.clone(),
+        Arc::new(RecordingArtifacts::default()),
+    )?;
+    let (client, server_io) = tokio::io::duplex(64 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_io);
+    let task = tokio::spawn(server.serve_unverified_io(
+        server_reader,
+        server_writer,
+        CancellationToken::new(),
+    ));
+    let (client_reader, mut writer) = tokio::io::split(client);
+    let mut reader = BufReader::new(client_reader);
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{},
+                "clientInfo":{"name":"tests","version":"1"}
+            }
+        }),
+    )
+    .await?;
+    let _initialize = receive(&mut reader).await?;
+    send(
+        &mut writer,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await?;
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"runtime-failure","method":"tools/call",
+            "params":{"name":"test.failure","arguments":{}}
+        }),
+    )
+    .await?;
+
+    let response = receive(&mut reader).await?;
+    assert!(response.get("error").is_none());
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "service is unavailable"
+    );
+    assert!(response["result"].get("structuredContent").is_none());
+    let encoded = serde_json::to_string(&response)?;
+    assert!(!encoded.contains("provider"));
+    assert!(!encoded.contains("/Users/"));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if audit
+                .tool_result_classes()
+                .is_ok_and(|classes| classes.contains(&AuditResultClass::ServiceRejected))
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let classes = audit.tool_result_classes()?;
+    assert!(classes.contains(&AuditResultClass::ServiceRejected));
+    assert!(!classes.contains(&AuditResultClass::Succeeded));
+
+    writer.shutdown().await?;
+    assert_eq!(task.await??, ServerExit::EndOfInput);
     Ok(())
 }
 
@@ -1515,6 +1671,17 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
         json!({
             "jsonrpc":"2.0","id":"loose","method":"tools/call",
             "params":{"name":"test.loose","arguments":{}}
+        }),
+    )
+    .await?;
+    assert_eq!(receive(&mut reader).await?["error"]["code"], -32010);
+    assert_eq!(artifacts.publication_count()?, 1);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"invalid-output","method":"tools/call",
+            "params":{"name":"test.invalid-output","arguments":{}}
         }),
     )
     .await?;

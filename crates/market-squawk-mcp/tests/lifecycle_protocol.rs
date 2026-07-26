@@ -635,11 +635,17 @@ struct ProgressService {
 #[async_trait]
 impl ToolServices for ProgressService {
     fn capabilities(&self) -> ServiceCapabilities {
-        let descriptor = ToolDescriptor::try_new(
+        let descriptor = ToolDescriptor::try_new_with_output(
             "test.progress",
             "1",
             "Report bounded progress for a test-only operation.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
+            json!({
+                "type":"object",
+                "properties":{"done":{"type":"boolean"}},
+                "required":["done"],
+                "additionalProperties":false
+            }),
             read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
             ToolEffects::read_only_closed_world(),
             |arguments: &serde_json::Map<String, Value>| {
@@ -708,7 +714,7 @@ struct TerminalProgressService {
 #[async_trait]
 impl ToolServices for TerminalProgressService {
     fn capabilities(&self) -> ServiceCapabilities {
-        let descriptor = ToolDescriptor::try_new(
+        let descriptor = ToolDescriptor::try_new_with_output(
             "test.terminal-progress",
             "1",
             "Attempt delayed progress around a terminal result.",
@@ -716,6 +722,12 @@ impl ToolServices for TerminalProgressService {
                 "type":"object",
                 "properties":{"wait":{"type":"boolean"}},
                 "required":["wait"],
+                "additionalProperties":false
+            }),
+            json!({
+                "type":"object",
+                "properties":{"done":{"type":"boolean"}},
+                "required":["done"],
                 "additionalProperties":false
             }),
             read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
@@ -949,6 +961,19 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
     assert_eq!(listed_tools.len(), COMPLETE_REGISTRY.len());
     for (tool, expected) in listed_tools.iter().zip(COMPLETE_REGISTRY) {
         assert_eq!(tool["name"], expected.name);
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        let output_variants = tool["outputSchema"]["oneOf"]
+            .as_array()
+            .ok_or("tool output schema must own the exact structured-content variants")?;
+        assert!(
+            !output_variants.is_empty()
+                && output_variants.iter().all(|variant| {
+                    variant["type"] == "object"
+                        && variant["additionalProperties"] == false
+                        && variant["required"].is_array()
+                }),
+            "tool output schema must be typed and closed: {tool}"
+        );
         assert_eq!(
             tool["_meta"]["org.market-squawk/tool-contract"]["domain"],
             expected.domain.as_str()

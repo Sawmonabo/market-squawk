@@ -1,5 +1,7 @@
 //! Closed descriptor registry and common request admission for the local application.
 
+mod output;
+
 use std::collections::HashSet;
 
 use chrono::DateTime;
@@ -11,6 +13,8 @@ use market_squawk_services::{
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
+
+use self::output::output_data_schema;
 
 /// Exact contract version shared by CLI and MCP for the first local release.
 pub const APPLICATION_CONTRACT_VERSION: &str = "1";
@@ -607,6 +611,8 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
         })?;
     for spec in OPERATION_SPECS {
         let schema = schema_for(*spec);
+        let output_schema =
+            output_data_schema(spec.name).ok_or(ServiceCapabilityError::InvalidOutputSchema)?;
         let effects = ToolEffects::try_new(
             matches!(spec.authorization, ToolAuthorization::ReadOnly),
             spec.destructive,
@@ -620,11 +626,12 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
             ToolResultPolicy::new(spec.source_evidence, spec.artifact),
         );
         let operation = *spec;
-        descriptors.push(ToolDescriptor::try_new(
+        descriptors.push(ToolDescriptor::try_new_with_output(
             spec.name,
             APPLICATION_CONTRACT_VERSION,
             spec.description,
             schema,
+            output_schema,
             contract,
             effects,
             move |arguments: &Map<String, Value>| admit(operation, arguments),

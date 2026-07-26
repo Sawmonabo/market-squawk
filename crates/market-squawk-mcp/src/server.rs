@@ -17,7 +17,7 @@ use market_squawk_services::{
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ErrorCode,
+        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock, ErrorCode,
         Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, Meta,
         NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId,
         ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
@@ -416,11 +416,10 @@ impl<S: ToolServices> ServiceHandler<S> {
         let progress = service_context.progress().clone();
 
         let execution = async {
-            let result = self
-                .services
-                .call(service_request, service_context)
-                .await
-                .map_err(service_error)?;
+            let result = match self.services.call(service_request, service_context).await {
+                Ok(result) => result,
+                Err(error) => return tool_execution_error(error),
+            };
             self.render_result(
                 descriptor,
                 result,
@@ -473,7 +472,7 @@ impl<S: ToolServices> ServiceHandler<S> {
             descriptor.contract().result().artifact(),
             ToolArtifactPolicy::InlineOnly
         ) {
-            return Err(service_error(ServiceError::ResourceExhausted));
+            return tool_execution_error(ServiceError::ResourceExhausted);
         }
 
         let metadata = result.metadata_value();
@@ -666,6 +665,7 @@ fn to_rmcp_tool(descriptor: &ToolDescriptor) -> Tool {
             .idempotent(effects.idempotent())
             .open_world(effects.open_world()),
     )
+    .with_raw_output_schema(Arc::new(descriptor.output_schema().clone()))
     .with_execution(ToolExecution::new().with_task_support(TaskSupport::Forbidden));
     if !descriptor.metadata().is_empty() {
         tool = tool.with_meta(Meta(descriptor.metadata().clone()));
@@ -706,6 +706,21 @@ fn service_error(error: ServiceError) -> McpError {
         }
         ServiceErrorClass::Internal => McpError::internal_error("service failed internally", None),
     }
+}
+
+fn tool_execution_error(error: ServiceError) -> Result<CallToolResult, McpError> {
+    let message = match error.class() {
+        ServiceErrorClass::InvalidRequest => "service request is invalid",
+        ServiceErrorClass::NotFound => "requested service object was not found",
+        ServiceErrorClass::Unauthorized => "service request is not authorized",
+        ServiceErrorClass::ResourceExhausted => "service resource limit exceeded",
+        ServiceErrorClass::Unavailable => "service is unavailable",
+        ServiceErrorClass::Cancelled
+        | ServiceErrorClass::DeadlineExceeded
+        | ServiceErrorClass::InvalidResult
+        | ServiceErrorClass::Internal => return Err(service_error(error)),
+    };
+    Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
 }
 
 fn cancelled_error() -> McpError {

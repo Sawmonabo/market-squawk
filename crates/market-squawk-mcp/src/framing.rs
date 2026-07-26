@@ -765,6 +765,9 @@ fn response_identity(message: &ServerJsonRpcMessage) -> Option<(RequestId, Audit
     match message {
         JsonRpcMessage::Response(response) => {
             let class = match &response.result {
+                ServerResult::CallToolResult(result) if result.is_error == Some(true) => {
+                    AuditResultClass::ServiceRejected
+                }
                 ServerResult::CallToolResult(result)
                     if result
                         .structured_content

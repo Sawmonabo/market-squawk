@@ -10,7 +10,7 @@ use crate::{
     JsonStructureLimits, ProgressError, RequestContext, ScopeRequirement, ServiceContractError,
     TOOL_CONFIRMATION_FIELD, TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD,
     TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD, ToolAuthorization, ToolContract, ToolScope,
-    TypedToolResult, validate_json_contract,
+    TypedToolResult, output_schema, validate_json_contract,
 };
 
 const CONTRACT_METADATA_KEY: &str = "org.market-squawk/tool-contract";
@@ -30,6 +30,9 @@ pub struct ToolDescriptor {
     description: Arc<str>,
     input_schema: Map<String, Value>,
     input_schema_bytes: usize,
+    output_data_schema: Value,
+    output_schema: Map<String, Value>,
+    output_schema_bytes: usize,
     contract: ToolContract,
     metadata: Map<String, Value>,
     effects: ToolEffects,
@@ -45,6 +48,9 @@ impl fmt::Debug for ToolDescriptor {
             .field("description", &self.description)
             .field("input_schema", &"[INPUT SCHEMA REDACTED]")
             .field("input_schema_bytes", &self.input_schema_bytes)
+            .field("output_data_schema", &"[OUTPUT DATA SCHEMA REDACTED]")
+            .field("output_schema", &"[OUTPUT SCHEMA REDACTED]")
+            .field("output_schema_bytes", &self.output_schema_bytes)
             .field("contract", &self.contract)
             .field("metadata", &"[PUBLIC METADATA REDACTED]")
             .field("effects", &self.effects)
@@ -64,6 +70,72 @@ impl ToolDescriptor {
         version: impl Into<Arc<str>>,
         description: impl Into<Arc<str>>,
         input_schema: Value,
+        contract: ToolContract,
+        effects: ToolEffects,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        Self::try_new_inner(
+            name,
+            version,
+            description,
+            input_schema,
+            Value::Bool(true),
+            false,
+            contract,
+            effects,
+            input_admission,
+        )
+    }
+
+    /// Creates a descriptor with a closed input schema and a specific structured-result schema.
+    ///
+    /// `output_data_schema` describes the operation-owned value under the canonical inline
+    /// envelope's `data` field. The descriptor composes and owns the complete MCP output schema,
+    /// including canonical metadata and the path-free artifact variant when the result policy
+    /// permits overflow publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError`] when text, input, output, or contract invariants are
+    /// violated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_output<A>(
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+        description: impl Into<Arc<str>>,
+        input_schema: Value,
+        output_data_schema: Value,
+        contract: ToolContract,
+        effects: ToolEffects,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        Self::try_new_inner(
+            name,
+            version,
+            description,
+            input_schema,
+            output_data_schema,
+            true,
+            contract,
+            effects,
+            input_admission,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_inner<A>(
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+        description: impl Into<Arc<str>>,
+        input_schema: Value,
+        output_data_schema: Value,
+        require_specific_output: bool,
         contract: ToolContract,
         effects: ToolEffects,
         input_admission: A,
@@ -106,6 +178,17 @@ impl ToolDescriptor {
         let Value::Object(input_schema) = bounded_schema else {
             return Err(ServiceCapabilityError::InvalidSchema);
         };
+        if require_specific_output && !output_schema::validate_data_schema(&output_data_schema) {
+            return Err(ServiceCapabilityError::InvalidOutputSchema);
+        }
+        let output_schema =
+            output_schema::output_schema(&output_data_schema, contract.result().artifact());
+        let output_schema_bytes = validate_json_contract(
+            &Value::Object(output_schema.clone()),
+            schema_limits,
+            MAXIMUM_DESCRIPTOR_SCHEMA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidOutputSchema)?;
         if !contract.is_compatible_with_effects(effects.read_only())
             || !schema_matches_scope(&input_schema, contract.scope())
             || (!matches!(contract.authorization(), ToolAuthorization::ReadOnly)
@@ -135,6 +218,9 @@ impl ToolDescriptor {
             description,
             input_schema,
             input_schema_bytes,
+            output_data_schema,
+            output_schema,
+            output_schema_bytes,
             contract,
             metadata,
             effects,
@@ -191,6 +277,18 @@ impl ToolDescriptor {
     #[must_use]
     pub const fn input_schema(&self) -> &Map<String, Value> {
         &self.input_schema
+    }
+
+    /// Complete JSON Schema for the exact structured-content envelope advertised to MCP clients.
+    #[must_use]
+    pub const fn output_schema(&self) -> &Map<String, Value> {
+        &self.output_schema
+    }
+
+    /// Validates operation-owned result data before any transport may publish it.
+    #[must_use]
+    pub(crate) fn validates_output_data(&self, data: &Value) -> bool {
+        output_schema::validate_data(&self.output_data_schema, data)
     }
 
     /// Complete typed operation contract carried into dispatch.
@@ -488,6 +586,9 @@ pub enum ServiceCapabilityError {
     /// Input schema is not a closed JSON object schema.
     #[error("service tool input schema must be a closed object")]
     InvalidSchema,
+    /// Output schema is not a supported, operation-specific structured-result schema.
+    #[error("service tool output schema must be specific and supported")]
+    InvalidOutputSchema,
     /// Public descriptor metadata is not a bounded JSON object.
     #[error("service tool metadata must be a bounded object")]
     InvalidMetadata,

@@ -5,6 +5,7 @@
 
 mod artifact;
 mod contract;
+mod output_schema;
 mod progress;
 mod request;
 mod response;

@@ -313,14 +313,17 @@ impl TypedToolResult {
         Ok(())
     }
 
-    /// Validates descriptor-owned source-evidence policy before transport publication.
+    /// Validates descriptor-owned source-evidence and operation-data policy before publication.
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceContractError::SourceEvidencePolicy`] when the result does not satisfy the
-    /// exact descriptor contract that admitted its request.
+    /// Returns [`ServiceContractError`] when the result does not satisfy the exact descriptor
+    /// contract that admitted its request.
     pub fn validate_for(&self, descriptor: &ToolDescriptor) -> Result<(), ServiceContractError> {
         if self.metadata.source_evidence() != descriptor.contract().result().source_evidence() {
+            return Err(ServiceContractError::SourceEvidencePolicy);
+        }
+        if !descriptor.validates_output_data(&self.structured_content) {
             return Err(ServiceContractError::SourceEvidencePolicy);
         }
         Ok(())
@@ -459,8 +462,8 @@ pub enum ServiceContractError {
     /// Complete/truncated metadata contradicted returned and available item counts.
     #[error("service result completeness metadata is inconsistent")]
     InvalidCompleteness,
-    /// Source evidence contradicted the exact descriptor result policy.
-    #[error("service result source evidence violates the descriptor contract")]
+    /// Source evidence or structured content contradicted the exact descriptor result policy.
+    #[error("service result violates the descriptor-owned output contract")]
     SourceEvidencePolicy,
     /// Structured JSON violated its depth, container, string, or encoded-byte ceiling.
     #[error("service result JSON contract failed: {0}")]
