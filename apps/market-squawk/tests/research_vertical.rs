@@ -15,7 +15,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures_util::future::BoxFuture;
 use market_squawk::application::{
-    ApplicationDomainService, ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    ApplicationDomainService, ManagedResearchExtractionSource,
+    PrepublishedResearchSourceRegistration, ProductionResearchIngestCoordinator,
     ResearchExtractionLimits, ResearchIngestCoordinator, ResearchRevisionPlanError,
     ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator, SourceDomainService,
     SourceRuntimeRequest, SourceRuntimeSnapshotBatch, SourceRuntimeView, SourceRuntimeViewError,
@@ -153,15 +154,116 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
                 .join("discovery-source-authority"),
         )?,
     )?;
-    let coordinator = Arc::new(ProductionResearchIngestCoordinator::new(
-        registry,
-        Arc::clone(&research),
-        ResearchExtractionLimits::try_new(
-            NonZeroU16::new(8).ok_or("discovery bound is zero")?,
-            NonZeroU32::new(16).ok_or("record bound is zero")?,
-            NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
-            Duration::from_secs(60),
+    let profile = SourceIdentifier::try_from("embedded.treasury-discovery")?;
+    let dataset = SourceIdentifier::try_from("average-interest-rates")?;
+    let source = DiscoveryFixtureSource::try_new(
+        "treasury-discovery-fixture",
+        "average-interest-rates:sha256:fixture",
+        FixtureDiscovery::Once,
+        FixtureExtraction::Observation,
+    )?;
+    let source_id = source.metadata().source_id().clone();
+    let primary_registration = PrepublishedResearchSourceRegistration::try_new(
+        profile.clone(),
+        source,
+        ResearchRightsAuthority::try_new(
+            source_id,
+            RightsBasis::reviewed_terms(
+                "https://fiscaldata.treasury.gov/api-documentation/",
+                evidence(41),
+            )?,
+            evidence(42),
+            None,
         )?,
+    )?;
+    let capacity_profile = SourceIdentifier::try_from("treasury.receipt-capacity")?;
+    let capacity_dataset = SourceIdentifier::try_from("receipt-capacity-dataset")?;
+    let capacity_source = DiscoveryFixtureSource::try_new(
+        "receipt-capacity-fixture",
+        "receipt-capacity-object",
+        FixtureDiscovery::Repeated,
+        FixtureExtraction::Observation,
+    )?;
+    let capacity_source_id = capacity_source.metadata().source_id().clone();
+    let capacity_registration = PrepublishedResearchSourceRegistration::try_new(
+        capacity_profile.clone(),
+        capacity_source,
+        fixture_rights(capacity_source_id, 71)?,
+    )?;
+    let expiry_profile = SourceIdentifier::try_from("treasury.receipt-expiry")?;
+    let expiry_dataset = SourceIdentifier::try_from("receipt-expiry-dataset")?;
+    let expiry_source = DiscoveryFixtureSource::try_new(
+        "receipt-expiry-fixture",
+        "receipt-expiry-object",
+        FixtureDiscovery::Once,
+        FixtureExtraction::Observation,
+    )?;
+    let expiry_source_id = expiry_source.metadata().source_id().clone();
+    let rights_expiry = current_timestamp()?.checked_add_nanos(2_000_000_000)?;
+    let expiry_registration = PrepublishedResearchSourceRegistration::try_new(
+        expiry_profile.clone(),
+        expiry_source,
+        ResearchRightsAuthority::try_new(
+            expiry_source_id,
+            RightsBasis::reviewed_terms(
+                "https://fiscaldata.treasury.gov/api-documentation/",
+                evidence(81),
+            )?,
+            evidence(82),
+            Some(rights_expiry),
+        )?,
+    )?;
+    let coordinator = Arc::new(
+        ProductionResearchIngestCoordinator::try_new_with_prepublished_sources(
+            registry,
+            Arc::clone(&research),
+            ResearchExtractionLimits::try_new(
+                NonZeroU16::new(8).ok_or("discovery bound is zero")?,
+                NonZeroU32::new(16).ok_or("record bound is zero")?,
+                NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
+                Duration::from_secs(60),
+            )?,
+            [
+                primary_registration,
+                capacity_registration,
+                expiry_registration,
+            ],
+        )?,
+    );
+    let expiry_context = long_context("receipt-expiry", Duration::from_secs(60))?;
+    let expiry_discovery = coordinator
+        .discover_registered_objects(
+            &expiry_profile,
+            &expiry_dataset,
+            None,
+            NonZeroU16::MIN,
+            &expiry_context,
+        )
+        .await?;
+    let expiry_selection = expiry_discovery
+        .objects()
+        .first()
+        .ok_or("expiry discovery returned no object")?;
+    assert_eq!(
+        expiry_selection.discovery_receipt_expires_at(),
+        rights_expiry
+    );
+    let expiry_ingest = admitted_ingest(
+        &expiry_profile,
+        &expiry_dataset,
+        expiry_selection.source_object().object_id(),
+        expiry_selection.discovery_receipt(),
+    )?;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert!(matches!(
+        ResearchIngestCoordinator::ingest(
+            coordinator.as_ref(),
+            &expiry_ingest,
+            &expiry_context,
+            expiry_context.limits(),
+        )
+        .await,
+        Err(ServiceError::NotFound)
     ));
     let onboarding = Arc::new(ProviderOnboardingService::try_new_with_provider_rate(
         research.onboarding_catalog(),
@@ -177,28 +279,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         Arc::new(EmptySourceRuntime),
         discovery,
         Arc::new(UnusedAdapterActivation),
-    )?;
-    let profile = SourceIdentifier::try_from("treasury.fiscal-data")?;
-    let dataset = SourceIdentifier::try_from("average-interest-rates")?;
-    let source = DiscoveryFixtureSource::try_new(
-        "treasury-discovery-fixture",
-        "average-interest-rates:sha256:fixture",
-        FixtureDiscovery::Once,
-        FixtureExtraction::Observation,
-    )?;
-    let source_id = source.metadata().source_id().clone();
-    coordinator.register_source(
-        profile.clone(),
-        source,
-        ResearchRightsAuthority::try_new(
-            source_id,
-            RightsBasis::reviewed_terms(
-                "https://fiscaldata.treasury.gov/api-documentation/",
-                evidence(41),
-            )?,
-            evidence(42),
-            None,
-        )?,
     )?;
     let capabilities = application_capabilities()?;
     let discover = capabilities
@@ -371,20 +451,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             && wire.get("response_body").is_none()
     );
 
-    let capacity_profile = SourceIdentifier::try_from("treasury.receipt-capacity")?;
-    let capacity_dataset = SourceIdentifier::try_from("receipt-capacity-dataset")?;
-    let capacity_source = DiscoveryFixtureSource::try_new(
-        "receipt-capacity-fixture",
-        "receipt-capacity-object",
-        FixtureDiscovery::Repeated,
-        FixtureExtraction::Observation,
-    )?;
-    let capacity_source_id = capacity_source.metadata().source_id().clone();
-    coordinator.register_source(
-        capacity_profile.clone(),
-        capacity_source,
-        fixture_rights(capacity_source_id, 71)?,
-    )?;
     let capacity_context = long_context("receipt-capacity", Duration::from_secs(60))?;
     let first_capacity_discovery = coordinator
         .discover_registered_objects(
@@ -504,64 +570,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         .structured_content()["rowCount"]
             == 1
     );
-    let expiry_profile = SourceIdentifier::try_from("treasury.receipt-expiry")?;
-    let expiry_dataset = SourceIdentifier::try_from("receipt-expiry-dataset")?;
-    let expiry_source = DiscoveryFixtureSource::try_new(
-        "receipt-expiry-fixture",
-        "receipt-expiry-object",
-        FixtureDiscovery::Once,
-        FixtureExtraction::Observation,
-    )?;
-    let expiry_source_id = expiry_source.metadata().source_id().clone();
-    let rights_expiry = current_timestamp()?.checked_add_nanos(2_000_000_000)?;
-    coordinator.register_source(
-        expiry_profile.clone(),
-        expiry_source,
-        ResearchRightsAuthority::try_new(
-            expiry_source_id,
-            RightsBasis::reviewed_terms(
-                "https://fiscaldata.treasury.gov/api-documentation/",
-                evidence(81),
-            )?,
-            evidence(82),
-            Some(rights_expiry),
-        )?,
-    )?;
-    let expiry_discovery = coordinator
-        .discover_registered_objects(
-            &expiry_profile,
-            &expiry_dataset,
-            None,
-            NonZeroU16::MIN,
-            &capacity_context,
-        )
-        .await?;
-    let expiry_selection = expiry_discovery
-        .objects()
-        .first()
-        .ok_or("expiry discovery returned no object")?;
-    assert_eq!(
-        expiry_selection.discovery_receipt_expires_at(),
-        rights_expiry
-    );
-    let expiry_ingest = admitted_ingest(
-        &expiry_profile,
-        &expiry_dataset,
-        expiry_selection.source_object().object_id(),
-        expiry_selection.discovery_receipt(),
-    )?;
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
-    assert!(matches!(
-        ResearchIngestCoordinator::ingest(
-            coordinator.as_ref(),
-            &expiry_ingest,
-            &capacity_context,
-            capacity_context.limits(),
-        )
-        .await,
-        Err(ServiceError::NotFound)
-    ));
-
     source_service.begin_shutdown();
     source_service
         .finish_shutdown(Instant::now() + Duration::from_secs(5))
@@ -693,7 +701,6 @@ async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifet
             ..ConfigOverrides::default()
         },
     ))?;
-    let product = LocalProduct::try_new(config)?;
     let profile = SourceIdentifier::try_from("treasury.one-shot-cli")?;
     let dataset = SourceIdentifier::try_from("one-shot-dataset")?;
     let source = DiscoveryFixtureSource::try_new(
@@ -703,11 +710,12 @@ async fn one_shot_source_cli_mints_and_consumes_its_receipt_in_one_product_lifet
         FixtureExtraction::Observation,
     )?;
     let source_id = source.metadata().source_id().clone();
-    product.research_ingest().register_source(
+    let registration = PrepublishedResearchSourceRegistration::try_new(
         profile.clone(),
         source,
         fixture_rights(source_id, 101)?,
     )?;
+    let product = LocalProduct::try_new_with_prepublished_research_sources(config, [registration])?;
     let cli = Cli::try_parse_from([
         "market-squawk",
         "ingest",
@@ -751,16 +759,6 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
                 .join("deadline-source-authority"),
         )?,
     )?;
-    let coordinator = ProductionResearchIngestCoordinator::new(
-        registry,
-        research,
-        ResearchExtractionLimits::try_new(
-            NonZeroU16::new(8).ok_or("discovery bound is zero")?,
-            NonZeroU32::new(16).ok_or("record bound is zero")?,
-            NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
-            Duration::from_secs(1),
-        )?,
-    );
     let dataset = SourceIdentifier::try_from("deadline-dataset")?;
     let discovery_profile = SourceIdentifier::try_from("deadline.discovery")?;
     let discovery_source = DiscoveryFixtureSource::try_new(
@@ -770,10 +768,34 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
         FixtureExtraction::Observation,
     )?;
     let discovery_source_id = discovery_source.metadata().source_id().clone();
-    coordinator.register_source(
+    let discovery_registration = PrepublishedResearchSourceRegistration::try_new(
         discovery_profile.clone(),
         discovery_source,
         fixture_rights(discovery_source_id, 51)?,
+    )?;
+    let extraction_profile = SourceIdentifier::try_from("deadline.extraction")?;
+    let extraction_source = DiscoveryFixtureSource::try_new(
+        "deadline-extraction-fixture",
+        "deadline-extraction-object",
+        FixtureDiscovery::Once,
+        FixtureExtraction::Pending,
+    )?;
+    let extraction_source_id = extraction_source.metadata().source_id().clone();
+    let extraction_registration = PrepublishedResearchSourceRegistration::try_new(
+        extraction_profile.clone(),
+        extraction_source,
+        fixture_rights(extraction_source_id, 61)?,
+    )?;
+    let coordinator = ProductionResearchIngestCoordinator::try_new_with_prepublished_sources(
+        registry,
+        research,
+        ResearchExtractionLimits::try_new(
+            NonZeroU16::new(8).ok_or("discovery bound is zero")?,
+            NonZeroU32::new(16).ok_or("record bound is zero")?,
+            NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
+            Duration::from_secs(1),
+        )?,
+        [discovery_registration, extraction_registration],
     )?;
     let context = deadline_context("bounded-discovery")?;
     let started = tokio::time::Instant::now();
@@ -791,19 +813,6 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
     ));
     assert!(started.elapsed() <= Duration::from_secs(2));
 
-    let extraction_profile = SourceIdentifier::try_from("deadline.extraction")?;
-    let extraction_source = DiscoveryFixtureSource::try_new(
-        "deadline-extraction-fixture",
-        "deadline-extraction-object",
-        FixtureDiscovery::Once,
-        FixtureExtraction::Pending,
-    )?;
-    let extraction_source_id = extraction_source.metadata().source_id().clone();
-    coordinator.register_source(
-        extraction_profile.clone(),
-        extraction_source,
-        fixture_rights(extraction_source_id, 61)?,
-    )?;
     let context = deadline_context("bounded-extraction")?;
     let discovery = coordinator
         .discover_registered_objects(

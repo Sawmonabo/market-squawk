@@ -56,6 +56,17 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<OnboardingSessionView, ProviderPortalActivationError>;
+
+    /// Closes admission to application-owned activation work before portal transport teardown.
+    fn begin_shutdown(&self) {}
+
+    /// Joins any retained activation reconciliation through the application shutdown deadline.
+    async fn finish_shutdown(
+        &self,
+        _deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        Ok(())
+    }
 }
 
 /// Closed portal-facing adapter activation failure.

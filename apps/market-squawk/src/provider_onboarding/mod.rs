@@ -13,5 +13,5 @@ pub use portal::{
     ProviderOnboardingPortal, ProviderPortalActivationAuthority, ProviderPortalActivationError,
     ProviderPortalConfig, ProviderPortalError,
 };
-pub(crate) use service::ProviderRuntimeStartupAdmissions;
 pub use service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
+pub(crate) use service::{ProviderOnboardingMutationAuthority, ProviderRuntimeStartupAdmissions};

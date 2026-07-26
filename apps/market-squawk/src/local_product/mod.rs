@@ -56,9 +56,9 @@ use crate::application::{
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
     LiveFairValueObservationBufferError, PaperApplicationServices,
-    ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
-    ResearchApplicationServices, ResearchExtractionLimits, ResearchSourceDiscoveryCoordinator,
-    SourceDomainService,
+    PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
+    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
+    ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
 };
 use crate::artifact_repository::controlled_artifact_repository;
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
@@ -108,6 +108,28 @@ impl LocalProduct {
     /// exist, the configured signed training release and any required sibling ONNX worker must be
     /// available and verified before the application is published.
     pub fn try_new(config: AppConfig) -> Result<Self, LocalProductError> {
+        Self::try_new_with_prepublished_research_sources(
+            config,
+            std::iter::empty::<PrepublishedResearchSourceRegistration>(),
+        )
+    }
+
+    /// Opens the local product with a bounded static research-adapter composition.
+    ///
+    /// Registrations are consumed before the coordinator or application is published. Code-owned
+    /// provider profiles remain restricted to exact onboarding and adapter activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same closed composition failures as [`Self::try_new`], plus invalid static
+    /// research registrations.
+    pub fn try_new_with_prepublished_research_sources<I>(
+        config: AppConfig,
+        registrations: I,
+    ) -> Result<Self, LocalProductError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
         let paths = LocalPaths::prepare(config.data_dir())?;
         let research = Arc::new(open_research(&paths)?);
         let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
@@ -130,11 +152,13 @@ impl LocalProduct {
                 authorization_subject_resolver,
                 provider_rate.clone(),
             )?;
-        let research_ingest = Arc::new(ProductionResearchIngestCoordinator::new(
-            source_registry,
-            Arc::clone(&research),
-            ResearchExtractionLimits::standard(),
-        ));
+        let (research_ingest, provider_runtime_mutation) =
+            ProductionResearchIngestCoordinator::try_new_with_provider_runtime_authority(
+                source_registry,
+                Arc::clone(&research),
+                ResearchExtractionLimits::standard(),
+                registrations,
+            )?;
 
         let secrets = Arc::new(
             PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
@@ -156,6 +180,7 @@ impl LocalProduct {
         let provider_activation = Arc::new(ProviderAdapterActivation::new(
             Arc::clone(&onboarding),
             Arc::clone(&research_ingest),
+            provider_runtime_mutation,
             config.clone(),
             provider_rate.clone(),
         ));
@@ -491,6 +516,9 @@ pub enum LocalProductError {
     /// Durable source-registry recovery failed.
     #[error(transparent)]
     SourceRegistry(#[from] market_squawk_sources::RegistryError),
+    /// Static research-adapter composition failed.
+    #[error(transparent)]
+    ResearchComposition(#[from] ResearchIngestCompositionError),
     /// Product-wide provider-rate authority could not be opened or reconciled.
     #[error(transparent)]
     ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),

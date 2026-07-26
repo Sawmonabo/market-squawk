@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     sync::{Arc, Mutex},
@@ -24,6 +25,7 @@ use market_squawk_sources::{
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
+    built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,6 +42,7 @@ use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 use super::super::domain_support::DomainLifecycle;
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
+const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
 mod provider_runtime;
 mod selection;
@@ -47,7 +50,7 @@ mod selection;
 use provider_runtime::ResearchProviderAdmission;
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 pub(crate) use provider_runtime::{
-    CommittedResearchProviderReplacement, PreparedResearchProviderReplacement,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
@@ -255,6 +258,74 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
     ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError>;
 }
 
+/// Rights-bound static research adapter sealed before its coordinator is published.
+///
+/// This value is intentionally non-cloneable. It can only be consumed by a prepublication
+/// coordinator or local-product constructor and cannot recover runtime mutation authority.
+pub struct PrepublishedResearchSourceRegistration {
+    profile: SourceIdentifier,
+    metadata: SourceMetadata,
+    source: Box<dyn ManagedResearchExtractionSource>,
+    rights: ResearchRightsAuthority,
+}
+
+impl PrepublishedResearchSourceRegistration {
+    /// Seals one embedded, user-owned, or licensed adapter for prepublication composition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects source/rights identity mismatch and every code-owned onboarding profile.
+    pub fn try_new<S>(
+        profile: SourceIdentifier,
+        source: S,
+        rights: ResearchRightsAuthority,
+    ) -> Result<Self, ResearchIngestCompositionError>
+    where
+        S: ManagedResearchExtractionSource,
+    {
+        let metadata = source.metadata().clone();
+        if metadata.source_id() != &rights.source_id {
+            return Err(ResearchIngestCompositionError::SourceRightsMismatch);
+        }
+        let built_in_profiles = built_in_provider_profiles()
+            .map_err(|_error| ResearchIngestCompositionError::ProviderProfilesUnavailable)?;
+        if built_in_profiles.get(profile.as_str()).is_some() {
+            return Err(ResearchIngestCompositionError::BuiltInProfileRequiresOnboarding);
+        }
+        Ok(Self {
+            profile,
+            metadata,
+            source: Box::new(source),
+            rights,
+        })
+    }
+
+    fn validate(
+        &self,
+        built_in_profiles: &market_squawk_sources::ProviderProfileRegistry,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if self.source.metadata() != &self.metadata
+            || self.metadata.source_id() != &self.rights.source_id
+        {
+            return Err(ResearchIngestCompositionError::SourceRightsMismatch);
+        }
+        if built_in_profiles.get(self.profile.as_str()).is_some() {
+            return Err(ResearchIngestCompositionError::BuiltInProfileRequiresOnboarding);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PrepublishedResearchSourceRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrepublishedResearchSourceRegistration")
+            .field("profile", &self.profile)
+            .field("source_id", self.metadata.source_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSource {
     fn revision_plan(
         &self,
@@ -364,25 +435,65 @@ impl ProductionResearchIngestCoordinator {
         }
     }
 
-    /// Registers one exact adapter revision and its retained persistence-rights evidence.
+    /// Consumes a bounded static adapter composition before publishing the coordinator.
     ///
-    /// Registration is intentionally explicit so onboarding can construct an adapter only after
-    /// every required credential, endpoint, terms, and local-root capability is available.
+    /// No post-publication static registration handle is retained or exposed.
     ///
     /// # Errors
     ///
-    /// Rejects duplicate profile identities, source/rights mismatch, shutdown, or durable source
-    /// registry failure without publishing a callable adapter entry.
-    pub fn register_source<S>(
-        &self,
-        profile: SourceIdentifier,
-        source: S,
-        rights: ResearchRightsAuthority,
-    ) -> Result<(), ResearchIngestCompositionError>
+    /// Rejects oversized, duplicate, changed, built-in, rights-mismatched, or registry-rejected
+    /// registrations without returning a coordinator.
+    pub fn try_new_with_prepublished_sources<I>(
+        registry: AuthoritativeSourceRegistry,
+        research: Arc<ResearchService>,
+        limits: ResearchExtractionLimits,
+        registrations: I,
+    ) -> Result<Self, ResearchIngestCompositionError>
     where
-        S: ManagedResearchExtractionSource,
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
-        self.register_source_inner(profile, source, rights, None)
+        let built_in_profiles = built_in_provider_profiles()
+            .map_err(|_error| ResearchIngestCompositionError::ProviderProfilesUnavailable)?;
+        let mut registrations_by_profile = BTreeMap::new();
+        for registration in registrations {
+            if registrations_by_profile.len() >= MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES {
+                return Err(ResearchIngestCompositionError::PrepublishedSourceLimitExceeded);
+            }
+            registration.validate(&built_in_profiles)?;
+            if registrations_by_profile
+                .insert(registration.profile.clone(), registration)
+                .is_some()
+            {
+                return Err(ResearchIngestCompositionError::DuplicateProfile);
+            }
+        }
+
+        let coordinator = Self::new(registry, research, limits);
+        for registration in registrations_by_profile.into_values() {
+            coordinator.register_prepublished_source(registration)?;
+        }
+        Ok(coordinator)
+    }
+
+    /// Constructs the production coordinator together with its one sealed provider-mutation
+    /// authority. The authority cannot be recovered from the coordinator after composition.
+    pub(crate) fn try_new_with_provider_runtime_authority<I>(
+        registry: AuthoritativeSourceRegistry,
+        research: Arc<ResearchService>,
+        limits: ResearchExtractionLimits,
+        registrations: I,
+    ) -> Result<(Arc<Self>, ResearchProviderRuntimeMutationAuthority), ResearchIngestCompositionError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
+        let coordinator = Arc::new(Self::try_new_with_prepublished_sources(
+            registry,
+            research,
+            limits,
+            registrations,
+        )?);
+        let authority = ResearchProviderRuntimeMutationAuthority::new(Arc::clone(&coordinator));
+        Ok((coordinator, authority))
     }
 
     fn register_source_inner<S>(
@@ -395,10 +506,34 @@ impl ProductionResearchIngestCoordinator {
     where
         S: ManagedResearchExtractionSource,
     {
+        let metadata = source.metadata().clone();
+        self.register_source_arc_inner(profile, metadata, Arc::new(source), rights, generation)
+    }
+
+    fn register_prepublished_source(
+        &self,
+        registration: PrepublishedResearchSourceRegistration,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        let PrepublishedResearchSourceRegistration {
+            profile,
+            metadata,
+            source,
+            rights,
+        } = registration;
+        self.register_source_arc_inner(profile, metadata, Arc::from(source), rights, None)
+    }
+
+    fn register_source_arc_inner(
+        &self,
+        profile: SourceIdentifier,
+        metadata: SourceMetadata,
+        source: Arc<dyn ManagedResearchExtractionSource>,
+        rights: ResearchRightsAuthority,
+        generation: Option<ResearchProviderRuntimeGeneration>,
+    ) -> Result<(), ResearchIngestCompositionError> {
         if self.lifecycle.shutdown_token().is_cancelled() {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
-        let metadata = source.metadata().clone();
         if metadata.source_id() != &rights.source_id {
             return Err(ResearchIngestCompositionError::SourceRightsMismatch);
         }
@@ -423,7 +558,7 @@ impl ProductionResearchIngestCoordinator {
         authority.sources.insert(
             profile,
             RegisteredExtractionSource {
-                source: Arc::new(source),
+                source,
                 metadata,
                 registration,
                 rights,
@@ -1265,6 +1400,15 @@ pub enum ResearchIngestCompositionError {
     /// A profile identity is already bound to an adapter.
     #[error("research extraction profile is already registered")]
     DuplicateProfile,
+    /// Static composition exceeded the code-owned adapter ceiling.
+    #[error("prepublished research source limit exceeded")]
+    PrepublishedSourceLimitExceeded,
+    /// A code-owned provider profile can only be published through exact onboarding.
+    #[error("built-in research provider profile requires onboarding")]
+    BuiltInProfileRequiresOnboarding,
+    /// The code-owned provider profile registry could not be constructed.
+    #[error("built-in research provider profiles are unavailable")]
+    ProviderProfilesUnavailable,
     /// Shutdown has closed registration authority.
     #[error("research extraction coordinator is shutting down")]
     ShuttingDown,

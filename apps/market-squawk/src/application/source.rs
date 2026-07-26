@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
     ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
-    ProviderPortalConfig, ProviderPortalError,
+    ProviderPortalActivationError, ProviderPortalConfig, ProviderPortalError,
 };
 
 mod results;
@@ -649,15 +649,21 @@ impl SourceController {
     }
 
     fn begin_shutdown(&self) {
+        self.portal_activation.begin_shutdown();
         self.lifecycle.begin_shutdown();
         self.portal_cancellation.cancel();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         self.begin_shutdown();
+        let activation = self
+            .portal_activation
+            .finish_shutdown(deadline)
+            .await
+            .map_err(map_portal_activation_shutdown_error);
         let lifecycle = self.lifecycle.finish_shutdown(deadline).await;
         let portal = self.finish_portal_shutdown(deadline).await;
-        lifecycle.and(portal)
+        activation.and(lifecycle).and(portal)
     }
 
     async fn finish_portal_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
@@ -676,6 +682,15 @@ impl SourceController {
             .map_err(map_portal_error);
         *state = PortalTaskState::Complete(outcome);
         outcome
+    }
+}
+
+fn map_portal_activation_shutdown_error(error: ProviderPortalActivationError) -> ServiceError {
+    match error {
+        ProviderPortalActivationError::Cancelled => ServiceError::Cancelled,
+        ProviderPortalActivationError::InvalidRequest
+        | ProviderPortalActivationError::Unavailable
+        | ProviderPortalActivationError::StateUnavailable => ServiceError::Unavailable,
     }
 }
 

@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::provider_onboarding::{ProviderOnboardingError, ProviderRuntimeStartupAdmissions};
 pub(super) use evidence::ActivationEvidenceCandidate;
 
-const RECIPE_SCHEMA_VERSION: u16 = 4;
+const RECIPE_SCHEMA_VERSION: u16 = 5;
+const EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION: u16 = 4;
 const PREDECESSOR_RECIPE_SCHEMA_VERSION: u16 = 3;
 const LEGACY_RECIPE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_SCHEMA_VERSION: u16 = 2;
@@ -63,6 +64,8 @@ pub(super) enum DurableActivationRecipeState {
     Desired(DurableActivationRecipe),
     /// One exact adapter was prepared but durable onboarding/callable cutover did not complete.
     Staged(DurableActivationRecipe),
+    /// Roll-forward authority is durable while exact candidate finalization remains incomplete.
+    Cutover(DurableActivationRecipe),
     /// Prior state was disabled and requires a new onboarding activation.
     Quarantined(DurableActivationQuarantine),
 }
@@ -116,14 +119,15 @@ impl DurableProviderActivationState {
                 Ok(DurableActivationRecipeState::Desired(recipe)) => {
                     vec![recipe.session_id]
                 }
-                Ok(DurableActivationRecipeState::Staged(recipe)) => {
-                    let mut sessions = vec![recipe.session_id];
-                    if let Some(predecessor) = recipe.staged_predecessor
-                        && predecessor.session_id != recipe.session_id
-                    {
-                        sessions.push(predecessor.session_id);
+                Ok(
+                    DurableActivationRecipeState::Staged(recipe)
+                    | DurableActivationRecipeState::Cutover(recipe),
+                ) => {
+                    let mut sessions = std::collections::BTreeSet::from([recipe.session_id]);
+                    if let Some(predecessor) = recipe.staged_predecessor {
+                        sessions.insert(predecessor.session_id);
                     }
-                    sessions
+                    sessions.into_iter().collect()
                 }
                 Ok(
                     DurableActivationRecipeState::Missing
@@ -223,7 +227,7 @@ impl DurableProviderActivationState {
         )
     }
 
-    /// Stages a cross-session replacement while retaining the exact predecessor envelope.
+    /// Stages a generation replacement while retaining the exact predecessor envelope.
     #[allow(
         clippy::too_many_arguments,
         reason = "independent replacement authority dimensions stay explicit for exact CAS"
@@ -237,8 +241,7 @@ impl DurableProviderActivationState {
         evidence_digests: &[String],
         runtime_generation_digest: EvidenceDigest,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
-        if predecessor.session_id == session_id
-            || predecessor.staged_predecessor.is_some()
+        if predecessor.staged_predecessor.is_some()
             || digest_bytes(&predecessor.encoded_state) != predecessor.state_digest
         {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
@@ -305,6 +308,44 @@ impl DurableProviderActivationState {
         Ok(predecessor.state_digest)
     }
 
+    /// Makes exact-candidate roll-forward durable while retaining predecessor recovery evidence.
+    pub(super) fn commit_staged_cutover(
+        &self,
+        surface_id: &str,
+        expected_staged_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        let DurableActivationRecipeState::Staged(recipe) = self.load_recipe(surface_id)? else {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        };
+        if recipe.state_digest != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let predecessor = recipe
+            .staged_predecessor
+            .as_ref()
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        let key = surface_key(surface_id)?;
+        let (encoded, cutover_digest) = encode_recipe(
+            surface_id,
+            recipe.session_id,
+            &recipe.request_bytes,
+            &recipe.evidence_digests,
+            recipe.runtime_generation_digest,
+            recipe.predecessor_runtime_generation_digest,
+            RecipePublicationState::Cutover,
+            Some(&predecessor.encoded_state),
+        )?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store
+            .load()?
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        if digest_bytes(&current) != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&encoded)?;
+        Ok(cutover_digest)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "independent authority dimensions stay explicit for review and exact CAS"
@@ -349,7 +390,7 @@ impl DurableProviderActivationState {
         let DurableActivationRecipeState::Staged(recipe) = self.load_recipe(surface_id)? else {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         };
-        if recipe.state_digest != expected_staged_digest {
+        if recipe.state_digest != expected_staged_digest || recipe.staged_predecessor.is_some() {
             return Err(DurableProviderActivationStateError::StaleState);
         }
         let key = surface_key(surface_id)?;
@@ -368,6 +409,40 @@ impl DurableProviderActivationState {
             .load()?
             .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
         if digest_bytes(&current) != expected_staged_digest {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        store.store(&encoded)?;
+        Ok(desired_digest)
+    }
+
+    /// Completes only the exact durable cutover and drops no predecessor evidence before then.
+    pub(super) fn complete_cutover_recipe(
+        &self,
+        surface_id: &str,
+        expected_cutover_digest: EvidenceDigest,
+    ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+        let DurableActivationRecipeState::Cutover(recipe) = self.load_recipe(surface_id)? else {
+            return Err(DurableProviderActivationStateError::InvalidRecipe);
+        };
+        if recipe.state_digest != expected_cutover_digest || recipe.staged_predecessor.is_none() {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let key = surface_key(surface_id)?;
+        let (encoded, desired_digest) = encode_recipe(
+            surface_id,
+            recipe.session_id,
+            &recipe.request_bytes,
+            &recipe.evidence_digests,
+            recipe.runtime_generation_digest,
+            recipe.predecessor_runtime_generation_digest,
+            RecipePublicationState::Desired,
+            None,
+        )?;
+        let store = LocalAuthorityStateStore::try_open(self.recipe_root(key))?;
+        let current = store
+            .load()?
+            .ok_or(DurableProviderActivationStateError::InvalidRecipe)?;
+        if digest_bytes(&current) != expected_cutover_digest {
             return Err(DurableProviderActivationStateError::StaleState);
         }
         store.store(&encoded)?;
@@ -496,7 +571,8 @@ impl DurableProviderActivationState {
             match self.load_recipe(surface_id)? {
                 DurableActivationRecipeState::Missing => {}
                 DurableActivationRecipeState::Desired(recipe)
-                | DurableActivationRecipeState::Staged(recipe) => {
+                | DurableActivationRecipeState::Staged(recipe)
+                | DurableActivationRecipeState::Cutover(recipe) => {
                     referenced.extend(recipe.evidence_digests);
                     if let Some(predecessor) = recipe.staged_predecessor {
                         referenced.extend(predecessor.evidence_digests);
@@ -606,6 +682,7 @@ struct RecipeWire {
 #[serde(rename_all = "snake_case")]
 enum RecipePublicationState {
     Staged,
+    Cutover,
     #[default]
     Desired,
 }
@@ -637,13 +714,16 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
 fn decode_recipe(
     surface_id: &str,
     encoded: &[u8],
-    allow_staged_predecessor: bool,
+    allow_embedded_predecessor: bool,
 ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
     let recipe: RecipeWire = serde_json::from_slice(encoded)
         .map_err(|_| DurableProviderActivationStateError::InvalidRecipe)?;
     if !matches!(
         recipe.schema_version,
-        RECIPE_SCHEMA_VERSION | PREDECESSOR_RECIPE_SCHEMA_VERSION | LEGACY_RECIPE_SCHEMA_VERSION
+        RECIPE_SCHEMA_VERSION
+            | EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION
+            | PREDECESSOR_RECIPE_SCHEMA_VERSION
+            | LEGACY_RECIPE_SCHEMA_VERSION
     ) || recipe.surface_id != surface_id
         || recipe.request_json.is_empty()
         || recipe.evidence_digests.len() > MAXIMUM_RECIPE_EVIDENCE_OBJECTS
@@ -651,10 +731,14 @@ fn decode_recipe(
         || recipe.schema_version == LEGACY_RECIPE_SCHEMA_VERSION
             && recipe.publication_state != RecipePublicationState::Desired
         || recipe.schema_version != RECIPE_SCHEMA_VERSION
+            && recipe.publication_state == RecipePublicationState::Cutover
+        || recipe.schema_version < EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION
             && recipe.predecessor_recipe_json.is_some()
         || recipe.publication_state == RecipePublicationState::Desired
             && recipe.predecessor_recipe_json.is_some()
-        || !allow_staged_predecessor && recipe.predecessor_recipe_json.is_some()
+        || recipe.publication_state == RecipePublicationState::Cutover
+            && recipe.predecessor_recipe_json.is_none()
+        || !allow_embedded_predecessor && recipe.predecessor_recipe_json.is_some()
     {
         return Err(DurableProviderActivationStateError::InvalidRecipe);
     }
@@ -694,9 +778,7 @@ fn decode_recipe(
             else {
                 return Err(DurableProviderActivationStateError::InvalidRecipe);
             };
-            if predecessor.session_id == recipe.session_id
-                || Some(predecessor.runtime_generation_digest)
-                    != predecessor_runtime_generation_digest
+            if Some(predecessor.runtime_generation_digest) != predecessor_runtime_generation_digest
             {
                 return Err(DurableProviderActivationStateError::InvalidRecipe);
             }
@@ -718,6 +800,7 @@ fn decode_recipe(
     Ok(match publication_state {
         RecipePublicationState::Desired => DurableActivationRecipeState::Desired(recipe),
         RecipePublicationState::Staged => DurableActivationRecipeState::Staged(recipe),
+        RecipePublicationState::Cutover => DurableActivationRecipeState::Cutover(recipe),
     })
 }
 
@@ -739,8 +822,10 @@ fn encode_recipe(
         || runtime_generation_digest.bytes() == [0; 32]
         || predecessor_runtime_generation_digest == Some(runtime_generation_digest)
         || predecessor_recipe.is_some()
-            && (publication_state != RecipePublicationState::Staged
-                || predecessor_runtime_generation_digest.is_none())
+            && (!matches!(
+                publication_state,
+                RecipePublicationState::Staged | RecipePublicationState::Cutover
+            ) || predecessor_runtime_generation_digest.is_none())
     {
         return Err(DurableProviderActivationStateError::InvalidRecipe);
     }
@@ -821,14 +906,28 @@ fn bundle_digest(
             hasher.update(b"market-squawk:durable-provider-activation:v3");
             hasher.update([match publication_state {
                 RecipePublicationState::Staged => 0,
+                RecipePublicationState::Cutover => {
+                    return Err(DurableProviderActivationStateError::InvalidRecipe);
+                }
+                RecipePublicationState::Desired => 1,
+            }]);
+        }
+        EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION => {
+            hasher.update(b"market-squawk:durable-provider-activation:v4");
+            hasher.update([match publication_state {
+                RecipePublicationState::Staged => 0,
+                RecipePublicationState::Cutover => {
+                    return Err(DurableProviderActivationStateError::InvalidRecipe);
+                }
                 RecipePublicationState::Desired => 1,
             }]);
         }
         RECIPE_SCHEMA_VERSION => {
-            hasher.update(b"market-squawk:durable-provider-activation:v4");
+            hasher.update(b"market-squawk:durable-provider-activation:v5");
             hasher.update([match publication_state {
                 RecipePublicationState::Staged => 0,
-                RecipePublicationState::Desired => 1,
+                RecipePublicationState::Cutover => 1,
+                RecipePublicationState::Desired => 2,
             }]);
         }
         _ => return Err(DurableProviderActivationStateError::InvalidRecipe),
@@ -850,7 +949,10 @@ fn bundle_digest(
     for digest in evidence_digests {
         hash_field(&mut hasher, digest.as_bytes())?;
     }
-    if schema_version == RECIPE_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        EMBEDDED_PREDECESSOR_RECIPE_SCHEMA_VERSION | RECIPE_SCHEMA_VERSION
+    ) {
         match predecessor_recipe {
             Some(encoded) => {
                 hasher.update([1]);

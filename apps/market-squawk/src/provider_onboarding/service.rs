@@ -32,7 +32,9 @@ use market_squawk_sources::{
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{
+    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -126,6 +128,16 @@ pub struct ProviderOnboardingService {
     secret_operations: Arc<Semaphore>,
 }
 
+/// Borrowed serialization authority for exact onboarding/runtime mutation.
+///
+/// Construction is private to [`ProviderOnboardingService`]. The adapter activation boundary
+/// retains this guard across currentness validation and the corresponding sealed runtime mutation,
+/// preventing a lease transition from racing the source-map change.
+pub(crate) struct ProviderOnboardingMutationAuthority<'a> {
+    service: &'a ProviderOnboardingService,
+    _guard: AsyncMutexGuard<'a, ()>,
+}
+
 /// Exact durable runtime-session authority admitted during startup reconciliation.
 #[derive(Debug, Default)]
 pub(crate) struct ProviderRuntimeStartupAdmissions {
@@ -153,6 +165,45 @@ impl ProviderRuntimeStartupAdmissions {
 }
 
 impl ProviderOnboardingService {
+    pub(crate) async fn acquire_runtime_mutation_authority(
+        &self,
+    ) -> ProviderOnboardingMutationAuthority<'_> {
+        ProviderOnboardingMutationAuthority {
+            service: self,
+            _guard: self.activation.lock().await,
+        }
+    }
+
+    pub(crate) fn try_acquire_runtime_mutation_authority(
+        &self,
+    ) -> Result<ProviderOnboardingMutationAuthority<'_>, ProviderOnboardingError> {
+        Ok(ProviderOnboardingMutationAuthority {
+            service: self,
+            _guard: self
+                .activation
+                .try_lock()
+                .map_err(|_error| ProviderOnboardingError::ActivationUnavailable)?,
+        })
+    }
+
+    pub(crate) fn prepared_activation_lease(
+        &self,
+        session_id: Uuid,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        self.prepared_lease_from_resumed(&resumed, profile)
+    }
+
+    pub(crate) fn discard_prepared_activation_at_startup(
+        &self,
+        prepared: &ProviderActivationLease,
+        evidence_digest: EvidenceDigest,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.try_acquire_runtime_mutation_authority()?
+            .discard_prepared_activation_at_startup(prepared, evidence_digest)
+    }
+
     /// Constructs the production service with one product-wide durable provider-rate authority.
     ///
     /// # Errors
@@ -782,7 +833,15 @@ impl ProviderOnboardingService {
         &self,
         prepared: &ProviderActivationLease,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
-        let _activation = self.activation.lock().await;
+        self.acquire_runtime_mutation_authority()
+            .await
+            .commit_prepared_activation(prepared)
+    }
+
+    fn commit_prepared_activation_locked(
+        &self,
+        prepared: &ProviderActivationLease,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let resumed = self
             .catalog
             .resume_provider_onboarding(prepared.session_id())?;
@@ -869,6 +928,7 @@ impl ProviderOnboardingService {
     }
 
     /// Returns whether one exact session has durably lost all activation authority.
+    #[cfg(test)]
     pub(crate) fn activation_recipe_is_invalidated(
         &self,
         session_id: Uuid,
@@ -1261,10 +1321,15 @@ impl ProviderOnboardingService {
             .catalog
             .resume_provider_onboarding(lease.session_id())?;
         let profile = self.current_profile_for(&resumed)?;
-        let current = self
-            .lease_from_resumed(&resumed, profile)
-            .or_else(|_| self.prepared_lease_from_resumed(&resumed, profile))?;
-        require_same_active_lease(&current, lease)?;
+        let current = match self.lease_from_resumed(&resumed, profile) {
+            Ok(current) if require_same_active_lease(&current, lease).is_ok() => current,
+            Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {
+                let prepared = self.prepared_lease_from_resumed(&resumed, profile)?;
+                require_same_active_lease(&prepared, lease)?;
+                prepared
+            }
+            Err(error) => return Err(error),
+        };
         let reference = current
             .secret_reference()
             .cloned()
@@ -1499,6 +1564,129 @@ impl ProviderOnboardingService {
                     .map(|profile| session_view(profile, resumed))
             })
             .collect()
+    }
+}
+
+impl ProviderOnboardingMutationAuthority<'_> {
+    pub(crate) fn active_lease(
+        &self,
+        session_id: Uuid,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        self.service.activation_lease(session_id)
+    }
+
+    pub(crate) fn require_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let current = self.service.activation_lease(expected.session_id())?;
+        require_same_active_lease(&current, expected)
+    }
+
+    pub(crate) fn require_prepared_or_active(
+        &self,
+        expected: &ProviderActivationLease,
+    ) -> Result<(), ProviderOnboardingError> {
+        let resumed = self
+            .service
+            .catalog
+            .resume_provider_onboarding(expected.session_id())?;
+        let profile = self.service.current_profile_for(&resumed)?;
+        match self.service.lease_from_resumed(&resumed, profile) {
+            Ok(current) if require_same_active_lease(&current, expected).is_ok() => return Ok(()),
+            Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+        let prepared = self
+            .service
+            .prepared_lease_from_resumed(&resumed, profile)?;
+        require_same_active_lease(&prepared, expected)
+    }
+
+    pub(crate) fn commit_prepared_activation(
+        &self,
+        prepared: &ProviderActivationLease,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        self.service.commit_prepared_activation_locked(prepared)
+    }
+
+    pub(crate) fn invalidate_activation_recipe(
+        &self,
+        session_id: Uuid,
+        evidence_digest: EvidenceDigest,
+    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
+        self.service
+            .invalidate_activation_recipe(session_id, evidence_digest)
+    }
+
+    pub(crate) async fn rollback_prepared_activation(
+        &self,
+        prepared: &ProviderActivationLease,
+        evidence_digest: EvidenceDigest,
+        cancellation: CancellationToken,
+    ) -> Result<(), ProviderOnboardingError> {
+        self.require_prepared_or_active(prepared)?;
+        let generation = prepared
+            .generation()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let resumed = self
+            .service
+            .catalog
+            .resume_provider_onboarding(prepared.session_id())?;
+        if resumed.lifecycle().candidate_generation() != Some(generation) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        if resumed.lifecycle().active_generation().is_some() {
+            self.service.append(
+                resumed.reservation(),
+                resumed.next_sequence(),
+                OnboardingEvent::CleanupRequired {
+                    generation: Some(generation),
+                    evidence_digest,
+                },
+            )?;
+        } else {
+            self.invalidate_activation_recipe(prepared.session_id(), evidence_digest)?;
+        }
+        self.service
+            .cleanup_superseded_unlocked(prepared.session_id(), cancellation)
+            .await
+    }
+
+    fn discard_prepared_activation_at_startup(
+        &self,
+        prepared: &ProviderActivationLease,
+        evidence_digest: EvidenceDigest,
+    ) -> Result<(), ProviderOnboardingError> {
+        let resumed = self
+            .service
+            .catalog
+            .resume_provider_onboarding(prepared.session_id())?;
+        let profile = self.service.current_profile_for(&resumed)?;
+        let exact = self
+            .service
+            .prepared_lease_from_resumed(&resumed, profile)?;
+        require_same_active_lease(&exact, prepared)?;
+        let Some(generation) = prepared.generation() else {
+            self.invalidate_activation_recipe(prepared.session_id(), evidence_digest)?;
+            return Ok(());
+        };
+        if resumed.lifecycle().candidate_generation() != Some(generation) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        if resumed.lifecycle().active_generation().is_none() {
+            self.invalidate_activation_recipe(prepared.session_id(), evidence_digest)?;
+            return Ok(());
+        }
+        self.service.append(
+            resumed.reservation(),
+            resumed.next_sequence(),
+            OnboardingEvent::CleanupRequired {
+                generation: Some(generation),
+                evidence_digest,
+            },
+        )?;
+        Ok(())
     }
 }
 

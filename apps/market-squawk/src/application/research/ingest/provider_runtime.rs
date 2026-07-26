@@ -403,7 +403,7 @@ impl ResearchProviderAdmission {
 }
 
 /// Fully constructed replacement held outside the callable runtime until exact finalization.
-pub(crate) struct PreparedResearchProviderReplacement {
+struct PreparedResearchProviderReplacement {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
     profile: SourceIdentifier,
     token: Uuid,
@@ -415,15 +415,8 @@ pub(crate) struct PreparedResearchProviderReplacement {
 }
 
 impl PreparedResearchProviderReplacement {
-    /// Returns the exact expected old runtime identity.
-    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
-        &self.expected
-    }
-
     /// Revokes and drains only the token-bound predecessor retained by this transaction.
-    pub(crate) async fn revoke_predecessor(
-        &mut self,
-    ) -> Result<(), ResearchIngestCompositionError> {
+    async fn revoke_predecessor(&mut self) -> Result<(), ResearchIngestCompositionError> {
         self.candidate_admission.ensure_pending()?;
         let admission = {
             let mut authority = self
@@ -454,7 +447,7 @@ impl PreparedResearchProviderReplacement {
     }
 
     /// Restores the exact predecessor retained by this token without publishing the candidate.
-    pub(crate) fn rollback(
+    fn rollback(
         mut self,
     ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
         self.candidate_admission.ensure_pending()?;
@@ -507,7 +500,7 @@ impl PreparedResearchProviderReplacement {
     }
 
     /// Transfers the validated candidate into a still-non-callable committed capability.
-    pub(crate) fn commit(
+    fn commit(
         &mut self,
     ) -> Result<CommittedResearchProviderReplacement, ResearchIngestCompositionError> {
         self.candidate_admission.ensure_pending()?;
@@ -589,7 +582,7 @@ impl Drop for PreparedResearchProviderReplacement {
 }
 
 /// Token-bound candidate retained pending until higher-level durable authority is exact.
-pub(crate) struct CommittedResearchProviderReplacement {
+struct CommittedResearchProviderReplacement {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
     profile: SourceIdentifier,
     token: Uuid,
@@ -601,16 +594,8 @@ pub(crate) struct CommittedResearchProviderReplacement {
 }
 
 impl CommittedResearchProviderReplacement {
-    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
-        &self.expected
-    }
-
-    pub(crate) const fn candidate(&self) -> &ResearchProviderRuntimeGeneration {
-        &self.candidate
-    }
-
     /// Cancels the pending candidate and re-admits the exact retained predecessor.
-    pub(crate) fn rollback(
+    fn rollback(
         mut self,
     ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
         self.candidate_admission.ensure_pending()?;
@@ -650,7 +635,7 @@ impl CommittedResearchProviderReplacement {
     }
 
     /// Publishes and activates the candidate after higher-level durable authority is exact.
-    pub(crate) fn finalize(
+    fn finalize(
         &mut self,
     ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
         self.candidate_admission.ensure_pending()?;
@@ -751,7 +736,45 @@ impl Drop for CommittedResearchProviderReplacement {
     }
 }
 
-impl ProductionResearchIngestCoordinator {
+/// Non-cloneable mutation authority minted with one exact production coordinator.
+///
+/// The coordinator itself exposes only read-only provider-generation inspection. Every provider
+/// source-map mutation requires this value, which is moved into the application-owned adapter
+/// activation boundary at composition.
+pub(crate) struct ResearchProviderRuntimeMutationAuthority {
+    coordinator: Arc<ProductionResearchIngestCoordinator>,
+}
+
+/// Opaque token-bound replacement whose transitions are available only through its minting
+/// [`ResearchProviderRuntimeMutationAuthority`].
+pub(crate) struct ResearchProviderRuntimeReplacement {
+    coordinator: Arc<ProductionResearchIngestCoordinator>,
+    expected: ResearchProviderRuntimeGeneration,
+    candidate: ResearchProviderRuntimeGeneration,
+    state: Option<ResearchProviderRuntimeReplacementState>,
+}
+
+enum ResearchProviderRuntimeReplacementState {
+    Prepared(PreparedResearchProviderReplacement),
+    Committed(CommittedResearchProviderReplacement),
+}
+
+impl ResearchProviderRuntimeMutationAuthority {
+    pub(super) fn new(coordinator: Arc<ProductionResearchIngestCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    fn require_bound(
+        &self,
+        transaction: &ResearchProviderRuntimeReplacement,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if Arc::ptr_eq(&self.coordinator, &transaction.coordinator) {
+            Ok(())
+        } else {
+            Err(ResearchIngestCompositionError::StaleRuntimeGeneration)
+        }
+    }
+
     /// Registers one provider adapter bound to an exact onboarding/runtime generation.
     pub(crate) fn register_provider_source<S>(
         &self,
@@ -768,14 +791,16 @@ impl ProductionResearchIngestCoordinator {
         {
             return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
         }
-        self.register_source_inner(
+        self.coordinator.register_source_inner(
             generation.profile().clone(),
             source,
             rights,
             Some(generation),
         )
     }
+}
 
+impl ProductionResearchIngestCoordinator {
     /// Returns the exact callable generation currently published for one provider profile.
     pub fn provider_runtime_generation(
         &self,
@@ -800,19 +825,21 @@ impl ProductionResearchIngestCoordinator {
             .map(Some)
             .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)
     }
+}
 
+impl ResearchProviderRuntimeMutationAuthority {
     /// Prepares an exact expected-old to exact-new adapter replacement without publishing it.
     pub(crate) fn prepare_provider_replacement<S>(
-        self: &Arc<Self>,
+        &self,
         expected: ResearchProviderRuntimeGeneration,
         candidate: ResearchProviderRuntimeGeneration,
         source: S,
         rights: ResearchRightsAuthority,
-    ) -> Result<PreparedResearchProviderReplacement, ResearchIngestCompositionError>
+    ) -> Result<ResearchProviderRuntimeReplacement, ResearchIngestCompositionError>
     where
         S: ManagedResearchExtractionSource,
     {
-        if self.lifecycle.shutdown_token().is_cancelled()
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
             || !candidate.is_exact_successor_of(&expected)?
             || source.metadata() != candidate.metadata()
             || rights != candidate.rights
@@ -824,10 +851,13 @@ impl ProductionResearchIngestCoordinator {
         let candidate_source: Arc<dyn ManagedResearchExtractionSource> = Arc::new(source);
         let candidate_admission = ResearchProviderAdmission::new_pending(&candidate)?;
         let mut authority = self
+            .coordinator
             .authority
             .lock()
             .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        if self.lifecycle.shutdown_token().is_cancelled() || authority.registry.is_none() {
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
         if authority.pending_replacements.contains_key(&profile) {
@@ -846,16 +876,101 @@ impl ProductionResearchIngestCoordinator {
         authority
             .pending_replacements
             .insert(profile.clone(), token);
-        Ok(PreparedResearchProviderReplacement {
-            coordinator: Arc::clone(self),
+        let prepared = PreparedResearchProviderReplacement {
+            coordinator: Arc::clone(&self.coordinator),
             profile,
             token,
-            expected,
-            candidate,
+            expected: expected.clone(),
+            candidate: candidate.clone(),
             candidate_source: Some(candidate_source),
             candidate_admission,
             completed: false,
+        };
+        Ok(ResearchProviderRuntimeReplacement {
+            coordinator: Arc::clone(&self.coordinator),
+            expected,
+            candidate,
+            state: Some(ResearchProviderRuntimeReplacementState::Prepared(prepared)),
         })
+    }
+
+    pub(crate) async fn revoke_predecessor(
+        &self,
+        transaction: &mut ResearchProviderRuntimeReplacement,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        self.require_bound(transaction)?;
+        match transaction.state.as_mut() {
+            Some(ResearchProviderRuntimeReplacementState::Prepared(prepared)) => {
+                prepared.revoke_predecessor().await
+            }
+            Some(ResearchProviderRuntimeReplacementState::Committed(_)) | None => {
+                Err(ResearchIngestCompositionError::InvalidRuntimeReplacement)
+            }
+        }
+    }
+
+    pub(crate) fn commit(
+        &self,
+        transaction: &mut ResearchProviderRuntimeReplacement,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        self.require_bound(transaction)?;
+        let state = transaction
+            .state
+            .take()
+            .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
+        match state {
+            ResearchProviderRuntimeReplacementState::Prepared(mut prepared) => {
+                match prepared.commit() {
+                    Ok(committed) => {
+                        transaction.state = Some(
+                            ResearchProviderRuntimeReplacementState::Committed(committed),
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        transaction.state =
+                            Some(ResearchProviderRuntimeReplacementState::Prepared(prepared));
+                        Err(error)
+                    }
+                }
+            }
+            ResearchProviderRuntimeReplacementState::Committed(committed) => {
+                transaction.state = Some(ResearchProviderRuntimeReplacementState::Committed(
+                    committed,
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn rollback(
+        &self,
+        mut transaction: ResearchProviderRuntimeReplacement,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.require_bound(&transaction)?;
+        match transaction
+            .state
+            .take()
+            .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?
+        {
+            ResearchProviderRuntimeReplacementState::Prepared(prepared) => prepared.rollback(),
+            ResearchProviderRuntimeReplacementState::Committed(committed) => committed.rollback(),
+        }
+    }
+
+    pub(crate) fn finalize(
+        &self,
+        transaction: &mut ResearchProviderRuntimeReplacement,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.require_bound(transaction)?;
+        match transaction.state.as_mut() {
+            Some(ResearchProviderRuntimeReplacementState::Committed(committed)) => {
+                committed.finalize()
+            }
+            Some(ResearchProviderRuntimeReplacementState::Prepared(_)) | None => {
+                Err(ResearchIngestCompositionError::InvalidRuntimeReplacement)
+            }
+        }
     }
 
     /// Revokes exactly one callable generation and every retained receipt minted from it.
@@ -866,6 +981,7 @@ impl ProductionResearchIngestCoordinator {
     ) -> Result<(), ResearchIngestCompositionError> {
         let admission = {
             let mut authority = self
+                .coordinator
                 .authority
                 .lock()
                 .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
@@ -883,6 +999,31 @@ impl ProductionResearchIngestCoordinator {
         };
         admission.revoke_and_drain().await;
         Ok(())
+    }
+}
+
+impl ResearchProviderRuntimeReplacement {
+    pub(crate) const fn expected(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.expected
+    }
+}
+
+impl std::fmt::Debug for ResearchProviderRuntimeMutationAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResearchProviderRuntimeMutationAuthority")
+            .field("coordinator", &"[SEALED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ResearchProviderRuntimeReplacement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResearchProviderRuntimeReplacement")
+            .field("expected", &self.expected)
+            .field("candidate", &self.candidate)
+            .finish_non_exhaustive()
     }
 }
 
