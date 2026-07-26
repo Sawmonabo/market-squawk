@@ -613,6 +613,14 @@ No new integration-test executable, worktree, or duplicate Cargo target was crea
 state is `10,332,448 KiB`, below both the 10 GiB focused-lane budget and the 20 GiB release ceiling;
 `.worktrees` is empty and incremental compilation remained disabled.
 
+The capability and checkpoint commits were fast-forwarded through release head
+`8a20d4b4c9b9746a7619f17290f00cd336ab2d3c` and pushed. The completed
+`fix/release-evidence-authority` branch was then deleted locally and on origin, remote and worktree
+metadata were pruned, and the sole checkout is the clean release worktree. PR `#26` and issues
+`#7`, `#25`, and `#31` contain the checkpoint evidence; all three issue items remain `In Progress`
+on Project 5. Task 20's GitHub dependency record now names Task 19A. No Dependabot pull request or
+remote Dependabot branch remains open.
+
 This checkpoint does not close issues `#7`, `#25`, or `#31`. The authorized Coinbase Direct
 credential/network trace, provider terms confirmation, unresolved FRED/ALFRED durable-use release
 contract, exact-head provider evidence, final fuzz/performance/full-gate evidence, grouped Quarter
