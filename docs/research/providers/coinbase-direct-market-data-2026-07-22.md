@@ -2,6 +2,7 @@
 
 - Initial audit date: 2026-07-22 (America/New_York)
 - Implementation-blocker review: 2026-07-24 (America/New_York)
+- Composition and authority review: 2026-07-25 (America/New_York)
 - Provider: Coinbase Exchange
 - Candidate endpoint: `wss://ws-direct.exchange.coinbase.com`
 - Candidate channel: authenticated `full`
@@ -132,6 +133,74 @@ transport, composition, and release-proof requirements remain open.
 12. Prove resynchronization, fallback degradation, shutdown, secret redaction, and zero paper
     mutation before current authority in the existing consolidated source/application harnesses.
 
+## 2026-07-25 composition and authority audit
+
+The application composition must not add authenticated Direct behavior to
+`ProductionSourceProvider`. That enum remains the closed public Coinbase/Kraken path, and both
+public source identities retain their immutable `DirectUnverified` ceilings. Direct is a separate
+activation and owned runtime because its snapshot/replay/session semantics cannot be represented by
+the generic raw-frame source.
+
+The required production flow is:
+
+```text
+exact current onboarding generation
+→ zeroizing Coinbase Exchange signer
+→ one Direct connection/session per product
+→ shared source registry and provider-rate authority
+→ capture-first Direct output
+→ initial canonical BookSnapshot
+→ exact BookDelta or cursor-only Quote
+→ existing live qualification
+→ existing strategy
+→ existing risk service and dispatcher
+→ existing realistic paper adapter
+```
+
+The audit identified these implementation boundaries:
+
+1. Add `coinbase.exchange-direct-market-data` as a distinct credentialed onboarding surface.
+   Its versioned secret envelope contains the Exchange key, signing secret, and passphrase as one
+   generation. `GET /users/self/verify` can verify the key, but only the signed `ws-direct`
+   subscription acknowledgement proves the requested live-channel entitlement.
+2. Retain a non-serializable process-current activation capability binding the exact onboarding
+   session, capability and rights digests, public configuration, secret generation and reference,
+   and verification expiry. Rotation, cancellation, deletion, expiry, or revocation must cancel
+   and drain every associated source generation before the signer is dropped and zeroized.
+3. Configure each product as one `CoinbaseDirectConfig` and one connection while sharing one
+   `AuthoritativeSourceRegistry` and account-scoped provider budget. Do not create an independent
+   rate authority per product.
+4. Complete the adapter publication contract. The current Direct update surface emits Quote
+   batches, but `BookImbalancePaperStrategy` acts on canonical `BookSnapshot` and `BookDelta`
+   events. The first publication for a generation must be a complete bounded price-level snapshot;
+   subsequent top-depth changes must be exact bounded deltas, including delete-on-zero. A sequenced
+   cursor advance with no published top-depth change may emit only a Quote.
+5. Do not publish a quiet-market bootstrap book from an HTTP snapshot whose sequence has no exact
+   matching WebSocket receipt. Initial publication waits for either an exact replay-final frame or
+   the first contiguous live successor and binds that frame evidence to the current book cursor.
+6. Capture every frame before decoding and qualify the resulting ordinary
+   `DecodedProviderBatch` through the existing registry, health, route, and live-runtime
+   authorities. Private lifecycle messages may update connection liveness but never market
+   freshness, canonical sequence, features, or action state.
+7. Limit `CoverageHealth::Sufficient.valid_until` to the earliest credential, activation,
+   product-evidence, coverage, or source-freshness expiry. Product status or precision mismatch
+   quarantines the generation rather than suppressing one observation.
+8. Reuse the existing strategy, risk, dispatcher, portfolio, checkpoint, audit, fee, and paper
+   authorities. `Bot.Start` receives an explicit Direct source choice plus exact provider session;
+   public Coinbase remains the default and Direct is never inferred from the word `coinbase`.
+
+The focused implementation verification belongs in existing harnesses: Direct transport snapshot
+and delta publication, capture-first qualification and expiry, preservation of public
+`DirectUnverified`, and rejection of missing/wrong/stale Direct onboarding sessions before side
+effects. The existing risk-to-paper scenario is reused rather than duplicated.
+
+Release promotion still requires an authorized unchanged-head trace proving authentication to
+`ws-direct`, exact `full` acknowledgement, product and level-3 snapshot acquisition, contiguous
+replay into a qualified canonical snapshot/delta, and arrival at the existing risk-enforced paper
+path. Coinbase Market Data Terms do not establish general valuation, model, export, or
+redistribution authority, so the default Direct path remains transient and execution-scoped unless
+separate rights evidence admits another use.
+
 ## Why Advanced Trade is not the primary candidate
 
 Advanced Trade documents a public `level2` channel, `sequence_num`, and delivery of snapshots and
@@ -182,3 +251,12 @@ Reviewed 2026-07-24:
 - [Coinbase Exchange WebSocket rate limits](https://docs.cdp.coinbase.com/exchange/websocket-feed/rate-limits)
 - [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data)
 - [Live official BTC-USD level-3 endpoint used for the boundedness observation](https://api.exchange.coinbase.com/products/BTC-USD/book?level=3)
+
+Revalidated 2026-07-25 for the composition and authority audit:
+
+- [Coinbase Exchange WebSocket overview](https://docs.cdp.coinbase.com/exchange/websocket-feed/overview)
+- [Coinbase Exchange WebSocket authentication](https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication)
+- [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels)
+- [Coinbase Exchange REST authentication](https://docs.cdp.coinbase.com/exchange/rest-api/authentication)
+- [Coinbase Exchange market-data connection limits](https://help.coinbase.com/en/exchange/managing-my-account/market-data-connections)
+- [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data)
