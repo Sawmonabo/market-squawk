@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `3219662a44026b45201b96e087d570c2f48a3724`
-  (`merge: provider onboarding control plane`), tree
-  `f114fe931b90fbb91adac2361df115dd94e57390`.
+  `041175590bd2e4a357ea28d75c675c252d3b3746`
+  (`merge: Coinbase Direct paper execution`), tree
+  `b0233f5b60cb6451d3feab410dba32abcc1144ba`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -44,11 +44,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   all 790 expected source files locked. Focused evidence passed for authenticated-profile truth,
   bounded HTTP bootstrap and sequenced-frame queuing, same-owner handoff to live supervision,
   sink-rejection-before-state-mutation, strict Coinbase/sources Clippy, formatting, and diff
-  integrity. The shared provider-rate authority is now integrated, but the Direct credential
-  profile/current signer, Direct wiring into that authority, canonical snapshot/delta publication,
-  application composition, central qualification, explicit risk-paper selection, and an authorized
-  unchanged-head trace remain open under issue `#7`; the integrated transport alone cannot publish
-  `DirectVerified` authority.
+  integrity. The application now binds an exact active Direct onboarding generation, current
+  signer, shared provider-rate/account authority, canonical snapshot/delta publication, central
+  qualification, and explicit risk-paper selection. The code boundary passed focused compile,
+  strict Clippy, formatting, and all 47 existing application tests; a focused lifecycle review
+  confirmed cancellable generation-bound startup and terminal-supervisor health propagation. An
+  authorized unchanged-head external trace remains open under issue `#7`.
 - Release-source admission is integrated through `c8ceb82`: authenticated Coinbase Direct release
   sources carry the required transport authority while the public Coinbase and Kraken compatibility
   sources retain `DirectUnverified` ceilings. No compatibility source can be promoted to
@@ -165,9 +166,10 @@ for documentation writers:
   implementations. Only Treasury Fiscal Data is release-available at this head. SEC and BLS require
   refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine Task 19A
   demonstration is not accepted.
-- Coinbase and Kraken remain capped at `DirectUnverified`; no current provider observation can
-  satisfy the default `DirectVerified` automated-execution gate. FRED/ALFRED durable use remains
-  fail-closed without affirmative per-series rights.
+- Public Coinbase and Kraken remain capped at `DirectUnverified`. The distinct authenticated
+  Coinbase Direct path can derive `DirectVerified` authority and reach central risk/paper execution,
+  but its required authorized unchanged-head acceptance trace is not complete. FRED/ALFRED durable
+  use remains fail-closed without affirmative per-series rights.
 
 The migration corrected stale README statements for the removed diagnostic MCP, complete CLI/MCP,
 portfolio import, FairValue composition, Python source-closure cardinality, and the Quarter 3 gate.
@@ -196,7 +198,7 @@ Subsequent source-derived review established the current first-use handoff state
 As verified through GitHub on 2026-07-25, Task 4 issue `#9` and Task 6 issue `#11` are closed and
 their Project 5 items are `Done`. Issues `#7`, `#10`, `#24`, `#25`, and `#31` remain open. Project
 5 marks Task 19A issue `#31` and Task 20 issue `#25` In Progress. The active product barriers are
-provider onboarding acceptance, the Coinbase Direct application vertical, remaining release
+provider and Coinbase Direct clean-machine/external acceptance evidence, remaining release
 prerequisite reconciliation, and Task 20's exact-head acceptance.
 
 ## Product delivery closeout and next barrier

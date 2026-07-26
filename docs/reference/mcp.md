@@ -9,8 +9,8 @@ authorization, audit behavior, and error mapping.
 | Document type | Reference |
 | Audience | MCP client authors, operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -365,12 +365,16 @@ identifiers. All fair-value tools use Local scope and not-applicable source evid
 | Tool | Specific arguments | Effect | Purpose |
 | --- | --- | --- | --- |
 | `Bot.GetStatus` | None | Read | Return controlled paper-operation lifecycle and risk status |
-| `Bot.Start` | `provider`, `initialCash`, `feeBasisPoints` | Confirm | Start an explicitly configured local paper operation |
+| `Bot.Start` | `provider`, optional `providerSessionId`, `initialCash`, `feeBasisPoints` | Confirm | Start an explicitly configured local paper operation |
 | `Bot.Stop` | `reason` | Confirm | Stop the current local paper operation and durably reconcile it |
 
-`Bot.Start.provider` is `coinbase` or `kraken`; `initialCash` is a decimal string; and
-`feeBasisPoints` must be an integer in `0..=10000`. The application descriptor and paper runtime
-enforce the same bound. All bot tools use Local scope.
+`Bot.Start.provider` is `coinbase`, `coinbase-direct`, or `kraken`. `coinbase-direct` requires
+`providerSessionId` to be the UUID of the exact active
+`coinbase.exchange-direct-market-data` onboarding session; public Coinbase and Kraken reject that
+field. `initialCash` is a decimal string, and `feeBasisPoints` must be an integer in `0..=10000`.
+The application descriptor and paper runtime enforce the same bounds. Direct source failure or
+session revocation cancels the run, reports a failed status requiring stop, and denies market and
+execution operations until cleanup. All bot tools use Local scope.
 
 ### Execution — 4 tools
 

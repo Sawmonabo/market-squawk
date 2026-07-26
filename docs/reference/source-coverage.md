@@ -9,8 +9,8 @@ adapters.
 | Document type | Reference |
 | Audience | Operators, source-adapter authors, research engineers, risk engineers, and auditors |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -257,6 +257,7 @@ operator has an active session or that mutable delivery acceptance is complete.
 | Surface | Implemented product path | Release state | Authentication/onboarding | Coverage and delivery | Runtime quality ceiling |
 | --- | --- | --- | --- | --- | --- |
 | `coinbase.public-market-data` | Live Coinbase Exchange WebSocket used by configured paper operation; diagnostic capture also exists | `rights_limited` | Public; no account, key, or contact | Crypto, configured instruments, one venue, real time, delivery `unknown`; not consolidated | `direct_unverified` |
+| `coinbase.exchange-direct-market-data` | Authenticated `ws-direct` full-channel and REST level-3 bootstrap selected by `Bot.Start` for risk-enforced paper execution | `rights_limited` | User-owned Coinbase Exchange account and View-only key envelope; exact active onboarding session required | Crypto, configured instruments, one Coinbase Exchange venue, real time, `direct_venue`; not consolidated | `direct_verified`, derived only from current runtime evidence |
 | `kraken.spot-public-market-data` | Live Kraken Spot WebSocket v2 used by configured paper operation | `rights_limited` | Public; no account, key, or contact | Crypto, one configured instrument/channel, one venue, real time, `direct_venue`; not consolidated | `direct_unverified` |
 | `sec.edgar-public` | SEC EDGAR extraction adapter | `refresh_required` | Public; non-secret organization/admin contact required | Regulatory filings, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
 | `fred-alfred.api-v1-v2` | FRED/ALFRED extraction and vintage adapter | `rights_blocked` | Provider account and API key; explicit manual secret import | Macroeconomic, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
@@ -270,23 +271,45 @@ operator has an active session or that mutable delivery acceptance is complete.
 
 ### Static catalog ceiling versus runtime ceiling
 
-The two exchange onboarding profiles contain a static catalog `qualityCeiling` of
-`direct_verified`, describing the highest reviewed capability class that the surface could support.
-The actual Coinbase and Kraken adapter metadata is stricter and hard-codes
-`direct_unverified`. Runtime observations, market results, strategy, and risk use the adapter
-metadata and runtime assessment; the catalog value cannot promote them.
+The public Coinbase and Kraken onboarding profiles contain a static catalog `qualityCeiling` of
+`direct_verified`, describing the highest reviewed capability class that those surfaces could
+support. Their actual adapter metadata is stricter and hard-codes `direct_unverified`; the catalog
+value cannot promote them. The separate authenticated Coinbase Direct adapter declares
+`direct_verified` only as a runtime ceiling. Its constructor, credential probe, connection, or
+subscription acknowledgement cannot mint execution authority.
 
 `Source.GetCoverage` can return both the static onboarding declaration and active
 `runtimeCoverage`. Readers must not treat the profile field as the quality of a runtime
-observation. At the reviewed commit, Coinbase and Kraken observations cannot satisfy the default
-`DirectVerified` automated-action gate.
+observation. Public Coinbase and Kraken observations cannot satisfy the default `DirectVerified`
+automated-action gate. Coinbase Direct can satisfy it only after its current runtime assessment
+proves the complete qualification contract for the exact generation and observation.
 
-The current `Bot.Start` application path selects the sealed configured Coinbase or Kraken live
-composition directly; it is not the lease-gated research activation path described below. That
-distinction neither raises the adapter's quality ceiling nor admits the profile's pending
-persistence, modeling, export, or redistribution rights.
+`Bot.Start` selects public Coinbase or Kraken directly, or selects `coinbase-direct` with the exact
+active onboarding-session UUID. The Direct activation binds the current credential generation,
+shared provider-rate and account authority, configured product routes, and central live
+qualification before strategy or risk can act. Its scoped rights do not admit research/fair-value
+persistence, modeling, export, or redistribution, so that runtime publishes only into the
+execution-owned live path.
 
 ## Live market-data adapters
+
+### Coinbase Exchange Direct
+
+The authenticated adapter connects only to `wss://ws-direct.exchange.coinbase.com` and the exact
+configured `https://api.exchange.coinbase.com/products/<product>` product and level-3 book
+endpoints. One active onboarding session supplies a current View-only signing capability. Each
+product owner captures authenticated frames before decode, validates the signed `full`
+subscription, queues a bounded sequence domain while acquiring the REST snapshot, replays
+contiguously, and publishes canonical price-level snapshots and deltas through the ordinary live
+qualification pipeline.
+
+The runtime is single-account and bounded: product cardinality, raw capture, replay, orders,
+price levels, queues, depth, refresh cadence, and retained bytes are admitted before network
+startup. A sequence gap, duplicate/out-of-order frame, stale generation, invalid product status,
+precision error, crossed or inconsistent book, queue overflow, capture failure, credential
+rotation/revocation, or terminal supervisor exit quarantines/cancels the affected run. Heartbeats do
+not refresh market-price freshness. No checksum is claimed because Coinbase does not provide one
+for this profile.
 
 ### Coinbase Exchange
 

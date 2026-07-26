@@ -8,8 +8,8 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Document type | Reference |
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -149,16 +149,18 @@ research evidence and cannot create execution authority.
 | `portfolio exposure <REQUEST>` | Confined JSON object | `Portfolio.GetExposure` |
 | `portfolio risk <REQUEST>` | Confined JSON object | `Portfolio.GetRisk` |
 | `bot status` | None | `Bot.GetStatus` |
-| `bot start --confirm` | `--provider <coinbase|kraken>` defaults to `coinbase`; optional `--seconds`; `--initial-cash` defaults to `100000`; `--fee-basis-points` defaults to `100` | `Bot.Start`, wait for duration/Ctrl-C, then confirmed `Bot.Stop` |
+| `bot start --confirm` | `--provider <coinbase|coinbase-direct|kraken>` defaults to `coinbase`; Direct requires `--provider-session-id <UUID>`; optional `--seconds`; `--initial-cash` defaults to `100000`; `--fee-basis-points` defaults to `100` | `Bot.Start`, wait for duration/Ctrl-C, then confirmed `Bot.Stop` |
 | `bot stop --reason <TEXT> --confirm` | Audit reason is required | `Bot.Stop` |
 | `execution orders` | None | `Execution.GetOrders` |
 | `execution fills` | None | `Execution.GetFills` |
 | `execution cancel <ORDER> --confirm` | Existing paper order identity | `Execution.Cancel` |
 | `execution reconcile --confirm` | None beyond confirmation | `Execution.Reconcile` |
 
-The current Coinbase and Kraken profiles remain `DirectUnverified`. Consequently, the bot and
-execution commands operate the risk-enforced paper system but current provider observations cannot
-satisfy the default `DirectVerified` automated-action gate.
+Public Coinbase and Kraken remain `DirectUnverified`. Authenticated `coinbase-direct` binds the
+exact active onboarding session and can derive `DirectVerified` authority only while every
+sequence, snapshot, status, timestamp, freshness, precision, coverage, and generation check
+remains current. Any failure cancels the paper run and denies further operations until stop
+completes.
 
 ### Fair value
 
@@ -258,7 +260,7 @@ The following commands are hidden from normal help and are not the primary produ
 | Command | Purpose and boundary |
 | --- | --- |
 | `mock --product <ID> --events <N> [--paper-bot]` | Deterministic diagnostic source; defaults are `TEST-USD` and `100` events |
-| `paper-bot [--provider <coinbase|kraken>] [--seconds <U64>] [--initial-cash <DECIMAL>] [--fee-basis-points <U32>]` | v0.1 production-composition compatibility command; defaults match `bot start` but it is not an unchecked order path |
+| `paper-bot [--provider <coinbase|coinbase-direct|kraken>] [--seconds <U64>] [--initial-cash <DECIMAL>] [--fee-basis-points <U32>]` | v0.1 public-source compatibility command; `coinbase-direct` is rejected with an instruction to use `bot start`, which retains the exact onboarding session and application authority |
 | `replay [--source coinbase-exchange] [--journal-format <current|legacy>]` | Validates and reconstructs the diagnostic Coinbase journal; other decoded sources are rejected |
 
 Replay is diagnostic tooling. It is not a source of current execution authority and is not a core

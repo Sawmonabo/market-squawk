@@ -9,8 +9,8 @@ authority-free source status views.
 | Document type | Operations runbook |
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -23,7 +23,7 @@ authority-free source status views.
 - [Run the supported Treasury Fiscal Data setup](#run-the-supported-treasury-fiscal-data-setup)
 - [Understand the source activate boundary](#understand-the-source-activate-boundary)
 - [Discover and ingest an exact provider object](#discover-and-ingest-an-exact-provider-object)
-- [Coinbase, Kraken, capture, and bot ceiling](#coinbase-kraken-capture-and-bot-ceiling)
+- [Exchange sources, capture, and bot authority](#exchange-sources-capture-and-bot-authority)
 - [Expected success evidence](#expected-success-evidence)
 - [Rollback and recovery](#rollback-and-recovery)
 - [Known failure modes](#known-failure-modes)
@@ -147,6 +147,7 @@ ledger.
 | Provider surface | Release state | Declared quality ceiling | Current operator boundary |
 | --- | --- | --- | --- |
 | `coinbase.public-market-data` | `rights_limited` | `direct_verified` | Registration/inspection only in the portal; persistence, modeling, export, and redistribution remain pending, and the shipping live adapter remains `DirectUnverified` |
+| `coinbase.exchange-direct-market-data` | `rights_limited` | `direct_verified` | Import and verify one View-only Exchange key envelope through the local portal; start the live-to-paper runtime only with the exact active session UUID; research/fair-value persistence, modeling, export, and redistribution remain pending |
 | `kraken.spot-public-market-data` | `rights_limited` | `direct_verified` | Registration/inspection only in the portal; the shipping book-v2 adapter remains `DirectUnverified` |
 | `sec.edgar-public` | `refresh_required` | `official_delayed` | SEC adapter and declared-contact onboarding are implemented, but portal activation is disabled until refreshed official evidence is published in a new code-owned revision |
 | `fred-alfred.api-v1-v2` | `rights_blocked` | `official_delayed` | All data-use operations are blocked; no key import, extraction, persistence, training, export, or redistribution procedure is authorized |
@@ -413,10 +414,9 @@ returned `discoveryReceipt` with the exact provider, dataset, and object to conf
 credentials, cannot authorize a different object, and are revoked when discovery publication
 fails.
 
-## Coinbase, Kraken, capture, and bot ceiling
+## Exchange sources, capture, and bot authority
 
-The Coinbase and Kraken onboarding profiles declare `direct_verified` as a theoretical code-owned
-quality ceiling. The shipping live adapters at this reviewed commit do not reach that ceiling:
+Public Coinbase and Kraken remain compatibility sources below automated-action quality:
 
 - Coinbase production metadata is `DirectUnverified`; the current adapter does not provide the
   complete sequence/checksum qualification required by Market Squawk's live evidence policy.
@@ -424,7 +424,15 @@ quality ceiling. The shipping live adapters at this reviewed commit do not reach
   the upstream book channel publishes a checksum; current Market Squawk sequence qualification is
   insufficient for `DirectVerified`.
 
-Therefore:
+The distinct `coinbase.exchange-direct-market-data` surface is user-authorized and
+`rights_limited`. Its current View-only credential generation, authenticated `ws-direct` full
+channel, REST level-3 bootstrap, exact sequence/snapshot handoff, product status, timestamps,
+precision, coverage, and live integrity evidence can derive `DirectVerified` authority. Start it
+only through `bot start --provider coinbase-direct --provider-session-id <UUID>` so the shipping
+application retains the exact onboarding lease, signer, shared rate/account authority, central
+qualification, risk, and paper runtime.
+
+Operational consequences:
 
 - `source coverage` must not be read as current observation quality;
 - public connectivity, a subscription acknowledgement, message flow, or a provider checksum by
@@ -432,9 +440,11 @@ Therefore:
 - the standalone `capture` command is a bounded Coinbase diagnostic journal path, not provider
   onboarding or execution qualification;
 - `capture --paper-bot` remains paper-only;
-- `bot start --provider coinbase|kraken` is subject to the same `DirectUnverified` source ceiling,
-  the fee-aware book-imbalance strategy, and central risk; source qualification prevents an
-  executable intent or live order.
+- `bot start --provider coinbase|kraken` remains subject to the `DirectUnverified` ceiling and
+  cannot produce an executable intent;
+- Coinbase Direct loses authority immediately on session rotation/revocation, sequence or snapshot
+  failure, stale data, invalid status, overflow, or terminal supervision; and
+- the current Direct rights do not authorize research/fair-value persistence, modeling, or export.
 
 For the complete qualification rules, see
 [Data quality and live qualification](../reference/data-quality.md). Current provider blockers and
@@ -528,7 +538,7 @@ lifecycle operation; do not remove files or catalog rows by hand.
 | Treasury XML cannot publish durably | Its separate rights profile admits retrieve/display but not persistence | Use the available Fiscal Data surface when its dataset fits; never inherit rights across surfaces |
 | Discovery or ingestion rejects an object | Provider activation, rights, exact dataset/object identity, metadata, or the fresh process-local receipt no longer matches | Read current source status, rerun the bounded listing, and retry the exact confirmed ingestion; never fabricate or reuse a receipt |
 | Status shows `currentSession: active` and `runtime: not_active` | Research extraction adapter is active but no live market runtime exists in this process | Treat session/activation evidence as extraction status; do not fabricate live health |
-| Coinbase/Kraken coverage says `direct_verified` but runtime quality does not | Profile ceiling was confused with evidence-derived current qualification | Use runtime quality and the data-quality gate; current shipping ceiling is `DirectUnverified` |
+| Public Coinbase/Kraken coverage says `direct_verified` but runtime quality does not | Profile ceiling was confused with evidence-derived current qualification | Use runtime quality and the data-quality gate; those public shipping paths remain `DirectUnverified` |
 | Activation request rejects as invalid | Wrong schema version, unknown field/kind, oversized or symlinked input, surface/session mismatch, missing evidence, or bad hash | Use the exact controlled request and evidence root; do not weaken validation |
 | Restart quarantines one provider | Durable recipe/evidence is invalid, superseded, unauthorized, or rejected by its adapter | Preserve quarantine evidence and re-onboard that surface; other providers stay isolated |
 
@@ -586,6 +596,8 @@ product currently admits.
 | --- | --- | --- |
 | [Coinbase Exchange WebSocket overview](https://docs.cdp.coinbase.com/exchange/websocket-feed/overview) | Public feed endpoints, increasing product sequence numbers, gap/out-of-order handling, and the need for consumer synchronization logic | 2026-07-23 |
 | [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels) | Heartbeat, level-book, and missed-message recovery characteristics of upstream channels | 2026-07-23 |
+| [Coinbase Exchange WebSocket authentication](https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication) | Signed subscription fields for the authenticated Direct feed | 2026-07-25 |
+| [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data) | Current scoped-use and downstream-use boundary retained by the code-owned rights profile | 2026-07-25 |
 | [Kraken WebSocket v2 book checksum](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2) | Optional CRC32 validation over the top ten price levels and exact local-book maintenance order | 2026-07-23 |
 | [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions/XBRL API boundary, no API key for these data APIs, and automated-access policy reference | 2026-07-23 |
 | [SEC developer resources](https://www.sec.gov/about/developer-resources) | Aggregate fair-access ceiling of no more than ten requests per second and declared-bot requirement | 2026-07-23 |

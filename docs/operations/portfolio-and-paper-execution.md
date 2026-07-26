@@ -8,8 +8,8 @@ revision-bound portfolio analytics, and operating the risk-enforced paper runtim
 | Document type | Operations runbook |
 | Audience | Local operators, portfolio analysts, and execution reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -41,12 +41,13 @@ portfolio does not fund or configure the paper runtime. The paper runtime create
 account from the supplied initial-cash and fee assumptions and publishes that cash as an immutable,
 evidence-bound sandbox portfolio revision consumed by central risk.
 
-The current Coinbase and Kraken profiles are `DirectUnverified`. The shipping paper composition
-owns a fee-aware book-imbalance strategy, but source qualification stops the path before its intent
-can receive approval. It can exercise the complete source, book, risk, dispatcher, audit,
-checkpoint, and shutdown lifecycle, but it cannot produce an execution-eligible order from current
-provider observations. A successful process start is therefore not evidence of a working
-live-to-paper result; that remains a release blocker in the
+Public Coinbase and Kraken are `DirectUnverified`, so their observations stop before strategy
+authority. The separate authenticated Coinbase Direct composition binds an exact current
+onboarding session and can qualify observations as `DirectVerified` before the existing fee-aware
+book-imbalance strategy, central risk, dispatcher, audit, checkpoint, and realistic paper engine.
+Any source, credential-generation, freshness, integrity, or supervisor failure cancels the run and
+denies market/execution operations until bounded stop completes. Release acceptance still requires
+the authorized unchanged-head live-to-paper evidence recorded in the
 [delivery ledger](../plans/delivery-ledger.md).
 
 ## Operating boundaries
@@ -209,6 +210,25 @@ market-squawk --output json bot start \
 Use `--provider kraken` for the configured Kraken profile. Omitting `--seconds` runs until Ctrl-C.
 The CLI starts the local runtime, waits for the duration or interrupt, requests a confirmed stop,
 and returns both start and stop results only after bounded shutdown.
+
+To run the authenticated Direct path, first complete
+`source setup coinbase.exchange-direct-market-data --confirm` and retain the resulting active
+session UUID. Then start the paper runtime with that exact authority:
+
+```bash
+market-squawk --output json bot start \
+  --provider coinbase-direct \
+  --provider-session-id <ACTIVE-SESSION-UUID> \
+  --seconds 60 \
+  --initial-cash 100000 \
+  --fee-basis-points 100 \
+  --confirm
+```
+
+The setup portal accepts one versioned secret envelope containing the View-only Exchange
+`api_key`, `passphrase`, and `signing_secret`; secret values are never command-line arguments or
+status output. The Direct run does not persist or export market observations under the current
+scoped rights.
 
 The one-shot CLI creates one `LocalProduct` per process. Consequently, a separate `bot status` or
 `execution` CLI process does not attach to an already-running foreground CLI process. Use the local

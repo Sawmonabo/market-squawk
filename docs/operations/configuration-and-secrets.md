@@ -9,8 +9,8 @@ by the reviewed `LocalProduct`.
 | Document type | Operations runbook |
 | Audience | Local operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -143,9 +143,11 @@ All durations are integer milliseconds. All memory limits are exact integer byte
 
 Coinbase and Kraken are complete, closed profiles rather than partial patches. Their endpoint,
 authorization, event, instrument, frame, queue, and timing contracts are specified in the
-[configuration reference](../reference/configuration.md). Configuration of either profile enables
-construction only; it does not overcome the shipping adapters' current `DirectUnverified`
-execution ceiling.
+[configuration reference](../reference/configuration.md). The configured public Coinbase and
+Kraken paths remain `DirectUnverified`. Coinbase Direct reuses the configured Coinbase
+product/instrument routes and limits but additionally requires an exact active onboarding-session
+UUID; the current signing secret is resolved through the composed secret backend and never appears
+in configuration, environment variables, or CLI arguments.
 
 ## Create and validate a configuration
 

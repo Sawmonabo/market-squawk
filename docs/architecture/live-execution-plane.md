@@ -10,8 +10,8 @@ event-to-action path.
 | Document type | Architecture |
 | Audience | Maintainers, adapter authors, strategy and risk engineers, operators, reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -22,7 +22,7 @@ event-to-action path.
 - [Execution authority](#execution-authority)
 - [Hot-path boundary](#hot-path-boundary)
 - [Failure and recovery](#failure-and-recovery)
-- [Current provider qualification ceiling](#current-provider-qualification-ceiling)
+- [Current provider qualification boundaries](#current-provider-qualification-boundaries)
 - [Related documentation and code](#related-documentation-and-code)
 - [External sources](#external-sources)
 
@@ -199,21 +199,22 @@ from exact-head measurements on documented hardware.
 | Dispatcher or adapter failure | Typed failure and reconciliation-required state | Execution reconciliation through the lifecycle owner |
 | Shutdown deadline | Ingress closes first; bounded components drain or report incomplete shutdown | Operator restarts from durable source and execution state |
 
-## Current provider qualification ceiling
+## Current provider qualification boundaries
 
-At the reviewed commit, the two shipping direct live adapters are intentionally capped below
-execution eligibility:
+At the reviewed commit, public compatibility sources remain below execution eligibility while the
+separate authenticated Coinbase Direct runtime can satisfy the evidence-derived gate:
 
 | Adapter | Implemented integrity evidence | Current ceiling | Automated-action consequence |
 | --- | --- | --- | --- |
-| Coinbase Exchange | Direct WebSocket frames, sealed source metadata, capture provenance, provider decoding, timestamp/precision checks, and route ownership | `DirectUnverified` because the selected production profile does not provide the complete sequence/checksum evidence required by Market Squawk's qualification contract | Cannot mint the `DirectVerified` capability required by central risk |
+| Coinbase Exchange public | Public WebSocket frames, sealed source metadata, capture provenance, provider decoding, timestamp/precision checks, and route ownership | `DirectUnverified` because the public profile does not provide the complete sequence evidence required by Market Squawk's qualification contract | Cannot mint the `DirectVerified` capability required by central risk |
+| Coinbase Exchange Direct | Exact active onboarding generation, View-only signer, authenticated full-channel acknowledgement, capture-first sequenced frames, REST level-3 snapshot, bounded contiguous replay, product status, precision, freshness, coverage, and generation health | `DirectVerified` only while every applicable runtime assessment remains current; checksum is explicitly unsupported by the provider profile | May issue a short-lived single-use live capability to central risk; any failed assessment cancels/quarantines before further action |
 | Kraken Spot WebSocket v2 | Direct book frames, exact decimal lexemes, message-atomic updates, snapshot handling, and Kraken top-ten CRC32 verification | `DirectUnverified` because the v2 book profile does not provide a book-update sequence that satisfies the platform's continuity requirement | Cannot mint the `DirectVerified` capability required by central risk |
 
-This is a deliberate safety ceiling, not an adapter-completeness claim. Both streams can support
-capture, validated local books, health reporting, comparison, and non-executable analysis. They do
-not currently authorize immediate automated paper orders from live observations. Paper execution
-itself is independently implemented, but the shipping Coinbase and Kraken live profiles cannot
-cross the production quality gate.
+These are evidence boundaries, not adapter-completeness claims. Public Coinbase and Kraken support
+capture, validated local books, health reporting, comparison, and non-executable analysis without
+crossing the production gate. Coinbase Direct uses the same central strategy, risk, dispatcher, and
+paper authority only after qualification; its credential, liveness, sequence, snapshot, status,
+freshness, precision, and coverage evidence remains continuously revocable.
 
 ## Related documentation and code
 
@@ -242,7 +243,9 @@ Current implementation anchors:
 - [Risk-owned live hook](../../crates/market-squawk-execution/src/live_hook.rs)
 - [Central risk service](../../crates/market-squawk-execution/src/risk.rs)
 - [Kraken decoder and checksum](../../adapters/market-squawk-adapter-kraken/src/decoder.rs)
-- [Coinbase source profile](../../adapters/market-squawk-adapter-coinbase/src/config.rs)
+- [Coinbase public source profile](../../adapters/market-squawk-adapter-coinbase/src/config.rs)
+- [Coinbase Direct profile and transport](../../adapters/market-squawk-adapter-coinbase/src/direct.rs)
+- [Coinbase Direct application owner](../../apps/market-squawk/src/live_source/direct.rs)
 
 Evidence and operations:
 
@@ -261,4 +264,5 @@ Market Squawk behavior.
 | Source | Architectural use | Reviewed |
 | --- | --- | --- |
 | [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels) | Channel-specific heartbeat, sequence, snapshot, and order-book semantics | 2026-07-23 |
+| [Coinbase Exchange WebSocket authentication](https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication) | Signed subscription inputs and authenticated feed boundary | 2026-07-25 |
 | [Kraken Spot WebSocket v2 book checksum](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2) | Message-atomic level application, delete-on-zero, exact decimal handling, and top-ten CRC32 calculation | 2026-07-23 |

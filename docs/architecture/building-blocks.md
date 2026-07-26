@@ -9,8 +9,8 @@ event-to-decision path.
 | Document type | Building-block architecture |
 | Audience | Maintainers, reviewers, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -196,7 +196,7 @@ consumer-owned authority.
 
 | Adapter | Current boundary |
 | --- | --- |
-| [Coinbase](../../adapters/market-squawk-adapter-coinbase/src/lib.rs) | Bounded Exchange WebSocket v1 frames and provider-normalized evidence; immutable `DirectUnverified` ceiling. |
+| [Coinbase](../../adapters/market-squawk-adapter-coinbase/src/lib.rs) | Separate bounded public `ws-feed` and authenticated `ws-direct`/REST level-3 profiles. Public observations remain `DirectUnverified`; the Direct profile supplies unqualified evidence to the central runtime, which alone can derive `DirectVerified`. |
 | [Kraken](../../adapters/market-squawk-adapter-kraken/src/lib.rs) | Spot WebSocket v2 books/trades, checksum evidence, session recovery, and provider-normalized observations; current execution qualification remains unavailable. |
 | [SEC](../../adapters/market-squawk-adapter-sec/src/lib.rs) | Bounded EDGAR submissions, filings, Company Facts, inline XBRL, raw evidence, and revision-aware normalization. |
 | [FRED/ALFRED](../../adapters/market-squawk-adapter-fred/src/lib.rs) | Series/vintage extraction with per-series rights admission and credential boundary. |

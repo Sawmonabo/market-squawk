@@ -9,8 +9,8 @@ runtime containers before the reader descends into crate or protocol detail.
 | Document type | Architecture overview |
 | Audience | Operators, maintainers, integrators, security reviewers, and research users |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -78,8 +78,10 @@ A quality label, connection heartbeat, computed price, fair-value classification
 observation is not an execution capability. Current automated action requires evidence owned and
 revalidated by the live runtime, then an intent admitted by central risk and a private one-use
 dispatch boundary. At the reviewed commit, Coinbase and Kraken remain capped at
-`DirectUnverified`; the architecture is runnable, but those observations cannot satisfy the
-default `DirectVerified` execution gate.
+`DirectUnverified` on their public compatibility paths. The distinct authenticated Coinbase Direct
+container can derive `DirectVerified` authority only from an exact current onboarding generation
+and complete runtime evidence; revocation or any integrity/liveness failure cancels that authority
+before further market or execution operations.
 
 ### Bounded ownership
 

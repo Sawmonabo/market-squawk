@@ -8,8 +8,8 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 | Document type | Operations runbook |
 | Audience | Local operators, incident responders, integrators, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-25 |
+| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
 
 ## Contents
 
@@ -121,7 +121,8 @@ Use `kraken.spot-public-market-data` or another exact registered profile identif
 | Provider not found or not ready | Registration/onboarding/activation is incomplete | Resume `source setup`, complete the local portal evidence, then run the exact confirmed activation request |
 | Setup browser did not open | Browser launch failed, not necessarily the portal | Use the loopback URL printed by the command before its bounded lifetime expires |
 | Activation recipe is rejected at restart | Durable recipe, rights, secret, endpoint, or adapter identity no longer matches | Refresh the evidence and perform an explicit activation; do not edit the recipe |
-| Connected but `DirectUnverified` | Shipping adapter metadata and runtime qualification retain the lower ceiling | This is the truthful current Coinbase/Kraken status, not a freshness bug; immediate automated action remains unavailable |
+| Public Coinbase or Kraken is connected but `DirectUnverified` | Public adapter metadata and runtime qualification retain the lower ceiling | This is the expected public-source status, not a freshness bug; use an admitted Coinbase Direct session when execution-quality evidence is required |
+| Coinbase Direct status becomes `failed` with `requiresStop: true` | The run token was cancelled or its account supervisor lost current liveness | Issue `Bot.Stop` through the owning MCP process, preserve the first source/credential/integrity failure, repair it, and start a new exact session/generation |
 | Heartbeats continue but market data is stale | Connection liveness is not market-price freshness | Reconnect/resynchronize; a heartbeat cannot refresh price authority |
 | Sequence gap, checksum mismatch, crossed book, invalid precision, or snapshot violation | The current connection generation is quarantined | Close/reap it, allocate a newer generation, obtain a new snapshot, and requalify all applicable evidence |
 | Reconnect loop | Provider, endpoint, network, authorization, or resynchronization remains invalid | Preserve the first causal error and source-health transitions; avoid treating repeated disconnect messages as separate root causes |

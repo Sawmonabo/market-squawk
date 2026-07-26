@@ -823,8 +823,26 @@ checkout, so this run contains no code-owned CI failure. Issue `#31` remains In 
 is release-available, while SEC/BLS evidence refresh, FRED rights, and the clean-machine
 activation/recovery acceptance remain open.
 
-The next grouped product barrier is Coinbase Exchange Direct composition. The shared provider-rate
-authority is implemented, but Direct still needs its distinct credential profile/current signer,
-wiring into that authority, canonical `BookSnapshot`/`BookDelta` publication, application
-composition, central qualification, explicit risk-paper start selection, and an authorized
-unchanged-head trace. Public Coinbase and Kraken retain `DirectUnverified` ceilings.
+## 2026-07-25 Coinbase Direct application checkpoint
+
+The moving release head is `041175590bd2e4a357ea28d75c675c252d3b3746`, tree
+`b0233f5b60cb6451d3feab410dba32abcc1144ba`. The shipping application now composes an exact active
+`coinbase.exchange-direct-market-data` onboarding session through its current signer, shared
+provider-rate and account authority, authenticated snapshot/live transport, canonical
+`BookSnapshot`/`BookDelta` publication, central qualification, strategy, risk, dispatcher, audit,
+checkpoint, and realistic paper execution. CLI and MCP both select this authority through
+`Bot.Start` provider `coinbase-direct` plus the exact session UUID. Public Coinbase and Kraken
+remain distinct `DirectUnverified` paths.
+
+Generation-bound start cancellation prevents stop or kill-switch requests from racing into a late
+running publication. Terminal Direct supervisor exit clears source health and cancels the shared
+run token; bot status reports failure and source, market, and execution operations fail closed until
+stop owns cleanup. Direct market observations are not sent to research or fair-value persistence
+because the current rights admit retrieval/display only.
+
+Focused verification passed formatting, application all-feature compile, strict application
+Clippy, binary compile, and all 47 existing application tests. A narrow read-only re-review
+confirmed both lifecycle remediations and found no regression in their immediate state/health
+surface. No new test target was added. The remaining Direct blocker is an authorized unchanged-head
+external credential-to-qualified-book-to-paper trace, coordinated with the provider clean-machine
+acceptance work and final Task 20 evidence.
