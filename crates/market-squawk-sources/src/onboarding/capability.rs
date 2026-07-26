@@ -66,6 +66,8 @@ pub enum CredentialKind {
     ApiKey,
     /// An identifier plus secret pair encoded inside one bounded secret value.
     ApiKeyPair,
+    /// An API-key identifier, signing secret, and passphrase in one bounded versioned envelope.
+    ApiKeySecretPassphrase,
     /// OAuth token-set material.
     OAuthTokenSet,
     /// Dynamic-registration credentials.

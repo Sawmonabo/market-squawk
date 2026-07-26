@@ -339,6 +339,77 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             "coinbase.exchange.market-data.read"
         )?]
     );
+    assert_eq!(
+        direct_coinbase.capability().credential_kind(),
+        CredentialKind::ApiKeySecretPassphrase
+    );
+    let direct_capability_json: serde_json::Value =
+        serde_json::from_slice(&direct_coinbase.capability().canonical_json()?)?;
+    assert_eq!(
+        direct_capability_json
+            .get("credential_kind")
+            .and_then(serde_json::Value::as_str),
+        Some("api_key_secret_passphrase")
+    );
+    assert_eq!(direct_coinbase.capability().revision().get(), 3);
+    let direct_history = direct_coinbase
+        .capability_history()
+        .map(|capability| (capability.revision().get(), capability.credential_kind()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct_history,
+        [
+            (1, CredentialKind::ApiKey),
+            (2, CredentialKind::ApiKey),
+            (3, CredentialKind::ApiKeySecretPassphrase),
+        ]
+    );
+    let composition_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        [
+            0xdf, 0x90, 0xf3, 0xc1, 0x53, 0x0e, 0x9a, 0xc6, 0xd4, 0x4f, 0x89, 0x48, 0x00, 0x10,
+            0x1f, 0xdf, 0x61, 0xf9, 0x3a, 0x8b, 0x93, 0x33, 0xd3, 0x25, 0x6c, 0xb5, 0x77, 0xd7,
+            0x2f, 0x8e, 0x75, 0x90,
+        ],
+    );
+    assert_eq!(
+        direct_coinbase
+            .capability()
+            .evidence()
+            .iter()
+            .find(|binding| {
+                binding.source_id().as_str() == "MSQ-COINBASE-DIRECT-COMPOSITION-AUDIT-2026-07-25"
+            })
+            .map(EvidenceBinding::digest),
+        Some(composition_digest)
+    );
+    assert_eq!(
+        direct_coinbase
+            .capability()
+            .rate_policy()
+            .enforcement_revision()
+            .map(ProviderCapabilityRevision::get),
+        Some(2)
+    );
+    for source_id in ["CB-EXCHANGE-REST-RATE-LIMITS", "CB-EXCHANGE-WS-RATE-LIMITS"] {
+        assert!(
+            direct_coinbase
+                .evidence()
+                .iter()
+                .any(|evidence| evidence.source_id() == source_id)
+        );
+    }
+    assert_eq!(
+        direct_coinbase.capability().rate_policy().evidence_digest(),
+        composition_digest
+    );
+    assert_eq!(
+        direct_coinbase
+            .capability()
+            .rate_policy()
+            .scope_evidence_digest(),
+        Some(composition_digest)
+    );
     let direct_budget = direct_coinbase
         .capability()
         .rate_policy()
@@ -348,7 +419,13 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         direct_budget.scope().as_source_identifier().as_str(),
         "coinbase-exchange"
     );
-    assert!(direct_budget.scope().authorization_account().is_some());
+    assert_eq!(
+        direct_budget
+            .scope()
+            .authorization_account()
+            .map(SourceIdentifier::as_str),
+        Some("coinbase.exchange-direct.account-template")
+    );
     assert_eq!(direct_budget.max_concurrent(), 2);
     assert_eq!(
         direct_budget
