@@ -12,7 +12,7 @@ of transport.
 | Audience | Maintainers, CLI and MCP authors, operators, security reviewers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 
@@ -280,11 +280,14 @@ failure, and the resulting report retains per-domain evidence.
 
 For MCP:
 
-1. session cancellation closes bounded ingress and propagates child cancellation tokens;
-2. protocol/runtime tasks stop under configured deadlines;
-3. the application begins reverse-order shutdown and reconciliation;
-4. durable audit records are flushed;
-5. the process returns a controlled exit only after server, audit, and application outcomes have
+1. platform termination listeners are installed before product composition so Unix
+   `SIGINT`/`SIGTERM` and Windows console termination events cannot bypass the async drain after
+   startup admission;
+2. session cancellation closes bounded ingress and propagates child cancellation tokens;
+3. protocol/runtime tasks stop under configured deadlines;
+4. the application begins reverse-order shutdown and reconciliation;
+5. durable audit records are flushed;
+6. the process returns a controlled exit only after server, audit, and application outcomes have
    been combined.
 
 Dropped application ownership invokes fail-safe admission closure. This is not a substitute for

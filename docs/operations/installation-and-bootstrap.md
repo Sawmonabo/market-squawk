@@ -11,7 +11,7 @@ paid provider, Python interpreter, or external ONNX Runtime library.
 | Audience | Local operators, release installers, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 
@@ -388,12 +388,14 @@ A valid query-only preflight has:
 ```
 
 `runtimeState: "not_observed"` is deliberate: the query-only command does not start an application,
-adapter, bot, or MCP session. The top-level `status` therefore remains `blocked` when current
-provider onboarding or runtime health has not been established, when a code-owned profile requires
-evidence refresh or rights admission, or when local storage is incomplete. Use the domain-specific
-`source status`, `source coverage`, and `source health` commands inside the intended runtime
-workflow for current source evidence. Exact-head provider, hosted-OS, fuzz, performance, security,
-and publication evidence remains authoritative only in the
+adapter, bot, or MCP session. That state is neither a positive health claim nor, by itself, a local
+readiness blocker. The top-level `status` remains `blocked` for locally established failures such as
+incomplete onboarding, code-owned evidence or rights gates, invalid contracts, or incomplete local
+storage. Current runtime status, coverage, and health come only from the bounded `Source.GetStatus`,
+`Source.GetCoverage`, and `Source.GetHealth` services in the application that owns the runtime; use
+the corresponding `source status`, `source coverage`, and `source health` commands in that workflow.
+Exact-head provider, hosted-OS, fuzz, performance, security, and publication evidence remains
+authoritative only in the
 [delivery ledger](../plans/delivery-ledger.md); doctor does not infer it.
 
 ## Safe restart and upgrade
@@ -456,7 +458,7 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | `init` rejects the path | Root cannot be safely created or canonicalized, or conflicts with existing state | Correct ownership/path selection; do not elevate or overwrite unrelated data |
 | `doctor` reports an unavailable layout or catalog | `init` was not run, the layout is incomplete, permissions changed, SQLite is unavailable, or catalog identities do not match | Preserve the JSON result; run the explicit bootstrap/upgrade procedure or repair the named local cause without deleting evidence |
 | `doctor` reports an invalid application/MCP descriptor contract | The binary's compiled service contract is internally inconsistent | Stop and use a verified binary; initialization cannot repair a compiled contract |
-| `doctor` reports top-level `blocked` with provider observations | Onboarding, rights, release evidence, or current runtime health is incomplete or deliberately not observed by the query-only command | Use provider/source operations and the delivery ledger; do not weaken a provider or execution gate |
+| `doctor` reports top-level `blocked` with provider observations | Durable onboarding, rights, or code-owned release evidence is incomplete or invalid | Use provider/source operations and the delivery ledger; query current runtime health through the application-owned source service |
 | Old version cannot open state after an attempted upgrade | New version initialized or migrated durable state | Restore the coherent pre-upgrade backup unless backward compatibility is proven |
 
 ## Local logs, data, and artifacts

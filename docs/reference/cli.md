@@ -9,7 +9,7 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 

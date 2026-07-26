@@ -10,7 +10,7 @@ authorization, audit behavior, and error mapping.
 | Audience | MCP client authors, operators, security reviewers, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 
@@ -55,8 +55,10 @@ market-squawk mcp serve
 ```
 
 `market-squawk mcp` starts the same server for compatibility. The process reserves stdout for MCP
-frames and uses the configured local control and artifact roots. A normal end of input initiates
-bounded server shutdown, application shutdown, and audit flush.
+frames and uses the configured local control and artifact roots. Platform termination listeners are
+installed before product composition: Unix `SIGINT`/`SIGTERM` and the corresponding Windows console
+termination events cancel the session and then await the same bounded server shutdown, application
+shutdown, and audit flush as a normal end of input.
 
 The transport accepts one JSON-RPC message per line. The newline delimiter is not part of the
 frame-size count. Whitespace-only lines are ignored. Production framing admits at most 1 MiB for
@@ -587,10 +589,11 @@ The protocol/server error mapping is:
 
 Error data does not disclose provider secrets, internal paths, or dynamic authority detail.
 
-End of input, explicit process cancellation, peer closure, bounded write timeout, rejected input,
-or audit failure drives supervised session shutdown. The application then receives its own bounded
-shutdown and the audit is flushed. A failure in server termination, application termination, or
-audit finalization makes the command fail rather than reporting a clean exit.
+End of input, a captured platform termination event, explicit process cancellation, peer closure,
+bounded write timeout, rejected input, or audit failure drives supervised session shutdown. The
+application then receives its own bounded shutdown and the audit is flushed. A failure in server
+termination, application termination, or audit finalization makes the command fail rather than
+reporting a clean exit.
 
 ## Relationship to the CLI
 

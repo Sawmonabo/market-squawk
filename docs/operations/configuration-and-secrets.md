@@ -10,7 +10,7 @@ by the reviewed `LocalProduct`.
 | Audience | Local operators, security reviewers, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 
@@ -418,7 +418,7 @@ commands for those separate checks.
 | Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
 | Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
 | `config validate` succeeds but `doctor` reports unavailable storage | Configuration validity does not prove that `init` created a safe, current layout and catalog | Preserve the doctor result; run the explicit bootstrap/upgrade procedure or repair the stable diagnostic class |
-| `doctor` remains top-level `blocked` | Provider onboarding, rights, current runtime health, or release evidence remains incomplete or unobserved | Use source operations and the delivery ledger; configuration is not authority to clear those gates |
+| `doctor` remains top-level `blocked` | Durable provider onboarding, rights, code-owned release evidence, or local storage remains incomplete or invalid | Use source operations and the delivery ledger; query current runtime health through the application-owned source service |
 
 ## Local logs, data, and artifacts
 

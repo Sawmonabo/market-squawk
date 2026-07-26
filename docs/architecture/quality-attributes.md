@@ -11,7 +11,7 @@ unmeasured target into a performance claim.
 | Audience | Maintainers, release reviewers, operators, security reviewers, and performance engineers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
+| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
 
 ## Contents
 
@@ -182,6 +182,9 @@ redacted provenance-bearing view. Diagnostics remain local and do not require a 
 observability stack. `doctor` is a query-only observer: it opens only an existing capability-bound
 layout and read-only SQLite snapshot, never initializes/migrates state, acquires the application or
 MCP audit writer, starts an adapter, or converts missing runtime health into a positive result.
+An explicitly `not_observed` runtime is informational rather than a fabricated failure; current
+status, coverage, and health remain authoritative only through the bounded application-owned Source
+service that shares the live runtime.
 
 ## Evidence map
 
