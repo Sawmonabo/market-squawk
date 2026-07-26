@@ -3,6 +3,10 @@
 #[cfg(feature = "release-evidence")]
 mod benchmark;
 mod close;
+mod close_demonstration;
+mod close_provider;
+#[cfg(feature = "release-evidence")]
+mod demonstrate;
 mod fuzz;
 mod identity;
 mod io;
@@ -59,9 +63,19 @@ pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand)
         ReleaseCommand::Evidence {
             command: ReleaseEvidenceCommand::Providers(arguments),
         } => providers::run(config, arguments).await,
-        ReleaseCommand::Demonstrate(_) => {
-            drop(config);
-            anyhow::bail!("selected release operation is not implemented")
+        ReleaseCommand::Demonstrate(arguments) => {
+            #[cfg(feature = "release-evidence")]
+            {
+                demonstrate::run(config, arguments).await
+            }
+            #[cfg(not(feature = "release-evidence"))]
+            {
+                drop(config);
+                drop(arguments);
+                anyhow::bail!(
+                    "release demonstration requires a build with the release-evidence feature"
+                )
+            }
         }
     }
 }

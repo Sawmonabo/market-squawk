@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 use chrono::{SecondsFormat, Utc};
+use market_squawk_backtesting::{ReleaseEvidenceBacktestResult, run_release_evidence_backtest};
 use market_squawk_data::{ReleaseEvidenceStorageResult, run_release_evidence_storage};
 use market_squawk_modeling::{ReleaseEvidenceInferenceFixture, ReleaseEvidenceInferenceIdentity};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
@@ -23,6 +24,7 @@ use super::io::{
 use super::process::{ProcessEvidence, ProcessTreeRssObservation};
 use crate::AppConfig;
 use crate::cli::ReleaseBenchmarkArguments;
+use crate::live_source::{CoinbaseReleaseEvidence, run_coinbase_release_evidence};
 use crate::paper_bot::{ReleasePaperBotBenchmarkComposition, ReleasePaperBotBenchmarkResult};
 
 const REPORT_KIND: &str = "market_squawk.release.performance";
@@ -188,6 +190,16 @@ struct WorkerMeasurements {
     completed_at: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DemonstrationKernelEvidence {
+    coinbase_public_decoder: CoinbaseReleaseEvidence,
+    components: components::ComponentEvidence,
+    integrated_live_path: IntegratedLiveEvidence,
+    analytical_storage: ReleaseEvidenceStorageResult,
+    backtest: ReleaseEvidenceBacktestResult,
+}
+
 pub(super) async fn run(
     config: AppConfig,
     arguments: ReleaseBenchmarkArguments,
@@ -329,6 +341,64 @@ pub(super) async fn run_worker(
     worker::canonical_value(&worker::WorkerEnvelope::new(binding, measurements))
 }
 
+pub(super) async fn run_demonstration_kernels(
+    config: AppConfig,
+    scratch: &std::path::Path,
+) -> Result<serde_json::Value> {
+    const WARM_UP_EVENTS: u64 = 32;
+    const MEASURED_EVENTS: u64 = 128;
+    const STORAGE_ROWS: u64 = 64;
+
+    let worker_path = onnx_worker_path()?;
+    let worker_binary = hash_stable_file(&worker_path, MAXIMUM_EXECUTABLE_BYTES)?;
+    let worker_digest = decode_digest(&worker_binary.sha256)?;
+    let mut inference = ReleaseEvidenceInferenceFixture::try_new(&worker_path, worker_digest)
+        .context("release demonstration inference admission failed")?;
+    let components = components::measure_all(&mut inference, MEASURED_EVENTS)
+        .context("release demonstration production kernels failed")?;
+    drop(inference);
+
+    let live_config = isolated_config(config, scratch.join("paper-data"))?;
+    let cancellation = CancellationToken::new();
+    let mut live = ReleasePaperBotBenchmarkComposition::try_new(live_config)?
+        .start(cancellation)
+        .await
+        .context("release demonstration paper composition failed to start")?;
+    let measurement = async {
+        live.warm_up(WARM_UP_EVENTS).await?;
+        live.measure(MEASURED_EVENTS).await
+    }
+    .await;
+    let close = live.finish().await;
+    let integrated_live_path = match (measurement, close) {
+        (Ok(()), Ok(result)) => integrated_live(result)?,
+        (Err(error), Ok(_result)) => return Err(error),
+        (Ok(()), Err(error)) => return Err(error),
+        (Err(measurement), Err(close)) => {
+            bail!(
+                "release demonstration paper measurement failed: {measurement:#}; \
+                 closeout also failed: {close:#}"
+            )
+        }
+    };
+    let analytical_storage =
+        run_release_evidence_storage(&scratch.join("analytical-data"), STORAGE_ROWS)
+            .await
+            .context("release demonstration analytical storage failed")?;
+    let backtest = run_release_evidence_backtest()
+        .context("release demonstration production backtest failed")?;
+    let coinbase_public_decoder = run_coinbase_release_evidence()
+        .context("release demonstration production Coinbase decoder failed")?;
+    serde_json::to_value(DemonstrationKernelEvidence {
+        coinbase_public_decoder,
+        components,
+        integrated_live_path,
+        analytical_storage,
+        backtest,
+    })
+    .context("release demonstration kernel evidence serialization failed")
+}
+
 async fn collect_worker_measurements(
     config: AppConfig,
     arguments: &ReleaseBenchmarkArguments,
@@ -387,7 +457,7 @@ async fn collect_worker_measurements(
     let post_measurement_observed_maximum =
         post_measurement_observation.admitted_observed_maximum_rss_bytes()?;
     drop(live_scratch);
-    let integrated_live_path = integrated_live(live_result);
+    let integrated_live_path = integrated_live(live_result)?;
 
     let storage_scratch = tempfile::Builder::new()
         .prefix("market-squawk-release-storage-")
@@ -487,8 +557,16 @@ fn validate_arguments(arguments: &ReleaseBenchmarkArguments) -> Result<EvidenceA
     })
 }
 
-fn integrated_live(result: ReleasePaperBotBenchmarkResult) -> IntegratedLiveEvidence {
-    IntegratedLiveEvidence {
+fn integrated_live(result: ReleasePaperBotBenchmarkResult) -> Result<IntegratedLiveEvidence> {
+    if result.dispatch_disposition != "dispatched"
+        || result.paper_terminal_state != "filled"
+        || result.paper_order_count != 1
+        || result.paper_fill_count == 0
+        || !result.shutdown_complete
+    {
+        bail!("release paper path did not produce one dispatched filled order and clean shutdown");
+    }
+    Ok(IntegratedLiveEvidence {
         latency_boundary: "bounded_ingress_attempt_to_observed_strategy_and_action_completion"
             .to_owned(),
         fixture_scope: "sealed_feature_gated_diagnostic_source_not_provider_qualification"
@@ -512,7 +590,7 @@ fn integrated_live(result: ReleasePaperBotBenchmarkResult) -> IntegratedLiveEvid
             .producer_observed_maximum_in_flight_batches,
         observer_retained_bytes: result.observer_retained_bytes,
         shutdown_complete: result.shutdown_complete,
-    }
+    })
 }
 
 fn worker_threshold_decision(

@@ -70,6 +70,17 @@ where
     pending.publish()
 }
 
+pub(super) fn ordered_strings_sha256(values: &[String]) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/release-ordered-strings/v1");
+    for value in values {
+        let length = u64::try_from(value.len()).context("release string length exceeds u64")?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
 fn report_bytes<T: Serialize>(kind: &'static str, payload: &T) -> Result<Vec<u8>> {
     let payload_value =
         serde_json::to_value(payload).context("failed to serialize release-evidence payload")?;

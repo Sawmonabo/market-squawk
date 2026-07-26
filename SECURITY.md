@@ -2,7 +2,10 @@
 
 ## Supported release
 
-The `main` branch and the latest tagged `0.x` release receive security fixes. This is research infrastructure and not a production brokerage or execution system.
+The release candidate is developed on `release/market-squawk-v0.1.0`. No complete local release is
+currently approved or tagged. Security corrections are integrated into the active release branch
+and then into `main` through the reviewed release pull request. This is research infrastructure and
+not a production brokerage or live-order execution system.
 
 ## Reporting
 
@@ -26,4 +29,11 @@ portfolio data, exchange secret, proprietary dataset, or unredacted sensitive lo
 
 ## Secrets
 
-Version 0.1 does not require credentials. Future credentialed adapters must use operating-system secret storage or encrypted local configuration, redact secrets from logs and MCP responses, and receive a separate threat-model review before merge.
+Core local operation and public-source adapters require no paid service and no mandatory
+credential. Authenticated Coinbase Direct and registered provider modes use explicit user-owned
+accounts where required. The shipping onboarding authority stores secret material in the operating
+system keyring when available and otherwise in the encrypted local fallback; configuration,
+tracing, CLI, MCP, provider evidence, and release evidence expose only redacted locators or
+credential-free digests. Provider activation is generation-bound, and credential replacement is
+transactional and recoverable. Never place a credential in a configuration file, command line,
+issue, pull request, log excerpt, or evidence artifact.

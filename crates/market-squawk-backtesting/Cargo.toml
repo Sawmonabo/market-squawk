@@ -9,6 +9,10 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 autotests = false
 
+[features]
+default = []
+release-evidence = []
+
 [dependencies]
 arrow.workspace = true
 cap-fs-ext.workspace = true

@@ -9,7 +9,7 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Implementation review base | `094172d4c6d32b73eecbdc6823ab284bdf09ad26` plus the release-demonstration change |
 
 ## Contents
 
@@ -179,6 +179,22 @@ Fair-value classification never changes market-data quality or creates live exec
 
 ## Release evidence
 
+| Command | Purpose and primary output |
+| --- | --- |
+| `release evidence fuzz` | Runs the six closed parser/protocol/model fuzz targets and atomically publishes `fuzz.json` |
+| `release evidence benchmark` | Supervises the production live/storage measurement worker and atomically publishes `performance.json` |
+| `release evidence providers` | Exercises the selected authorized production provider surfaces and creates `providers/provider-evidence.json` |
+| `release demonstrate --offline` | Composes the complete local product against the exact provider/Python evidence and atomically publishes `demo.json` |
+| `release evidence close` | Validates the complete exact-HEAD directory and atomically publishes its terminal `manifest.json` |
+
+Exact-head producers accept `--head` and `--tree`, reject a dirty or changing repository, and use
+no-clobber outputs. The fuzz and benchmark commands permit omitted identities only for provisional
+diagnosis; their reports cannot close a release. The demonstration and closer require exact
+identities. Benchmark and demonstration execution require a binary built with the
+`release-evidence` feature.
+
+### Provider acceptance
+
 `release evidence providers` is the production provider-acceptance producer. It is intentionally
 separate from ordinary source setup and requires:
 
@@ -224,6 +240,30 @@ identity barrier does the command create
 `release evidence close` command rejects a provider report unless it contains every mandatory
 Coinbase, Kraken, SEC, FRED/ALFRED, BLS v1, Treasury XML, and Treasury Fiscal surface plus the
 required Direct action, FRED/ALFRED rights, restart, and exact-binary evidence.
+
+### Demonstration and closure
+
+`release demonstrate --offline` requires:
+
+- exact `--head` and `--tree`;
+- `--provider-evidence <HEAD-ROOT>/providers`;
+- `--python-evidence <HEAD-ROOT>/python/market-squawk-release.json`; and
+- `--output-file <HEAD-ROOT>/demo.json`, which must not exist.
+
+It revalidates the provider report, current executable, signed CPython 3.12 and 3.13 environments,
+repository identity, and directory topology at admission and publication. It runs production
+live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/doctor, and stdio MCP
+paths. Public-source fixtures remain `DirectUnverified`; the local product starts with the paper bot
+stopped and proves execution operations fail closed until a running source owns authority.
+
+`release evidence close` accepts only the exact HEAD-keyed root containing `fuzz.json`,
+`performance.json`, `providers/`, `python/`, `demo.json`, and `full-gate.log`. Its
+`--output-file` must be the absent `<HEAD-ROOT>/manifest.json`. The closer rejects missing or extra
+root entries, credentials, symlinks, parent traversal, cross-HEAD artifacts, binary mismatches,
+failed thresholds, incomplete product predicates, or incomplete provider rights/action evidence.
+
+The reproducible sequence and current blockers are in the
+[exact-head release gate](../verification/usable-release-gate.md).
 
 ## Confirmation and input admission
 

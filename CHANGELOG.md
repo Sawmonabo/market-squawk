@@ -25,6 +25,10 @@ All notable changes to this project are documented here.
   legacy journal format, and made dual-format selection fail closed until explicitly resolved.
 - Hardened local and CI verification with exact dependency inventory, exact compatibility-brand
   allowances, immutable GitHub Action commits, strict workspace gates, and bounded offline smokes.
+- Added an exact-head, offline all-vertical release demonstration over production live/model/risk/
+  paper kernels, Arrow/Parquet/DataFusion and point-in-time storage, Python admission, backtesting,
+  portfolio, fair value, CLI, doctor, and the shipping stdio MCP composition; strict release closure
+  now requires its immutable evidence and fails closed on stopped paper authority.
 
 ## 0.1.0 - 2026-07-15
 

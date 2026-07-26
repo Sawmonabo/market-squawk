@@ -22,6 +22,7 @@ delivery status, research, and historical evidence so each page has one clear jo
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
 | Follow the approved implementation sequence | [Implementation plan](plans/implementation-plan.md) |
+| Reproduce or review the terminal release evidence | [Exact-head release gate](verification/usable-release-gate.md) |
 | Inspect original research and primary-source decisions | [Research](research/) |
 | Inspect historical architecture baselines | [Architecture audits](audits/architecture/) |
 | Review test design or release evidence | [Testing](testing/) and [verification](verification/) |
@@ -101,6 +102,13 @@ Use only these release-status labels in maintained product summaries:
 Historical evidence can describe a state that is no longer current. Its date and reviewed commit
 are part of its meaning. Do not copy an old gap classification into a current architecture or
 operations page.
+
+The maintained release methodology is split into the
+[all-vertical demonstration](verification/usable-release-demonstration.md),
+[performance evidence](verification/usable-release-performance.md), and
+[exact-head gate](verification/usable-release-gate.md). The
+[Quarter 4 review record](reports/usable-release-review.md) remains explicitly unapproved until one
+frozen candidate completes every evidence predicate.
 
 ## Reading paths
 

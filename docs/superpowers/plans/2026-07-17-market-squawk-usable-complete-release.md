@@ -2575,8 +2575,9 @@ events and fails if post-warm-up RSS grows beyond 32 MiB or 1% of the warm plate
 larger, or if any queue exceeds configured capacity. Every run records hardware, OS, toolchain,
 fixture/digest, event/row count, throughput, p50/p95/p99/max and peak RSS.
 
-Before the candidate freeze, exercise every producer against a provisional ignored directory. These
-runs validate the tooling but are never approval evidence:
+Before the candidate freeze, exercise the internal fuzz and performance producers once against a
+provisional ignored directory when their implementation changes. These runs validate the tooling
+but are never approval evidence. Do not repeat them without a concrete failure or producer change:
 
 ```bash
 EVIDENCE_DIR=target/release-evidence/provisional
@@ -2596,9 +2597,11 @@ warmed p99 is strictly below 1,000,000 ns, queues remain bounded, post-warm-up R
 growth bound, and analytical I/O probes record zero calls from the live path. The checker refuses to
 write a passing report when measurements, fixture hashes, hardware fields or component distributions
 are missing. No performance claim is permitted from estimates, local-server network timing, a failed
-run or a different commit. The tracked demonstration, performance, and gate documents are prepared
-before the candidate freeze as human-readable methodology and provisional-result summaries. They
-must state that they are not exact-head approval evidence and are never rewritten after a freeze.
+run or a different commit. The strict demonstration and closer are exact-HEAD producers and are not
+run from the provisional directory. The tracked demonstration, performance, and gate documents are
+prepared before the candidate freeze as human-readable methodology and provisional-result
+summaries. They must state that they are not exact-head approval evidence and are never rewritten
+after a freeze.
 
 - [ ] **Step 4: Implement the separate authorized provider-evidence producer**
 
@@ -2633,26 +2636,22 @@ head/tree/binary hashes, credentials in output, unsupported quality promotion an
 
 - [ ] **Step 5: Finish every tracked file and commit the candidate before collecting evidence**
 
-First exercise the required self-contained tract ONNX backend, build the sealed Python releases from
-the committed source/wheelhouse lock, and run the deterministic local gate. Verify an operator-
-supplied external ONNX Runtime only when that optional Linux backend is configured; it is not the
-required ONNX capability. The dependency checker proves neither Python nor either backend enters
-live/execution runtime edges. Complete the README, changelog, security guidance, review procedure,
-and all tracked human-readable summaries now. A tracked file may summarize provisional evidence and
-methodology, but it must never claim to contain evidence for the commit that contains itself.
+Exercise the required self-contained tract ONNX backend through the focused product gate. Verify an
+operator-supplied external ONNX Runtime only when that optional Linux backend is configured; it is
+not the required ONNX capability. The dependency checker proves neither Python nor either backend
+enters live/execution runtime edges. Complete the README, changelog, security guidance, review
+procedure, and all tracked human-readable summaries now. A tracked file may summarize provisional
+evidence and methodology, but it must never claim to contain evidence for the commit that contains
+itself. Signed Python releases and the strict all-vertical demonstration are created only after the
+candidate is committed and clean.
 
 ```bash
-python3 scripts/build_python_release.py \
-  --lock python/wheelhouse-lock.json \
-  --artifact-root target/release-evidence/provisional/python \
-  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
-  --offline
-cargo run -p market-squawk --release --all-features --locked -- \
-  release demonstrate --offline \
-  --provider-evidence target/release-evidence/provisional/providers \
-  --python-evidence target/release-evidence/provisional/python/release-manifest.json \
-  --output-file target/release-evidence/provisional/demo.json
-./scripts/verify.sh
+CARGO_INCREMENTAL=0 cargo check -p market-squawk --all-targets --all-features --locked
+CARGO_INCREMENTAL=0 cargo clippy \
+  -p market-squawk-data -p market-squawk-backtesting -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --test control_plane \
+  --all-features --locked usable_release_vertical_requires_explicit_offline_admission
 git diff --check
 git commit -m "release: prove usable complete local platform"
 ```
@@ -2710,7 +2709,7 @@ python3 scripts/build_python_release.py \
 cargo run -p market-squawk --release --all-features --locked -- \
   release demonstrate --offline --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --provider-evidence "$EVIDENCE_DIR/providers" \
-  --python-evidence "$EVIDENCE_DIR/python/release-manifest.json" \
+  --python-evidence "$EVIDENCE_DIR/python/market-squawk-release.json" \
   --output-file "$EVIDENCE_DIR/demo.json"
 ./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
 cargo run -p market-squawk --release --all-features --locked -- \

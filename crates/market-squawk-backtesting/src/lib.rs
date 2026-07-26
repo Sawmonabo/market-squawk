@@ -7,6 +7,8 @@ mod engine;
 mod experiments;
 mod fills;
 mod model_strategy;
+#[cfg(feature = "release-evidence")]
+mod release_evidence;
 mod service;
 mod strategy;
 
@@ -39,6 +41,10 @@ pub use fills::{
     ResearchExecutionAssumptionsInput, ResearchFill, ResearchLiquidityPriority,
 };
 pub use model_strategy::{BacktestModelDecisionMapper, BacktestModelStrategy};
+#[cfg(feature = "release-evidence")]
+pub use release_evidence::{
+    ReleaseEvidenceBacktestError, ReleaseEvidenceBacktestResult, run_release_evidence_backtest,
+};
 pub use service::{
     BacktestFailure, BacktestOutcome, BacktestResult, BacktestService, BacktestServiceError,
     BacktestTrialPlan,

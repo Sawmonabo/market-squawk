@@ -10,6 +10,8 @@ mod journal;
 mod journal_path_integration;
 #[path = "../production_mcp_composition.rs"]
 mod production_mcp_composition;
+#[path = "../release_demonstration.rs"]
+mod release_demonstration;
 #[path = "../replay.rs"]
 mod replay;
 #[path = "../research_vertical.rs"]

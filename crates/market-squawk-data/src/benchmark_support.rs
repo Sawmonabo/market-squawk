@@ -3,6 +3,7 @@
 #[path = "benchmark_support/python_admission.rs"]
 mod python_admission;
 
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,8 @@ use arrow::array::{Int64Array, UInt64Array};
 use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest,
     PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use rust_decimal::Decimal;
@@ -24,8 +26,9 @@ use super::{GenerationKind, PinnedDataset, PinnedManifestObject, pinned_dataset_
 use crate::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan,
-    ObjectStoreConfig, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch,
-    ResearchQueryEngine, Sha256Digest,
+    ObjectStoreConfig, PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy,
+    PointInTimeRequest, PointInTimeRevisionMode, PointInTimeService, QueryLimits, QueryRequest,
+    QueryResult, ResearchArrowBatch, ResearchQueryEngine, Sha256Digest,
 };
 
 const MAX_PHYSICAL_ROWS: usize = 4_096;
@@ -61,6 +64,10 @@ pub struct ReleaseEvidenceStorageResult {
     parquet_publication: StorageLatency,
     parquet_read: StorageLatency,
     datafusion_query: StorageLatency,
+    point_in_time_selected_rows: u64,
+    point_in_time_content_sha256: [u8; 32],
+    point_in_time_audit_sha256: [u8; 32],
+    point_in_time_retained_bytes: usize,
     python_verified_rows: u64,
     python_selected_rows_per_verification: u64,
     python_export_sha256: [u8; 32],
@@ -87,6 +94,9 @@ pub enum ReleaseEvidenceStorageError {
     /// Pinned DataFusion query execution failed.
     #[error("release-evidence DataFusion query failed")]
     DataFusion,
+    /// Bounded point-in-time selection failed.
+    #[error("release-evidence point-in-time selection failed")]
+    PointInTime,
     /// Typed Python dataset handoff admission failed.
     #[error("release-evidence Python handoff failed")]
     PythonHandoff,
@@ -245,6 +255,47 @@ pub async fn run_release_evidence_storage(
         plan.content_hash(),
     )
     .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
+    let candidates = observations
+        .iter()
+        .cloned()
+        .map(|observation| PointInTimeCandidate::new(observation, manifest.clone()))
+        .collect::<Vec<_>>();
+    let point_in_time = PointInTimeService::new()
+        .select(
+            &PointInTimeRequest::try_new(
+                PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)
+                    .map_err(|_| ReleaseEvidenceStorageError::PointInTime)?,
+                Timestamp::from_unix_nanos(130),
+                None,
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+                None,
+                PointInTimeLimits::try_new(
+                    physical_rows,
+                    physical_rows,
+                    physical_rows,
+                    physical_rows,
+                    16 * 1024 * 1024,
+                )
+                .map_err(|_| ReleaseEvidenceStorageError::PointInTime)?,
+            )
+            .map_err(|_| ReleaseEvidenceStorageError::PointInTime)?,
+            &candidates,
+            &cancellation,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .map_err(|_| ReleaseEvidenceStorageError::PointInTime)?;
+    if point_in_time.records().len() != physical_rows
+        || !point_in_time.exclusions().is_empty()
+        || point_in_time.revision_counts().current() != physical_rows
+    {
+        return Err(ReleaseEvidenceStorageError::PointInTime);
+    }
+    let point_in_time_selected_rows = u64::try_from(point_in_time.records().len())
+        .map_err(|_| ReleaseEvidenceStorageError::PointInTime)?;
+    let point_in_time_content_sha256 = point_in_time.content_identity().bytes();
+    let point_in_time_audit_sha256 = point_in_time.audit_identity().bytes();
+    let point_in_time_retained_bytes = point_in_time.retained_bytes();
     let objects = vec![PinnedManifestObject {
         artifact_id: Uuid::from_u128(0x7b8b8d9f_6777_4bfa_8d5c_10ce489eb091),
         relative_reference: published.relative_reference().into(),
@@ -372,6 +423,10 @@ pub async fn run_release_evidence_storage(
                 .ok_or(ReleaseEvidenceStorageError::InvalidFixture)?,
             query_elapsed,
         )?,
+        point_in_time_selected_rows,
+        point_in_time_content_sha256,
+        point_in_time_audit_sha256,
+        point_in_time_retained_bytes,
         python_verified_rows: python.measured_rows,
         python_selected_rows_per_verification: python.selected_rows_per_verification,
         python_export_sha256: python.export_sha256,
