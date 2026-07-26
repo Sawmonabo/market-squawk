@@ -76,12 +76,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   research-runtime, shutdown, and restart-recovery authorities. The release closer requires the
   closed mandatory surface set, exact executable identity, a real `DirectVerified` paper action,
   admitted FRED/ALFRED persistence and model-training rights, and complete restart evidence.
-  SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, complete working
-  Treasury daily-rate ingestion, and the authorized Coinbase Direct trace remain fail-closed
-  acceptance inputs; no release predicate was manufactured. Official Treasury/Data.gov research
-  dated 2026-07-26 establishes CC0 durable-use authority for all five daily-rate families, so
-  Treasury is now an internal mandatory implementation and exact-head acceptance gap rather than
-  an external rights blocker.
+  SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, Treasury daily-rate
+  exact-head external proof, and the authorized Coinbase Direct trace remain fail-closed acceptance
+  inputs; no release predicate was manufactured. Official Treasury/Data.gov research dated
+  2026-07-26 establishes CC0 durable-use authority for all five daily-rate families, and the
+  mandatory internal implementation subsequently completed at `50912c1`.
 - Task 19 local control-plane candidate `879e505223729fee4a5be607b21a6deb396f849f`
   is integrated unchanged after independent exact-range review reported zero Critical, Important,
   or Minor findings. The shipping CLI now owns full-product `init`, provenance-bearing redacted
@@ -565,14 +564,15 @@ predicates remain open.
 The provider, research/model, and execution/paper implementation lanes are integrated. Remaining
 work is no longer represented as those three active implementation lanes:
 
-1. Complete all five official Treasury daily-rate families through retrieval, normalization,
-   durable local publication, query, restart recovery, and exact-head release evidence. Then run
-   the authorized provider producer with the remaining external SEC/BLS evidence,
-   FRED/ALFRED durable-use rights, and Coinbase Direct credential inputs. Issues `#7` and `#31`
-   remain open until those predicates succeed.
-2. Freeze the Quarter 4 candidate only after the Task 19A predicates close. Task 20
-   then owns the single full nonincremental gate, clean-machine demonstration, fuzz/security/
+1. Run the mandatory unchanged-head provider acceptance. The five-family Treasury daily-rate
+   implementation is complete at `50912c18271a0389fb5ac8817555230930dd0506`; the provider run must
+   still retrieve, publish, query, and recover fresh official Treasury bodies alongside the
+   remaining SEC/BLS evidence, FRED/ALFRED durable-use rights, and Coinbase Direct credential
+   inputs. Issues `#7` and `#31` remain open until those predicates succeed.
+2. Freeze the Quarter 4 candidate only after the Task 19A predicates close, then run Task 20's
+   mandatory single full nonincremental gate, clean-machine demonstration, fuzz/security/
    performance evidence, grouped exact-head review, release publication, and repository closeout.
+   These are release requirements, not optional follow-up work.
 
 Task 20 hardening preparation may continue while externally coordinated provider inputs are
 obtained, but final provider evidence and every Task 20 exact-head artifact are serialized behind
@@ -631,3 +631,37 @@ credential/network trace, provider terms confirmation, unresolved FRED/ALFRED du
 contract, exact-head provider evidence, final fuzz/performance/full-gate evidence, grouped Quarter
 4 review, and release publication remain open. Hosted Actions remains externally blocked before
 checkout by the GitHub account billing/spending state; it has not exposed a code-owned CI failure.
+
+## 2026-07-26 five-family Treasury and Python release-matrix checkpoint
+
+Implementation commit `50912c18271a0389fb5ac8817555230930dd0506` completes the mandatory
+Treasury daily-rate product path. The public, no-credential profile now admits all six durable-use
+operations under the pinned Treasury/Data.gov CC0 evidence. The portal activates one bounded year
+range containing all five official families. The shipping adapter implements exact year, month,
+and all-history queries; strict family-specific XML schemas; checked financial values; canonical
+`OfficialDelayed` observations; raw-payload and revision lineage; complete-or-error cross-page
+integrity; Arrow/Parquet publication; queryability; and durable restart recovery.
+
+The exact-head provider producer derives its proof year from the active configuration, retrieves
+and publishes one common year for every family, verifies each result through
+`Macro.GetObservations`, and repeats the authority check after restart. The closer reconstructs
+each canonical family/query and binds the report to its exact daily-rate object, request digest,
+payload digest, manifest, and lineage. Invented family labels, permuted datasets, Fiscal Data
+objects, repeated pages, malformed empty entries, and partial bounded histories fail closed.
+
+The same commit hardens the signed Python release matrix. Closure now proves distinct signed
+CPython 3.12 and 3.13 tags and versions, reconciles each environment receipt with the declared
+support matrix, binds both roots to the same top-level signed release manifest and selected
+application/ONNX worker, and repeats the verification at publication barriers.
+
+Focused verification passed the Treasury adapter's existing consolidated suite, the existing
+Treasury profile authority test, the existing modeling content-identity regression, strict
+Treasury/modeling/application Clippy, application release-feature compile, Rust formatting,
+Python builder syntax validation, and diff integrity. A narrow re-review confirmed all five
+material integration findings resolved. No new integration-test executable or worktree was
+created. `.worktrees` remains empty and the root target is approximately 11 GiB, below the
+20 GiB ceiling.
+
+This checkpoint completes implementation, not the mandatory external proof. Task 19A and release
+closure remain blocked until the unchanged candidate exercises fresh official Treasury responses
+through this shipping path together with every other required provider predicate.

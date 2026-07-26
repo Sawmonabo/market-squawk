@@ -8,8 +8,8 @@ from activated research providers into immutable analytical datasets.
 | Document type | Operations runbook |
 | Audience | Local research operators, data stewards, and incident responders |
 | Status | Current, with provider limitations called out below |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
 
 ## Contents
 
@@ -113,14 +113,14 @@ code-owned revision may separately admit scoped retrieval without admitting dura
 | SEC company facts | Activate `sec.edgar-public`, then `ingest source` | Dataset `sec.company-facts.cik.<10-digit-CIK>`; object is the exact `https://data.sec.gov/api/xbrl/companyfacts/CIK<10-digit-CIK>.json` locator | Adapter path is implemented, but the profile is currently `refresh_required`; a new code-owned evidence revision must make activation available |
 | FRED/ALFRED | Registered adapter only | Dataset `fred:series-observations:<SERIES>:<REALTIME_START>:<REALTIME_END>` or the `alfred:` form; object `fred-page:<OFFSET>:10000:<PAGE_SHA256>:<METADATA_SHA256>` | The CLI does not list discovery objects, and the tracked rights decision blocks durable use |
 | BLS v1/v2 | Registered adapter only | Activated plan chooses `bls:timeseries:<public-v1\|registered-v2>:<PLAN_SHA256>`; object `bls:<CHUNK_INDEX>:<RESPONSE_SHA256>` | The CLI does not expose the plan-bound dataset or discovered response digest |
-| Treasury Fiscal Data | Registered adapter only | Dataset `treasury:fiscal-data:average-interest-rates-v2:<QUERY_SHA256>`; object `treasury-page:fiscal:<PAGE>=1+:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | The CLI does not list discovery objects |
-| Treasury daily par yield curve | Registered adapter only | Dataset `treasury:daily-par-yield-curve:<YEAR>`; object `treasury-page:yield:0:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | The CLI does not list discovery objects |
+| Treasury Fiscal Data | Portal setup, `source discover`, then `ingest source` | Dataset `treasury:fiscal-data:average-interest-rates-v2:<QUERY_SHA256>`; object `treasury-page:fiscal:<PAGE>=1+:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path |
+| Treasury daily rates | Portal setup, `source discover`, then `ingest source` | Datasets `treasury:daily-par-yield-curve:<YEAR>`, `treasury:daily-bill-rates:<YEAR>`, `treasury:daily-long-term-rates:<YEAR>`, `treasury:daily-real-par-yield-curve:<YEAR>`, and `treasury:daily-real-long-term-rates:<YEAR>`; object `treasury-page:daily-rate:0:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path for every configured year across all five families |
 | Portfolio export | `portfolio import <PATH> --account <ID> --confirm` | Dedicated portfolio manifest and account authority | Portfolio evidence enters through the dedicated workflow in [Portfolio and paper execution](portfolio-and-paper-execution.md) |
 
 The digest-bearing forms above describe what the adapters validate. They become selectable only
-when accepted application discovery evidence returns the exact identity. At the reviewed commit,
-FRED/ALFRED, BLS, and Treasury first-use ingestion is not a complete CLI workflow because no
-command returns the discovery batch from which those exact IDs are selected.
+when accepted application discovery evidence returns the exact identity. Treasury's portal and
+`source discover` command provide that authority. FRED/ALFRED and BLS remain unavailable for the
+release-state reasons in [Source coverage](../reference/source-coverage.md).
 
 ## Ingest a user-owned file
 
@@ -345,7 +345,7 @@ known.
 
 ### Revisions
 
-- SEC, FRED/ALFRED, BLS, and Treasury daily-yield records retain provider-specific revision
+- SEC, FRED/ALFRED, BLS, and Treasury daily-rate records retain provider-specific revision
   evidence where the provider supplies it.
 - Treasury Fiscal Data rows and user-owned file/portfolio rows use locally observed revision
   authority when no truthful provider order exists.
@@ -466,7 +466,7 @@ manifest and acquisition evidence according to the operator's retention policy.
 
 ## External sources
 
-External provider and format references were rechecked on 2026-07-23. Market Squawk's accepted
+External provider and format references were rechecked on 2026-07-26. Market Squawk's accepted
 rights evidence and frozen source remain authoritative for what the product may persist.
 
 - [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)
@@ -478,5 +478,6 @@ rights evidence and frozen source remain authoritative for what the product may 
 - [BLS API signatures](https://www.bls.gov/developers/api_signature.htm)
 - [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/)
 - [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed)
+- [Treasury daily-rates source and rights decision](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md)
 - [Apache Arrow format specification](https://arrow.apache.org/docs/format/)
 - [Apache Parquet format specification](https://github.com/apache/parquet-format)

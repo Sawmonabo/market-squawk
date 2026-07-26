@@ -106,19 +106,18 @@ work is bound by the single canonical
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
   authority, precision-preserving research time, immutable representation evidence, and the
   analytical ingestion service are composed end to end.
-- Evidence-bound Treasury Fiscal Data onboarding, activation, and average-interest-rates
-  extraction through the current local portal. It uses an allowlisted HTTPS client, bounded
-  pagination, exact provider metadata and payload evidence, conservative availability, durable
-  desired state, provider-isolated restart recovery, and precision-preserving
-  `market-squawk-research-v3` observations without an account, key, or paid service. SEC EDGAR,
-  FRED/ALFRED, BLS, and Treasury daily-yield adapter implementations exist behind the release and
-  rights blockers listed below; they are not presented as current first-use workflows.
+- Evidence-bound Treasury Fiscal Data and daily-rate onboarding, activation, and research
+  ingestion through the local portal without an account, key, or paid service. The daily-rate
+  workflow covers all five official families across a bounded year range, validates exact
+  family-specific XML and all-history pagination, publishes precision-preserving
+  `market-squawk-research-v3` observations, and recovers the exact research runtime after restart.
+  SEC EDGAR, FRED/ALFRED, and BLS implementations remain behind the release blockers below.
 - A bounded loopback onboarding portal for every built-in provider profile. It opens the exact
-  provider handoff automatically, commits no-credential Coinbase public, Kraken, and Treasury XML
-  sessions through their scoped probes, collects the three Coinbase Direct credential fields as
-  one write-only versioned secret, supports renewal/replacement and local-authority removal, and
-  keeps refresh- or rights-blocked profiles disabled. Research adapter configuration remains
-  provider-specific rather than being inferred from a successful account or source probe.
+  provider handoff automatically, commits no-credential Coinbase public and Kraken sessions,
+  activates Treasury XML as a real five-family research source, collects the three Coinbase Direct
+  credential fields as one write-only versioned secret, supports renewal/replacement and
+  local-authority removal, and keeps refresh- or rights-blocked profiles disabled. Research
+  adapter configuration remains provider-specific.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
@@ -210,8 +209,8 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | execution-eligible paper acceptance | Coinbase Direct is wired through the existing feature, strategy, central-risk, dispatcher, audit, checkpoint, and realistic paper engine. The required authorized unchanged-head live-to-paper demonstration has not yet been accepted | Issue `#7` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | The accepted control plane and loopback portal own guided provider handoff, no-credential and typed Coinbase Direct setup, shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, local-authority removal, OS-keyring-first routing, and encrypted fallback. The shipping exact-head evidence producer and release closer exercise and bind provider activation, live quality, research-runtime authority, restart recovery, exact executable identity, a required Direct paper action, and FRED/ALFRED durable-use admission. Release acceptance remains blocked because SEC and BLS still require successful official-body evidence, FRED/ALFRED durable use remains rights-blocked, Treasury daily XML lacks durable-use authority, and the authorized clean-machine trace is not accepted | Issue `#31` / Task 19A |
-| `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issue `#31` / Tasks 19A–20 |
+| `Missing` | complete provider-onboarding acceptance | The accepted control plane and loopback portal own guided provider handoff, no-credential and typed Coinbase Direct setup, shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, local-authority removal, OS-keyring-first routing, encrypted fallback, and a working five-family Treasury research activation. Release acceptance remains blocked by SEC/BLS official-body acceptance, FRED/ALFRED durable-use rights, the authorized Coinbase Direct trace, and one unchanged-head provider evidence run | Issue `#31` / Task 19A |
+| `Missing` | complete official research-provider workflows | Treasury Fiscal Data and all five Treasury daily-rate families now have real local workflows. SEC EDGAR and BLS remain `refresh_required`, while FRED/ALFRED remains `rights_blocked`; the complete mandatory provider set therefore remains release-blocking | Issue `#31` / Tasks 19A–20 |
 | `Missing` | release security/fuzz/performance gate | Task 19's local control plane and corrected source-adapter dependency boundary are accepted. The hardened fuzz, measurement, provider, offline all-vertical demonstration, and strict atomic evidence-closure producers are implemented, but no final unchanged-head provider/Python/demo/performance/security evidence set, grouped release review, publication, or closeout exists | Issue `#25` / Task 20 |
 
 This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
@@ -592,7 +591,7 @@ adapters/
 ├── market-squawk-adapter-paper/     realistic paper execution, accounting, audit, and recovery
 ├── market-squawk-adapter-portfolio/ raw-preserving holdings and transaction normalization
 ├── market-squawk-adapter-sec/       SEC submissions, filings, Company Facts, and inline XBRL
-└── market-squawk-adapter-treasury/  Fiscal Data and official yield-feed extraction
+└── market-squawk-adapter-treasury/  Fiscal Data and five-family daily-rate extraction
 python/                             local PIT data, finance, visualization, training, and examples
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, operations, reference, plans, research, and evidence

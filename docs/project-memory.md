@@ -1026,7 +1026,7 @@ provider evidence, production fuzz/performance evidence, the supervised full gat
 manifest, grouped Quarter 4 review, publication, and the remaining external provider predicates
 must still close against one unchanged candidate.
 
-## 2026-07-26 Treasury daily-rate authority correction
+## 2026-07-26 Treasury daily-rate authority and completion rule
 
 Treasury daily interest rates are a mandatory Market Squawk V1 capability. Official Treasury and
 Data.gov research now establishes the five supported feed families, their historical coverage,
@@ -1034,10 +1034,17 @@ and CC0 dataset-level authority for local persistence, analytics, backtesting, m
 controlled export. This supersedes the earlier conclusion that Treasury daily XML durable use was
 still an external rights blocker.
 
-The remaining Treasury gap is internal implementation and proof. The current adapter covers only
-the nominal par-yield family. V1 must cover nominal par yields, bill rates, long-term rates, real
-par yields, and real long-term rates through the production adapter, local analytical
-publication, bounded query, provenance, point-in-time semantics, restart recovery, portal/CLI/MCP
-surfaces, and exact-head release evidence. A source-only onboarding session, fixture, or metadata
-declaration cannot close this requirement. The maintained source and acceptance decision is
+Implementation commit `50912c18271a0389fb5ac8817555230930dd0506` now covers nominal par yields,
+bill rates, long-term rates, real par yields, and real long-term rates through the production
+adapter, bounded year/month/all-history queries, local analytical publication, query,
+provenance/revision evidence, restart recovery, the portal, and exact release-evidence producer and
+closer. Cross-page history is complete-or-error and rejects repeated payloads/rows, invalid page or
+date progression, malformed empty entries, and caller-bound truncation.
+
+Treasury is not optional and is not complete merely because the code exists. V1 remains blocked
+until one clean unchanged release candidate retrieves fresh official responses for all five
+families, durably publishes and queries them, recovers them after restart, and passes the terminal
+release closer. A source-only onboarding session, fixture, synthetic response, contract, metadata
+declaration, or provisional run cannot close this requirement. The maintained source and
+acceptance decision is
 [`docs/research/providers/2026-07-26-treasury-daily-rates-release-authority.md`](research/providers/2026-07-26-treasury-daily-rates-release-authority.md).

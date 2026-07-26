@@ -9,8 +9,8 @@ adapters.
 | Document type | Reference |
 | Audience | Operators, source-adapter authors, research engineers, risk engineers, and auditors |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
 
 ## Contents
 
@@ -263,7 +263,7 @@ operator has an active session or that mutable delivery acceptance is complete.
 | `fred-alfred.api-v1-v2` | FRED/ALFRED extraction and vintage adapter | `rights_blocked` | Provider account and API key; explicit manual secret import | Macroeconomic, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
 | `bls.v1-unregistered` | BLS public API v1 extraction | `refresh_required` | Public; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
 | `bls.v2-registered` | BLS public API v2 extraction | `refresh_required` | Provider registration, API key, and non-secret contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
-| `treasury.daily-rates-xml` | Treasury daily par-yield XML extraction | `rights_limited` | Public; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
+| `treasury.daily-rates-xml` | Five-family Treasury daily-rate XML research ingestion | `available` | Public; no account, key, or contact | Macroeconomic; nominal curves from 1990, bills from 2002, long-term and real long-term from 2000, real curves from 2003; delayed, non-venue, historical | `official_delayed` |
 | `treasury.fiscal-data` | Fiscal Data average-interest-rates v2 extraction | `available` | Public; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
 | `local.files` | Bounded user-owned file extraction and research ingestion | `available` | Local user-authorized root; no remote credential | Alternative data, delayed, non-venue, network denied, revision-preserving | `direct_unverified` |
 | `local.portfolio-imports` | Raw-preserving holdings/transactions import and reconciliation | `available` | Local user-authorized root; no onboarding credential | Portfolio, delayed, non-venue, network denied, revision-preserving | `direct_unverified` |
@@ -365,10 +365,10 @@ Research activation requires an active immutable onboarding lease for the exact 
 source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
 activation request is a closed schema-version-2 object, capped at 1 MiB. Its provider kinds are
 `sec`, `bls`, `treasury_fiscal`, `treasury_daily_rates`, and `fred_alfred`; each kind has a closed,
-provider-specific scope. The loopback portal exposes SEC, BLS, and Treasury Fiscal research
-activation plus source-session activation for public Coinbase, Coinbase Direct, Kraken, and
-Treasury daily XML. Source-session activation verifies and commits onboarding authority but does
-not manufacture a research adapter or durable-use right.
+provider-specific scope. The loopback portal exposes SEC, BLS, Treasury Fiscal, and Treasury daily
+research activation plus source-session activation for public Coinbase, Coinbase Direct, and
+Kraken. Source-session activation verifies onboarding authority but does not manufacture a
+research adapter or durable-use right.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |
@@ -376,7 +376,7 @@ not manufacture a research adapter or durable-use right.
 | BLS v1/v2 | Exact selected series and inclusive year range | Tier-specific endpoint and request plan; at most 1,000 series metadata inputs; v2 secret resolved only in explicit foreground work |
 | FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key plus exact per-series rights; revision-preserving; fail-closed durable rights assessment |
 | Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
-| Treasury daily XML | Daily par-yield curve for one year | Separate XML surface and evidence; Fiscal Data rights are not inherited |
+| Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
 
 The research metadata for these adapters uses a positive one-nanosecond `delayed` declaration and
 `unknown` delivery rather than claiming real-time or direct delivery.
@@ -391,10 +391,9 @@ that explicit resume. Invalid evidence, authority, or adapter state quarantines 
 At the reviewed commit, release and rights gates have concrete consequences:
 
 - SEC and both BLS profiles require a new admitted evidence refresh revision.
-- Treasury daily XML has pending persistence rights; Fiscal Data rights do not transfer to it.
 - FRED is rights-blocked, so an API key alone cannot produce an active lease.
-- Treasury Fiscal Data is the current built-in official profile whose release and all six rights
-  operations are admitted.
+- Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
+  rights operations admitted by their separate dataset-level evidence.
 
 ### FRED durable-rights boundary
 
@@ -474,7 +473,7 @@ redistribute.
 | FRED/ALFRED | Blocked | Blocked | Blocked | Blocked | Blocked | Blocked |
 | BLS v1 unregistered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
 | BLS v2 registered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
-| Treasury daily-rates XML | Admitted | Admitted | Pending | Pending | Pending | Pending |
+| Treasury daily-rates XML | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
 | Treasury Fiscal Data | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
 | Local files | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
 | Local portfolio imports | Admitted | Admitted | Admitted | Admitted | Admitted | Pending |
@@ -562,7 +561,8 @@ contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 | [BLS API terms of service](https://www.bls.gov/developers/termsOfService.htm) | BLS provenance, representation, limits, and third-party-rights boundary | 2026-07-23 |
 | [FRED API documentation](https://fred.stlouisfed.org/docs/api/fred/) | Series, observations, and vintage interfaces implemented by the adapter | 2026-07-23 |
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | API access does not override third-party series rights; scope-specific permission may still be required | 2026-07-23 |
-| [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Daily-rate XML is a distinct provider surface | 2026-07-23 |
+| [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five provider families, start years, selectors, and zero-based all-history pagination | 2026-07-26 |
+| [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Matching public-access Data.gov records and CC0 durable-use admission | 2026-07-26 |
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Dataset-specific public API, query, paging, and provenance surface | 2026-07-23 |
 
 External provider pages define upstream interfaces and terms. The reviewed Market Squawk code head

@@ -9,8 +9,8 @@ authority-free source status views.
 | Document type | Operations runbook |
 | Audience | Source operators, data-rights reviewers, incident responders, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `50912c18271a0389fb5ac8817555230930dd0506` |
 
 ## Contents
 
@@ -21,6 +21,7 @@ authority-free source status views.
 - [Read source status, coverage, and health](#read-source-status-coverage-and-health)
 - [Register a source profile](#register-a-source-profile)
 - [Run the supported Treasury Fiscal Data setup](#run-the-supported-treasury-fiscal-data-setup)
+- [Run the supported Treasury daily-rates setup](#run-the-supported-treasury-daily-rates-setup)
 - [Understand the source activate boundary](#understand-the-source-activate-boundary)
 - [Discover and ingest an exact provider object](#discover-and-ingest-an-exact-provider-object)
 - [Exchange sources, capture, and bot authority](#exchange-sources-capture-and-bot-authority)
@@ -45,9 +46,9 @@ source discover <PROVIDER> --dataset <DATASET>
 source activate <REQUEST> --confirm
 ```
 
-This page covers those exact commands and the currently usable Treasury Fiscal Data portal path.
-It explains how the same source surface can have distinct profile, onboarding, extraction, and
-live-runtime states.
+This page covers those exact commands and the usable Treasury Fiscal Data and five-family
+daily-rates portal paths. It explains how the same source surface can have distinct profile,
+onboarding, extraction, and live-runtime states.
 
 At the reviewed commit there is no generic:
 
@@ -155,7 +156,7 @@ ledger.
 | `fred-alfred.api-v1-v2` | `rights_blocked` | `official_delayed` | All data-use operations are blocked; no key import, extraction, persistence, training, export, or redistribution procedure is authorized |
 | `bls.v1-unregistered` | `refresh_required` | `official_delayed` | BLS v1 extraction/onboarding is implemented but portal activation is disabled pending evidence refresh |
 | `bls.v2-registered` | `refresh_required` | `official_delayed` | BLS v2 registered-tier and key lifecycle are implemented but portal secret import and activation are disabled pending evidence refresh |
-| `treasury.daily-rates-xml` | `rights_limited` | `official_delayed` | No-credential portal probe and source-session activation admit retrieval/display only; durable publication remains closed |
+| `treasury.daily-rates-xml` | `available` | `official_delayed` | No-credential five-family research activation, durable publication, query, and restart recovery |
 | `treasury.fiscal-data` | `available` | `official_delayed` | Current supported portal workflow; no account, key, or paid service required |
 | `local.files` | `available` | `direct_unverified` | Use bounded `ingest file`; the portal accepts no filesystem path |
 | `local.portfolio-imports` | `available` | `direct_unverified` | Use bounded portfolio import commands; preserve user-owned source evidence |
@@ -165,7 +166,7 @@ The portal lists every profile with its handoff instruction, release state, and 
 full rights, duties, coverage, and evidence remain available in `source status` and
 `source coverage`. Setup is enabled only for `available` or `rights_limited` profiles with an
 exact source-session or research-adapter request. Public Coinbase, Coinbase Direct, Kraken,
-Treasury daily XML, and Treasury Fiscal Data therefore have guided setup; SEC and both BLS
+Treasury daily XML and Treasury Fiscal Data therefore have guided setup; SEC and both BLS
 profiles remain disabled while `refresh_required`, and FRED/ALFRED remains disabled while
 `rights_blocked`.
 
@@ -339,6 +340,34 @@ reconstructs the exact desired research adapter from the durable recipe without 
 The live-runtime fields may remain `not_active` or `not_established`; Treasury is a research
 extraction source, not a live market route.
 
+## Run the supported Treasury daily-rates setup
+
+Start the same bounded portal for the daily-rate surface:
+
+```bash
+"$MSQ" --config "$CONFIG" --output json \
+  source setup treasury.daily-rates-xml --confirm
+```
+
+Verify the loopback address as described above. In the Treasury daily-rates form, select an
+inclusive first year from 1990 through the current year and an inclusive last year from 2003
+through the current year. The last year must not precede the first. Selecting **Set up provider**
+creates a no-credential lease and one durable research configuration containing every official
+family available within the range:
+
+- nominal par yield curves from 1990;
+- bill rates from 2002;
+- long-term and real long-term rates from 2000; and
+- real par yield curves from 2003.
+
+The form activates the adapter; it does not download every configured year immediately. Use
+`source discover` and `ingest source` with one exact dataset such as
+`treasury:daily-bill-rates:2026`. A successful ingestion returns a manifest, row count, object
+count, byte count, and lineage digest. Verify the published dataset through
+`query dataset <DATASET_ID>` or `Macro.GetObservations`, then stop the portal with Ctrl-C and
+confirm `source status`, `source coverage`, and `source health` still report the active recovered
+session.
+
 ## Understand the source activate boundary
 
 The public command is:
@@ -377,7 +406,7 @@ The closed provider kinds are:
 | `sec` | No request-file evidence; must match an active `sec.edgar-public` lease |
 | `bls` | Exact series-metadata file references and hashes, inclusive start/end years, and either BLS surface lease |
 | `treasury_fiscal` | Inclusive first/last dates and page size for the exact Fiscal Data query |
-| `treasury_daily_rates` | Exact year for the daily par-yield-curve XML configuration |
+| `treasury_daily_rates` | Inclusive first/last years; every official family available in that range is activated |
 | `fred_alfred` | Exact rights artifact, API terms, services legal terms, privacy policy, per-series owner grants, operations, and validity intervals |
 
 Credential bytes are never part of this request. FRED's request shape does not override its
@@ -610,6 +639,7 @@ product currently admits.
 | [BLS API v2 signatures](https://www.bls.gov/developers/api_signature_v2.htm) | Exact registered-v2 request family, series identifiers, years, and registration-key field | 2026-07-23 |
 | [BLS terms of service](https://www.bls.gov/developers/termsOfService.htm) | Official API-use duties retained by the BLS profile | 2026-07-23 |
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Official Fiscal Service API query and pagination contract | 2026-07-23 |
-| [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Separate XML endpoint families and pagination behavior; rights are not inherited from Fiscal Data | 2026-07-23 |
+| [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five XML families, year/month selectors, and zero-based 300-row all-history pagination | 2026-07-26 |
+| [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Dataset-level public-access and CC0 evidence for durable local use | 2026-07-26 |
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Required API key, mutable terms, usage restrictions, and obligations that prevent implied durable rights | 2026-07-23 |
 | [FRED API key documentation](https://fred.stlouisfed.org/docs/api/fred/v2/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-23 |

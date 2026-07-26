@@ -9,7 +9,7 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-26 |
-| Implementation review base | `094172d4c6d32b73eecbdc6823ab284bdf09ad26` plus the release-demonstration change |
+| Implementation review base | `50912c18271a0389fb5ac8817555230930dd0506` |
 
 ## Contents
 
@@ -93,10 +93,11 @@ Configuration precedence, every environment mapping, and the provider-profile co
 `127.0.0.1`, an explicit port, no credentials, query, or fragment, and a lifetime from 30 seconds
 through one hour. A browser-launch failure does not terminate the portal; the URL remains in the
 command result and local log. The portal commits source-only sessions for public Coinbase,
-Coinbase Direct, Kraken, and Treasury daily XML; the Coinbase Direct form creates the exact
-version-1 credential envelope from separate write-only API-key, passphrase, and signing-secret
-fields. SEC, BLS, and Treasury Fiscal use provider-specific research-adapter forms. Buttons remain
-disabled when the code-owned profile is `refresh_required` or `rights_blocked`.
+Coinbase Direct, and Kraken. Treasury daily XML uses a provider-specific research form that selects
+an inclusive year range and activates all five official families; Treasury Fiscal has its own
+date/page form. The Coinbase Direct form creates the exact version-1 credential envelope from
+separate write-only API-key, passphrase, and signing-secret fields. Buttons remain disabled when
+the code-owned profile is `refresh_required` or `rights_blocked`.
 
 ### Research, datasets, and features
 
@@ -226,10 +227,12 @@ treasury.daily-rates-xml
 treasury.fiscal-data
 ```
 
-The producer can establish no-credential onboarding for public Coinbase, public Kraken, and the
-rights-limited Treasury XML probe. It does not invent SEC contact data, BLS series semantics,
-Treasury Fiscal query bounds, provider credentials, or FRED/ALFRED rights. Every selected surface
-must recover an exact active lease; durable research surfaces must also recover the same callable
+The producer can establish no-credential onboarding for public Coinbase and public Kraken. It
+requires a portal-prepared Treasury daily research runtime with all five official families and an
+inclusive configured range; it then retrieves, ingests, queries, and recovers one configured
+common year across those families. It does not invent SEC contact data, BLS series semantics,
+Treasury query bounds, provider credentials, or FRED/ALFRED rights. Every selected surface must
+recover an exact active lease; durable research surfaces must also recover the same callable
 runtime generation after a clean application shutdown and restart.
 
 Live surfaces are exercised one at a time through the production application. Public Coinbase and

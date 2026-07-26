@@ -8,10 +8,11 @@ required before the capability can be called complete.
 | --- | --- |
 | Document type | Provider source and rights decision |
 | Audience | Treasury adapter, research ingestion, onboarding, and release owners |
-| Status | Approved source basis; implementation and exact-head acceptance remain required |
+| Status | Approved source basis and implemented product path; exact-head external acceptance remains required |
 | Researched on | 2026-07-26 |
 | Provider | U.S. Department of the Treasury, Office of Debt Management |
 | Cost/account | Public HTTPS feed; no account, key, subscription, or paid service |
+| Implementation | `50912c18271a0389fb5ac8817555230930dd0506` |
 | Supersedes | The 2026-07-25 conclusion that daily-rate XML durable use remained unestablished |
 
 ## Contents
@@ -19,8 +20,7 @@ required before the capability can be called complete.
 - [Decision](#decision)
 - [Official source and coverage](#official-source-and-coverage)
 - [Durable-use authority](#durable-use-authority)
-- [Current implementation gap](#current-implementation-gap)
-- [Required implementation](#required-implementation)
+- [Implemented authority boundary](#implemented-authority-boundary)
 - [Required release evidence](#required-release-evidence)
 - [Sources](#sources)
 
@@ -46,8 +46,11 @@ recovery for every family.
 ## Official source and coverage
 
 Treasury documents one HTTPS XML endpoint with a required `data` family and a year, month, or
-all-history selector. The all-history form is zero-indexed and paginated; Treasury instructs
-developers to continue until a page contains no Atom entries.
+all-history selector. The all-history form is zero-indexed and returns 300 rows per complete page;
+Treasury instructs developers to increment page numbers until the feed contains no Atom entries.
+The adapter therefore treats an empty feed as the terminal response, rejects a malformed empty
+`<entry/>`, and verifies cross-page request order, payload and row uniqueness, ascending dates,
+page-size progression, and whole-query resource limits.
 
 The official start years are:
 
@@ -100,42 +103,28 @@ website media, or third-party material outside the identified datasets. Market S
 the official dataset identity, retrieval URL, retrieval time, payload digest, provider record
 identity, and publication/effective-time evidence.
 
-## Current implementation gap
+## Implemented authority boundary
 
-The repository currently implements only the nominal daily par-yield-curve family:
+The production path now includes:
 
-- `TreasurySourceConfig` has a single daily XML variant, `DailyParYieldCurve`.
-- `TreasuryYieldCurveProfile` fixes the provider key to `daily_treasury_yield_curve`.
-- the parser and normalizer understand only nominal curve maturity fields;
-- the onboarding portal submits `treasury.daily-rates-xml` as a source-only session; and
-- terminal provider validation performs no Treasury daily-runtime or persistence check.
+1. A closed `TreasuryDailyRateFamily` type for all five official families, provider keys, start
+   years, typed schemas, and stable dataset and series identities.
+2. Exact year, month, and bounded all-history requests through the allowlisted Treasury endpoint.
+3. Strict namespace-aware parsing with checked decimals, null semantics, dates, maturities, rate
+   types, CUSIPs, duplicate rejection, and cross-page integrity tracking.
+4. Canonical `OfficialDelayed` macro observations carrying exact payload, source-record,
+   publication, availability, ingestion, revision, and lineage evidence.
+5. A no-credential portal form that selects an inclusive year range and activates every family
+   available within that range as one durable research runtime.
+6. Discovery, extraction, Arrow/Parquet publication, DataFusion-backed query, and restart recovery
+   through the same application services used by CLI and MCP.
+7. A release producer that retrieves, publishes, queries, and recovers one configured common year
+   for every family, plus a closer that recomputes the exact family, dataset, request, object, and
+   payload bindings rather than trusting report labels.
 
-The existing nominal parser, bounded HTTP client, research-source contract, lineage handling, and
-publication coordinator are reusable foundations. They do not prove complete Treasury daily-rate
-coverage.
-
-## Required implementation
-
-The production adapter must add:
-
-1. A closed `TreasuryDailyRateFamily` type covering all five provider keys, schemas, official start
-   years, and stable dataset/series identities.
-2. Bounded year, month, and all-history requests with exact allowlisted URLs, zero-based pagination,
-   terminal-page detection, cancellation, timeouts, body limits, and source health.
-3. Strict namespace-aware parsers for all five schemas, including provider null semantics,
-   checked decimals, dates, maturities, rate types, CUSIPs, duplicate detection, and unknown-field
-   policy.
-4. Canonical macro observations with explicit units, effective date, published/available/ingested
-   times, source record identity, exact payload digest, quality, rights evidence, and revision
-   handling.
-5. Discovery and extraction across every selected family and requested time range.
-6. Portal configuration that activates a real Treasury daily research adapter. The default V1
-   setup selects all five families and a bounded historical range; advanced users may narrow the
-   family set or range.
-7. Durable publication through the existing Arrow/Parquet research coordinator, manifest and
-   lineage authority, deduplication, point-in-time query path, and restart recovery.
-8. Updated source coverage, health, doctor, CLI, MCP, and reference output that reports the exact
-   admitted families and time coverage.
+This implementation does not close the external acceptance predicate by itself. The unchanged
+release candidate must still retrieve fresh official bodies through the shipping adapter and
+publish the resulting exact-head evidence.
 
 ## Required release evidence
 
