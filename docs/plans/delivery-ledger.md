@@ -76,9 +76,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   research-runtime, shutdown, and restart-recovery authorities. The release closer requires the
   closed mandatory surface set, exact executable identity, a real `DirectVerified` paper action,
   admitted FRED/ALFRED persistence and model-training rights, and complete restart evidence.
-  SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, Treasury daily-XML
-  durable-use rights, and the authorized Coinbase Direct trace remain fail-closed external
-  acceptance inputs; no release predicate was manufactured.
+  SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, complete working
+  Treasury daily-rate ingestion, and the authorized Coinbase Direct trace remain fail-closed
+  acceptance inputs; no release predicate was manufactured. Official Treasury/Data.gov research
+  dated 2026-07-26 establishes CC0 durable-use authority for all five daily-rate families, so
+  Treasury is now an internal mandatory implementation and exact-head acceptance gap rather than
+  an external rights blocker.
 - Task 19 local control-plane candidate `879e505223729fee4a5be607b21a6deb396f849f`
   is integrated unchanged after independent exact-range review reported zero Critical, Important,
   or Minor findings. The shipping CLI now owns full-product `init`, provenance-bearing redacted
@@ -562,9 +565,11 @@ predicates remain open.
 The provider, research/model, and execution/paper implementation lanes are integrated. Remaining
 work is no longer represented as those three active implementation lanes:
 
-1. Run the authorized exact-head provider producer when the external SEC/BLS evidence,
-   FRED/ALFRED durable-use rights, Treasury daily-XML durable-use rights, and Coinbase Direct
-   credential inputs exist. Issues `#7` and `#31` remain open until that evidence succeeds.
+1. Complete all five official Treasury daily-rate families through retrieval, normalization,
+   durable local publication, query, restart recovery, and exact-head release evidence. Then run
+   the authorized provider producer with the remaining external SEC/BLS evidence,
+   FRED/ALFRED durable-use rights, and Coinbase Direct credential inputs. Issues `#7` and `#31`
+   remain open until those predicates succeed.
 2. Freeze the Quarter 4 candidate only after the Task 19A predicates close. Task 20
    then owns the single full nonincremental gate, clean-machine demonstration, fuzz/security/
    performance evidence, grouped exact-head review, release publication, and repository closeout.

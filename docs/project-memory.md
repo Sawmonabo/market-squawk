@@ -1025,3 +1025,19 @@ These authority corrections are focused Task 20 preparation, not final release a
 provider evidence, production fuzz/performance evidence, the supervised full gate, the closed
 manifest, grouped Quarter 4 review, publication, and the remaining external provider predicates
 must still close against one unchanged candidate.
+
+## 2026-07-26 Treasury daily-rate authority correction
+
+Treasury daily interest rates are a mandatory Market Squawk V1 capability. Official Treasury and
+Data.gov research now establishes the five supported feed families, their historical coverage,
+and CC0 dataset-level authority for local persistence, analytics, backtesting, model training, and
+controlled export. This supersedes the earlier conclusion that Treasury daily XML durable use was
+still an external rights blocker.
+
+The remaining Treasury gap is internal implementation and proof. The current adapter covers only
+the nominal par-yield family. V1 must cover nominal par yields, bill rates, long-term rates, real
+par yields, and real long-term rates through the production adapter, local analytical
+publication, bounded query, provenance, point-in-time semantics, restart recovery, portal/CLI/MCP
+surfaces, and exact-head release evidence. A source-only onboarding session, fixture, or metadata
+declaration cannot close this requirement. The maintained source and acceptance decision is
+[`docs/research/providers/2026-07-26-treasury-daily-rates-release-authority.md`](research/providers/2026-07-26-treasury-daily-rates-release-authority.md).

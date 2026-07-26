@@ -57,6 +57,9 @@ decisions can be audited without relying on conversation history.
 
 ## Provider decisions
 
+- [Treasury daily rates release authority](providers/2026-07-26-treasury-daily-rates-release-authority.md)
+  — official five-family feed coverage, CC0 durable-use authority, current implementation gap,
+  and mandatory V1 release evidence.
 - [FRED and ALFRED API rights decision](providers/fred-alfred-rights-2026-07-22.md) — current API
   key contract, durable-storage and model-use restrictions, third-party-series boundary, and exact
   release gate.
