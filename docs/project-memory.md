@@ -967,3 +967,32 @@ head, but its `verify`, `macos`, and `windows` jobs each contain zero steps and 
 payment/spending-limit annotation; no repository code executed and no code-owned CI defect is
 present in that run. Issues `#7`, `#25`, and `#31` remain open and In Progress until their actual
 Coinbase Direct, provider-rights, and exact-candidate release predicates close.
+
+## 2026-07-26 guided provider-onboarding coverage checkpoint
+
+Release capability head `2a8e9ab473203949cbf1fb18648f0bc1fb4c9dee`, tree
+`eaff305b5146c4ef54134ccfbde9325cfa00efd9`, closes the portal-coverage gap found during the
+external-acceptance preflight. The portal had listed every built-in profile but could activate only
+SEC, BLS, and Treasury Fiscal research requests; rights-limited Coinbase, Coinbase Direct, Kraken,
+and Treasury daily XML were disabled despite having scoped setup authority.
+
+The corrected portal has a separate source-session request admitted only for those four exact
+surfaces. It commits no-credential probes, verifies and commits the Coinbase Direct credential
+generation, never constructs a research adapter through that path, and rejects research surfaces
+before provider verification can run. Coinbase Direct uses three write-only fields to construct
+the exact version-1 secret envelope inside the loopback page. Guided renewal/replacement,
+cleanup continuation, terminal-session restart, and product-owned local-authority removal remain
+inside the existing bounded lifecycle and secure-store authority. Refresh-required SEC/BLS and
+rights-blocked FRED/ALFRED remain visibly disabled rather than being promoted by UI logic.
+
+The exact integrated head passed the source-session allowlist/commit test in the existing library
+harness, the existing CSRF/write-only-secret portal vertical, strict application
+all-target/all-feature Clippy, formatting, diff integrity, and direct JavaScript syntax
+validation. No new test target, worktree, duplicate target directory, or origin feature branch was
+created. The merged local feature branch was deleted and worktree/remote metadata was pruned. The
+root target is 17,055,000 KiB with 9,500 KiB of incremental state, below the 20 GiB ceiling.
+
+This checkpoint removes an internal Task 19A implementation defect but does not close the external
+acceptance predicates: SEC/BLS evidence refresh, FRED/ALFRED durable-use authority, Treasury daily
+XML durable-use authority, the authorized Coinbase Direct trace, and the clean-machine provider
+evidence run remain open.

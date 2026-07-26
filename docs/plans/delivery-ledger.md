@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `4ac54d261401320d8e18eac7eadc7b86501cb852`
-  (`feat(release): add exact-head product demonstration`), tree
-  `571ff42e54c61839bcaa73fd2da6b95577d2afba`.
+  `2a8e9ab473203949cbf1fb18648f0bc1fb4c9dee`
+  (`feat(onboarding): complete guided provider setup`), tree
+  `eaff305b5146c4ef54134ccfbde9325cfa00efd9`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -111,6 +111,16 @@ evidence; it does not replace the README capability truth or the canonical relea
   fuzz workspace's locked offline metadata admission, and ownership-map JSON validation. The
   demonstration proves the complete offline product surface without fabricating the separately
   required authorized Coinbase Direct trace or provider persistence/training rights.
+- Provider-onboarding coverage is integrated at `2a8e9ab`. The loopback portal now commits scoped
+  source sessions for public Coinbase, Coinbase Direct, Kraken, and Treasury daily XML; builds the
+  closed Coinbase credential envelope from separate write-only fields; continues cleanup and
+  restart flows; and exposes product-owned local-authority removal. Research surfaces cannot enter
+  that source-only path. The provider evidence producer now commits its automatically probed
+  no-credential sessions before requiring active authority.
+- Exact integrated evidence passed the new source-session allowlist/commit test in the existing
+  library harness and the existing CSRF/write-only-secret portal vertical. Strict application
+  all-target/all-feature Clippy, formatting, diff integrity, and direct Node syntax validation of
+  the embedded portal JavaScript passed. No new test executable or worktree was created.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
@@ -128,6 +138,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   empty, the root incremental directory is approximately 9 MiB, and approximately 114 GiB is free.
   The release-demonstration lane then reclaimed 7.1 GiB before its clean worktree and merged local
   branch were removed; no matching origin branch existed, and worktree/remote metadata was pruned.
+  The onboarding-coverage lane used the root target, introduced no worktree or origin branch, and
+  deleted its merged local feature branch immediately after fast-forward integration. The root
+  target is 17,055,000 KiB, below its 20 GiB ceiling, with 9,500 KiB of incremental state.
 - Dependabot pull requests `#2`, `#32`, `#33`, `#34`, and `#35` are merged; superseded updates
   `#3` and `#4` are closed. No dependency pull request or Dependabot branch remains open locally or
   on origin.
