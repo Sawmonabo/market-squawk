@@ -80,7 +80,9 @@ impl CoinbaseDirectSigningCapability for FixtureSigner {
 }
 
 #[derive(Debug)]
-struct FixtureAuthorizationSubjectResolver;
+struct FixtureAuthorizationSubjectResolver {
+    subject: SourceIdentifier,
+}
 
 impl AuthorizationSubjectResolver for FixtureAuthorizationSubjectResolver {
     fn resolve_subject_record(
@@ -91,8 +93,7 @@ impl AuthorizationSubjectResolver for FixtureAuthorizationSubjectResolver {
         if mode != AuthorizationMode::UserAuthorized {
             return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
         }
-        SourceIdentifier::try_from("coinbase-direct-fixture-credential")
-            .map_err(|_| AuthorizationSubjectResolutionError::EvidenceUnresolved)
+        Ok(self.subject.clone())
     }
 }
 
@@ -541,9 +542,12 @@ fn live_generation(
     market_squawk_sources::CurrentSourceSession,
     LiveSourceGeneration,
 )> {
+    let resolver = FixtureAuthorizationSubjectResolver {
+        subject: identifier(&format!("{session_id}-credential"))?,
+    };
     let mut registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
-            Arc::new(FixtureAuthorizationSubjectResolver),
+            Arc::new(resolver),
         )?;
     let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
     let session = registry.begin_session(
