@@ -846,3 +846,32 @@ confirmed both lifecycle remediations and found no regression in their immediate
 surface. No new test target was added. The remaining Direct blocker is an authorized unchanged-head
 external credential-to-qualified-book-to-paper trace, coordinated with the provider clean-machine
 acceptance work and final Task 20 evidence.
+
+## 2026-07-25 provider release-admission checkpoint
+
+Provider release admission is integrated at product head
+`bf02a0b3d35108f1ef771f3e7e292a552395f126`. The shipping
+`release evidence providers` command is the sole provider acceptance producer. It must use the
+production `LocalProduct` authorities, an exact clean repository head/tree, explicit operator
+network and terms gates, exact built-in surface identifiers, an absent controlled output
+directory, and the running executable's stable identity. It records credential-free capability,
+rights, runtime-response, live-quality, paper-action, shutdown, and restart-recovery evidence and
+publishes only after the repository and executable remain unchanged.
+
+The release closer requires the complete mandatory provider set, exact evidence-to-release-binary
+identity, `DirectVerified` Coinbase Direct quality with a nonempty risk-approved paper action,
+`DirectUnverified` public Coinbase/Kraken evidence with no orders, callable durable research
+runtimes, admitted FRED/ALFRED persistence and model-training rights, and exact restart recovery.
+Diagnostic subsets cannot close the release.
+
+Capability revisions 1 and 2 remain immutable. Revised SEC, FRED/ALFRED, BLS, Treasury daily XML,
+and Treasury Fiscal contracts use contiguous revision 3. FRED limits are enforced conjunctively in
+both capability and activated-runtime layers. Treasury daily XML uses one code-owned completed
+year, an exact family/year request, and the production bounded schema parser.
+
+The acceptance producer does not convert missing external evidence into authority. SEC and BLS
+remain refresh-required until accepted successful official bodies exist; FRED/ALFRED durable use
+remains rights-blocked; Treasury daily XML durable publication remains closed; and Coinbase Direct
+still requires its authorized unchanged-head external trace. Issues `#7` and `#31` remain open until
+those exact predicates are satisfied. The provider release-admission worktree, its 6.9 GiB generated
+target, and its merged local/origin feature branch were removed after integration and push.

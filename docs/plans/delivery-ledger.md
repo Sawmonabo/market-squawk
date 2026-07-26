@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `041175590bd2e4a357ea28d75c675c252d3b3746`
-  (`merge: Coinbase Direct paper execution`), tree
-  `b0233f5b60cb6451d3feab410dba32abcc1144ba`.
+  `bf02a0b3d35108f1ef771f3e7e292a552395f126`
+  (`merge: provider release admission`), tree
+  `b626e0e5bf9ffb9c29c4d982ebb66b41f11a1c5d`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -70,6 +70,15 @@ evidence; it does not replace the README capability truth or the canonical relea
   exact cutover and recovery transitions, strict no-default and release-evidence Clippy, formatting,
   and diff integrity passed. Issue `#31` remains In Progress because provider release availability
   and the clean-machine activation/recovery acceptance evidence remain incomplete.
+- Provider release-admission candidate `978db45a0c60427531fc6e3d44fd4d52ba75772a`
+  is integrated at `bf02a0b`. The production CLI now collects exact-head provider evidence through
+  the shipping onboarding, activation, live-quality, central-risk, paper-execution,
+  research-runtime, shutdown, and restart-recovery authorities. The release closer requires the
+  closed mandatory surface set, exact executable identity, a real `DirectVerified` paper action,
+  admitted FRED/ALFRED persistence and model-training rights, and complete restart evidence.
+  SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, Treasury daily-XML
+  durable-use rights, and the authorized Coinbase Direct trace remain fail-closed external
+  acceptance inputs; no release predicate was manufactured.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
@@ -77,9 +86,13 @@ evidence; it does not replace the README capability truth or the canonical relea
   performance-evidence worktree, its 1.0 GiB generated target, both merged local branches, and the
   remaining origin feature branch are also removed and pruned. The accepted provider-onboarding
   lane reclaimed 6.8 GiB before its clean worktree and merged local branch were removed; no matching
-  origin branch existed. Only the release worktree remains. Its generated target is approximately
-  11 GiB, below the enforced 20 GiB ceiling with a zero-byte incremental cache; `.worktrees` is
-  empty and approximately 113 GiB is free.
+  origin branch existed. The provider release-admission lane reclaimed 6.9 GiB before its clean
+  worktree and merged local/origin branch were removed and metadata was pruned. Only the release
+  worktree remains. Its generated target is approximately 13 GiB, below the enforced 20 GiB
+  ceiling; `.worktrees` is empty and approximately 115 GiB is free.
+- Dependabot pull requests `#2`, `#32`, `#33`, `#34`, and `#35` are merged; superseded updates
+  `#3` and `#4` are closed. No dependency pull request or Dependabot branch remains open locally or
+  on origin.
 - Hosted Actions run `30182462309` at `3219662` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
   payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
@@ -474,21 +487,22 @@ demonstration, evidence, final review, exact-head release gate, publication, and
 Quarter 3 acceptance nor the completed documentation portal claims that the Market Squawk product
 release is complete.
 
-## Active Quarter 4 implementation wave
+## Active Quarter 4 closeout sequence
 
-The release head after documentation closeout is the common start barrier. Three grouped product
-lanes may proceed in parallel; the integration owner retains every shared composition and manifest
-hotspot.
+The provider, research/model, and execution/paper implementation lanes are integrated. Remaining
+work is no longer represented as those three active implementation lanes:
 
-| Lane | Start dependency | Owned implementation surface | Reserved integration hotspots | Focused gate | Merge order |
-| --- | --- | --- | --- | --- | --- |
-| Provider first use | Current onboarding/activation authority and code-owned provider evidence | Platform secret backends, source onboarding state, SEC/FRED/BLS/Treasury adapters, provider portal/activation modules | Workspace manifests/lock, `main.rs`, `local_product/mod.rs`, application descriptor registry, README/ledger | Affected platform/sources/adapters and consolidated provider/control-plane cases only | 1 |
-| Research/model first use | Current catalog, dataset, Python release, and model authority | Data/analytics/modeling/Python internals, dataset cursor/export handoff, feature publication, bounded artifact retrieval implementation | Workspace manifests/lock, global CLI enum, application descriptor registry/composition, README/ledger | Affected data/analytics/modeling/Python suites and existing control-plane cases only | 2 |
-| Execution/paper readiness | Current risk/dispatch/paper authority; final executable demo waits for provider qualification | Execution/live/paper modules, controlled strategy, paper lifecycle, effective fee bound | Workspace manifests/lock, application descriptor registry/composition, source qualification policy, README/ledger | Existing execution/live/paper and consolidated risk-execution cases only | 3 |
-| Integration owner | Accepted commits from all three lanes | Shared application/CLI/MCP wiring, conflict resolution, lockfile, release truth and issue state | Sole writer for every reserved hotspot | One affected integration gate after each merge; Task 20 owns the only full exact-head release gate | serialized |
+1. Reconcile Task 19 issues `#10` and `#24` against the shipping application/CLI/MCP composition,
+   implement any substantiated product gap, and record bounded local acceptance evidence.
+2. Run the authorized exact-head provider producer when the external SEC/BLS evidence,
+   FRED/ALFRED durable-use rights, Treasury daily-XML durable-use rights, and Coinbase Direct
+   credential inputs exist. Issues `#7` and `#31` remain open until that evidence succeeds.
+3. Freeze the Quarter 4 candidate only after the Task 19 and Task 19A predicates close. Task 20
+   then owns the single full nonincremental gate, clean-machine demonstration, fuzz/security/
+   performance evidence, grouped exact-head review, release publication, and repository closeout.
 
-Every worker uses `CARGO_INCREMENTAL=0`, its worktree-local default `target/`, and no broad workspace
-gate. Each lane stops before a reserved hotspot, reports the exact required integration change, and
-keeps tests to the smallest behavioral proof of a real authority or producer-to-consumer defect.
-The integration owner monitors all targets, stops a lane at its measured cache ceiling, and removes
-each clean worktree plus local/origin feature branch after accepted integration.
+Task 19 local acceptance and externally coordinated provider inputs may advance independently.
+Final provider evidence and every Task 20 exact-head artifact are serialized behind one unchanged
+release candidate. Focused work continues with `CARGO_INCREMENTAL=0`; only Task 20 may run the broad
+workspace gate. The root target remains capped at 20 GiB, and every completed feature lane must
+reclaim its generated target and delete its clean local/origin branch and worktree.
