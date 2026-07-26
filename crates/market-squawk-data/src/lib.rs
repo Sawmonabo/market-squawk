@@ -52,16 +52,16 @@ pub use authority_transition::{
 };
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
-    CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits, ContractCompletion,
-    DatasetManifestRecord, FairValueCatalogAuditEvent, FairValueCatalogCommit,
+    CatalogDiagnosticSnapshot, CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits,
+    ContractCompletion, DatasetManifestRecord, FairValueCatalogAuditEvent, FairValueCatalogCommit,
     FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
     FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
     FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
     IngestReservation, IngestRunRecord, IngestRunState, OnboardingAppendOutcome,
     OnboardingReservation, OnboardingReservationRequest, PinnedInstrumentDefinitions,
-    PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
-    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
-    StoredObservedRevision,
+    ProviderOnboardingDiagnostic, PublishedIngest, QueryArtifactReservation,
+    QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle, ResumedIngest,
+    ResumedProviderOnboarding, SourceCursor, StoredObservedRevision,
 };
 pub use catalog_capabilities::{
     FairValueCatalogCapability, InstrumentDefinitionReadCapability, OnboardingCatalogCapability,

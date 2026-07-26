@@ -7,6 +7,7 @@ use std::{
 use market_squawk::{
     LocalProduct, application::application_capabilities, mcp::LocalMcpComposition,
 };
+use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
 use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext};
 use serde_json::{Value, json};
@@ -25,10 +26,15 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         &environment,
         ConfigOverrides {
             data_dir: Some(temporary.path().to_path_buf()),
+            source_shutdown_ms: Some(60_000),
             ..ConfigOverrides::default()
         },
     ))?;
     let product = LocalProduct::try_new(config)?;
+    assert_eq!(
+        product.application().shutdown_timeout(),
+        Duration::from_secs(65)
+    );
     let artifacts = product.artifacts();
     let artifact = artifacts
         .publish(
@@ -83,6 +89,10 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         .map(|tool| tool["name"].as_str().ok_or("tool is missing its name"))
         .collect::<Result<Vec<_>, _>>()?;
     let expected_capabilities = application_capabilities()?;
+    validate_service_capabilities(
+        &expected_capabilities,
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )?;
     let expected_names = expected_capabilities
         .tools()
         .iter()

@@ -42,7 +42,6 @@ const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVE_START_TIMEOUT: Duration = Duration::from_secs(90);
 const LIVE_QUALIFICATION_TIMEOUT: Duration = Duration::from_secs(120);
 const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SHUTDOWN_BARRIER_MARGIN: Duration = Duration::from_secs(5);
 
 const COINBASE_PUBLIC: &str = "coinbase.public-market-data";
 const COINBASE_DIRECT: &str = "coinbase.exchange-direct-market-data";
@@ -208,16 +207,12 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     }
     let executable_path = env::current_exe().context("running executable path is unavailable")?;
     let executable = hash_stable_file(&executable_path, MAXIMUM_EXECUTABLE_BYTES)?;
-    let shutdown_timeout = config
-        .source_shutdown()
-        .checked_add(SHUTDOWN_BARRIER_MARGIN)
-        .ok_or_else(|| anyhow!("provider shutdown deadline overflow"))?;
-
     let product = LocalProduct::try_new(config.clone())
         .context("provider evidence could not initialize the local product")?;
+    let shutdown_timeout = product.application().shutdown_timeout();
     let collection =
         collect_provider_evidence(&product, &selected, &arguments, shutdown_timeout).await;
-    let shutdown = shutdown_product(&product, shutdown_timeout).await;
+    let shutdown = shutdown_product(&product).await;
     let (mut surfaces, expectations, direct_action, fred_rights) = match (collection, shutdown) {
         (Ok(collection), Ok(())) => collection,
         (Err(collection_error), Ok(())) => return Err(collection_error),
@@ -233,7 +228,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     let recovered = LocalProduct::try_new(config)
         .context("provider evidence could not reconstruct the local product")?;
     let recovery = verify_restart_recovery(&recovered, &expectations);
-    let recovered_shutdown = shutdown_product(&recovered, shutdown_timeout).await;
+    let recovered_shutdown = shutdown_product(&recovered).await;
     match (recovery, recovered_shutdown) {
         (Ok(()), Ok(())) => {}
         (Err(recovery_error), Ok(())) => return Err(recovery_error),
@@ -911,7 +906,8 @@ fn verify_restart_recovery(
     Ok(())
 }
 
-async fn shutdown_product(product: &LocalProduct, timeout: Duration) -> Result<()> {
+async fn shutdown_product(product: &LocalProduct) -> Result<()> {
+    let timeout = product.application().shutdown_timeout();
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| anyhow!("provider shutdown deadline overflow"))?;

@@ -13,7 +13,11 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
 fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> TestResult {
-    let config = app_config()?;
+    let temporary = tempfile::tempdir()?;
+    let config = app_config_with_overrides(ConfigOverrides {
+        data_dir: Some(temporary.path().join("data")),
+        ..ConfigOverrides::default()
+    })?;
     let source = config
         .coinbase()
         .ok_or("Coinbase production configuration missing")?;
@@ -71,10 +75,6 @@ fn controlled_local_paper_service_composes_without_network_access() -> TestResul
     );
     assert!(excessive.is_err());
     Ok(())
-}
-
-fn app_config() -> TestResult<AppConfig> {
-    app_config_with_overrides(ConfigOverrides::default())
 }
 
 fn app_config_with_overrides(overrides: ConfigOverrides) -> TestResult<AppConfig> {

@@ -101,7 +101,10 @@ impl ToolDescriptor {
     ///
     /// Returns [`ServiceCapabilityError`] when text, input, output, or contract invariants are
     /// violated.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor keeps every immutable transport contract explicit at admission"
+    )]
     pub fn try_new_with_output<A>(
         name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,
@@ -128,7 +131,10 @@ impl ToolDescriptor {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared validator receives the complete immutable descriptor contract"
+    )]
     fn try_new_inner<A>(
         name: impl Into<Arc<str>>,
         version: impl Into<Arc<str>>,

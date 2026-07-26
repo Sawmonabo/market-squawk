@@ -69,9 +69,24 @@ impl ProviderProfileView {
         self.id
     }
 
+    /// Returns the current immutable capability revision.
+    pub const fn capability_revision(&self) -> u64 {
+        self.capability_revision
+    }
+
     /// Returns the current release gate.
     pub const fn release_state(&self) -> ProfileReleaseState {
         self.release_state
+    }
+
+    /// Returns the rights-admission state bound into the current capability.
+    pub const fn rights_state(&self) -> RightsAdmissionState {
+        self.rights_state
+    }
+
+    /// Returns the maximum canonical quality this profile may produce.
+    pub const fn quality_ceiling(&self) -> DataQuality {
+        self.quality_ceiling
     }
 
     /// Returns the exact official handoff.

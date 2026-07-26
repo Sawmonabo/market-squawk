@@ -375,10 +375,7 @@ impl ProviderOnboardingService {
         limit: CatalogLimit,
     ) -> Result<Vec<OnboardingSessionView>, ProviderOnboardingError> {
         let sessions = self.catalog.current_provider_onboarding_sessions(limit)?;
-        sessions
-            .into_iter()
-            .map(|session| self.resume(session.reservation().session_id()))
-            .collect()
+        self.session_views(sessions)
     }
 
     /// Starts a durable session and completes every safe automatic step.

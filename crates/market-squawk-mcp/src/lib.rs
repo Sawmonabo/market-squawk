@@ -26,4 +26,4 @@ pub use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
-pub use server::{McpServer, ServerError, ServerExit};
+pub use server::{McpServer, ServerError, ServerExit, validate_service_capabilities};

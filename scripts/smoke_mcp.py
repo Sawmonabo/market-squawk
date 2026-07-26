@@ -11,8 +11,8 @@ import threading
 from typing import TextIO
 
 
-REQUEST_TIMEOUT_SECONDS = 5.0
-SHUTDOWN_TIMEOUT_SECONDS = 5.0
+REQUEST_TIMEOUT_SECONDS = 15.0
+SHUTDOWN_TIMEOUT_SECONDS = 25.0
 
 
 def require(condition: bool, message: str) -> None:
@@ -65,6 +65,18 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
 
+def finish_process(process: subprocess.Popen[str]) -> None:
+    require(process.stdin is not None, "MCP process stdin is unavailable")
+    process.stdin.close()
+    try:
+        return_code = process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        raise TimeoutError("MCP process did not complete bounded EOF shutdown") from error
+    require(return_code == 0, f"MCP process exited with status {return_code}")
+
+
 def main() -> int:
     if len(sys.argv) > 2:
         print("usage: smoke_mcp.py [/path/to/market-squawk]", file=sys.stderr)
@@ -79,7 +91,7 @@ def main() -> int:
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
     ):
         process = subprocess.Popen(
-            [str(binary), "--data-dir", data_dir, "mcp", "--offline"],
+            [str(binary), "--data-dir", data_dir, "mcp", "serve"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_log,
@@ -126,6 +138,27 @@ def main() -> int:
                 for tool in tool_entries
                 if isinstance(tool, dict) and isinstance(tool.get("name"), str)
             }
+            required_domains = {
+                "Source",
+                "Market",
+                "Research",
+                "Fundamental",
+                "Macro",
+                "Portfolio",
+                "Analysis",
+                "Model",
+                "FairValue",
+                "Bot",
+                "Execution",
+            }
+            observed_domains = {
+                name.split(".", maxsplit=1)[0] for name in names if "." in name
+            }
+            missing_domains = sorted(required_domains - observed_domains)
+            require(
+                not missing_domains,
+                f"MCP tool registry is missing required domains: {missing_domains}",
+            )
             require("Market.GetSnapshot" in names, "Market.GetSnapshot tool is missing")
             require("Risk.TriggerKillSwitch" in names, "Risk.TriggerKillSwitch tool is missing")
             tools_by_name = {
@@ -139,12 +172,17 @@ def main() -> int:
                 .get("org.market-squawk/tool-contract", {})
             )
             require(
-                snapshot_contract.get("maximumDataQuality") == "direct_unverified",
-                "Market.GetSnapshot must expose its structured quality ceiling",
+                snapshot_contract.get("domain") == "market",
+                "Market.GetSnapshot must expose its market-domain contract",
             )
             require(
-                snapshot_contract.get("executionAuthority") == "none",
-                "Market.GetSnapshot must expose its lack of execution authority",
+                snapshot_contract.get("authorization") == "read_only",
+                "Market.GetSnapshot must expose read-only authority",
+            )
+            require(
+                snapshot_contract.get("result", {}).get("sourceEvidence")
+                == "required",
+                "Market.GetSnapshot must require source and quality evidence",
             )
             kill_switch_contract = (
                 tools_by_name["Risk.TriggerKillSwitch"]
@@ -152,28 +190,78 @@ def main() -> int:
                 .get("org.market-squawk/tool-contract", {})
             )
             require(
-                kill_switch_contract.get("executionAuthority") == "none",
-                "Risk.TriggerKillSwitch must expose its lack of execution authority",
+                kill_switch_contract.get("domain") == "bot",
+                "Risk.TriggerKillSwitch must expose its paper-bot domain",
             )
             require(
-                kill_switch_contract.get("simulationAccess") == "none",
-                "Risk.TriggerKillSwitch must not read paper-simulation state",
+                kill_switch_contract.get("authorization") == "local_confirmation",
+                "Risk.TriggerKillSwitch must require local confirmation",
             )
-            require(
-                kill_switch_contract.get("controlAuthority")
-                == "paper_simulation_stop_only",
-                "Risk.TriggerKillSwitch must remain confined to paper-simulation control",
+            status = request(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "Bot.GetStatus",
+                        "arguments": {
+                            "resultLimits": {
+                                "maximumItems": 16,
+                                "maximumBytes": 65536,
+                            }
+                        },
+                    },
+                },
             )
+            require("error" not in status, f"Bot.GetStatus failed: {status}")
             require(
-                kill_switch_contract.get("resourceScope")
-                == "current_paper_simulation_run",
-                "Risk.TriggerKillSwitch must remain confined to the current local run",
+                status.get("result", {})
+                .get("structuredContent", {})
+                .get("data", {})
+                .get("state")
+                == "stopped",
+                "Bot.GetStatus did not reach the production application",
+            )
+            mutation = request(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "Risk.TriggerKillSwitch",
+                        "arguments": {
+                            "confirm": True,
+                            "reason": "production MCP smoke",
+                            "resultLimits": {
+                                "maximumItems": 16,
+                                "maximumBytes": 65536,
+                            },
+                        },
+                    },
+                },
+            )
+            require("error" not in mutation, f"Risk.TriggerKillSwitch failed: {mutation}")
+            require(
+                mutation.get("result", {})
+                .get("structuredContent", {})
+                .get("data", {})
+                .get("shutdownComplete")
+                is True,
+                "Risk.TriggerKillSwitch did not complete through governed paper control",
             )
             print("MCP smoke test passed")
         except BaseException as error:
             failure = error
         finally:
-            stop_process(process)
+            if failure is None:
+                try:
+                    finish_process(process)
+                except BaseException as error:
+                    failure = error
+            else:
+                stop_process(process)
         if failure is not None:
             stderr_log.seek(0)
             diagnostics = stderr_log.read().strip()

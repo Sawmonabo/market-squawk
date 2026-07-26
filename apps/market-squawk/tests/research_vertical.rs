@@ -877,7 +877,7 @@ async fn oversized_datafusion_result_returns_one_retrievable_opaque_parquet_refe
     Ok(())
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_context_deadline()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
@@ -932,25 +932,25 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
             NonZeroU16::new(8).ok_or("discovery bound is zero")?,
             NonZeroU32::new(16).ok_or("record bound is zero")?,
             NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
-            Duration::from_secs(1),
+            Duration::from_millis(50),
         )?,
         [discovery_registration, extraction_registration],
     )?;
     let context = deadline_context("bounded-discovery")?;
-    let started = tokio::time::Instant::now();
     assert!(matches!(
-        coordinator
-            .discover_registered_objects(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            coordinator.discover_registered_objects(
                 &discovery_profile,
                 &dataset,
                 None,
                 NonZeroU16::MIN,
                 &context,
-            )
-            .await,
+            ),
+        )
+        .await?,
         Err(ServiceError::DeadlineExceeded)
     ));
-    assert!(started.elapsed() <= Duration::from_secs(2));
 
     let context = deadline_context("bounded-extraction")?;
     let discovery = coordinator
@@ -973,12 +973,14 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
         selected.discovery_receipt(),
     )?;
     let context = deadline_context("bounded-extraction-ingest")?;
-    let started = tokio::time::Instant::now();
     assert!(matches!(
-        ResearchIngestCoordinator::ingest(&coordinator, &request, &context, context.limits()).await,
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ResearchIngestCoordinator::ingest(&coordinator, &request, &context, context.limits()),
+        )
+        .await?,
         Err(ServiceError::DeadlineExceeded)
     ));
-    assert!(started.elapsed() <= Duration::from_secs(2));
 
     ResearchIngestCoordinator::begin_shutdown(&coordinator);
     ResearchIngestCoordinator::finish_shutdown(

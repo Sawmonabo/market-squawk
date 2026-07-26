@@ -14,6 +14,7 @@ use market_squawk::{
         Cli, Command, ConfigCommand, McpCommand, OutputFormat, ProductionSourceArgument,
         ReleaseCommand, ReleaseEvidenceCommand, SourceCommand,
     },
+    doctor,
     local_product::execute_cli_command,
     mcp::LocalMcpComposition,
     paper_bot::local_paper_bot,
@@ -59,13 +60,39 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let paths = AppPaths::prepare(config.data_dir())?;
-            if let Some(path) = paths.journal_initialization_file("coinbase-exchange")?
-                && !path.exists()
-            {
-                paths.open_journal_writer("coinbase-exchange")?.flush()?;
+            let product = LocalProduct::try_new(config)?;
+            let initialization = (|| -> Result<()> {
+                if let Some(path) = product
+                    .paths()
+                    .journal_initialization_file("coinbase-exchange")?
+                    && !path.exists()
+                {
+                    product
+                        .paths()
+                        .open_journal_writer("coinbase-exchange")?
+                        .flush()?;
+                }
+                Ok(())
+            })();
+            let application = product.application();
+            let deadline = std::time::Instant::now()
+                .checked_add(application.shutdown_timeout())
+                .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
+            let shutdown = application.shutdown(deadline).await;
+            match (initialization, shutdown.is_complete()) {
+                (Ok(()), true) => {
+                    println!("initialized {}", product.paths().root().display());
+                }
+                (Err(error), true) => return Err(error),
+                (Ok(()), false) => {
+                    anyhow::bail!("local application initialization shutdown was incomplete");
+                }
+                (Err(error), false) => {
+                    return Err(error.context(
+                        "local application initialization failed and shutdown was incomplete",
+                    ));
+                }
             }
-            println!("initialized {}", paths.root().display());
         }
         Command::Config { command } => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
@@ -263,24 +290,7 @@ fn run_config_command(
     config: &AppConfig,
     output: OutputFormat,
 ) -> Result<()> {
-    let value = serde_json::json!({
-        "data_root_configured": !config.data_dir().as_os_str().is_empty(),
-        "products": config.products(),
-        "stale_after_ms": config.stale_after().as_millis(),
-        "capture_queue_capacity": config.capture_queue_capacity().get(),
-        "capture_memory_ceiling_bytes": config.capture_memory_ceiling_bytes().get(),
-        "capture_destination_registry_memory_ceiling_bytes": config
-            .capture_destination_registry_memory_ceiling_bytes()
-            .get(),
-        "paper_bot_enabled": config.paper_bot_enabled(),
-        "capture_flush_interval_ms": config.capture_flush_interval().as_millis(),
-        "capture_shutdown_ms": config.capture_shutdown().as_millis(),
-        "source_shutdown_ms": config.source_shutdown().as_millis(),
-        "training_release_configured": config.training_release_root().is_some(),
-        "source_secret_configured": config.source_secret().is_some(),
-        "coinbase_configured": config.coinbase().is_some(),
-        "kraken_configured": config.kraken().is_some(),
-    });
+    let value = serde_json::to_value(config.redacted_view())?;
     match command {
         ConfigCommand::Show => emit_result(output, "effective configuration", &value),
         ConfigCommand::Validate => {
@@ -317,7 +327,7 @@ async fn run_product_command(
         Ok(_) | Err(_) => Ok(()),
     };
     let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(10))
+        .checked_add(application.shutdown_timeout())
         .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
     let shutdown = application.shutdown(deadline).await;
     let result = result.map_err(anyhow::Error::from)?;
@@ -376,50 +386,14 @@ async fn hold_onboarding_portal(result: &serde_json::Value) -> Result<()> {
 }
 
 async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {
-    let storage_exists = config
-        .data_dir()
-        .try_exists()
-        .context("failed to inspect the configured local storage root")?;
-    let product = LocalProduct::try_new(config.clone());
-    let (application_composed, shutdown_complete, composition_error) = match product {
-        Ok(product) => {
-            let application = product.application();
-            let deadline = std::time::Instant::now()
-                .checked_add(Duration::from_secs(10))
-                .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
-            let report = application.shutdown(deadline).await;
-            (true, report.is_complete(), None)
-        }
-        Err(error) => (false, false, Some(error.to_string())),
+    let report = doctor::inspect(&config).await?;
+    let summary = if report.is_ready() {
+        "local readiness checks passed"
+    } else {
+        "local readiness is blocked"
     };
-    let value = serde_json::json!({
-        "status": "blocked",
-        "local_storage": {
-            "configured": !config.data_dir().as_os_str().is_empty(),
-            "exists": storage_exists,
-        },
-        "tracing": {
-            "local_only": true,
-            "remote_exporter": false,
-        },
-        "providers": {
-            "coinbase_configured": config.coinbase().is_some(),
-            "kraken_configured": config.kraken().is_some(),
-        },
-        "application": {
-            "composed": application_composed,
-            "shutdown_complete": shutdown_complete,
-            "error": composition_error,
-        },
-        "release_blockers": [
-            "release-approved activation evidence and portal-driven adapter registration for every required research provider",
-            "governed backtest input registration through MCP",
-            "execution-qualified live fair-value input publication with account-specific market-access authority",
-            "verified fail-closed local MCP startup authority on every supported operating system",
-            "release security, fuzz, benchmark, documentation, and full-workspace verification evidence",
-        ],
-    });
-    emit_result(output, "release readiness is blocked", &value)
+    let value = serde_json::to_value(report)?;
+    emit_result(output, summary, &value)
 }
 
 fn emit_result(output: OutputFormat, human_summary: &str, value: &serde_json::Value) -> Result<()> {

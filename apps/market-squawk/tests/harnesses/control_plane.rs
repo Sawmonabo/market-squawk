@@ -16,6 +16,72 @@ mod replay;
 mod research_vertical;
 
 #[cfg(test)]
+mod product_doctor {
+    use std::{collections::BTreeMap, ffi::OsString};
+
+    use market_squawk::doctor;
+    use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn reports_provenance_without_mutating_or_exposing_secret_locators() -> TestResult {
+        const SECRET_REFERENCE: &str = "keyring:doctor-secret-locator";
+
+        let temporary = tempfile::tempdir()?;
+        let environment = BTreeMap::from([(
+            OsString::from("MARKET_SQUAWK_SOURCE_SECRET"),
+            OsString::from(SECRET_REFERENCE),
+        )]);
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &environment,
+            ConfigOverrides {
+                data_dir: Some(temporary.path().to_path_buf()),
+                source_shutdown_ms: Some(60_000),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let entries_before = std::fs::read_dir(temporary.path())?.count();
+        let report = serde_json::to_value(doctor::inspect(&config).await?)?;
+        let entries_after = std::fs::read_dir(temporary.path())?.count();
+
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["configuration"]["sourceShutdownMs"]["value"], 60_000);
+        assert_eq!(report["configuration"]["sourceShutdownMs"]["origin"], "cli");
+        assert_eq!(
+            report["configuration"]["sourceSecretConfigured"]["value"],
+            true
+        );
+        assert_eq!(
+            report["configuration"]["sourceSecretConfigured"]["origin"],
+            "environment"
+        );
+        assert_eq!(entries_before, entries_after);
+        assert_eq!(report["localStorage"]["modifiedByInspection"], false);
+        assert_eq!(report["localStorage"]["layout"]["state"], "unavailable");
+        assert_eq!(report["application"]["descriptorContractValid"], true);
+        assert_eq!(report["application"]["requiredDomainsComplete"], true);
+        assert_eq!(report["mcp"]["descriptorContractValid"], true);
+        assert_eq!(report["artifacts"]["capabilityConfined"], false);
+        assert_eq!(report["artifacts"]["arbitraryPathAccess"], false);
+        assert!(
+            report["providers"]["surfaces"]
+                .as_array()
+                .is_some_and(|surfaces| !surfaces.is_empty())
+        );
+        assert_eq!(report["providers"]["runtimeObservation"], "not_observed");
+        assert!(
+            report["releaseBlockers"]
+                .as_array()
+                .is_some_and(|blockers| !blockers.is_empty())
+        );
+        assert!(!serde_json::to_string(&report)?.contains(SECRET_REFERENCE));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod portfolio_application {
     use std::error::Error;
     use std::io::Write as _;

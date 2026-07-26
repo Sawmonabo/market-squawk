@@ -90,13 +90,7 @@ impl<S: ToolServices> McpServer<S> {
     ) -> Result<Self, ServerError> {
         let sdk_reaper = SdkThreadReaper::process().map_err(|_error| ServerError::SdkThread)?;
         let capabilities = services.capabilities();
-        let tools: Arc<[Tool]> = capabilities
-            .tools()
-            .iter()
-            .map(to_rmcp_tool)
-            .collect::<Vec<_>>()
-            .into();
-        validate_capability_response(&tools, limits)?;
+        let tools = validated_protocol_tools(&capabilities, limits)?;
         Ok(Self {
             services,
             capabilities,
@@ -611,6 +605,36 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
     ) -> Result<CallToolResult, McpError> {
         self.execute_tool(request, context).await
     }
+}
+
+/// Validates the complete service capability set exactly as it will be advertised over MCP.
+///
+/// This is a pure diagnostic boundary: it converts every descriptor to its production MCP tool
+/// representation and proves the complete `tools/list` response fits the configured frame. It does
+/// not create an SDK runtime, acquire audit or artifact authority, or start a protocol session.
+///
+/// # Errors
+///
+/// Returns [`ServerError::InvalidComposition`] when the converted capability response cannot be
+/// encoded within the configured frame.
+pub fn validate_service_capabilities(
+    capabilities: &ServiceCapabilities,
+    limits: McpLimits,
+) -> Result<(), ServerError> {
+    validated_protocol_tools(capabilities, limits).map(|_tools| ())
+}
+
+fn validated_protocol_tools(
+    capabilities: &ServiceCapabilities,
+    limits: McpLimits,
+) -> Result<Arc<[Tool]>, ServerError> {
+    let tools = capabilities
+        .tools()
+        .iter()
+        .map(to_rmcp_tool)
+        .collect::<Vec<_>>();
+    validate_capability_response(&tools, limits)?;
+    Ok(tools.into())
 }
 
 fn structured_result(value: serde_json::Value) -> CallToolResult {

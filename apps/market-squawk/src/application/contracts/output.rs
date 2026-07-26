@@ -705,7 +705,8 @@ mod tests {
     use super::output_data_schema;
 
     #[test]
-    fn every_production_operation_has_a_code_owned_data_contract() {
+    fn every_production_operation_has_a_code_owned_data_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
         for operation in super::super::OPERATION_SPECS {
             assert!(
                 output_data_schema(operation.name).is_some(),
@@ -713,8 +714,7 @@ mod tests {
                 operation.name
             );
         }
-        let capabilities = super::super::application_capabilities()
-            .expect("all production output contracts must compose into descriptors");
+        let capabilities = super::super::application_capabilities()?;
         assert_eq!(
             capabilities.tools().len(),
             super::super::OPERATION_SPECS.len()
@@ -723,5 +723,6 @@ mod tests {
             descriptor.output_schema().get("type") == Some(&serde_json::json!("object"))
                 && descriptor.output_schema().get("oneOf").is_some()
         }));
+        Ok(())
     }
 }

@@ -2,6 +2,7 @@
 
 mod authority;
 mod backup;
+mod diagnostics;
 mod evidence;
 mod fair_value;
 mod migration_preflight;
@@ -24,6 +25,7 @@ pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
 };
+pub use self::diagnostics::{CatalogDiagnosticSnapshot, ProviderOnboardingDiagnostic};
 pub use self::fair_value::{
     FairValueCatalogAuditEvent, FairValueCatalogCommit, FairValueCatalogLink,
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogRecord,

@@ -12,6 +12,7 @@ pub mod backtest_strategy;
 pub mod bot;
 pub mod cli;
 pub mod diagnostic_engine;
+pub mod doctor;
 mod domain;
 pub mod features;
 pub mod live_runtime;

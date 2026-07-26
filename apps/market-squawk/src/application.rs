@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -70,6 +70,29 @@ const REQUIRED_DOMAINS: [ServiceDomain; 11] = [
     ServiceDomain::Bot,
     ServiceDomain::Execution,
 ];
+const APPLICATION_SHUTDOWN_DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// Validated whole-application shutdown budget derived from the admitted source deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplicationShutdownBudget(Duration);
+
+impl ApplicationShutdownBudget {
+    fn try_from_source_timeout(
+        source_timeout: Duration,
+    ) -> Result<Self, ApplicationCompositionError> {
+        if source_timeout.is_zero() {
+            return Err(ApplicationCompositionError::InvalidShutdownBudget);
+        }
+        source_timeout
+            .checked_add(APPLICATION_SHUTDOWN_DRAIN_MARGIN)
+            .map(Self)
+            .ok_or(ApplicationCompositionError::InvalidShutdownBudget)
+    }
+
+    const fn timeout(self) -> Duration {
+        self.0
+    }
+}
 
 /// One application-owned product-domain implementation.
 ///
@@ -173,6 +196,7 @@ impl fmt::Debug for ApplicationDomainServices {
 pub struct Application {
     capabilities: ServiceCapabilities,
     domains: ApplicationDomainServices,
+    shutdown_budget: ApplicationShutdownBudget,
     accepting_requests: AtomicBool,
     shutdown: tokio::sync::Mutex<Option<ApplicationShutdownReport>>,
 }
@@ -184,6 +208,10 @@ impl Application {
     /// Market, Bot, and Execution services. Every other authority owns exactly one domain. The
     /// resulting set still crosses [`ApplicationDomainServices::try_new`], so a misplaced,
     /// duplicated, or missing implementation fails before either CLI or MCP can receive it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each required product domain and the shared source deadline remain explicit at the sole composition root"
+    )]
     pub fn try_from_product_services(
         source: Arc<dyn ApplicationDomainService>,
         research: &ResearchApplicationServices,
@@ -192,6 +220,7 @@ impl Application {
         model: Arc<dyn ApplicationDomainService>,
         fair_value: Arc<dyn ApplicationDomainService>,
         paper: &PaperApplicationServices,
+        source_shutdown_timeout: Duration,
     ) -> Result<Self, ApplicationCompositionError> {
         let services = vec![
             source,
@@ -206,7 +235,10 @@ impl Application {
             paper.bot(),
             paper.execution(),
         ];
-        Self::try_new(ApplicationDomainServices::try_new(services)?)
+        Self::try_new(
+            ApplicationDomainServices::try_new(services)?,
+            source_shutdown_timeout,
+        )
     }
 
     /// Constructs the complete local service surface after every mandatory domain is ready.
@@ -216,13 +248,23 @@ impl Application {
     /// Returns [`ApplicationCompositionError`] if a code-owned descriptor is invalid.
     pub fn try_new(
         domains: ApplicationDomainServices,
+        source_shutdown_timeout: Duration,
     ) -> Result<Self, ApplicationCompositionError> {
         Ok(Self {
             capabilities: application_capabilities()?,
             domains,
+            shutdown_budget: ApplicationShutdownBudget::try_from_source_timeout(
+                source_shutdown_timeout,
+            )?,
             accepting_requests: AtomicBool::new(true),
             shutdown: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Returns the product-owned deadline budget for complete reverse-order shutdown.
+    #[must_use]
+    pub const fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_budget.timeout()
     }
 
     /// Atomically admits a transport-neutral request through its exact registered descriptor.
@@ -298,6 +340,7 @@ impl fmt::Debug for Application {
             .debug_struct("Application")
             .field("capabilities", &self.capabilities)
             .field("domains", &self.domains)
+            .field("shutdown_timeout", &self.shutdown_timeout())
             .field(
                 "accepting_requests",
                 &self.accepting_requests.load(Ordering::Acquire),
@@ -499,6 +542,9 @@ pub enum ApplicationCompositionError {
     /// One or more product domains is absent, duplicated, or unsupported.
     #[error("application domain services are incomplete")]
     IncompleteDomains,
+    /// The source shutdown deadline cannot produce a finite whole-application drain budget.
+    #[error("application shutdown budget is invalid")]
+    InvalidShutdownBudget,
     /// A code-owned descriptor violated the shared service contract.
     #[error("application capability contract is invalid: {0}")]
     Capability(#[from] ServiceCapabilityError),
@@ -536,7 +582,10 @@ mod tests {
                 retained: Arc::clone(&retained),
             }) as Arc<dyn ApplicationDomainService>
         });
-        let application = Application::try_new(ApplicationDomainServices::try_new(domains)?)?;
+        let application = Application::try_new(
+            ApplicationDomainServices::try_new(domains)?,
+            Duration::from_secs(5),
+        )?;
         let request = application.admit(
             "Source.Discover",
             json!({

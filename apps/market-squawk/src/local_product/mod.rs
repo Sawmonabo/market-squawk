@@ -292,6 +292,7 @@ impl LocalProduct {
             model,
             fair_value,
             &paper,
+            config.source_shutdown(),
         )?);
         Ok(Self {
             paths,
@@ -384,12 +385,7 @@ impl std::fmt::Debug for LocalProduct {
 }
 
 fn open_research(paths: &LocalPaths) -> Result<ResearchService, LocalProductError> {
-    let catalog = CatalogConfig::try_new(
-        paths.catalog()?.clone(),
-        CATALOG_BUSY_TIMEOUT,
-        CatalogLimit::new(CATALOG_MAXIMUM_ROWS)?,
-        CatalogResultLimits::try_new(CATALOG_MAXIMUM_RECORD_BYTES, CATALOG_MAXIMUM_RESULT_BYTES)?,
-    )?;
+    let catalog = local_catalog_config(paths)?;
     let objects =
         ObjectStoreConfig::try_new(MAXIMUM_STAGING_BYTES, MAXIMUM_ROW_GROUP_ROWS, ORPHAN_GRACE)?;
     ResearchService::open_or_initialize(
@@ -397,6 +393,16 @@ fn open_research(paths: &LocalPaths) -> Result<ResearchService, LocalProductErro
         catalog,
         MAXIMUM_OBJECTS_PER_DATASET_GENERATION,
         objects,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) fn local_catalog_config(paths: &LocalPaths) -> Result<CatalogConfig, LocalProductError> {
+    CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        CATALOG_BUSY_TIMEOUT,
+        CatalogLimit::new(CATALOG_MAXIMUM_ROWS)?,
+        CatalogResultLimits::try_new(CATALOG_MAXIMUM_RECORD_BYTES, CATALOG_MAXIMUM_RESULT_BYTES)?,
     )
     .map_err(Into::into)
 }

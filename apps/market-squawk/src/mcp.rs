@@ -13,10 +13,7 @@ mod journal_worker;
 #[cfg(test)]
 mod services;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use audit::DurableAuditSink;
 use market_squawk_mcp::{
@@ -37,7 +34,6 @@ pub struct LocalMcpComposition {
     server: HardenedMcpServer<Application>,
     audit: Arc<DurableAuditSink>,
     application: ApplicationOwner,
-    application_shutdown_timeout: Duration,
 }
 
 impl std::fmt::Debug for LocalMcpComposition {
@@ -47,10 +43,6 @@ impl std::fmt::Debug for LocalMcpComposition {
             .field("server", &self.server)
             .field("audit", &"[DURABLE BOUNDED AUDIT]")
             .field("application", &"[LIFECYCLE-OWNED APPLICATION]")
-            .field(
-                "application_shutdown_timeout",
-                &self.application_shutdown_timeout,
-            )
             .finish_non_exhaustive()
     }
 }
@@ -70,7 +62,6 @@ impl LocalMcpComposition {
         let control = paths.control_root()?.try_clone_directory()?;
         let audit = Arc::new(DurableAuditSink::try_new(control)?);
         let limit_spec = McpLimitSpec::default();
-        let application_shutdown_timeout = limit_spec.shutdown_timeout;
         let limits = McpLimits::try_from(limit_spec)?;
         let server =
             HardenedMcpServer::try_new(Arc::clone(&application), limits, audit.clone(), artifacts)?;
@@ -78,7 +69,6 @@ impl LocalMcpComposition {
             server,
             audit,
             application: ApplicationOwner::new(application),
-            application_shutdown_timeout,
         })
     }
 
@@ -91,11 +81,9 @@ impl LocalMcpComposition {
             server,
             audit,
             application,
-            application_shutdown_timeout,
         } = self;
         let server = server.serve_stdio(cancellation).await;
-        let application =
-            shutdown_application(application.application(), application_shutdown_timeout).await;
+        let application = shutdown_application(application.application()).await;
         finish_hardened_session(server, audit.flush(), application)
     }
 
@@ -114,13 +102,11 @@ impl LocalMcpComposition {
             server,
             audit,
             application,
-            application_shutdown_timeout,
         } = self;
         let server = server
             .serve_unverified_io(reader, writer, cancellation)
             .await;
-        let application =
-            shutdown_application(application.application(), application_shutdown_timeout).await;
+        let application = shutdown_application(application.application()).await;
         finish_hardened_session(server, audit.flush(), application)
     }
 }
@@ -148,11 +134,10 @@ impl Drop for ApplicationOwner {
 
 async fn shutdown_application(
     application: &Application,
-    shutdown_timeout: Duration,
 ) -> Result<ApplicationShutdownReport, LocalMcpApplicationShutdownError> {
     application.begin_shutdown();
     let deadline = Instant::now()
-        .checked_add(shutdown_timeout)
+        .checked_add(application.shutdown_timeout())
         .ok_or(LocalMcpApplicationShutdownError::InvalidDeadline)?;
     let report = application.shutdown(deadline).await;
     if report.is_complete() {

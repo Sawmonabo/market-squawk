@@ -3512,17 +3512,16 @@ mod tests {
             .await?)
     }
 
+    type TreasuryActivation = (
+        Box<[u8]>,
+        LoadedActivationEvidence,
+        ProviderAdapterActivationRequest,
+    );
+
     fn treasury_activation(
         product: &crate::LocalProduct,
         lease: &ProviderActivationLease,
-    ) -> Result<
-        (
-            Box<[u8]>,
-            LoadedActivationEvidence,
-            ProviderAdapterActivationRequest,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<TreasuryActivation, Box<dyn std::error::Error>> {
         let (provider, evidence) = portal_provider_request(
             lease.session_id(),
             ProviderPortalActivationRequest::TreasuryFiscal {

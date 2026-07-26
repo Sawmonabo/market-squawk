@@ -524,6 +524,59 @@ impl CatalogAuthority {
     }
 }
 
+pub(super) fn diagnostic_current_sessions(
+    connection: &rusqlite::Connection,
+    limit: super::CatalogLimit,
+    result_bytes: super::CatalogResultLimits,
+) -> Result<Vec<super::ProviderOnboardingDiagnostic>, CatalogError> {
+    let transaction = connection.unchecked_transaction()?;
+    let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+    let mut statement = transaction.prepare(
+        "SELECT candidate.session_id
+         FROM provider_onboarding_sessions AS candidate
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM provider_onboarding_sessions AS newer
+             WHERE newer.surface_id=candidate.surface_id
+               AND (
+                   newer.created_at_ns > candidate.created_at_ns
+                   OR (
+                       newer.created_at_ns = candidate.created_at_ns
+                       AND newer.session_id > candidate.session_id
+                   )
+               )
+         )
+         ORDER BY candidate.surface_id, candidate.session_id
+         LIMIT ?1",
+    )?;
+    let rows = statement.query_map([row_limit], |row| row.get::<_, String>(0))?;
+    let mut budget = ResultBudget::new(result_bytes);
+    let mut session_ids = Vec::new();
+    session_ids
+        .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+        .map_err(|_| CatalogError::Allocation)?;
+    for row in rows {
+        let session_id = row?;
+        budget.charge([session_id.len()])?;
+        session_ids.push(Uuid::parse_str(&session_id).map_err(|_| CatalogError::CorruptCatalog)?);
+    }
+    drop(statement);
+    let mut sessions = Vec::new();
+    sessions
+        .try_reserve_exact(session_ids.len())
+        .map_err(|_| CatalogError::Allocation)?;
+    for session_id in session_ids {
+        let loaded = load_session(&transaction, Uuid::nil(), session_id, &mut budget)?;
+        sessions.push(super::ProviderOnboardingDiagnostic::new(
+            loaded.capability.surface_id().as_str().to_owned(),
+            loaded.reservation.session_id(),
+            loaded.lifecycle.state(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(sessions)
+}
+
 struct LoadedOnboarding {
     reservation: OnboardingReservation,
     capability: ProviderCapability,
