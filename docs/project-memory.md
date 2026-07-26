@@ -793,3 +793,38 @@ Task 6 issue `#11` is closed and its Project 5 item is `Done`. The open issues a
 `#24`, `#25`, and `#31`; Tasks 19A and 20 are In Progress. The provider-onboarding remediation is
 the sole active feature worktree. Exact-head production measurements and the remaining product
 acceptance work keep the release blocked.
+
+## 2026-07-25 provider-onboarding control-plane checkpoint
+
+The moving release head is
+`3219662a44026b45201b96e087d570c2f48a3724`, tree
+`f114fe931b90fbb91adac2361df115dd94e57390`. It merges the independently accepted
+provider-onboarding candidate `489113fae63ae2e7288be2bf784abea6651a8bec` without changing the
+accepted provider blobs. The integrated control plane now owns shared provider rate budgets,
+generation-bound activation, transactional credential replacement, bounded failed-cutover
+recovery, candidate-preferred renewal, and retained portal transaction ownership through durable
+mutation and shutdown.
+
+Focused integrated verification passed: the release-evidence application check; the one-shot
+source activation vertical; the exact prepared-candidate cutover transition; failed replacement
+recovery; strict application Clippy both without defaults and with `release-evidence`; formatting;
+and staged/unstaged diff integrity. Independent exact-candidate and merge-resolution reviews found
+no material blocker. Broad workspace verification remains reserved for Task 20.
+
+The completed provider lane reclaimed 6.8 GiB of generated output. Its clean worktree and merged
+local branch were removed, no matching origin branch existed, and worktree/remote metadata was
+pruned. Only the release worktree remains; `.worktrees` is empty. Root `target/` is approximately
+11 GiB, `target/debug/incremental` is 0 bytes, approximately 113 GiB is free, and the root cache
+remains below its 20 GiB ceiling.
+
+GitHub Actions run `30182462309` at the exact integrated head created `verify`, `windows`, and
+`macos` jobs with no steps. GitHub reported the account payment/spending-limit annotation before
+checkout, so this run contains no code-owned CI failure. Issue `#31` remains In Progress: Treasury
+is release-available, while SEC/BLS evidence refresh, FRED rights, and the clean-machine
+activation/recovery acceptance remain open.
+
+The next grouped product barrier is Coinbase Exchange Direct composition. The shared provider-rate
+authority is implemented, but Direct still needs its distinct credential profile/current signer,
+wiring into that authority, canonical `BookSnapshot`/`BookDelta` publication, application
+composition, central qualification, explicit risk-paper start selection, and an authorized
+unchanged-head trace. Public Coinbase and Kraken retain `DirectUnverified` ceilings.

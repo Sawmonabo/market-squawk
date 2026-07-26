@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `620d212ea4f28b8b50130fb5f430a42947e41cd4`
-  (`merge: integrate release performance evidence`), tree
-  `596d9b33ef6415741b19e230a91a416fd907b77c`.
+  `3219662a44026b45201b96e087d570c2f48a3724`
+  (`merge: provider onboarding control plane`), tree
+  `f114fe931b90fbb91adac2361df115dd94e57390`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -44,10 +44,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   all 790 expected source files locked. Focused evidence passed for authenticated-profile truth,
   bounded HTTP bootstrap and sequenced-frame queuing, same-owner handoff to live supervision,
   sink-rejection-before-state-mutation, strict Coinbase/sources Clippy, formatting, and diff
-  integrity. Shipping credential activation, shared rate authority, application composition,
-  central qualification, strategy/risk/paper authority, and an authorized unchanged-head trace
-  remain open under issue `#7`; the integrated transport alone cannot publish `DirectVerified`
-  authority.
+  integrity. The shared provider-rate authority is now integrated, but the Direct credential
+  profile/current signer, Direct wiring into that authority, canonical snapshot/delta publication,
+  application composition, central qualification, explicit risk-paper selection, and an authorized
+  unchanged-head trace remain open under issue `#7`; the integrated transport alone cannot publish
+  `DirectVerified` authority.
 - Release-source admission is integrated through `c8ceb82`: authenticated Coinbase Direct release
   sources carry the required transport authority while the public Coinbase and Kraken compatibility
   sources retain `DirectUnverified` ceilings. No compatibility source can be promoted to
@@ -59,15 +60,26 @@ evidence; it does not replace the README capability truth or the canonical relea
   validation through an atomic no-clobber commit. The focused integrated application check,
   formatting, and diff integrity passed. Exact-head production measurements and final Task 20
   evidence remain open.
+- Provider-onboarding control-plane candidate
+  `489113fae63ae2e7288be2bf784abea6651a8bec` was accepted by independent exact-head review and
+  merged unchanged at `3219662`. The integrated authority owns shared provider rate budgets,
+  generation-bound activation, transactional credential replacement, bounded failed-cutover
+  recovery, candidate-preferred renewal, and retained portal transaction ownership through durable
+  mutation and shutdown. Focused integrated application checks, the one-shot activation vertical,
+  exact cutover and recovery transitions, strict no-default and release-evidence Clippy, formatting,
+  and diff integrity passed. Issue `#31` remains In Progress because provider release availability
+  and the clean-machine activation/recovery acceptance evidence remain incomplete.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
   branch is deleted, no matching origin branch existed, and metadata is pruned. The completed
   performance-evidence worktree, its 1.0 GiB generated target, both merged local branches, and the
-  remaining origin feature branch are also removed and pruned. Active generated targets are
-  approximately 7.1 GiB in root and 6.9 GiB in the sole provider-onboarding lane, both below their
-  enforced ceilings with zero-byte incremental caches.
-- Hosted Actions run `30179378256` at `620d212` created three jobs with empty step lists. No
+  remaining origin feature branch are also removed and pruned. The accepted provider-onboarding
+  lane reclaimed 6.8 GiB before its clean worktree and merged local branch were removed; no matching
+  origin branch existed. Only the release worktree remains. Its generated target is approximately
+  11 GiB, below the enforced 20 GiB ceiling with a zero-byte incremental cache; `.worktrees` is
+  empty and approximately 113 GiB is free.
+- Hosted Actions run `30182462309` at `3219662` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
   payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
 - Documentation execution source head:

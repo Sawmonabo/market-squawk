@@ -175,12 +175,13 @@ integrity core supplies bounded snapshot evidence, order-level ownership, closed
 contiguous replay, currentness evidence, and fail-closed quarantine. Its authenticated Direct
 transport now performs the bounded HTTP bootstrap, queues and validates authenticated sequenced
 frames through the handoff frontier, and transfers the same integrity owner to live supervision.
-That transport is not yet composed by the shipping application with operator credential
-activation, shared provider-rate authority, central qualification, strategy/risk/paper authority,
-or an authorized unchanged-head trace. The separately composed compatibility source can enter the
-live runtime only at its declared `DirectUnverified` ceiling; Coinbase and Kraken therefore remain
-execution-ineligible. All fills remain local paper simulation; no broker adapter or live order
-authority is enabled.
+That transport is not yet composed by the shipping application with a distinct Coinbase Exchange
+Direct credential profile and current signer capability, admission into the integrated shared
+provider-rate authority, canonical `BookSnapshot`/`BookDelta` publication, central qualification,
+explicit strategy/risk/paper start selection, or an authorized unchanged-head trace. The separately
+composed compatibility source can enter the live runtime only at its declared `DirectUnverified`
+ceiling; Coinbase and Kraken therefore remain execution-ineligible. All fills remain local paper
+simulation; no broker adapter or live order authority is enabled.
 
 ## Required but missing
 
@@ -189,11 +190,11 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | The accepted integrity core and authenticated Direct transport implement bounded HTTP bootstrap, snapshot/replay, order ownership, sequence/currentness evidence, fail-closed quarantine, and one-owner handoff; shipping credential activation, shared provider-rate authority, application composition, central qualification, strategy/risk/paper authority, and an authorized unchanged-head trace remain incomplete, so no Coinbase source can publish `DirectVerified` authority | Task 2 |
+| `Missing` | Coinbase direct-source qualification | The accepted integrity core and authenticated Direct transport implement bounded HTTP bootstrap, snapshot/replay, order ownership, sequence/currentness evidence, fail-closed quarantine, and one-owner handoff. The shared provider-rate authority is integrated, but the Direct credential profile/current signer, Direct wiring into that authority, canonical snapshot/delta publication, application composition, central qualification, explicit risk-paper selection, and an authorized unchanged-head trace remain incomplete, so no Coinbase source can publish `DirectVerified` authority | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issue `#7` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery and OS-keyring-first encrypted fallback are implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
+| `Missing` | complete provider-onboarding acceptance | The accepted control plane now owns shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, retained portal mutation ownership, OS-keyring-first routing, and encrypted fallback. Release acceptance remains blocked because only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
 | `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
 | `Missing` | release security/fuzz/performance gate | The hardened measurement and atomic evidence-publication machinery is integrated and independently accepted, but no final unchanged-head production measurement, complete security/fuzz evidence set, grouped release review, publication, or closeout exists | Issue `#25` / Task 20 |
 
