@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `bf02a0b3d35108f1ef771f3e7e292a552395f126`
-  (`merge: provider release admission`), tree
-  `b626e0e5bf9ffb9c29c4d982ebb66b41f11a1c5d`.
+  `879e505223729fee4a5be607b21a6deb396f849f`
+  (`docs: close Task 19 lifecycle review`), tree
+  `76c096f88f5b6cde7c465275c52bd39bbb2d9fdb`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -79,6 +79,21 @@ evidence; it does not replace the README capability truth or the canonical relea
   SEC/BLS successful official-body evidence, FRED/ALFRED durable-use rights, Treasury daily-XML
   durable-use rights, and the authorized Coinbase Direct trace remain fail-closed external
   acceptance inputs; no release predicate was manufactured.
+- Task 19 local control-plane candidate `879e505223729fee4a5be607b21a6deb396f849f`
+  is integrated unchanged after independent exact-range review reported zero Critical, Important,
+  or Minor findings. The shipping CLI now owns full-product `init`, provenance-bearing redacted
+  configuration reads, and query-only `doctor` diagnostics that never create, migrate, recover, or
+  exclusively lock product state. The sole 62-tool stdio MCP registry advertises and validates
+  operation-specific output schemas, maps actionable service rejections to protocol tool errors,
+  and performs application-owned bounded shutdown. Unix and Windows termination listeners are
+  installed before composition so startup-time signals cannot bypass the MCP, application, or
+  audit drain.
+- Focused Task 19 evidence passed the existing application, services, and MCP suites; strict
+  affected-package Clippy; formatting; diff integrity; shipping MCP smoke; real `init` followed by
+  two byte-identical nonmutating `doctor` runs; and a real startup-time SIGTERM process probe. The
+  required workspace-boundary checker remains red on the pre-existing normal dependency
+  `market-squawk-adapter-coinbase -> market-squawk-live`. Task 19 issue `#24` therefore remains open
+  until that dependency direction is corrected and the gate is rerun.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
@@ -87,15 +102,17 @@ evidence; it does not replace the README capability truth or the canonical relea
   remaining origin feature branch are also removed and pruned. The accepted provider-onboarding
   lane reclaimed 6.8 GiB before its clean worktree and merged local branch were removed; no matching
   origin branch existed. The provider release-admission lane reclaimed 6.9 GiB before its clean
-  worktree and merged local/origin branch were removed and metadata was pruned. Only the release
-  worktree remains. Its generated target is approximately 13 GiB, below the enforced 20 GiB
-  ceiling; `.worktrees` is empty and approximately 115 GiB is free.
+  worktree and merged local/origin branch were removed and metadata was pruned. Task 19 reclaimed
+  8.4 GiB before its clean owned worktree and merged local branch were removed; no matching origin
+  branch existed, and worktree/remote metadata was pruned. Only the release worktree remains. Its
+  generated target is approximately 13 GiB, below the enforced 20 GiB ceiling; `.worktrees` is
+  empty, the root incremental directory is approximately 9 MiB, and approximately 114 GiB is free.
 - Dependabot pull requests `#2`, `#32`, `#33`, `#34`, and `#35` are merged; superseded updates
   `#3` and `#4` are closed. No dependency pull request or Dependabot branch remains open locally or
   on origin.
-- Hosted Actions run `30182462309` at `3219662` created three jobs with empty step lists. No
+- Hosted Actions run `30183191490` at `b15178b` created three jobs with empty step lists. No
   checkout, build, lint, or test step ran; each check reported the external account
-  payment/spending-limit blocker. No code-owned CI failure exists to remediate at this head.
+  payment/spending-limit blocker. That run contains no code-owned CI failure to remediate.
 - Documentation execution source head:
   `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
@@ -208,11 +225,11 @@ Subsequent source-derived review established the current first-use handoff state
   encrypted-file fallback and explicit foreground portal unlock/lock. The remaining onboarding
   blocker is provider release availability and the clean-machine acceptance demonstration.
 
-As verified through GitHub on 2026-07-25, Task 4 issue `#9` and Task 6 issue `#11` are closed and
+As verified through GitHub on 2026-07-26, Task 4 issue `#9` and Task 6 issue `#11` are closed and
 their Project 5 items are `Done`. Issues `#7`, `#10`, `#24`, `#25`, and `#31` remain open. Project
-5 marks Task 19A issue `#31` and Task 20 issue `#25` In Progress. The active product barriers are
-provider and Coinbase Direct clean-machine/external acceptance evidence, remaining release
-prerequisite reconciliation, and Task 20's exact-head acceptance.
+5 marks the remaining release issues In Progress. The active barriers are the Coinbase
+adapter-to-live dependency-direction violation, provider and Coinbase Direct clean-machine/external
+acceptance evidence, prerequisite-issue reconciliation, and Task 20's exact-head acceptance.
 
 ## Product delivery closeout and next barrier
 
@@ -316,9 +333,21 @@ prerequisite reconciliation, and Task 20's exact-head acceptance.
   Independent task review approved the final lane with no remaining finding. Fresh integrated
   gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
 - Quarter 3 closed only after `CARGO_INCREMENTAL=0 ./scripts/verify.sh` passed at exact pushed head
-  `c6f0124`. Quarter 4 is now the active delivery quarter: Tasks 19 and 19A, followed by Task 20.
-  Open prerequisite issues `#7`, `#9`, `#10`, and `#11` must be reconciled through those product
-  slices or explicitly closed with exact evidence; they cannot be ignored at release closeout.
+  `c6f0124`. Quarter 4 is now the active delivery quarter: Task 19's local control-plane
+  implementation is accepted, Task 19A's external/provider acceptance remains open, and Task 20
+  follows both. Open prerequisite issues `#7` and `#10` must be reconciled with exact evidence; they
+  cannot be ignored at release closeout.
+- Task 19 owner: GitHub issue `#24`, still In Progress until the required workspace-boundary gate
+  is green.
+- Delivered at exact accepted and pushed head `879e505`: full-product initialization and bounded
+  shutdown, redacted configuration provenance, nonmutating query-only diagnostics, operation-
+  specific MCP output schemas and validation, protocol-correct service rejection, and startup-safe
+  Unix/Windows termination ownership.
+- Task 19 verification: focused application/services/MCP suites, strict affected-package Clippy,
+  formatting, diff integrity, shipping MCP smoke, repeated nonmutating `doctor`, and a real
+  startup-time SIGTERM process probe passed. Independent exact-range review reported no Critical,
+  Important, or Minor finding. The only remaining Task 19 gate is the pre-existing Coinbase
+  adapter-to-live dependency direction.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -482,27 +511,32 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is the open Task 19/19A acceptance work, followed by Task 20's integrated
-demonstration, evidence, final review, exact-head release gate, publication, and cleanup. Neither
-Quarter 3 acceptance nor the completed documentation portal claims that the Market Squawk product
-release is complete.
+The next delivery event is the source-adapter dependency-boundary correction that closes Task 19's
+local gate. Provider/Task 19A acceptance and prerequisite reconciliation then feed Task 20's
+integrated demonstration, evidence, final review, exact-head release gate, publication, and
+cleanup. Neither Task 19 acceptance nor the completed documentation portal claims that the Market
+Squawk product release is complete.
 
 ## Active Quarter 4 closeout sequence
 
 The provider, research/model, and execution/paper implementation lanes are integrated. Remaining
 work is no longer represented as those three active implementation lanes:
 
-1. Reconcile Task 19 issues `#10` and `#24` against the shipping application/CLI/MCP composition,
-   implement any substantiated product gap, and record bounded local acceptance evidence.
-2. Run the authorized exact-head provider producer when the external SEC/BLS evidence,
+1. Move the Coinbase adapter's shared book-integrity and provider-normalization contracts behind an
+   allowed source-layer dependency, remove its normal dependency on the live crate, and rerun the
+   focused package and required workspace-boundary gates.
+2. Reconcile issues `#10` and `#24` against the accepted shipping application/CLI/MCP evidence,
+   then close their Project 5 items only after the corrected exact head is pushed.
+3. Run the authorized exact-head provider producer when the external SEC/BLS evidence,
    FRED/ALFRED durable-use rights, Treasury daily-XML durable-use rights, and Coinbase Direct
    credential inputs exist. Issues `#7` and `#31` remain open until that evidence succeeds.
-3. Freeze the Quarter 4 candidate only after the Task 19 and Task 19A predicates close. Task 20
+4. Freeze the Quarter 4 candidate only after the Task 19 and Task 19A predicates close. Task 20
    then owns the single full nonincremental gate, clean-machine demonstration, fuzz/security/
    performance evidence, grouped exact-head review, release publication, and repository closeout.
 
-Task 19 local acceptance and externally coordinated provider inputs may advance independently.
-Final provider evidence and every Task 20 exact-head artifact are serialized behind one unchanged
-release candidate. Focused work continues with `CARGO_INCREMENTAL=0`; only Task 20 may run the broad
-workspace gate. The root target remains capped at 20 GiB, and every completed feature lane must
-reclaim its generated target and delete its clean local/origin branch and worktree.
+The dependency-boundary correction and externally coordinated provider inputs may advance
+independently. Final provider evidence and every Task 20 exact-head artifact are serialized behind
+one unchanged release candidate. Focused work continues with `CARGO_INCREMENTAL=0`; only Task 20
+may run the broad workspace gate. The root target remains capped at 20 GiB, and every completed
+feature lane must reclaim its generated target and delete its clean local/origin branch and
+worktree.

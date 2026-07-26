@@ -157,13 +157,20 @@ work is bound by the single canonical
   workflows over genuine live, research, analytics, or portfolio producers.
 - A complete local CLI hierarchy over the production `LocalProduct` composition for configuration,
   sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
-  paper execution, fair value, MCP, and readiness diagnosis. Mutating operations retain explicit
-  confirmation, typed request admission, shared application-service authority, and bounded output.
+  paper execution, fair value, MCP, and readiness diagnosis. `init` owns initialization, migration,
+  recovery, journal preparation, and bounded shutdown; configuration reads expose redacted
+  provenance; and `doctor` inspects only existing storage through bounded query-only diagnostics
+  without creating, migrating, recovering, or locking product authorities. Mutating operations
+  retain explicit confirmation, typed request admission, shared application-service authority, and
+  bounded output.
 - A sole production local stdio MCP composition spanning all 11 required domains and 62 code-owned
-  typed tools. The shared application descriptors enforce schemas, authorization, evidence and
-  artifact policy, bounds, deadlines, cancellation, durable audit, controlled artifacts, and
-  lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services,
-  including digest-bound, chunked reads of opaque controlled artifacts without exposing paths.
+  typed tools. The shared application descriptors enforce operation-specific input and output
+  schemas, runtime output validation, authorization, evidence and artifact policy, bounds,
+  deadlines, cancellation, durable audit, controlled artifacts, protocol-correct tool errors, and
+  lifecycle-owned shutdown. Unix and Windows termination listeners are installed before product
+  composition so signals received during startup still trigger the bounded MCP, application, and
+  audit drain. The CLI and MCP call the same transport-neutral application services, including
+  digest-bound, chunked reads of opaque controlled artifacts without exposing paths.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
   production source.
 
@@ -198,8 +205,8 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | execution-eligible paper acceptance | Coinbase Direct is wired through the existing feature, strategy, central-risk, dispatcher, audit, checkpoint, and realistic paper engine. The required authorized unchanged-head live-to-paper demonstration has not yet been accepted | Issue `#7` / Task 20 |
 | `Missing` | complete provider-onboarding acceptance | The accepted control plane owns shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, retained portal mutation ownership, OS-keyring-first routing, and encrypted fallback. The shipping exact-head evidence producer and release closer now exercise and bind provider activation, live quality, research-runtime authority, restart recovery, exact executable identity, a required Direct paper action, and FRED/ALFRED durable-use admission. Release acceptance remains blocked because SEC and BLS still require successful official-body evidence, FRED/ALFRED durable use remains rights-blocked, Treasury daily XML lacks durable-use authority, and the authorized clean-machine trace is not accepted | Issue `#31` / Task 19A |
-| `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
-| `Missing` | release security/fuzz/performance gate | The hardened measurement and atomic evidence-publication machinery is integrated and independently accepted, but no final unchanged-head production measurement, complete security/fuzz evidence set, grouped release review, publication, or closeout exists | Issue `#25` / Task 20 |
+| `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issue `#31` / Tasks 19A–20 |
+| `Missing` | release architecture/security/fuzz/performance gate | Task 19's local control-plane implementation is accepted, but the required workspace-boundary gate still rejects the Coinbase adapter's normal dependency on the live crate. The hardened measurement and atomic evidence-publication machinery is integrated and independently accepted, but no final unchanged-head production measurement, complete security/fuzz evidence set, grouped release review, publication, or closeout exists | Issues `#24`, `#25` / Tasks 19–20 |
 
 This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
 not endorsed or certified by the Federal Reserve Bank of St. Louis.

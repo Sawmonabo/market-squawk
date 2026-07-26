@@ -875,3 +875,34 @@ remains rights-blocked; Treasury daily XML durable publication remains closed; a
 still requires its authorized unchanged-head external trace. Issues `#7` and `#31` remain open until
 those exact predicates are satisfied. The provider release-admission worktree, its 6.9 GiB generated
 target, and its merged local/origin feature branch were removed after integration and push.
+
+## 2026-07-26 Task 19 local control-plane acceptance checkpoint
+
+Task 19's local application, CLI, and MCP implementation is accepted and pushed at exact release
+head `879e505223729fee4a5be607b21a6deb396f849f`, tree
+`76c096f88f5b6cde7c465275c52bd39bbb2d9fdb`. The shipping CLI now owns initialized and recovered
+full-product startup, redacted configuration provenance, and bounded query-only diagnostics over
+existing storage. `doctor` does not create, migrate, recover, or exclusively lock product
+authorities. The sole 62-tool stdio MCP registry advertises and validates operation-specific output
+schemas, distinguishes actionable tool rejections from protocol failures, and drains through
+application-owned bounded shutdown. Platform termination listeners are installed before product
+composition so Unix or Windows termination arriving during startup cannot bypass cleanup.
+
+Focused application, services, and MCP verification; strict affected-package Clippy; formatting;
+diff integrity; shipping MCP smoke; repeated byte-identical nonmutating diagnostics; and a real
+startup-time SIGTERM probe passed. No new test executable was added. Independent exact-range
+re-review reported zero Critical, Important, or Minor findings.
+
+The required workspace-boundary checker still rejects the pre-existing normal dependency
+`market-squawk-adapter-coinbase -> market-squawk-live`. Task 19 issue `#24` must remain open until
+shared book-integrity and provider-normalization ownership is moved behind an allowed source-layer
+boundary, the adapter's live dependency is removed, and the required gate passes. This is the next
+single product lane; it must not trigger a broad workspace rebuild.
+
+After the accepted head was pushed, the Task 19 lane reclaimed 8.4 GiB, its clean owned worktree and
+merged local branch were removed, no matching origin branch existed, and worktree/remote metadata
+was pruned. Only the release worktree remains. Root generated state is approximately 13 GiB,
+`.worktrees` is empty, root incremental state is approximately 9 MiB, and approximately 114 GiB is
+free. Draft release PR `#26` is the sole open pull request; no dependency-bot PR remains open.
+Hosted Actions run `30183191490` again created three empty-step jobs and reported the account
+payment/spending-limit annotation before checkout, so it provides no code-owned CI failure to fix.
