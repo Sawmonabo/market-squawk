@@ -1184,8 +1184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn superseded_recipe_quarantines_only_its_provider_during_product_startup() -> TestResult
-    {
+    async fn missing_authority_recipe_is_quarantined_during_product_startup() -> TestResult {
         let temporary = tempfile::tempdir()?;
         let environment = BTreeMap::<OsString, OsString>::new();
         let config = AppConfig::load(ConfigSources::new(
@@ -1221,7 +1220,7 @@ mod tests {
             state.load_recipe("treasury.fiscal-data")?,
             DurableActivationRecipeState::Quarantined(quarantine)
                 if quarantine.reason
-                    == DurableActivationQuarantineReason::RequestSuperseded
+                    == DurableActivationQuarantineReason::AuthorityInvalidated
         ));
         Ok(())
     }
