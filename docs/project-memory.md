@@ -893,11 +893,13 @@ diff integrity; shipping MCP smoke; repeated byte-identical nonmutating diagnost
 startup-time SIGTERM probe passed. No new test executable was added. Independent exact-range
 re-review reported zero Critical, Important, or Minor findings.
 
-The required workspace-boundary checker still rejects the pre-existing normal dependency
-`market-squawk-adapter-coinbase -> market-squawk-live`. Task 19 issue `#24` must remain open until
-shared book-integrity and provider-normalization ownership is moved behind an allowed source-layer
-boundary, the adapter's live dependency is removed, and the required gate passes. This is the next
-single product lane; it must not trigger a broad workspace rebuild.
+Correction `a3609b3aa4890fe6970d3994abf2bd172f9d3239`, tree
+`ef62a12c7b9be1172b57d2f0d7dc609cd28c7509`, moved provider-generic order synchronization and exact
+decimal normalization into `market-squawk-sources`, retained the live crate's public API through
+exact-type re-exports, and removed the Coinbase adapter's normal dependency on the live crate. The
+required workspace-boundary gate, 264 existing sources/live/Coinbase unit tests, strict affected-
+package Clippy, application compile, formatting, and diff integrity passed. No new test or test
+target was added. Issues `#10` and `#24` are closed and their Project 5 items are `Done`.
 
 After the accepted head was pushed, the Task 19 lane reclaimed 8.4 GiB, its clean owned worktree and
 merged local branch were removed, no matching origin branch existed, and worktree/remote metadata
@@ -906,3 +908,9 @@ was pruned. Only the release worktree remains. Root generated state is approxima
 free. Draft release PR `#26` is the sole open pull request; no dependency-bot PR remains open.
 Hosted Actions run `30183191490` again created three empty-step jobs and reported the account
 payment/spending-limit annotation before checkout, so it provides no code-owned CI failure to fix.
+
+The boundary-correction lane subsequently reclaimed 1.9 GiB, its clean worktree and merged local
+branch were removed, no matching origin branch existed, and worktree/remote metadata was pruned.
+Only issues `#7`, `#25`, and `#31` remain open and In Progress. Root generated state remains
+approximately 13 GiB, `.worktrees` is empty, root incremental state is approximately 9 MiB, and
+approximately 114 GiB is free.
