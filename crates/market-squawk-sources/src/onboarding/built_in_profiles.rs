@@ -24,12 +24,20 @@ const PROJECT_HANDOFF: &str = "https://github.com/Sawmonabo/market-squawk";
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
+const LEGACY_REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
     [
         0x55, 0xb7, 0xf0, 0x38, 0x50, 0x15, 0xfb, 0xd3, 0x18, 0xc8, 0x77, 0xf9, 0x9e, 0x32, 0x9c,
         0x31, 0x98, 0x02, 0x4a, 0x31, 0xfd, 0x8f, 0x05, 0xcb, 0x9e, 0x7e, 0x12, 0xe7, 0x66, 0x31,
         0x80, 0xcb,
+    ],
+);
+const PROVIDER_RELEASE_REPORT_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0x74, 0xb4, 0x3e, 0x5e, 0x35, 0xf2, 0x47, 0xf5, 0x62, 0x54, 0x0e, 0x65, 0x7a, 0xcc, 0x1a,
+        0x9f, 0xd4, 0xd8, 0xe9, 0xf0, 0xde, 0x0c, 0x8a, 0x1b, 0x63, 0xeb, 0x4a, 0xa3, 0x6a, 0x9a,
+        0x73, 0xcf,
     ],
 );
 const COINBASE_DIRECT_COMPOSITION_DIGEST: EvidenceDigest = EvidenceDigest::new(
@@ -41,6 +49,8 @@ const COINBASE_DIRECT_COMPOSITION_DIGEST: EvidenceDigest = EvidenceDigest::new(
     ],
 );
 const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
+/// Code-owned completed year used by the bounded Treasury daily-rate onboarding probe.
+pub const TREASURY_DAILY_RATES_PROBE_YEAR: u16 = 2025;
 
 const RIGHTS_LIMITED: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Admitted),
@@ -204,14 +214,21 @@ const SEC_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         "DOC-019",
         "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
-        REVIEW_DATE,
+        "2026-07-25",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "SEC-FAIR-ACCESS",
+        "https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data",
+        "2026-07-25",
         None,
         true,
     ),
     ProfileEvidence::new(
         "DOC-020",
         "https://www.sec.gov/about/webmaster-frequently-asked-questions",
-        REVIEW_DATE,
+        "2026-07-25",
         None,
         true,
     ),
@@ -233,47 +250,68 @@ const FRED_EVIDENCE: &[ProfileEvidence] = &[
     ),
     ProfileEvidence::new(
         "DOC-025",
-        "https://fred.stlouisfed.org/legal/",
-        REVIEW_DATE,
+        "https://fred.stlouisfed.org/legal/terms/",
+        "2026-07-25",
         None,
-        false,
+        true,
     ),
 ];
 const BLS_V1_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         "DOC-026",
-        "https://www.bls.gov/developers/api_FAQs.htm",
-        REVIEW_DATE,
+        "https://www.bls.gov/developers/api_faqs.htm",
+        "2026-07-25",
         None,
         true,
     ),
     ProfileEvidence::new(
         "DOC-029",
         "https://www.bls.gov/developers/termsOfService.htm",
-        REVIEW_DATE,
+        "2026-07-25",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "BLS-CONTENT-ORIGIN",
+        "https://www.bls.gov/opub/copyright-information.htm",
+        "2026-07-25",
         None,
         true,
     ),
 ];
 const BLS_V2_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        "DOC-026",
+        "https://www.bls.gov/developers/api_faqs.htm",
+        "2026-07-25",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
         "DOC-027",
         "https://data.bls.gov/registrationEngine/",
-        REVIEW_DATE,
+        "2026-07-25",
         None,
         false,
     ),
     ProfileEvidence::new(
         "DOC-028",
         "https://www.bls.gov/developers/api_signature_v2.htm",
-        REVIEW_DATE,
+        "2026-07-25",
         None,
         true,
     ),
     ProfileEvidence::new(
         "DOC-029",
         "https://www.bls.gov/developers/termsOfService.htm",
-        REVIEW_DATE,
+        "2026-07-25",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
+        "BLS-CONTENT-ORIGIN",
+        "https://www.bls.gov/opub/copyright-information.htm",
+        "2026-07-25",
         None,
         true,
     ),
@@ -281,7 +319,7 @@ const BLS_V2_EVIDENCE: &[ProfileEvidence] = &[
 const TREASURY_XML_EVIDENCE: &[ProfileEvidence] = &[ProfileEvidence::new(
     "DOC-030",
     "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
-    REVIEW_DATE,
+    "2026-07-25",
     None,
     false,
 )];
@@ -303,7 +341,7 @@ const LOCAL_EVIDENCE: &[ProfileEvidence] = &[ProfileEvidence::new(
     "market-squawk-local-capability-v1",
     PROJECT_HANDOFF,
     REVIEW_DATE,
-    Some(REPORT_DIGEST),
+    Some(LEGACY_REPORT_DIGEST),
     false,
 )];
 
@@ -365,7 +403,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
         prior_credential_kind,
         RatePolicyDescriptor::try_new(
             SourceIdentifier::try_from(spec.rate_policy)?,
-            REPORT_DIGEST,
+            LEGACY_REPORT_DIGEST,
             true,
         )?,
     )?;
@@ -375,11 +413,11 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
         prior_credential_kind,
         RatePolicyDescriptor::try_new_enforced(
             SourceIdentifier::try_from(spec.rate_policy)?,
-            REPORT_DIGEST,
+            LEGACY_REPORT_DIGEST,
             true,
             ProviderCapabilityRevision::new(1)?,
             SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
-            REPORT_DIGEST,
+            LEGACY_REPORT_DIGEST,
             built_in_budget(&spec, false)?,
             spec.probe.transport() != ProbeTransport::Local,
         )?,
@@ -398,6 +436,23 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 COINBASE_DIRECT_COMPOSITION_DIGEST,
                 built_in_budget(&spec, true)?,
                 true,
+            )?,
+        )?;
+        (vec![legacy_capability, revision_two], current)
+    } else if has_provider_release_revision(spec.id) {
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                spec.probe.transport() != ProbeTransport::Local,
             )?,
         )?;
         (vec![legacy_capability, revision_two], current)
@@ -463,7 +518,15 @@ fn build_capability(
         credential_kind,
         minimum_authority,
         maximum_authority,
-        verifier_revision: SourceIdentifier::try_from(format!("{}.probe.v1", spec.id))?,
+        verifier_revision: SourceIdentifier::try_from(format!(
+            "{}.probe.v{}",
+            spec.id,
+            if spec.id == "treasury.daily-rates-xml" && revision.get() >= 3 {
+                2
+            } else {
+                1
+            }
+        ))?,
         rate_policy,
         rights_state: spec.rights_state,
         lifecycle_support: if matches!(
@@ -483,9 +546,18 @@ fn capability_evidence(
     spec: &BuiltInSpec,
     revision: ProviderCapabilityRevision,
 ) -> Result<Vec<EvidenceBinding>, ProviderProfileError> {
+    let (report_source, report_digest) =
+        if revision.get() >= 3 && has_provider_release_revision(spec.id) {
+            (
+                "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25",
+                PROVIDER_RELEASE_REPORT_DIGEST,
+            )
+        } else {
+            ("MSQ-ONBOARDING-REPORT-2026-07-23", LEGACY_REPORT_DIGEST)
+        };
     let mut evidence = vec![EvidenceBinding::new(
-        SourceIdentifier::try_from("MSQ-ONBOARDING-REPORT-2026-07-23")?,
-        REPORT_DIGEST,
+        SourceIdentifier::try_from(report_source)?,
+        report_digest,
     )];
     if spec.id == COINBASE_DIRECT_PROFILE && revision.get() >= 3 {
         evidence.push(EvidenceBinding::new(
@@ -496,9 +568,29 @@ fn capability_evidence(
     Ok(evidence)
 }
 
+fn has_provider_release_revision(profile_id: &str) -> bool {
+    matches!(
+        profile_id,
+        "sec.edgar-public"
+            | "fred-alfred.api-v1-v2"
+            | "bls.v1-unregistered"
+            | "bls.v2-registered"
+            | "treasury.daily-rates-xml"
+            | "treasury.fiscal-data"
+    )
+}
+
+fn current_rate_policy(spec: &BuiltInSpec) -> &'static str {
+    if spec.id == "fred-alfred.api-v1-v2" {
+        "fred-alfred.api-v1-v2.rate-policy.v2"
+    } else {
+        spec.rate_policy
+    }
+}
+
 fn built_in_budget(
     spec: &BuiltInSpec,
-    direct_current: bool,
+    current_revision: bool,
 ) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
     let backoff =
         BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?;
@@ -506,6 +598,7 @@ fn built_in_budget(
         "sec.edgar-public" => simple_budget("us-sec-edgar", None, 8, SECOND_NANOS, 4, backoff),
         "bls.v1-unregistered" => bls_budget(None, 25, backoff),
         "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 500, backoff),
+        "fred-alfred.api-v1-v2" if current_revision => fred_budget(backoff),
         "fred-alfred.api-v1-v2" => simple_budget(
             "fred",
             Some("fred.onboarding-rights-blocked"),
@@ -525,7 +618,7 @@ fn built_in_budget(
         // one provider-published aggregate contract.
         COINBASE_DIRECT_PROFILE => simple_budget(
             "coinbase-exchange",
-            Some(if direct_current {
+            Some(if current_revision {
                 "coinbase.exchange-direct.account-template"
             } else {
                 "coinbase.exchange-direct.default-account"
@@ -565,6 +658,33 @@ fn simple_budget(
         NonZeroU32::new(requests).ok_or(ProviderProfileError::InvalidProfile)?,
         nonzero_u64(window_nanos)?,
         NonZeroU16::new(concurrency).ok_or(ProviderProfileError::InvalidProfile)?,
+        backoff,
+    )?)
+}
+
+fn fred_budget(backoff: BackoffPolicy) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    // The one-second window is Market Squawk's conservative ceiling for the combined v1/v2
+    // profile. The retained official evidence is specific to v2, so it is not represented as a
+    // provider-published v1 limit.
+    let windows = [
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(SECOND_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(120).ok_or(ProviderProfileError::InvalidProfile)?,
+            nonzero_u64(MINUTE_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )?,
+    ];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("fred")?,
+            SourceIdentifier::try_from("fred.onboarding-rights-blocked")?,
+        ),
+        &windows,
+        NonZeroU16::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
         backoff,
     )?)
 }
@@ -729,7 +849,7 @@ fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
             "declare an application/company and administrative contact in User-Agent",
             "retain public EDGAR provenance and enforce the aggregate fair-access limit",
         ],
-        persistence_evidence_source_id: Some("DOC-019"),
+        persistence_evidence_source_id: Some("DOC-020"),
         rotation: "update the declared non-secret contact when administrative ownership changes",
         revocation: "remove the source configuration locally",
         recovery: REFRESH_RECOVERY,
@@ -856,10 +976,14 @@ fn treasury_xml() -> Result<BuiltInSpec, ProviderProfileError> {
         permissions: &[],
         coverage: "Treasury daily interest-rate XML families; durable publication remains closed",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::network(
+        probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
             "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml",
-            None,
+            "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value=2025",
+            &[
+                ("data", "daily_treasury_yield_curve"),
+                ("field_tdr_date_value", "2025"),
+            ],
         )?,
         rights: RIGHTS_LIMITED,
         duties: &["do not inherit Fiscal Data rights onto this separate XML surface"],

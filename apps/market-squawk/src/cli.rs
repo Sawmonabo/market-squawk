@@ -651,7 +651,11 @@ pub struct ReleaseFuzzArguments {
     #[arg(long, default_value_t = 2_048)]
     pub rss_limit_mib: u64,
     /// New no-clobber JSON evidence file.
-    #[arg(long)]
+    #[arg(
+        id = "fuzz_output_file",
+        long = "output-file",
+        value_name = "OUTPUT_FILE"
+    )]
     pub output: PathBuf,
 }
 
@@ -683,7 +687,11 @@ pub struct ReleaseBenchmarkArguments {
     #[arg(long, default_value_t = 999_999)]
     pub max_warmed_p99_ns: u64,
     /// New no-clobber JSON evidence file.
-    #[arg(long)]
+    #[arg(
+        id = "benchmark_output_file",
+        long = "output-file",
+        value_name = "OUTPUT_FILE"
+    )]
     pub output: PathBuf,
 }
 
@@ -703,7 +711,11 @@ pub struct ReleaseProviderArguments {
     #[arg(long)]
     pub require_fred_alfred_rights: bool,
     /// New empty directory that will own provider evidence.
-    #[arg(long)]
+    #[arg(
+        id = "provider_output_directory",
+        long = "output-directory",
+        value_name = "OUTPUT_DIRECTORY"
+    )]
     pub output: PathBuf,
 }
 
@@ -720,7 +732,11 @@ pub struct ReleaseCloseArguments {
     #[arg(long)]
     pub binary: PathBuf,
     /// New no-clobber closed-manifest file inside the evidence directory.
-    #[arg(long)]
+    #[arg(
+        id = "closed_manifest_output_file",
+        long = "output-file",
+        value_name = "OUTPUT_FILE"
+    )]
     pub output: PathBuf,
 }
 
@@ -740,7 +756,11 @@ pub struct ReleaseDemonstrateArguments {
     #[arg(long)]
     pub python_evidence: PathBuf,
     /// New no-clobber JSON evidence file.
-    #[arg(long)]
+    #[arg(
+        id = "demonstration_output_file",
+        long = "output-file",
+        value_name = "OUTPUT_FILE"
+    )]
     pub output: PathBuf,
 }
 

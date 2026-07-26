@@ -9,13 +9,14 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Reviewed commit | Provider release-admission candidate pending integration |
 
 ## Contents
 
 - [Scope](#scope)
 - [Invocation and global options](#invocation-and-global-options)
 - [Command hierarchy](#command-hierarchy)
+- [Release evidence](#release-evidence)
 - [Confirmation and input admission](#confirmation-and-input-admission)
 - [Request and result limits](#request-and-result-limits)
 - [Output and exit behavior](#output-and-exit-behavior)
@@ -175,6 +176,54 @@ completes.
 | `fair-value approve <MEASUREMENT> --decision <ID> --reviewer <ID> --approved-at <RFC3339> --expires-at <RFC3339> --confirm` | Exact decision, distinct reviewer, approval time, and expiry | `FairValue.Approve` |
 
 Fair-value classification never changes market-data quality or creates live execution authority.
+
+## Release evidence
+
+`release evidence providers` is the production provider-acceptance producer. It is intentionally
+separate from ordinary source setup and requires:
+
+- exact `--head` and `--tree` identities for a clean, unchanged repository;
+- `MARKET_SQUAWK_EXTERNAL_NETWORK=1` and
+  `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED=1`;
+- a nonempty, duplicate-free list of exact built-in surface identifiers;
+- an existing parent for `--output-directory`, while the output directory itself must not exist;
+  and
+- portal-prepared active sessions and callable research runtimes for surfaces that require
+  contacts, credentials, series/query configuration, or admitted durable-use rights.
+
+The closed surface identifiers are:
+
+```text
+coinbase.public-market-data
+coinbase.exchange-direct-market-data
+kraken.spot-public-market-data
+sec.edgar-public
+fred-alfred.api-v1-v2
+bls.v1-unregistered
+bls.v2-registered
+treasury.daily-rates-xml
+treasury.fiscal-data
+```
+
+The producer can establish no-credential onboarding for public Coinbase, public Kraken, and the
+rights-limited Treasury XML probe. It does not invent SEC contact data, BLS series semantics,
+Treasury Fiscal query bounds, provider credentials, or FRED/ALFRED rights. Every selected surface
+must recover an exact active lease; durable research surfaces must also recover the same callable
+runtime generation after a clean application shutdown and restart.
+
+Live surfaces are exercised one at a time through the production application. Public Coinbase and
+Kraken must remain `DirectUnverified` and must produce no automated paper order. Coinbase Direct
+must reach `DirectVerified`; `--require-direct-verified-action` additionally requires at least one
+strategy-originated, centrally risk-approved paper order. `--require-fred-alfred-rights` requires
+both persistence and model-training admission for the exact FRED/ALFRED surface. The current
+rights-blocked FRED/ALFRED profile therefore keeps that release predicate closed.
+
+Only after collection, shutdown, restart recovery, executable hashing, and a second repository
+identity barrier does the command create
+`<OUTPUT-DIRECTORY>/provider-evidence.json` through atomic no-clobber publication. The final
+`release evidence close` command rejects a provider report unless it contains every mandatory
+Coinbase, Kraken, SEC, FRED/ALFRED, BLS v1, Treasury XML, and Treasury Fiscal surface plus the
+required Direct action, FRED/ALFRED rights, restart, and exact-binary evidence.
 
 ## Confirmation and input admission
 

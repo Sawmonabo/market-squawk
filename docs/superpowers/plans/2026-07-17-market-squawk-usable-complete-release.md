@@ -2583,12 +2583,12 @@ EVIDENCE_DIR=target/release-evidence/provisional
 mkdir -p "$EVIDENCE_DIR"
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence fuzz --toolchain nightly-2026-07-15 \
-  --seconds-per-target 120 --rss-limit-mib 2048 --output "$EVIDENCE_DIR/fuzz.json"
+  --seconds-per-target 120 --rss-limit-mib 2048 --output-file "$EVIDENCE_DIR/fuzz.json"
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence benchmark --warm-up-events 1000000 --events 60000000 \
   --storage-rows 10000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --output "$EVIDENCE_DIR/performance.json"
+  --output-file "$EVIDENCE_DIR/performance.json"
 ```
 
 Expected: every command exits 0; measured end-to-decision throughput is at least 100,000 events/s,
@@ -2619,11 +2619,12 @@ release approval:
 ```bash
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+PROVIDER_SURFACES="coinbase.public-market-data,coinbase.exchange-direct-market-data,kraken.spot-public-market-data,sec.edgar-public,fred-alfred.api-v1-v2,bls.v1-unregistered,treasury.daily-rates-xml,treasury.fiscal-data"
 cargo run -p market-squawk --release --all-features --locked -- \
-  release evidence providers --providers coinbase,kraken,fred-alfred \
+  release evidence providers --providers "$PROVIDER_SURFACES" \
   --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
   --require-direct-verified-action --require-fred-alfred-rights \
-  --output target/release-evidence/provisional/providers
+  --output-directory target/release-evidence/provisional/providers
 ```
 
 Expected: the command passes only on real authorized network delivery at the unchanged candidate;
@@ -2650,7 +2651,7 @@ cargo run -p market-squawk --release --all-features --locked -- \
   release demonstrate --offline \
   --provider-evidence target/release-evidence/provisional/providers \
   --python-evidence target/release-evidence/provisional/python/release-manifest.json \
-  --output target/release-evidence/provisional/demo.json
+  --output-file target/release-evidence/provisional/demo.json
 ./scripts/verify.sh
 git diff --check
 git commit -m "release: prove usable complete local platform"
@@ -2679,26 +2680,27 @@ test -z "$(git status --porcelain)"
 HEAD_SHA="$(git rev-parse HEAD)"
 TREE_SHA="$(git rev-parse HEAD^{tree})"
 EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
-mkdir -p "$EVIDENCE_DIR/providers"
+mkdir -p "$EVIDENCE_DIR"
 
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence fuzz --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --toolchain nightly-2026-07-15 --seconds-per-target 120 \
-  --rss-limit-mib 2048 --output "$EVIDENCE_DIR/fuzz.json"
+  --rss-limit-mib 2048 --output-file "$EVIDENCE_DIR/fuzz.json"
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence benchmark --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --warm-up-events 1000000 --events 60000000 --storage-rows 10000000 \
   --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --output "$EVIDENCE_DIR/performance.json"
+  --output-file "$EVIDENCE_DIR/performance.json"
 
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+PROVIDER_SURFACES="coinbase.public-market-data,coinbase.exchange-direct-market-data,kraken.spot-public-market-data,sec.edgar-public,fred-alfred.api-v1-v2,bls.v1-unregistered,treasury.daily-rates-xml,treasury.fiscal-data"
 cargo run -p market-squawk --release --all-features --locked -- \
-  release evidence providers --providers coinbase,kraken,fred-alfred \
+  release evidence providers --providers "$PROVIDER_SURFACES" \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --require-direct-verified-action --require-fred-alfred-rights \
-  --output "$EVIDENCE_DIR/providers"
+  --output-directory "$EVIDENCE_DIR/providers"
 
 python3 scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
@@ -2709,13 +2711,13 @@ cargo run -p market-squawk --release --all-features --locked -- \
   release demonstrate --offline --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --provider-evidence "$EVIDENCE_DIR/providers" \
   --python-evidence "$EVIDENCE_DIR/python/release-manifest.json" \
-  --output "$EVIDENCE_DIR/demo.json"
+  --output-file "$EVIDENCE_DIR/demo.json"
 ./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \
-  --binary target/release/market-squawk --output "$EVIDENCE_DIR/manifest.json"
+  --binary target/release/market-squawk --output-file "$EVIDENCE_DIR/manifest.json"
 git diff --exit-code
 test -z "$(git status --porcelain)"
 git status --short --branch

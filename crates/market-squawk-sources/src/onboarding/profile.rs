@@ -3,13 +3,16 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use market_squawk_domain::{DataQuality, EvidenceDigest};
+use market_squawk_domain::{DataQuality, EvidenceDigest, SourceIdentifier};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::{CredentialKind, ProviderCapability, RightsAdmissionState, SetupMode};
-use crate::{EndpointPolicy, HttpRequestBounds, NetworkPolicyError};
+use crate::{
+    ApiEndpointRule, EndpointPolicy, HttpRequestBounds, NetworkPolicyError, PathScope,
+    QueryParameterRule,
+};
 
 const MAX_PROFILES: usize = 32;
 const MAX_CAPABILITY_HISTORY: usize = 255;
@@ -222,6 +225,58 @@ impl VerificationProbe {
             body,
             semantic_expectation: "successful bounded response with the provider's expected schema",
             endpoint_policy: Some(EndpointPolicy::try_new_with_bounds([endpoint], bounds)?),
+        })
+    }
+
+    /// Constructs a fixed network check whose public query keys and values must match exactly.
+    pub(crate) fn network_exact_public_query(
+        transport: ProbeTransport,
+        base_endpoint: &'static str,
+        endpoint: &'static str,
+        query: &[(&str, &str)],
+    ) -> Result<Self, NetworkPolicyError> {
+        if transport != ProbeTransport::HttpGet || query.is_empty() {
+            return Err(NetworkPolicyError::InvalidRequestBounds);
+        }
+        let seconds =
+            |value| NonZeroU64::new(value).ok_or(NetworkPolicyError::InvalidRequestBounds);
+        let bounds = HttpRequestBounds::try_new(
+            seconds(5_000_000_000)?,
+            seconds(10_000_000_000)?,
+            seconds(10_000_000_000)?,
+            0,
+            seconds(1024 * 1024)?,
+        )?;
+        let query_rules = query
+            .iter()
+            .map(|(key, value)| {
+                QueryParameterRule::try_new_exact_public(
+                    SourceIdentifier::try_from(*key)
+                        .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?,
+                    SourceIdentifier::try_from(*value)
+                        .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let maximum_query_parameters =
+            u8::try_from(query.len()).map_err(|_| NetworkPolicyError::InvalidRequestBounds)?;
+        let maximum_encoded_query_bytes =
+            u16::try_from(endpoint.len()).map_err(|_| NetworkPolicyError::InvalidRequestBounds)?;
+        let rule = ApiEndpointRule::try_new(
+            base_endpoint,
+            PathScope::Exact,
+            query_rules,
+            maximum_query_parameters,
+            maximum_encoded_query_bytes,
+        )?;
+        let policy = EndpointPolicy::try_from_api_rules(vec![rule], bounds)?;
+        policy.authorize(endpoint)?;
+        Ok(Self {
+            transport,
+            endpoint: Some(endpoint),
+            body: None,
+            semantic_expectation: "successful bounded response matching the exact provider family and year schema",
+            endpoint_policy: Some(policy),
         })
     }
 

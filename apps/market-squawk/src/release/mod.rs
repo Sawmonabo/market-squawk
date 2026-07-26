@@ -7,6 +7,7 @@ mod fuzz;
 mod identity;
 mod io;
 mod process;
+mod providers;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -56,9 +57,9 @@ pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand)
             }
         }
         ReleaseCommand::Evidence {
-            command: ReleaseEvidenceCommand::Providers(_),
-        }
-        | ReleaseCommand::Demonstrate(_) => {
+            command: ReleaseEvidenceCommand::Providers(arguments),
+        } => providers::run(config, arguments).await,
+        ReleaseCommand::Demonstrate(_) => {
             drop(config);
             anyhow::bail!("selected release operation is not implemented")
         }

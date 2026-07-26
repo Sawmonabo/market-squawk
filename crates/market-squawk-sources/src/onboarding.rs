@@ -6,7 +6,7 @@ mod lifecycle;
 mod profile;
 mod public_configuration;
 
-pub use built_in_profiles::built_in_provider_profiles;
+pub use built_in_profiles::{TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles};
 pub use capability::{
     AuthoritySet, CapabilityRegistrationOutcome, CredentialKind, EvidenceBinding, HumanBoundary,
     LifecycleSupport, ProviderCapability, ProviderCapabilityError, ProviderCapabilityInput,

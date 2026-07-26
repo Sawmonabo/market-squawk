@@ -107,8 +107,8 @@ pub use onboarding::{
     ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
     ProviderPublicConfiguration, PublicConfigurationError, RatePolicyDescriptor,
     RemoteRevocationOutcome, Requirement, RightsAdmissionState, RuntimeCapabilityObservation,
-    RuntimeProviderCapability, SecretStoreClearOutcome, SetupMode, VerificationProbe,
-    ZeroFeeStatus, built_in_provider_profiles,
+    RuntimeProviderCapability, SecretStoreClearOutcome, SetupMode, TREASURY_DAILY_RATES_PROBE_YEAR,
+    VerificationProbe, ZeroFeeStatus, built_in_provider_profiles,
 };
 pub use order::{
     ProviderCursorOnlyReason, ProviderOrderChangeReason, ProviderOrderEvent,

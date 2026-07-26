@@ -312,6 +312,7 @@ pub struct ProviderActivationLease {
     public_configuration: ProviderPublicConfiguration,
     account_digest: Option<EvidenceDigest>,
     verification_evidence_digest: Option<EvidenceDigest>,
+    runtime_evidence_digest: EvidenceDigest,
     provider_budget_policy: Option<ProviderBudgetPolicy>,
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
@@ -334,6 +335,7 @@ impl ProviderActivationLease {
             public_configuration: input.public_configuration,
             account_digest: input.account_digest,
             verification_evidence_digest: input.verification_evidence_digest,
+            runtime_evidence_digest: input.runtime_evidence_digest,
             provider_budget_policy: input.provider_budget_policy,
             generation: input.generation,
             secret_reference: input.secret_reference,
@@ -400,6 +402,11 @@ impl ProviderActivationLease {
         self.verification_evidence_digest
     }
 
+    /// Returns the exact successful provider response or local-verifier evidence.
+    pub const fn runtime_evidence_digest(&self) -> EvidenceDigest {
+        self.runtime_evidence_digest
+    }
+
     /// Returns the exact admitted provider budget policy for this capability revision.
     pub const fn provider_budget_policy(&self) -> Option<&ProviderBudgetPolicy> {
         self.provider_budget_policy.as_ref()
@@ -444,6 +451,7 @@ impl std::fmt::Debug for ProviderActivationLease {
                 "verification_evidence_digest",
                 &self.verification_evidence_digest,
             )
+            .field("runtime_evidence_digest", &self.runtime_evidence_digest)
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -465,6 +473,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub public_configuration: ProviderPublicConfiguration,
     pub account_digest: Option<EvidenceDigest>,
     pub verification_evidence_digest: Option<EvidenceDigest>,
+    pub runtime_evidence_digest: EvidenceDigest,
     pub provider_budget_policy: Option<ProviderBudgetPolicy>,
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,

@@ -249,6 +249,8 @@ fn load_config(
 ) -> Result<AppConfig> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
+    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
+    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
     Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,

@@ -319,6 +319,79 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         Some((500, 86_400_000_000_000))
     );
 
+    let fred = profiles
+        .get("fred-alfred.api-v1-v2")
+        .ok_or("missing FRED/ALFRED profile")?;
+    let fred_budget = fred
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("FRED/ALFRED omitted rate enforcement")?;
+    assert_eq!(fred_budget.window_count(), 2);
+    assert_eq!(
+        fred_budget
+            .window(0)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((2, 1_000_000_000))
+    );
+    assert_eq!(
+        fred_budget
+            .window(1)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((120, 60_000_000_000))
+    );
+
+    let sec = profiles
+        .get("sec.edgar-public")
+        .ok_or("missing SEC profile")?;
+    let bls_public = profiles
+        .get("bls.v1-unregistered")
+        .ok_or("missing BLS v1 profile")?;
+    let treasury_xml = profiles
+        .get("treasury.daily-rates-xml")
+        .ok_or("missing Treasury XML profile")?;
+    let treasury_fiscal = profiles
+        .get("treasury.fiscal-data")
+        .ok_or("missing Treasury Fiscal Data profile")?;
+    for profile in [sec, fred, bls_public, treasury_xml, treasury_fiscal] {
+        assert_eq!(profile.capability().revision().get(), 3);
+        assert_eq!(
+            profile
+                .capability_history()
+                .map(|capability| capability.revision().get())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(profile.capability().evidence().iter().any(|binding| {
+            binding.source_id().as_str() == "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25"
+        }));
+    }
+    assert_eq!(
+        bls_public.capability().setup_mode(),
+        SetupMode::NoCredential
+    );
+    assert!(
+        sec.evidence()
+            .iter()
+            .any(|evidence| evidence.source_id() == "SEC-FAIR-ACCESS")
+    );
+    assert!(
+        bls_public
+            .evidence()
+            .iter()
+            .any(|evidence| evidence.source_id() == "BLS-CONTENT-ORIGIN")
+    );
+    assert_eq!(
+        treasury_xml.probe().endpoint(),
+        Some(
+            "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value=2025"
+        )
+    );
+    assert_eq!(
+        treasury_xml.capability().verifier_revision().as_str(),
+        "treasury.daily-rates-xml.probe.v2"
+    );
+
     let public_coinbase = profiles
         .get("coinbase.public-market-data")
         .ok_or("missing public Coinbase profile")?;
