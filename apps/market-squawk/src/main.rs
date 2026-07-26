@@ -9,9 +9,10 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
+    ProductionSourceProvider,
     cli::{
-        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
-        ReleaseEvidenceCommand, SourceCommand,
+        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ProductionSourceArgument,
+        ReleaseCommand, ReleaseEvidenceCommand, SourceCommand,
     },
     local_product::execute_cli_command,
     mcp::LocalMcpComposition,
@@ -124,13 +125,21 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::PaperBot(arguments) => {
-            let provider = arguments.provider;
+            let provider = match arguments.provider {
+                ProductionSourceArgument::Coinbase => ProductionSourceProvider::Coinbase,
+                ProductionSourceArgument::Kraken => ProductionSourceProvider::Kraken,
+                ProductionSourceArgument::CoinbaseDirect => {
+                    return Err(anyhow!(
+                        "Coinbase Direct requires `market-squawk bot start` so the exact \
+                         provider-onboarding session and application authority are retained"
+                    ));
+                }
+            };
             let seconds = arguments.seconds;
             let initial_cash = arguments.initial_cash;
             let fee_basis_points = arguments.fee_basis_points;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let composition =
-                local_paper_bot(config, provider.into(), initial_cash, fee_basis_points)?;
+            let composition = local_paper_bot(config, provider, initial_cash, fee_basis_points)?;
             let cancellation = CancellationToken::new();
             let runtime = composition.start(cancellation.clone()).await?;
             let primary = match seconds {

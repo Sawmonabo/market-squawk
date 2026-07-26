@@ -22,13 +22,13 @@ use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
     CoverageTopology, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
     HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration,
-    LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, PathScope, ProviderBookSide,
-    ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
-    ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
-    ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
-    SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
+    LiveCoverageRule, LiveProtocolProfile, MAX_DECODED_BOOK_ITEMS, NetworkAccessPolicy, PathScope,
+    ProviderBookSide, ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme,
+    ProviderNumericPolicy, ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind,
+    ProviderOrderRecord, ProviderPrice, ProviderQuantity, QueryParameterRule,
+    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,9 @@ use crate::{CoinbaseConfigError, CoinbaseProductMapping, CoinbaseTransportLimits
 
 /// Authenticated Direct Market Data WebSocket endpoint.
 pub const COINBASE_DIRECT_WEBSOCKET_ENDPOINT: &str = "wss://ws-direct.exchange.coinbase.com";
+/// Exact Coinbase Exchange credential-verification endpoint.
+pub const COINBASE_DIRECT_VERIFY_ENDPOINT: &str =
+    "https://api.exchange.coinbase.com/users/self/verify";
 const COINBASE_REST_ORIGIN: &str = "https://api.exchange.coinbase.com";
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
@@ -48,12 +51,23 @@ const DIRECT_CHANNEL: &str = "full";
 const WEBSOCKET_AUTH_PATH: &str = "/users/self/verify";
 const MAX_SIGNING_FIELD_BYTES: usize = 1_024;
 const MAX_SIGNING_SECRET_BYTES: usize = 1_024;
+const MAX_CREDENTIAL_ENVELOPE_BYTES: usize = 8 * 1_024;
 const MAX_SIGNED_SUBSCRIPTION_BYTES: usize = 16 * 1024;
+const CREDENTIAL_ENVELOPE_VERSION: u8 = 1;
 const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
 const MAX_DIRECT_PRODUCT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 2;
+const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 1;
 const MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW: u32 = 3;
+const DIRECT_SESSION_FIXED_MEMORY_BYTES: u64 = 128 * 1024;
+const DIRECT_SNAPSHOT_LIVE_COPIES: u64 = 2;
+const DIRECT_WEBSOCKET_FRAME_COPIES: u64 = 4;
+const DIRECT_BOOK_STATE_COPIES: u64 = 2;
+const DIRECT_ORDER_ENTRY_UPPER_BYTES: u64 = 768;
+const DIRECT_PRICE_LEVEL_ENTRY_UPPER_BYTES: u64 = 128;
+const DIRECT_QUEUE_EVENT_OVERHEAD_BYTES: u64 = 256;
+const DIRECT_SNAPSHOT_SEGMENT_OVERHEAD_BYTES: u64 = 512;
+const DIRECT_PUBLICATION_LEVEL_OVERHEAD_BYTES: u64 = 64;
 
 /// Complete transport, snapshot, queue, and level-3 ownership limits for one product generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +84,8 @@ impl CoinbaseDirectLimits {
     ///
     /// # Errors
     ///
-    /// Rejects zero/excessive snapshot limits or a byte limit impossible under the segment count.
+    /// Rejects zero/excessive snapshot limits, a byte limit impossible under the segment count,
+    /// or publication depth whose worst-case full-image delta exceeds the canonical batch bound.
     pub fn try_new(
         websocket: CoinbaseTransportLimits,
         max_snapshot_bytes: u64,
@@ -89,6 +104,7 @@ impl CoinbaseDirectLimits {
             || max_snapshot_bytes > segment_capacity
             || product_refresh_interval.is_zero()
             || product_refresh_interval > MAX_DIRECT_PRODUCT_REFRESH_INTERVAL
+            || book.published_depth() > MAX_DECODED_BOOK_ITEMS / 4
         {
             return Err(CoinbaseConfigError::InvalidDirectLimits);
         }
@@ -125,6 +141,87 @@ impl CoinbaseDirectLimits {
     pub const fn book(self) -> DirectBookLimits {
         self.book
     }
+
+    /// Returns a checked conservative upper bound for one pre-network Direct session.
+    ///
+    /// The estimate includes the complete snapshot response while it is captured and decoded,
+    /// WebSocket frame working copies, the queued replay payload and event containers, both
+    /// possible order-book state slots, price-level arenas, and both bid/ask publication buffers.
+    /// It deliberately overestimates allocator and hash-table overhead so application composition
+    /// can reject an unsafe aggregate before opening a socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoinbaseConfigError::InvalidDirectLimits`] when the configured bounds cannot be
+    /// represented as one `u64` byte ceiling.
+    pub fn checked_maximum_retained_bytes(self) -> Result<u64, CoinbaseConfigError> {
+        let book = self.book;
+        let snapshot_bytes = self
+            .max_snapshot_bytes
+            .checked_mul(DIRECT_SNAPSHOT_LIVE_COPIES)
+            .ok_or(CoinbaseConfigError::InvalidDirectLimits)?;
+        let frame_bytes = direct_memory_product(
+            self.websocket.max_frame_bytes(),
+            DIRECT_WEBSOCKET_FRAME_COPIES,
+        )?;
+        let snapshot_segment_bytes = direct_memory_product(
+            self.max_snapshot_segments,
+            DIRECT_SNAPSHOT_SEGMENT_OVERHEAD_BYTES,
+        )?;
+        let queue_payload_bytes = u64::try_from(book.max_queue_bytes())
+            .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?;
+        let queue_event_bytes =
+            direct_memory_product(book.max_queue_events(), DIRECT_QUEUE_EVENT_OVERHEAD_BYTES)?;
+        let order_bytes = direct_memory_product(
+            book.max_orders(),
+            DIRECT_ORDER_ENTRY_UPPER_BYTES
+                .checked_mul(DIRECT_BOOK_STATE_COPIES)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        let price_level_bytes = direct_memory_product(
+            book.max_price_levels(),
+            DIRECT_PRICE_LEVEL_ENTRY_UPPER_BYTES
+                .checked_mul(DIRECT_BOOK_STATE_COPIES)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        let publication_bytes = direct_memory_product(
+            book.published_depth(),
+            DIRECT_PUBLICATION_LEVEL_OVERHEAD_BYTES
+                .checked_add(
+                    u64::try_from(std::mem::size_of::<PriceTicks>())
+                        .map_err(|_| CoinbaseConfigError::InvalidDirectLimits)?,
+                )
+                .and_then(|value| {
+                    value.checked_add(u64::try_from(std::mem::size_of::<QuantityLots>()).ok()?)
+                })
+                .and_then(|value| value.checked_mul(4))
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)?,
+        )?;
+        [
+            DIRECT_SESSION_FIXED_MEMORY_BYTES,
+            snapshot_bytes,
+            frame_bytes,
+            snapshot_segment_bytes,
+            queue_payload_bytes,
+            queue_event_bytes,
+            order_bytes,
+            price_level_bytes,
+            publication_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or(CoinbaseConfigError::InvalidDirectLimits)
+        })
+    }
+}
+
+fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfigError> {
+    u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(bytes))
+        .ok_or(CoinbaseConfigError::InvalidDirectLimits)
 }
 
 /// Immutable metadata and endpoint profile for one product per Direct connection.
@@ -511,9 +608,77 @@ impl CoinbaseDirectHmacSigner {
         passphrase: String,
         secret_base64: String,
     ) -> Result<Self, CoinbaseDirectSigningError> {
-        let key = Zeroizing::new(key);
-        let passphrase = Zeroizing::new(passphrase);
-        let secret_base64 = Zeroizing::new(secret_base64);
+        Self::try_new_zeroizing(
+            Zeroizing::new(key),
+            Zeroizing::new(passphrase),
+            Zeroizing::new(secret_base64),
+        )
+    }
+
+    /// Imports one exact versioned secret envelope from the local secret capability.
+    ///
+    /// The accepted JSON object contains only `version`, `api_key`, `passphrase`, and
+    /// `signing_secret`. Every credential field is zeroized when parsing, validation, or signer
+    /// ownership ends.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an oversized, malformed, incomplete, unknown-field, or non-version-1 envelope and
+    /// every invalid credential field.
+    pub fn try_from_secret_envelope(envelope: &str) -> Result<Self, CoinbaseDirectSigningError> {
+        if envelope.is_empty() || envelope.len() > MAX_CREDENTIAL_ENVELOPE_BYTES {
+            return Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope);
+        }
+        let CredentialEnvelopeWire {
+            version,
+            api_key: SecretCredentialField(key),
+            passphrase: SecretCredentialField(passphrase),
+            signing_secret: SecretCredentialField(secret_base64),
+        } = serde_json::from_str(envelope)
+            .map_err(|_error| CoinbaseDirectSigningError::InvalidCredentialEnvelope)?;
+        if version != CREDENTIAL_ENVELOPE_VERSION {
+            return Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope);
+        }
+        Self::try_new_zeroizing(key, passphrase, secret_base64)
+    }
+
+    /// Builds the exact signed non-mutating Exchange credential-verification request.
+    ///
+    /// The method and target are code-owned so callers cannot apply this signing capability to an
+    /// arbitrary request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero timestamp or a signing/header value that violates the bounded credential
+    /// contract.
+    pub fn verification_request(
+        &self,
+        client: &reqwest::Client,
+        unix_seconds: u64,
+    ) -> Result<reqwest::RequestBuilder, CoinbaseDirectSigningError> {
+        if unix_seconds == 0 {
+            return Err(CoinbaseDirectSigningError::InvalidTimestamp);
+        }
+        let timestamp = unix_seconds.to_string();
+        let authentication = self.sign(CoinbaseDirectSigningRequest {
+            timestamp: &timestamp,
+        })?;
+        let key = sensitive_header(authentication.key())?;
+        let signature = sensitive_header(authentication.signature())?;
+        let passphrase = sensitive_header(authentication.passphrase())?;
+        Ok(client
+            .get(COINBASE_DIRECT_VERIFY_ENDPOINT)
+            .header("CB-ACCESS-KEY", key)
+            .header("CB-ACCESS-SIGN", signature)
+            .header("CB-ACCESS-TIMESTAMP", timestamp)
+            .header("CB-ACCESS-PASSPHRASE", passphrase))
+    }
+
+    fn try_new_zeroizing(
+        key: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+        secret_base64: Zeroizing<String>,
+    ) -> Result<Self, CoinbaseDirectSigningError> {
         if !valid_signing_field(&key)
             || !valid_signing_field(&passphrase)
             || secret_base64.is_empty()
@@ -535,6 +700,26 @@ impl CoinbaseDirectHmacSigner {
             passphrase,
             secret,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialEnvelopeWire {
+    version: u8,
+    api_key: SecretCredentialField,
+    passphrase: SecretCredentialField,
+    signing_secret: SecretCredentialField,
+}
+
+struct SecretCredentialField(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for SecretCredentialField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
 }
 
@@ -575,7 +760,17 @@ impl fmt::Debug for CoinbaseDirectHmacSigner {
 fn valid_signing_field(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_SIGNING_FIELD_BYTES
+        && value.is_ascii()
         && !value.chars().any(char::is_control)
+}
+
+fn sensitive_header(
+    value: &str,
+) -> Result<reqwest::header::HeaderValue, CoinbaseDirectSigningError> {
+    let mut header = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_error| CoinbaseDirectSigningError::InvalidAuthentication)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// Bounded authentication fields. Debug output never reveals any field.
@@ -660,6 +855,9 @@ pub enum CoinbaseDirectSigningError {
     /// Timestamp zero cannot satisfy the authentication window.
     #[error("Coinbase Direct signing timestamp is invalid")]
     InvalidTimestamp,
+    /// The imported versioned secret envelope was invalid.
+    #[error("Coinbase Direct credential envelope is invalid")]
+    InvalidCredentialEnvelope,
     /// A signing result was empty, oversized, or contained control characters.
     #[error("Coinbase Direct authentication output is invalid")]
     InvalidAuthentication,
@@ -2220,12 +2418,13 @@ mod tests {
     use sha2::Digest as _;
 
     use crate::{
-        COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError, CoinbaseDirectAuthentication,
-        CoinbaseDirectConfig, CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome,
-        CoinbaseDirectDecoder, CoinbaseDirectHmacSigner, CoinbaseDirectLimits,
-        CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
-        CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
-        CoinbaseDirectStopType, CoinbaseProductMapping, CoinbaseTransportLimits,
+        COINBASE_DIRECT_VERIFY_ENDPOINT, COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError,
+        CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectDecodeError,
+        CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectHmacSigner,
+        CoinbaseDirectLimits, CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability,
+        CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
+        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseProductMapping,
+        CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2236,14 +2435,16 @@ mod tests {
 
     #[test]
     fn production_signer_decodes_and_zeroizes_the_exchange_secret_boundary() -> TestResult {
-        let signer = CoinbaseDirectHmacSigner::try_new(
-            "fixture-key".to_owned(),
-            "fixture-passphrase".to_owned(),
-            "dGVzdC1zZWNyZXQ=".to_owned(),
+        let _tls = market_squawk_sources::install_ring_tls_provider()?;
+        let signer = CoinbaseDirectHmacSigner::try_from_secret_envelope(
+            r#"{"version":1,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ="}"#,
         )?;
         let authentication = signer.sign(CoinbaseDirectSigningRequest {
             timestamp: "1721847600",
         })?;
+        let request = signer
+            .verification_request(&reqwest::Client::new(), 1_721_847_600)?
+            .build()?;
 
         assert_eq!(authentication.key(), "fixture-key");
         assert_eq!(authentication.passphrase(), "fixture-passphrase");
@@ -2255,6 +2456,33 @@ mod tests {
             format!("{signer:?}"),
             "CoinbaseDirectHmacSigner([REDACTED])"
         );
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), COINBASE_DIRECT_VERIFY_ENDPOINT);
+        assert_eq!(request.headers()["cb-access-key"], "fixture-key");
+        assert_eq!(
+            request.headers()["cb-access-passphrase"],
+            "fixture-passphrase"
+        );
+        assert_eq!(request.headers()["cb-access-timestamp"], "1721847600");
+        assert_eq!(
+            request.headers()["cb-access-sign"],
+            "A5aXA9/etj7poRg/4b7U0odFyG7J5MlveUG2uOAZlP0="
+        );
+        assert!(request.headers()["cb-access-key"].is_sensitive());
+        assert!(request.headers()["cb-access-sign"].is_sensitive());
+        assert!(request.headers()["cb-access-passphrase"].is_sensitive());
+        assert!(matches!(
+            CoinbaseDirectHmacSigner::try_from_secret_envelope(
+                r#"{"version":2,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ="}"#,
+            ),
+            Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope)
+        ));
+        assert!(matches!(
+            CoinbaseDirectHmacSigner::try_from_secret_envelope(
+                r#"{"version":1,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ=","unexpected":"value"}"#,
+            ),
+            Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope)
+        ));
         Ok(())
     }
 
@@ -2502,13 +2730,11 @@ mod tests {
             "full"
         );
         assert!(!format!("{subscription:?}").contains("fixture-pass"));
-        for (case, max_concurrent, short_window_requests, long_window_requests) in [
-            ("concurrency", 1, 3, 3),
-            ("primary window", 2, 2, 3),
-            ("additional window", 2, 3, 2),
-        ] {
+        for (case, short_window_requests, long_window_requests) in
+            [("primary window", 2, 3), ("additional window", 3, 2)]
+        {
             let outcome = config_with_budget(
-                max_concurrent,
+                1,
                 &[
                     (short_window_requests, 1_000_000_000),
                     (long_window_requests, 2_000_000_000),

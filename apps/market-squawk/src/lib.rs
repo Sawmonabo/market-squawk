@@ -51,7 +51,8 @@ pub use domain::{
 };
 pub use live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 pub use live_source::{
-    ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
+    CoinbaseDirectLiveRuntime, CoinbaseDirectOutputFailure, CoinbaseDirectProductRuntimeError,
+    CoinbaseDirectSupervisorError, ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
@@ -72,7 +73,10 @@ pub use portfolio_application::{
     PortfolioApplicationServiceError, PortfolioFairValueReadCapability,
 };
 pub use provider_activation::{
-    ActivatedResearchProvider, BlsAdapterActivation, FredAdapterActivation, LiveProviderActivation,
+    ActivatedResearchProvider, BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
+    CoinbaseDirectAccountActivation, CoinbaseDirectActivationSpecError,
+    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
+    CoinbaseDirectRuntimeAdmission, FredAdapterActivation, LiveProviderActivation,
     LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderActivationOutcome,
     ProviderAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
     SecAdapterActivation, TreasuryAdapterActivation,

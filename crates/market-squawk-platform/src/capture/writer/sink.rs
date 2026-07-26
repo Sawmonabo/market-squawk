@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -172,6 +173,24 @@ pub struct MemoryCaptureSink {
     dynamic_retained_bytes: usize,
 }
 
+/// Fixed-capacity transient capture storage for sources whose admitted rights exclude persistence.
+///
+/// The sink retains only the newest complete records within independent count and byte ceilings.
+/// Replacement never allocates after construction: the record deque is preallocated, retained
+/// record clones share the already-admitted source and payload allocations, and old records are
+/// removed before a new record is inserted. This provides a bounded asynchronous capture barrier
+/// without writing provider data to durable storage.
+#[derive(Debug)]
+pub struct RollingMemoryCaptureSink {
+    destination: CaptureDestination,
+    records: VecDeque<CapturedRawRecord>,
+    max_records: usize,
+    retained_byte_limit: usize,
+    fixed_retained_bytes: usize,
+    dynamic_retained_bytes: usize,
+    overwritten_records: u64,
+}
+
 /// Failure to construct a never-growing, separately bounded in-memory capture sink.
 #[derive(Debug, Error)]
 pub enum MemoryCaptureSinkConstructionError {
@@ -293,6 +312,96 @@ impl MemoryCaptureSink {
     }
 }
 
+impl RollingMemoryCaptureSink {
+    /// Constructs a fully preallocated rolling transient sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when fixed record storage exceeds the byte ceiling, arithmetic
+    /// overflows, or the exact deque allocation cannot be reserved.
+    pub fn try_new(
+        max_records: NonZeroUsize,
+        max_retained_bytes: NonZeroUsize,
+    ) -> Result<Self, MemoryCaptureSinkConstructionError> {
+        let max_records = max_records.get();
+        let retained_byte_limit = max_retained_bytes.get();
+        let minimum_fixed = max_records
+            .checked_mul(std::mem::size_of::<CapturedRawRecord>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(MemoryCaptureSinkConstructionError::ArithmeticOverflow)?;
+        if minimum_fixed > retained_byte_limit {
+            return Err(
+                MemoryCaptureSinkConstructionError::FixedStorageBudgetExceeded {
+                    required: minimum_fixed,
+                    limit: retained_byte_limit,
+                },
+            );
+        }
+        let mut records = VecDeque::new();
+        records.try_reserve_exact(max_records).map_err(|_error| {
+            MemoryCaptureSinkConstructionError::AllocationFailed {
+                requested_records: max_records,
+            }
+        })?;
+        let fixed_retained_bytes = records
+            .capacity()
+            .checked_mul(std::mem::size_of::<CapturedRawRecord>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(MemoryCaptureSinkConstructionError::ArithmeticOverflow)?;
+        if fixed_retained_bytes > retained_byte_limit {
+            return Err(
+                MemoryCaptureSinkConstructionError::FixedStorageBudgetExceeded {
+                    required: fixed_retained_bytes,
+                    limit: retained_byte_limit,
+                },
+            );
+        }
+        Ok(Self {
+            destination: CaptureDestination::unique_memory(),
+            records,
+            max_records,
+            retained_byte_limit,
+            fixed_retained_bytes,
+            dynamic_retained_bytes: 0,
+            overwritten_records: 0,
+        })
+    }
+
+    /// Returns the currently retained records from oldest to newest.
+    pub fn records(&self) -> &VecDeque<CapturedRawRecord> {
+        &self.records
+    }
+
+    /// Returns the number of records intentionally replaced by the rolling policy.
+    pub const fn overwritten_records(&self) -> u64 {
+        self.overwritten_records
+    }
+
+    /// Returns the complete conservatively charged retained storage.
+    pub fn total_retained_bytes(&self) -> Result<usize, CaptureSinkError> {
+        self.fixed_retained_bytes
+            .checked_add(self.dynamic_retained_bytes)
+            .ok_or(CaptureSinkError::AccountingInvariant)
+    }
+
+    fn remove_oldest(&mut self) -> Result<(), CaptureSinkError> {
+        let oldest = self
+            .records
+            .pop_front()
+            .ok_or(CaptureSinkError::AccountingInvariant)?;
+        let dynamic = oldest.checked_sink_dynamic_retained_bytes()?;
+        self.dynamic_retained_bytes = self
+            .dynamic_retained_bytes
+            .checked_sub(dynamic)
+            .ok_or(CaptureSinkError::AccountingInvariant)?;
+        self.overwritten_records = self
+            .overwritten_records
+            .checked_add(1)
+            .ok_or(CaptureSinkError::AccountingInvariant)?;
+        Ok(())
+    }
+}
+
 impl CaptureSink for MemoryCaptureSink {
     fn destination(&self) -> CaptureDestination {
         self.destination.clone()
@@ -330,6 +439,54 @@ impl CaptureSink for MemoryCaptureSink {
         }
         self.records.push(retained);
         self.dynamic_retained_bytes = next_dynamic;
+        Ok(())
+    }
+
+    fn flush(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
+        context.checkpoint()
+    }
+}
+
+impl CaptureSink for RollingMemoryCaptureSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
+    fn append(
+        &mut self,
+        record: &CapturedRawRecord,
+        context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
+        context.checkpoint()?;
+        let record_dynamic_bytes = record.checked_sink_dynamic_retained_bytes()?;
+        let minimum_required = self
+            .fixed_retained_bytes
+            .checked_add(record_dynamic_bytes)
+            .ok_or(CaptureSinkError::AccountingInvariant)?;
+        if minimum_required > self.retained_byte_limit {
+            return Err(CaptureSinkError::RetainedByteLimitExceeded {
+                required: minimum_required,
+                limit: self.retained_byte_limit,
+            });
+        }
+        while self.records.len() >= self.max_records
+            || self
+                .fixed_retained_bytes
+                .checked_add(self.dynamic_retained_bytes)
+                .and_then(|bytes| bytes.checked_add(record_dynamic_bytes))
+                .is_none_or(|required| required > self.retained_byte_limit)
+        {
+            self.remove_oldest()?;
+        }
+        let retained = record.clone();
+        if !record.shares_record_allocations_with(&retained) {
+            return Err(CaptureSinkError::InvalidPayloadSharing);
+        }
+        self.records.push_back(retained);
+        self.dynamic_retained_bytes = self
+            .dynamic_retained_bytes
+            .checked_add(record_dynamic_bytes)
+            .ok_or(CaptureSinkError::AccountingInvariant)?;
         Ok(())
     }
 

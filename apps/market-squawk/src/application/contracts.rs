@@ -165,8 +165,9 @@ const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
 const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
         "provider",
-        ArgumentKind::Enumeration(&["coinbase", "kraken"]),
+        ArgumentKind::Enumeration(&["coinbase", "coinbase-direct", "kraken"]),
     ),
+    ArgumentSpec::optional("providerSessionId", ArgumentKind::Identifier),
     ArgumentSpec::required("initialCash", ArgumentKind::Decimal),
     ArgumentSpec::required(
         "feeBasisPoints",

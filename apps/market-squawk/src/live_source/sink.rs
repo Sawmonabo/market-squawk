@@ -15,7 +15,7 @@ use market_squawk_sources::{
     ConnectionLiveness, ControlFrameKind, CurrentHealthReporter, CurrentSourceSession,
     DecodeInternalError, DecodeOutcome, FreshnessPolicy, MarketDecoder, ProviderTimestampEvidence,
     QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError, ResynchronizationReason,
-    SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadataProvider,
+    SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider,
     ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
@@ -33,6 +33,19 @@ pub(super) struct ProductionRawMarketSinkInput<'a> {
     pub(super) routes: Vec<RouteActivationPublisher>,
 }
 
+/// Input capabilities for an adapter that already produced capture-bound decoder outcomes.
+#[derive(Debug)]
+pub(super) struct ProductionPredecodedMarketSinkInput<'a> {
+    pub(super) capture: RawCapturePublisher<CaptureGenerationCapabilities>,
+    pub(super) registry: &'a mut AuthoritativeSourceRegistry,
+    pub(super) session: &'a CurrentSourceSession,
+    pub(super) health_reporter: CurrentHealthReporter,
+    pub(super) metadata: SourceMetadata,
+    pub(super) subscription: SubscriptionStateMachine,
+    pub(super) live_ingress: LiveRuntimeIngress,
+    pub(super) routes: Vec<RouteActivationPublisher>,
+}
+
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
 #[derive(Debug)]
 pub(super) struct ProductionRawMarketSink<'a> {
@@ -40,7 +53,8 @@ pub(super) struct ProductionRawMarketSink<'a> {
     registry: &'a mut AuthoritativeSourceRegistry,
     session: &'a CurrentSourceSession,
     health_reporter: CurrentHealthReporter,
-    decoder: ProductionMarketDecoder,
+    decoder: Option<ProductionMarketDecoder>,
+    metadata: SourceMetadata,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
     live_ingress: LiveRuntimeIngress,
@@ -58,27 +72,73 @@ impl<'a> ProductionRawMarketSink<'a> {
     pub(super) fn try_new(
         input: ProductionRawMarketSinkInput<'a>,
     ) -> Result<Self, ProductionSinkConstructionError> {
-        if input.routes.is_empty() {
+        let metadata = input.decoder.metadata().clone();
+        Self::try_new_inner(
+            input.capture,
+            input.registry,
+            input.session,
+            input.health_reporter,
+            Some(input.decoder),
+            metadata,
+            input.subscription,
+            input.live_ingress,
+            input.routes,
+        )
+    }
+
+    pub(super) fn try_new_predecoded(
+        input: ProductionPredecodedMarketSinkInput<'a>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        Self::try_new_inner(
+            input.capture,
+            input.registry,
+            input.session,
+            input.health_reporter,
+            None,
+            input.metadata,
+            input.subscription,
+            input.live_ingress,
+            input.routes,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the common captured-outcome authority keeps every capability explicit"
+    )]
+    fn try_new_inner(
+        capture: RawCapturePublisher<CaptureGenerationCapabilities>,
+        registry: &'a mut AuthoritativeSourceRegistry,
+        session: &'a CurrentSourceSession,
+        health_reporter: CurrentHealthReporter,
+        decoder: Option<ProductionMarketDecoder>,
+        metadata: SourceMetadata,
+        subscription: SubscriptionStateMachine,
+        live_ingress: LiveRuntimeIngress,
+        route_publishers: Vec<RouteActivationPublisher>,
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        if route_publishers.is_empty() {
             return Err(ProductionSinkConstructionError::MissingRoutes);
         }
         let mut routes = HashMap::new();
         routes
-            .try_reserve(input.routes.len())
+            .try_reserve(route_publishers.len())
             .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
-        for route in input.routes {
+        for route in route_publishers {
             if routes.insert(route.route().clone(), route).is_some() {
                 return Err(ProductionSinkConstructionError::DuplicateRoute);
             }
         }
         Ok(Self {
-            capture: input.capture,
-            registry: input.registry,
-            session: input.session,
-            health_reporter: input.health_reporter,
-            decoder: input.decoder,
-            generation: GenerationIdentity::from_session(input.session),
-            subscription: input.subscription,
-            live_ingress: input.live_ingress,
+            capture,
+            registry,
+            session,
+            health_reporter,
+            decoder,
+            metadata,
+            generation: GenerationIdentity::from_session(session),
+            subscription,
+            live_ingress,
             routes,
             last_transport_at: None,
             last_market_at: None,
@@ -95,22 +155,74 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 
     fn process_frame(&mut self, frame: RawMarketFrame) -> Result<(), ProductionSinkFailure> {
-        let receipt = self
-            .capture
-            .try_publish(&frame)
-            .map_err(ProductionSinkFailure::Capture)?;
-        self.poll_route_failures()?;
-        let received_at = frame.received_at();
+        let receipt = self.capture_frame(&frame)?;
         let validated_frame = self
             .session
             .validate_live_frame(&frame)
             .map_err(ProductionSinkFailure::Registry)?;
         let outcome = self
             .decoder
+            .as_mut()
+            .ok_or(ProductionSinkFailure::MissingDecoder)?
             .decode(&validated_frame)
             .map_err(ProductionSinkFailure::Decode)?;
+        self.process_captured_outcome(outcome, receipt)
+    }
+
+    /// Captures and validates one adapter-predecoded frame without decoding it a second time.
+    pub(super) fn try_capture_predecoded(
+        &mut self,
+        frame: &RawMarketFrame,
+    ) -> Result<market_squawk_sources::CaptureAdmissionReceipt, SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        if self.decoder.is_some() {
+            return Err(self.fail(ProductionSinkFailure::UnexpectedDecoder));
+        }
+        let receipt = self
+            .capture_frame(frame)
+            .map_err(|failure| self.fail(failure))?;
+        self.session
+            .validate_live_frame(frame)
+            .map_err(ProductionSinkFailure::Registry)
+            .map_err(|failure| self.fail(failure))?;
+        Ok(receipt)
+    }
+
+    pub(super) fn try_process_captured_outcome(
+        &mut self,
+        outcome: DecodeOutcome,
+        receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<(), SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        self.process_captured_outcome(outcome, receipt)
+            .map_err(|failure| self.fail(failure))
+    }
+
+    fn capture_frame(
+        &mut self,
+        frame: &RawMarketFrame,
+    ) -> Result<market_squawk_sources::CaptureAdmissionReceipt, ProductionSinkFailure> {
+        let receipt = self
+            .capture
+            .try_publish(frame)
+            .map_err(ProductionSinkFailure::Capture)?;
+        self.poll_route_failures()?;
+        Ok(receipt)
+    }
+
+    fn process_captured_outcome(
+        &mut self,
+        outcome: DecodeOutcome,
+        receipt: market_squawk_sources::CaptureAdmissionReceipt,
+    ) -> Result<(), ProductionSinkFailure> {
+        self.poll_route_failures()?;
         let latest_source_at = latest_source_timestamp(&outcome);
         let decoded_route = decoded_route(&outcome)?;
+        let received_at = outcome.evidence().received_at();
         let validated_session = self
             .registry
             .validate_session(self.session, received_at)
@@ -238,10 +350,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             .ok_or(ProductionSinkFailure::UnknownRoute)?;
         if let Some(dormant) = dormant {
             manager.start_activation(dormant, batch)?;
-            self.health_rebind_at = Some(rebind_at(
-                received_at,
-                self.decoder.metadata().freshness_policy(),
-            )?);
+            self.health_rebind_at = Some(rebind_at(received_at, self.metadata.freshness_policy())?);
             self.health_valid_until = Some(valid_until);
         } else {
             manager.try_publish(batch)?;
@@ -268,7 +377,7 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 
     fn record_health(&mut self, observed_at: Timestamp) -> Result<(), ProductionSinkFailure> {
-        let metadata = self.decoder.metadata();
+        let metadata = &self.metadata;
         let authorization_deadline = metadata
             .authorization()
             .inclusive_authorization_deadline()
@@ -415,6 +524,10 @@ pub enum ProductionSinkFailure {
     Registry(RegistryError),
     #[error("decoder implementation failed")]
     Decode(DecodeInternalError),
+    #[error("predecoded sink cannot accept a raw frame")]
+    MissingDecoder,
+    #[error("decoded sink cannot accept an adapter-predecoded frame")]
+    UnexpectedDecoder,
     #[error("subscription state failed")]
     Subscription(SubscriptionFailure),
     #[error("source requested resynchronization")]
@@ -469,6 +582,8 @@ impl ProductionSinkFailure {
             | Self::Capture(_)
             | Self::Registry(_)
             | Self::Decode(_)
+            | Self::MissingDecoder
+            | Self::UnexpectedDecoder
             | Self::Health(_)
             | Self::Ingress(_)
             | Self::RouteActivation(_)
@@ -503,6 +618,8 @@ impl ProductionSinkFailure {
             Self::Capture(_)
             | Self::Registry(_)
             | Self::Decode(_)
+            | Self::MissingDecoder
+            | Self::UnexpectedDecoder
             | Self::Subscription(_)
             | Self::Resynchronize(_)
             | Self::Quarantine(_)

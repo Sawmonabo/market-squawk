@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use market_squawk_adapter_coinbase::{CoinbaseDirectLimits, CoinbaseTransportLimits};
 use market_squawk_adapter_paper::{
     FeeSchedule, PaperAccountBootstrap, PaperCheckpointRepository, PaperExecutionConfig,
     PaperExecutionConfigInput, PaperExposureValuation, PaperVenueSession,
@@ -18,7 +19,8 @@ use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, S
 use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, InstrumentDefinition, Money, OrderId,
-    OrderReasonCode, PriceTicks, RuleVersion, SourceIdentifier, StrategyId, Timestamp,
+    OrderReasonCode, PriceTicks, ProviderProduct, RuleVersion, SourceIdentifier, StrategyId,
+    Timestamp,
 };
 use market_squawk_execution::portfolio_execution_state;
 use market_squawk_execution::{
@@ -30,7 +32,7 @@ use market_squawk_execution::{
     Strategy,
 };
 use market_squawk_live::{
-    ActionAuthorityIssueLimit, DepthLimit, LiveRouteConfig, LiveRouteConfigInput,
+    ActionAuthorityIssueLimit, DepthLimit, DirectBookLimits, LiveRouteConfig, LiveRouteConfigInput,
     LiveRuntimeConfig, LiveRuntimeConfigInput, RouteActionHook, ShardKey, ShardRoutingVersion,
     SnapshotLimits,
 };
@@ -40,16 +42,21 @@ use market_squawk_portfolio::{
     PortfolioLimits, PortfolioService, PortfolioServiceLimitInput, PortfolioServiceLimits,
     RevisionEvidence, TransactionRevision, ValuationSet,
 };
-use market_squawk_sources::ProviderRateAuthority;
+use market_squawk_sources::{FreshnessPolicy, ProviderRateAuthority};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
 };
 use crate::provider_rate::open_provider_rate_authority;
-use crate::{AppConfig, ProductionLiveSourceComposition, ProductionSourceProvider};
+use crate::{
+    AppConfig, CoinbaseDirectAccountActivation, CoinbaseDirectAdapterActivation,
+    CoinbaseDirectProductActivation, ProductionLiveSourceComposition, ProductionSourceProvider,
+    ProviderActivationOutcome, ProviderAdapterActivation, ProviderAdapterActivationRequest,
+};
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const LOCAL_PAPER_STRATEGY_ID: &str = "454b500a-22ce-4a6d-a174-7320c724f78f";
@@ -62,6 +69,18 @@ const LOCAL_PAPER_REQUIRED_FEATURES: [RequiredLiveFeature; 2] = [
     RequiredLiveFeature::BookImbalance,
 ];
 const COINBASE_RETAINED_DEPTH: usize = 32;
+const COINBASE_DIRECT_MAXIMUM_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+const COINBASE_DIRECT_MAXIMUM_SNAPSHOT_SEGMENTS: usize = 16;
+const COINBASE_DIRECT_PRODUCT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const COINBASE_DIRECT_MAXIMUM_ORDERS: usize = 100_000;
+const COINBASE_DIRECT_MAXIMUM_PRICE_LEVELS: usize = 50_000;
+const COINBASE_DIRECT_MAXIMUM_QUEUE_EVENTS: usize = 16_384;
+const COINBASE_DIRECT_MAXIMUM_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const COINBASE_DIRECT_MAXIMUM_RUNTIME_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const COINBASE_DIRECT_SUPERVISOR_QUEUE_RECORDS: usize =
+    crate::COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS;
+const COINBASE_DIRECT_SUPERVISOR_QUEUE_BYTES: usize = 64 * 1024;
+const COINBASE_DIRECT_MAXIMUM_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
 const MAILBOX_COMMANDS_PER_ROUTE: usize = 4_096;
 const MAILBOX_BYTES_PER_ROUTE: u32 = 16 * 1024 * 1024;
 const FEATURE_WINDOW_OBSERVATIONS_PER_ROUTE: usize = 4_096;
@@ -122,6 +141,33 @@ pub(crate) fn local_paper_bot_with_provider_rate(
     )
 }
 
+pub(crate) async fn local_coinbase_direct_paper_bot_with_activation(
+    config: AppConfig,
+    provider_session_id: Uuid,
+    initial_cash: Decimal,
+    fee_basis_points: u32,
+    provider_activation: &ProviderAdapterActivation,
+    cancellation: CancellationToken,
+) -> Result<ProductionPaperBotComposition> {
+    let source = configured_source(&config, ProductionSourceProvider::Coinbase)?;
+    let request = coinbase_direct_activation_request(&config, &source)?;
+    let activation = provider_activation
+        .activate_ready_profile(provider_session_id, request, cancellation)
+        .await?;
+    let ProviderActivationOutcome::CoinbaseDirect(activation) = activation else {
+        bail!("provider session did not activate the Coinbase Direct surface");
+    };
+    build_local_paper_bot(
+        config,
+        PaperBotBuildSource::CoinbaseDirect(activation),
+        source,
+        initial_cash,
+        fee_basis_points,
+        0,
+        controlled_paper_strategy,
+    )
+}
+
 /// Backward-compatible Coinbase selection for existing application callers.
 pub fn local_coinbase_paper_bot(
     config: AppConfig,
@@ -138,8 +184,7 @@ pub fn local_coinbase_paper_bot(
 
 #[derive(Debug)]
 struct ConfiguredPaperSource {
-    definitions: Vec<InstrumentDefinition>,
-    retained_depth: usize,
+    routes: Vec<LiveRouteConfig>,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
 }
@@ -149,6 +194,7 @@ enum PaperBotBuildSource {
         provider: ProductionSourceProvider,
         provider_rate: ProviderRateAuthority,
     },
+    CoinbaseDirect(Box<CoinbaseDirectAccountActivation>),
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark,
 }
@@ -162,29 +208,120 @@ fn configured_source(
             let source = config
                 .coinbase()
                 .ok_or_else(|| anyhow!("production Coinbase configuration is required"))?;
-            Ok(ConfiguredPaperSource {
-                definitions: source
+            configured_paper_source(
+                source
                     .instruments()
                     .iter()
                     .map(|mapping| mapping.definition().clone())
                     .collect(),
-                retained_depth: COINBASE_RETAINED_DEPTH,
-                maximum_message_bytes: u32::try_from(source.max_frame_bytes().get())?,
-                freshness_nanos: u64::try_from(source.freshness().as_nanos())?,
-            })
+                COINBASE_RETAINED_DEPTH,
+                u32::try_from(source.max_frame_bytes().get())?,
+                u64::try_from(source.freshness().as_nanos())?,
+            )
         }
         ProductionSourceProvider::Kraken => {
             let source = config
                 .kraken()
                 .ok_or_else(|| anyhow!("production Kraken configuration is required"))?;
-            Ok(ConfiguredPaperSource {
-                definitions: vec![source.definition().clone()],
-                retained_depth: source.depth(),
-                maximum_message_bytes: u32::try_from(source.max_frame_bytes().get())?,
-                freshness_nanos: u64::try_from(source.freshness().as_nanos())?,
-            })
+            configured_paper_source(
+                vec![source.definition().clone()],
+                source.depth(),
+                u32::try_from(source.max_frame_bytes().get())?,
+                u64::try_from(source.freshness().as_nanos())?,
+            )
         }
     }
+}
+
+fn configured_paper_source(
+    definitions: Vec<InstrumentDefinition>,
+    retained_depth: usize,
+    maximum_message_bytes: u32,
+    freshness_nanos: u64,
+) -> Result<ConfiguredPaperSource> {
+    let first = definitions
+        .first()
+        .ok_or_else(|| anyhow!("production source instrument set is empty"))?;
+    let venue = first
+        .venue_mappings()
+        .first()
+        .ok_or_else(|| anyhow!("production source instrument has no venue mapping"))?
+        .venue_id()
+        .clone();
+    let mut routes = Vec::new();
+    routes.try_reserve_exact(definitions.len())?;
+    for definition in definitions {
+        routes.push(LiveRouteConfig::try_new(LiveRouteConfigInput {
+            route: ShardKey::new(venue.clone(), definition.instrument_id()),
+            definition,
+            depth: DepthLimit::new(retained_depth)?,
+            nonce_capacity: 64,
+            nonce_reclaim_budget: 8,
+            maximum_capability_lifetime: Duration::from_secs(1),
+        })?);
+    }
+    Ok(ConfiguredPaperSource {
+        routes,
+        maximum_message_bytes,
+        freshness_nanos,
+    })
+}
+
+fn coinbase_direct_activation_request(
+    config: &AppConfig,
+    source: &ConfiguredPaperSource,
+) -> Result<ProviderAdapterActivationRequest> {
+    let coinbase = config
+        .coinbase()
+        .ok_or_else(|| anyhow!("production Coinbase configuration is required"))?;
+    if coinbase.instruments().len() != source.routes.len() {
+        bail!("Coinbase Direct route topology differs from configured products");
+    }
+    let freshness = FreshnessPolicy::try_new(
+        source.freshness_nanos,
+        source.freshness_nanos,
+        source.freshness_nanos,
+        source.freshness_nanos,
+        COINBASE_DIRECT_MAXIMUM_CLOCK_SKEW_NANOS,
+    )?;
+    let transport = CoinbaseTransportLimits::try_new(
+        coinbase.max_frame_bytes().get(),
+        coinbase.subscription_ack_timeout(),
+        coinbase.subscription_ack_timeout(),
+    )?;
+    let limits = CoinbaseDirectLimits::try_new(
+        transport,
+        COINBASE_DIRECT_MAXIMUM_SNAPSHOT_BYTES,
+        COINBASE_DIRECT_MAXIMUM_SNAPSHOT_SEGMENTS,
+        COINBASE_DIRECT_PRODUCT_REFRESH_INTERVAL,
+        DirectBookLimits::try_new(
+            COINBASE_DIRECT_MAXIMUM_ORDERS,
+            COINBASE_DIRECT_MAXIMUM_PRICE_LEVELS,
+            COINBASE_DIRECT_MAXIMUM_QUEUE_EVENTS,
+            COINBASE_DIRECT_MAXIMUM_QUEUE_BYTES,
+            COINBASE_RETAINED_DEPTH,
+        )?,
+    )?;
+    let mut products = Vec::new();
+    products.try_reserve_exact(source.routes.len())?;
+    for (mapping, route) in coinbase.instruments().iter().zip(&source.routes) {
+        products.push(CoinbaseDirectProductActivation::try_new(
+            ProviderProduct::new(SourceIdentifier::try_from(mapping.product())?),
+            route.clone(),
+            freshness,
+            limits,
+        )?);
+    }
+    Ok(ProviderAdapterActivationRequest::CoinbaseDirect(
+        CoinbaseDirectAdapterActivation::try_new(
+            products,
+            nonzero_u64(COINBASE_DIRECT_MAXIMUM_RUNTIME_BYTES)?,
+            config.capture_queue_capacity(),
+            config.capture_memory_ceiling_bytes(),
+            nonzero_usize(COINBASE_DIRECT_SUPERVISOR_QUEUE_RECORDS)?,
+            nonzero_usize(COINBASE_DIRECT_SUPERVISOR_QUEUE_BYTES)?,
+        )?,
+    ))
 }
 
 fn build_local_paper_bot<F>(
@@ -200,8 +337,7 @@ where
     F: FnMut(&LiveRouteConfig) -> Result<Box<dyn Strategy>>,
 {
     let ConfiguredPaperSource {
-        definitions,
-        retained_depth,
+        routes,
         maximum_message_bytes,
         freshness_nanos,
     } = source_profile;
@@ -211,37 +347,15 @@ where
     if u64::from(fee_basis_points) > MAX_PAPER_FEE_BASIS_POINTS {
         bail!("paper fee basis points must not exceed {MAX_PAPER_FEE_BASIS_POINTS}");
     }
-    let first = definitions
+    let first = routes
         .first()
-        .ok_or_else(|| anyhow!("production source instrument set is empty"))?;
-    let currency = first.quote_currency();
-    let venue = first
-        .venue_mappings()
-        .first()
-        .ok_or_else(|| anyhow!("production source instrument has no venue mapping"))?
-        .venue_id()
-        .clone();
-    if definitions.iter().any(|definition| {
-        definition.quote_currency() != currency
-            || definition
-                .venue_mappings()
-                .first()
-                .is_none_or(|mapping| mapping.venue_id() != &venue)
+        .ok_or_else(|| anyhow!("production source route set is empty"))?;
+    let currency = first.definition().quote_currency();
+    let venue = first.route().venue().clone();
+    if routes.iter().any(|route| {
+        route.definition().quote_currency() != currency || route.route().venue() != &venue
     }) {
         bail!("one local paper run requires a single reporting currency and venue");
-    }
-
-    let mut routes = Vec::new();
-    routes.try_reserve_exact(definitions.len())?;
-    for definition in definitions {
-        routes.push(LiveRouteConfig::try_new(LiveRouteConfigInput {
-            route: ShardKey::new(venue.clone(), definition.instrument_id()),
-            definition,
-            depth: DepthLimit::new(retained_depth)?,
-            nonce_capacity: 64,
-            nonce_reclaim_budget: 8,
-            maximum_capability_lifetime: Duration::from_secs(1),
-        })?);
     }
     let account_id = AccountId::from_str(LOCAL_PAPER_ACCOUNT_ID)?;
     let cash = Money::new(initial_cash, currency);
@@ -397,6 +511,14 @@ where
                 strategies,
             )?)
         }
+        PaperBotBuildSource::CoinbaseDirect(activation) => {
+            Ok(ProductionPaperBotComposition::try_new_coinbase_direct(
+                *activation,
+                runtime_config,
+                execution,
+                strategies,
+            )?)
+        }
         #[cfg(feature = "release-evidence")]
         PaperBotBuildSource::ReleaseBenchmark => {
             Ok(ProductionPaperBotComposition::try_new_release_benchmark(
@@ -422,12 +544,7 @@ where
     build_local_paper_bot(
         config,
         PaperBotBuildSource::ReleaseBenchmark,
-        ConfiguredPaperSource {
-            definitions: vec![definition],
-            retained_depth: 10,
-            maximum_message_bytes: 16 * 1024 * 1024,
-            freshness_nanos: 60_000_000_000,
-        },
+        configured_paper_source(vec![definition], 10, 16 * 1024 * 1024, 60_000_000_000)?,
         Decimal::new(1_000_000, 0),
         0,
         action_hook_overhead_bytes,
@@ -615,6 +732,7 @@ fn bound_risk_policy(
             provider: ProductionSourceProvider::Kraken,
             ..
         } => "local-kraken-paper-risk",
+        PaperBotBuildSource::CoinbaseDirect(_) => "local-coinbase-direct-paper-risk",
         #[cfg(feature = "release-evidence")]
         PaperBotBuildSource::ReleaseBenchmark => "release-benchmark-paper-risk",
     };

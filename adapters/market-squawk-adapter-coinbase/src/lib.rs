@@ -18,17 +18,17 @@ pub use config::{
 };
 pub use decoder::CoinbaseExchangeDecoder;
 pub use direct::{
-    COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectActivation, CoinbaseDirectAuthentication,
-    CoinbaseDirectCaptureError, CoinbaseDirectConfig, CoinbaseDirectDecodeError,
-    CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectHmacSigner,
-    CoinbaseDirectLimits, CoinbaseDirectNonBookEvent, CoinbaseDirectNonBookKind,
-    CoinbaseDirectProductError, CoinbaseDirectProductEvidence, CoinbaseDirectReceivedLifecycle,
-    CoinbaseDirectSigningCapability, CoinbaseDirectSigningError, CoinbaseDirectSigningRequest,
-    CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError, CoinbaseDirectStopType,
-    CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
+    COINBASE_DIRECT_VERIFY_ENDPOINT, COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseDirectActivation,
+    CoinbaseDirectAuthentication, CoinbaseDirectCaptureError, CoinbaseDirectConfig,
+    CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
+    CoinbaseDirectHmacSigner, CoinbaseDirectLimits, CoinbaseDirectNonBookEvent,
+    CoinbaseDirectNonBookKind, CoinbaseDirectProductError, CoinbaseDirectProductEvidence,
+    CoinbaseDirectReceivedLifecycle, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
+    CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
+    CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
 };
 pub use direct_transport::{
     CoinbaseDirectBookUpdate, CoinbaseDirectOutput, CoinbaseDirectPublicationError,
-    CoinbaseDirectSession, CoinbaseDirectSessionError,
+    CoinbaseDirectPublicationKind, CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
 pub use source::CoinbaseExchangeSource;

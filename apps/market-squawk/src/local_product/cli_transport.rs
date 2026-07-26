@@ -512,12 +512,19 @@ async fn bot(
             let mut start_arguments = json_object(json!({
                 "provider": match paper.provider {
                     crate::cli::ProductionSourceArgument::Coinbase => "coinbase",
+                    crate::cli::ProductionSourceArgument::CoinbaseDirect => "coinbase-direct",
                     crate::cli::ProductionSourceArgument::Kraken => "kraken",
                 },
                 "initialCash": paper.initial_cash.to_string(),
                 "feeBasisPoints": paper.fee_basis_points,
                 "confirm": confirm,
             }))?;
+            if let Some(provider_session_id) = paper.provider_session_id {
+                start_arguments.insert(
+                    "providerSessionId".to_owned(),
+                    Value::String(provider_session_id.to_string()),
+                );
+            }
             let started = invoke(
                 product,
                 "Bot.Start",

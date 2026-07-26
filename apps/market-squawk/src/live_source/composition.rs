@@ -459,7 +459,7 @@ impl SupervisorDropCancellation {
         Self { token }
     }
 
-    fn cancel(&self) {
+    pub(super) fn cancel(&self) {
         self.token.cancel();
     }
 }
@@ -898,6 +898,8 @@ pub enum ProductionLiveSourceRuntimeError {
     DuplicateQualifiedMarketExportRoute { route: ShardKey },
     #[error(transparent)]
     LiveRuntime(#[from] LiveRuntimeCompositionError),
+    #[error(transparent)]
+    CoinbaseDirect(#[from] super::CoinbaseDirectSupervisorError),
     #[error(transparent)]
     Supervisor(#[from] ProductionSupervisorError),
     #[error("production source supervisor task failed: {0}")]

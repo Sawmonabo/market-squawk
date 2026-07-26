@@ -1,5 +1,6 @@
 //! Lease-gated construction of production live and research adapters.
 
+mod direct;
 mod specs;
 
 use std::fmt;
@@ -32,10 +33,12 @@ use market_squawk_sources::{
     SourceMetadata,
 };
 
+pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub use specs::{
-    BlsAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
-    PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
-    SecAdapterActivation, TreasuryAdapterActivation,
+    BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
+    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation, FredAdapterActivation,
+    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
+    ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
 };
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
@@ -390,6 +393,7 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Treasury(spec) => &spec.metadata,
             ProviderAdapterActivationRequest::Fred(spec) => &spec.metadata,
             ProviderAdapterActivationRequest::Live(_)
+            | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
             | ProviderAdapterActivationRequest::Portfolio(_) => {
                 return Err(ProviderAdapterActivationError::SourceBinding);
@@ -483,6 +487,7 @@ impl ProviderAdapterActivation {
                 .await?
             }
             ProviderAdapterActivationRequest::Live(_)
+            | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::Sec(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
             | ProviderAdapterActivationRequest::Portfolio(_) => {
@@ -534,6 +539,16 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Live(routes) => {
                 self.activate_live(lease, routes).map(Into::into)
             }
+            ProviderAdapterActivationRequest::CoinbaseDirect(spec) => {
+                direct::activate_coinbase_direct(
+                    Arc::clone(&self.onboarding),
+                    self.app_config.clone(),
+                    self.provider_rate.clone(),
+                    lease,
+                    spec,
+                )
+                .map(Into::into)
+            }
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
             }
@@ -565,6 +580,10 @@ impl ProviderAdapterActivation {
         match request {
             ProviderAdapterActivationRequest::Live(routes) => {
                 self.activate_live(lease, routes).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::CoinbaseDirect(_spec) => {
+                require_surface(&lease, "coinbase.exchange-direct-market-data")?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
             }
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
@@ -945,6 +964,8 @@ impl fmt::Debug for CommittedProviderAdapterReplacement {
 pub enum ProviderActivationOutcome {
     /// Validated live connector construction.
     Live(Box<LiveProviderActivation>),
+    /// Exclusively owned authenticated Coinbase Direct account construction.
+    CoinbaseDirect(Box<CoinbaseDirectAccountActivation>),
     /// Registered research extraction adapter.
     Research(Box<ActivatedResearchProvider>),
 }
@@ -952,6 +973,12 @@ pub enum ProviderActivationOutcome {
 impl From<LiveProviderActivation> for ProviderActivationOutcome {
     fn from(value: LiveProviderActivation) -> Self {
         Self::Live(Box::new(value))
+    }
+}
+
+impl From<CoinbaseDirectAccountActivation> for ProviderActivationOutcome {
+    fn from(value: CoinbaseDirectAccountActivation) -> Self {
+        Self::CoinbaseDirect(Box::new(value))
     }
 }
 

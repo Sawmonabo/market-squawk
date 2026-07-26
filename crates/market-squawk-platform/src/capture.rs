@@ -578,8 +578,9 @@ pub use writer::{
     CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterSpawnError,
     DestinationFenceRegistryInitializationError,
     DestinationFenceRegistryPermanentInitializationError, MemoryCaptureSink,
-    MemoryCaptureSinkConstructionError, PendingCaptureWriter, WriterFixedStorageReceipt,
-    WriterRuntimeProofError, initialize_capture_process_infrastructure, spawn_capture_writer,
+    MemoryCaptureSinkConstructionError, PendingCaptureWriter, RollingMemoryCaptureSink,
+    WriterFixedStorageReceipt, WriterRuntimeProofError, initialize_capture_process_infrastructure,
+    spawn_capture_writer,
 };
 
 #[cfg(test)]

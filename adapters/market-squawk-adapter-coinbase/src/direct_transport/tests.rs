@@ -10,30 +10,22 @@ use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use market_squawk_domain::{
     AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinitionRevision,
-    InstrumentExecutionTerms, InstrumentId, LotSize, MetadataRevision, ProviderProduct,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
+    InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MetadataRevision,
+    ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
 };
 use market_squawk_live::{DirectBookLimits, DirectSyncPhase};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecoderEvidence, FreshnessPolicy,
-    LiveSourceGeneration, ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload,
-    RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
+    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
+    FreshnessPolicy, LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy,
+    ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame, RawMarketSink, SessionId,
+    SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
-use tokio_tungstenite::{
-    accept_async, client_async,
-    tungstenite::{
-        Message,
-        protocol::frame::{
-            Frame,
-            coding::{Data, OpCode},
-        },
-    },
-};
+use tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -51,11 +43,14 @@ use crate::{
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
-const SNAPSHOT_BODY: &[u8] = br#"{"sequence":100,"time":"2026-07-24T21:34:10.600Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
+const SNAPSHOT_BODY: &[u8] = br#"{"sequence":104,"time":"2026-07-24T21:34:10.604Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
 const SEQUENCE_101: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":101,"order_id":"order-101","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_102: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":102,"order_id":"order-102","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_103: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":103,"order_id":"order-103","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_104: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","sequence":104,"order_id":"order-104","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
+const SEQUENCE_105: &str = r#"{"type":"open","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","sequence":105,"order_id":"order-105","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
+const SEQUENCE_106: &str = r#"{"type":"done","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","sequence":106,"order_id":"order-105","reason":"canceled","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
+const SEQUENCE_107: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","sequence":107,"order_id":"order-107","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
 const SUBSCRIPTION_ACK: &str =
     r#"{"type":"subscriptions","channels":[{"name":"full","product_ids":["BTC-USD"]}]}"#;
@@ -202,12 +197,27 @@ fn successful_http_response(url: &str, body: &'static [u8]) -> CoinbaseDirectHtt
 }
 
 #[derive(Debug, Eq, PartialEq)]
+enum RecordedPublication {
+    Snapshot {
+        bids: Vec<(String, String)>,
+        asks: Vec<(String, String)>,
+    },
+    Delta {
+        changes: Vec<(ProviderBookSide, String, String)>,
+    },
+    Quote {
+        bid: Option<(String, String)>,
+        ask: Option<(String, String)>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
 struct RecordedBook {
     sequence: u64,
     snapshot_url: String,
     source_identifier: String,
-    bid: Option<(String, String)>,
-    ask: Option<(String, String)>,
+    event_class: LiveEventClass,
+    publication: RecordedPublication,
     bids: Vec<(i64, i64)>,
     asks: Vec<(i64, i64)>,
 }
@@ -242,6 +252,20 @@ impl RawMarketSink for RecordingOutput {
 }
 
 impl CoinbaseDirectOutput for RecordingOutput {
+    fn try_publish_subscription_acknowledgement(
+        &mut self,
+        acknowledgement: DecodedControlFrame,
+    ) -> Result<(), SinkError> {
+        if self
+            .frames
+            .last()
+            .is_none_or(|frame| frame.frame_id() != acknowledgement.evidence().frame_id())
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        Ok(())
+    }
+
     fn try_publish_product(
         &mut self,
         evidence: CoinbaseDirectProductEvidence,
@@ -271,33 +295,41 @@ impl CoinbaseDirectOutput for RecordingOutput {
     }
 
     fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError> {
-        let quote = update
-            .try_quote_batch()
+        let batch = update
+            .try_publication_batch()
             .map_err(|_error| SinkError::CaptureIncomplete)?;
-        let observation = quote
+        let observation = batch
             .observations()
             .first()
             .ok_or(SinkError::CaptureIncomplete)?;
-        let ProviderObservationPayload::Quote { bid, ask } = observation.payload() else {
-            return Err(SinkError::CaptureIncomplete);
+        let publication = match observation.payload() {
+            ProviderObservationPayload::BookSnapshot(snapshot) => RecordedPublication::Snapshot {
+                bids: snapshot.bids().iter().map(record_level).collect::<Vec<_>>(),
+                asks: snapshot.asks().iter().map(record_level).collect::<Vec<_>>(),
+            },
+            ProviderObservationPayload::BookDelta(delta) => RecordedPublication::Delta {
+                changes: delta
+                    .changes()
+                    .iter()
+                    .map(|change| {
+                        let (price, quantity) = record_level(change.level());
+                        (change.side(), price, quantity)
+                    })
+                    .collect::<Vec<_>>(),
+            },
+            ProviderObservationPayload::Quote { bid, ask } => RecordedPublication::Quote {
+                bid: bid.as_ref().map(record_level),
+                ask: ask.as_ref().map(record_level),
+            },
+            _ => return Err(SinkError::CaptureIncomplete),
         };
         let book = update.book();
         self.books.push(RecordedBook {
             sequence: update.sequence().get(),
             snapshot_url: update.snapshot_receipt().final_url().to_owned(),
             source_identifier: observation.source_identifier().as_str().to_owned(),
-            bid: bid.as_ref().map(|level| {
-                (
-                    level.price().value().as_str().to_owned(),
-                    level.quantity().value().as_str().to_owned(),
-                )
-            }),
-            ask: ask.as_ref().map(|level| {
-                (
-                    level.price().value().as_str().to_owned(),
-                    level.quantity().value().as_str().to_owned(),
-                )
-            }),
+            event_class: observation.event_class(),
+            publication,
             bids: book
                 .bids()
                 .map(|level| (level.price().get(), level.quantity().get()))
@@ -310,6 +342,13 @@ impl CoinbaseDirectOutput for RecordingOutput {
         self.first_book.notify_one();
         Ok(())
     }
+}
+
+fn record_level(level: &market_squawk_sources::ProviderBookLevel) -> (String, String) {
+    (
+        level.price().value().as_str().to_owned(),
+        level.quantity().value().as_str().to_owned(),
+    )
 }
 
 #[tokio::test]
@@ -350,6 +389,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         assert_eq!(subscription["key"], "fixture-key");
         assert_eq!(subscription["passphrase"], "fixture-passphrase");
         assert_eq!(subscription["signature"], "fixture-signature");
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
 
         controls.product_started.await?;
@@ -376,15 +419,6 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .send(())
             .map_err(|_| "snapshot request was dropped")?;
 
-        let (sequence_103_head, sequence_103_tail) =
-            SEQUENCE_103.as_bytes().split_at(SEQUENCE_103.len() / 2);
-        socket
-            .send(Message::Frame(Frame::message(
-                Bytes::copy_from_slice(sequence_103_head),
-                OpCode::Data(Data::Text),
-                false,
-            )))
-            .await?;
         let frontier = socket
             .next()
             .await
@@ -394,17 +428,14 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         };
         assert_eq!(frontier.len(), 56);
         socket.send(Message::Pong(frontier)).await?;
-        socket
-            .send(Message::Frame(Frame::message(
-                Bytes::copy_from_slice(sequence_103_tail),
-                OpCode::Data(Data::Continue),
-                true,
-            )))
-            .await?;
+        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
+        socket.send(Message::Text(SEQUENCE_103.into())).await?;
+        socket.send(Message::Text(SEQUENCE_104.into())).await?;
 
         first_book.notified().await;
-        socket.send(Message::Text(SEQUENCE_104.into())).await?;
-        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
+        socket.send(Message::Text(SEQUENCE_105.into())).await?;
+        socket.send(Message::Text(SEQUENCE_106.into())).await?;
+        socket.send(Message::Text(SEQUENCE_107.into())).await?;
         socket
             .send(Message::Ping(Bytes::from_static(b"direct-probe")))
             .await?;
@@ -444,7 +475,7 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         .await?
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-    assert_eq!(output.frames.len(), 6);
+    assert_eq!(output.frames.len(), 9);
     assert_eq!(output.frames[0].payload(), SUBSCRIPTION_ACK.as_bytes());
     assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 1);
@@ -452,20 +483,56 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         output.books,
         [
             RecordedBook {
-                sequence: 103,
+                sequence: 104,
                 snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(103),
-                bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
-                ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
+                source_identifier: snapshot_identity(104),
+                event_class: LiveEventClass::BookSnapshot,
+                publication: RecordedPublication::Snapshot {
+                    bids: vec![("100.00".to_owned(), "1.00000000".to_owned())],
+                    asks: vec![("101.00".to_owned(), "2.00000000".to_owned())],
+                },
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
             },
             RecordedBook {
-                sequence: 104,
+                sequence: 105,
                 snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(104),
-                bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
-                ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
+                source_identifier: snapshot_identity(105),
+                event_class: LiveEventClass::BookDelta,
+                publication: RecordedPublication::Delta {
+                    changes: vec![(
+                        ProviderBookSide::Bid,
+                        "99.00".to_owned(),
+                        "0.50000000".to_owned(),
+                    )],
+                },
+                bids: vec![(10_000, 100_000_000), (9_900, 50_000_000)],
+                asks: vec![(10_100, 200_000_000)],
+            },
+            RecordedBook {
+                sequence: 106,
+                snapshot_url: config.snapshot_url().to_owned(),
+                source_identifier: snapshot_identity(106),
+                event_class: LiveEventClass::BookDelta,
+                publication: RecordedPublication::Delta {
+                    changes: vec![(
+                        ProviderBookSide::Bid,
+                        "99.00".to_owned(),
+                        "0.00000000".to_owned(),
+                    )],
+                },
+                bids: vec![(10_000, 100_000_000)],
+                asks: vec![(10_100, 200_000_000)],
+            },
+            RecordedBook {
+                sequence: 107,
+                snapshot_url: config.snapshot_url().to_owned(),
+                source_identifier: snapshot_identity(107),
+                event_class: LiveEventClass::Quote,
+                publication: RecordedPublication::Quote {
+                    bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
+                    ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
+                },
                 bids: vec![(10_000, 100_000_000)],
                 asks: vec![(10_100, 200_000_000)],
             },
@@ -585,7 +652,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
         BudgetScope::for_authorization(identifier("coinbase-exchange")?, &authorization)?,
         NonZeroU32::new(8).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(2).ok_or("zero concurrency")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,

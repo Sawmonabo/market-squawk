@@ -31,7 +31,7 @@ pub use capture::{
     ProcessCaptureShutdownOutcome, ProcessCaptureShutdownPolicy, ProcessCaptureShutdownPolicyError,
     ProcessCaptureWriterSpawnError, ProcessJournalCaptureConfig, ProcessJournalCaptureConfigError,
     ProcessJournalCaptureWriter, RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
-    RawCaptureWriter, WriterFixedStorageReceipt, WriterRuntimeProofError,
+    RawCaptureWriter, RollingMemoryCaptureSink, WriterFixedStorageReceipt, WriterRuntimeProofError,
     initialize_capture_process_infrastructure, raw_capture_channel, run_capture_helper,
     spawn_capture_writer, spawn_process_journal_capture_writer,
 };

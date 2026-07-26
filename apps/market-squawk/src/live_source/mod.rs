@@ -1,6 +1,7 @@
 //! Private production live-source composition.
 
 mod composition;
+mod direct;
 mod instruments;
 mod kraken;
 mod provider;
@@ -13,6 +14,10 @@ pub use composition::{
     ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError,
+};
+pub use direct::{
+    CoinbaseDirectLiveRuntime, CoinbaseDirectOutputFailure, CoinbaseDirectProductRuntimeError,
+    CoinbaseDirectSupervisorError,
 };
 pub use provider::ProductionSourceProvider;
 pub use supervisor::ProductionSupervisorError;

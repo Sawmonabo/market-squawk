@@ -1,22 +1,180 @@
 //! Typed, capability-bearing provider activation inputs.
 
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use market_squawk_adapter_bls::BlsSeriesMetadata;
+use market_squawk_adapter_coinbase::{
+    CoinbaseConfigError, CoinbaseDirectLimits, CoinbaseProductMapping,
+};
 use market_squawk_adapter_files::ExtractionLimits;
 use market_squawk_adapter_fred::FredRightsPolicy;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
-use market_squawk_domain::ProviderIdentityRegistry;
+use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct};
+use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
     BoundedInput, LocalAuthorityStateStore, SecretReference, UserAuthorizedInputRoot,
     UserOwnedInputEvidence,
 };
-use market_squawk_sources::SourceMetadata;
+use market_squawk_sources::{FreshnessPolicy, SourceMetadata};
 
 use crate::application::ResearchIngestCompositionError;
+
+/// Coinbase Direct account subscription ceiling for the exact `full` product/channel pair.
+pub const COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS: usize = 10;
+const COINBASE_EXCHANGE_VENUE: &str = "coinbase-exchange";
+
+/// Closed configuration for one Coinbase Direct product and its sole live route.
+#[derive(Clone, Debug)]
+pub struct CoinbaseDirectProductActivation {
+    pub(super) mapping: CoinbaseProductMapping,
+    pub(super) route: LiveRouteConfig,
+    pub(super) freshness: FreshnessPolicy,
+    pub(super) limits: CoinbaseDirectLimits,
+}
+
+impl CoinbaseDirectProductActivation {
+    /// Binds one provider product to one stable instrument route and all generation limits.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a product outside the pinned Coinbase Exchange grammar or a route whose current
+    /// Coinbase venue symbol does not name that exact product.
+    pub fn try_new(
+        product: ProviderProduct,
+        route: LiveRouteConfig,
+        freshness: FreshnessPolicy,
+        limits: CoinbaseDirectLimits,
+    ) -> Result<Self, CoinbaseDirectActivationSpecError> {
+        let mapping = CoinbaseProductMapping::try_new(product, route.route().instrument())?;
+        let venue_mapping = route
+            .definition()
+            .venue_mappings()
+            .iter()
+            .find(|candidate| candidate.venue_id() == route.route().venue())
+            .ok_or(CoinbaseDirectActivationSpecError::RouteMismatch)?;
+        if route.route().venue().as_str() != COINBASE_EXCHANGE_VENUE
+            || venue_mapping.venue_symbol().as_str()
+                != mapping.product().as_source_identifier().as_str()
+        {
+            return Err(CoinbaseDirectActivationSpecError::RouteMismatch);
+        }
+        Ok(Self {
+            mapping,
+            route,
+            freshness,
+            limits,
+        })
+    }
+
+    /// Returns the exact provider product reserved by this connection.
+    pub const fn product(&self) -> &ProviderProduct {
+        self.mapping.product()
+    }
+
+    /// Returns the sole internal live route for the product.
+    pub const fn route(&self) -> &LiveRouteConfig {
+        &self.route
+    }
+
+    /// Returns the sealed provider-product to internal-instrument mapping.
+    pub const fn mapping(&self) -> &CoinbaseProductMapping {
+        &self.mapping
+    }
+
+    /// Returns the source-data freshness contract for this exact product.
+    pub const fn freshness(&self) -> &FreshnessPolicy {
+        &self.freshness
+    }
+
+    /// Returns every transport, snapshot, replay, book, and publication bound.
+    pub const fn limits(&self) -> CoinbaseDirectLimits {
+        self.limits
+    }
+}
+
+/// Complete pre-network account-level admission request for Coinbase Direct.
+#[derive(Debug)]
+pub struct CoinbaseDirectAdapterActivation {
+    pub(super) products: Vec<CoinbaseDirectProductActivation>,
+    pub(super) maximum_runtime_bytes: NonZeroU64,
+    pub(super) capture_queue_records_per_product: NonZeroUsize,
+    pub(super) capture_queue_bytes_per_product: NonZeroUsize,
+    pub(super) supervisor_queue_records: NonZeroUsize,
+    pub(super) supervisor_queue_bytes: NonZeroUsize,
+}
+
+impl CoinbaseDirectAdapterActivation {
+    /// Validates the complete unique product/route set before any account authority is acquired.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty, duplicate, wrong-venue, or over-cap product set.
+    pub fn try_new(
+        mut products: Vec<CoinbaseDirectProductActivation>,
+        maximum_runtime_bytes: NonZeroU64,
+        capture_queue_records_per_product: NonZeroUsize,
+        capture_queue_bytes_per_product: NonZeroUsize,
+        supervisor_queue_records: NonZeroUsize,
+        supervisor_queue_bytes: NonZeroUsize,
+    ) -> Result<Self, CoinbaseDirectActivationSpecError> {
+        if products.is_empty() || products.len() > COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS {
+            return Err(CoinbaseDirectActivationSpecError::SubscriptionCardinality);
+        }
+        products.sort_by(|left, right| {
+            left.product()
+                .as_source_identifier()
+                .as_str()
+                .cmp(right.product().as_source_identifier().as_str())
+        });
+        for (index, product) in products.iter().enumerate() {
+            if product.route.route().venue().as_str() != COINBASE_EXCHANGE_VENUE {
+                return Err(CoinbaseDirectActivationSpecError::RouteMismatch);
+            }
+            if products[index.saturating_add(1)..].iter().any(|other| {
+                other.product() == product.product() || other.route.route() == product.route.route()
+            }) {
+                return Err(CoinbaseDirectActivationSpecError::DuplicateSubscription);
+            }
+        }
+        Ok(Self {
+            products,
+            maximum_runtime_bytes,
+            capture_queue_records_per_product,
+            capture_queue_bytes_per_product,
+            supervisor_queue_records,
+            supervisor_queue_bytes,
+        })
+    }
+
+    /// Returns the complete product set that will be atomically reserved.
+    pub fn products(&self) -> &[CoinbaseDirectProductActivation] {
+        &self.products
+    }
+}
+
+/// Invalid Coinbase Direct account activation topology.
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum CoinbaseDirectActivationSpecError {
+    /// Coinbase product syntax or mapping construction violated the pinned adapter contract.
+    #[error(transparent)]
+    Coinbase(#[from] CoinbaseConfigError),
+    /// The complete account set is empty or exceeds the ten product/channel subscriptions.
+    #[error("Coinbase Direct subscription cardinality is invalid")]
+    SubscriptionCardinality,
+    /// Two configured connections claim the same product or live route.
+    #[error("Coinbase Direct contains a duplicate product or route")]
+    DuplicateSubscription,
+    /// A Direct product is not bound to the Coinbase Exchange venue.
+    #[error("Coinbase Direct route does not use the Coinbase Exchange venue")]
+    RouteMismatch,
+    /// Checked product, queue, capture, and publication memory exceeded the configured ceiling.
+    #[error("Coinbase Direct runtime memory admission failed")]
+    MemoryAdmission,
+}
 
 /// SEC adapter construction inputs whose filesystem authority is already capability-confined.
 pub struct SecAdapterActivation {
@@ -226,6 +384,8 @@ impl fmt::Debug for PortfolioAdapterActivation {
 pub enum ProviderAdapterActivationRequest {
     /// Coinbase or Kraken live routes, selected by the lease surface.
     Live(Vec<market_squawk_live::LiveRouteConfig>),
+    /// Authenticated Coinbase Direct account runtime with one bounded connection per product.
+    CoinbaseDirect(CoinbaseDirectAdapterActivation),
     /// SEC EDGAR research extraction.
     Sec(SecAdapterActivation),
     /// BLS public-v1 or registered-v2 research extraction.
@@ -288,6 +448,15 @@ pub enum ProviderAdapterActivationError {
     /// Live source configuration or route binding was invalid.
     #[error(transparent)]
     Live(#[from] crate::ProductionLiveSourceCompositionError),
+    /// Coinbase Direct account/product topology is invalid.
+    #[error(transparent)]
+    CoinbaseDirectSpec(#[from] CoinbaseDirectActivationSpecError),
+    /// Coinbase Direct account-scoped durable lifetime ownership is unavailable.
+    #[error(transparent)]
+    CoinbaseDirectAuthority(#[from] market_squawk_platform::LocalAuthorityStateStoreError),
+    /// Coinbase Direct control-state paths are unsafe or unavailable.
+    #[error(transparent)]
+    CoinbaseDirectPath(#[from] market_squawk_platform::PathError),
     /// Durable provider authorization-subject admission was unavailable or inconsistent.
     #[error(transparent)]
     ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
