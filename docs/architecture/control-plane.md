@@ -11,8 +11,8 @@ of transport.
 | Document type | Architecture |
 | Audience | Maintainers, CLI and MCP authors, operators, security reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -119,7 +119,7 @@ implementations. General read-only DataFusion SQL is likewise an explicit CLI-on
 
 ## Application contract
 
-At the reviewed commit, the immutable application capability registry contains **59 typed
+At the reviewed implementation, the immutable application capability registry contains **62 typed
 operation descriptors** across exactly 11 required domains:
 
 | Domain | Responsibility |
@@ -136,13 +136,17 @@ operation descriptors** across exactly 11 required domains:
 | `Bot` | Status, kill switch, and controlled paper-operation lifecycle |
 | `Execution` | Orders, fills, cancellation, and reconciliation |
 
-Every descriptor defines a version, closed input schema, domain, effects, authorization/confirmation
-policy, source-evidence policy, scope, result bounds, and artifact policy. `Application` admits an
-operation only through its exact descriptor, dispatches it to the one service owning that domain,
-and validates the typed result against both the request limits and descriptor before returning it.
+Every descriptor defines a version, closed input schema, operation-specific structured-output
+schema, domain, effects, authorization/confirmation policy, source-evidence policy, scope, result
+bounds, and artifact policy. `Application` admits an operation only through its exact descriptor,
+dispatches it to the one service owning that domain, and validates the typed result against the
+request limits, source-evidence policy, and output schema before returning it.
 
-All 59 application descriptors are mapped into MCP tools; the server does not maintain a separate
-handwritten tool catalog. CLI commands representing application operations call
+All 62 application descriptors are mapped into MCP tools with their complete `inputSchema`,
+`outputSchema`, effect annotations, task prohibition, and bounded contract metadata; the server does
+not maintain a separate handwritten tool catalog. The pure MCP capability check performs that exact
+conversion and proves the complete `tools/list` response fits the configured frame before a server
+can be published. CLI commands representing application operations call
 `Application::invoke` with the same descriptor admission. This prevents schema and authorization
 drift between transports while allowing the explicit local producer workflows described above to
 retain their stronger path, file, signing, or publication capabilities.
@@ -182,7 +186,7 @@ sequenceDiagram
     Server->>App: typed request, limits, deadline, cancellation
     App->>Domain: descriptor-admitted domain call
     Domain-->>App: typed bounded result
-    App->>App: descriptor and result-limit validation
+    App->>App: descriptor output, evidence, and result-limit validation
     App-->>Server: validated result
     alt result fits inline limits
         Server-->>Peer: structured inline result
@@ -210,7 +214,7 @@ shipping composition caps one MCP artifact at 64 MiB.
 
 `market-squawk query sql` resolves one immutable dataset generation and calls the bounded read-only
 DataFusion service. This path accepts a single validated read-only statement against the fixed
-dataset relation. It is intentionally not one of the 59 application/MCP operations.
+dataset relation. It is intentionally not one of the 62 application/MCP operations.
 
 ## Local state and artifact authority
 
@@ -293,8 +297,9 @@ work.
 | --- | --- | --- |
 | Mandatory domain missing, duplicated, or misplaced | `Application` composition fails before CLI/MCP service publication | Correct composition; all 11 domains are mandatory |
 | Unknown operation or invalid closed-schema argument | Request is rejected before domain dispatch | Correct the command/tool input |
+| Domain service rejects an actionable tool call | MCP returns a bounded `isError: true` tool result and audits `service_rejected` | Correct the request or restore the named domain authority, then retry with a new request identity |
 | Request cancelled or deadline elapsed | Domain sees cancellation; late output is not admitted as a successful result | Issue a new request with a new identity |
-| Result exceeds descriptor or request limits | Result is rejected or published only when the descriptor permits a bounded artifact | Narrow the request or retrieve the returned artifact reference |
+| Result violates its output schema or exceeds descriptor/request limits | Invalid output fails as a protocol/server error; valid overflow is published only when the descriptor permits a bounded artifact | Correct the service contract defect, narrow the request, or retrieve the returned valid artifact reference |
 | MCP frame, JSON, concurrency, or queue limit exceeded | Session/request fails closed without unbounded buffering | Correct the client or restart a fresh bounded session |
 | Durable mutation-audit admission fails | Mutation does not reach the application service | Repair private local audit storage, then retry explicitly |
 | Controlled artifact publication fails | No artifact reference is returned | Repair local storage and repeat the read-only operation if safe |
@@ -371,6 +376,7 @@ Market Squawk behavior.
 | Source | Architectural use | Reviewed |
 | --- | --- | --- |
 | [MCP 2025-11-25 lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) | Initialization, capability negotiation, operation, timeout, and stdio shutdown semantics | 2026-07-23 |
-| [MCP 2025-11-25 tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) | Tool discovery, closed input/output schema, error, and security requirements | 2026-07-23 |
+| [MCP 2025-11-25 tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) | Tool discovery, input/output schema, structured results, tool errors, and security requirements | 2026-07-26 |
+| [MCP 2025-11-25 schema](https://modelcontextprotocol.io/specification/2025-11-25/schema) | Exact `Tool.outputSchema`, `CallToolResult.structuredContent`, and `CallToolResult.isError` wire contracts | 2026-07-26 |
 | [MCP 2025-11-25 cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation) | Request-identity cancellation and late-cancellation race semantics | 2026-07-23 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction boundaries and single-writer behavior for local catalog state | 2026-07-23 |

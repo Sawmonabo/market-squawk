@@ -8,8 +8,8 @@ arguments, local authority boundaries, result envelopes, and exit behavior.
 | Document type | Reference |
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | Provider release-admission candidate pending integration |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -68,10 +68,10 @@ Configuration precedence, every environment mapping, and the provider-profile co
 
 | Command | Arguments | Authority and result |
 | --- | --- | --- |
-| `init` | None | Prepares the configured local paths and current Coinbase diagnostic journal; prints the initialized root |
-| `config show` | None | Loads validated configuration and emits its redacted effective values |
-| `config validate` | None | Performs the same load/validation and emits `valid: true` plus the redacted effective values |
-| `doctor` | None | Composes the local product, performs bounded shutdown, and reports readiness plus current release blockers |
+| `init` | None | Explicitly prepares/opens the full local product, initializes or migrates durable authorities, creates the current Coinbase diagnostic journal, completes bounded shutdown, and prints the initialized root |
+| `config show` | None | Loads validated configuration and emits the shared redacted `{value, origin}` view |
+| `config validate` | None | Performs the same load/validation and emits `valid: true` plus the shared provenance-bearing redacted view |
+| `doctor` | None | Performs a bounded query-only inspection of an existing layout/catalog plus compiled application/MCP contracts and provider facts; it does not initialize storage, acquire application/MCP writer authority, start adapters, or call remote endpoints |
 | `mcp` | Optional `serve` | Runs the sole production MCP server over stdio; bare `mcp` is the v0.1 compatibility form for `mcp serve` |
 
 `mcp` reserves stdout for protocol frames. It does not render a normal CLI result envelope.

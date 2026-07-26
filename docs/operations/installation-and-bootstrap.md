@@ -10,8 +10,8 @@ paid provider, Python interpreter, or external ONNX Runtime library.
 | Document type | Operations runbook |
 | Audience | Local operators, release installers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -36,7 +36,7 @@ Use this procedure for a source-based local installation at the reviewed product
 - the exact Rust toolchain and locked Cargo dependency graph;
 - all three executables needed by the installed application;
 - an operator-owned, versioned installation directory;
-- configuration validation, `init`, and the bounded `doctor` composition check;
+- configuration validation, stateful `init`, and the bounded query-only `doctor` check;
 - safe replacement of one installed version with another.
 
 This runbook does not:
@@ -111,8 +111,8 @@ selectable installation path.
    group- or other-writable. The ONNX worker is also admitted as a stable regular file.
 5. Run the application as the operator who owns its installation and data. Do not use elevated
    privileges to compensate for an incorrectly owned install or data root.
-6. Choose a new, dedicated data root for first bootstrap. `init` creates state; `doctor` composes
-   the product and can initialize or migrate additional durable state.
+6. Choose a new, dedicated data root for first bootstrap. `init` owns product initialization,
+   migration, recovery, and bounded shutdown. `doctor` never substitutes for that stateful step.
 7. Keep stdout and stderr separate in automation. Command results use stdout; tracing uses stderr.
    `mcp serve` reserves stdout for protocol frames.
 8. A successful build or `doctor` call is local evidence only. It does not grant provider rights,
@@ -275,9 +275,11 @@ Do not create `DATA_ROOT` over an unrelated directory. Then run:
 ```
 
 `config validate` parses and validates the effective configuration without proving source or
-runtime readiness. `init` prepares the controlled root and initial diagnostic journal. `doctor`
-then opens the production `LocalProduct`, exercises bounded composition and shutdown, and may
-create the catalog and additional control state.
+runtime readiness. `init` prepares the controlled root, initializes or opens the production
+authorities, creates the initial diagnostic journal, and completes application-owned bounded
+shutdown. `doctor` then performs a query-only inspection of the existing layout, catalog,
+descriptor contracts, provider sessions, configuration, and local policy. It does not create,
+migrate, recover, or lock an application/MCP authority and it never probes a remote endpoint.
 
 For a persistent configuration file, complete
 [Configuration and secrets operations](configuration-and-secrets.md), then pass the same explicit
@@ -308,12 +310,27 @@ The default JSON from `config validate` includes:
 {
   "valid": true,
   "effective": {
-    "data_root_configured": true,
-    "products": ["BTC-USD"],
-    "source_secret_configured": false,
-    "coinbase_configured": false,
-    "kraken_configured": false,
-    "training_release_configured": false
+    "schemaVersion": "market-squawk-effective-config-v1",
+    "dataDirectory": {
+      "value": "/absolute/operator-owned/market-squawk-data",
+      "origin": "cli"
+    },
+    "products": {
+      "value": ["BTC-USD"],
+      "origin": "safe_default"
+    },
+    "sourceSecretConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    },
+    "coinbaseConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    },
+    "krakenConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    }
   }
 }
 ```
@@ -331,27 +348,53 @@ Immediately after `init`, the root contains at least:
     └── coinbase-exchange.msj
 ```
 
-`doctor` can additionally create `catalog.sqlite3` and service-specific control directories while
-composing the product.
+`init` also creates `catalog.sqlite3` and the service-specific control directories required by the
+production composition. `doctor` reports a missing or incomplete layout as a blocker and leaves it
+unchanged.
 
 ### Doctor interpretation
 
-A successful local composition has:
+A valid query-only preflight has:
 
 ```json
 {
+  "localStorage": {
+    "modifiedByInspection": false,
+    "layout": {
+      "state": "available",
+      "error": null
+    },
+    "catalog": {
+      "state": "available",
+      "journalMode": "wal",
+      "error": null
+    }
+  },
   "application": {
-    "composed": true,
-    "shutdown_complete": true,
+    "descriptorContractValid": true,
+    "runtimeState": "not_observed",
+    "requiredDomainsComplete": true,
+    "error": null
+  },
+  "mcp": {
+    "descriptorContractValid": true,
+    "runtimeState": "not_observed",
+    "transport": "stdio",
+    "durableAuditConfigured": true,
+    "controlledArtifactsConfigured": true,
     "error": null
   }
 }
 ```
 
-The top-level doctor `status` may still be `blocked`. That is expected while release-level provider
-qualification, rights, clean-machine, or other ledger-owned barriers remain open. Do not reinterpret
-`application.composed: true` as a release-ready verdict, and do not treat the doctor's embedded
-blocker summary as more current than the [delivery ledger](../plans/delivery-ledger.md).
+`runtimeState: "not_observed"` is deliberate: the query-only command does not start an application,
+adapter, bot, or MCP session. The top-level `status` therefore remains `blocked` when current
+provider onboarding or runtime health has not been established, when a code-owned profile requires
+evidence refresh or rights admission, or when local storage is incomplete. Use the domain-specific
+`source status`, `source coverage`, and `source health` commands inside the intended runtime
+workflow for current source evidence. Exact-head provider, hosted-OS, fuzz, performance, security,
+and publication evidence remains authoritative only in the
+[delivery ledger](../plans/delivery-ledger.md); doctor does not infer it.
 
 ## Safe restart and upgrade
 
@@ -374,10 +417,12 @@ For an upgrade:
    directory.
 4. Record the new file hashes and run `--version` plus `config validate`.
 5. Point the service or operator command at the new versioned application path.
-6. Run `doctor`; remember that this step opens durable application state and may initialize or
-   migrate it.
-7. Start the intended workload only after doctor composition and its bounded shutdown succeed.
-8. Retain the prior versioned binaries and pre-upgrade data backup until recovery evidence has been
+6. Run `init` with the new version to perform the explicit stateful open/migration/recovery and
+   application-owned bounded shutdown.
+7. Run `doctor` to inspect the resulting state without reopening writer or MCP audit authority.
+8. Start the intended workload only after initialization succeeds and doctor reports no unexpected
+   local storage or contract blocker.
+9. Retain the prior versioned binaries and pre-upgrade data backup until recovery evidence has been
    reviewed.
 
 Never overwrite the active version in place. Do not use a symlinked helper as a “current” switch.
@@ -392,7 +437,7 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
   Remove it only when it was created solely for the failed attempt and contains no wanted state.
 - **New version failed before opening state:** point the launch command back to the previous
   versioned binary bundle.
-- **New version ran `doctor` or another stateful command:** do not run the old binary against
+- **New version ran `init` or another stateful command:** do not run the old binary against
   possibly migrated state on assumption alone. Quiesce the new version and restore the coherent
   pre-upgrade data-root backup unless compatibility has been explicitly verified.
 - **Wrong data root selected:** stop immediately. Configuration does not move or merge state.
@@ -409,8 +454,9 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | ONNX worker is unavailable | Worker omitted, moved, symlinked, changed during admission, or built without the required target | Reinstall the exact worker beside the application |
 | `config validate` fails before state exists | Invalid file, environment, CLI override, or closed-schema value | Follow the configuration runbook; initialization is not a remedy for invalid configuration |
 | `init` rejects the path | Root cannot be safely created or canonicalized, or conflicts with existing state | Correct ownership/path selection; do not elevate or overwrite unrelated data |
-| `doctor` reports `application.composed: false` | Local product, path, catalog, helper, or recovery composition failed | Preserve stderr and the JSON result; repair the named local cause before starting workloads |
-| `doctor` composes but top-level status is `blocked` | Mutable release barriers remain | Read the delivery ledger; do not weaken a provider or execution gate |
+| `doctor` reports an unavailable layout or catalog | `init` was not run, the layout is incomplete, permissions changed, SQLite is unavailable, or catalog identities do not match | Preserve the JSON result; run the explicit bootstrap/upgrade procedure or repair the named local cause without deleting evidence |
+| `doctor` reports an invalid application/MCP descriptor contract | The binary's compiled service contract is internally inconsistent | Stop and use a verified binary; initialization cannot repair a compiled contract |
+| `doctor` reports top-level `blocked` with provider observations | Onboarding, rights, release evidence, or current runtime health is incomplete or deliberately not observed by the query-only command | Use provider/source operations and the delivery ledger; do not weaken a provider or execution gate |
 | Old version cannot open state after an attempted upgrade | New version initialized or migrated durable state | Restore the coherent pre-upgrade backup unless backward compatibility is proven |
 
 ## Local logs, data, and artifacts
@@ -419,7 +465,7 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | --- | --- |
 | `<source>/target/release/` | Local Cargo build outputs; generated, replaceable, and not runtime authority |
 | `<install-root>/bin/` | The three installed executable files and operator-recorded inventory |
-| `<data-root>/catalog.sqlite3` | Durable catalog after product composition; SQLite `-wal` and `-shm` sidecars may exist while active |
+| `<data-root>/catalog.sqlite3` | Durable catalog after `init`; SQLite `-wal` and `-shm` sidecars may exist while active |
 | `<data-root>/journal/` | Immutable diagnostic/capture journal state |
 | `<data-root>/artifacts/` | Controlled application artifacts |
 | `<data-root>/control/` | Durable control-plane and authority state |

@@ -9,8 +9,8 @@ authorization, audit behavior, and error mapping.
 | Document type | Reference |
 | Audience | MCP client authors, operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -161,10 +161,18 @@ The outer MCP request object is independently bounded to depth 32, 64 KiB per JS
 Each `tools/list` entry includes:
 
 - `inputSchema`, the closed schema described here;
+- `outputSchema`, the code-owned schema for the complete `structuredContent` object;
 - standard effect annotations;
 - execution metadata declaring task support `forbidden`; and
 - `_meta["org.market-squawk/tool-contract"]`, containing schema version, service domain,
   authorization class, scope requirements, source-evidence policy, and artifact policy.
+
+The output schema is not a generic placeholder. Each production operation declares the shape of
+its `data` value, and the descriptor composes that shape with the canonical metadata envelope and,
+where allowed, the path-free artifact-reference variant. The application validates the returned
+operation data against the same descriptor before MCP chooses inline or artifact publication. The
+MCP composition converts and size-validates the complete descriptor set before it can advertise the
+tools capability.
 
 Read tools are annotated read-only, non-destructive, idempotent, and closed-world. Mutations are
 annotated destructive and closed-world. `FairValue.Measure`, `FairValue.Classify`,
@@ -420,6 +428,12 @@ Source-derived operations return bounded nonempty coverage and quality evidence;
 return the explicit not-applicable objects shown above. Each evidence value is limited to 8 KiB,
 depth 8, 4 KiB strings, and 256 array items or object entries.
 
+Before returning an inline result or publishing an overflow artifact, the server revalidates the
+result against the caller's admitted byte/item/JSON-structure limits, the descriptor's
+source-evidence policy, and the operation-specific `outputSchema`. A schema-invalid or otherwise
+invalid result is a server failure (`-32010`), produces no artifact, and is never returned as a
+successful tool result.
+
 Read descriptors use `opaque_on_overflow`. If a valid read result exceeds either 64 KiB inline
 bytes or 1,000 inline logical items, but remains within the 64 MiB and 1,000,000-item hard MCP
 ceilings, the server publishes the complete canonical JSON envelope as a controlled artifact and
@@ -539,20 +553,37 @@ from proceeding.
 
 ## Errors and session termination
 
+MCP distinguishes protocol/server failures from errors reported by an invoked tool. An actionable
+post-dispatch service failure in one of the following classes returns a normal `tools/call` result
+with `isError: true`, one bounded redacted text content block, and no `structuredContent`:
+
+| Tool-error class | Stable content |
+| --- | --- |
+| Invalid request discovered by the domain service | `service request is invalid` |
+| Requested domain object not found | `requested service object was not found` |
+| Domain authorization rejected | `service request is not authorized` |
+| Domain resource ceiling exhausted | `service resource limit exceeded` |
+| Domain service unavailable | `service is unavailable` |
+
+These results are audited as `service_rejected`; they are not audited as success. Clients may use
+the returned tool-error content to correct an actionable request. Cancellation, deadline expiry,
+invalid application output, and internal failure remain protocol/server errors because they do not
+represent an actionable business result.
+
+The protocol/server error mapping is:
+
 | Code | Classification and stable message |
 | ---: | --- |
 | `-32700` | JSON parse error: `parse error` |
 | `-32600` | Invalid JSON-RPC request, repeated initialization, or invalid request identifier |
-| `-32601` | Unknown method, unavailable capability, or service operation not found |
-| `-32602` | Invalid tool/list parameters: `service request is invalid` or the bounded-list cursor diagnostic |
-| `-32001` | Service unavailable: `service is unavailable` |
+| `-32601` | Unknown method, unavailable capability, or unregistered tool |
+| `-32602` | Invalid pre-dispatch tool/list parameters or the bounded-list cursor diagnostic |
 | `-32002` | Lifecycle gate: `server initialization is not complete` |
-| `-32003` | Authorization failure: `service request is not authorized` |
 | `-32008` | Deadline: `request deadline exceeded` |
 | `-32009` | Duplicate active request identity: `duplicate active request identifier` |
-| `-32010` | Frame, body, concurrency, progress, writer, or service-result resource ceiling |
+| `-32010` | Frame, body, concurrency, progress, writer, result, or descriptor-output ceiling |
 | `-32800` | Cancellation: `request was cancelled` |
-| `-32603` | Internal failure; artifact admission/publication reports `artifact publication failed` |
+| `-32603` | Internal failure, including artifact admission/publication failure |
 
 Error data does not disclose provider secrets, internal paths, or dynamic authority detail.
 
@@ -601,7 +632,8 @@ artifact-read resource.
 | --- | --- | --- |
 | [MCP lifecycle specification, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) | Initialize negotiation and initialized-notification ordering | 2026-07-23 |
 | [MCP stdio transport specification, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio) | Newline-delimited JSON-RPC over inherited stdin/stdout | 2026-07-23 |
-| [MCP tools specification, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) | Tool listing, invocation, schemas, annotations, structured content, and task-support fields | 2026-07-23 |
+| [MCP tools specification, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) | Tool listing, invocation, input/output schemas, structured results, tool errors, annotations, and task-support fields | 2026-07-26 |
+| [MCP schema reference, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/schema) | `Tool.outputSchema` describes the root `structuredContent` object and `CallToolResult.isError` distinguishes tool-reported failure | 2026-07-26 |
 | [MCP cancellation utility, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation) | Standard cancellation notification and race semantics | 2026-07-23 |
 | [MCP progress utility, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress) | Progress-token and notification semantics | 2026-07-23 |
 

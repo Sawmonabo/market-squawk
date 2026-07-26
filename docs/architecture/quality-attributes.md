@@ -10,8 +10,8 @@ unmeasured target into a performance claim.
 | Document type | Quality-attribute architecture |
 | Audience | Maintainers, release reviewers, operators, security reviewers, and performance engineers |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -177,8 +177,11 @@ platform-specific helper, keyring, path, and process evidence.
 
 Operational diagnostics expose source health, redacted effective configuration, application
 readiness, bounded failures, durable audit, and controlled artifact references. `AppConfig`
-retains per-setting provenance internally; the reviewed `config show` renderer does not yet expose
-those origins. Diagnostics remain local and do not require a remote observability stack.
+retains per-setting provenance, and `config show`, `config validate`, and `doctor` expose the same
+redacted provenance-bearing view. Diagnostics remain local and do not require a remote
+observability stack. `doctor` is a query-only observer: it opens only an existing capability-bound
+layout and read-only SQLite snapshot, never initializes/migrates state, acquires the application or
+MCP audit writer, starts an adapter, or converts missing runtime health into a positive result.
 
 ## Evidence map
 

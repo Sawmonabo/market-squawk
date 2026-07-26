@@ -9,8 +9,8 @@ by the reviewed `LocalProduct`.
 | Document type | Operations runbook |
 | Audience | Local operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -196,8 +196,9 @@ For a new root:
 ```
 
 For an existing root, take any required coherent backup before the first stateful command with a
-new application version. `config validate` does not open the root, but `doctor` composes the
-product and can initialize, recover, or migrate state.
+new application version. `config validate` does not open the root. `init` is the explicit stateful
+product initialization/migration/recovery boundary; `doctor` opens only an existing layout and a
+bounded SQLite read-only/query-only snapshot.
 
 ### 4. Keep invocation consistent
 
@@ -212,9 +213,10 @@ Run:
 "$MSQ" --config "$CONFIG" --output json config show
 ```
 
-The JSON is the effective redacted value view. It includes the products, timing, resource ceilings,
-paper flag, and only configured/not-configured booleans for the data root, training release,
-secret locator, Coinbase profile, and Kraken profile.
+The JSON is the effective redacted value view. It includes the data and training-release paths,
+products, timing, resource ceilings, and paper flag. Secret locators, Coinbase profiles, and Kraken
+profiles are represented only by configured/not-configured booleans. Every setting includes its
+effective precedence origin.
 
 To test the precedence of one non-secret value without changing the file:
 
@@ -223,8 +225,8 @@ MARKET_SQUAWK_SOURCE_SHUTDOWN_MS=7000 \
   "$MSQ" --config "$CONFIG" --source-shutdown-ms 9000 --output json config show
 ```
 
-The effective `source_shutdown_ms` must be `9000`: the CLI layer wins over the environment, which
-wins over the file.
+The effective `sourceShutdownMs` entry must be `{"value":9000,"origin":"cli"}`: the CLI layer wins
+over the environment, which wins over the file.
 
 Internally, `AppConfig` records one origin for every setting:
 
@@ -233,11 +235,10 @@ Internally, `AppConfig` records one origin for every setting:
 - `environment`
 - `cli`
 
-The internal redacted provenance schema is `market-squawk-effective-config-v1`. At the reviewed
-commit, however, the public `config show` and `config validate` implementations do not call that
-serializer. They do **not** expose per-setting origins. Do not infer that a value came from the
-file merely because it equals the file or default value; inspect the environment and launch
-arguments directly.
+The public provenance schema is `market-squawk-effective-config-v1`. `config show`,
+`config validate`, and `doctor` all call the same serializer, so automation can read the recorded
+origin instead of inferring it from a value. The process environment and launch arguments remain
+the authoritative inputs when investigating how that origin was supplied.
 
 ## Secret operations boundary
 
@@ -322,7 +323,7 @@ onboarding lifecycle.
    ```
 
 7. Start the intended process with the same `--config`, environment, and CLI overrides.
-8. Run `doctor` or the domain-specific read-only status command and retain stdout plus stderr.
+8. Run query-only `doctor` or the domain-specific status command and retain stdout plus stderr.
 
 No signal or file rewrite changes the configuration of a process that is already running.
 
@@ -334,24 +335,36 @@ With the baseline above, `config validate` returns this shape:
 {
   "valid": true,
   "effective": {
-    "capture_destination_registry_memory_ceiling_bytes": 1048576,
-    "capture_flush_interval_ms": 1000,
-    "capture_memory_ceiling_bytes": 67108864,
-    "capture_queue_capacity": 16384,
-    "capture_shutdown_ms": 5000,
-    "coinbase_configured": false,
-    "data_root_configured": true,
-    "kraken_configured": false,
-    "paper_bot_enabled": false,
-    "products": ["BTC-USD"],
-    "source_secret_configured": false,
-    "source_shutdown_ms": 5000,
-    "stale_after_ms": 5000,
-    "training_release_configured": false
+    "schemaVersion": "market-squawk-effective-config-v1",
+    "dataDirectory": {
+      "value": "/absolute/operator-owned/market-squawk-data",
+      "origin": "local_file"
+    },
+    "products": {
+      "value": ["BTC-USD"],
+      "origin": "local_file"
+    },
+    "sourceShutdownMs": {
+      "value": 5000,
+      "origin": "safe_default"
+    },
+    "sourceSecretConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    },
+    "coinbaseConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    },
+    "krakenConfigured": {
+      "value": false,
+      "origin": "safe_default"
+    }
   }
 }
 ```
 
+The complete result contains the remaining bounded settings in the same `{value, origin}` form.
 Success proves:
 
 - the explicit file was readable, bounded, valid UTF-8 TOML, and closed-schema compliant;
@@ -399,13 +412,13 @@ commands for those separate checks.
 | Products reject despite looking valid | Literal comma split retained whitespace, duplicate, empty, oversized, or disallowed character | Supply a unique list with no padding around comma-separated environment values |
 | Capture timing rejects | Flush interval is zero/greater than shutdown, or shutdown exceeds `60000` | Correct both values as one merged configuration |
 | Changed file has no effect | Environment or CLI layer wins, or the existing process has not restarted | Inspect launch inputs, stop the old process, validate, and start anew |
-| `config show` has no origins | Current CLI does not expose stored `ConfigProvenance` | Audit file, environment, and CLI separately; do not infer |
-| `source_secret_configured` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
+| A reported origin is unexpected | A higher-precedence environment or CLI layer supplied the effective value | Inspect the inherited environment and exact launch arguments; correct the highest-precedence source |
+| `sourceSecretConfigured.value` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
 | OS credential prompt or service is unavailable | Primary keyring backend/session unavailable | Unlock the code-owned fallback through the foreground portal before an admitted credential mutation, or fail closed |
 | Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
 | Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
-| `config validate` succeeds but `doctor` fails | Configuration validity is narrower than application/path/catalog/helper composition | Preserve doctor stderr and repair the named composition failure |
-| `doctor` remains top-level `blocked` | Release-level barriers remain | Consult the delivery ledger; configuration is not authority to clear them |
+| `config validate` succeeds but `doctor` reports unavailable storage | Configuration validity does not prove that `init` created a safe, current layout and catalog | Preserve the doctor result; run the explicit bootstrap/upgrade procedure or repair the stable diagnostic class |
+| `doctor` remains top-level `blocked` | Provider onboarding, rights, current runtime health, or release evidence remains incomplete or unobserved | Use source operations and the delivery ledger; configuration is not authority to clear those gates |
 
 ## Local logs, data, and artifacts
 

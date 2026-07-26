@@ -8,8 +8,8 @@ profiles, provenance, and local secret-storage boundary implemented by Market Sq
 | Document type | Reference |
 | Audience | Operators, integrators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-26 |
+| Reviewed commit | `93f79a830765781242ce824e0db84f38d04c0b63` |
 
 ## Contents
 
@@ -211,21 +211,20 @@ rather than being guessed successful.
 ## Provenance and reporting
 
 `AppConfig` records one origin for every setting: `safe_default`, `local_file`, `environment`, or
-`cli`. The internal `redacted_view()` contract can serialize each effective value with that origin
-under schema `market-squawk-effective-config-v1`; it exposes only configured/not-configured booleans
-for secrets and live-source profiles.
-
-At the reviewed commit, `market-squawk config show` and `config validate` emit redacted effective
-values and configured-state booleans but do **not** call that provenance-bearing serializer. Their
-current CLI JSON therefore does not expose per-setting origins. Consumers must not infer an origin
-from a value that happens to equal a default.
+`cli`. `market-squawk config show`, `config validate`, and `doctor` serialize the same
+`market-squawk-effective-config-v1` redacted view. Every setting is represented as
+`{"value": ..., "origin": ...}`. Secret references and live-source profiles are represented only by
+configured/not-configured booleans; their locators, credentials, authorization evidence, and
+profile bodies are not exposed.
 
 ## Loading, failure, and recovery behavior
 
-Configuration is read before the local product is composed. Any file, environment, provider-profile,
-cross-setting, path, secret-reference, or bound violation fails closed and prevents the requested
-runtime from starting. Error variants intentionally omit file contents, rejected environment
-values, secret locators, and resolved material.
+Configuration is read before the requested command acquires authority. Any file, environment,
+provider-profile, cross-setting, path, secret-reference, or bound violation fails closed and
+prevents initialization, inspection, or runtime startup. Error variants intentionally omit file
+contents, rejected environment values, secret locators, and resolved material. `doctor` then uses
+the validated configuration only for query-only existing-layout inspection; it does not compose a
+runtime.
 
 There is no in-process reload or rollback operation. Correct the explicit source, restart the
 command, and re-run `market-squawk config validate`. Configuration success confirms parsing and
