@@ -12,6 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
+use market_squawk_adapter_treasury::{
+    DailyParYieldCurvePage, FiscalDataParseLimits, TreasuryYieldCurveProfile,
+};
 use market_squawk_data::{
     CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
     OnboardingReservationRequest, ResumedProviderOnboarding,
@@ -28,8 +31,8 @@ use market_squawk_sources::{
     CapabilityRegistrationOutcome, CredentialGenerationState, OnboardingEvent, OnboardingState,
     ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
     ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
-    ProviderRateDeclaration, SecretStoreClearOutcome, built_in_provider_profiles,
-    install_ring_tls_provider,
+    ProviderRateDeclaration, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
+    built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -1451,6 +1454,10 @@ impl ProviderOnboardingService {
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
+            runtime_evidence_digest: generation
+                .and_then(|generation| lifecycle.generation_runtime_digest(generation))
+                .or_else(|| lifecycle.anonymous_runtime_digest())
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?,
             provider_budget_policy: profile
                 .capability()
                 .rate_policy()
@@ -1540,6 +1547,10 @@ impl ProviderOnboardingService {
             verification_evidence_digest: generation
                 .and_then(|generation| lifecycle.generation_verification(generation))
                 .map(AuthorityVerification::evidence_digest),
+            runtime_evidence_digest: generation
+                .and_then(|generation| lifecycle.generation_runtime_digest(generation))
+                .or_else(|| lifecycle.anonymous_runtime_digest())
+                .ok_or(ProviderOnboardingError::InvalidSessionState)?,
             provider_budget_policy: profile
                 .capability()
                 .rate_policy()
@@ -2151,14 +2162,18 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         return Err(ProviderOnboardingError::ProbeUnavailable);
     }
     if profile_id == "treasury.daily-rates-xml" {
-        let prefix = &body[..body.len().min(512)];
-        return if prefix.windows(4).any(|window| window == b"<feed")
-            || prefix.windows(5).any(|window| window == b"<?xml")
-        {
-            Ok(())
-        } else {
-            Err(ProviderOnboardingError::ProbeUnavailable)
-        };
+        let request = TreasuryYieldCurveProfile::daily_par_yield_curve()
+            .page(TREASURY_DAILY_RATES_PROBE_YEAR, 0)
+            .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let page = DailyParYieldCurvePage::parse(
+            body,
+            &request,
+            FiscalDataParseLimits::production_defaults(),
+        )
+        .map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
+        return (!page.is_terminal())
+            .then_some(())
+            .ok_or(ProviderOnboardingError::ProbeUnavailable);
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;

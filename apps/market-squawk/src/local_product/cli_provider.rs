@@ -1981,13 +1981,7 @@ fn build_research_activation(
                 HistoricalCapability::RevisionPreserving,
                 metadata_effective,
                 fred_network_policy()?,
-                simple_budget(
-                    "fred",
-                    120,
-                    MINUTE_NANOS,
-                    2,
-                    Some(authorization_subject(lease)?),
-                )?,
+                fred_budget(lease)?,
             )?;
             ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
         }
@@ -2620,6 +2614,38 @@ fn backoff() -> Result<BackoffPolicy, CliProviderActivationError> {
 
 fn nonzero_u64(value: u64) -> Result<NonZeroU64, CliProviderActivationError> {
     NonZeroU64::new(value).ok_or(CliProviderActivationError::InvalidMetadata)
+}
+
+fn fred_budget(
+    lease: &ProviderActivationLease,
+) -> Result<ProviderBudgetPolicy, CliProviderActivationError> {
+    // Match the capability-level conservative ceiling for the combined v1/v2 surface. The
+    // retained official two-per-second evidence is v2-specific, not a claimed v1 provider limit.
+    let windows = [
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
+            nonzero_u64(SECOND_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        ProviderBudgetWindow::try_new(
+            NonZeroU32::new(120).ok_or(CliProviderActivationError::InvalidMetadata)?,
+            nonzero_u64(MINUTE_NANOS)?,
+            BudgetWindowSemantics::Sliding,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    ];
+    ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::with_authorization_account(
+            SourceIdentifier::try_from("fred")
+                .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+            authorization_subject(lease)?,
+        ),
+        &windows,
+        NonZeroU16::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
+        backoff()?,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
 fn bls_tier(lease: &ProviderActivationLease) -> Result<BlsAccessTier, CliProviderActivationError> {
