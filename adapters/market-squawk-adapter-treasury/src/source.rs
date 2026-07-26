@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{JSON_MEDIA_TYPE, TreasuryHttpClient, XML_MEDIA_TYPE, system_timestamp};
 use crate::{
-    DailyParYieldCurvePage, FiscalDataPage, FiscalDataParseLimits, TreasuryFiscalQuery,
-    TreasuryPageRequest, TreasuryProtocolError, TreasuryYieldCurvePageRequest,
-    TreasuryYieldCurveProfile,
+    FiscalDataPage, FiscalDataParseLimits, TreasuryDailyRateFamily, TreasuryDailyRatePage,
+    TreasuryDailyRatePageRequest, TreasuryDailyRateQuery, TreasuryFiscalQuery, TreasuryPageRequest,
+    TreasuryProtocolError, TreasuryYieldCurvePageRequest,
 };
 
 mod lineage;
@@ -27,20 +27,103 @@ mod normalize;
 use lineage::{
     ObjectKind, ParsedObjectId, invalid_protocol, lower_hex, source_object, verify_refetched_object,
 };
-use normalize::{canonical_fiscal_records, canonical_yield_records};
+use normalize::{canonical_daily_rate_records, canonical_fiscal_records};
+
+const MAX_DAILY_RATE_QUERIES: usize = 1_024;
+const MAX_DAILY_RATE_PAGES: usize = 1_024;
+
+/// A bounded, immutable set of official Treasury daily-rate datasets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryDailyRatesConfig {
+    queries: Vec<TreasuryDailyRateQuery>,
+}
+
+impl TreasuryDailyRatesConfig {
+    /// Binds one source generation to an exact, non-empty set of daily-rate queries.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty set, duplicate dataset identities, or more than 1,024 queries.
+    pub fn try_new(
+        queries: impl IntoIterator<Item = TreasuryDailyRateQuery>,
+    ) -> Result<Self, TreasuryProtocolError> {
+        let mut accepted = Vec::new();
+        for query in queries {
+            if accepted.len() == MAX_DAILY_RATE_QUERIES
+                || accepted
+                    .iter()
+                    .any(|existing: &TreasuryDailyRateQuery| existing.dataset() == query.dataset())
+            {
+                return Err(TreasuryProtocolError::InvalidQuery);
+            }
+            accepted
+                .try_reserve(1)
+                .map_err(|_| TreasuryProtocolError::InvalidQuery)?;
+            accepted.push(query);
+        }
+        if accepted.is_empty() {
+            return Err(TreasuryProtocolError::InvalidQuery);
+        }
+        Ok(Self { queries: accepted })
+    }
+
+    /// Builds complete yearly coverage for all five official daily-rate families.
+    ///
+    /// Each family starts at the later of the requested year and Treasury's documented first
+    /// available year. The end year must include at least one year from every required family.
+    ///
+    /// # Errors
+    ///
+    /// Rejects reversed, unsupported, incomplete, or excessively large ranges.
+    pub fn all_families(start_year: u16, end_year: u16) -> Result<Self, TreasuryProtocolError> {
+        let latest_family_start = TreasuryDailyRateFamily::ALL
+            .into_iter()
+            .map(TreasuryDailyRateFamily::start_year)
+            .max()
+            .ok_or(TreasuryProtocolError::InvalidQuery)?;
+        if start_year > end_year || end_year < latest_family_start {
+            return Err(TreasuryProtocolError::InvalidQuery);
+        }
+        let query_count = TreasuryDailyRateFamily::ALL
+            .into_iter()
+            .map(|family| {
+                let first_year = start_year.max(family.start_year());
+                usize::from(end_year - first_year) + 1
+            })
+            .sum::<usize>();
+        if query_count > MAX_DAILY_RATE_QUERIES {
+            return Err(TreasuryProtocolError::InvalidQuery);
+        }
+        let mut queries = Vec::new();
+        queries
+            .try_reserve_exact(query_count)
+            .map_err(|_| TreasuryProtocolError::InvalidQuery)?;
+        for family in TreasuryDailyRateFamily::ALL {
+            let first_year = start_year.max(family.start_year());
+            for year in first_year..=end_year {
+                queries.push(TreasuryDailyRateQuery::year(family, year)?);
+            }
+        }
+        Self::try_new(queries)
+    }
+
+    /// Returns all exact configured queries in stable family/range order.
+    pub fn queries(&self) -> &[TreasuryDailyRateQuery] {
+        &self.queries
+    }
+
+    fn query(&self, dataset: &SourceIdentifier) -> Option<&TreasuryDailyRateQuery> {
+        self.queries.iter().find(|query| query.dataset() == dataset)
+    }
+}
 
 /// One exact provider profile authorized for a Treasury source instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TreasurySourceConfig {
     /// One exact Fiscal Data average-interest-rates query family.
     AverageInterestRates(TreasuryFiscalQuery),
-    /// One exact daily par-yield-curve year query family.
-    DailyParYieldCurve {
-        /// Official profile and methodology evidence.
-        profile: TreasuryYieldCurveProfile,
-        /// Exact provider year filter.
-        year: u16,
-    },
+    /// One bounded set of exact official daily-rate query families.
+    DailyRates(TreasuryDailyRatesConfig),
 }
 
 impl TreasurySourceConfig {
@@ -55,39 +138,82 @@ impl TreasurySourceConfig {
     ///
     /// Rejects a year outside the provider's supported nominal-curve range.
     pub fn daily_par_yield_curve(year: u16) -> Result<Self, TreasuryProtocolError> {
-        let profile = TreasuryYieldCurveProfile::daily_par_yield_curve();
-        profile.page(year, 0)?;
-        Ok(Self::DailyParYieldCurve { profile, year })
+        let query =
+            TreasuryDailyRateQuery::year(TreasuryDailyRateFamily::NominalParYieldCurve, year)?;
+        Ok(Self::DailyRates(TreasuryDailyRatesConfig::try_new([
+            query,
+        ])?))
+    }
+
+    /// Creates a source for an exact set of official daily-rate queries.
+    pub const fn daily_rates(config: TreasuryDailyRatesConfig) -> Self {
+        Self::DailyRates(config)
+    }
+
+    /// Creates complete yearly coverage for all five official daily-rate families.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a range that cannot include every family or exceeds bounded configuration limits.
+    pub fn daily_rates_all_families(
+        start_year: u16,
+        end_year: u16,
+    ) -> Result<Self, TreasuryProtocolError> {
+        TreasuryDailyRatesConfig::all_families(start_year, end_year).map(Self::DailyRates)
     }
 
     /// Returns the exact quality ceiling required by this profile.
     pub const fn quality(&self) -> DataQuality {
         match self {
             Self::AverageInterestRates(_) => DataQuality::OfficialDelayed,
-            Self::DailyParYieldCurve { profile, .. } => profile.quality(),
+            Self::DailyRates(_) => DataQuality::OfficialDelayed,
         }
     }
 
-    fn authorization_probe_url(&self) -> Result<String, TreasuryProtocolError> {
+    fn authorization_probe_urls(&self) -> Result<Vec<String>, TreasuryProtocolError> {
         match self {
-            Self::AverageInterestRates(query) => Ok(query.page(1)?.url().to_owned()),
-            Self::DailyParYieldCurve { profile, year } => {
-                Ok(profile.page(*year, 0)?.url().to_owned())
-            }
+            Self::AverageInterestRates(query) => Ok(vec![query.page(1)?.url().to_owned()]),
+            Self::DailyRates(config) => config
+                .queries()
+                .iter()
+                .map(|query| query.page(0).map(|page| page.url().to_owned()))
+                .collect(),
         }
     }
 
-    fn dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
-        let value = match self {
-            Self::AverageInterestRates(query) => format!(
+    fn query(&self, dataset: &SourceIdentifier) -> Option<&TreasuryDailyRateQuery> {
+        match self {
+            Self::AverageInterestRates(_) => None,
+            Self::DailyRates(config) => config.query(dataset),
+        }
+    }
+
+    fn accepts_dataset(&self, dataset: &SourceIdentifier) -> Result<bool, TreasurySourceError> {
+        match self {
+            Self::AverageInterestRates(query) => {
+                let expected = SourceIdentifier::try_from(format!(
+                    "treasury:fiscal-data:average-interest-rates-v2:{}",
+                    lower_hex(query.query_digest())
+                ))
+                .map_err(|_| TreasurySourceError::InvalidProtocol)?;
+                Ok(dataset == &expected)
+            }
+            Self::DailyRates(config) => Ok(config.query(dataset).is_some()),
+        }
+    }
+
+    fn single_dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
+        match self {
+            Self::AverageInterestRates(query) => SourceIdentifier::try_from(format!(
                 "treasury:fiscal-data:average-interest-rates-v2:{}",
                 lower_hex(query.query_digest())
-            ),
-            Self::DailyParYieldCurve { year, .. } => {
-                format!("treasury:daily-par-yield-curve:{year}")
+            ))
+            .map_err(|_| TreasurySourceError::InvalidProtocol),
+            Self::DailyRates(config) if config.queries().len() == 1 => {
+                Ok(config.queries()[0].dataset().clone())
             }
-        };
-        SourceIdentifier::try_from(value).map_err(|_| TreasurySourceError::InvalidProtocol)
+            Self::DailyRates(_) => Err(TreasurySourceError::InvalidProtocol),
+        }
     }
 }
 
@@ -156,15 +282,15 @@ impl RetrievedFiscalDataPage {
     }
 }
 
-/// A fetched yield-curve page retaining exact bytes and local-first-observation evidence.
+/// A fetched daily-rate page retaining exact bytes and local-first-observation evidence.
 #[derive(Clone, Debug)]
-pub struct RetrievedYieldCurvePage {
+pub struct RetrievedDailyRatePage {
     received_at: Timestamp,
     bytes: Bytes,
-    page: DailyParYieldCurvePage,
+    page: TreasuryDailyRatePage,
 }
 
-impl RetrievedYieldCurvePage {
+impl RetrievedDailyRatePage {
     /// Returns the local first-observation time for this exact response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
@@ -176,10 +302,13 @@ impl RetrievedYieldCurvePage {
     }
 
     /// Returns the validated page.
-    pub const fn page(&self) -> &DailyParYieldCurvePage {
+    pub const fn page(&self) -> &TreasuryDailyRatePage {
         &self.page
     }
 }
+
+/// Backward-compatible name for one retrieved Treasury daily-rate page.
+pub type RetrievedYieldCurvePage = RetrievedDailyRatePage;
 
 /// Allowlisted Treasury research producer requiring registry authority per request.
 pub struct TreasurySource {
@@ -203,16 +332,16 @@ impl std::fmt::Debug for TreasurySource {
 impl TreasurySource {
     /// Builds the most authoritative truthful revision plan supported by this Treasury profile.
     ///
-    /// Daily par-yield observations use the provider publication timestamp and exact record token.
+    /// Daily-rate observations use the provider publication timestamp and exact record token.
     /// Fiscal Data average-rate rows publish no version chronology, so their revisions are bound to
     /// exact locally observed canonical content instead of a fabricated provider order.
     ///
     /// # Errors
     ///
     /// Returns [`TreasurySourceError::InvalidMetadata`] when the batch belongs to another source
-    /// registration, [`TreasurySourceError::InvalidProtocol`] when a yield record lacks its required
-    /// publication timestamp, and [`TreasurySourceError::RevisionAuthority`] when bounded exact
-    /// evidence construction fails.
+    /// registration, [`TreasurySourceError::InvalidProtocol`] when a daily-rate record lacks its
+    /// required publication timestamp, and [`TreasurySourceError::RevisionAuthority`] when bounded
+    /// exact evidence construction fails.
     pub fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -226,7 +355,7 @@ impl TreasurySource {
             TreasurySourceConfig::AverageInterestRates(_) => {
                 ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
             }
-            TreasurySourceConfig::DailyParYieldCurve { .. } => {
+            TreasurySourceConfig::DailyRates(_) => {
                 let mut evidence = Vec::new();
                 evidence
                     .try_reserve_exact(batch.records().len())
@@ -304,11 +433,12 @@ impl TreasurySource {
         {
             return Err(TreasurySourceError::InvalidMetadata);
         }
-        let probe = config.authorization_probe_url()?;
-        metadata
-            .network_policy()
-            .authorize(&probe)
-            .map_err(|_| TreasurySourceError::InvalidMetadata)?;
+        for probe in config.authorization_probe_urls()? {
+            metadata
+                .network_policy()
+                .authorize(&probe)
+                .map_err(|_| TreasurySourceError::InvalidMetadata)?;
+        }
         Ok(())
     }
 
@@ -318,8 +448,15 @@ impl TreasurySource {
     }
 
     /// Returns the exact dataset identity accepted by discovery for this configured source.
+    ///
+    /// This compatibility accessor is available only for a single-dataset source. Multi-dataset
+    /// daily-rate sources are addressed by the dataset supplied to each discovery request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreasurySourceError::InvalidProtocol`] for a multi-dataset configuration.
     pub fn dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
-        self.config.dataset()
+        self.config.single_dataset()
     }
 
     /// Returns a bounded copy of local producer health.
@@ -382,22 +519,21 @@ impl TreasurySource {
         result
     }
 
-    /// Fetches and validates one page from the exact configured daily par-yield query family.
-    pub async fn fetch_yield_curve_page(
+    /// Fetches and validates one page from an exact configured daily-rate query family.
+    pub async fn fetch_daily_rate_page(
         &self,
         authority: &ExtractionAuthority,
-        request: &TreasuryYieldCurvePageRequest,
+        request: &TreasuryDailyRatePageRequest,
         limits: FiscalDataParseLimits,
         deadline: Timestamp,
         cancellation: &CancellationToken,
-    ) -> Result<RetrievedYieldCurvePage, ExtractionSourceError> {
-        let TreasurySourceConfig::DailyParYieldCurve { profile, year } = &self.config else {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
-            ));
-        };
-        let expected = profile
-            .page(*year, request.page_number())
+    ) -> Result<RetrievedDailyRatePage, ExtractionSourceError> {
+        let query = self
+            .config
+            .query(request.dataset())
+            .ok_or_else(invalid_protocol)?;
+        let expected = query
+            .page(request.page_number())
             .map_err(|_| invalid_protocol())?;
         if expected.request_digest() != request.request_digest() {
             return Err(ExtractionSourceError::Source(
@@ -419,11 +555,10 @@ impl TreasurySource {
             )
             .await
             .and_then(|response| {
-                let page = DailyParYieldCurvePage::parse(&response.bytes, request, limits)
-                    .map_err(|_| {
-                        ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                    })?;
-                Ok(RetrievedYieldCurvePage {
+                let page = TreasuryDailyRatePage::parse(&response.bytes, request, limits).map_err(
+                    |_| ExtractionSourceError::Source(SourceError::InvalidProtocolState),
+                )?;
+                Ok(RetrievedDailyRatePage {
                     received_at: response.received_at,
                     bytes: response.bytes,
                     page,
@@ -431,6 +566,25 @@ impl TreasurySource {
             });
         self.record_extraction_result(&result, |page| page.page.response_payload_digest())?;
         result
+    }
+
+    /// Backward-compatible nominal-yield fetch entry point.
+    pub async fn fetch_yield_curve_page(
+        &self,
+        authority: &ExtractionAuthority,
+        request: &TreasuryYieldCurvePageRequest,
+        limits: FiscalDataParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<RetrievedYieldCurvePage, ExtractionSourceError> {
+        self.fetch_daily_rate_page(
+            authority,
+            request.as_daily_request(),
+            limits,
+            deadline,
+            cancellation,
+        )
+        .await
     }
 
     async fn discover_impl(
@@ -441,7 +595,10 @@ impl TreasurySource {
     ) -> Result<DiscoveryBatch, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.effective_at().is_some()
-            || request.dataset() != &self.config.dataset().map_err(map_adapter_error)?
+            || !self
+                .config
+                .accepts_dataset(request.dataset())
+                .map_err(map_adapter_error)?
         {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
@@ -491,13 +648,28 @@ impl TreasurySource {
                     })?;
                 }
             }
-            TreasurySourceConfig::DailyParYieldCurve { profile, year } => {
-                if request.max_results() > 0 {
-                    let page_request = profile.page(*year, 0).map_err(|_| {
+            TreasurySourceConfig::DailyRates(config) => {
+                let query = config
+                    .query(request.dataset())
+                    .ok_or_else(invalid_protocol)?;
+                let mut tracker = query
+                    .is_all_history()
+                    .then(|| {
+                        crate::TreasuryDailyRatePaginationTracker::try_new(
+                            query,
+                            MAX_DAILY_RATE_PAGES,
+                            market_squawk_sources::MAX_EXTRACTION_RECORDS,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|_| invalid_protocol())?;
+                let mut page_number = 0_usize;
+                loop {
+                    let page_request = query.page(page_number).map_err(|_| {
                         ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                     })?;
                     let retrieved = self
-                        .fetch_yield_curve_page(
+                        .fetch_daily_rate_page(
                             &authority,
                             &page_request,
                             limits,
@@ -505,6 +677,18 @@ impl TreasurySource {
                             &cancellation,
                         )
                         .await?;
+                    let terminal = match tracker.as_mut() {
+                        Some(tracker) => tracker
+                            .accept(retrieved.page())
+                            .map_err(|_| invalid_protocol())?,
+                        None => retrieved.page().is_terminal(),
+                    };
+                    if terminal {
+                        break;
+                    }
+                    if objects.len() == usize::from(request.max_results()) {
+                        return Err(invalid_protocol());
+                    }
                     objects.push(source_object(
                         &self.metadata,
                         &request,
@@ -512,8 +696,12 @@ impl TreasurySource {
                         retrieved.exact_payload(),
                         retrieved.received_at(),
                         "application/atom+xml",
-                        ObjectKind::Yield,
+                        ObjectKind::DailyRate,
                     )?);
+                    if !query.is_all_history() {
+                        break;
+                    }
+                    page_number = page_number.checked_add(1).ok_or_else(invalid_protocol)?;
                 }
             }
         }
@@ -529,7 +717,10 @@ impl TreasurySource {
         self.validate_authority(&authority)?;
         if request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
-            || request.object().dataset() != &self.config.dataset().map_err(map_adapter_error)?
+            || !self
+                .config
+                .accepts_dataset(request.object().dataset())
+                .map_err(map_adapter_error)?
         {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
@@ -567,13 +758,16 @@ impl TreasurySource {
                 )
                 .map_err(map_adapter_error)?
             }
-            (TreasurySourceConfig::DailyParYieldCurve { profile, year }, ObjectKind::Yield) => {
-                let page_request = profile.page(*year, parsed.page_number).map_err(|_| {
+            (TreasurySourceConfig::DailyRates(config), ObjectKind::DailyRate) => {
+                let query = config
+                    .query(request.object().dataset())
+                    .ok_or_else(invalid_protocol)?;
+                let page_request = query.page(parsed.page_number).map_err(|_| {
                     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                 })?;
                 parsed.verify_request(page_request.request_digest())?;
                 let retrieved = self
-                    .fetch_yield_curve_page(
+                    .fetch_daily_rate_page(
                         &authority,
                         &page_request,
                         limits,
@@ -587,7 +781,7 @@ impl TreasurySource {
                     retrieved.exact_payload(),
                 )?;
                 ingested_at = system_timestamp().map_err(map_adapter_error)?;
-                canonical_yield_records(
+                canonical_daily_rate_records(
                     &self.metadata,
                     retrieved.page(),
                     retrieved.received_at(),

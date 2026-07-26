@@ -57,9 +57,12 @@ pub enum TrainingEnvironmentError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedTrainingEnvironment {
     receipt_sha256: [u8; 32],
+    release_manifest_sha256: [u8; 32],
     application_sha256: [u8; 32],
     onnx_worker_sha256: [u8; 32],
     validator_sha256: [u8; 32],
+    python_tag: Box<str>,
+    python_version: Box<str>,
     training_code_revision: Box<str>,
 }
 
@@ -68,6 +71,12 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub const fn receipt_sha256(&self) -> [u8; 32] {
         self.receipt_sha256
+    }
+
+    /// Returns the exact signed release-manifest digest installed into this environment.
+    #[must_use]
+    pub const fn release_manifest_sha256(&self) -> [u8; 32] {
+        self.release_manifest_sha256
     }
 
     /// Returns the signed exact application executable digest.
@@ -86,6 +95,18 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub const fn validator_sha256(&self) -> [u8; 32] {
         self.validator_sha256
+    }
+
+    /// Returns the signed CPython compatibility tag for this environment.
+    #[must_use]
+    pub fn python_tag(&self) -> &str {
+        &self.python_tag
+    }
+
+    /// Returns the signed exact CPython version for this environment.
+    #[must_use]
+    pub fn python_version(&self) -> &str {
+        &self.python_version
     }
 
     /// Returns the builder-derived source-closure revision.
@@ -213,8 +234,11 @@ struct RuntimeRequirementWire {
 struct VerifiedFiles {
     environment: EnvironmentWire,
     receipt_sha256: [u8; 32],
+    release_manifest_sha256: [u8; 32],
     application_sha256: [u8; 32],
+    application_size_bytes: u64,
     onnx_worker_sha256: [u8; 32],
+    onnx_worker_size_bytes: u64,
     validator_sha256: [u8; 32],
     root: PathBuf,
 }
@@ -273,7 +297,10 @@ pub fn verify_validator_training_environment(
     verified.into_public()
 }
 
-/// Verifies the fixed installed receipt, current application, and sibling ONNX worker.
+/// Verifies the fixed installed receipt and the selected application and sibling ONNX worker.
+///
+/// The selected programs may be separately installed copies. Their stable sizes and SHA-256
+/// identities must equal the executables bound by the signed release manifest.
 ///
 /// # Errors
 ///
@@ -284,13 +311,18 @@ pub fn verify_application_training_environment(
     onnx_worker: &Path,
 ) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
     let verified = verify_installed_files(root)?;
-    let expected_application = verified.root.join("bin/market-squawk");
-    let expected_worker = verified.root.join("bin/market-squawk-onnx-worker");
-    if canonical(application)? != canonical(&expected_application)?
-        || canonical(onnx_worker)? != canonical(&expected_worker)?
-    {
-        return Err(TrainingEnvironmentError::RuntimeWitness);
-    }
+    verify_runtime_program_identity(
+        application,
+        verified.application_sha256,
+        verified.application_size_bytes,
+        MAX_APPLICATION_EXECUTABLE_BYTES,
+    )?;
+    verify_runtime_program_identity(
+        onnx_worker,
+        verified.onnx_worker_sha256,
+        verified.onnx_worker_size_bytes,
+        MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+    )?;
     verified.into_public()
 }
 
@@ -298,9 +330,12 @@ impl VerifiedFiles {
     fn into_public(self) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
         Ok(VerifiedTrainingEnvironment {
             receipt_sha256: self.receipt_sha256,
+            release_manifest_sha256: self.release_manifest_sha256,
             application_sha256: self.application_sha256,
             onnx_worker_sha256: self.onnx_worker_sha256,
             validator_sha256: self.validator_sha256,
+            python_tag: self.environment.interpreter.python_tag.into(),
+            python_version: self.environment.interpreter.version.into(),
             training_code_revision: self.environment.training_code_revision.into(),
         })
     }
@@ -442,11 +477,84 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     Ok(VerifiedFiles {
         environment,
         receipt_sha256: receipt_file.sha256,
+        release_manifest_sha256: manifest_file.sha256,
         application_sha256: application.sha256,
+        application_size_bytes: application.size_bytes,
         onnx_worker_sha256: onnx_worker.sha256,
+        onnx_worker_size_bytes: onnx_worker.size_bytes,
         validator_sha256: validator.sha256,
         root: canonical_root,
     })
+}
+
+fn verify_runtime_program_identity(
+    path: &Path,
+    expected_sha256: [u8; 32],
+    expected_size_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<(), TrainingEnvironmentError> {
+    if expected_size_bytes == 0 || expected_size_bytes > maximum_bytes {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+    let named = fs::symlink_metadata(path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+    controlled_metadata(&named).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    let canonical_path =
+        fs::canonicalize(path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    if !canonical_path.is_absolute() {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+    let mut file =
+        File::open(&canonical_path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    let before = file
+        .metadata()
+        .map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    if !same_file(&named, &before)
+        || controlled_metadata(&before).is_err()
+        || before.len() != expected_size_bytes
+    {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut observed = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?)
+            .filter(|value| *value <= maximum_bytes)
+            .ok_or(TrainingEnvironmentError::RuntimeWitness)?;
+        digest.update(&buffer[..read]);
+    }
+
+    let after = file
+        .metadata()
+        .map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    let named_after =
+        fs::symlink_metadata(path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    let canonical_after =
+        fs::canonicalize(path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
+    if named_after.file_type().is_symlink()
+        || !named_after.is_file()
+        || controlled_metadata(&after).is_err()
+        || controlled_metadata(&named_after).is_err()
+        || !same_file(&before, &after)
+        || !same_file(&before, &named_after)
+        || canonical_after != canonical_path
+        || observed != expected_size_bytes
+        || <[u8; 32]>::from(digest.finalize()) != expected_sha256
+    {
+        return Err(TrainingEnvironmentError::RuntimeWitness);
+    }
+    Ok(())
 }
 
 fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
@@ -1098,4 +1206,42 @@ fn base64_url(bytes: &[u8; 32]) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{TrainingEnvironmentError, hash, verify_runtime_program_identity};
+
+    #[test]
+    fn runtime_program_identity_accepts_a_copy_and_rejects_a_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let installed = temporary.path().join("installed-program");
+        let selected = temporary.path().join("selected-program");
+        fs::write(&installed, b"signed program bytes")?;
+        fs::copy(&installed, &selected)?;
+        assert_ne!(fs::canonicalize(&installed)?, fs::canonicalize(&selected)?);
+        let expected = hash(b"signed program bytes");
+
+        verify_runtime_program_identity(
+            &selected,
+            expected,
+            b"signed program bytes".len() as u64,
+            1024,
+        )?;
+
+        fs::write(&selected, b"tamper program bytes")?;
+        assert_eq!(
+            verify_runtime_program_identity(
+                &selected,
+                expected,
+                b"signed program bytes".len() as u64,
+                1024,
+            ),
+            Err(TrainingEnvironmentError::RuntimeWitness)
+        );
+        Ok(())
+    }
 }

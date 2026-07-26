@@ -13,8 +13,8 @@ use market_squawk_sources::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AverageInterestRate, DailyParYieldCurvePage, FiscalDataPage, TreasuryRateProfile,
-    TreasurySourceError,
+    AverageInterestRate, FiscalDataPage, TreasuryDailyRateMetric, TreasuryDailyRatePage,
+    TreasuryRateProfile, TreasurySourceError,
 };
 
 pub(super) struct CanonicalTreasuryRecord {
@@ -64,9 +64,9 @@ pub(super) fn canonical_fiscal_records(
         .collect()
 }
 
-pub(super) fn canonical_yield_records(
+pub(super) fn canonical_daily_rate_records(
     source: &SourceMetadata,
-    page: &DailyParYieldCurvePage,
+    page: &TreasuryDailyRatePage,
     received_at: Timestamp,
     ingested_at: Timestamp,
 ) -> Result<Vec<CanonicalTreasuryRecord>, TreasurySourceError> {
@@ -74,26 +74,24 @@ pub(super) fn canonical_yield_records(
         .iter()
         .flat_map(|observation| {
             observation
-                .rates_percent()
-                .map(move |(maturity, value)| (observation, maturity, value))
+                .metric_points()
+                .map(move |(metric, point)| (observation, metric, point))
         })
-        .map(|(observation, maturity, value)| {
-            let series = identifier(format!(
-                "treasury:daily-par-yield-curve:{}",
-                maturity.as_str()
-            ))?;
+        .map(|(observation, metric, point)| {
+            let series = identifier(metric_series(metric))?;
             let revision = identifier(format!(
-                "treasury-yield:{}:{}:{}:{}",
+                "treasury-daily-rate:{}:{}:{}:{}:{}",
+                observation.family().dataset_family_token(),
                 observation.record_date(),
-                observation.source_record_id(),
-                maturity.as_str(),
+                metric.as_series_token(),
                 observation.source_published_at().unix_nanos(),
+                lower_hex(observation.row_identity()),
             ))?;
             canonical_record(
                 source,
-                DataQuality::Indicative,
+                DataQuality::OfficialDelayed,
                 series,
-                value,
+                point.rate_percent(),
                 revision,
                 observation.record_date(),
                 page.response_payload_digest(),
@@ -103,6 +101,28 @@ pub(super) fn canonical_yield_records(
             )
         })
         .collect()
+}
+
+fn metric_series(metric: TreasuryDailyRateMetric) -> String {
+    match metric {
+        TreasuryDailyRateMetric::NominalParYield(maturity) => {
+            format!("treasury:daily-par-yield-curve:{}", maturity.as_str())
+        }
+        TreasuryDailyRateMetric::Bill { maturity, measure } => format!(
+            "treasury:daily-bill-rates:{}:{}",
+            maturity.as_str(),
+            measure.as_str()
+        ),
+        TreasuryDailyRateMetric::LongTerm(rate_type) => {
+            format!("treasury:daily-long-term-rates:{}", rate_type.as_str())
+        }
+        TreasuryDailyRateMetric::RealParYield(maturity) => {
+            format!("treasury:daily-real-par-yield-curve:{}", maturity.as_str())
+        }
+        TreasuryDailyRateMetric::RealLongTermAverage => {
+            "treasury:daily-real-long-term-rates:average".to_owned()
+        }
+    }
 }
 
 #[allow(

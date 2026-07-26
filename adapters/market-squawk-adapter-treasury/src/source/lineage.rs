@@ -10,26 +10,26 @@ use market_squawk_sources::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{TreasuryPageRequest, TreasuryYieldCurvePageRequest};
+use crate::{TreasuryDailyRatePageRequest, TreasuryPageRequest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ObjectKind {
     Fiscal,
-    Yield,
+    DailyRate,
 }
 
 impl ObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Fiscal => "fiscal",
-            Self::Yield => "yield",
+            Self::DailyRate => "daily-rate",
         }
     }
 
     fn parse(value: &str) -> Result<Self, ExtractionSourceError> {
         match value {
             "fiscal" => Ok(Self::Fiscal),
-            "yield" => Ok(Self::Yield),
+            "daily-rate" => Ok(Self::DailyRate),
             _ => Err(invalid_protocol()),
         }
     }
@@ -55,7 +55,7 @@ impl PageIdentity for TreasuryPageRequest {
     }
 }
 
-impl PageIdentity for TreasuryYieldCurvePageRequest {
+impl PageIdentity for TreasuryDailyRatePageRequest {
     fn url(&self) -> &str {
         self.url()
     }
@@ -131,10 +131,7 @@ impl ParsedObjectId {
             .map_err(|_| invalid_protocol())?;
         let request_digest = parse_lower_hex(fields.next().ok_or_else(invalid_protocol)?)?;
         let payload_digest = parse_lower_hex(fields.next().ok_or_else(invalid_protocol)?)?;
-        if fields.next().is_some()
-            || (kind == ObjectKind::Fiscal && page_number == 0)
-            || (kind == ObjectKind::Yield && page_number != 0)
-        {
+        if fields.next().is_some() || (kind == ObjectKind::Fiscal && page_number == 0) {
             return Err(invalid_protocol());
         }
         Ok(Self {

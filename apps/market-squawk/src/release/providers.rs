@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
+use market_squawk_adapter_treasury::{TreasuryDailyRateFamily, TreasuryDailyRateQuery};
 use market_squawk_data::CatalogLimit;
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
 use market_squawk_services::{
@@ -27,7 +28,7 @@ use super::{
 };
 use crate::{
     AppConfig, LocalProduct, OnboardingSessionView, ProviderActivationLease, ProviderProfileView,
-    application::{Application, ResearchProviderRuntimeGeneration},
+    application::{Application, ResearchProviderRuntimeGeneration, ResearchSourceDiscovery},
     cli::ReleaseProviderArguments,
 };
 
@@ -41,6 +42,7 @@ const REQUEST_MAXIMUM_ITEMS: usize = 1024;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVE_START_TIMEOUT: Duration = Duration::from_secs(90);
 const LIVE_QUALIFICATION_TIMEOUT: Duration = Duration::from_secs(120);
+const RESEARCH_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(90);
 const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 const COINBASE_PUBLIC: &str = "coinbase.public-market-data";
@@ -144,6 +146,23 @@ struct ResearchRuntimeEvidence {
     rights_authorization_digest: EvidenceDigest,
     runtime_generation_digest: EvidenceDigest,
     authority_effective_at_unix_nanos: i64,
+    publications: Vec<ResearchPublicationEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResearchPublicationEvidence {
+    family: String,
+    provider_dataset: String,
+    source_object_id: String,
+    source_payload_digest: EvidenceDigest,
+    analytical_dataset_id: String,
+    manifest_version: u64,
+    manifest_content_hash: String,
+    row_count: u64,
+    total_bytes: u64,
+    object_count: u64,
+    lineage_digest: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,7 +246,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
 
     let recovered = LocalProduct::try_new(config)
         .context("provider evidence could not reconstruct the local product")?;
-    let recovery = verify_restart_recovery(&recovered, &expectations);
+    let recovery = verify_restart_recovery(&recovered, &expectations).await;
     let recovered_shutdown = shutdown_product(&recovered).await;
     match (recovery, recovered_shutdown) {
         (Ok(()), Ok(())) => {}
@@ -335,7 +354,15 @@ async fn collect_provider_evidence(
             let runtime = activation
                 .research_runtime_generation(&profile_id)?
                 .ok_or_else(|| anyhow!("provider research runtime is not active: {surface_id}"))?;
-            Some(research_runtime_evidence(&runtime)?)
+            let publications = if *surface_id == TREASURY_XML {
+                let acceptance_year = product
+                    .treasury_daily_rate_release_year()
+                    .context("Treasury daily-rate activation does not cover all five families")?;
+                exercise_treasury_research(product.application().as_ref(), acceptance_year).await?
+            } else {
+                Vec::new()
+            };
+            Some(research_runtime_evidence(&runtime, publications)?)
         } else {
             None
         };
@@ -422,7 +449,7 @@ async fn ensure_active_session(
         }
         return Ok(session.clone());
     }
-    if !matches!(surface_id, COINBASE_PUBLIC | KRAKEN_PUBLIC | TREASURY_XML) {
+    if !matches!(surface_id, COINBASE_PUBLIC | KRAKEN_PUBLIC) {
         bail!(
             "provider surface requires a portal-prepared active session before release evidence: {surface_id}"
         );
@@ -464,7 +491,7 @@ fn preflight_selected_authority(
 ) -> Result<()> {
     for surface_id in selected {
         let Some(session) = sessions.get(*surface_id) else {
-            if matches!(*surface_id, COINBASE_PUBLIC | KRAKEN_PUBLIC | TREASURY_XML) {
+            if matches!(*surface_id, COINBASE_PUBLIC | KRAKEN_PUBLIC) {
                 continue;
             }
             bail!(
@@ -527,6 +554,7 @@ fn activation_evidence(lease: &ProviderActivationLease) -> ActivationEvidence {
 
 fn research_runtime_evidence(
     runtime: &ResearchProviderRuntimeGeneration,
+    publications: Vec<ResearchPublicationEvidence>,
 ) -> Result<ResearchRuntimeEvidence> {
     Ok(ResearchRuntimeEvidence {
         source_id: runtime.metadata().source_id().as_str().to_owned(),
@@ -536,7 +564,208 @@ fn research_runtime_evidence(
         rights_authorization_digest: runtime.rights_authorization_evidence(),
         runtime_generation_digest: runtime.generation_digest()?,
         authority_effective_at_unix_nanos: runtime.authority_effective_at().unix_nanos(),
+        publications,
     })
+}
+
+async fn exercise_treasury_research(
+    application: &Application,
+    acceptance_year: u16,
+) -> Result<Vec<ResearchPublicationEvidence>> {
+    let mut evidence = Vec::new();
+    for (family, dataset) in treasury_acceptance_datasets(acceptance_year)? {
+        let dataset_text = dataset.as_str();
+        let discovery = invoke(
+            application,
+            "Source.Discover",
+            json_object(json!({
+                "provider": TREASURY_XML,
+                "dataset": dataset_text,
+                "confirm": true,
+                "sourceCoverage": [TREASURY_XML],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
+        if discovery.profile().as_str() != TREASURY_XML
+            || discovery.request().dataset() != &dataset
+            || discovery.objects().len() != 1
+            || !discovery.rights().persistence_operation_admitted()
+        {
+            bail!("Treasury discovery did not produce one persistence-authorized exact object");
+        }
+        let object = discovery
+            .objects()
+            .first()
+            .ok_or_else(|| anyhow!("Treasury discovery object is absent"))?;
+        let source_object = object.source_object();
+        let source_object_id = source_object.object_id().as_str().to_owned();
+        let source_payload_digest = source_object.evidence().content_digest();
+        let ingestion = invoke(
+            application,
+            "Research.IngestSource",
+            json_object(json!({
+                "provider": TREASURY_XML,
+                "object": source_object_id,
+                "dataset": dataset_text,
+                "discoveryReceipt": object.discovery_receipt(),
+                "confirm": true,
+                "sourceCoverage": [TREASURY_XML],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let publication = parse_research_publication(
+            family,
+            dataset_text,
+            source_object_id,
+            source_payload_digest,
+            &ingestion,
+        )?;
+        verify_queryable_publication(application, &publication).await?;
+        evidence.push(publication);
+    }
+    Ok(evidence)
+}
+
+fn parse_research_publication(
+    family: &str,
+    provider_dataset: &str,
+    source_object_id: String,
+    source_payload_digest: EvidenceDigest,
+    ingestion: &Value,
+) -> Result<ResearchPublicationEvidence> {
+    let manifest = ingestion
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("Treasury ingestion manifest is absent"))?;
+    let analytical_dataset_id = required_text(manifest.get("datasetId"), "dataset id")?;
+    let manifest_content_hash = required_sha256(
+        manifest.get("contentHash"),
+        "Treasury manifest content hash",
+    )?;
+    let manifest_version =
+        required_nonzero_u64(manifest.get("manifestVersion"), "Treasury manifest version")?;
+    let row_count =
+        required_nonzero_u64(ingestion.get("rowCount"), "Treasury publication row count")?;
+    let total_bytes = required_nonzero_u64(
+        ingestion.get("totalBytes"),
+        "Treasury publication byte count",
+    )?;
+    let object_count = required_nonzero_u64(
+        ingestion.get("objectCount"),
+        "Treasury publication object count",
+    )?;
+    let lineage_digest =
+        required_sha256(ingestion.get("lineageDigest"), "Treasury lineage digest")?;
+    Ok(ResearchPublicationEvidence {
+        family: family.to_owned(),
+        provider_dataset: provider_dataset.to_owned(),
+        source_object_id,
+        source_payload_digest,
+        analytical_dataset_id,
+        manifest_version,
+        manifest_content_hash,
+        row_count,
+        total_bytes,
+        object_count,
+        lineage_digest,
+    })
+}
+
+async fn verify_queryable_publication(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+) -> Result<()> {
+    let observations = invoke(
+        application,
+        "Macro.GetObservations",
+        json_object(json!({
+            "dataset": publication.analytical_dataset_id,
+            "sourceCoverage": [TREASURY_XML],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let manifest = observations
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("Treasury query manifest is absent"))?;
+    if manifest.get("datasetId").and_then(Value::as_str)
+        != Some(publication.analytical_dataset_id.as_str())
+        || manifest.get("manifestVersion").and_then(Value::as_u64)
+            != Some(publication.manifest_version)
+        || manifest.get("contentHash").and_then(Value::as_str)
+            != Some(publication.manifest_content_hash.as_str())
+    {
+        bail!("Treasury query did not use the exact published manifest");
+    }
+    let has_rows = observations
+        .get("rows")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty());
+    let has_artifact_rows = observations
+        .pointer("/artifact/rowCount")
+        .and_then(Value::as_u64)
+        .is_some_and(|rows| rows > 0);
+    if !has_rows && !has_artifact_rows {
+        bail!("Treasury publication is not queryable");
+    }
+    Ok(())
+}
+
+fn treasury_acceptance_datasets(
+    acceptance_year: u16,
+) -> Result<Vec<(&'static str, SourceIdentifier)>> {
+    TreasuryDailyRateFamily::ALL
+        .into_iter()
+        .map(|family| {
+            let query = TreasuryDailyRateQuery::year(family, acceptance_year)?;
+            Ok((
+                treasury_family_evidence_name(family),
+                query.dataset().clone(),
+            ))
+        })
+        .collect()
+}
+
+const fn treasury_family_evidence_name(family: TreasuryDailyRateFamily) -> &'static str {
+    match family {
+        TreasuryDailyRateFamily::NominalParYieldCurve => "nominal_par_yield_curve",
+        TreasuryDailyRateFamily::BillRates => "bill_rates",
+        TreasuryDailyRateFamily::LongTermRates => "long_term_rates",
+        TreasuryDailyRateFamily::RealParYieldCurve => "real_par_yield_curve",
+        TreasuryDailyRateFamily::RealLongTermRates => "real_long_term_rates",
+    }
+}
+
+fn required_text(value: Option<&Value>, field: &str) -> Result<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("{field} is absent"))
+}
+
+fn required_nonzero_u64(value: Option<&Value>, field: &str) -> Result<u64> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("{field} is absent or zero"))
+}
+
+fn required_sha256(value: Option<&Value>, field: &str) -> Result<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("{field} is not a lowercase SHA-256 digest"))
 }
 
 async fn exercise_live_surface(
@@ -866,7 +1095,7 @@ fn json_object(value: Value) -> Result<Map<String, Value>> {
         .ok_or_else(|| anyhow!("code-owned provider arguments are not an object"))
 }
 
-fn verify_restart_recovery(
+async fn verify_restart_recovery(
     product: &LocalProduct,
     expectations: &[RecoveryExpectation],
 ) -> Result<()> {
@@ -898,8 +1127,14 @@ fn verify_restart_recovery(
                     .ok_or_else(|| {
                         anyhow!("provider research runtime was not recovered: {surface_id}")
                     })?;
-                if research_runtime_evidence(&runtime)? != *expected_runtime {
+                let mut expected_identity = expected_runtime.clone();
+                expected_identity.publications.clear();
+                if research_runtime_evidence(&runtime, Vec::new())? != expected_identity {
                     bail!("provider research runtime changed during restart: {surface_id}");
+                }
+                for publication in &expected_runtime.publications {
+                    verify_queryable_publication(product.application().as_ref(), publication)
+                        .await?;
                 }
             }
             None => {
@@ -979,7 +1214,7 @@ fn is_live_surface(surface_id: &str) -> bool {
 fn requires_research_runtime(surface_id: &str) -> bool {
     matches!(
         surface_id,
-        SEC_EDGAR | FRED_ALFRED | BLS_PUBLIC | BLS_REGISTERED | TREASURY_FISCAL
+        SEC_EDGAR | FRED_ALFRED | BLS_PUBLIC | BLS_REGISTERED | TREASURY_XML | TREASURY_FISCAL
     )
 }
 

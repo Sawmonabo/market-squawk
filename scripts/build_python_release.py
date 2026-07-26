@@ -1370,6 +1370,8 @@ def _build_release(
         )
         matrix_evidence.append(
             {
+                "release_directory": f"release-cp{minor[0]}{minor[1]}",
+                "python_tag": f"cp{runtime.version[0]}{runtime.version[1]}",
                 "python": _run_output(
                     [release_python, "--version"], root, runtime_environment
                 ),

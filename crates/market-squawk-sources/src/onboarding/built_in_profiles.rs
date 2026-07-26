@@ -48,7 +48,18 @@ const COINBASE_DIRECT_COMPOSITION_DIGEST: EvidenceDigest = EvidenceDigest::new(
         0x75, 0x90,
     ],
 );
+const TREASURY_DAILY_RATES_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0x43, 0x17, 0x26, 0xc4, 0x84, 0x3c, 0x75, 0x7b, 0xe6, 0x5e, 0x79, 0x8c, 0x64, 0x9c, 0x50,
+        0xfb, 0x14, 0x88, 0x1c, 0xc5, 0xfa, 0x05, 0xe3, 0x7c, 0xce, 0xd7, 0x68, 0x8e, 0x1d, 0x5e,
+        0x7f, 0x92,
+    ],
+);
 const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
+const TREASURY_DAILY_RATES_PROFILE: &str = "treasury.daily-rates-xml";
+const TREASURY_DAILY_RATES_AUTHORITY_SOURCE: &str =
+    "MSQ-TREASURY-DAILY-RATES-RELEASE-AUTHORITY-2026-07-26";
 /// Code-owned completed year used by the bounded Treasury daily-rate onboarding probe.
 pub const TREASURY_DAILY_RATES_PROBE_YEAR: u16 = 2025;
 
@@ -316,13 +327,64 @@ const BLS_V2_EVIDENCE: &[ProfileEvidence] = &[
         true,
     ),
 ];
-const TREASURY_XML_EVIDENCE: &[ProfileEvidence] = &[ProfileEvidence::new(
-    "DOC-030",
-    "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
-    "2026-07-25",
-    None,
-    false,
-)];
+const TREASURY_XML_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        "DOC-030",
+        "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TREASURY-DATA-GOV-NOMINAL-PAR-CC0",
+        "https://catalog.data.gov/dataset/interest-rate-statistics-daily-treasury-yield-curve-rates",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TREASURY-DATA-GOV-BILL-RATES-CC0",
+        "https://catalog.data.gov/dataset/interest-rate-statistics-daily-treasury-bill-rates",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TREASURY-DATA-GOV-LONG-TERM-CC0",
+        "https://catalog.data.gov/dataset/daily-treasury-long-term-rate-data",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TREASURY-DATA-GOV-REAL-PAR-CC0",
+        "https://catalog.data.gov/dataset/daily-treasury-real-yield-curve-rates",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TREASURY-DATA-GOV-REAL-LONG-TERM-CC0",
+        "https://catalog.data.gov/dataset/daily-treasury-real-long-term-rates",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "CC0-1.0-LEGAL-CODE",
+        "https://creativecommons.org/publicdomain/zero/1.0/legalcode",
+        "2026-07-26",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        TREASURY_DAILY_RATES_AUTHORITY_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/bf3a9099db391d51efab9fe839741003bc6b546a/docs/research/providers/2026-07-26-treasury-daily-rates-release-authority.md",
+        "2026-07-26",
+        Some(TREASURY_DAILY_RATES_AUTHORITY_DIGEST),
+        false,
+    ),
+];
 const FISCAL_EVIDENCE: &[ProfileEvidence] = &[ProfileEvidence::new(
     "DOC-031",
     "https://fiscaldata.treasury.gov/api-documentation/",
@@ -439,6 +501,32 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             )?,
         )?;
         (vec![legacy_capability, revision_two], current)
+    } else if spec.id == TREASURY_DAILY_RATES_PROFILE {
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                spec.probe.transport() != ProbeTransport::Local,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            revision_three.rate_policy().clone(),
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
     } else if has_provider_release_revision(spec.id) {
         let current = build_capability(
             &spec,
@@ -538,7 +626,13 @@ fn build_capability(
             LifecycleSupport::new(false, false, false)
         },
         evidence: capability_evidence(spec, revision)?,
-        refresh_trigger: SourceIdentifier::try_from(spec.refresh_trigger)?,
+        refresh_trigger: SourceIdentifier::try_from(
+            if spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 4 {
+                "TREASURY-XML-AUTHORITY-2026-07-26"
+            } else {
+                spec.refresh_trigger
+            },
+        )?,
     })?)
 }
 
@@ -563,6 +657,12 @@ fn capability_evidence(
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from("MSQ-COINBASE-DIRECT-COMPOSITION-AUDIT-2026-07-25")?,
             COINBASE_DIRECT_COMPOSITION_DIGEST,
+        ));
+    }
+    if spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 4 {
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(TREASURY_DAILY_RATES_AUTHORITY_SOURCE)?,
+            TREASURY_DAILY_RATES_AUTHORITY_DIGEST,
         ));
     }
     Ok(evidence)
@@ -963,18 +1063,18 @@ fn bls_v2() -> Result<BuiltInSpec, ProviderProfileError> {
 
 fn treasury_xml() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: "treasury.daily-rates-xml",
+        id: TREASURY_DAILY_RATES_PROFILE,
         display_name: "U.S. Treasury daily interest-rate XML",
         official_entry: "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
         setup: ProfileActivationMode::NoCredential,
-        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsLimited,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "Treasury daily interest-rate XML families; durable publication remains closed",
+        coverage: "All five Treasury daily-rate families: daily_treasury_yield_curve, daily_treasury_bill_rates, daily_treasury_long_term_rate, daily_treasury_real_yield_curve, daily_treasury_real_long_term",
         quality: DataQuality::OfficialDelayed,
         probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
@@ -985,16 +1085,20 @@ fn treasury_xml() -> Result<BuiltInSpec, ProviderProfileError> {
                 ("field_tdr_date_value", "2025"),
             ],
         )?,
-        rights: RIGHTS_LIMITED,
-        duties: &["do not inherit Fiscal Data rights onto this separate XML surface"],
-        persistence_evidence_source_id: None,
+        rights: RIGHTS_ALL,
+        duties: &[
+            "apply CC0 1.0 only to the five identified Treasury daily-rate datasets",
+            "retain the dataset family, official URL, retrieval time, payload digest, provider record identity, and publication and effective-time provenance",
+            "exclude Treasury seals, trademarks, unrelated website media, and third-party materials from this dataset-level admission",
+        ],
+        persistence_evidence_source_id: Some(TREASURY_DAILY_RATES_AUTHORITY_SOURCE),
         rotation: "not applicable: this surface has no credential",
         revocation: "not applicable: this surface has no credential",
         recovery: COMMON_RECOVERY,
         evidence: TREASURY_XML_EVIDENCE,
         rate_policy: "treasury.daily-rates-xml.rate-policy.v1",
         refresh_trigger: "TREASURY-XML",
-        handoff_instruction: "No account or token is requested; durable use remains rights-limited.",
+        handoff_instruction: "No account or token is required; continue with the bounded public daily-rate probe.",
     })
 }
 

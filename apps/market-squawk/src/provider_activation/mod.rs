@@ -449,10 +449,7 @@ impl ProviderAdapterActivation {
                     (
                         TREASURY_FISCAL_SURFACE,
                         TreasurySourceConfig::AverageInterestRates(_)
-                    ) | (
-                        TREASURY_XML_SURFACE,
-                        TreasurySourceConfig::DailyParYieldCurve { .. }
-                    )
+                    ) | (TREASURY_XML_SURFACE, TreasurySourceConfig::DailyRates(_))
                 );
                 if !matches {
                     return Err(ProviderAdapterActivationError::SurfaceMismatch);
@@ -709,10 +706,7 @@ impl ProviderAdapterActivation {
             (
                 TREASURY_FISCAL_SURFACE,
                 TreasurySourceConfig::AverageInterestRates(_)
-            ) | (
-                TREASURY_XML_SURFACE,
-                TreasurySourceConfig::DailyParYieldCurve { .. }
-            )
+            ) | (TREASURY_XML_SURFACE, TreasurySourceConfig::DailyRates(_))
         );
         if !matches {
             return Err(ProviderAdapterActivationError::SurfaceMismatch);

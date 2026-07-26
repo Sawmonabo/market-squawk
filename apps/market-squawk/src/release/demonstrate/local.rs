@@ -9,7 +9,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use market_squawk_modeling::verify_application_training_environment;
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use market_squawk_services::ServiceError;
 use serde::{Deserialize, Serialize};
@@ -22,6 +21,7 @@ use crate::cli::{
 };
 use crate::doctor;
 use crate::local_product::{CliProductError, execute_cli_command};
+use crate::release::close::verify_python_training_matrix;
 use crate::{AppConfig, LocalProduct};
 
 const ACCOUNT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -462,28 +462,10 @@ async fn doctor_evidence(config: &AppConfig) -> Result<DoctorEvidence> {
 
 fn verify_training_matrix(python_directory: &Path) -> Result<(PathBuf, bool)> {
     let application = std::env::current_exe().context("release executable path is unavailable")?;
-    let worker = application.with_file_name(if cfg!(windows) {
-        "market-squawk-onnx-worker.exe"
-    } else {
-        "market-squawk-onnx-worker"
-    });
-    let mut roots = Vec::new();
-    for name in ["release-cp312", "release-cp313"] {
-        let root = python_directory.join(name);
-        let metadata = fs::symlink_metadata(&root)
-            .with_context(|| format!("signed Python training root {name} is unavailable"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("signed Python training root is not a real directory");
-        }
-        verify_application_training_environment(&root, &application, &worker)
-            .with_context(|| format!("signed Python training root {name} failed admission"))?;
-        roots.push(root);
-    }
-    let selected = roots
-        .into_iter()
-        .next()
-        .context("signed Python training matrix is empty")?;
-    Ok((selected, true))
+    Ok((
+        verify_python_training_matrix(python_directory, &application)?,
+        true,
+    ))
 }
 
 pub(super) fn revalidate_training_matrix(python_directory: &Path) -> Result<()> {

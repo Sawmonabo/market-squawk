@@ -3,6 +3,8 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
+use market_squawk_adapter_treasury::{TreasuryDailyRateFamily, TreasuryDailyRateQuery};
+use market_squawk_sources::DataUseOperation;
 use serde_json::Value;
 
 use super::close::string_set;
@@ -28,6 +30,14 @@ const ALLOWED_PROVIDER_SURFACES: [&str; 9] = [
     "bls.v2-registered",
     "treasury.daily-rates-xml",
     "treasury.fiscal-data",
+];
+const DATA_USE_OPERATIONS: [DataUseOperation; 6] = [
+    DataUseOperation::Retrieve,
+    DataUseOperation::Display,
+    DataUseOperation::Persist,
+    DataUseOperation::ModelTraining,
+    DataUseOperation::Export,
+    DataUseOperation::Redistribute,
 ];
 
 pub(super) fn validate_provider_evidence(payload: &Value) -> Result<()> {
@@ -216,6 +226,7 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
         | "fred-alfred.api-v1-v2"
         | "bls.v1-unregistered"
         | "bls.v2-registered"
+        | "treasury.daily-rates-xml"
         | "treasury.fiscal-data" => {
             let runtime = surface
                 .pointer("/research_runtime")
@@ -248,11 +259,196 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
             {
                 bail!("FRED/ALFRED runtime lacks admitted durable-use operations");
             }
+            if surface_id == "treasury.daily-rates-xml"
+                && DATA_USE_OPERATIONS.iter().any(|operation| {
+                    surface
+                        .pointer(&format!(
+                            "/activation/data_use_admission/{}",
+                            operation.evidence_name()
+                        ))
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                })
+            {
+                bail!("Treasury daily-rate runtime lacks admitted durable-use operations");
+            }
+            if surface_id == "treasury.daily-rates-xml" {
+                validate_treasury_publications(runtime)?;
+            } else if runtime
+                .pointer("/publications")
+                .and_then(Value::as_array)
+                .is_none_or(|publications| !publications.is_empty())
+            {
+                bail!("non-Treasury research runtime contains unexpected publication evidence");
+            }
         }
-        "treasury.daily-rates-xml" => {}
         _ => bail!("provider evidence contains an unknown surface"),
     }
     Ok(())
+}
+
+fn validate_treasury_publications(runtime: &Value) -> Result<()> {
+    let publications = runtime
+        .pointer("/publications")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Treasury publication evidence is absent"))?;
+    if publications.len() != TreasuryDailyRateFamily::ALL.len() {
+        bail!("Treasury publication evidence does not cover all five families");
+    }
+    let mut families = BTreeSet::new();
+    let mut provider_datasets = BTreeSet::new();
+    let mut analytical_datasets = BTreeSet::new();
+    let mut acceptance_year = None;
+    for publication in publications {
+        let family_name = publication
+            .get("family")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Treasury publication family is invalid"))?;
+        let family = treasury_family(family_name)
+            .ok_or_else(|| anyhow::anyhow!("Treasury publication family is invalid"))?;
+        let provider_dataset = publication
+            .get("provider_dataset")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
+        let year = treasury_dataset_year(family, provider_dataset)
+            .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
+        if acceptance_year
+            .replace(year)
+            .is_some_and(|other| other != year)
+        {
+            bail!("Treasury publications do not use one common configured acceptance year");
+        }
+        let query = TreasuryDailyRateQuery::year(family, year)?;
+        if query.dataset().as_str() != provider_dataset {
+            bail!("Treasury publication family is not bound to its canonical dataset");
+        }
+        let source_object = publication
+            .get("source_object_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Treasury source object identity is invalid"))?;
+        let payload_digest = publication
+            .get("source_payload_digest")
+            .and_then(evidence_digest_hex)
+            .ok_or_else(|| anyhow::anyhow!("Treasury source payload digest is absent"))?;
+        let request = query.page(0)?;
+        if !treasury_source_object_matches(source_object, request.request_digest(), &payload_digest)
+        {
+            bail!("Treasury source object is not bound to its dataset and exact payload");
+        }
+        let analytical_dataset = publication
+            .get("analytical_dataset_id")
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Treasury analytical dataset identity is invalid"))?;
+        if source_object.is_empty()
+            || !families.insert(family)
+            || !provider_datasets.insert(provider_dataset)
+            || !analytical_datasets.insert(analytical_dataset)
+            || publication
+                .get("manifest_version")
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value == 0)
+            || !valid_sha256(publication.get("manifest_content_hash"))
+            || publication
+                .get("row_count")
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value == 0)
+            || publication
+                .get("total_bytes")
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value == 0)
+            || publication.get("object_count").and_then(Value::as_u64) != Some(1)
+            || !valid_sha256(publication.get("lineage_digest"))
+        {
+            bail!("Treasury publication evidence is incomplete");
+        }
+    }
+    if TreasuryDailyRateFamily::ALL
+        .into_iter()
+        .any(|family| !families.contains(&family))
+    {
+        bail!("Treasury publication evidence omitted a required family");
+    }
+    Ok(())
+}
+
+fn treasury_family(value: &str) -> Option<TreasuryDailyRateFamily> {
+    match value {
+        "nominal_par_yield_curve" => Some(TreasuryDailyRateFamily::NominalParYieldCurve),
+        "bill_rates" => Some(TreasuryDailyRateFamily::BillRates),
+        "long_term_rates" => Some(TreasuryDailyRateFamily::LongTermRates),
+        "real_par_yield_curve" => Some(TreasuryDailyRateFamily::RealParYieldCurve),
+        "real_long_term_rates" => Some(TreasuryDailyRateFamily::RealLongTermRates),
+        _ => None,
+    }
+}
+
+fn treasury_dataset_year(family: TreasuryDailyRateFamily, dataset: &str) -> Option<u16> {
+    let prefix = match family {
+        TreasuryDailyRateFamily::NominalParYieldCurve => "treasury:daily-par-yield-curve:",
+        TreasuryDailyRateFamily::BillRates => "treasury:daily-bill-rates:",
+        TreasuryDailyRateFamily::LongTermRates => "treasury:daily-long-term-rates:",
+        TreasuryDailyRateFamily::RealParYieldCurve => "treasury:daily-real-par-yield-curve:",
+        TreasuryDailyRateFamily::RealLongTermRates => "treasury:daily-real-long-term-rates:",
+    };
+    dataset
+        .strip_prefix(prefix)?
+        .parse::<u16>()
+        .ok()
+        .filter(|year| (family.start_year()..=9999).contains(year))
+}
+
+fn treasury_source_object_matches(
+    identity: &str,
+    request_digest: [u8; 32],
+    payload_digest: &str,
+) -> bool {
+    let request_digest = lower_hex(&request_digest);
+    let mut fields = identity.split(':');
+    fields.next() == Some("treasury-page")
+        && fields.next() == Some("daily-rate")
+        && fields.next() == Some("0")
+        && fields.next() == Some(request_digest.as_str())
+        && fields.next() == Some(payload_digest)
+        && fields.next().is_none()
+}
+
+fn evidence_digest_hex(value: &Value) -> Option<String> {
+    if value.pointer("/algorithm").and_then(Value::as_str) != Some("sha256") {
+        return None;
+    }
+    let bytes = value.pointer("/bytes")?.as_array()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let bytes = bytes
+        .iter()
+        .map(Value::as_u64)
+        .map(|value| value.and_then(|value| u8::try_from(value).ok()))
+        .collect::<Option<Vec<_>>>()?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(lower_hex(&bytes))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn valid_sha256(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn empty_result(value: Option<&Value>) -> bool {

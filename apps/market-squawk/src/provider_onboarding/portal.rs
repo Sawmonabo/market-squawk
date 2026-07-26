@@ -1087,8 +1087,7 @@ function blsConfiguration(section) {
 function configuration(profile, section) {
   if (profile.id === 'coinbase.public-market-data' ||
       profile.id === 'coinbase.exchange-direct-market-data' ||
-      profile.id === 'kraken.spot-public-market-data' ||
-      profile.id === 'treasury.daily-rates-xml') {
+      profile.id === 'kraken.spot-public-market-data') {
     return () => ({kind: 'source'});
   }
   if (profile.id === 'sec.edgar-public') return () => ({kind: 'sec'});
@@ -1103,6 +1102,16 @@ function configuration(profile, section) {
     section.append(first, last, page);
     return () => ({kind: 'treasury_fiscal', first_record_date: dateValue(first),
       last_record_date: dateValue(last), page_size: Number(requiredValue(page))});
+  }
+  if (profile.id === 'treasury.daily-rates-xml') {
+    const currentYear = new Date().getUTCFullYear();
+    const start = input('number', 'First observation year');
+    const end = input('number', 'Last observation year');
+    start.min = '1990'; start.max = String(currentYear); start.value = String(currentYear - 5);
+    end.min = '2003'; end.max = String(currentYear); end.value = String(currentYear);
+    section.append(start, end);
+    return () => ({kind: 'treasury_daily_rates',
+      start_year: Number(requiredValue(start)), end_year: Number(requiredValue(end))});
   }
   return null;
 }

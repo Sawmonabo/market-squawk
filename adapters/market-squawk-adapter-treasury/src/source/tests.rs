@@ -63,7 +63,7 @@ impl TreasuryTransport for ScriptedTransport {
 }
 
 #[tokio::test]
-async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records() -> TestResult {
+async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() -> TestResult {
     let now = system_timestamp()?;
     let fiscal_query = TreasuryFiscalQuery::average_interest_rates_v2(
         CalendarDate::new(2026, 1, 1)?,
@@ -75,6 +75,7 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records()
         now,
         fiscal_config,
         DataQuality::OfficialDelayed,
+        true,
         include_bytes!("../../fixtures/average_interest_rates.json"),
         b"application/json",
     )
@@ -92,7 +93,8 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records()
     let yield_records = exercise_source(
         now,
         yield_config,
-        DataQuality::Indicative,
+        DataQuality::OfficialDelayed,
+        false,
         include_bytes!("../../fixtures/daily_par_yield_curve.xml"),
         b"application/atom+xml",
     )
@@ -111,7 +113,7 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records()
         one_month,
         "treasury:daily-par-yield-curve:1m",
         "3.72",
-        DataQuality::Indicative,
+        DataQuality::OfficialDelayed,
         Some("2026-07-21T06:54:08+00:00"),
     )?;
     Ok(())
@@ -121,6 +123,7 @@ async fn exercise_source(
     now: Timestamp,
     config: TreasurySourceConfig,
     quality: DataQuality,
+    expected_locally_observed_revisions: bool,
     payload: &'static [u8],
     content_type: &'static [u8],
 ) -> TestResult<Vec<market_squawk_sources::ExtractionRecord>> {
@@ -175,7 +178,7 @@ async fn exercise_source(
     let revisions = source.revision_plan(&extraction)?;
     assert_eq!(
         revisions.is_locally_observed(),
-        quality == DataQuality::OfficialDelayed
+        expected_locally_observed_revisions
     );
     let urls = transport
         .requested_urls
@@ -183,7 +186,7 @@ async fn exercise_source(
         .map_err(|_| "request log poisoned")?;
     assert_eq!(urls.len(), 2);
     assert_eq!(urls[0], urls[1]);
-    if quality == DataQuality::Indicative {
+    if !expected_locally_observed_revisions {
         assert!(!urls[0].contains("page="));
         assert!(!urls[0].contains("page%5B"));
     }
@@ -288,17 +291,25 @@ fn metadata(
             5,
             4_096,
         )?,
-        TreasurySourceConfig::DailyParYieldCurve { profile, year } => ApiEndpointRule::try_new(
-            profile
-                .page(*year, 0)?
+        TreasurySourceConfig::DailyRates(config) => ApiEndpointRule::try_new(
+            config
+                .queries()
+                .first()
+                .ok_or("daily-rate query missing")?
+                .page(0)?
                 .url()
                 .split('?')
                 .next()
                 .ok_or("missing path")?,
             PathScope::Exact,
-            query_rules(&[("data", 64), ("field_tdr_date_value", 4)])?,
-            2,
-            256,
+            query_rules(&[
+                ("data", 64),
+                ("field_tdr_date_value", 4),
+                ("field_tdr_date_value_month", 6),
+                ("page", 20),
+            ])?,
+            3,
+            512,
         )?,
     };
     let network = EndpointPolicy::try_from_api_rules(
@@ -377,7 +388,6 @@ fn exact_evidence(bytes: &[u8]) -> ExactPayloadEvidence {
 const fn quality_token(quality: DataQuality) -> &'static str {
     match quality {
         DataQuality::OfficialDelayed => "fiscal",
-        DataQuality::Indicative => "yield",
         _ => "invalid",
     }
 }

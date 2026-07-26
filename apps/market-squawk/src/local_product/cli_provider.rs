@@ -86,11 +86,10 @@ const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = "fred-alfred.api-v1-v2";
-const PORTAL_SOURCE_SURFACES: [&str; 4] = [
+const PORTAL_SOURCE_SURFACES: [&str; 3] = [
     COINBASE_PUBLIC_SURFACE,
     COINBASE_DIRECT_SURFACE,
     KRAKEN_PUBLIC_SURFACE,
-    TREASURY_XML_SURFACE,
 ];
 
 /// Shared application authority behind local portal adapter activation and durable restart.
@@ -2022,9 +2021,12 @@ fn build_research_activation(
                 metadata, config,
             ))
         }
-        ProviderRequest::TreasuryDailyRates { year } => {
-            let config = TreasurySourceConfig::daily_par_yield_curve(year)
-                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+        ProviderRequest::TreasuryDailyRates {
+            year,
+            start_year,
+            end_year,
+        } => {
+            let config = treasury_daily_rates_config(year, start_year, end_year)?;
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
             ProviderAdapterActivationRequest::Treasury(TreasuryAdapterActivation::new(
@@ -2107,7 +2109,12 @@ enum ProviderRequest {
         page_size: u16,
     },
     TreasuryDailyRates {
-        year: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        year: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_year: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_year: Option<u16>,
     },
     FredAlfred {
         configuration: Box<FredProviderRequest>,
@@ -2147,6 +2154,19 @@ fn portal_provider_request(
                 first_record_date,
                 last_record_date,
                 page_size,
+            },
+            LoadedActivationEvidence {
+                objects: BTreeMap::new(),
+            },
+        )),
+        ProviderPortalActivationRequest::TreasuryDailyRates {
+            start_year,
+            end_year,
+        } => Ok((
+            ProviderRequest::TreasuryDailyRates {
+                year: None,
+                start_year: Some(start_year),
+                end_year: Some(end_year),
             },
             LoadedActivationEvidence {
                 objects: BTreeMap::new(),
@@ -2193,6 +2213,48 @@ fn portal_provider_request(
             ))
         }
     }
+}
+
+fn treasury_daily_rates_config(
+    legacy_year: Option<u16>,
+    start_year: Option<u16>,
+    end_year: Option<u16>,
+) -> Result<TreasurySourceConfig, CliProviderActivationError> {
+    match (legacy_year, start_year, end_year) {
+        (Some(year), None, None) => TreasurySourceConfig::daily_par_yield_curve(year)
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration),
+        (None, Some(start), Some(end)) if start <= end => {
+            TreasurySourceConfig::daily_rates_all_families(start, end)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)
+        }
+        _ => Err(CliProviderActivationError::ProviderConfiguration),
+    }
+}
+
+pub(super) fn treasury_daily_rate_release_year(
+    state: &DurableProviderActivationState,
+) -> Result<u16, CliProviderActivationError> {
+    let recipe = state
+        .load_recipe(TREASURY_XML_SURFACE)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+    let DurableActivationRecipeState::Desired(recipe) = recipe else {
+        return Err(CliProviderActivationError::StateUnavailable);
+    };
+    let request = decode_request(&recipe.request_bytes)?;
+    if request.session_id != recipe.session_id {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    let ProviderRequest::TreasuryDailyRates {
+        year: None,
+        start_year: Some(start_year),
+        end_year: Some(end_year),
+    } = request.provider
+    else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    TreasurySourceConfig::daily_rates_all_families(start_year, end_year)
+        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    Ok(end_year)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2902,16 +2964,25 @@ fn treasury_metadata(
                 4_096,
             )
         }
-        TreasurySourceConfig::DailyParYieldCurve { profile, year } => {
-            let page = profile
-                .page(*year, 0)
+        TreasurySourceConfig::DailyRates(config) => {
+            let query = config
+                .queries()
+                .first()
+                .ok_or(CliProviderActivationError::ProviderConfiguration)?;
+            let page = query
+                .page(0)
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
             ApiEndpointRule::try_new(
                 without_query(page.url())?,
                 PathScope::Exact,
-                query_rules(&[("data", 64), ("field_tdr_date_value", 4)])?,
-                2,
-                256,
+                query_rules(&[
+                    ("data", 64),
+                    ("field_tdr_date_value", 4),
+                    ("field_tdr_date_value_month", 6),
+                    ("page", 20),
+                ])?,
+                3,
+                512,
             )
         }
     }

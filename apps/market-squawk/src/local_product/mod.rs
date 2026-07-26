@@ -350,6 +350,13 @@ impl LocalProduct {
         &self.provider_activation_state
     }
 
+    /// Returns one configured year covered by all five active Treasury daily-rate families.
+    pub(crate) fn treasury_daily_rate_release_year(
+        &self,
+    ) -> Result<u16, CliProviderActivationError> {
+        cli_provider::treasury_daily_rate_release_year(&self.provider_activation_state)
+    }
+
     /// Returns the durable portfolio service used by direct CLI publication boundaries.
     pub fn portfolio(&self) -> Arc<PortfolioApplicationService> {
         Arc::clone(&self.portfolio)

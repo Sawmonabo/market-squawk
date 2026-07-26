@@ -27,6 +27,107 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
 }
 
 #[test]
+fn treasury_daily_rates_profile_binds_complete_public_release_authority() -> TestResult {
+    let profiles = built_in_provider_profiles()?;
+    let profile = profiles
+        .get("treasury.daily-rates-xml")
+        .ok_or("missing Treasury daily-rates profile")?;
+    let decision_source = "MSQ-TREASURY-DAILY-RATES-RELEASE-AUTHORITY-2026-07-26";
+    let decision_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        [
+            0x43, 0x17, 0x26, 0xc4, 0x84, 0x3c, 0x75, 0x7b, 0xe6, 0x5e, 0x79, 0x8c, 0x64, 0x9c,
+            0x50, 0xfb, 0x14, 0x88, 0x1c, 0xc5, 0xfa, 0x05, 0xe3, 0x7c, 0xce, 0xd7, 0x68, 0x8e,
+            0x1d, 0x5e, 0x7f, 0x92,
+        ],
+    );
+
+    assert_eq!(profile.zero_fee(), ZeroFeeStatus::Confirmed);
+    assert_eq!(profile.release_state(), ProfileReleaseState::Available);
+    assert_eq!(
+        profile.activation_mode(),
+        ProfileActivationMode::NoCredential
+    );
+    assert_eq!(
+        profile.requirements(),
+        (
+            Requirement::NotRequired,
+            Requirement::NotRequired,
+            Requirement::NotRequired,
+        )
+    );
+    let (coverage, quality) = profile.coverage();
+    assert_eq!(quality, market_squawk_domain::DataQuality::OfficialDelayed);
+    for family in [
+        "daily_treasury_yield_curve",
+        "daily_treasury_bill_rates",
+        "daily_treasury_long_term_rate",
+        "daily_treasury_real_yield_curve",
+        "daily_treasury_real_long_term",
+    ] {
+        assert!(coverage.contains(family));
+    }
+    let (rights, duties) = profile.rights();
+    assert_eq!(rights.len(), 6);
+    assert!(
+        rights
+            .iter()
+            .all(|right| right.admission() == OperationAdmission::Admitted)
+    );
+    assert_eq!(
+        duties,
+        [
+            "apply CC0 1.0 only to the five identified Treasury daily-rate datasets",
+            "retain the dataset family, official URL, retrieval time, payload digest, provider \
+             record identity, and publication and effective-time provenance",
+            "exclude Treasury seals, trademarks, unrelated website media, and third-party \
+             materials from this dataset-level admission",
+        ]
+    );
+
+    let persistence_evidence = profile
+        .persistence_evidence()
+        .ok_or("Treasury daily rates omitted persistence evidence")?;
+    assert_eq!(persistence_evidence.source_id(), decision_source);
+    assert_eq!(persistence_evidence.content_digest(), Some(decision_digest));
+    assert!(!persistence_evidence.refresh_required());
+
+    assert_eq!(profile.capability().revision().get(), 4);
+    assert_eq!(
+        profile
+            .capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    let prior = profile
+        .capability_history()
+        .find(|capability| capability.revision().get() == 3)
+        .ok_or("Treasury daily rates omitted historical revision 3")?;
+    assert_eq!(prior.refresh_trigger().as_str(), "TREASURY-XML");
+    assert!(
+        prior
+            .evidence()
+            .iter()
+            .all(|binding| binding.source_id().as_str() != decision_source)
+    );
+    assert_eq!(
+        profile.capability().refresh_trigger().as_str(),
+        "TREASURY-XML-AUTHORITY-2026-07-26"
+    );
+    assert_eq!(
+        profile
+            .capability()
+            .evidence()
+            .iter()
+            .find(|binding| binding.source_id().as_str() == decision_source)
+            .map(EvidenceBinding::digest),
+        Some(decision_digest)
+    );
+    Ok(())
+}
+
+#[test]
 fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal() -> TestResult {
     let capability_v1 = capability(1)?;
     let mut registry = ProviderCapabilityRegistry::new();
@@ -353,7 +454,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     let treasury_fiscal = profiles
         .get("treasury.fiscal-data")
         .ok_or("missing Treasury Fiscal Data profile")?;
-    for profile in [sec, fred, bls_public, treasury_xml, treasury_fiscal] {
+    for profile in [sec, fred, bls_public, treasury_fiscal] {
         assert_eq!(profile.capability().revision().get(), 3);
         assert_eq!(
             profile

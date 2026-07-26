@@ -1,11 +1,12 @@
 //! Exact-head evidence-set validation and closed-manifest publication.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use chrono::{SecondsFormat, Utc};
+use market_squawk_modeling::verify_application_training_environment;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -15,8 +16,9 @@ pub(super) use super::close_provider::{validate_provider_binary, validate_provid
 use super::close_quality::{validate_fuzz_evidence, validate_gate_evidence};
 use super::identity::RepositoryIdentity;
 use super::io::{
-    PublishedReport, StableFileIdentity, VerifiedReport, hash_stable_file, is_pending_report_path,
-    publish_report_with_pending_identity_barrier, read_report, read_stable_bytes,
+    PublishedReport, StableFileIdentity, VerifiedReport, hash_stable_file, hex_digest,
+    is_pending_report_path, publish_report_with_pending_identity_barrier, read_report,
+    read_stable_bytes,
 };
 use crate::cli::ReleaseCloseArguments;
 
@@ -25,6 +27,7 @@ const MAXIMUM_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAXIMUM_EVIDENCE_FILES: usize = 10_000;
 const MAXIMUM_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
+const MAXIMUM_ONNX_WORKER_BYTES: u64 = 256 * 1024 * 1024;
 const REQUIRED_ROOT_ENTRIES: [&str; 7] = [
     "demo.json",
     "full-gate.json",
@@ -50,6 +53,13 @@ struct ArtifactIdentity {
     path: String,
     sha256: String,
     byte_count: u64,
+}
+
+#[derive(Debug)]
+struct DeclaredPythonRuntime {
+    python_tag: String,
+    python_version: String,
+    receipt_sha256: String,
 }
 
 pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
@@ -140,6 +150,7 @@ pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
         &full_gate_log,
     )?;
     let (artifacts, total_artifact_bytes) = inventory_artifacts(&evidence_root, None)?;
+    verify_python_training_matrix(&evidence_root.join("python"), &arguments.binary)?;
     repository.verify_unchanged()?;
     let payload = ClosedEvidence {
         repository,
@@ -187,11 +198,150 @@ fn revalidate_closure_inputs(
     {
         bail!("release-closure immutable input changed at the publication barrier");
     }
+    verify_python_training_matrix(&evidence_root.join("python"), &arguments.binary)?;
     let (artifacts, total_artifact_bytes) = inventory_artifacts(evidence_root, permitted_pending)?;
     if artifacts != payload.artifacts || total_artifact_bytes != payload.total_artifact_bytes {
         bail!("release-evidence artifact inventory changed at the publication barrier");
     }
     payload.repository.verify_unchanged()
+}
+
+pub(super) fn verify_python_training_matrix(
+    directory: &Path,
+    selected_application: &Path,
+) -> Result<PathBuf> {
+    let application = hash_stable_file(selected_application, MAXIMUM_BINARY_BYTES)?;
+    let onnx_worker_path = application.canonical_path().with_file_name(format!(
+        "market-squawk-onnx-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let onnx_worker = hash_stable_file(&onnx_worker_path, MAXIMUM_ONNX_WORKER_BYTES)?;
+    let directory_metadata = fs::symlink_metadata(directory)
+        .context("signed Python evidence directory is unavailable")?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        bail!("signed Python evidence directory is not a real directory");
+    }
+    let directory = directory
+        .canonicalize()
+        .context("signed Python evidence directory is unavailable")?;
+    let release_manifest = hash_stable_file(
+        &directory.join("market-squawk-release.json"),
+        MAXIMUM_REPORT_BYTES,
+    )
+    .context("top-level signed Python release manifest is unavailable")?;
+    let declared_matrix = declared_python_matrix(&directory)?;
+    let mut selected = None;
+    for (name, expected_tag) in [("release-cp312", "cp312"), ("release-cp313", "cp313")] {
+        let declared = declared_matrix
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Python support matrix omitted {name}"))?;
+        if declared.python_tag != expected_tag {
+            bail!("Python support matrix maps a release directory to the wrong interpreter");
+        }
+        let root = directory.join(name);
+        let metadata = fs::symlink_metadata(&root)
+            .with_context(|| format!("signed Python training root {name} is unavailable"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("signed Python training root is not a real directory");
+        }
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("signed Python training root {name} is unavailable"))?;
+        if root.parent() != Some(directory.as_path()) {
+            bail!("signed Python training root escaped its evidence directory");
+        }
+        let verified = verify_application_training_environment(
+            &root,
+            application.canonical_path(),
+            onnx_worker.canonical_path(),
+        )
+        .with_context(|| format!("signed Python training root {name} failed admission"))?;
+        if hex_digest(verified.release_manifest_sha256()) != release_manifest.sha256 {
+            bail!("signed Python training root does not bind the top-level release manifest");
+        }
+        if verified.python_tag() != expected_tag
+            || verified.python_tag() != declared.python_tag
+            || verified.python_version() != declared.python_version
+            || hex_digest(verified.receipt_sha256()) != declared.receipt_sha256
+        {
+            bail!("signed Python training root does not bind its declared support-matrix entry");
+        }
+        if selected.is_none() {
+            selected = Some(root);
+        }
+    }
+    if hash_stable_file(selected_application, MAXIMUM_BINARY_BYTES)? != application
+        || hash_stable_file(&onnx_worker_path, MAXIMUM_ONNX_WORKER_BYTES)? != onnx_worker
+    {
+        bail!("selected application or ONNX worker changed during Python matrix admission");
+    }
+    selected.context("signed Python training matrix is empty")
+}
+
+fn declared_python_matrix(directory: &Path) -> Result<BTreeMap<String, DeclaredPythonRuntime>> {
+    let bytes = read_stable_bytes(
+        &directory.join("market-squawk-release-evidence.json"),
+        MAXIMUM_REPORT_BYTES,
+    )
+    .context("top-level Python release evidence is unavailable")?;
+    let evidence: Value =
+        serde_json::from_slice(&bytes).context("top-level Python release evidence is invalid")?;
+    if evidence.pointer("/schema_version").and_then(Value::as_u64) != Some(5) {
+        bail!("top-level Python release evidence schema is invalid");
+    }
+    let entries = evidence
+        .pointer("/support_matrix")
+        .and_then(Value::as_array)
+        .filter(|entries| entries.len() == 2)
+        .ok_or_else(|| anyhow::anyhow!("Python support matrix is not the exact required pair"))?;
+    let mut matrix = BTreeMap::new();
+    for entry in entries {
+        let directory = entry
+            .get("release_directory")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "release-cp312" | "release-cp313"))
+            .ok_or_else(|| anyhow::anyhow!("Python support-matrix directory is invalid"))?;
+        let python_tag = entry
+            .get("python_tag")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "cp312" | "cp313"))
+            .ok_or_else(|| anyhow::anyhow!("Python support-matrix tag is invalid"))?;
+        let python_version = entry
+            .get("python")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("Python "))
+            .filter(|value| !value.is_empty() && value.len() <= 32)
+            .ok_or_else(|| anyhow::anyhow!("Python support-matrix version is invalid"))?;
+        let receipt_sha256 = entry
+            .get("training_environment_sha256")
+            .and_then(Value::as_str)
+            .filter(|value| lower_sha256(value))
+            .ok_or_else(|| anyhow::anyhow!("Python support-matrix receipt is invalid"))?;
+        if matrix
+            .insert(
+                directory.to_owned(),
+                DeclaredPythonRuntime {
+                    python_tag: python_tag.to_owned(),
+                    python_version: python_version.to_owned(),
+                    receipt_sha256: receipt_sha256.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            bail!("Python support matrix repeats a release directory");
+        }
+    }
+    if !matrix.contains_key("release-cp312") || !matrix.contains_key("release-cp313") {
+        bail!("Python support matrix omitted a required release directory");
+    }
+    Ok(matrix)
+}
+
+fn lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn string_set(values: &[Value], label: &str) -> Result<BTreeSet<String>> {

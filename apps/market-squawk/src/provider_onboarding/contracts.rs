@@ -220,7 +220,7 @@ pub enum OnboardingNextAction {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ProviderPortalActivationRequest {
-    /// Commit one verified live or rights-limited source session without a research adapter.
+    /// Commit one verified live source session without a research adapter.
     Source,
     /// SEC EDGAR needs only the declared contact already retained by onboarding.
     Sec,
@@ -241,6 +241,13 @@ pub enum ProviderPortalActivationRequest {
         last_record_date: CalendarDate,
         /// Bounded provider page size.
         page_size: u16,
+    },
+    /// Treasury daily rates across all five official XML families.
+    TreasuryDailyRates {
+        /// Inclusive first observation year.
+        start_year: u16,
+        /// Inclusive final observation year.
+        end_year: u16,
     },
 }
 

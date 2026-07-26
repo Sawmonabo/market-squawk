@@ -10,6 +10,51 @@
       "accessed_on": "2026-07-21",
       "evidence_class": "captured_official_response",
       "note": "Exact authorized public JSON response captured with one explicit row and page size."
+    },
+    {
+      "path": "daily_par_yield_curve.xml",
+      "sha256": "d75b496cb8fcb2a0ad1aaa260d6e53bb30d6e7984fa3fe017289646da3fd9e08",
+      "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month=202601",
+      "documentation_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "accessed_on": "2026-07-21",
+      "evidence_class": "bounded_official_response_excerpt",
+      "note": "One complete provider entry retained with exact Atom/OData field names, namespaces, values, and feed identity."
+    },
+    {
+      "path": "daily_bill_rates.xml",
+      "sha256": "34b65a69474d46c0446459d6233b51ada123a394ead812b9fafcfab338993189",
+      "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_bill_rates&field_tdr_date_value_month=202601",
+      "documentation_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "bounded_official_response_excerpt",
+      "note": "One complete provider entry retained with bill measures, maturity dates, CUSIPs, namespaces, values, and feed identity."
+    },
+    {
+      "path": "daily_long_term_rates.xml",
+      "sha256": "b93d477e25df0f4d97129307b65c981a430e3f934b69852f1219ab423851247c",
+      "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_long_term_rate&field_tdr_date_value_month=202601",
+      "documentation_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "bounded_official_response_excerpt",
+      "note": "The three complete provider entries for one date retain every official long-term RATE_TYPE and exact feed identity."
+    },
+    {
+      "path": "daily_real_par_yield_curve.xml",
+      "sha256": "a7bb4a6ac2a65e6c34056403f68b56b1cdab07b6a1b88a7a461fb88acd0cc0a7",
+      "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_real_yield_curve&field_tdr_date_value_month=202601",
+      "documentation_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "bounded_official_response_excerpt",
+      "note": "One complete provider entry retained with exact real par-yield fields, namespaces, values, and feed identity."
+    },
+    {
+      "path": "daily_real_long_term_rates.xml",
+      "sha256": "de1d72deb74ab10d5385b6d69afec5bc31dc59f440bc466c063adfcc933ac1c3",
+      "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_real_long_term&field_tdr_date_value_month=202601",
+      "documentation_url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "bounded_official_response_excerpt",
+      "note": "One complete provider entry retained with exact real long-term fields, namespaces, values, and feed identity."
     }
   ]
 }
