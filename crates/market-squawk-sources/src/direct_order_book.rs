@@ -1,15 +1,15 @@
-//! Bounded level-3 ownership and atomic snapshot/replay handoff.
+//! Provider-generic bounded level-3 ownership and atomic snapshot/replay handoff.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 
+use crate::{
+    FrameSessionBinding, FrameSessionLease, ProviderBookSide, ProviderOrderChangeReason,
+    ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord, SegmentedHttpResponseReceipt,
+};
 use market_squawk_domain::{
     ConnectionGeneration, InstrumentExecutionTerms, PriceTicks, ProviderProduct, QuantityLots,
     SequenceNumber, SourceIdentifier, Timestamp,
-};
-use market_squawk_sources::{
-    FrameSessionBinding, FrameSessionLease, ProviderBookSide, ProviderOrderChangeReason,
-    ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord, SegmentedHttpResponseReceipt,
 };
 use thiserror::Error;
 
@@ -58,7 +58,7 @@ impl DirectBookLimits {
         published_depth: usize,
     ) -> Result<Self, DirectOrderBookError> {
         let maximum_queue_bytes = max_queue_events
-            .checked_mul(market_squawk_sources::MAX_RAW_FRAME_BYTES)
+            .checked_mul(crate::MAX_RAW_FRAME_BYTES)
             .ok_or(DirectOrderBookError::InvalidLimits)?;
         if max_orders == 0
             || max_orders > MAX_DIRECT_ORDERS
@@ -1745,13 +1745,13 @@ pub enum DirectOrderBookError {
 mod tests {
     use std::str::FromStr as _;
 
+    use crate::{
+        ProviderBookSide, ProviderOrderChangeReason, ProviderOrderEventKind, ProviderOrderRecord,
+    };
     use market_squawk_domain::{
         ConnectionGeneration, Currency, Denomination, InstrumentDefinitionRevision,
         InstrumentExecutionTerms, InstrumentId, LotSize, PriceTicks, ProviderProduct, QuantityLots,
         SequenceNumber, SourceIdentifier, TickSize, Timestamp,
-    };
-    use market_squawk_sources::{
-        ProviderBookSide, ProviderOrderChangeReason, ProviderOrderEventKind, ProviderOrderRecord,
     };
     use rust_decimal::Decimal;
 

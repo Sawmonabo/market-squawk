@@ -19,14 +19,12 @@ use market_squawk_domain::{
     InstrumentExecutionTerms, LiveEventClass, MarketDepth, PriceTicks, QuantityLots,
     SequenceNumber, SnapshotApplicability, SourceIdentifier, Timestamp,
 };
-use market_squawk_live::{
-    DirectOrderBook, DirectOrderBookError, DirectPublishedBook, DirectPublishedLevel,
-};
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, ChecksumValidationProfile,
-    ControlFrameKind, DecodedControlFrame, DecodedProviderBatch, DecoderEvidence,
-    HttpCaptureMethod, LiveSourceGeneration, NetworkAccessPolicy, ProviderBookChange,
-    ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ControlFrameKind, DecodedControlFrame, DecodedProviderBatch, DecoderEvidence, DirectOrderBook,
+    DirectOrderBookError, DirectPublishedBook, DirectPublishedLevel, HttpCaptureMethod,
+    LiveSourceGeneration, NetworkAccessPolicy, ProviderBookChange, ProviderBookLevel,
+    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
     ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
     ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink,
     SegmentedHttpCaptureError, SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt,

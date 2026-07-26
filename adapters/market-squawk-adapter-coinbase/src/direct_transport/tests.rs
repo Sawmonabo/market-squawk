@@ -13,14 +13,13 @@ use market_squawk_domain::{
     InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MetadataRevision,
     ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
 };
-use market_squawk_live::{DirectBookLimits, DirectSyncPhase};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
     BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
-    FreshnessPolicy, LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy,
-    ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame, RawMarketSink, SessionId,
-    SinkError, SourceError,
+    DirectBookLimits, DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide,
+    ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame,
+    RawMarketSink, SessionId, SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};

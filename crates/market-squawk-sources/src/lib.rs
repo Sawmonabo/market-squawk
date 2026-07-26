@@ -9,11 +9,13 @@ mod bounded;
 mod capture;
 mod checksum;
 mod decoder;
+mod direct_order_book;
 mod extraction;
 mod health;
 mod http_capture;
 mod live;
 mod metadata;
+mod normalization;
 mod onboarding;
 mod order;
 mod policy;
@@ -55,6 +57,10 @@ pub use decoder::{
     ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderStatusEvidence,
     ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
+pub use direct_order_book::{
+    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
+    DirectPublishedLevel, DirectSyncPhase,
+};
 pub use extraction::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily,
     CanonicalObservationPayload, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
@@ -94,6 +100,9 @@ pub use metadata::{
     NetworkAccessPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
     SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
     SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
+};
+pub use normalization::{
+    NormalizationError, normalize_delta_quantity, normalize_positive_quantity, normalize_price,
 };
 pub use onboarding::{
     AuthorityBindings, AuthoritySet, AuthorityVerification, AuthorityVerificationInput,

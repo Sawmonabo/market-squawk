@@ -4,10 +4,8 @@ mod action;
 mod authority;
 mod book;
 mod cross_venue;
-mod direct_order_book;
 mod features;
 mod integrity;
-mod normalization;
 mod processor;
 mod provider_book;
 mod qualification;
@@ -31,17 +29,15 @@ pub use cross_venue::{
     CrossVenueFeatureError, CrossVenueFeatureHub, CrossVenueFeatureSnapshot, CrossVenueUpdate,
     CrossVenueVenueSnapshot,
 };
-pub use direct_order_book::{
-    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
-    DirectPublishedLevel, DirectSyncPhase,
-};
 pub use features::{FeatureInvalidationReason, RouteFeatureError, RouteFeatureState};
 pub use integrity::{
     ChecksumValidationError, KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID,
     ResolvedChecksumValidator, SequenceTracker, SequenceValidationError, kraken_v2_crc32,
 };
-pub use normalization::{
-    NormalizationError, normalize_delta_quantity, normalize_positive_quantity, normalize_price,
+pub use market_squawk_sources::{
+    DirectBookLimits, DirectOrderBook, DirectOrderBookError, DirectPublishedBook,
+    DirectPublishedLevel, DirectSyncPhase, NormalizationError, normalize_delta_quantity,
+    normalize_positive_quantity, normalize_price,
 };
 pub use qualification::{CommittedQualifiedMarketObservation, QualifiedMarketPrice};
 pub use qualified_export::{

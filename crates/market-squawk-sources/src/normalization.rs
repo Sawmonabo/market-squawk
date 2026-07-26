@@ -1,10 +1,11 @@
-//! Exact provider-decimal conversion at the live adapter boundary.
+//! Exact provider-decimal conversion at a source-adapter boundary.
 
 use market_squawk_domain::{
     LotSize, PriceError, PriceTicks, QuantityError, QuantityLots, TickSize,
 };
-use market_squawk_sources::{ProviderPrice, ProviderQuantity};
 use thiserror::Error;
+
+use crate::{ProviderPrice, ProviderQuantity};
 
 /// Converts one exact provider price to instrument ticks without rounding.
 ///

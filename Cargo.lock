@@ -3465,7 +3465,6 @@ dependencies = [
  "futures-util",
  "hmac",
  "market-squawk-domain",
- "market-squawk-live",
  "market-squawk-sources",
  "reqwest",
  "serde",

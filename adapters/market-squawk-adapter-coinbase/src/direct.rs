@@ -14,21 +14,19 @@ use market_squawk_domain::{
     SequenceValidationRule, SnapshotApplicability, SourceId, SourceIdentifier, Timestamp,
     TradingStatus, VenueId,
 };
-use market_squawk_live::{
-    DirectBookLimits, DirectOrderBook, DirectOrderBookError, normalize_delta_quantity,
-    normalize_positive_quantity, normalize_price,
-};
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
-    CoverageTopology, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
-    HttpCaptureMethod, HttpRequestBounds, InstrumentCoverage, LiveCoverageDeclaration,
-    LiveCoverageRule, LiveProtocolProfile, MAX_DECODED_BOOK_ITEMS, NetworkAccessPolicy, PathScope,
-    ProviderBookSide, ProviderBudgetPolicy, ProviderCursorOnlyReason, ProviderDecimalLexeme,
-    ProviderNumericPolicy, ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind,
-    ProviderOrderRecord, ProviderPrice, ProviderQuantity, QueryParameterRule,
-    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SemanticInterpretationProfile,
-    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
+    CoverageTopology, DecoderEvidence, DirectBookLimits, DirectOrderBook, DirectOrderBookError,
+    EndpointPolicy, FreshnessPolicy, HistoricalCapability, HttpCaptureMethod, HttpRequestBounds,
+    InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
+    MAX_DECODED_BOOK_ITEMS, NetworkAccessPolicy, PathScope, ProviderBookSide, ProviderBudgetPolicy,
+    ProviderCursorOnlyReason, ProviderDecimalLexeme, ProviderNumericPolicy,
+    ProviderOrderChangeReason, ProviderOrderEvent, ProviderOrderEventKind, ProviderOrderRecord,
+    ProviderPrice, ProviderQuantity, QueryParameterRule, SegmentedHttpResponseCapture,
+    SegmentedHttpResponseReceipt, SemanticInterpretationProfile, SequenceValidationProfile,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame, normalize_delta_quantity,
+    normalize_positive_quantity, normalize_price,
 };
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -2406,14 +2404,14 @@ mod tests {
         MetadataRevision, PriceTicks, ProviderProduct, QuantityLots, RevisionBoundPayloadEvidence,
         SequenceCapability, SourceId, SourceIdentifier, TickSize, Timestamp, TradingStatus,
     };
-    use market_squawk_live::{DirectBookLimits, DirectOrderBook, DirectSyncPhase};
     use market_squawk_sources::{
         AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
         AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-        BudgetScope, BudgetWindowSemantics, CurrentSourceSession, FreshnessPolicy,
-        HttpCaptureMethod, ProviderBookSide, ProviderBudgetPolicy, ProviderBudgetWindow,
-        ProviderDecimalLexeme, ProviderOrderChangeReason, ProviderOrderEventKind, RawFrameFactory,
-        SessionId, TransportFrameKind,
+        BudgetScope, BudgetWindowSemantics, CurrentSourceSession, DirectBookLimits,
+        DirectOrderBook, DirectSyncPhase, FreshnessPolicy, HttpCaptureMethod, ProviderBookSide,
+        ProviderBudgetPolicy, ProviderBudgetWindow, ProviderDecimalLexeme,
+        ProviderOrderChangeReason, ProviderOrderEventKind, RawFrameFactory, SessionId,
+        TransportFrameKind,
     };
     use sha2::Digest as _;
 
@@ -2791,7 +2789,7 @@ mod tests {
         )?;
         assert_eq!(
             byte_bounded_owner.try_queue(received),
-            Err(market_squawk_live::DirectOrderBookError::QueueBytesExceeded)
+            Err(market_squawk_sources::DirectOrderBookError::QueueBytesExceeded)
         );
         assert_eq!(byte_bounded_owner.phase(), DirectSyncPhase::Quarantined);
 
@@ -2918,7 +2916,7 @@ mod tests {
             CoinbaseDirectSnapshotDecoder::try_new(&config)?
                 .decode_into(&crossed_capture, &mut crossed_owner),
             Err(CoinbaseDirectSnapshotError::Owner(
-                market_squawk_live::DirectOrderBookError::CrossedBook
+                market_squawk_sources::DirectOrderBookError::CrossedBook
             ))
         );
         assert_eq!(crossed_owner.phase(), DirectSyncPhase::Quarantined);
@@ -2972,7 +2970,7 @@ mod tests {
         )?;
         assert_eq!(
             mutation_owner.try_apply_live(crossing_open),
-            Err(market_squawk_live::DirectOrderBookError::CrossedBook)
+            Err(market_squawk_sources::DirectOrderBookError::CrossedBook)
         );
         assert_eq!(mutation_owner.phase(), DirectSyncPhase::Quarantined);
 
@@ -3060,7 +3058,7 @@ mod tests {
         assert_eq!(
             CoinbaseDirectSnapshotDecoder::try_new(&config)?.decode_into(&capture, &mut owner),
             Err(CoinbaseDirectSnapshotError::Owner(
-                market_squawk_live::DirectOrderBookError::SnapshotGenerationMismatch
+                market_squawk_sources::DirectOrderBookError::SnapshotGenerationMismatch
             ))
         );
         assert_eq!(owner.phase(), DirectSyncPhase::Quarantined);
