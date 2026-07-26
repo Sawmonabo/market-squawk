@@ -914,3 +914,21 @@ branch were removed, no matching origin branch existed, and worktree/remote meta
 Only issues `#7`, `#25`, and `#31` remain open and In Progress. Root generated state remains
 approximately 13 GiB, `.worktrees` is empty, root incremental state is approximately 9 MiB, and
 approximately 114 GiB is free.
+
+## 2026-07-26 release-PR ancestry and CI recovery checkpoint
+
+GitHub stopped scheduling `pull_request` workflows after `b15178b` because release PR `#26` had
+become merge-conflicted with `main`. The only five mainline-only commits were the merged Dependabot
+updates for anyhow 1.0.104, clap 4.6.4, serde_json 1.0.151, tokio 1.53.1, and
+tokio-tungstenite 0.30.0. Those exact versions were already present in the release lockfile and had
+been integrated and verified at `b15178b`; the histories differed only because main retained the
+five individual bot commits while release retained the consolidated integration commit.
+
+An ancestry-only `ours` merge at `ed86d4ff5b4ff26a8b22a8bf7b592a50cc1e714e` records
+`ea2408eddb5a521aae2d766a059f9db0b4bbb904` as the second parent while preserving exact release tree
+`4087626a8c3722fd07d38f2bd970ba316e30d2e2`. PR `#26` immediately changed from conflicting to
+mergeable and scheduled run `30197493366`. Its `verify`, `macos`, and `windows` jobs contain no
+steps; all three were rejected before checkout by the GitHub account payment/spending-limit
+annotation. Repository workflow enablement, trigger configuration, PR ancestry, and current-head
+scheduling are therefore healthy; hosted execution remains externally blocked until the account
+state is repaired.

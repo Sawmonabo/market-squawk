@@ -115,9 +115,13 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Dependabot pull requests `#2`, `#32`, `#33`, `#34`, and `#35` are merged; superseded updates
   `#3` and `#4` are closed. No dependency pull request or Dependabot branch remains open locally or
   on origin.
-- Hosted Actions run `30183191490` at `b15178b` created three jobs with empty step lists. No
-  checkout, build, lint, or test step ran; each check reported the external account
-  payment/spending-limit blocker. That run contains no code-owned CI failure to remediate.
+- Mainline ancestry merge `ed86d4f` records the five already-integrated Dependabot commits from
+  `main` without changing the accepted release tree
+  `4087626a8c3722fd07d38f2bd970ba316e30d2e2`. The release PR changed from conflicting to mergeable
+  and immediately scheduled current-head Actions run `30197493366`.
+- Hosted Actions run `30197493366` at `ed86d4f` created `verify`, `macos`, and `windows` jobs with
+  empty step lists. No checkout, build, lint, or test step ran; each check reported the external
+  account payment/spending-limit blocker. That run contains no code-owned CI failure to remediate.
 - Documentation execution source head:
   `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
