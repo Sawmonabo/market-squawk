@@ -41,6 +41,9 @@ use crate::{CoinbaseConfigError, CoinbaseProductMapping, CoinbaseTransportLimits
 
 /// Authenticated Direct Market Data WebSocket endpoint.
 pub const COINBASE_DIRECT_WEBSOCKET_ENDPOINT: &str = "wss://ws-direct.exchange.coinbase.com";
+/// Exact Coinbase Exchange credential-verification endpoint.
+pub const COINBASE_DIRECT_VERIFY_ENDPOINT: &str =
+    "https://api.exchange.coinbase.com/users/self/verify";
 const COINBASE_REST_ORIGIN: &str = "https://api.exchange.coinbase.com";
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
@@ -48,7 +51,9 @@ const DIRECT_CHANNEL: &str = "full";
 const WEBSOCKET_AUTH_PATH: &str = "/users/self/verify";
 const MAX_SIGNING_FIELD_BYTES: usize = 1_024;
 const MAX_SIGNING_SECRET_BYTES: usize = 1_024;
+const MAX_CREDENTIAL_ENVELOPE_BYTES: usize = 8 * 1_024;
 const MAX_SIGNED_SUBSCRIPTION_BYTES: usize = 16 * 1024;
+const CREDENTIAL_ENVELOPE_VERSION: u8 = 1;
 const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
 const MAX_DIRECT_PRODUCT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -511,9 +516,77 @@ impl CoinbaseDirectHmacSigner {
         passphrase: String,
         secret_base64: String,
     ) -> Result<Self, CoinbaseDirectSigningError> {
-        let key = Zeroizing::new(key);
-        let passphrase = Zeroizing::new(passphrase);
-        let secret_base64 = Zeroizing::new(secret_base64);
+        Self::try_new_zeroizing(
+            Zeroizing::new(key),
+            Zeroizing::new(passphrase),
+            Zeroizing::new(secret_base64),
+        )
+    }
+
+    /// Imports one exact versioned secret envelope from the local secret capability.
+    ///
+    /// The accepted JSON object contains only `version`, `api_key`, `passphrase`, and
+    /// `signing_secret`. Every credential field is zeroized when parsing, validation, or signer
+    /// ownership ends.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an oversized, malformed, incomplete, unknown-field, or non-version-1 envelope and
+    /// every invalid credential field.
+    pub fn try_from_secret_envelope(envelope: &str) -> Result<Self, CoinbaseDirectSigningError> {
+        if envelope.is_empty() || envelope.len() > MAX_CREDENTIAL_ENVELOPE_BYTES {
+            return Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope);
+        }
+        let CredentialEnvelopeWire {
+            version,
+            api_key: SecretCredentialField(key),
+            passphrase: SecretCredentialField(passphrase),
+            signing_secret: SecretCredentialField(secret_base64),
+        } = serde_json::from_str(envelope)
+            .map_err(|_error| CoinbaseDirectSigningError::InvalidCredentialEnvelope)?;
+        if version != CREDENTIAL_ENVELOPE_VERSION {
+            return Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope);
+        }
+        Self::try_new_zeroizing(key, passphrase, secret_base64)
+    }
+
+    /// Builds the exact signed non-mutating Exchange credential-verification request.
+    ///
+    /// The method and target are code-owned so callers cannot apply this signing capability to an
+    /// arbitrary request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero timestamp or a signing/header value that violates the bounded credential
+    /// contract.
+    pub fn verification_request(
+        &self,
+        client: &reqwest::Client,
+        unix_seconds: u64,
+    ) -> Result<reqwest::RequestBuilder, CoinbaseDirectSigningError> {
+        if unix_seconds == 0 {
+            return Err(CoinbaseDirectSigningError::InvalidTimestamp);
+        }
+        let timestamp = unix_seconds.to_string();
+        let authentication = self.sign(CoinbaseDirectSigningRequest {
+            timestamp: &timestamp,
+        })?;
+        let key = sensitive_header(authentication.key())?;
+        let signature = sensitive_header(authentication.signature())?;
+        let passphrase = sensitive_header(authentication.passphrase())?;
+        Ok(client
+            .get(COINBASE_DIRECT_VERIFY_ENDPOINT)
+            .header("CB-ACCESS-KEY", key)
+            .header("CB-ACCESS-SIGN", signature)
+            .header("CB-ACCESS-TIMESTAMP", timestamp)
+            .header("CB-ACCESS-PASSPHRASE", passphrase))
+    }
+
+    fn try_new_zeroizing(
+        key: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+        secret_base64: Zeroizing<String>,
+    ) -> Result<Self, CoinbaseDirectSigningError> {
         if !valid_signing_field(&key)
             || !valid_signing_field(&passphrase)
             || secret_base64.is_empty()
@@ -535,6 +608,26 @@ impl CoinbaseDirectHmacSigner {
             passphrase,
             secret,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialEnvelopeWire {
+    version: u8,
+    api_key: SecretCredentialField,
+    passphrase: SecretCredentialField,
+    signing_secret: SecretCredentialField,
+}
+
+struct SecretCredentialField(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for SecretCredentialField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
 }
 
@@ -575,7 +668,17 @@ impl fmt::Debug for CoinbaseDirectHmacSigner {
 fn valid_signing_field(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_SIGNING_FIELD_BYTES
+        && value.is_ascii()
         && !value.chars().any(char::is_control)
+}
+
+fn sensitive_header(
+    value: &str,
+) -> Result<reqwest::header::HeaderValue, CoinbaseDirectSigningError> {
+    let mut header = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_error| CoinbaseDirectSigningError::InvalidAuthentication)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// Bounded authentication fields. Debug output never reveals any field.
@@ -660,6 +763,9 @@ pub enum CoinbaseDirectSigningError {
     /// Timestamp zero cannot satisfy the authentication window.
     #[error("Coinbase Direct signing timestamp is invalid")]
     InvalidTimestamp,
+    /// The imported versioned secret envelope was invalid.
+    #[error("Coinbase Direct credential envelope is invalid")]
+    InvalidCredentialEnvelope,
     /// A signing result was empty, oversized, or contained control characters.
     #[error("Coinbase Direct authentication output is invalid")]
     InvalidAuthentication,
@@ -2220,12 +2326,13 @@ mod tests {
     use sha2::Digest as _;
 
     use crate::{
-        COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError, CoinbaseDirectAuthentication,
-        CoinbaseDirectConfig, CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome,
-        CoinbaseDirectDecoder, CoinbaseDirectHmacSigner, CoinbaseDirectLimits,
-        CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
-        CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
-        CoinbaseDirectStopType, CoinbaseProductMapping, CoinbaseTransportLimits,
+        COINBASE_DIRECT_VERIFY_ENDPOINT, COINBASE_DIRECT_WEBSOCKET_ENDPOINT, CoinbaseConfigError,
+        CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectDecodeError,
+        CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectHmacSigner,
+        CoinbaseDirectLimits, CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability,
+        CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
+        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseProductMapping,
+        CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2236,14 +2343,16 @@ mod tests {
 
     #[test]
     fn production_signer_decodes_and_zeroizes_the_exchange_secret_boundary() -> TestResult {
-        let signer = CoinbaseDirectHmacSigner::try_new(
-            "fixture-key".to_owned(),
-            "fixture-passphrase".to_owned(),
-            "dGVzdC1zZWNyZXQ=".to_owned(),
+        let _tls = market_squawk_sources::install_ring_tls_provider()?;
+        let signer = CoinbaseDirectHmacSigner::try_from_secret_envelope(
+            r#"{"version":1,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ="}"#,
         )?;
         let authentication = signer.sign(CoinbaseDirectSigningRequest {
             timestamp: "1721847600",
         })?;
+        let request = signer
+            .verification_request(&reqwest::Client::new(), 1_721_847_600)?
+            .build()?;
 
         assert_eq!(authentication.key(), "fixture-key");
         assert_eq!(authentication.passphrase(), "fixture-passphrase");
@@ -2255,6 +2364,33 @@ mod tests {
             format!("{signer:?}"),
             "CoinbaseDirectHmacSigner([REDACTED])"
         );
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), COINBASE_DIRECT_VERIFY_ENDPOINT);
+        assert_eq!(request.headers()["cb-access-key"], "fixture-key");
+        assert_eq!(
+            request.headers()["cb-access-passphrase"],
+            "fixture-passphrase"
+        );
+        assert_eq!(request.headers()["cb-access-timestamp"], "1721847600");
+        assert_eq!(
+            request.headers()["cb-access-sign"],
+            "A5aXA9/etj7poRg/4b7U0odFyG7J5MlveUG2uOAZlP0="
+        );
+        assert!(request.headers()["cb-access-key"].is_sensitive());
+        assert!(request.headers()["cb-access-sign"].is_sensitive());
+        assert!(request.headers()["cb-access-passphrase"].is_sensitive());
+        assert!(matches!(
+            CoinbaseDirectHmacSigner::try_from_secret_envelope(
+                r#"{"version":2,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ="}"#,
+            ),
+            Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope)
+        ));
+        assert!(matches!(
+            CoinbaseDirectHmacSigner::try_from_secret_envelope(
+                r#"{"version":1,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ=","unexpected":"value"}"#,
+            ),
+            Err(CoinbaseDirectSigningError::InvalidCredentialEnvelope)
+        ));
         Ok(())
     }
 

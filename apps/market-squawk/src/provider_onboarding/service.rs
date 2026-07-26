@@ -11,6 +11,7 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
+use market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner;
 use market_squawk_data::{
     CatalogError, CatalogLimit, OnboardingCatalogCapability, OnboardingReservation,
     OnboardingReservationRequest, ResumedProviderOnboarding,
@@ -52,6 +53,7 @@ const _: () = assert!(MAXIMUM_PENDING_SECRET_REAPS <= Semaphore::MAX_PERMITS);
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
 const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
+const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
 
@@ -722,16 +724,22 @@ impl ProviderOnboardingService {
                         .run_credential_probe(profile, &secret, cancellation.clone())
                         .await?;
                     let verified_at = system_timestamp()?;
-                    let verification_expires_at = if profile.id() == "bls.v2-registered" {
-                        Some(Timestamp::from_unix_nanos(
+                    let verification_validity_nanos = match profile.id() {
+                        "bls.v2-registered" => Some(BLS_REGISTRATION_VALIDITY_NANOS),
+                        "coinbase.exchange-direct-market-data" => {
+                            Some(COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS)
+                        }
+                        _ => None,
+                    };
+                    let verification_expires_at = verification_validity_nanos
+                        .map(|validity| {
                             verified_at
                                 .unix_nanos()
-                                .checked_add(BLS_REGISTRATION_VALIDITY_NANOS)
-                                .ok_or(ProviderOnboardingError::Clock)?,
-                        ))
-                    } else {
-                        None
-                    };
+                                .checked_add(validity)
+                                .map(Timestamp::from_unix_nanos)
+                                .ok_or(ProviderOnboardingError::Clock)
+                        })
+                        .transpose()?;
                     let requested = resumed.lifecycle().requested_authority().clone();
                     let verification = AuthorityVerification::try_new(
                         profile.capability(),
@@ -1154,9 +1162,12 @@ impl ProviderOnboardingService {
         secret: &SecretValue,
         cancellation: CancellationToken,
     ) -> Result<EvidenceDigest, ProviderOnboardingError> {
-        if profile.id() != "bls.v2-registered"
-            || profile.probe().transport() != ProbeTransport::HttpPostJson
-        {
+        let expected_transport = match profile.id() {
+            "bls.v2-registered" => ProbeTransport::HttpPostJson,
+            "coinbase.exchange-direct-market-data" => ProbeTransport::HttpGet,
+            _ => return Err(ProviderOnboardingError::InvalidProfile),
+        };
+        if profile.probe().transport() != expected_transport {
             return Err(ProviderOnboardingError::InvalidProfile);
         }
         let probe = profile.probe();
@@ -1186,31 +1197,43 @@ impl ProviderOnboardingService {
                 cancellation.clone(),
             )
             .await?;
-        let mut body: serde_json::Value = serde_json::from_str(
-            probe
-                .body()
-                .ok_or(ProviderOnboardingError::InvalidProfile)?,
-        )
-        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
-        let object = body
-            .as_object_mut()
-            .ok_or(ProviderOnboardingError::InvalidProfile)?;
-        if object
-            .insert(
-                "registrationkey".to_owned(),
-                serde_json::Value::String(secret.expose_secret().to_owned()),
-            )
-            .is_some()
-        {
-            return Err(ProviderOnboardingError::InvalidProfile);
-        }
-        let body =
-            serde_json::to_vec(&body).map_err(|_| ProviderOnboardingError::InvalidProfile)?;
-        let request = self
-            .client
-            .post(endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
+        let request = match profile.id() {
+            "bls.v2-registered" => {
+                let mut body: serde_json::Value = serde_json::from_str(
+                    probe
+                        .body()
+                        .ok_or(ProviderOnboardingError::InvalidProfile)?,
+                )
+                .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+                let object = body
+                    .as_object_mut()
+                    .ok_or(ProviderOnboardingError::InvalidProfile)?;
+                if object
+                    .insert(
+                        "registrationkey".to_owned(),
+                        serde_json::Value::String(secret.expose_secret().to_owned()),
+                    )
+                    .is_some()
+                {
+                    return Err(ProviderOnboardingError::InvalidProfile);
+                }
+                let body = serde_json::to_vec(&body)
+                    .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+                self.client
+                    .post(endpoint)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+            }
+            "coinbase.exchange-direct-market-data" => {
+                let signer =
+                    CoinbaseDirectHmacSigner::try_from_secret_envelope(secret.expose_secret())
+                        .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?;
+                signer
+                    .verification_request(&self.client, unix_seconds_now()?)
+                    .map_err(|_error| ProviderOnboardingError::InvalidSecretShape)?
+            }
+            _ => return Err(ProviderOnboardingError::InvalidProfile),
+        };
         let response = self
             .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
@@ -2075,6 +2098,9 @@ fn validate_secret_shape(
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         }
+        "coinbase.exchange-direct-market-data" => {
+            CoinbaseDirectHmacSigner::try_from_secret_envelope(value).is_ok()
+        }
         _ => false,
     };
     if valid {
@@ -2102,6 +2128,9 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
     let valid = match profile_id {
         "coinbase.public-market-data" => value.get("product_id").is_some(),
+        "coinbase.exchange-direct-market-data" => {
+            value.as_object().is_some_and(|object| !object.is_empty())
+        }
         "kraken.spot-public-market-data" => {
             value
                 .get("error")
@@ -2165,7 +2194,23 @@ fn credential_assurance(
         "bls.v2-registered" => {
             SourceIdentifier::try_from("bls-timeseries-read-only-verification").map_err(Into::into)
         }
+        "coinbase.exchange-direct-market-data" => SourceIdentifier::try_from(
+            "coinbase-exchange-view-key-verified-live-entitlement-pending",
+        )
+        .map_err(Into::into),
         _ => Err(ProviderOnboardingError::InvalidProfile),
+    }
+}
+
+fn unix_seconds_now() -> Result<u64, ProviderOnboardingError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ProviderOnboardingError::Clock)?
+        .as_secs();
+    if seconds == 0 {
+        Err(ProviderOnboardingError::Clock)
+    } else {
+        Ok(seconds)
     }
 }
 
@@ -2301,6 +2346,31 @@ mod tests {
     use crate::ResearchService;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn coinbase_direct_credential_shape_and_probe_semantics_fail_closed() -> TestResult {
+        let profiles = built_in_provider_profiles()?;
+        let profile = profiles
+            .get("coinbase.exchange-direct-market-data")
+            .ok_or("Coinbase Direct onboarding profile is missing")?;
+        let secret = SecretValue::new(
+            r#"{"version":1,"api_key":"fixture-key","passphrase":"fixture-passphrase","signing_secret":"dGVzdC1zZWNyZXQ="}"#
+                .to_owned(),
+        )?;
+        validate_secret_shape(profile, &secret)?;
+        let signer =
+            market_squawk_adapter_coinbase::CoinbaseDirectHmacSigner::try_from_secret_envelope(
+                secret.expose_secret(),
+            )?;
+        assert_eq!(
+            format!("{signer:?}"),
+            "CoinbaseDirectHmacSigner([REDACTED])"
+        );
+        validate_probe_semantics(profile.id(), br#"{"id":"fixture-user"}"#)?;
+        assert!(validate_probe_semantics(profile.id(), b"{}").is_err());
+        assert!(validate_probe_semantics(profile.id(), b"[]").is_err());
+        Ok(())
+    }
 
     #[test]
     fn startup_runtime_admission_is_exact_to_surface_and_session() -> TestResult {

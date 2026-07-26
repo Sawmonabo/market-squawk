@@ -318,6 +318,44 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             .map(|window| (window.requests_per_window(), window.window_nanos())),
         Some((500, 86_400_000_000_000))
     );
+
+    let public_coinbase = profiles
+        .get("coinbase.public-market-data")
+        .ok_or("missing public Coinbase profile")?;
+    let direct_coinbase = profiles
+        .get("coinbase.exchange-direct-market-data")
+        .ok_or("missing Coinbase Exchange Direct profile")?;
+    assert_eq!(
+        public_coinbase.coverage().1,
+        market_squawk_domain::DataQuality::DirectUnverified
+    );
+    assert_eq!(
+        direct_coinbase.coverage().1,
+        market_squawk_domain::DataQuality::DirectVerified
+    );
+    assert_eq!(
+        direct_coinbase.capability().maximum_authority().as_slice(),
+        &[SourceIdentifier::try_from(
+            "coinbase.exchange.market-data.read"
+        )?]
+    );
+    let direct_budget = direct_coinbase
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("Coinbase Direct omitted rate enforcement")?;
+    assert_eq!(
+        direct_budget.scope().as_source_identifier().as_str(),
+        "coinbase-exchange"
+    );
+    assert!(direct_budget.scope().authorization_account().is_some());
+    assert_eq!(direct_budget.max_concurrent(), 2);
+    assert_eq!(
+        direct_budget
+            .window(0)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((10, 1_000_000_000))
+    );
     Ok(())
 }
 

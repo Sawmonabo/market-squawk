@@ -131,6 +131,36 @@ const COINBASE_EVIDENCE: &[ProfileEvidence] = &[
         false,
     ),
 ];
+const COINBASE_DIRECT_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        "CB-DIRECT-AUTH",
+        "https://docs.cdp.coinbase.com/exchange/rest-api/authentication",
+        "2026-07-25",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "CB-DIRECT-WS-AUTH",
+        "https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication",
+        "2026-07-25",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "CB-DIRECT-CONNECTIONS",
+        "https://help.coinbase.com/en/exchange/managing-my-account/market-data-connections",
+        "2026-07-25",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "CB-MARKET-DATA-TERMS",
+        "https://www.coinbase.com/legal/market_data",
+        "2026-07-25",
+        None,
+        false,
+    ),
+];
 const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         "DOC-011",
@@ -285,6 +315,7 @@ struct BuiltInSpec {
 pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderProfileError> {
     ProviderProfileRegistry::try_new(vec![
         build(coinbase()?)?,
+        build(coinbase_direct()?)?,
         build(kraken()?)?,
         build(sec()?)?,
         build(fred()?)?,
@@ -388,7 +419,10 @@ fn build_capability(
         verifier_revision: SourceIdentifier::try_from(format!("{}.probe.v1", spec.id))?,
         rate_policy,
         rights_state: spec.rights_state,
-        lifecycle_support: if spec.id == "bls.v2-registered" {
+        lifecycle_support: if matches!(
+            spec.id,
+            "bls.v2-registered" | "coinbase.exchange-direct-market-data"
+        ) {
             LifecycleSupport::new(true, false, true)
         } else {
             LifecycleSupport::new(false, false, false)
@@ -422,6 +456,14 @@ fn built_in_budget(spec: &BuiltInSpec) -> Result<ProviderBudgetPolicy, ProviderP
         "coinbase.public-market-data" => {
             simple_budget("coinbase", None, 1, MINUTE_NANOS, 1, backoff)
         }
+        "coinbase.exchange-direct-market-data" => simple_budget(
+            "coinbase-exchange",
+            Some("coinbase.exchange-direct.default-account"),
+            10,
+            SECOND_NANOS,
+            2,
+            backoff,
+        ),
         "kraken.spot-public-market-data" => {
             simple_budget("kraken", None, 1, MINUTE_NANOS, 1, backoff)
         }
@@ -522,6 +564,39 @@ fn coinbase() -> Result<BuiltInSpec, ProviderProfileError> {
         rate_policy: "coinbase.public-market-data.rate-policy.v1",
         refresh_trigger: "CB-PUBLIC",
         handoff_instruction: "No account or key is requested; continue with the bounded public probe.",
+    })
+}
+
+fn coinbase_direct() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: "coinbase.exchange-direct-market-data",
+        display_name: "Coinbase Exchange Direct Market Data",
+        official_entry: "https://help.coinbase.com/en/exchange/managing-my-account/how-to-create-an-api-key",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::Confirmed,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("coinbase.exchange.market-data.read"),
+        permissions: &["view"],
+        coverage: "Authenticated Coinbase Exchange ws-direct full-channel products; single venue and not consolidated",
+        quality: DataQuality::DirectVerified,
+        probe: VerificationProbe::network(
+            ProbeTransport::HttpGet,
+            "https://api.exchange.coinbase.com/users/self/verify",
+            None,
+        )?,
+        rights: RIGHTS_LIMITED,
+        duties: EXCHANGE_DUTIES,
+        persistence_evidence_source_id: None,
+        rotation: "create a replacement View-only Exchange key and import the complete envelope as a higher generation",
+        revocation: "delete the exact Exchange key remotely, then delete the exact local generation",
+        recovery: COMMON_RECOVERY,
+        evidence: COINBASE_DIRECT_EVIDENCE,
+        rate_policy: "coinbase.exchange-direct-market-data.rate-policy.v1",
+        refresh_trigger: "CB-EXCHANGE-DIRECT",
+        handoff_instruction: "Create a Coinbase Exchange API key with View permission only, then import one version-1 envelope containing api_key, passphrase, and signing_secret.",
     })
 }
 
