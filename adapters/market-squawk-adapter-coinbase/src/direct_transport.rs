@@ -712,7 +712,11 @@ impl CoinbaseDirectSession {
                 map_connect_error(error, &self.budget)
             })
             .await?;
-        self.run_connected(socket, permit, signer, None, output, cancellation)
+        permit.release();
+        self.budget
+            .record_success()
+            .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+        self.run_connected(socket, signer, None, output, cancellation)
             .await
     }
 
@@ -735,15 +739,9 @@ impl CoinbaseDirectSession {
             }
             self.validate_generation()?;
             let permit = self.acquire_budget()?;
-            self.run_connected(
-                socket,
-                permit,
-                signer,
-                Some(unix_seconds),
-                output,
-                cancellation,
-            )
-            .await
+            permit.release();
+            self.run_connected(socket, signer, Some(unix_seconds), output, cancellation)
+                .await
         }
         .await;
         self.finish_generation(outcome)
@@ -752,7 +750,6 @@ impl CoinbaseDirectSession {
     async fn run_connected<S>(
         &mut self,
         socket: WebSocketStream<S>,
-        connection_guard: BudgetPermit,
         signer: &dyn CoinbaseDirectSigningCapability,
         fixed_unix_seconds: Option<u64>,
         output: &mut dyn CoinbaseDirectOutput,
@@ -793,8 +790,6 @@ impl CoinbaseDirectSession {
             };
             (outcome, shutdown)
         };
-        // The socket has completed its bounded shutdown or terminal drop before this release.
-        connection_guard.release();
         shutdown?;
         outcome
     }
@@ -811,6 +806,7 @@ impl CoinbaseDirectSession {
     {
         let limits = self.config.limits().websocket();
         self.validate_generation()?;
+        let subscription_permit = self.acquire_budget()?;
         send_with_deadline(
             socket,
             Message::Text(subscription.as_str().into()),
@@ -821,6 +817,7 @@ impl CoinbaseDirectSession {
         drop(subscription);
         self.await_subscription(socket, output, cancellation)
             .await?;
+        subscription_permit.release();
         self.budget
             .record_success()
             .map_err(|reason| SourceError::BudgetUnavailable { reason })?;

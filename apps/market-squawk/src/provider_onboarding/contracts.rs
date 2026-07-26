@@ -10,9 +10,9 @@ use market_squawk_sources::{
     CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, DataUseOperation,
     DataUseRight, EvidenceBinding, HumanBoundary, LifecycleSupport, LocalDeletionOutcome,
     OnboardingState, OperationAdmission, ProfileEvidence, ProfileReleaseState,
-    ProviderCapabilityRevision, ProviderOnboardingProfile, ProviderPublicConfiguration,
-    RatePolicyDescriptor, RemoteRevocationOutcome, Requirement, RightsAdmissionState, SetupMode,
-    ZeroFeeStatus,
+    ProviderBudgetPolicy, ProviderCapabilityRevision, ProviderOnboardingProfile,
+    ProviderPublicConfiguration, RatePolicyDescriptor, RemoteRevocationOutcome, Requirement,
+    RightsAdmissionState, SetupMode, ZeroFeeStatus,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -310,6 +310,9 @@ pub struct ProviderActivationLease {
     persistence_evidence: Option<ProfileEvidence>,
     public_configuration_digest: EvidenceDigest,
     public_configuration: ProviderPublicConfiguration,
+    account_digest: Option<EvidenceDigest>,
+    verification_evidence_digest: Option<EvidenceDigest>,
+    provider_budget_policy: Option<ProviderBudgetPolicy>,
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
     verification_expires_at: Option<Timestamp>,
@@ -329,6 +332,9 @@ impl ProviderActivationLease {
             persistence_evidence: input.persistence_evidence,
             public_configuration_digest: input.public_configuration_digest,
             public_configuration: input.public_configuration,
+            account_digest: input.account_digest,
+            verification_evidence_digest: input.verification_evidence_digest,
+            provider_budget_policy: input.provider_budget_policy,
             generation: input.generation,
             secret_reference: input.secret_reference,
             verification_expires_at: input.verification_expires_at,
@@ -384,6 +390,21 @@ impl ProviderActivationLease {
         &self.public_configuration
     }
 
+    /// Returns the verified provider account binding without exposing provider identity text.
+    pub const fn account_digest(&self) -> Option<EvidenceDigest> {
+        self.account_digest
+    }
+
+    /// Returns the redacted provider-verification evidence bound into this activation.
+    pub const fn verification_evidence_digest(&self) -> Option<EvidenceDigest> {
+        self.verification_evidence_digest
+    }
+
+    /// Returns the exact admitted provider budget policy for this capability revision.
+    pub const fn provider_budget_policy(&self) -> Option<&ProviderBudgetPolicy> {
+        self.provider_budget_policy.as_ref()
+    }
+
     /// Returns the activated credential generation, when this surface uses one.
     pub const fn generation(&self) -> Option<SecretGeneration> {
         self.generation
@@ -418,6 +439,11 @@ impl std::fmt::Debug for ProviderActivationLease {
             .field("surface_id", &self.surface_id)
             .field("capability_revision", &self.capability_revision)
             .field("rights_decision_digest", &self.rights_decision_digest)
+            .field("account_digest", &self.account_digest)
+            .field(
+                "verification_evidence_digest",
+                &self.verification_evidence_digest,
+            )
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -437,6 +463,9 @@ pub(super) struct ProviderActivationLeaseInput {
     pub persistence_evidence: Option<ProfileEvidence>,
     pub public_configuration_digest: EvidenceDigest,
     pub public_configuration: ProviderPublicConfiguration,
+    pub account_digest: Option<EvidenceDigest>,
+    pub verification_evidence_digest: Option<EvidenceDigest>,
+    pub provider_budget_policy: Option<ProviderBudgetPolicy>,
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
     pub verification_expires_at: Option<Timestamp>,

@@ -374,6 +374,10 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         assert_eq!(subscription["key"], "fixture-key");
         assert_eq!(subscription["passphrase"], "fixture-passphrase");
         assert_eq!(subscription["signature"], "fixture-signature");
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+        ));
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
 
         controls.product_started.await?;
@@ -633,7 +637,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
         BudgetScope::for_authorization(identifier("coinbase-exchange")?, &authorization)?,
         NonZeroU32::new(8).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(2).ok_or("zero concurrency")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,

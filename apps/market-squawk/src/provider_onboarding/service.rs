@@ -54,6 +54,8 @@ const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
 const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
 const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
+const COINBASE_ACCOUNT_BINDING_DOMAIN: &[u8] =
+    b"market-squawk/coinbase-exchange-account-binding/v1\0";
 static SECRET_OPERATION_REAPER: LazyLock<SecretOperationReaper> =
     LazyLock::new(SecretOperationReaper::start);
 
@@ -720,7 +722,7 @@ impl ProviderOnboardingService {
                         },
                     )
                     .await?;
-                    let response_evidence = self
+                    let probe_evidence = self
                         .run_credential_probe(profile, &secret, cancellation.clone())
                         .await?;
                     let verified_at = system_timestamp()?;
@@ -751,13 +753,15 @@ impl ProviderOnboardingService {
                                 None,
                                 None,
                                 None,
-                                Some(resumed.reservation().public_configuration_digest()),
+                                probe_evidence
+                                    .account_digest
+                                    .or(Some(resumed.reservation().public_configuration_digest())),
                             ),
                             verified_at,
                             expires_at: verification_expires_at,
                             verifier_revision: profile.capability().verifier_revision().clone(),
                             assurance_limitation: credential_assurance(profile)?,
-                            evidence_digest: response_evidence,
+                            evidence_digest: probe_evidence.response_digest,
                         },
                     )
                     .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
@@ -1161,7 +1165,7 @@ impl ProviderOnboardingService {
         profile: &ProviderOnboardingProfile,
         secret: &SecretValue,
         cancellation: CancellationToken,
-    ) -> Result<EvidenceDigest, ProviderOnboardingError> {
+    ) -> Result<CredentialProbeEvidence, ProviderOnboardingError> {
         let expected_transport = match profile.id() {
             "bls.v2-registered" => ProbeTransport::HttpPostJson,
             "coinbase.exchange-direct-market-data" => ProbeTransport::HttpGet,
@@ -1238,11 +1242,18 @@ impl ProviderOnboardingService {
             .collect_probe_response(request, policy, &rate_permit, cancellation)
             .await?;
         validate_probe_semantics(profile.id(), &response)?;
+        let account_digest = match profile.id() {
+            "coinbase.exchange-direct-market-data" => Some(coinbase_account_digest(&response)?),
+            _ => None,
+        };
         rate_permit.record_success()?;
-        Ok(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(&response).into(),
-        ))
+        Ok(CredentialProbeEvidence {
+            response_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&response).into(),
+            ),
+            account_digest,
+        })
     }
 
     async fn collect_probe_response(
@@ -1434,6 +1445,17 @@ impl ProviderOnboardingService {
             persistence_evidence: profile.persistence_evidence(),
             public_configuration_digest: resumed.reservation().public_configuration_digest(),
             public_configuration: resumed.public_configuration().clone(),
+            account_digest: generation
+                .and_then(|generation| lifecycle.generation_verification(generation))
+                .and_then(|verification| verification.bindings().account_digest()),
+            verification_evidence_digest: generation
+                .and_then(|generation| lifecycle.generation_verification(generation))
+                .map(AuthorityVerification::evidence_digest),
+            provider_budget_policy: profile
+                .capability()
+                .rate_policy()
+                .enforcement_policy()
+                .cloned(),
             generation,
             secret_reference,
             verification_expires_at,
@@ -1512,6 +1534,17 @@ impl ProviderOnboardingService {
             persistence_evidence: profile.persistence_evidence(),
             public_configuration_digest: resumed.reservation().public_configuration_digest(),
             public_configuration: resumed.public_configuration().clone(),
+            account_digest: generation
+                .and_then(|generation| lifecycle.generation_verification(generation))
+                .and_then(|verification| verification.bindings().account_digest()),
+            verification_evidence_digest: generation
+                .and_then(|generation| lifecycle.generation_verification(generation))
+                .map(AuthorityVerification::evidence_digest),
+            provider_budget_policy: profile
+                .capability()
+                .rate_policy()
+                .enforcement_policy()
+                .cloned(),
             generation,
             secret_reference,
             verification_expires_at,
@@ -1958,6 +1991,9 @@ fn require_same_active_lease(
         && current.capability_digest() == expected.capability_digest()
         && current.rights_decision_digest() == expected.rights_decision_digest()
         && current.public_configuration_digest() == expected.public_configuration_digest()
+        && current.account_digest() == expected.account_digest()
+        && current.verification_evidence_digest() == expected.verification_evidence_digest()
+        && current.provider_budget_policy() == expected.provider_budget_policy()
         && current.generation() == expected.generation()
         && current.secret_reference() == expected.secret_reference()
     {
@@ -2128,9 +2164,7 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
     let valid = match profile_id {
         "coinbase.public-market-data" => value.get("product_id").is_some(),
-        "coinbase.exchange-direct-market-data" => {
-            value.as_object().is_some_and(|object| !object.is_empty())
-        }
+        "coinbase.exchange-direct-market-data" => coinbase_account_id(&value).is_some(),
         "kraken.spot-public-market-data" => {
             value
                 .get("error")
@@ -2155,6 +2189,35 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     } else {
         Err(ProviderOnboardingError::ProbeUnavailable)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CredentialProbeEvidence {
+    response_digest: EvidenceDigest,
+    account_digest: Option<EvidenceDigest>,
+}
+
+fn coinbase_account_digest(body: &[u8]) -> Result<EvidenceDigest, ProviderOnboardingError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
+    let account = coinbase_account_id(&value).ok_or(ProviderOnboardingError::ProbeUnavailable)?;
+    let length =
+        u64::try_from(account.len()).map_err(|_| ProviderOnboardingError::ProbeUnavailable)?;
+    let mut hasher = Sha256::new();
+    hasher.update(COINBASE_ACCOUNT_BINDING_DOMAIN);
+    hasher.update(length.to_be_bytes());
+    hasher.update(account.as_bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    ))
+}
+
+fn coinbase_account_id(value: &serde_json::Value) -> Option<&str> {
+    let account = value.as_object()?.get("id")?.as_str()?;
+    market_squawk_domain::SourceIdentifier::try_from(account)
+        .ok()
+        .map(|_validated| account)
 }
 
 fn event_digest(
@@ -2367,8 +2430,14 @@ mod tests {
             "CoinbaseDirectHmacSigner([REDACTED])"
         );
         validate_probe_semantics(profile.id(), br#"{"id":"fixture-user"}"#)?;
+        assert_eq!(
+            coinbase_account_digest(br#"{"id":"fixture-user"}"#)?,
+            coinbase_account_digest(br#"{"id":"fixture-user","profile_id":"ignored"}"#)?
+        );
         assert!(validate_probe_semantics(profile.id(), b"{}").is_err());
         assert!(validate_probe_semantics(profile.id(), b"[]").is_err());
+        assert!(validate_probe_semantics(profile.id(), br#"{"id":"fixture user"}"#).is_err());
+        assert!(validate_probe_semantics(profile.id(), br#"{"id":7}"#).is_err());
         Ok(())
     }
 

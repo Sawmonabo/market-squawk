@@ -57,7 +57,7 @@ const CREDENTIAL_ENVELOPE_VERSION: u8 = 1;
 const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIRECT_SNAPSHOT_SEGMENTS: usize = 64;
 const MAX_DIRECT_PRODUCT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 2;
+const MIN_DIRECT_CONCURRENT_REQUESTS: u16 = 1;
 const MIN_DIRECT_BOOTSTRAP_REQUESTS_PER_WINDOW: u32 = 3;
 
 /// Complete transport, snapshot, queue, and level-3 ownership limits for one product generation.

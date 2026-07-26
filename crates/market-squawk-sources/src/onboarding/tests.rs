@@ -431,7 +431,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         direct_budget
             .window(0)
             .map(|window| (window.requests_per_window(), window.window_nanos())),
-        Some((10, 1_000_000_000))
+        Some((8, 1_000_000_000))
     );
     Ok(())
 }

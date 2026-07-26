@@ -520,6 +520,9 @@ fn built_in_budget(
         "coinbase.public-market-data" => {
             simple_budget("coinbase", None, 1, MINUTE_NANOS, 1, backoff)
         }
+        // Market Squawk's conservative combined safety ceiling for Direct network operations.
+        // Coinbase documents distinct per-IP and account/message limits; this is not presented as
+        // one provider-published aggregate contract.
         COINBASE_DIRECT_PROFILE => simple_budget(
             "coinbase-exchange",
             Some(if direct_current {
@@ -527,7 +530,7 @@ fn built_in_budget(
             } else {
                 "coinbase.exchange-direct.default-account"
             }),
-            10,
+            8,
             SECOND_NANOS,
             2,
             backoff,
