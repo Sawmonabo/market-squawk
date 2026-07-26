@@ -80,9 +80,18 @@ const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
 const SEC_SURFACE: &str = "sec.edgar-public";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
 const BLS_REGISTERED_SURFACE: &str = "bls.v2-registered";
+const COINBASE_DIRECT_SURFACE: &str = "coinbase.exchange-direct-market-data";
+const COINBASE_PUBLIC_SURFACE: &str = "coinbase.public-market-data";
+const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = "fred-alfred.api-v1-v2";
+const PORTAL_SOURCE_SURFACES: [&str; 4] = [
+    COINBASE_PUBLIC_SURFACE,
+    COINBASE_DIRECT_SURFACE,
+    KRAKEN_PUBLIC_SURFACE,
+    TREASURY_XML_SURFACE,
+];
 
 /// Shared application authority behind local portal adapter activation and durable restart.
 #[derive(Clone)]
@@ -111,6 +120,74 @@ impl ProviderResearchActivationService {
     }
 
     async fn activate_from_portal(
+        &self,
+        session_id: Uuid,
+        request: ProviderPortalActivationRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
+        match request {
+            ProviderPortalActivationRequest::Source => {
+                self.activate_source_from_portal(session_id, cancellation)
+                    .await
+            }
+            request => {
+                self.activate_research_from_portal(session_id, request, cancellation)
+                    .await
+            }
+        }
+    }
+
+    async fn activate_source_from_portal(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        if cancellation.is_cancelled() {
+            return Err(CliProviderActivationError::Cancelled);
+        }
+        let onboarding = Arc::clone(&self.onboarding);
+        let response = self
+            .tasks
+            .spawn(async move {
+                let completion = CancellationToken::new();
+                let session = onboarding
+                    .resume(session_id)
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                let expected_surface = session.surface_id().to_owned();
+                if !PORTAL_SOURCE_SURFACES.contains(&expected_surface.as_str()) {
+                    return Err(CliProviderActivationError::SurfaceMismatch);
+                }
+                let lease = onboarding
+                    .prepare_runtime_activation_target(session_id, completion.clone())
+                    .await
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                if lease.surface_id().as_str() != expected_surface {
+                    return Err(CliProviderActivationError::SurfaceMismatch);
+                }
+                onboarding
+                    .commit_prepared_activation(&lease)
+                    .await
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                onboarding
+                    .reconcile_cleanup(session_id, completion)
+                    .await
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                let active = onboarding
+                    .activation_lease(session_id)
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                Ok(ProviderPortalActivationView::from_lease(
+                    active.surface_id().clone(),
+                    &active,
+                ))
+            })
+            .await?;
+        response
+            .await
+            .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+    }
+
+    async fn activate_research_from_portal(
         &self,
         session_id: Uuid,
         request: ProviderPortalActivationRequest,
@@ -2054,6 +2131,7 @@ fn portal_provider_request(
     request: ProviderPortalActivationRequest,
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     match request {
+        ProviderPortalActivationRequest::Source => Err(CliProviderActivationError::SurfaceMismatch),
         ProviderPortalActivationRequest::Sec => Ok((
             ProviderRequest::Sec,
             LoadedActivationEvidence {
@@ -3470,14 +3548,84 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn portal_source_activation_commits_only_nonresearch_provider_sessions() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let product = crate::LocalProduct::try_new(config)?;
+        let source_lease = prepared_anonymous_lease(
+            &product,
+            "kraken.spot-public-market-data",
+            "portal-source-activation",
+        )
+        .await?;
+        let activation = ProviderResearchActivationService::new(
+            product.paths().clone(),
+            product.provider_onboarding(),
+            product.provider_activation(),
+            product.provider_activation_state().clone(),
+        );
+
+        activation
+            .activate_from_portal(
+                source_lease.session_id(),
+                ProviderPortalActivationRequest::Source,
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(
+            product
+                .provider_onboarding()
+                .resume(source_lease.session_id())?
+                .state(),
+            OnboardingState::ActiveScoped
+        );
+
+        let research_lease =
+            prepared_treasury_lease(&product, "portal-source-surface-mismatch").await?;
+        assert!(matches!(
+            activation
+                .activate_from_portal(
+                    research_lease.session_id(),
+                    ProviderPortalActivationRequest::Source,
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(CliProviderActivationError::SurfaceMismatch)
+        ));
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        Ok(())
+    }
+
     async fn prepared_treasury_lease(
         product: &crate::LocalProduct,
         operation: &str,
     ) -> Result<ProviderActivationLease, Box<dyn std::error::Error>> {
+        prepared_anonymous_lease(product, TREASURY_FISCAL_SURFACE, operation).await
+    }
+
+    async fn prepared_anonymous_lease(
+        product: &crate::LocalProduct,
+        surface_id: &str,
+        operation: &str,
+    ) -> Result<ProviderActivationLease, Box<dyn std::error::Error>> {
         let profiles = built_in_provider_profiles()?;
         let profile = profiles
-            .get(TREASURY_FISCAL_SURFACE)
-            .ok_or("Treasury onboarding profile is missing")?;
+            .get(surface_id)
+            .ok_or("onboarding profile is missing")?;
         let catalog = product.research().onboarding_catalog();
         catalog.register_provider_capability(profile.capability())?;
         let request = OnboardingReservationRequest::try_new(

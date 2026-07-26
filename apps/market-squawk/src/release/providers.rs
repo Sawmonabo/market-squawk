@@ -435,6 +435,17 @@ async fn ensure_active_session(
         )
         .await
         .with_context(|| format!("provider onboarding probe failed: {surface_id}"))?;
+    product
+        .provider_onboarding()
+        .activate(session.session_id(), CancellationToken::new())
+        .await
+        .with_context(|| format!("provider onboarding activation failed: {surface_id}"))?;
+    let session = product
+        .provider_onboarding()
+        .resume(session.session_id())
+        .with_context(|| {
+            format!("provider onboarding state could not be reloaded: {surface_id}")
+        })?;
     if session.state() != OnboardingState::ActiveScoped {
         bail!(
             "provider onboarding did not establish active authority for {surface_id}: {:?}",

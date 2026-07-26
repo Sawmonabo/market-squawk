@@ -120,11 +120,13 @@ The portal is bounded to 15 minutes, uses a local session cookie and CSRF token,
 requests, connections, time, and body sizes. Keep it on loopback. Do not proxy, publish, bookmark,
 or forward its URL.
 
-If a future release-available profile requests a provider-created key, enter it only into the
-write-only password field served by that exact local portal. Never put it in a source activation
-request, TOML, an environment variable, CLI argument, issue, log, or chat. The current
-`LocalProduct` uses the OS keyring first and a code-owned encrypted-file fallback that accepts its
-unlock only through the explicit foreground loopback portal; see
+If a profile requests provider-created credentials, enter them only into the write-only fields
+served by that exact local portal. Coinbase Direct accepts separate API-key, passphrase, and
+signing-secret fields and constructs the closed version-1 envelope inside the local page. Never put
+credential material in a source activation request, TOML, an environment variable, CLI argument,
+issue, log, or chat. The current `LocalProduct` uses the OS keyring first and a code-owned
+encrypted-file fallback that accepts its unlock only through the explicit foreground loopback
+portal; see
 [Configuration and secrets operations](configuration-and-secrets.md).
 
 ### Treat rights as authority, not advice
@@ -146,14 +148,14 @@ ledger.
 
 | Provider surface | Release state | Declared quality ceiling | Current operator boundary |
 | --- | --- | --- | --- |
-| `coinbase.public-market-data` | `rights_limited` | `direct_verified` | Registration/inspection only in the portal; persistence, modeling, export, and redistribution remain pending, and the shipping live adapter remains `DirectUnverified` |
+| `coinbase.public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; persistence, modeling, export, and redistribution remain pending, and the shipping live adapter remains `DirectUnverified` |
 | `coinbase.exchange-direct-market-data` | `rights_limited` | `direct_verified` | Import and verify one View-only Exchange key envelope through the local portal; start the live-to-paper runtime only with the exact active session UUID; research/fair-value persistence, modeling, export, and redistribution remain pending |
-| `kraken.spot-public-market-data` | `rights_limited` | `direct_verified` | Registration/inspection only in the portal; the shipping book-v2 adapter remains `DirectUnverified` |
+| `kraken.spot-public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; the shipping book-v2 adapter remains `DirectUnverified` |
 | `sec.edgar-public` | `refresh_required` | `official_delayed` | SEC adapter and declared-contact onboarding are implemented, but portal activation is disabled until refreshed official evidence is published in a new code-owned revision |
 | `fred-alfred.api-v1-v2` | `rights_blocked` | `official_delayed` | All data-use operations are blocked; no key import, extraction, persistence, training, export, or redistribution procedure is authorized |
 | `bls.v1-unregistered` | `refresh_required` | `official_delayed` | BLS v1 extraction/onboarding is implemented but portal activation is disabled pending evidence refresh |
 | `bls.v2-registered` | `refresh_required` | `official_delayed` | BLS v2 registered-tier and key lifecycle are implemented but portal secret import and activation are disabled pending evidence refresh |
-| `treasury.daily-rates-xml` | `rights_limited` | `official_delayed` | Retrieval/display are admitted; durable publication remains closed and the portal has no activation form |
+| `treasury.daily-rates-xml` | `rights_limited` | `official_delayed` | No-credential portal probe and source-session activation admit retrieval/display only; durable publication remains closed |
 | `treasury.fiscal-data` | `available` | `official_delayed` | Current supported portal workflow; no account, key, or paid service required |
 | `local.files` | `available` | `direct_unverified` | Use bounded `ingest file`; the portal accepts no filesystem path |
 | `local.portfolio-imports` | `available` | `direct_unverified` | Use bounded portfolio import commands; preserve user-owned source evidence |
@@ -161,9 +163,11 @@ ledger.
 
 The portal lists every profile with its handoff instruction, release state, and official link. The
 full rights, duties, coverage, and evidence remain available in `source status` and
-`source coverage`. The portal activation button is enabled only when the profile is `available`
-**and** a provider-specific form exists. At this head, that makes Treasury Fiscal Data the only
-external provider with a current human portal activation procedure.
+`source coverage`. Setup is enabled only for `available` or `rights_limited` profiles with an
+exact source-session or research-adapter request. Public Coinbase, Coinbase Direct, Kraken,
+Treasury daily XML, and Treasury Fiscal Data therefore have guided setup; SEC and both BLS
+profiles remain disabled while `refresh_required`, and FRED/ALFRED remains disabled while
+`rights_blocked`.
 
 ## Read source status, coverage, and health
 
@@ -301,7 +305,7 @@ and evidence in the `source status`/`source coverage` output retained above. The
 2. Enter an inclusive first record date.
 3. Enter an inclusive last record date no earlier than the first.
 4. Enter a page size from `1` through `10000`; the form defaults to `1000`.
-5. Select **Activate provider adapter** once.
+5. Select **Set up provider** once.
 
 The portal starts a durable no-credential onboarding session, performs the bounded official probe,
 obtains an immutable activation lease, constructs the exact average-interest-rates query, persists
@@ -519,9 +523,10 @@ extraction completed or that a dataset was published.
 - **Provider terms or rights changed:** stop new use, retain exact lineage and evidence, and wait
   for a reviewed code-owned profile revision. The operator cannot widen rights locally.
 
-There is no current generic deactivate or session-cancel CLI. If removal of an activated provider
-is required, quiesce provider use, preserve the data root, and escalate for a product-owned
-lifecycle operation; do not remove files or catalog rows by hand.
+There is no generic deactivate or session-cancel CLI. The loopback portal exposes **Remove local
+provider authority** for the current session and routes it through product-owned adapter
+deregistration, credential cleanup, and durable cancellation. Quiesce provider use first, preserve
+the data root, and never remove files or catalog rows by hand.
 
 ## Known failure modes
 
@@ -529,7 +534,7 @@ lifecycle operation; do not remove files or catalog rows by hand.
 | --- | --- | --- |
 | Mutation rejects with confirmation required | `--confirm` omitted | Recheck the exact provider/request, then rerun explicitly |
 | Unknown provider | Argument is not one of the eleven exact surface IDs | Use `source status` without a filter and copy the code-owned ID |
-| Portal activation button is disabled | Profile is not `available`, or no provider-specific form exists | Read the displayed release state and ledger; activation is unavailable for that surface at this head |
+| Portal setup button is disabled | Profile is `refresh_required` or `rights_blocked`, or no exact supported request exists | Read the displayed release state and ledger; setup is unavailable for that surface at this head |
 | Browser does not open | Local browser integration failed | Use only the exact loopback URL emitted on stdout/stderr while the command remains running |
 | Portal returns expired/unauthorized/CSRF error | Portal lifetime or local session boundary ended | Close the page and run a new confirmed `source setup` |
 | Official probe fails | DNS, TLS, endpoint, provider health, rate budget, or policy mismatch | Preserve the bounded error; retry only after the named condition clears |

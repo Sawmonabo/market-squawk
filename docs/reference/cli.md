@@ -92,7 +92,11 @@ Configuration precedence, every environment mapping, and the provider-profile co
 `source setup` accepts only the loopback URL returned by the product: scheme `http`, host
 `127.0.0.1`, an explicit port, no credentials, query, or fragment, and a lifetime from 30 seconds
 through one hour. A browser-launch failure does not terminate the portal; the URL remains in the
-command result and local log.
+command result and local log. The portal commits source-only sessions for public Coinbase,
+Coinbase Direct, Kraken, and Treasury daily XML; the Coinbase Direct form creates the exact
+version-1 credential envelope from separate write-only API-key, passphrase, and signing-secret
+fields. SEC, BLS, and Treasury Fiscal use provider-specific research-adapter forms. Buttons remain
+disabled when the code-owned profile is `refresh_required` or `rights_blocked`.
 
 ### Research, datasets, and features
 

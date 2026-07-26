@@ -365,7 +365,10 @@ Research activation requires an active immutable onboarding lease for the exact 
 source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
 activation request is a closed schema-version-2 object, capped at 1 MiB. Its provider kinds are
 `sec`, `bls`, `treasury_fiscal`, `treasury_daily_rates`, and `fred_alfred`; each kind has a closed,
-provider-specific scope. The loopback portal exposes only SEC, BLS, and Treasury Fiscal activation.
+provider-specific scope. The loopback portal exposes SEC, BLS, and Treasury Fiscal research
+activation plus source-session activation for public Coinbase, Coinbase Direct, Kraken, and
+Treasury daily XML. Source-session activation verifies and commits onboarding authority but does
+not manufacture a research adapter or durable-use right.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |

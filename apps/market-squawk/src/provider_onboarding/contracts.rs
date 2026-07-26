@@ -220,6 +220,8 @@ pub enum OnboardingNextAction {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ProviderPortalActivationRequest {
+    /// Commit one verified live or rights-limited source session without a research adapter.
+    Source,
     /// SEC EDGAR needs only the declared contact already retained by onboarding.
     Sec,
     /// BLS needs explicit user-verified series semantics and a bounded year range.

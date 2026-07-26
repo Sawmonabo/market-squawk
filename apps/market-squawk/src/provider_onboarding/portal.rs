@@ -1085,6 +1085,12 @@ function blsConfiguration(section) {
   });
 }
 function configuration(profile, section) {
+  if (profile.id === 'coinbase.public-market-data' ||
+      profile.id === 'coinbase.exchange-direct-market-data' ||
+      profile.id === 'kraken.spot-public-market-data' ||
+      profile.id === 'treasury.daily-rates-xml') {
+    return () => ({kind: 'source'});
+  }
   if (profile.id === 'sec.edgar-public') return () => ({kind: 'sec'});
   if (profile.id === 'bls.v1-unregistered' || profile.id === 'bls.v2-registered') {
     return blsConfiguration(section);
@@ -1107,15 +1113,29 @@ async function activate(session, adapterRequest) {
 async function importSecret(session, adapterRequest, replacement) {
   const status = document.getElementById('status');
   status.textContent = '';
-  const secret = input('password', replacement ? 'Provider-created replacement key' :
-    'Provider-created key', 8192);
-  secret.autocomplete = 'off';
+  let secretInputs;
+  let secretValue;
+  if (session.surface_id === 'coinbase.exchange-direct-market-data') {
+    const apiKey = input('password', 'Coinbase Exchange API key', 1024);
+    const passphrase = input('password', 'Coinbase Exchange passphrase', 1024);
+    const signingSecret = input('password', 'Coinbase Exchange signing secret', 1024);
+    secretInputs = [apiKey, passphrase, signingSecret];
+    secretValue = () => JSON.stringify({version: 1, api_key: requiredValue(apiKey),
+      passphrase: requiredValue(passphrase), signing_secret: requiredValue(signingSecret)});
+  } else {
+    const secret = input('password', replacement ? 'Provider-created replacement key' :
+      'Provider-created API key', 8192);
+    secretInputs = [secret];
+    secretValue = () => requiredValue(secret);
+  }
+  for (const secret of secretInputs) secret.autocomplete = 'off';
   const submit = document.createElement('button');
   submit.textContent = replacement ? 'Import replacement and cut over' :
-    'Import key and activate adapter';
+    'Import credentials and activate provider';
   submit.addEventListener('click', async () => {
-    const value = requiredValue(secret);
-    secret.value = ''; secret.remove(); submit.remove();
+    const value = secretValue();
+    for (const secret of secretInputs) { secret.value = ''; secret.remove(); }
+    submit.remove();
     const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret',
       value, 'application/octet-stream');
     if (stored.next_action === 'verify_and_activate' ||
@@ -1123,7 +1143,7 @@ async function importSecret(session, adapterRequest, replacement) {
       await activate(stored, adapterRequest);
     }
   });
-  status.before(secret, submit);
+  status.before(...secretInputs, submit);
 }
 async function continueSession(session, adapterRequest) {
   if (session.next_action === 'active') return activate(session, adapterRequest);
@@ -1143,8 +1163,9 @@ async function continueSession(session, adapterRequest) {
     return activate(session, adapterRequest);
   }
   if (session.next_action === 'reconcile_cleanup') {
-    return mutate('/api/v1/sessions/' + session.session_id + '/cleanup',
+    const reconciled = await mutate('/api/v1/sessions/' + session.session_id + '/cleanup',
       '{}', 'application/json');
+    return continueSession(reconciled, adapterRequest);
   }
   document.getElementById('status').textContent = JSON.stringify(session, null, 2);
   return session;
@@ -1183,11 +1204,13 @@ fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
     const buildConfiguration = configuration(profile, section);
     const current = sessions.get(profile.id);
     const button = document.createElement('button');
-    button.textContent = current ? 'Continue or manage provider' : 'Activate provider adapter';
-    button.disabled = profile.release_state !== 'available' || buildConfiguration === null;
+    button.textContent = current ? 'Continue or manage provider' : 'Set up provider';
+    const releaseAvailable = profile.release_state === 'available' ||
+      profile.release_state === 'rights_limited';
+    button.disabled = !releaseAvailable || buildConfiguration === null;
     button.addEventListener('click', () => {
       try {
-        const operation = current ?
+        const operation = current && current.next_action !== 'start_new_session' ?
           continueSession(current, buildConfiguration()) :
           start(profile, organization, email, buildConfiguration());
         operation.catch(error => {
@@ -1196,6 +1219,20 @@ fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
       }
       catch (error) { document.getElementById('status').textContent = String(error); }
     });
-    section.append(button); root.append(section);
+    section.append(button);
+    if (current) {
+      const remove = document.createElement('button');
+      remove.textContent = 'Remove local provider authority';
+      remove.addEventListener('click', async () => {
+        try {
+          await mutate('/api/v1/sessions/' + current.session_id + '/cancel',
+            '{}', 'application/json');
+        } catch (error) {
+          document.getElementById('status').textContent = String(error);
+        }
+      });
+      section.append(remove);
+    }
+    root.append(section);
   }
 }).catch(() => { document.getElementById('profiles').textContent = 'Portal bootstrap unavailable.'; });"#;

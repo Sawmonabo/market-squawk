@@ -29,6 +29,10 @@ All notable changes to this project are documented here.
   paper kernels, Arrow/Parquet/DataFusion and point-in-time storage, Python admission, backtesting,
   portfolio, fair value, CLI, doctor, and the shipping stdio MCP composition; strict release closure
   now requires its immutable evidence and fails closed on stopped paper authority.
+- Completed guided loopback setup for public Coinbase, Coinbase Direct, Kraken, Treasury daily XML,
+  and Treasury Fiscal Data, including typed write-only Coinbase credentials, scoped source-session
+  activation, renewal/replacement recovery, and product-owned local-authority removal. Provider
+  evidence now commits automatically probed no-credential sessions before evaluating them.
 
 ## 0.1.0 - 2026-07-15
 
