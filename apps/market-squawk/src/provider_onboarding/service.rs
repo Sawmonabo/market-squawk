@@ -18,9 +18,9 @@ use market_squawk_data::{
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, EncryptedFileUnlockCapability, LocalSecretStoreError,
-    SecretCancellation, SecretDeletionDisposition, SecretInteractionPolicy, SecretKey,
-    SecretMutationEffect, SecretOperationControl, SecretReconciliationObservation, SecretStore,
-    SecretValue,
+    SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
+    SecretKey, SecretMutationEffect, SecretOperationControl, SecretReconciliationObservation,
+    SecretStore, SecretValue,
 };
 use market_squawk_sources::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
@@ -848,23 +848,19 @@ impl ProviderOnboardingService {
             .catalog
             .resume_provider_onboarding(prepared.session_id())?;
         let profile = self.current_profile_for(&resumed)?;
-        if let Ok(active) = self.lease_from_resumed(&resumed, profile) {
-            require_same_active_lease(&active, prepared)?;
-            return Ok(active);
+        match self.lease_from_resumed(&resumed, profile) {
+            Ok(active) if require_same_active_lease(&active, prepared).is_ok() => {
+                return Ok(active);
+            }
+            Ok(_) | Err(ProviderOnboardingError::ActivationUnavailable) => {}
+            Err(error) => return Err(error),
         }
         let current = self.prepared_lease_from_resumed(&resumed, profile)?;
         require_same_active_lease(&current, prepared)?;
-        let event = match (
+        let event = prepared_activation_event(
             resumed.lifecycle().active_generation(),
             prepared.generation(),
-        ) {
-            (Some(prior_generation), Some(candidate_generation)) => OnboardingEvent::Cutover {
-                prior_generation,
-                candidate_generation,
-            },
-            (None, generation) => OnboardingEvent::Activate { generation },
-            (Some(_), None) => return Err(ProviderOnboardingError::InvalidSessionState),
-        };
+        )?;
         self.append(resumed.reservation(), resumed.next_sequence(), event)?;
         self.activation_lease(prepared.session_id())
     }
@@ -1915,6 +1911,20 @@ fn secret_fallback_control(
     .map_err(Into::into)
 }
 
+fn prepared_activation_event(
+    active_generation: Option<SecretGeneration>,
+    candidate_generation: Option<SecretGeneration>,
+) -> Result<OnboardingEvent, ProviderOnboardingError> {
+    match (active_generation, candidate_generation) {
+        (Some(prior_generation), Some(candidate_generation)) => Ok(OnboardingEvent::Cutover {
+            prior_generation,
+            candidate_generation,
+        }),
+        (None, generation) => Ok(OnboardingEvent::Activate { generation }),
+        (Some(_), None) => Err(ProviderOnboardingError::InvalidSessionState),
+    }
+}
+
 fn require_same_active_lease(
     current: &ProviderActivationLease,
     expected: &ProviderActivationLease,
@@ -2300,6 +2310,20 @@ mod tests {
         let admissions = ProviderRuntimeStartupAdmissions::try_new([(surface.clone(), desired)])?;
         assert!(!admissions.admits(&surface, predecessor));
         assert!(admissions.admits(&surface, desired));
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_activation_event_selects_exact_cutover() -> TestResult {
+        let predecessor = market_squawk_platform::SecretGeneration::new(1)?;
+        let candidate = market_squawk_platform::SecretGeneration::new(2)?;
+        assert!(matches!(
+            prepared_activation_event(Some(predecessor), Some(candidate))?,
+            OnboardingEvent::Cutover {
+                prior_generation,
+                candidate_generation,
+            } if prior_generation == predecessor && candidate_generation == candidate
+        ));
         Ok(())
     }
 
