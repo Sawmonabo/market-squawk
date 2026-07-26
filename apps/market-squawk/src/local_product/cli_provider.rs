@@ -121,45 +121,39 @@ impl ProviderResearchActivationService {
             return Err(CliProviderActivationError::Cancelled);
         }
         let (provider, evidence) = portal_provider_request(session_id, request)?;
-        let lease = match self.onboarding.activation_lease(session_id) {
-            Ok(lease) => lease,
-            Err(ProviderOnboardingError::ActivationUnavailable) => self
-                .onboarding
-                .prepare_activation(session_id, cancellation.clone())
-                .await
-                .map_err(CliProviderActivationError::Onboarding)?,
-            Err(error) => return Err(CliProviderActivationError::Onboarding(error)),
-        };
-        require_surface(&lease, provider.surface())?;
-        let surface_id = lease.surface_id().as_str().to_owned();
-        let _activation_guard = self
-            .state
-            .acquire_activation(&surface_id)
-            .await
-            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
-        let request = ActivationRequest {
-            schema_version: REQUEST_SCHEMA_VERSION,
-            session_id,
-            provider,
-        };
-        let request_bytes = serde_json::to_vec(&request)
-            .map_err(|_error| CliProviderActivationError::InvalidRequest)?;
-        if request_bytes.is_empty()
-            || u64::try_from(request_bytes.len())
-                .map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
-        {
-            return Err(CliProviderActivationError::InvalidRequest);
-        }
-        let activation =
-            build_research_activation(&self.paths, &lease, &request_bytes, request, &evidence)?;
+        let paths = self.paths.clone();
         let state = self.state.clone();
         let activation_authority = Arc::clone(&self.activation);
         let onboarding = Arc::clone(&self.onboarding);
-        let completion = CancellationToken::new();
         let response = self
             .tasks
             .spawn(async move {
-                let _activation_guard = _activation_guard;
+                let completion = CancellationToken::new();
+                let lease = onboarding
+                    .prepare_runtime_activation_target(session_id, completion.clone())
+                    .await
+                    .map_err(CliProviderActivationError::Onboarding)?;
+                require_surface(&lease, provider.surface())?;
+                let surface_id = lease.surface_id().as_str().to_owned();
+                let _activation_guard = state
+                    .acquire_activation(&surface_id)
+                    .await
+                    .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+                let request = ActivationRequest {
+                    schema_version: REQUEST_SCHEMA_VERSION,
+                    session_id,
+                    provider,
+                };
+                let request_bytes = serde_json::to_vec(&request)
+                    .map_err(|_error| CliProviderActivationError::InvalidRequest)?;
+                if request_bytes.is_empty()
+                    || u64::try_from(request_bytes.len())
+                        .map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
+                {
+                    return Err(CliProviderActivationError::InvalidRequest);
+                }
+                let activation =
+                    build_research_activation(&paths, &lease, &request_bytes, request, &evidence)?;
                 publish_research_activation(
                     &state,
                     &activation_authority,
@@ -1207,7 +1201,8 @@ pub(super) async fn activate_research_provider(
     let (root, input, request) = read_request(request_path)?;
     let onboarding = product.provider_onboarding();
     let lease = onboarding
-        .activation_lease(request.session_id)
+        .prepare_runtime_activation_target(request.session_id, cancellation.clone())
+        .await
         .map_err(CliProviderActivationError::Onboarding)?;
     require_surface(&lease, request.provider.surface())?;
     let surface_id = lease.surface_id().as_str().to_owned();
@@ -3410,24 +3405,38 @@ mod tests {
         );
 
         let tasks = ProviderActivationTaskAuthority::new();
-        let (release, released) = tokio::sync::oneshot::channel();
+        let held_activation = recovered
+            .provider_activation_state()
+            .acquire_activation(TREASURY_FISCAL_SURFACE)
+            .await?;
+        let retained_state = recovered.provider_activation_state().clone();
+        let (started, retained_started) = tokio::sync::oneshot::channel();
+        let (completed, retained_completed) = tokio::sync::oneshot::channel();
         let response_waiter = tasks
             .spawn(async move {
-                let _released = released.await;
+                let _started = started.send(());
+                let acquired = retained_state
+                    .acquire_activation(TREASURY_FISCAL_SURFACE)
+                    .await
+                    .is_ok();
+                let _completed = completed.send(acquired);
             })
             .await?;
+        retained_started.await?;
         assert!(matches!(
             tasks.spawn(async {}).await,
             Err(CliProviderActivationError::StateUnavailable)
         ));
         drop(response_waiter);
+        drop(held_activation);
         tasks.begin_shutdown();
-        release.send(()).map_err(|_| {
-            std::io::Error::other("retained activation task was dropped with its response waiter")
-        })?;
         tasks
             .finish_shutdown(Instant::now() + Duration::from_secs(5))
             .await?;
+        assert!(
+            retained_completed.await?,
+            "retained activation did not survive waiter drop and gate contention"
+        );
         assert!(matches!(
             tasks.spawn(async {}).await,
             Err(CliProviderActivationError::StateUnavailable)
@@ -3473,7 +3482,7 @@ mod tests {
         }
         Ok(product
             .provider_onboarding()
-            .prepare_activation(reservation.session_id(), CancellationToken::new())
+            .prepare_runtime_activation_target(reservation.session_id(), CancellationToken::new())
             .await?)
     }
 

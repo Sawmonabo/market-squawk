@@ -644,12 +644,14 @@ impl ProviderOnboardingService {
         }
     }
 
-    /// Verifies one stored credential and returns a non-callable adapter-construction candidate.
+    /// Selects and verifies the exact lease that a new runtime publication must target.
     ///
-    /// Repeated calls after activation recover the same durable generation without repeating the
-    /// provider request. Profiles whose code-owned evidence is rights-blocked or refresh-required
-    /// remain unavailable.
-    pub(crate) async fn prepare_activation(
+    /// A prepared replacement generation always takes precedence over the still-active predecessor
+    /// in the same session. The active lease is returned only when no replacement candidate
+    /// exists, which keeps predecessor authority available for rollback without readmitting it as
+    /// the requested successor. Repeated calls after activation recover the same durable
+    /// generation without repeating the provider request.
+    pub(crate) async fn prepare_runtime_activation_target(
         &self,
         session_id: Uuid,
         cancellation: CancellationToken,
@@ -873,7 +875,9 @@ impl ProviderOnboardingService {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
-        let prepared = self.prepare_activation(session_id, cancellation).await?;
+        let prepared = self
+            .prepare_runtime_activation_target(session_id, cancellation)
+            .await?;
         self.commit_prepared_activation(&prepared).await
     }
 
