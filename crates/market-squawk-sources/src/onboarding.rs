@@ -17,6 +17,7 @@ pub use lifecycle::{
     AuthorityBindings, AuthorityVerification, AuthorityVerificationInput,
     CredentialGenerationState, LocalDeletionOutcome, OnboardingEvent, OnboardingEventKind,
     OnboardingLifecycle, OnboardingState, OnboardingStateError, RemoteRevocationOutcome,
+    SecretStoreClearOutcome,
 };
 pub use profile::{
     DataUseOperation, DataUseRight, OperationAdmission, ProbeTransport, ProfileActivationMode,

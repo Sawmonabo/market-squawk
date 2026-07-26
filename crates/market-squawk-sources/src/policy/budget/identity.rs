@@ -115,9 +115,7 @@ impl BudgetScope {
                     authorization.basis().as_source_identifier().clone(),
                 ))
             }
-            crate::AuthorizationMode::UserOwnedLocal => {
-                Err(NetworkPolicyError::InvalidBudgetScope)
-            }
+            crate::AuthorizationMode::UserOwnedLocal => Err(NetworkPolicyError::InvalidBudgetScope),
         }
     }
 
@@ -180,11 +178,8 @@ impl BackoffPolicy {
         self.maximum_nanos.get()
     }
 
-    pub(in crate::policy) fn delay_nanos(
-        self,
-        attempt: u32,
-        jitter_sample_basis_points: u16,
-    ) -> u64 {
+    /// Returns the bounded exponential fallback delay for one refusal attempt.
+    pub fn delay_nanos(self, attempt: u32, jitter_sample_basis_points: u16) -> u64 {
         let shift = attempt.min(63);
         let base = self
             .initial_nanos
@@ -315,12 +310,8 @@ impl<'de> Deserialize<'de> for ProviderBudgetWindow {
         D: Deserializer<'de>,
     {
         let wire = ProviderBudgetWindowWire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.requests_per_window,
-            wire.window_nanos,
-            wire.semantics,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::try_new(wire.requests_per_window, wire.window_nanos, wire.semantics)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -328,8 +319,8 @@ fn default_window_semantics() -> BudgetWindowSemantics {
     BudgetWindowSemantics::Tumbling
 }
 
-fn empty_additional_budget_windows(
-) -> BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS> {
+fn empty_additional_budget_windows()
+-> BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS> {
     BoundedVec::empty()
 }
 
@@ -357,8 +348,7 @@ pub struct ProviderBudgetPolicy {
         default = "empty_additional_budget_windows",
         skip_serializing_if = "no_additional_budget_windows"
     )]
-    additional_windows:
-        BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
+    additional_windows: BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
 }
 
 impl ProviderBudgetPolicy {
@@ -436,8 +426,8 @@ impl ProviderBudgetPolicy {
             .try_reserve(MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS)
             .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         additional.extend(canonical);
-        let additional_windows = BoundedVec::try_new(additional)
-            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        let additional_windows =
+            BoundedVec::try_new(additional).map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         Ok(Self {
             scope,
             requests_per_window: primary.requests_per_window,
@@ -477,9 +467,7 @@ impl ProviderBudgetPolicy {
         self.additional_windows.as_slice().get(index - 1).copied()
     }
 
-    pub(in crate::policy) fn windows(
-        &self,
-    ) -> impl Iterator<Item = ProviderBudgetWindow> + '_ {
+    pub(in crate::policy) fn windows(&self) -> impl Iterator<Item = ProviderBudgetWindow> + '_ {
         std::iter::once(self.primary_window())
             .chain(self.additional_windows.as_slice().iter().copied())
     }
@@ -500,6 +488,21 @@ impl ProviderBudgetPolicy {
     /// Returns the provider-refusal backoff policy.
     pub const fn backoff(&self) -> BackoffPolicy {
         self.backoff
+    }
+
+    pub(in crate::policy) fn with_authorization_subject(
+        &self,
+        subject: SourceIdentifier,
+    ) -> Result<Self, NetworkPolicyError> {
+        if self.scope.authorization_account().is_none() {
+            return Err(NetworkPolicyError::InvalidBudgetScope);
+        }
+        let mut qualified = self.clone();
+        qualified.scope = BudgetScope::with_authorization_account(
+            self.scope.as_source_identifier().clone(),
+            subject,
+        );
+        Ok(qualified)
     }
 
     pub(crate) fn has_same_limits_as(&self, other: &Self) -> bool {
@@ -543,8 +546,7 @@ struct ProviderBudgetPolicyWire {
     #[serde(default = "default_window_semantics")]
     window_semantics: BudgetWindowSemantics,
     #[serde(default = "empty_additional_budget_windows")]
-    additional_windows:
-        BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
+    additional_windows: BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
 }
 
 impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
@@ -567,7 +569,7 @@ impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
         );
         windows.extend(wire.additional_windows.into_vec());
         Self::try_new_conjunctive(wire.scope, &windows, wire.max_concurrent, wire.backoff)
-        .map_err(serde::de::Error::custom)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -608,14 +610,12 @@ impl PersistedProviderBudgetPolicy {
         self.validate_structure()
             .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?;
         let collision_key = match self.authorization.mode() {
-            crate::AuthorizationMode::PublicInterface => {
-                BudgetCollisionKey::Public(
-                    self.endpoint_policy
-                        .canonical_network_authorities()
-                        .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?
-                        .into_vec(),
-                )
-            }
+            crate::AuthorizationMode::PublicInterface => BudgetCollisionKey::Public(
+                self.endpoint_policy
+                    .canonical_network_authorities()
+                    .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?
+                    .into_vec(),
+            ),
             crate::AuthorizationMode::UserAuthorized | crate::AuthorizationMode::Licensed => {
                 let resolved = resolver
                     .resolve_subject_record(

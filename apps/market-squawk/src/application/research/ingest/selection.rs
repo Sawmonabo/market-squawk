@@ -16,8 +16,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    CoordinatorAuthority, ManagedResearchExtractionSource, ResearchRightsAuthority,
-    ResearchSourceDiscoveryRights,
+    CoordinatorAuthority, ManagedResearchExtractionSource, ResearchProviderAdmission,
+    ResearchRightsAuthority, ResearchSourceDiscoveryRights,
 };
 
 /// One exact discovered object paired with its opaque, single-use ingestion authority.
@@ -226,12 +226,16 @@ impl RetainedDiscoverySelections {
         profile: &SourceIdentifier,
         metadata: &SourceMetadata,
         rights: &ResearchRightsAuthority,
+        admission: &ResearchProviderAdmission,
         discovery: DiscoveryBatch,
         retention: Duration,
         observed_monotonic: Instant,
         observed_wall: Timestamp,
         operation_deadline: Instant,
     ) -> Result<ResearchSourceDiscovery, ServiceError> {
+        admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         self.prune_expired(observed_monotonic, observed_wall);
         let object_count = discovery.objects().len();
         let retained_count = self
@@ -297,6 +301,7 @@ impl RetainedDiscoverySelections {
                 profile: profile.clone(),
                 metadata: metadata.clone(),
                 rights: rights.clone(),
+                admission: admission.clone(),
                 request: discovery.request().clone(),
                 object: object.clone(),
                 monotonic_expiry,
@@ -403,6 +408,11 @@ impl RetainedDiscoverySelections {
     pub(super) fn clear(&mut self) {
         self.entries.clear();
     }
+
+    pub(super) fn revoke_profile(&mut self, profile: &SourceIdentifier) {
+        self.entries
+            .retain(|selection| &selection.profile != profile);
+    }
 }
 
 struct RetainedDiscoverySelection {
@@ -410,6 +420,7 @@ struct RetainedDiscoverySelection {
     profile: SourceIdentifier,
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
+    admission: ResearchProviderAdmission,
     request: DiscoveryRequest,
     object: SourceObject,
     monotonic_expiry: Instant,
@@ -431,6 +442,7 @@ pub(super) struct PreparedRetainedSelection {
     pub(super) rights: ResearchRightsAuthority,
     pub(super) authority: ExtractionAuthority,
     pub(super) object: SourceObject,
+    pub(super) admission: ResearchProviderAdmission,
 }
 
 impl CoordinatorAuthority {
@@ -472,9 +484,14 @@ impl CoordinatorAuthority {
         if registered.metadata != selection.metadata
             || registered.rights != selection.rights
             || registered.source.metadata() != &selection.metadata
+            || !registered.admission.matches(&selection.admission)
         {
             return Err(ServiceError::NotFound);
         }
+        registered
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         selection.rights.validate_at(observed_wall)?;
         let authority = registry
             .extraction_authority(&registered.registration, registered.source.as_ref())
@@ -490,6 +507,7 @@ impl CoordinatorAuthority {
             rights: selection.rights,
             authority,
             object: selection.object,
+            admission: selection.admission,
         })
     }
 }

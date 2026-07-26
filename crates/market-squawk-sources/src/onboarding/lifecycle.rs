@@ -1,7 +1,7 @@
 //! Generation-bound provider onboarding authority.
 
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_platform::{SecretGeneration, SecretRef};
+use market_squawk_platform::{SecretGeneration, SecretMutationPlan, SecretRef};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -11,7 +11,8 @@ use super::{
 };
 use crate::onboarding::capability::nonzero_digest;
 
-const MAX_RETAINED_GENERATIONS: usize = 4;
+const MAX_RETAINED_GENERATIONS: usize = 256;
+const MAX_OPERATION_RETRY_BUDGET: u8 = 8;
 
 /// Non-secret issuer, audience, resource, and account bindings observed by a verifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,6 +278,8 @@ pub enum OnboardingState {
     ProtocolValidated,
     /// One exact credential generation is stored but unverified.
     StoredUnverified,
+    /// A durable exact store plan may require local reconciliation.
+    SecretReconciliationRequired,
     /// Requested authority exactly matched observed authority.
     VerifiedLeastPrivilege,
     /// Rights and rate-policy admission remain incomplete.
@@ -285,6 +288,8 @@ pub enum OnboardingState {
     RuntimeVerificationPending,
     /// The exact active generation is admitted for scoped use.
     ActiveScoped,
+    /// The active credential reached its provider-verification renewal boundary.
+    RenewalRequired,
     /// Evidence change invalidated activation until review.
     RefreshRequired,
     /// A candidate generation is being prepared while the prior remains active.
@@ -309,10 +314,12 @@ impl OnboardingState {
             Self::CredentialImportedUnverified => "credential_imported_unverified",
             Self::ProtocolValidated => "protocol_validated",
             Self::StoredUnverified => "stored_unverified",
+            Self::SecretReconciliationRequired => "secret_reconciliation_required",
             Self::VerifiedLeastPrivilege => "verified_least_privilege",
             Self::RightsAdmissionPending => "rights_admission_pending",
             Self::RuntimeVerificationPending => "runtime_verification_pending",
             Self::ActiveScoped => "active_scoped",
+            Self::RenewalRequired => "renewal_required",
             Self::RefreshRequired => "refresh_required",
             Self::RotationPending => "rotation_pending",
             Self::RevocationUnconfirmed => "revocation_unconfirmed",
@@ -329,6 +336,10 @@ impl OnboardingState {
 pub enum CredentialGenerationState {
     /// Catalog authority reserved this generation before secret storage.
     Reserved,
+    /// Exact backend selection was durably planned before any mutation.
+    StorePlanned,
+    /// The planned target may exist and requires exact reconciliation.
+    StoreReconciliationRequired,
     /// The exact generation was stored but not authority-verified.
     StoredUnverified,
     /// Least-privilege authority was verified.
@@ -341,6 +352,8 @@ pub enum CredentialGenerationState {
     Retired,
     /// This generation is an immutable catalog tombstone.
     Tombstoned,
+    /// A never-stored candidate was abandoned without external effect.
+    AbandonedNoEffect,
     /// Exact cleanup of this generation is incomplete.
     CleanupRequired,
 }
@@ -375,12 +388,28 @@ pub enum LocalDeletionOutcome {
     Indeterminate,
 }
 
+/// Exact no-debt outcome when clearing a planned secret mutation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStoreClearOutcome {
+    /// The exact planned target was confirmed absent.
+    Absent,
+    /// The exact planned target was deleted.
+    Deleted,
+}
+
 /// Stable event class used by catalog indexing and audit summaries.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingEventKind {
     /// User-provided credential material entered the secure-store boundary.
     CredentialImported,
+    /// Exact backend selection was persisted before secret mutation.
+    SecretStorePlanned,
+    /// The exact planned target requires foreground reconciliation.
+    SecretStoreReconciliationRequired,
+    /// A planned target was confirmed absent or deleted.
+    SecretStoreCleared,
     /// The admitted credential protocol completed validation.
     ProtocolValidated,
     /// The exact opaque secret reference was durably stored.
@@ -395,8 +424,12 @@ pub enum OnboardingEventKind {
     RuntimeVerified,
     /// The exact generation or anonymous surface became active.
     Activate,
+    /// The active credential reached its verified renewal boundary.
+    RenewalRequired,
     /// A higher candidate generation was reserved.
     BeginRotation,
+    /// A reserved candidate was abandoned before any external mutation.
+    CandidateCancelledNoEffect,
     /// Authority moved atomically to the prepared candidate.
     Cutover,
     /// Remote revocation produced a separately recorded outcome.
@@ -415,6 +448,8 @@ pub enum OnboardingEventKind {
     IndeterminateRemoteState,
     /// Exact cleanup remains required.
     CleanupRequired,
+    /// Runtime activation was quarantined and all retained secret authority was revoked.
+    ActivationQuarantined,
     /// A policy or authority gate blocked the session.
     Blocked,
     /// Cancellation permanently blocked later activation.
@@ -426,6 +461,9 @@ impl OnboardingEventKind {
     pub const fn database_name(self) -> &'static str {
         match self {
             Self::CredentialImported => "credential_imported",
+            Self::SecretStorePlanned => "secret_store_planned",
+            Self::SecretStoreReconciliationRequired => "secret_store_reconciliation_required",
+            Self::SecretStoreCleared => "secret_store_cleared",
             Self::ProtocolValidated => "protocol_validated",
             Self::CredentialStored => "credential_stored",
             Self::AuthorityVerified => "authority_verified",
@@ -433,7 +471,9 @@ impl OnboardingEventKind {
             Self::RatePolicyAdmitted => "rate_policy_admitted",
             Self::RuntimeVerified => "runtime_verified",
             Self::Activate => "activate",
+            Self::RenewalRequired => "renewal_required",
             Self::BeginRotation => "begin_rotation",
+            Self::CandidateCancelledNoEffect => "candidate_cancelled_no_effect",
             Self::Cutover => "cutover",
             Self::RemoteRevocation => "remote_revocation",
             Self::LocalDeletion => "local_deletion",
@@ -443,6 +483,7 @@ impl OnboardingEventKind {
             Self::Unavailable => "unavailable",
             Self::IndeterminateRemoteState => "indeterminate_remote_state",
             Self::CleanupRequired => "cleanup_required",
+            Self::ActivationQuarantined => "activation_quarantined",
             Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
         }
@@ -459,6 +500,29 @@ pub enum OnboardingEvent {
         generation: SecretGeneration,
         /// Digest of redacted import evidence.
         evidence_digest: EvidenceDigest,
+    },
+    /// Freezes one exact backend and locator before credential bytes can be written.
+    SecretStorePlanned {
+        /// Durable non-secret exact mutation plan.
+        plan: SecretMutationPlan,
+        /// Digest of redacted import and planning evidence.
+        evidence_digest: EvidenceDigest,
+    },
+    /// Records that a durable plan may have been applied but was not catalog-committed.
+    SecretStoreReconciliationRequired {
+        /// Exact candidate generation.
+        generation: SecretGeneration,
+        /// Digest of redacted reconciliation evidence.
+        evidence_digest: EvidenceDigest,
+    },
+    /// Clears a durable plan only after exact absence or deletion is known.
+    SecretStoreCleared {
+        /// Exact candidate generation.
+        generation: SecretGeneration,
+        /// Exact planned target.
+        reference: SecretRef,
+        /// Determinate no-debt outcome.
+        outcome: SecretStoreClearOutcome,
     },
     /// The provider-specific credential protocol was validated.
     ProtocolValidated {
@@ -503,10 +567,35 @@ pub enum OnboardingEvent {
         /// `None` identifies a no-secret surface.
         generation: Option<SecretGeneration>,
     },
+    /// Records the exact expiry that suspended active credential authority.
+    RenewalRequired {
+        /// Exact active generation requiring replacement.
+        generation: SecretGeneration,
+        /// Exclusive expiry retained by its authority verification.
+        expires_at: Timestamp,
+        /// Digest of the non-secret renewal decision.
+        evidence_digest: EvidenceDigest,
+    },
     /// Reserves a higher candidate while retaining active authority.
     BeginRotation {
         /// Exact next credential generation.
         candidate_generation: SecretGeneration,
+        /// Unique owner of the bounded rotation operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_owner: Option<SourceIdentifier>,
+        /// Fixed wall-clock counterpart to the operation's monotonic runtime deadline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_at: Option<Timestamp>,
+        /// Maximum retry count for this exact operation.
+        #[serde(default)]
+        retry_budget: u8,
+    },
+    /// Cancels a reserved candidate only when no plan, reference, or mutation debt exists.
+    CandidateCancelledNoEffect {
+        /// Exact candidate generation.
+        generation: SecretGeneration,
+        /// Digest of the no-effect cancellation decision.
+        evidence_digest: EvidenceDigest,
     },
     /// Moves authority to a fully admitted candidate.
     Cutover {
@@ -565,6 +654,11 @@ pub enum OnboardingEvent {
         /// Digest of redacted cleanup evidence.
         evidence_digest: EvidenceDigest,
     },
+    /// Revokes runtime activation and establishes cleanup authority for every retained secret.
+    ActivationQuarantined {
+        /// Digest of the exact quarantined runtime or activation-recipe state.
+        evidence_digest: EvidenceDigest,
+    },
     /// Blocks activation on an admitted policy decision.
     Blocked {
         /// Digest of the non-secret blocking decision.
@@ -582,6 +676,11 @@ impl OnboardingEvent {
     pub const fn kind(&self) -> OnboardingEventKind {
         match self {
             Self::CredentialImported { .. } => OnboardingEventKind::CredentialImported,
+            Self::SecretStorePlanned { .. } => OnboardingEventKind::SecretStorePlanned,
+            Self::SecretStoreReconciliationRequired { .. } => {
+                OnboardingEventKind::SecretStoreReconciliationRequired
+            }
+            Self::SecretStoreCleared { .. } => OnboardingEventKind::SecretStoreCleared,
             Self::ProtocolValidated { .. } => OnboardingEventKind::ProtocolValidated,
             Self::CredentialStored { .. } => OnboardingEventKind::CredentialStored,
             Self::AuthorityVerified { .. } => OnboardingEventKind::AuthorityVerified,
@@ -589,7 +688,11 @@ impl OnboardingEvent {
             Self::RatePolicyAdmitted { .. } => OnboardingEventKind::RatePolicyAdmitted,
             Self::RuntimeVerified { .. } => OnboardingEventKind::RuntimeVerified,
             Self::Activate { .. } => OnboardingEventKind::Activate,
+            Self::RenewalRequired { .. } => OnboardingEventKind::RenewalRequired,
             Self::BeginRotation { .. } => OnboardingEventKind::BeginRotation,
+            Self::CandidateCancelledNoEffect { .. } => {
+                OnboardingEventKind::CandidateCancelledNoEffect
+            }
             Self::Cutover { .. } => OnboardingEventKind::Cutover,
             Self::RemoteRevocation { .. } => OnboardingEventKind::RemoteRevocation,
             Self::LocalDeletion { .. } => OnboardingEventKind::LocalDeletion,
@@ -599,6 +702,7 @@ impl OnboardingEvent {
             Self::Unavailable { .. } => OnboardingEventKind::Unavailable,
             Self::IndeterminateRemoteState { .. } => OnboardingEventKind::IndeterminateRemoteState,
             Self::CleanupRequired { .. } => OnboardingEventKind::CleanupRequired,
+            Self::ActivationQuarantined { .. } => OnboardingEventKind::ActivationQuarantined,
             Self::Blocked { .. } => OnboardingEventKind::Blocked,
             Self::Cancelled { .. } => OnboardingEventKind::Cancelled,
         }
@@ -621,12 +725,17 @@ impl OnboardingEvent {
     pub const fn generation(&self) -> Option<SecretGeneration> {
         match self {
             Self::CredentialImported { generation, .. }
+            | Self::SecretStoreReconciliationRequired { generation, .. }
+            | Self::SecretStoreCleared { generation, .. }
+            | Self::CandidateCancelledNoEffect { generation, .. }
             | Self::ProtocolValidated { generation, .. }
             | Self::RemoteRevocation { generation, .. }
             | Self::LocalDeletion { generation, .. }
             | Self::Retire { generation }
-            | Self::Tombstone { generation } => Some(*generation),
+            | Self::Tombstone { generation }
+            | Self::RenewalRequired { generation, .. } => Some(*generation),
             Self::CredentialStored { reference } => Some(reference.generation()),
+            Self::SecretStorePlanned { plan, .. } => Some(plan.target().generation()),
             Self::AuthorityVerified { .. } => None,
             Self::RightsAdmitted { generation, .. }
             | Self::RatePolicyAdmitted { generation, .. }
@@ -636,6 +745,9 @@ impl OnboardingEvent {
             | Self::CleanupRequired { generation, .. } => *generation,
             Self::BeginRotation {
                 candidate_generation,
+                operation_owner: _,
+                deadline_at: _,
+                retry_budget: _,
             } => Some(*candidate_generation),
             Self::Cutover {
                 candidate_generation,
@@ -643,6 +755,7 @@ impl OnboardingEvent {
             } => Some(*candidate_generation),
             Self::RefreshRequired { .. }
             | Self::Unavailable { .. }
+            | Self::ActivationQuarantined { .. }
             | Self::Blocked { .. }
             | Self::Cancelled { .. } => None,
         }
@@ -663,6 +776,7 @@ impl OnboardingEvent {
 struct GenerationRecord {
     generation: SecretGeneration,
     state: CredentialGenerationState,
+    store_plan: Option<SecretMutationPlan>,
     reference: Option<SecretRef>,
     verification: Option<AuthorityVerification>,
     rights_digest: Option<EvidenceDigest>,
@@ -677,6 +791,7 @@ impl GenerationRecord {
         Self {
             generation,
             state: CredentialGenerationState::Reserved,
+            store_plan: None,
             reference: None,
             verification: None,
             rights_digest: None,
@@ -688,7 +803,8 @@ impl GenerationRecord {
     }
 
     fn fully_admitted(&self, capability: &ProviderCapability, observed_at: Timestamp) -> bool {
-        self.reference.is_some()
+        self.store_plan.is_none()
+            && self.reference.is_some()
             && self
                 .verification
                 .as_ref()
@@ -711,9 +827,14 @@ pub struct OnboardingLifecycle {
     generations: Vec<GenerationRecord>,
     active_generation: Option<SecretGeneration>,
     candidate_generation: Option<SecretGeneration>,
+    rotation_operation_owner: Option<SourceIdentifier>,
+    rotation_deadline_at: Option<Timestamp>,
+    rotation_retry_budget: u8,
+    rotation_started_from_renewal: bool,
     anonymous_rights_digest: Option<EvidenceDigest>,
     anonymous_rate_policy_digest: Option<EvidenceDigest>,
     anonymous_runtime_digest: Option<EvidenceDigest>,
+    cancelled: bool,
 }
 
 impl OnboardingLifecycle {
@@ -759,9 +880,14 @@ impl OnboardingLifecycle {
             generations,
             active_generation: None,
             candidate_generation,
+            rotation_operation_owner: None,
+            rotation_deadline_at: None,
+            rotation_retry_budget: 0,
+            rotation_started_from_renewal: false,
             anonymous_rights_digest: None,
             anonymous_rate_policy_digest: None,
             anonymous_runtime_digest: None,
+            cancelled: false,
         })
     }
 
@@ -773,10 +899,20 @@ impl OnboardingLifecycle {
         observed_at: Timestamp,
     ) -> Result<OnboardingState, OnboardingStateError> {
         self.ensure_capability(capability)?;
+        if self.state == OnboardingState::RotationPending
+            && rotation_progress_event(&event)
+            && self
+                .rotation_deadline_at
+                .is_some_and(|deadline| observed_at >= deadline)
+        {
+            return Err(OnboardingStateError::DeadlineExceeded);
+        }
         if matches!(
             self.state,
-            OnboardingState::RefreshRequired
+            OnboardingState::RenewalRequired
+                | OnboardingState::RefreshRequired
                 | OnboardingState::Unavailable
+                | OnboardingState::SecretReconciliationRequired
                 | OnboardingState::IndeterminateRemoteState
                 | OnboardingState::CleanupRequired
                 | OnboardingState::Blocked
@@ -787,11 +923,18 @@ impl OnboardingLifecycle {
                 | OnboardingEvent::Blocked { .. }
                 | OnboardingEvent::Cancelled { .. }
                 | OnboardingEvent::CleanupRequired { .. }
+                | OnboardingEvent::ActivationQuarantined { .. }
                 | OnboardingEvent::IndeterminateRemoteState { .. }
                 | OnboardingEvent::RemoteRevocation { .. }
                 | OnboardingEvent::LocalDeletion { .. }
                 | OnboardingEvent::Retire { .. }
                 | OnboardingEvent::Tombstone { .. }
+                | OnboardingEvent::BeginRotation { .. }
+                | OnboardingEvent::RenewalRequired { .. }
+                | OnboardingEvent::SecretStoreReconciliationRequired { .. }
+                | OnboardingEvent::SecretStoreCleared { .. }
+                | OnboardingEvent::CredentialStored { .. }
+                | OnboardingEvent::CandidateCancelledNoEffect { .. }
         ) {
             return Err(OnboardingStateError::InvalidTransition);
         }
@@ -803,10 +946,89 @@ impl OnboardingLifecycle {
                 require_digest(evidence_digest)?;
                 self.require_candidate(generation)?;
                 let record = self.generation_mut(generation)?;
-                if record.state != CredentialGenerationState::Reserved {
+                if record.state != CredentialGenerationState::Reserved
+                    || record.store_plan.is_some()
+                    || record.reference.is_some()
+                {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 self.state = self.pending_state(OnboardingState::CredentialImportedUnverified);
+            }
+            OnboardingEvent::SecretStorePlanned {
+                plan,
+                evidence_digest,
+            } => {
+                require_digest(evidence_digest)?;
+                let generation = plan.target().generation();
+                self.require_candidate(generation)?;
+                let record = self.generation_mut(generation)?;
+                if record.state != CredentialGenerationState::Reserved
+                    || record.store_plan.is_some()
+                    || record.reference.is_some()
+                {
+                    return Err(OnboardingStateError::InvalidTransition);
+                }
+                record.store_plan = Some(plan);
+                record.state = CredentialGenerationState::StorePlanned;
+                self.state = self.pending_state(OnboardingState::CredentialImportedUnverified);
+            }
+            OnboardingEvent::SecretStoreReconciliationRequired {
+                generation,
+                evidence_digest,
+            } => {
+                require_digest(evidence_digest)?;
+                self.require_candidate(generation)?;
+                let record = self.generation_mut(generation)?;
+                if !matches!(
+                    record.state,
+                    CredentialGenerationState::StorePlanned
+                        | CredentialGenerationState::StoreReconciliationRequired
+                ) || record.store_plan.is_none()
+                    || record.reference.is_some()
+                {
+                    return Err(OnboardingStateError::InvalidTransition);
+                }
+                record.state = CredentialGenerationState::StoreReconciliationRequired;
+                self.state = OnboardingState::SecretReconciliationRequired;
+            }
+            OnboardingEvent::SecretStoreCleared {
+                generation,
+                reference,
+                outcome: _,
+            } => {
+                let is_candidate = self.candidate_generation == Some(generation);
+                let quarantined_cleanup =
+                    !is_candidate && self.state == OnboardingState::CleanupRequired;
+                if !is_candidate && !quarantined_cleanup {
+                    return Err(OnboardingStateError::GenerationMismatch);
+                }
+                {
+                    let record = self.generation_mut(generation)?;
+                    if !matches!(
+                        record.state,
+                        CredentialGenerationState::StorePlanned
+                            | CredentialGenerationState::StoreReconciliationRequired
+                            | CredentialGenerationState::CleanupRequired
+                    ) || record
+                        .store_plan
+                        .as_ref()
+                        .is_none_or(|plan| plan.target() != &reference)
+                        || record.reference.is_some()
+                    {
+                        return Err(OnboardingStateError::InvalidTransition);
+                    }
+                    record.store_plan = None;
+                    record.state = if quarantined_cleanup {
+                        CredentialGenerationState::AbandonedNoEffect
+                    } else {
+                        CredentialGenerationState::Reserved
+                    };
+                }
+                self.state = if quarantined_cleanup {
+                    self.cleanup_completion_state()
+                } else {
+                    self.pending_state(OnboardingState::UserActionRequired)
+                };
             }
             OnboardingEvent::ProtocolValidated {
                 generation,
@@ -815,7 +1037,9 @@ impl OnboardingLifecycle {
                 require_digest(evidence_digest)?;
                 self.require_candidate(generation)?;
                 let record = self.generation(generation)?;
-                if record.state != CredentialGenerationState::Reserved || record.reference.is_some()
+                if record.state != CredentialGenerationState::Reserved
+                    || record.store_plan.is_some()
+                    || record.reference.is_some()
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -830,10 +1054,24 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 let record = self.generation_mut(generation)?;
-                if record.state != CredentialGenerationState::Reserved || record.reference.is_some()
+                let planned = record
+                    .store_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.target() == &reference);
+                let legacy_unplanned = record.store_plan.is_none()
+                    && record.state == CredentialGenerationState::Reserved;
+                if (!matches!(
+                    record.state,
+                    CredentialGenerationState::StorePlanned
+                        | CredentialGenerationState::StoreReconciliationRequired
+                        | CredentialGenerationState::CleanupRequired
+                ) && !legacy_unplanned)
+                    || (!planned && !legacy_unplanned)
+                    || record.reference.is_some()
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
+                record.store_plan = None;
                 record.reference = Some(reference);
                 record.state = CredentialGenerationState::StoredUnverified;
                 self.state = self.pending_state(OnboardingState::StoredUnverified);
@@ -948,12 +1186,41 @@ impl OnboardingLifecycle {
                 }
                 self.state = OnboardingState::ActiveScoped;
             }
+            OnboardingEvent::RenewalRequired {
+                generation,
+                expires_at,
+                evidence_digest,
+            } => {
+                require_digest(evidence_digest)?;
+                let verification = self
+                    .generation_verification(generation)
+                    .ok_or(OnboardingStateError::InvalidTransition)?;
+                if self.state != OnboardingState::ActiveScoped
+                    || self.active_generation != Some(generation)
+                    || verification.expires_at() != Some(expires_at)
+                    || observed_at < expires_at
+                {
+                    return Err(OnboardingStateError::InvalidTransition);
+                }
+                self.state = OnboardingState::RenewalRequired;
+            }
             OnboardingEvent::BeginRotation {
                 candidate_generation,
+                operation_owner,
+                deadline_at,
+                retry_budget,
             } => {
+                let started_from_renewal = self.state == OnboardingState::RenewalRequired;
                 if !capability.lifecycle_support().rotation()
-                    || self.state != OnboardingState::ActiveScoped
+                    || !matches!(
+                        self.state,
+                        OnboardingState::ActiveScoped | OnboardingState::RenewalRequired
+                    )
                     || self.candidate_generation.is_some()
+                    || retry_budget > MAX_OPERATION_RETRY_BUDGET
+                    || deadline_at.is_some_and(|deadline| deadline <= observed_at)
+                    || capability.rate_policy().enforcement_policy().is_some()
+                        && (operation_owner.is_none() || deadline_at.is_none())
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -977,7 +1244,37 @@ impl OnboardingLifecycle {
                 self.generations
                     .push(GenerationRecord::reserved(candidate_generation));
                 self.candidate_generation = Some(candidate_generation);
+                self.rotation_operation_owner = operation_owner;
+                self.rotation_deadline_at = deadline_at;
+                self.rotation_retry_budget = retry_budget;
+                self.rotation_started_from_renewal = started_from_renewal;
                 self.state = OnboardingState::RotationPending;
+            }
+            OnboardingEvent::CandidateCancelledNoEffect {
+                generation,
+                evidence_digest,
+            } => {
+                require_digest(evidence_digest)?;
+                self.require_candidate(generation)?;
+                let renewal_required = self.rotation_started_from_renewal;
+                let active_exists = self.active_generation.is_some();
+                let record = self.generation_mut(generation)?;
+                if record.state != CredentialGenerationState::Reserved
+                    || record.store_plan.is_some()
+                    || record.reference.is_some()
+                {
+                    return Err(OnboardingStateError::InvalidTransition);
+                }
+                record.state = CredentialGenerationState::AbandonedNoEffect;
+                self.candidate_generation = None;
+                self.clear_rotation_operation();
+                self.state = if !active_exists {
+                    OnboardingState::Blocked
+                } else if renewal_required {
+                    OnboardingState::RenewalRequired
+                } else {
+                    OnboardingState::ActiveScoped
+                };
             }
             OnboardingEvent::Cutover {
                 prior_generation,
@@ -1010,6 +1307,7 @@ impl OnboardingLifecycle {
                     CredentialGenerationState::ActiveScoped;
                 self.active_generation = Some(candidate_generation);
                 self.candidate_generation = None;
+                self.clear_rotation_operation();
                 self.state = OnboardingState::ActiveScoped;
             }
             OnboardingEvent::RemoteRevocation {
@@ -1019,7 +1317,10 @@ impl OnboardingLifecycle {
             } => {
                 require_digest(evidence_digest)?;
                 let supports_remote_revocation = capability.lifecycle_support().remote_revocation();
-                if !supports_remote_revocation && outcome != RemoteRevocationOutcome::Unsupported {
+                if (!supports_remote_revocation && outcome != RemoteRevocationOutcome::Unsupported)
+                    || (supports_remote_revocation
+                        && outcome == RemoteRevocationOutcome::Unsupported)
+                {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 let generation_state = self.generation(generation)?.state;
@@ -1053,24 +1354,33 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidTransition);
                 } else {
                     self.generation_mut(generation)?.remote_revocation = Some(outcome);
-                    self.state = match (outcome, generation_state) {
-                        (RemoteRevocationOutcome::Indeterminate, _) => {
-                            OnboardingState::IndeterminateRemoteState
+                    self.state = if self.active_generation.is_none() {
+                        OnboardingState::CleanupRequired
+                    } else {
+                        match (outcome, generation_state) {
+                            (RemoteRevocationOutcome::Indeterminate, _) => {
+                                OnboardingState::IndeterminateRemoteState
+                            }
+                            (_, CredentialGenerationState::CleanupRequired) => {
+                                OnboardingState::CleanupRequired
+                            }
+                            (
+                                RemoteRevocationOutcome::Confirmed
+                                | RemoteRevocationOutcome::NotFound,
+                                _,
+                            ) => OnboardingState::ActiveScoped,
+                            (RemoteRevocationOutcome::Unsupported, _)
+                                if supports_remote_revocation =>
+                            {
+                                OnboardingState::RefreshRequired
+                            }
+                            (RemoteRevocationOutcome::Unsupported, _) => {
+                                OnboardingState::ActiveScoped
+                            }
+                            (RemoteRevocationOutcome::Failed, _) => {
+                                OnboardingState::RevocationUnconfirmed
+                            }
                         }
-                        (_, CredentialGenerationState::CleanupRequired) => {
-                            OnboardingState::CleanupRequired
-                        }
-                        (
-                            RemoteRevocationOutcome::Confirmed | RemoteRevocationOutcome::NotFound,
-                            _,
-                        ) => OnboardingState::ActiveScoped,
-                        (RemoteRevocationOutcome::Unsupported, _) if supports_remote_revocation => {
-                            OnboardingState::RefreshRequired
-                        }
-                        (
-                            RemoteRevocationOutcome::Unsupported | RemoteRevocationOutcome::Failed,
-                            _,
-                        ) => OnboardingState::RevocationUnconfirmed,
                     };
                 }
             }
@@ -1087,6 +1397,7 @@ impl OnboardingLifecycle {
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
+                let active_exists = self.active_generation.is_some();
                 let record = self.generation_mut(generation)?;
                 record.local_deletion = Some(outcome);
                 if matches!(
@@ -1097,14 +1408,18 @@ impl OnboardingLifecycle {
                     self.state = OnboardingState::CleanupRequired;
                 } else {
                     record.state = CredentialGenerationState::SupersededRetained;
-                    self.state = match record.remote_revocation {
-                        Some(
-                            RemoteRevocationOutcome::Unsupported | RemoteRevocationOutcome::Failed,
-                        ) => OnboardingState::RevocationUnconfirmed,
-                        Some(RemoteRevocationOutcome::Indeterminate) => {
-                            OnboardingState::IndeterminateRemoteState
+                    self.state = if !active_exists {
+                        OnboardingState::CleanupRequired
+                    } else {
+                        match record.remote_revocation {
+                            Some(RemoteRevocationOutcome::Failed) => {
+                                OnboardingState::RevocationUnconfirmed
+                            }
+                            Some(RemoteRevocationOutcome::Indeterminate) => {
+                                OnboardingState::IndeterminateRemoteState
+                            }
+                            _ => OnboardingState::ActiveScoped,
                         }
-                        _ => OnboardingState::ActiveScoped,
                     };
                 }
             }
@@ -1115,7 +1430,14 @@ impl OnboardingLifecycle {
                         record.local_deletion,
                         Some(LocalDeletionOutcome::Deleted | LocalDeletionOutcome::NotFound)
                     )
-                    || record.remote_revocation.is_none()
+                    || !matches!(
+                        record.remote_revocation,
+                        Some(
+                            RemoteRevocationOutcome::Confirmed
+                                | RemoteRevocationOutcome::NotFound
+                                | RemoteRevocationOutcome::Unsupported
+                        )
+                    )
                 {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
@@ -1127,6 +1449,24 @@ impl OnboardingLifecycle {
                     return Err(OnboardingStateError::InvalidTransition);
                 }
                 record.state = CredentialGenerationState::Tombstoned;
+                if self.candidate_generation == Some(generation) {
+                    let renewal_required = self.rotation_started_from_renewal;
+                    self.candidate_generation = None;
+                    self.clear_rotation_operation();
+                    self.state = if self.active_generation.is_some() {
+                        if renewal_required {
+                            OnboardingState::RenewalRequired
+                        } else {
+                            OnboardingState::ActiveScoped
+                        }
+                    } else {
+                        OnboardingState::Blocked
+                    };
+                } else if self.active_generation.is_some() {
+                    self.state = OnboardingState::ActiveScoped;
+                } else {
+                    self.state = self.cleanup_completion_state();
+                }
             }
             OnboardingEvent::RefreshRequired { evidence_digest } => {
                 require_digest(evidence_digest)?;
@@ -1152,14 +1492,63 @@ impl OnboardingLifecycle {
             } => {
                 require_digest(evidence_digest)?;
                 if let Some(generation) = generation {
-                    self.generation_mut(generation)?.state =
-                        CredentialGenerationState::CleanupRequired;
+                    let active_is_target = self.active_generation == Some(generation);
+                    let record = self.generation_mut(generation)?;
+                    if record.reference.is_none() && record.store_plan.is_none() {
+                        return Err(OnboardingStateError::InvalidTransition);
+                    }
+                    record.state = CredentialGenerationState::CleanupRequired;
+                    if active_is_target {
+                        self.active_generation = None;
+                    }
                 }
                 self.state = OnboardingState::CleanupRequired;
             }
-            OnboardingEvent::Blocked { evidence_digest }
-            | OnboardingEvent::Cancelled { evidence_digest } => {
+            OnboardingEvent::ActivationQuarantined { evidence_digest } => {
                 require_digest(evidence_digest)?;
+                let mut cleanup_required = false;
+                for record in &mut self.generations {
+                    match record.state {
+                        CredentialGenerationState::Reserved => {
+                            if record.reference.is_some() || record.store_plan.is_some() {
+                                return Err(OnboardingStateError::InvalidTransition);
+                            }
+                            record.state = CredentialGenerationState::AbandonedNoEffect;
+                        }
+                        CredentialGenerationState::StorePlanned
+                        | CredentialGenerationState::StoreReconciliationRequired
+                        | CredentialGenerationState::StoredUnverified
+                        | CredentialGenerationState::VerifiedLeastPrivilege
+                        | CredentialGenerationState::ActiveScoped
+                        | CredentialGenerationState::SupersededRetained
+                        | CredentialGenerationState::CleanupRequired => {
+                            if record.reference.is_none() && record.store_plan.is_none() {
+                                return Err(OnboardingStateError::InvalidTransition);
+                            }
+                            record.state = CredentialGenerationState::CleanupRequired;
+                            cleanup_required = true;
+                        }
+                        CredentialGenerationState::Retired
+                        | CredentialGenerationState::Tombstoned
+                        | CredentialGenerationState::AbandonedNoEffect => {}
+                    }
+                }
+                self.active_generation = None;
+                self.candidate_generation = None;
+                self.clear_rotation_operation();
+                self.state = if cleanup_required {
+                    OnboardingState::CleanupRequired
+                } else {
+                    OnboardingState::Blocked
+                };
+            }
+            OnboardingEvent::Blocked { evidence_digest } => {
+                require_digest(evidence_digest)?;
+                self.state = OnboardingState::Blocked;
+            }
+            OnboardingEvent::Cancelled { evidence_digest } => {
+                require_digest(evidence_digest)?;
+                self.cancelled = true;
                 self.state = OnboardingState::Blocked;
             }
         }
@@ -1206,6 +1595,38 @@ impl OnboardingLifecycle {
         self.candidate_generation
     }
 
+    /// Returns the next contiguous credential generation without reserving it.
+    pub fn next_generation(&self) -> Result<SecretGeneration, OnboardingStateError> {
+        let next = match self.generations.last() {
+            Some(record) => record
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or(OnboardingStateError::ResourceLimit)?,
+            None => 1,
+        };
+        SecretGeneration::new(next).map_err(|_| OnboardingStateError::ResourceLimit)
+    }
+
+    /// Returns the current rotation-operation owner.
+    pub const fn rotation_operation_owner(&self) -> Option<&SourceIdentifier> {
+        self.rotation_operation_owner.as_ref()
+    }
+
+    /// Returns the fixed wall-clock deadline for the current rotation.
+    pub const fn rotation_deadline_at(&self) -> Option<Timestamp> {
+        self.rotation_deadline_at
+    }
+
+    /// Returns the bounded retry ceiling for the current rotation.
+    pub const fn rotation_retry_budget(&self) -> Option<u8> {
+        if self.candidate_generation.is_some() {
+            Some(self.rotation_retry_budget)
+        } else {
+            None
+        }
+    }
+
     /// Returns the retained state for one exact generation.
     pub fn generation_state(
         &self,
@@ -1225,6 +1646,25 @@ impl OnboardingLifecycle {
             .and_then(|record| record.reference.as_ref())
     }
 
+    /// Returns the durable exact mutation plan for an unfinished candidate store.
+    pub fn generation_store_plan(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<&SecretMutationPlan> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.store_plan.as_ref())
+    }
+
+    /// Returns the exact local target that may require reconciliation or deletion.
+    pub fn generation_cleanup_reference(&self, generation: SecretGeneration) -> Option<&SecretRef> {
+        self.generation_reference(generation).or_else(|| {
+            self.generation_store_plan(generation)
+                .map(SecretMutationPlan::target)
+        })
+    }
+
     /// Returns retained least-privilege verification for one exact generation.
     pub fn generation_verification(
         &self,
@@ -1234,6 +1674,87 @@ impl OnboardingLifecycle {
             .iter()
             .find(|record| record.generation == generation)
             .and_then(|record| record.verification.as_ref())
+    }
+
+    /// Returns the retained rights admission for one exact generation.
+    pub fn generation_rights_digest(&self, generation: SecretGeneration) -> Option<EvidenceDigest> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.rights_digest)
+    }
+
+    /// Returns the retained rate-policy admission for one exact generation.
+    pub fn generation_rate_policy_digest(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<EvidenceDigest> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.rate_policy_digest)
+    }
+
+    /// Returns the retained runtime verification for one exact generation.
+    pub fn generation_runtime_digest(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<EvidenceDigest> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.runtime_digest)
+    }
+
+    /// Returns the no-credential rights admission.
+    pub const fn anonymous_rights_digest(&self) -> Option<EvidenceDigest> {
+        self.anonymous_rights_digest
+    }
+
+    /// Returns the no-credential rate-policy admission.
+    pub const fn anonymous_rate_policy_digest(&self) -> Option<EvidenceDigest> {
+        self.anonymous_rate_policy_digest
+    }
+
+    /// Returns the no-credential runtime verification.
+    pub const fn anonymous_runtime_digest(&self) -> Option<EvidenceDigest> {
+        self.anonymous_runtime_digest
+    }
+
+    /// Returns whether terminal cancellation was durably recorded after cleanup.
+    pub const fn cancellation_recorded(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Returns the latest separately retained remote-revocation result.
+    pub fn generation_remote_revocation(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<RemoteRevocationOutcome> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.remote_revocation)
+    }
+
+    /// Returns the latest separately retained exact local-deletion result.
+    pub fn generation_local_deletion(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<LocalDeletionOutcome> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.local_deletion)
+    }
+
+    /// Iterates every retained generation and state in ascending generation order.
+    pub fn generation_states(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (SecretGeneration, CredentialGenerationState)> + '_ {
+        self.generations
+            .iter()
+            .map(|record| (record.generation, record.state))
     }
 
     /// Returns the exact rights-decision digest retained for the active authority.
@@ -1253,6 +1774,7 @@ impl OnboardingLifecycle {
         !matches!(
             self.state,
             OnboardingState::Unavailable
+                | OnboardingState::RenewalRequired
                 | OnboardingState::RefreshRequired
                 | OnboardingState::IndeterminateRemoteState
                 | OnboardingState::Blocked
@@ -1342,6 +1864,27 @@ impl OnboardingLifecycle {
             OnboardingState::RightsAdmissionPending
         }
     }
+
+    fn clear_rotation_operation(&mut self) {
+        self.rotation_operation_owner = None;
+        self.rotation_deadline_at = None;
+        self.rotation_retry_budget = 0;
+        self.rotation_started_from_renewal = false;
+    }
+
+    fn cleanup_completion_state(&self) -> OnboardingState {
+        if self
+            .generations
+            .iter()
+            .any(|record| record.state == CredentialGenerationState::CleanupRequired)
+        {
+            OnboardingState::CleanupRequired
+        } else if self.active_generation.is_some() {
+            OnboardingState::ActiveScoped
+        } else {
+            OnboardingState::Blocked
+        }
+    }
 }
 
 /// Provider onboarding validation or transition failure.
@@ -1371,6 +1914,9 @@ pub enum OnboardingStateError {
     /// The event is not legal from the current state.
     #[error("provider onboarding transition is invalid")]
     InvalidTransition,
+    /// The bounded rotation operation elapsed before this transition.
+    #[error("provider onboarding operation deadline elapsed")]
+    DeadlineExceeded,
     /// A bounded state or event ceiling was exceeded.
     #[error("provider onboarding resource limit was exceeded")]
     ResourceLimit,
@@ -1404,4 +1950,20 @@ fn require_digest(digest: EvidenceDigest) -> Result<(), OnboardingStateError> {
     } else {
         Err(OnboardingStateError::InvalidEvidence)
     }
+}
+
+fn rotation_progress_event(event: &OnboardingEvent) -> bool {
+    matches!(
+        event,
+        OnboardingEvent::CredentialImported { .. }
+            | OnboardingEvent::SecretStorePlanned { .. }
+            | OnboardingEvent::ProtocolValidated { .. }
+            | OnboardingEvent::CredentialStored { .. }
+            | OnboardingEvent::AuthorityVerified { .. }
+            | OnboardingEvent::RightsAdmitted { .. }
+            | OnboardingEvent::RatePolicyAdmitted { .. }
+            | OnboardingEvent::RuntimeVerified { .. }
+            | OnboardingEvent::Activate { .. }
+            | OnboardingEvent::Cutover { .. }
+    )
 }

@@ -7,9 +7,12 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
-    CapabilityRegistrationOutcome, DataUseOperation, DataUseRight, OnboardingState,
-    OperationAdmission, ProfileEvidence, ProfileReleaseState, ProviderCapabilityRevision,
-    ProviderOnboardingProfile, ProviderPublicConfiguration, Requirement, ZeroFeeStatus,
+    CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, DataUseOperation,
+    DataUseRight, EvidenceBinding, HumanBoundary, LifecycleSupport, LocalDeletionOutcome,
+    OnboardingState, OperationAdmission, ProfileEvidence, ProfileReleaseState,
+    ProviderCapabilityRevision, ProviderOnboardingProfile, ProviderPublicConfiguration,
+    RatePolicyDescriptor, RemoteRevocationOutcome, Requirement, RightsAdmissionState, SetupMode,
+    ZeroFeeStatus,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,6 +22,20 @@ use uuid::Uuid;
 pub struct ProviderProfileView {
     id: &'static str,
     display_name: &'static str,
+    capability_revision: u64,
+    capability_digest: EvidenceDigest,
+    selected_setup_mode: SetupMode,
+    setup_modes: [SetupModeAvailability; 5],
+    human_boundary: HumanBoundary,
+    credential_kind: CredentialKind,
+    minimum_authority: Vec<SourceIdentifier>,
+    maximum_authority: Vec<SourceIdentifier>,
+    verifier_revision: SourceIdentifier,
+    rate_policy: RatePolicyDescriptor,
+    rights_state: RightsAdmissionState,
+    lifecycle_support: LifecycleSupport,
+    capability_evidence: Vec<EvidenceBinding>,
+    refresh_trigger: SourceIdentifier,
     zero_fee: ZeroFeeStatus,
     account_requirement: Requirement,
     credential_requirement: Requirement,
@@ -37,6 +54,13 @@ pub struct ProviderProfileView {
     revocation: &'static str,
     recovery: &'static [&'static str],
     evidence: Vec<ProfileEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct SetupModeAvailability {
+    mode: SetupMode,
+    supported: bool,
+    selected: bool,
 }
 
 impl ProviderProfileView {
@@ -58,6 +82,7 @@ impl ProviderProfileView {
 
 impl From<&ProviderOnboardingProfile> for ProviderProfileView {
     fn from(profile: &ProviderOnboardingProfile) -> Self {
+        let capability = profile.capability();
         let (account, credential, administrative_contact) = profile.requirements();
         let (handoff_url, handoff_instruction) = profile.handoff();
         let (coverage, quality_ceiling) = profile.coverage();
@@ -66,6 +91,20 @@ impl From<&ProviderOnboardingProfile> for ProviderProfileView {
         Self {
             id: profile.id(),
             display_name: profile.display_name(),
+            capability_revision: capability.revision().get(),
+            capability_digest: capability.content_digest(),
+            selected_setup_mode: capability.setup_mode(),
+            setup_modes: setup_mode_availability(capability.setup_mode()),
+            human_boundary: capability.human_boundary(),
+            credential_kind: capability.credential_kind(),
+            minimum_authority: capability.minimum_authority().as_slice().to_vec(),
+            maximum_authority: capability.maximum_authority().as_slice().to_vec(),
+            verifier_revision: capability.verifier_revision().clone(),
+            rate_policy: capability.rate_policy().clone(),
+            rights_state: capability.rights_state(),
+            lifecycle_support: capability.lifecycle_support(),
+            capability_evidence: capability.evidence().to_vec(),
+            refresh_trigger: capability.refresh_trigger().clone(),
             zero_fee: profile.zero_fee(),
             account_requirement: account,
             credential_requirement: credential,
@@ -144,6 +183,14 @@ pub enum OnboardingNextAction {
     VerifyAndActivate,
     /// Refresh the named mutable official evidence.
     RefreshEvidence,
+    /// Import a replacement credential before the active verification expires.
+    RenewCredential,
+    /// Import a higher replacement generation while retaining prior authority.
+    ImportReplacement,
+    /// Verify the replacement and atomically cut over authority.
+    VerifyAndCutover,
+    /// Reconcile remote status and exact local cleanup for retained generations.
+    ReconcileCleanup,
     /// Resolve the exact rights conflict before credential handling.
     ResolveRights,
     /// Recover the provider condition, then create a new immutable session.
@@ -192,6 +239,7 @@ pub struct ProviderPortalActivationView {
     public_configuration_digest: EvidenceDigest,
     credential_generation: Option<u64>,
     verification_expires_at: Option<Timestamp>,
+    authority_effective_at: Timestamp,
     issued_at: Timestamp,
 }
 
@@ -207,6 +255,7 @@ impl ProviderPortalActivationView {
             public_configuration_digest: lease.public_configuration_digest(),
             credential_generation: lease.generation().map(SecretGeneration::get),
             verification_expires_at: lease.verification_expires_at(),
+            authority_effective_at: lease.authority_effective_at(),
             issued_at: lease.issued_at(),
         }
     }
@@ -217,13 +266,32 @@ impl ProviderPortalActivationView {
 pub struct OnboardingSessionView {
     session_id: Uuid,
     surface_id: String,
+    capability_revision: u64,
+    capability_digest: EvidenceDigest,
+    current_capability: bool,
     state: OnboardingState,
     next_action: OnboardingNextAction,
     credential_stored: bool,
+    active_generation: Option<u64>,
+    candidate_generation: Option<u64>,
+    rotation_operation_owner: Option<SourceIdentifier>,
+    rotation_deadline_at: Option<Timestamp>,
+    rotation_retry_budget: Option<u8>,
+    generations: Vec<CredentialGenerationView>,
     public_configuration: ProviderPublicConfiguration,
     official_handoff_url: &'static str,
     handoff_instruction: &'static str,
     recovery: &'static [&'static str],
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CredentialGenerationView {
+    generation: u64,
+    state: CredentialGenerationState,
+    credential_stored: bool,
+    verification_expires_at: Option<Timestamp>,
+    remote_revocation: Option<RemoteRevocationOutcome>,
+    local_deletion: Option<LocalDeletionOutcome>,
 }
 
 /// Immutable in-process authority to construct one exact activated provider adapter.
@@ -245,6 +313,7 @@ pub struct ProviderActivationLease {
     generation: Option<SecretGeneration>,
     secret_reference: Option<SecretRef>,
     verification_expires_at: Option<Timestamp>,
+    authority_effective_at: Timestamp,
     issued_at: Timestamp,
 }
 
@@ -263,6 +332,7 @@ impl ProviderActivationLease {
             generation: input.generation,
             secret_reference: input.secret_reference,
             verification_expires_at: input.verification_expires_at,
+            authority_effective_at: input.authority_effective_at,
             issued_at: input.issued_at,
         }
     }
@@ -329,6 +399,11 @@ impl ProviderActivationLease {
         self.verification_expires_at
     }
 
+    /// Returns the durable instant from which this exact activation authority is effective.
+    pub const fn authority_effective_at(&self) -> Timestamp {
+        self.authority_effective_at
+    }
+
     /// Returns the trusted local instant when the lease was issued.
     pub const fn issued_at(&self) -> Timestamp {
         self.issued_at
@@ -346,6 +421,7 @@ impl std::fmt::Debug for ProviderActivationLease {
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
+            .field("authority_effective_at", &self.authority_effective_at)
             .field("issued_at", &self.issued_at)
             .finish()
     }
@@ -364,6 +440,7 @@ pub(super) struct ProviderActivationLeaseInput {
     pub generation: Option<SecretGeneration>,
     pub secret_reference: Option<SecretRef>,
     pub verification_expires_at: Option<Timestamp>,
+    pub authority_effective_at: Timestamp,
     pub issued_at: Timestamp,
 }
 
@@ -405,36 +482,111 @@ pub(super) fn session_view(
 ) -> OnboardingSessionView {
     let lifecycle = resumed.lifecycle();
     let generation = lifecycle
-        .active_generation()
-        .or_else(|| lifecycle.candidate_generation());
+        .candidate_generation()
+        .or_else(|| lifecycle.active_generation());
     let credential_stored = generation
         .and_then(|generation| lifecycle.generation_reference(generation))
         .is_some();
-    let next_action = match lifecycle.state() {
-        OnboardingState::UserActionRequired => OnboardingNextAction::ImportSecret,
-        OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
-        OnboardingState::RefreshRequired => OnboardingNextAction::RefreshEvidence,
-        OnboardingState::Unavailable => OnboardingNextAction::StartNewSession,
-        OnboardingState::ActiveScoped => OnboardingNextAction::Active,
-        OnboardingState::Blocked
-            if profile.release_state() == ProfileReleaseState::RightsBlocked =>
-        {
-            OnboardingNextAction::ResolveRights
+    let cleanup_required = lifecycle.generation_states().any(|(generation, state)| {
+        lifecycle.active_generation() != Some(generation)
+            && matches!(
+                state,
+                CredentialGenerationState::SupersededRetained
+                    | CredentialGenerationState::CleanupRequired
+                    | CredentialGenerationState::Retired
+            )
+    });
+    let current_capability = lifecycle.capability_revision() == profile.capability().revision()
+        && lifecycle.capability_digest() == profile.capability().content_digest();
+    let next_action = if !current_capability {
+        OnboardingNextAction::RefreshEvidence
+    } else {
+        match lifecycle.state() {
+            OnboardingState::UserActionRequired => OnboardingNextAction::ImportSecret,
+            OnboardingState::SecretReconciliationRequired
+                if lifecycle.active_generation().is_some() =>
+            {
+                OnboardingNextAction::ImportReplacement
+            }
+            OnboardingState::SecretReconciliationRequired => OnboardingNextAction::ImportSecret,
+            OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RuntimeVerificationPending
+                if lifecycle.active_generation().is_some() =>
+            {
+                OnboardingNextAction::VerifyAndCutover
+            }
+            OnboardingState::RuntimeVerificationPending => OnboardingNextAction::VerifyAndActivate,
+            OnboardingState::RenewalRequired => OnboardingNextAction::RenewCredential,
+            OnboardingState::RotationPending if credential_stored => {
+                OnboardingNextAction::VerifyAndCutover
+            }
+            OnboardingState::RotationPending => OnboardingNextAction::ImportReplacement,
+            OnboardingState::RefreshRequired => OnboardingNextAction::RefreshEvidence,
+            OnboardingState::Unavailable => OnboardingNextAction::StartNewSession,
+            OnboardingState::ActiveScoped if cleanup_required => {
+                OnboardingNextAction::ReconcileCleanup
+            }
+            OnboardingState::ActiveScoped => OnboardingNextAction::Active,
+            OnboardingState::RevocationUnconfirmed
+            | OnboardingState::IndeterminateRemoteState
+            | OnboardingState::CleanupRequired => OnboardingNextAction::ReconcileCleanup,
+            OnboardingState::Blocked
+                if profile.release_state() == ProfileReleaseState::RightsBlocked =>
+            {
+                OnboardingNextAction::ResolveRights
+            }
+            OnboardingState::Blocked => OnboardingNextAction::None,
+            _ => OnboardingNextAction::CompleteProviderHandoff,
         }
-        OnboardingState::Blocked => OnboardingNextAction::None,
-        _ => OnboardingNextAction::CompleteProviderHandoff,
     };
+    let generations = lifecycle
+        .generation_states()
+        .map(|(generation, state)| CredentialGenerationView {
+            generation: generation.get(),
+            state,
+            credential_stored: lifecycle.generation_reference(generation).is_some(),
+            verification_expires_at: lifecycle
+                .generation_verification(generation)
+                .and_then(|verification| verification.expires_at()),
+            remote_revocation: lifecycle.generation_remote_revocation(generation),
+            local_deletion: lifecycle.generation_local_deletion(generation),
+        })
+        .collect();
     let (official_handoff_url, handoff_instruction) = profile.handoff();
     let (_, _, recovery) = profile.lifecycle();
     OnboardingSessionView {
         session_id: resumed.reservation().session_id(),
         surface_id: profile.id().to_owned(),
+        capability_revision: lifecycle.capability_revision().get(),
+        capability_digest: lifecycle.capability_digest(),
+        current_capability,
         state: lifecycle.state(),
         next_action,
         credential_stored,
+        active_generation: lifecycle.active_generation().map(SecretGeneration::get),
+        candidate_generation: lifecycle.candidate_generation().map(SecretGeneration::get),
+        rotation_operation_owner: lifecycle.rotation_operation_owner().cloned(),
+        rotation_deadline_at: lifecycle.rotation_deadline_at(),
+        rotation_retry_budget: lifecycle.rotation_retry_budget(),
+        generations,
         public_configuration: resumed.public_configuration().clone(),
         official_handoff_url,
         handoff_instruction,
         recovery,
     }
+}
+
+fn setup_mode_availability(selected: SetupMode) -> [SetupModeAvailability; 5] {
+    [
+        SetupMode::NoCredential,
+        SetupMode::ManualApiKeyImport,
+        SetupMode::OAuthAuthorizationCodePkce,
+        SetupMode::OAuthDevice,
+        SetupMode::DynamicClientRegistration,
+    ]
+    .map(|mode| SetupModeAvailability {
+        mode,
+        supported: mode == selected,
+        selected: mode == selected,
+    })
 }

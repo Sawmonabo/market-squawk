@@ -24,9 +24,8 @@ impl SharedProviderBudget {
                 |generation| generation.checked_add(1),
             );
         }
-        let durable_terminal = durable_binding.map(|binding| {
-            binding.session.persist_terminal_and_detach()
-        });
+        let durable_terminal =
+            durable_binding.map(|binding| binding.session.persist_terminal_and_detach());
         match durable_terminal {
             None | Some(Ok(())) => reason,
             Some(Err(_)) => BudgetUnavailableReason::PersistenceUnavailable,

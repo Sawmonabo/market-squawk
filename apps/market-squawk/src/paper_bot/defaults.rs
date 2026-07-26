@@ -40,6 +40,7 @@ use market_squawk_portfolio::{
     PortfolioLimits, PortfolioService, PortfolioServiceLimitInput, PortfolioServiceLimits,
     RevisionEvidence, TransactionRevision, ValuationSet,
 };
+use market_squawk_sources::ProviderRateAuthority;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -47,6 +48,7 @@ use uuid::Uuid;
 use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
 };
+use crate::provider_rate::open_provider_rate_authority;
 use crate::{AppConfig, ProductionLiveSourceComposition, ProductionSourceProvider};
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
@@ -87,10 +89,31 @@ pub fn local_paper_bot(
     initial_cash: Decimal,
     fee_basis_points: u32,
 ) -> Result<ProductionPaperBotComposition> {
+    let paths = LocalPaths::prepare(config.data_dir())?;
+    let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
+    local_paper_bot_with_provider_rate(
+        config,
+        provider,
+        initial_cash,
+        fee_basis_points,
+        provider_rate,
+    )
+}
+
+pub(crate) fn local_paper_bot_with_provider_rate(
+    config: AppConfig,
+    provider: ProductionSourceProvider,
+    initial_cash: Decimal,
+    fee_basis_points: u32,
+    provider_rate: ProviderRateAuthority,
+) -> Result<ProductionPaperBotComposition> {
     let source = configured_source(&config, provider)?;
     build_local_paper_bot(
         config,
-        PaperBotBuildSource::Production(provider),
+        PaperBotBuildSource::Production {
+            provider,
+            provider_rate,
+        },
         source,
         initial_cash,
         fee_basis_points,
@@ -121,9 +144,11 @@ struct ConfiguredPaperSource {
     freshness_nanos: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
 enum PaperBotBuildSource {
-    Production(ProductionSourceProvider),
+    Production {
+        provider: ProductionSourceProvider,
+        provider_rate: ProviderRateAuthority,
+    },
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark,
 }
@@ -321,7 +346,7 @@ where
         maximum_action_hook_bytes_per_route,
     )?;
     let risk_policy = bound_risk_policy(
-        build_source,
+        &build_source,
         maximum_action_hook_bytes_per_route,
         runtime_peak_bytes.get(),
     )?;
@@ -355,9 +380,16 @@ where
         paper_control_timeout: Duration::from_secs(5),
     };
     match build_source {
-        PaperBotBuildSource::Production(provider) => {
-            let source =
-                ProductionLiveSourceComposition::try_for_provider(config, routes, provider)?;
+        PaperBotBuildSource::Production {
+            provider,
+            provider_rate,
+        } => {
+            let source = ProductionLiveSourceComposition::try_for_provider_with_rate_authority(
+                config,
+                routes,
+                provider,
+                provider_rate,
+            )?;
             Ok(ProductionPaperBotComposition::try_new(
                 source,
                 runtime_config,
@@ -548,10 +580,15 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
 ) -> Result<ProductionPaperBotComposition> {
     let provider = ProductionSourceProvider::Kraken;
     let source = configured_source(&config, provider)?;
+    let paths = LocalPaths::prepare(config.data_dir())?;
+    let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
     let mut strategy = Some(strategy);
     build_local_paper_bot(
         config,
-        PaperBotBuildSource::Production(provider),
+        PaperBotBuildSource::Production {
+            provider,
+            provider_rate,
+        },
         source,
         initial_cash,
         fee_basis_points,
@@ -565,17 +602,19 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
 }
 
 fn bound_risk_policy(
-    build_source: PaperBotBuildSource,
+    build_source: &PaperBotBuildSource,
     maximum_action_hook_bytes_per_route: usize,
     runtime_peak_bytes: u64,
 ) -> Result<RiskPolicyIdentity> {
     let base = match build_source {
-        PaperBotBuildSource::Production(ProductionSourceProvider::Coinbase) => {
-            "local-coinbase-paper-risk"
-        }
-        PaperBotBuildSource::Production(ProductionSourceProvider::Kraken) => {
-            "local-kraken-paper-risk"
-        }
+        PaperBotBuildSource::Production {
+            provider: ProductionSourceProvider::Coinbase,
+            ..
+        } => "local-coinbase-paper-risk",
+        PaperBotBuildSource::Production {
+            provider: ProductionSourceProvider::Kraken,
+            ..
+        } => "local-kraken-paper-risk",
         #[cfg(feature = "release-evidence")]
         PaperBotBuildSource::ReleaseBenchmark => "release-benchmark-paper-risk",
     };

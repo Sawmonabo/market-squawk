@@ -21,6 +21,7 @@ mod manifest;
 mod migrations;
 mod parquet_store;
 mod pit;
+mod provider_rate;
 mod publication_coordinator;
 mod python_dataset;
 mod query;
@@ -82,8 +83,8 @@ pub use dataset_builder::{
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    PinnedArtifactQueryRequest, QueryArtifactPublication, ResearchIngestService,
-    extraction_batch_digest,
+    IngestPrecommitAuthority, PinnedArtifactQueryRequest, QueryArtifactPublication,
+    ResearchIngestService, extraction_batch_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
@@ -109,6 +110,7 @@ pub use pit::{
     PointInTimeRevisionCounts, PointInTimeRevisionMode, PointInTimeRevisionState,
     PointInTimeSelection, PointInTimeService,
 };
+pub use provider_rate::SqliteProviderRateStore;
 pub use python_dataset::{
     PythonDatasetCatalogError, PythonDatasetIdentity, PythonDatasetRow, PythonDatasetSelection,
     PythonDatasetSelectionRevalidation, PythonDatasetValue, PythonDatasetVerificationLimits,

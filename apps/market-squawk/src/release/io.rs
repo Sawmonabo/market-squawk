@@ -46,6 +46,7 @@ pub(super) fn publish_report<T: Serialize>(
     pending.publish()
 }
 
+#[cfg(feature = "release-evidence")]
 pub(super) fn publish_report_with_identity_barrier<T, F>(
     output: &Path,
     kind: &'static str,

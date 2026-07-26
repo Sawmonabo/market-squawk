@@ -12,6 +12,7 @@ use super::{CredentialKind, ProviderCapability, RightsAdmissionState, SetupMode}
 use crate::{EndpointPolicy, HttpRequestBounds, NetworkPolicyError};
 
 const MAX_PROFILES: usize = 32;
+const MAX_CAPABILITY_HISTORY: usize = 255;
 
 /// Whether an external account, secret, or declared contact is needed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -309,6 +310,7 @@ impl ProfileEvidence {
 pub struct ProviderOnboardingProfile {
     id: &'static str,
     display_name: &'static str,
+    historical_capabilities: Box<[ProviderCapability]>,
     capability: ProviderCapability,
     zero_fee: ZeroFeeStatus,
     account: Requirement,
@@ -335,6 +337,7 @@ pub struct ProviderOnboardingProfile {
 pub(crate) struct ProviderOnboardingProfileInput {
     pub id: &'static str,
     pub display_name: &'static str,
+    pub historical_capabilities: Vec<ProviderCapability>,
     pub capability: ProviderCapability,
     pub zero_fee: ZeroFeeStatus,
     pub account: Requirement,
@@ -359,7 +362,7 @@ pub(crate) struct ProviderOnboardingProfileInput {
 
 impl ProviderOnboardingProfile {
     pub(crate) fn try_new(
-        input: ProviderOnboardingProfileInput,
+        mut input: ProviderOnboardingProfileInput,
     ) -> Result<Self, ProviderProfileError> {
         let credentialed = input.capability.credential_kind() != CredentialKind::None;
         let persistence_admitted = input.rights.iter().any(|right| {
@@ -386,8 +389,22 @@ impl ProviderOnboardingProfile {
         let exact_current_persistence_evidence = persistence_evidence.is_some_and(|evidence| {
             evidence.content_digest.is_some() && !evidence.refresh_required
         });
+        let history_valid = input.historical_capabilities.len() <= MAX_CAPABILITY_HISTORY
+            && input
+                .historical_capabilities
+                .iter()
+                .chain(std::iter::once(&input.capability))
+                .all(|capability| capability.surface_id().as_str() == input.id)
+            && input
+                .historical_capabilities
+                .iter()
+                .chain(std::iter::once(&input.capability))
+                .map(ProviderCapability::revision)
+                .map(super::ProviderCapabilityRevision::get)
+                .eq(1..=input.capability.revision().get());
         if input.id.is_empty()
             || input.display_name.is_empty()
+            || !history_valid
             || input.id != input.capability.surface_id().as_str()
             || input.handoff_url != input.capability.official_entry_uri()
             || input.evidence.is_empty()
@@ -410,12 +427,19 @@ impl ProviderOnboardingProfile {
                 && input.capability.rights_state() != RightsAdmissionState::AdmittedScoped)
             || (input.capability.setup_mode() == SetupMode::NoCredential
                 && input.credential != Requirement::NotRequired)
+            || input
+                .capability
+                .rate_policy()
+                .enforcement_policy()
+                .is_none()
         {
             return Err(ProviderProfileError::InvalidProfile);
         }
+        input.historical_capabilities.shrink_to_fit();
         Ok(Self {
             id: input.id,
             display_name: input.display_name,
+            historical_capabilities: input.historical_capabilities.into_boxed_slice(),
             capability: input.capability,
             zero_fee: input.zero_fee,
             account: input.account,
@@ -452,6 +476,24 @@ impl ProviderOnboardingProfile {
     /// Returns the exact catalog capability.
     pub const fn capability(&self) -> &ProviderCapability {
         &self.capability
+    }
+
+    /// Iterates every immutable capability revision in contiguous order.
+    pub fn capability_history(&self) -> impl Iterator<Item = &ProviderCapability> {
+        self.historical_capabilities
+            .iter()
+            .chain(std::iter::once(&self.capability))
+    }
+
+    /// Returns an exact retained capability identity without upgrading its authority.
+    pub fn capability_at(
+        &self,
+        revision: super::ProviderCapabilityRevision,
+        digest: EvidenceDigest,
+    ) -> Option<&ProviderCapability> {
+        self.capability_history().find(|capability| {
+            capability.revision() == revision && capability.content_digest() == digest
+        })
     }
 
     /// Returns the zero-fee evidence classification.

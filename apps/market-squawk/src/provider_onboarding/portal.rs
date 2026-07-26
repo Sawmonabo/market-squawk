@@ -17,6 +17,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use market_squawk_data::CatalogLimit;
 use market_squawk_platform::{EncryptedFileFallbackStatus, LocalSecretStoreError, SecretValue};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
@@ -28,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::contracts::{
-    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderProfileView,
+    OnboardingSessionView, ProviderPortalActivationRequest, ProviderPortalActivationView,
+    ProviderProfileView,
 };
 use super::service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 
@@ -47,6 +49,24 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         request: ProviderPortalActivationRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError>;
+
+    /// Revokes callable runtime authority before deterministic onboarding cleanup.
+    async fn cancel(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<OnboardingSessionView, ProviderPortalActivationError>;
+
+    /// Closes admission to application-owned activation work before portal transport teardown.
+    fn begin_shutdown(&self) {}
+
+    /// Joins any retained activation reconciliation through the application shutdown deadline.
+    async fn finish_shutdown(
+        &self,
+        _deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        Ok(())
+    }
 }
 
 /// Closed portal-facing adapter activation failure.
@@ -408,10 +428,12 @@ async fn dispatch(
         ));
     }
     if method == Method::GET && path == "/api/v1/bootstrap" {
+        let session_limit = CatalogLimit::new(32).map_err(ProviderOnboardingError::from)?;
         let response = BootstrapResponse {
             csrf_token: &security.csrf_token,
             encrypted_file_fallback: service.encrypted_file_fallback_status()?,
             profiles: service.profiles(),
+            sessions: service.current_sessions(session_limit)?,
         };
         return with_session_cookie(json_response(StatusCode::OK, &response), &security);
     }
@@ -476,13 +498,26 @@ async fn dispatch(
             let activated = activation.activate(session_id, input, cancellation).await?;
             return Ok(json_response(StatusCode::OK, &activated));
         }
+        if method == Method::POST && action == Some("renew") {
+            validate_mutation(&request, &security, "application/json")?;
+            let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+            require_empty_json_body(&body)?;
+            let status = service.begin_renewal(session_id).await?;
+            return Ok(json_response(StatusCode::OK, &status));
+        }
+        if method == Method::POST && action == Some("cleanup") {
+            validate_mutation(&request, &security, "application/json")?;
+            let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+            require_empty_json_body(&body)?;
+            let status = service.reconcile_cleanup(session_id, cancellation).await?;
+            return Ok(json_response(StatusCode::OK, &status));
+        }
         if method == Method::POST && action == Some("cancel") {
             validate_mutation(&request, &security, "application/json")?;
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
-            if !body.is_empty() && body != b"{}" {
-                return Err(PortalRequestError::InvalidBody);
-            }
-            return Ok(json_response(StatusCode::OK, &service.cancel(session_id)?));
+            require_empty_json_body(&body)?;
+            let status = activation.cancel(session_id, cancellation).await?;
+            return Ok(json_response(StatusCode::OK, &status));
         }
     }
     Err(PortalRequestError::NotFound)
@@ -704,6 +739,14 @@ fn parse_session_path(path: &str) -> Option<(Uuid, Option<&str>)> {
     Some((session_id, action))
 }
 
+fn require_empty_json_body(body: &[u8]) -> Result<(), PortalRequestError> {
+    if body.is_empty() || body == b"{}" {
+        Ok(())
+    } else {
+        Err(PortalRequestError::InvalidBody)
+    }
+}
+
 fn with_session_cookie(
     mut response: Response<Full<Bytes>>,
     security: &PortalSecurity,
@@ -794,12 +837,23 @@ fn map_error(error: PortalRequestError) -> Response<Full<Bytes>> {
             error_response(StatusCode::BAD_REQUEST, "invalid_request")
         }
         PortalRequestError::Application(ProviderOnboardingError::SecretImportUnavailable)
+        | PortalRequestError::Application(ProviderOnboardingError::RenewalUnavailable)
         | PortalRequestError::Application(ProviderOnboardingError::InvalidSessionState)
         | PortalRequestError::Application(ProviderOnboardingError::ActivationUnavailable)
         | PortalRequestError::Application(ProviderOnboardingError::ActivationExpired)
         | PortalRequestError::Application(ProviderOnboardingError::EvidenceRefreshRequired)
+        | PortalRequestError::Application(
+            ProviderOnboardingError::RemoteReconciliationRequired
+            | ProviderOnboardingError::SecretCleanupUnavailable,
+        )
         | PortalRequestError::Application(ProviderOnboardingError::RightsBlocked) => {
             error_response(StatusCode::CONFLICT, "invalid_session_state")
+        }
+        PortalRequestError::Application(ProviderOnboardingError::ProbeRateLimited) => {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "provider_rate_limited")
+        }
+        PortalRequestError::Application(ProviderOnboardingError::ProbeDeadlineExceeded) => {
+            error_response(StatusCode::GATEWAY_TIMEOUT, "provider_deadline_elapsed")
         }
         PortalRequestError::Application(ProviderOnboardingError::SecretStore(
             LocalSecretStoreError::AuthenticationFailed
@@ -852,6 +906,7 @@ struct BootstrapResponse<'a> {
     csrf_token: &'a str,
     encrypted_file_fallback: EncryptedFileFallbackStatus,
     profiles: Vec<ProviderProfileView>,
+    sessions: Vec<OnboardingSessionView>,
 }
 
 #[derive(Serialize)]
@@ -1049,6 +1104,51 @@ async function activate(session, adapterRequest) {
   return mutate('/api/v1/sessions/' + session.session_id + '/activate',
     JSON.stringify(adapterRequest), 'application/json');
 }
+async function importSecret(session, adapterRequest, replacement) {
+  const status = document.getElementById('status');
+  status.textContent = '';
+  const secret = input('password', replacement ? 'Provider-created replacement key' :
+    'Provider-created key', 8192);
+  secret.autocomplete = 'off';
+  const submit = document.createElement('button');
+  submit.textContent = replacement ? 'Import replacement and cut over' :
+    'Import key and activate adapter';
+  submit.addEventListener('click', async () => {
+    const value = requiredValue(secret);
+    secret.value = ''; secret.remove(); submit.remove();
+    const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret',
+      value, 'application/octet-stream');
+    if (stored.next_action === 'verify_and_activate' ||
+        stored.next_action === 'verify_and_cutover') {
+      await activate(stored, adapterRequest);
+    }
+  });
+  status.before(secret, submit);
+}
+async function continueSession(session, adapterRequest) {
+  if (session.next_action === 'active') return activate(session, adapterRequest);
+  if (session.next_action === 'renew_credential') {
+    const rotation = await mutate('/api/v1/sessions/' + session.session_id + '/renew',
+      '{}', 'application/json');
+    return continueSession(rotation, adapterRequest);
+  }
+  if (session.next_action === 'import_secret') {
+    return importSecret(session, adapterRequest, false);
+  }
+  if (session.next_action === 'import_replacement') {
+    return importSecret(session, adapterRequest, true);
+  }
+  if (session.next_action === 'verify_and_activate' ||
+      session.next_action === 'verify_and_cutover') {
+    return activate(session, adapterRequest);
+  }
+  if (session.next_action === 'reconcile_cleanup') {
+    return mutate('/api/v1/sessions/' + session.session_id + '/cleanup',
+      '{}', 'application/json');
+  }
+  document.getElementById('status').textContent = JSON.stringify(session, null, 2);
+  return session;
+}
 async function start(profile, organization, email, adapterRequest) {
   if (profile.credential_requirement === 'required_provider_controlled' ||
       profile.account_requirement === 'required_provider_controlled') {
@@ -1060,26 +1160,12 @@ async function start(profile, organization, email, adapterRequest) {
     request.administrative_email = requiredValue(email);
   }
   const session = await mutate('/api/v1/sessions', JSON.stringify(request), 'application/json');
-  if (session.next_action === 'active') return activate(session, adapterRequest);
-  if (session.next_action !== 'import_secret') return session;
-  const status = document.getElementById('status');
-  status.textContent = '';
-  const secret = input('password', 'Provider-created key', 8192);
-  secret.autocomplete = 'off';
-  const submit = document.createElement('button');
-  submit.textContent = 'Import key and activate adapter';
-  submit.addEventListener('click', async () => {
-    const value = requiredValue(secret);
-    secret.value = ''; secret.remove(); submit.remove();
-    const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret',
-      value, 'application/octet-stream');
-    if (stored.next_action === 'verify_and_activate') await activate(session, adapterRequest);
-  });
-  status.before(secret, submit);
+  return continueSession(session, adapterRequest);
 }
 fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
   csrf = data.csrf_token;
   renderFallback(data.encrypted_file_fallback);
+  const sessions = new Map(data.sessions.map(session => [session.surface_id, session]));
   const root = document.getElementById('profiles'); root.textContent = '';
   for (const profile of data.profiles) {
     const section = document.createElement('section');
@@ -1095,12 +1181,19 @@ fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
     }
     section.append(title, detail, link, document.createTextNode(' '), organization, email);
     const buildConfiguration = configuration(profile, section);
-    const button = document.createElement('button'); button.textContent = 'Activate provider adapter';
+    const current = sessions.get(profile.id);
+    const button = document.createElement('button');
+    button.textContent = current ? 'Continue or manage provider' : 'Activate provider adapter';
     button.disabled = profile.release_state !== 'available' || buildConfiguration === null;
     button.addEventListener('click', () => {
-      try { start(profile, organization, email, buildConfiguration()).catch(error => {
+      try {
+        const operation = current ?
+          continueSession(current, buildConfiguration()) :
+          start(profile, organization, email, buildConfiguration());
+        operation.catch(error => {
         document.getElementById('status').textContent = String(error);
-      }); }
+        });
+      }
       catch (error) { document.getElementById('status').textContent = String(error); }
     });
     section.append(button); root.append(section);

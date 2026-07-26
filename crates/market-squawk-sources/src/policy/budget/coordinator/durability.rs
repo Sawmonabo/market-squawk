@@ -50,6 +50,8 @@ pub(crate) enum CleanShutdownValidationError {
 pub(crate) struct ProviderBudgetPool {
     budgets: Vec<RegisteredBudget>,
     durability: Option<Arc<AuthorityDurabilitySession>>,
+    provider_rate: Option<ProviderRateAuthority>,
+    local_coordinator: Option<ProcessBudgetCoordinator>,
 }
 
 impl std::fmt::Debug for ProviderBudgetPool {
@@ -66,6 +68,8 @@ impl ProviderBudgetPool {
         Ok(Self {
             budgets: Vec::new(),
             durability: None,
+            provider_rate: None,
+            local_coordinator: None,
         })
     }
 
@@ -73,6 +77,20 @@ impl ProviderBudgetPool {
         Self {
             budgets: Vec::new(),
             durability: Some(session),
+            provider_rate: None,
+            local_coordinator: None,
+        }
+    }
+
+    pub(crate) fn new_durable_with_provider_rate(
+        session: Arc<AuthorityDurabilitySession>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Self {
+        Self {
+            budgets: Vec::new(),
+            durability: Some(session),
+            provider_rate: Some(provider_rate),
+            local_coordinator: Some(ProcessBudgetCoordinator::new(MAX_PROCESS_BUDGET_SCOPES)),
         }
     }
 
@@ -98,7 +116,7 @@ impl ProviderBudgetPool {
         self.budgets
             .try_reserve(1)
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
-        let mut coordinated = coordinate_budget_policies(std::slice::from_ref(&resolved))?;
+        let mut coordinated = self.coordinate(std::slice::from_ref(&resolved), None)?;
         let budget = coordinated
             .pop()
             .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
@@ -140,7 +158,18 @@ impl ProviderBudgetPool {
         self.budgets
             .try_reserve(1)
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
-        let budget = coordinate_durable_budget_policy(&resolved, session, registry)?;
+        let budget = if let Some(coordinator) = &mut self.local_coordinator {
+            let mut coordinated = coordinator.coordinate_with_provider_rate(
+                std::slice::from_ref(&resolved),
+                Some(DurableRegistration { session, registry }),
+                self.provider_rate.as_ref(),
+            )?;
+            coordinated
+                .pop()
+                .ok_or(BudgetPoolError::CoordinatorCorrupt)?
+        } else {
+            coordinate_durable_budget_policy(&resolved, session, registry)?
+        };
         self.budgets.push(RegisteredBudget {
             persisted: resolved.persisted().clone(),
             budget: budget.clone(),
@@ -176,7 +205,7 @@ impl ProviderBudgetPool {
         self.budgets
             .try_reserve(additional)
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
-        let coordinated = coordinate_budget_policies(policies)?;
+        let coordinated = self.coordinate(policies, None)?;
         if coordinated.len() != policies.len() {
             return Err(BudgetPoolError::CoordinatorCorrupt);
         }
@@ -230,18 +259,23 @@ impl ProviderBudgetPool {
             .try_reserve(staged.len())
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
         groups_to_coordinate.extend(
-            staged
-                .iter()
-                .map(|(_declarations, combined, checkpoint)| {
-                    (combined.clone(), checkpoint.clone())
-                }),
+            staged.iter().map(|(_declarations, combined, checkpoint)| {
+                (combined.clone(), checkpoint.clone())
+            }),
         );
-        let coordinated = coordinate_restored_budget_groups(&groups_to_coordinate, &session)?;
+        let coordinated = if let Some(coordinator) = &mut self.local_coordinator {
+            coordinator.coordinate_restored_with_provider_rate(
+                &groups_to_coordinate,
+                &session,
+                self.provider_rate.as_ref(),
+            )?
+        } else {
+            coordinate_restored_budget_groups(&groups_to_coordinate, &session)?
+        };
         if coordinated.len() != staged.len() {
             return Err(BudgetPoolError::CoordinatorCorrupt);
         }
-        for ((declarations, _combined, _checkpoint), budget) in
-            staged.into_iter().zip(coordinated)
+        for ((declarations, _combined, _checkpoint), budget) in staged.into_iter().zip(coordinated)
         {
             for declaration in declarations {
                 self.budgets.push(RegisteredBudget {
@@ -258,6 +292,21 @@ impl ProviderBudgetPool {
             .iter()
             .map(|registered| registered.persisted.clone())
             .collect()
+    }
+
+    fn coordinate(
+        &mut self,
+        policies: &[ResolvedProviderBudgetPolicy],
+        durable: Option<DurableRegistration<'_>>,
+    ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        match &mut self.local_coordinator {
+            Some(coordinator) => coordinator.coordinate_with_provider_rate(
+                policies,
+                durable,
+                self.provider_rate.as_ref(),
+            ),
+            None => coordinate_budget_policies(policies),
+        }
     }
 
     pub(crate) fn policies_with(
@@ -323,20 +372,14 @@ impl ProviderBudgetPool {
                 .budgets
                 .iter()
                 .filter(|candidate| {
-                    Arc::ptr_eq(
-                        &candidate.budget.allocation,
-                        &registered.budget.allocation,
-                    )
+                    Arc::ptr_eq(&candidate.budget.allocation, &registered.budget.allocation)
                 })
                 .count();
             let declarations_match = self
                 .budgets
                 .iter()
                 .filter(|candidate| {
-                    Arc::ptr_eq(
-                        &candidate.budget.allocation,
-                        &registered.budget.allocation,
-                    )
+                    Arc::ptr_eq(&candidate.budget.allocation, &registered.budget.allocation)
                 })
                 .all(|candidate| group.declarations().contains(&candidate.persisted));
             if policy_count != group.declarations().len() || !declarations_match {
@@ -405,6 +448,15 @@ impl ProcessBudgetCoordinator {
         policies: &[ResolvedProviderBudgetPolicy],
         durable: Option<DurableRegistration<'_>>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        self.coordinate_with_provider_rate(policies, durable, None)
+    }
+
+    fn coordinate_with_provider_rate(
+        &mut self,
+        policies: &[ResolvedProviderBudgetPolicy],
+        durable: Option<DurableRegistration<'_>>,
+        provider_rate: Option<&ProviderRateAuthority>,
+    ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
         self.discard_cleanly_closed_durable_allocations();
         let remaining_capacity = self
             .capacity
@@ -420,6 +472,12 @@ impl ProcessBudgetCoordinator {
             .try_reserve(policies.len())
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
         for resolved in policies {
+            let provider_rate_binding = provider_rate
+                .map(|authority| {
+                    ProviderRateDeclaration::from_resolved(resolved)
+                        .and_then(|declaration| authority.register_binding(&declaration))
+                })
+                .transpose()?;
             let mut matching_index = None;
             for (index, allocation) in working.iter().enumerate() {
                 if !allocation
@@ -436,7 +494,11 @@ impl ProcessBudgetCoordinator {
                 let existing = working
                     .get_mut(index)
                     .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
-                if !existing.allocation.policy.has_same_limits_as(resolved.policy()) {
+                if !existing
+                    .allocation
+                    .policy
+                    .has_same_limits_as(resolved.policy())
+                {
                     return Err(BudgetPoolError::ConflictingPolicy);
                 }
                 existing
@@ -474,6 +536,13 @@ impl ProcessBudgetCoordinator {
                         return Err(BudgetPoolError::ConflictingDurability);
                     }
                 }
+                match (&existing.allocation.provider_rate, &provider_rate_binding) {
+                    (None, None) => {}
+                    (Some(existing), Some(candidate)) if existing.same_group(candidate) => {}
+                    (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
+                        return Err(BudgetPoolError::ConflictingDurability);
+                    }
+                }
                 result.push(SharedProviderBudget {
                     allocation: Arc::clone(&existing.allocation),
                 });
@@ -488,14 +557,9 @@ impl ProcessBudgetCoordinator {
                 .map_err(|_| BudgetPoolError::ClockUnavailable)?;
             let budget = if let Some(registration) = &durable {
                 let state = BudgetState::new(resolved.policy(), observation.monotonic);
-                let checkpoint = checkpoint_from_runtime(
-                    resolved.policy(),
-                    &state,
-                    observation,
-                    1,
-                    false,
-                )
-                .map_err(|_| BudgetPoolError::Persistence)?;
+                let checkpoint =
+                    checkpoint_from_runtime(resolved.policy(), &state, observation, 1, false)
+                        .map_err(|_| BudgetPoolError::Persistence)?;
                 let slot = registration
                     .session
                     .register_budget_group(
@@ -505,21 +569,37 @@ impl ProcessBudgetCoordinator {
                         observation.wall_clock,
                     )
                     .map_err(|_| BudgetPoolError::Persistence)?;
-                SharedProviderBudget::new_durable(
-                    resolved.policy().clone(),
-                    observation.monotonic,
-                    clock,
-                    BudgetDurabilityBinding {
-                        session: Arc::clone(registration.session),
-                        slot,
-                    },
-                )
+                let durability = BudgetDurabilityBinding {
+                    session: Arc::clone(registration.session),
+                    slot,
+                };
+                match provider_rate_binding {
+                    Some(provider_rate) => SharedProviderBudget::new_durable_with_provider_rate(
+                        resolved.policy().clone(),
+                        observation.monotonic,
+                        clock,
+                        durability,
+                        provider_rate,
+                    ),
+                    None => SharedProviderBudget::new_durable(
+                        resolved.policy().clone(),
+                        observation.monotonic,
+                        clock,
+                        durability,
+                    ),
+                }
             } else {
-                SharedProviderBudget::new(
-                    resolved.policy().clone(),
-                    observation.monotonic,
-                    clock,
-                )
+                match provider_rate_binding {
+                    Some(provider_rate) => SharedProviderBudget::new_with_provider_rate(
+                        resolved.policy().clone(),
+                        provider_rate,
+                    )?,
+                    None => SharedProviderBudget::new(
+                        resolved.policy().clone(),
+                        observation.monotonic,
+                        clock,
+                    ),
+                }
             };
             working.push(CoordinatedBudgetAllocation {
                 collision_key: resolved.collision_key().clone(),
@@ -538,6 +618,15 @@ impl ProcessBudgetCoordinator {
         &mut self,
         groups: &[(ResolvedProviderBudgetPolicy, BudgetCheckpointState)],
         session: &Arc<AuthorityDurabilitySession>,
+    ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        self.coordinate_restored_with_provider_rate(groups, session, None)
+    }
+
+    fn coordinate_restored_with_provider_rate(
+        &mut self,
+        groups: &[(ResolvedProviderBudgetPolicy, BudgetCheckpointState)],
+        session: &Arc<AuthorityDurabilitySession>,
+        provider_rate: Option<&ProviderRateAuthority>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
         self.discard_cleanly_closed_durable_allocations();
         let total = self
@@ -566,15 +655,31 @@ impl ProcessBudgetCoordinator {
                 return Err(BudgetPoolError::ConflictingDurability);
             }
             let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
-            let budget = SharedProviderBudget::from_checkpoint(
-                resolved.policy().clone(),
-                checkpoint,
-                clock,
-                BudgetDurabilityBinding {
-                    session: Arc::clone(session),
-                    slot,
-                },
-            )
+            let durability = BudgetDurabilityBinding {
+                session: Arc::clone(session),
+                slot,
+            };
+            let provider_rate_binding = provider_rate
+                .map(|authority| {
+                    ProviderRateDeclaration::from_resolved(resolved)
+                        .and_then(|declaration| authority.register_binding(&declaration))
+                })
+                .transpose()?;
+            let budget = match provider_rate_binding {
+                Some(provider_rate) => SharedProviderBudget::from_checkpoint_with_provider_rate(
+                    resolved.policy().clone(),
+                    checkpoint,
+                    clock,
+                    durability,
+                    provider_rate,
+                ),
+                None => SharedProviderBudget::from_checkpoint(
+                    resolved.policy().clone(),
+                    checkpoint,
+                    clock,
+                    durability,
+                ),
+            }
             .map_err(|_| BudgetPoolError::Persistence)?;
             working.push(CoordinatedBudgetAllocation {
                 collision_key: resolved.collision_key().clone(),
@@ -614,9 +719,7 @@ fn coordinate_durable_budget_policy(
         std::slice::from_ref(policy),
         Some(DurableRegistration { session, registry }),
     )?;
-    coordinated
-        .pop()
-        .ok_or(BudgetPoolError::CoordinatorCorrupt)
+    coordinated.pop().ok_or(BudgetPoolError::CoordinatorCorrupt)
 }
 
 fn coordinate_restored_budget_groups(
@@ -673,6 +776,7 @@ pub enum BudgetPoolError {
 pub struct BudgetPermit {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
     pub(in crate::policy) runtime_admission: RuntimeOperationAdmission,
+    pub(in crate::policy) provider_rate: Option<ProviderRatePermit>,
     pub(in crate::policy) released: bool,
 }
 
@@ -700,42 +804,51 @@ impl BudgetPermit {
         };
         let admission = &self.runtime_admission;
         if !budget.durability_is_available() {
-            let _reason = budget.terminal_fault(
-                BudgetUnavailableReason::PersistenceUnavailable,
-                admission,
-            );
+            let _reason =
+                budget.terminal_fault(BudgetUnavailableReason::PersistenceUnavailable, admission);
             self.released = true;
+            if let Some(permit) = &mut self.provider_rate {
+                let _released = permit.release();
+            }
             return;
         }
         let Ok(observation) = self.allocation.clock.observation() else {
-            let _reason = budget.terminal_fault(
-                BudgetUnavailableReason::ClockUnavailable,
-                admission,
-            );
+            let _reason =
+                budget.terminal_fault(BudgetUnavailableReason::ClockUnavailable, admission);
             self.released = true;
+            if let Some(permit) = &mut self.provider_rate {
+                let _released = permit.release();
+            }
             return;
         };
         let Ok(mut state) = self.allocation.state.lock() else {
-            let _reason = budget.terminal_fault(
-                BudgetUnavailableReason::StatePoisoned,
-                admission,
-            );
+            let _reason = budget.terminal_fault(BudgetUnavailableReason::StatePoisoned, admission);
             self.released = true;
+            if let Some(permit) = &mut self.provider_rate {
+                let _released = permit.release();
+            }
             return;
         };
         let Some(in_flight) = state.in_flight.checked_sub(1) else {
-            let _reason = budget.terminal_fault(
-                BudgetUnavailableReason::StateCorrupt,
-                admission,
-            );
+            let _reason = budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, admission);
             drop(state);
             self.released = true;
+            if let Some(permit) = &mut self.provider_rate {
+                let _released = permit.release();
+            }
             return;
         };
         state.in_flight = in_flight;
         let _persisted = budget.persist_locked(&state, observation, admission);
         drop(state);
+        let provider_release = self
+            .provider_rate
+            .as_mut()
+            .map_or(Ok(()), ProviderRatePermit::release);
         self.released = true;
+        if let Err(reason) = provider_release {
+            let _reason = budget.terminal_fault(reason, admission);
+        }
     }
 }
 

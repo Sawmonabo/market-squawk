@@ -23,9 +23,7 @@ impl AuthorityDurabilitySession {
         result
     }
 
-    fn persist_global_terminal_state_and_detach(
-        &self,
-    ) -> Result<(), AuthorityPersistenceError> {
+    fn persist_global_terminal_state_and_detach(&self) -> Result<(), AuthorityPersistenceError> {
         let (mut current, envelope_usable) = match self.envelope.lock() {
             Ok(current) => (current, true),
             Err(poisoned) => (poisoned.into_inner(), false),

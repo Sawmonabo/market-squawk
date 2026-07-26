@@ -27,11 +27,7 @@ pub(in crate::policy) fn checkpoint_from_runtime(
         &state.primary_sliding_releases,
         observation,
     )?);
-    for (window, runtime) in policy
-        .windows()
-        .skip(1)
-        .zip(&state.additional_windows)
-    {
+    for (window, runtime) in policy.windows().skip(1).zip(&state.additional_windows) {
         windows.push(window_checkpoint_from_runtime(
             window,
             runtime.window_started_at,
@@ -140,8 +136,8 @@ fn wall_deadline_to_monotonic(
         .unix_nanos()
         .checked_sub(observation.wall_clock.unix_nanos())
         .ok_or(AuthorityPersistenceError::InvalidState)?;
-    let remaining = u64::try_from(remaining)
-        .map_err(|_| AuthorityPersistenceError::InvalidState)?;
+    let remaining =
+        u64::try_from(remaining).map_err(|_| AuthorityPersistenceError::InvalidState)?;
     observation
         .monotonic
         .checked_add(remaining)
@@ -218,10 +214,7 @@ fn restore_window_state(
             },
         ) => {
             *window_started_at = observation.monotonic;
-            *restored_window_ends_at = wall_deadline_to_monotonic(
-                observation,
-                *window_ends_wall,
-            )?;
+            *restored_window_ends_at = wall_deadline_to_monotonic(observation, *window_ends_wall)?;
             *requests_used = if restored_window_ends_at.is_some() {
                 *saved_requests
             } else {

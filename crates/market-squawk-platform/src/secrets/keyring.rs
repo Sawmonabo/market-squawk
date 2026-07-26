@@ -6,8 +6,11 @@ use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroize as _;
 
 use super::{
-    LocalSecretStoreError, SecretBackend, SecretGeneration, SecretInteractionCapability, SecretKey,
-    SecretOperationControl, SecretRef, SecretStore, SecretStoreCapabilities, valid_component,
+    LocalSecretStoreError, SecretBackend, SecretDeletionDisposition, SecretGeneration,
+    SecretInteractionCapability, SecretKey, SecretMutationDisposition, SecretMutationFailure,
+    SecretMutationPlan, SecretOperationControl, SecretReconciliationObservation, SecretRef,
+    SecretStore, SecretStoreCapabilities, delete_exact_plan, execute_exact_plan,
+    inspect_exact_plan, match_exact_plan, valid_component,
 };
 use crate::SecretValue;
 
@@ -75,6 +78,69 @@ impl SecretStore for OsKeyringSecretStore {
         }
         control.read_postflight()?;
         Ok(capabilities)
+    }
+
+    fn plan_create(
+        &self,
+        key: &SecretKey,
+        generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
+        let capabilities = self.probe(control)?;
+        SecretMutationPlan::create(key, capabilities.backend(), generation)
+    }
+
+    fn plan_replace(
+        &self,
+        key: &SecretKey,
+        current: &SecretRef,
+        candidate_generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
+        let capabilities = self.probe(control)?;
+        if current.backend() != capabilities.backend() {
+            return Err(LocalSecretStoreError::InvalidReference);
+        }
+        let _current = self.read(current, control)?;
+        SecretMutationPlan::replace(key, current.clone(), candidate_generation)
+    }
+
+    fn execute_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationDisposition, SecretMutationFailure> {
+        execute_exact_plan(self, os_backend(), key, plan, value, control)
+    }
+
+    fn inspect_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+        inspect_exact_plan(self, os_backend(), key, plan, control)
+    }
+
+    fn matches_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        expected: &SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+        match_exact_plan(self, os_backend(), key, plan, expected, control)
+    }
+
+    fn delete_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretDeletionDisposition, SecretMutationFailure> {
+        delete_exact_plan(self, os_backend(), key, plan, control)
     }
 
     fn create(

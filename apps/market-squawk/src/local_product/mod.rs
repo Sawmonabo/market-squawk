@@ -24,7 +24,7 @@ use market_squawk_domain::RoundingPolicy;
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
 use market_squawk_services::{ArtifactError, ArtifactRepository};
-use market_squawk_sources::AuthoritativeSourceRegistry;
+use market_squawk_sources::{AuthoritativeSourceRegistry, AuthorizationSubjectResolver};
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
 
@@ -56,15 +56,16 @@ use crate::application::{
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
     LiveFairValueObservationBufferError, PaperApplicationServices,
-    ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
-    ResearchApplicationServices, ResearchExtractionLimits, ResearchSourceDiscoveryCoordinator,
-    SourceDomainService,
+    PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
+    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
+    ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
 };
 use crate::artifact_repository::controlled_artifact_repository;
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
+use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError, ProviderAdapterActivation, ProviderOnboardingError,
@@ -107,12 +108,35 @@ impl LocalProduct {
     /// exist, the configured signed training release and any required sibling ONNX worker must be
     /// available and verified before the application is published.
     pub fn try_new(config: AppConfig) -> Result<Self, LocalProductError> {
+        Self::try_new_with_prepublished_research_sources(
+            config,
+            std::iter::empty::<PrepublishedResearchSourceRegistration>(),
+        )
+    }
+
+    /// Opens the local product with a bounded static research-adapter composition.
+    ///
+    /// Registrations are consumed before the coordinator or application is published. Code-owned
+    /// provider profiles remain restricted to exact onboarding and adapter activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same closed composition failures as [`Self::try_new`], plus invalid static
+    /// research registrations.
+    pub fn try_new_with_prepublished_research_sources<I>(
+        config: AppConfig,
+        registrations: I,
+    ) -> Result<Self, LocalProductError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
         let paths = LocalPaths::prepare(config.data_dir())?;
         let research = Arc::new(open_research(&paths)?);
         let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
             .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
         let artifacts =
             controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
+        let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
         let source_store = LocalAuthorityStateStore::try_open(
             paths
@@ -120,12 +144,21 @@ impl LocalProduct {
                 .root()
                 .join(SOURCE_AUTHORITY_DIRECTORY),
         )?;
-        let source_registry = AuthoritativeSourceRegistry::try_new_durable(source_store)?;
-        let research_ingest = Arc::new(ProductionResearchIngestCoordinator::new(
-            source_registry,
-            Arc::clone(&research),
-            ResearchExtractionLimits::standard(),
-        ));
+        let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
+            Arc::new(provider_rate.clone());
+        let source_registry =
+            AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+                source_store,
+                authorization_subject_resolver,
+                provider_rate.clone(),
+            )?;
+        let (research_ingest, provider_runtime_mutation) =
+            ProductionResearchIngestCoordinator::try_new_with_provider_runtime_authority(
+                source_registry,
+                Arc::clone(&research),
+                ResearchExtractionLimits::standard(),
+                registrations,
+            )?;
 
         let secrets = Arc::new(
             PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
@@ -133,17 +166,24 @@ impl LocalProduct {
                 paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY),
             )?,
         );
-        let onboarding = Arc::new(ProviderOnboardingService::try_new(
-            research.onboarding_catalog(),
-            secrets,
-        )?);
+        let provider_activation_state =
+            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
+        let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;
+        let onboarding = Arc::new(
+            ProviderOnboardingService::try_new_with_provider_rate_and_runtime_admissions(
+                research.onboarding_catalog(),
+                secrets,
+                provider_rate.clone(),
+                runtime_admissions,
+            )?,
+        );
         let provider_activation = Arc::new(ProviderAdapterActivation::new(
             Arc::clone(&onboarding),
             Arc::clone(&research_ingest),
+            provider_runtime_mutation,
             config.clone(),
+            provider_rate.clone(),
         ));
-        let provider_activation_state =
-            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
         cli_provider::restore_research_providers(
             &paths,
             &onboarding,
@@ -160,7 +200,11 @@ impl LocalProduct {
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
         )?);
-        let paper = PaperApplicationServices::new(config.clone(), Arc::clone(&live_fair_value));
+        let paper = PaperApplicationServices::new(
+            config.clone(),
+            Arc::clone(&live_fair_value),
+            provider_rate,
+        );
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
@@ -473,6 +517,12 @@ pub enum LocalProductError {
     /// Durable source-registry recovery failed.
     #[error(transparent)]
     SourceRegistry(#[from] market_squawk_sources::RegistryError),
+    /// Static research-adapter composition failed.
+    #[error(transparent)]
+    ResearchComposition(#[from] ResearchIngestCompositionError),
+    /// Product-wide provider-rate authority could not be opened or reconciled.
+    #[error(transparent)]
+    ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
     /// Preferred local secret-store construction failed.
     #[error(transparent)]
     Secrets(#[from] market_squawk_platform::LocalSecretStoreError),

@@ -367,7 +367,9 @@ impl CatalogAuthority {
             return Err(CatalogError::OnboardingSequenceConflict);
         }
         let occurred_at = trusted_catalog_now(&transaction)?;
-        if occurred_at >= reservation.deadline_at() && !event_allowed_after_deadline(&event) {
+        if occurred_at >= reservation.deadline_at()
+            && !event_allowed_after_deadline(&resumed.lifecycle, &event)
+        {
             return Err(CatalogError::OnboardingDeadlineExceeded);
         }
         let resulting_state =
@@ -430,6 +432,36 @@ impl CatalogAuthority {
         limit: super::CatalogLimit,
     ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
         self.list_provider_onboarding_sessions(limit, true)
+    }
+
+    /// Returns one deterministic page of durable session identities for complete startup scans.
+    pub fn provider_onboarding_session_ids_after(
+        &self,
+        after: Option<Uuid>,
+        limit: super::CatalogLimit,
+    ) -> Result<Vec<Uuid>, CatalogError> {
+        self.catalog().enforce_limit(limit)?;
+        let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+        let after = after.map(|session_id| session_id.hyphenated().to_string());
+        let mut statement = self.catalog().connection.prepare(
+            "SELECT session_id
+             FROM provider_onboarding_sessions
+             WHERE (?1 IS NULL OR session_id > ?1)
+             ORDER BY session_id
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, row_limit], |row| row.get::<_, String>(0))?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        let mut sessions = Vec::new();
+        sessions
+            .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+            .map_err(|_| CatalogError::Allocation)?;
+        for row in rows {
+            let encoded = row?;
+            budget.charge([encoded.len()])?;
+            sessions.push(Uuid::parse_str(&encoded).map_err(|_| CatalogError::CorruptCatalog)?);
+        }
+        Ok(sessions)
     }
 
     fn list_provider_onboarding_sessions(
@@ -944,16 +976,41 @@ fn lifecycle_created_at(
         .map_err(Into::into)
 }
 
-fn event_allowed_after_deadline(event: &OnboardingEvent) -> bool {
+fn event_allowed_after_deadline(lifecycle: &OnboardingLifecycle, event: &OnboardingEvent) -> bool {
     matches!(
         event,
         OnboardingEvent::Cancelled { .. }
+            | OnboardingEvent::RefreshRequired { .. }
+            | OnboardingEvent::SecretStoreReconciliationRequired { .. }
+            | OnboardingEvent::SecretStoreCleared { .. }
+            | OnboardingEvent::CandidateCancelledNoEffect { .. }
             | OnboardingEvent::IndeterminateRemoteState { .. }
             | OnboardingEvent::CleanupRequired { .. }
+            | OnboardingEvent::ActivationQuarantined { .. }
             | OnboardingEvent::RemoteRevocation { .. }
             | OnboardingEvent::LocalDeletion { .. }
             | OnboardingEvent::Retire { .. }
             | OnboardingEvent::Tombstone { .. }
+    ) || matches!(
+        (lifecycle.state(), event),
+        (
+            OnboardingState::ActiveScoped,
+            OnboardingEvent::RenewalRequired { .. } | OnboardingEvent::BeginRotation { .. }
+        ) | (
+            OnboardingState::RenewalRequired,
+            OnboardingEvent::BeginRotation { .. }
+        ) | (
+            OnboardingState::RotationPending,
+            OnboardingEvent::CredentialImported { .. }
+                | OnboardingEvent::SecretStorePlanned { .. }
+                | OnboardingEvent::ProtocolValidated { .. }
+                | OnboardingEvent::CredentialStored { .. }
+                | OnboardingEvent::AuthorityVerified { .. }
+                | OnboardingEvent::RightsAdmitted { .. }
+                | OnboardingEvent::RatePolicyAdmitted { .. }
+                | OnboardingEvent::RuntimeVerified { .. }
+                | OnboardingEvent::Cutover { .. }
+        )
     )
 }
 
@@ -961,6 +1018,15 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
     match event.kind() {
         market_squawk_sources::OnboardingEventKind::CredentialImported => {
             "provider-onboarding.credential-imported"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStorePlanned => {
+            "provider-onboarding.secret-store-planned"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStoreReconciliationRequired => {
+            "provider-onboarding.secret-store-reconciliation-required"
+        }
+        market_squawk_sources::OnboardingEventKind::SecretStoreCleared => {
+            "provider-onboarding.secret-store-cleared"
         }
         market_squawk_sources::OnboardingEventKind::ProtocolValidated => {
             "provider-onboarding.protocol-validated"
@@ -981,8 +1047,14 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
             "provider-onboarding.runtime-verified"
         }
         market_squawk_sources::OnboardingEventKind::Activate => "provider-onboarding.activated",
+        market_squawk_sources::OnboardingEventKind::RenewalRequired => {
+            "provider-onboarding.renewal-required"
+        }
         market_squawk_sources::OnboardingEventKind::BeginRotation => {
             "provider-onboarding.rotation-begun"
+        }
+        market_squawk_sources::OnboardingEventKind::CandidateCancelledNoEffect => {
+            "provider-onboarding.candidate-cancelled-no-effect"
         }
         market_squawk_sources::OnboardingEventKind::Cutover => "provider-onboarding.cutover",
         market_squawk_sources::OnboardingEventKind::RemoteRevocation => {
@@ -1004,6 +1076,9 @@ fn onboarding_audit_type(event: &OnboardingEvent) -> &'static str {
         }
         market_squawk_sources::OnboardingEventKind::CleanupRequired => {
             "provider-onboarding.cleanup-required"
+        }
+        market_squawk_sources::OnboardingEventKind::ActivationQuarantined => {
+            "provider-onboarding.activation-quarantined"
         }
         market_squawk_sources::OnboardingEventKind::Blocked => "provider-onboarding.blocked",
         market_squawk_sources::OnboardingEventKind::Cancelled => "provider-onboarding.cancelled",

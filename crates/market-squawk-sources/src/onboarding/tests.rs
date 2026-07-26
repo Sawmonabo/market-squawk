@@ -27,7 +27,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
 }
 
 #[test]
-fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() -> TestResult {
+fn provider_onboarding_authority_lifecycle_requires_exact_generation_and_renewal() -> TestResult {
     let capability_v1 = capability(1)?;
     let mut registry = ProviderCapabilityRegistry::new();
     assert_eq!(
@@ -135,27 +135,55 @@ fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() 
     assert_eq!(lifecycle.state(), OnboardingState::ActiveScoped);
     assert_eq!(lifecycle.active_generation(), Some(generation_one));
 
+    let renewal_at = lifecycle
+        .generation_verification(generation_one)
+        .and_then(AuthorityVerification::expires_at)
+        .ok_or("generation one verification omitted its renewal boundary")?;
+    lifecycle.apply(
+        &capability_v1,
+        OnboardingEvent::RenewalRequired {
+            generation: generation_one,
+            expires_at: renewal_at,
+            evidence_digest: digest(40),
+        },
+        renewal_at,
+    )?;
+    assert_eq!(lifecycle.state(), OnboardingState::RenewalRequired);
+
     let generation_two = SecretGeneration::new(2)?;
+    let rotation_at = Timestamp::from_unix_nanos(
+        renewal_at
+            .unix_nanos()
+            .checked_add(1)
+            .ok_or("rotation timestamp overflow")?,
+    );
     lifecycle.apply(
         &capability_v1,
         OnboardingEvent::BeginRotation {
             candidate_generation: generation_two,
+            operation_owner: Some(SourceIdentifier::try_from("test-rotation-generation-2")?),
+            deadline_at: Some(Timestamp::from_unix_nanos(2_000)),
+            retry_budget: 1,
         },
-        observed_at,
+        renewal_at,
     )?;
     lifecycle.apply(
         &capability_v1,
         OnboardingEvent::CredentialStored {
             reference: secret_ref(2, 'b')?,
         },
-        observed_at,
+        rotation_at,
     )?;
     lifecycle.apply(
         &capability_v1,
         OnboardingEvent::AuthorityVerified {
-            verification: Box::new(verified_authority(&capability_v1, requested, 20)?),
+            verification: Box::new(verified_authority(
+                &capability_v1,
+                requested,
+                rotation_at.unix_nanos(),
+            )?),
         },
-        observed_at,
+        rotation_at,
     )?;
     for event in [
         OnboardingEvent::RightsAdmitted {
@@ -171,7 +199,7 @@ fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() 
             evidence_digest: digest(44),
         },
     ] {
-        lifecycle.apply(&capability_v1, event, observed_at)?;
+        lifecycle.apply(&capability_v1, event, rotation_at)?;
     }
     lifecycle.apply(
         &capability_v1,
@@ -179,7 +207,7 @@ fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() 
             prior_generation: generation_one,
             candidate_generation: generation_two,
         },
-        observed_at,
+        rotation_at,
     )?;
     assert_eq!(lifecycle.active_generation(), Some(generation_two));
     assert_eq!(
@@ -194,7 +222,7 @@ fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() 
             outcome: RemoteRevocationOutcome::Unsupported,
             evidence_digest: digest(45),
         },
-        observed_at,
+        rotation_at,
     )?;
     lifecycle.apply(
         &capability_v1,
@@ -202,25 +230,93 @@ fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() 
             generation: generation_one,
             outcome: LocalDeletionOutcome::Deleted,
         },
-        observed_at,
+        rotation_at,
     )?;
     lifecycle.apply(
         &capability_v1,
         OnboardingEvent::Retire {
             generation: generation_one,
         },
-        observed_at,
+        rotation_at,
     )?;
     lifecycle.apply(
         &capability_v1,
         OnboardingEvent::Tombstone {
             generation: generation_one,
         },
-        observed_at,
+        rotation_at,
     )?;
     assert_eq!(
         lifecycle.generation_state(generation_one),
         Some(CredentialGenerationState::Tombstoned)
+    );
+    assert_eq!(lifecycle.state(), OnboardingState::ActiveScoped);
+    assert_eq!(
+        lifecycle.generation_remote_revocation(generation_one),
+        Some(RemoteRevocationOutcome::Unsupported)
+    );
+    assert_eq!(
+        lifecycle.generation_local_deletion(generation_one),
+        Some(LocalDeletionOutcome::Deleted)
+    );
+    let active_reference = secret_ref(2, 'b')?;
+    lifecycle.apply(
+        &capability_v1,
+        OnboardingEvent::ActivationQuarantined {
+            evidence_digest: digest(46),
+        },
+        rotation_at,
+    )?;
+    assert_eq!(lifecycle.state(), OnboardingState::CleanupRequired);
+    assert_eq!(lifecycle.active_generation(), None);
+    assert_eq!(lifecycle.candidate_generation(), None);
+    assert_eq!(
+        lifecycle.generation_state(generation_two),
+        Some(CredentialGenerationState::CleanupRequired)
+    );
+    assert_eq!(
+        lifecycle.generation_reference(generation_two),
+        Some(&active_reference)
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() -> TestResult {
+    let profiles = built_in_provider_profiles()?;
+    for profile in profiles.iter() {
+        let descriptor = profile.capability().rate_policy();
+        let policy = descriptor
+            .enforcement_policy()
+            .ok_or("current profile omitted rate enforcement")?;
+        assert!(!policy.scope().as_source_identifier().as_str().is_empty());
+        assert!(policy.window_count() >= 1);
+        assert!(policy.max_concurrent() >= 1);
+        assert!(descriptor.enforcement_revision().is_some());
+        assert!(descriptor.endpoint_class().is_some());
+        assert!(descriptor.scope_evidence_digest().is_some());
+        assert!(descriptor.unknown_is_conservative());
+    }
+
+    assert!(capability(1)?.rate_policy().enforcement_policy().is_none());
+
+    let bls = profiles
+        .get("bls.v2-registered")
+        .ok_or("missing BLS v2 profile")?
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("BLS v2 omitted rate enforcement")?;
+    assert_eq!(bls.window_count(), 2);
+    assert_eq!(
+        bls.window(0)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((50, 10_000_000_000))
+    );
+    assert_eq!(
+        bls.window(1)
+            .map(|window| (window.requests_per_window(), window.window_nanos())),
+        Some((500, 86_400_000_000_000))
     );
     Ok(())
 }
@@ -269,7 +365,11 @@ fn verified_authority(
                 Some(digest(55)),
             ),
             verified_at: Timestamp::from_unix_nanos(verified_at),
-            expires_at: Some(Timestamp::from_unix_nanos(1_000)),
+            expires_at: Some(Timestamp::from_unix_nanos(
+                verified_at
+                    .checked_add(1_000)
+                    .ok_or("verification expiry overflow")?,
+            )),
             verifier_revision: SourceIdentifier::try_from("provider-key-info-v1")?,
             assurance_limitation: SourceIdentifier::try_from("provider-reported-authority")?,
             evidence_digest: digest(56),

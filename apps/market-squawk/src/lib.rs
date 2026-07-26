@@ -1,3 +1,5 @@
+#![cfg_attr(all(test, target_os = "macos"), allow(linker_messages))]
+
 //! Local-first Market Squawk application composition.
 //!
 //! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
@@ -21,6 +23,7 @@ pub mod paper_bot;
 pub mod portfolio_application;
 pub mod provider_activation;
 pub mod provider_onboarding;
+mod provider_rate;
 pub mod quality;
 pub mod release;
 pub mod replay;

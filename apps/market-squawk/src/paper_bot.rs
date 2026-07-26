@@ -69,6 +69,7 @@ struct ProductionPaperRecovery {
     quarantined: bool,
 }
 
+pub(crate) use defaults::local_paper_bot_with_provider_rate;
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
 #[cfg(test)]
 pub(crate) use defaults::{
@@ -145,6 +146,37 @@ impl PaperBotSourceComposition {
             Self::Production(source) => source.routes(),
             #[cfg(feature = "release-evidence")]
             Self::ReleaseBenchmark(routes) => routes,
+        }
+    }
+
+    fn production(&self) -> Option<&ProductionLiveSourceComposition> {
+        #[cfg(feature = "release-evidence")]
+        {
+            match self {
+                Self::Production(source) => Some(source),
+                Self::ReleaseBenchmark(_) => None,
+            }
+        }
+        #[cfg(not(feature = "release-evidence"))]
+        {
+            let Self::Production(source) = self;
+            Some(source)
+        }
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    fn into_production(self) -> Option<Box<ProductionLiveSourceComposition>> {
+        #[cfg(feature = "release-evidence")]
+        {
+            match self {
+                Self::Production(source) => Some(source),
+                Self::ReleaseBenchmark(_) => None,
+            }
+        }
+        #[cfg(not(feature = "release-evidence"))]
+        {
+            let Self::Production(source) = self;
+            Some(source)
         }
     }
 }
@@ -225,9 +257,10 @@ impl ProductionPaperBotComposition {
         mut self,
         endpoint: &str,
     ) -> Result<Self, crate::ProductionLiveSourceCompositionError> {
-        let PaperBotSourceComposition::Production(source) = self.source else {
-            return Err(crate::ProductionLiveSourceCompositionError::RouteSetMismatch);
-        };
+        let source = self
+            .source
+            .into_production()
+            .ok_or(crate::ProductionLiveSourceCompositionError::RouteSetMismatch)?;
         self.source = PaperBotSourceComposition::Production(Box::new(
             (*source).with_local_kraken_endpoint_for_test(endpoint)?,
         ));
@@ -265,9 +298,10 @@ impl ProductionPaperBotComposition {
         qualified_market_exports: Vec<RouteQualifiedMarketExport>,
         cancellation: CancellationToken,
     ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
-        let PaperBotSourceComposition::Production(source) = &self.source else {
-            return Err(ProductionPaperBotStartError::InvalidRecoveryOwnership);
-        };
+        let source = self
+            .source
+            .production()
+            .ok_or(ProductionPaperBotStartError::InvalidRecoveryOwnership)?;
         source
             .validate_qualified_market_export_routes(&qualified_market_exports)
             .map_err(ProductionPaperBotStartError::Source)?;

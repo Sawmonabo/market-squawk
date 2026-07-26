@@ -17,8 +17,10 @@ use crate::{LocalAuthorityStateStoreError, SecretValue};
 pub use self::encrypted::EncryptedFileSecretStore;
 pub use self::keyring::OsKeyringSecretStore;
 pub use self::managed::{
-    SecretBackend, SecretCancellation, SecretDeadlineCapability, SecretGeneration,
-    SecretInteractionCapability, SecretInteractionPolicy, SecretOperationControl, SecretRef,
+    SecretBackend, SecretCancellation, SecretDeadlineCapability, SecretDeletionDisposition,
+    SecretGeneration, SecretInteractionCapability, SecretInteractionPolicy,
+    SecretMutationDisposition, SecretMutationEffect, SecretMutationFailure, SecretMutationKind,
+    SecretMutationPlan, SecretOperationControl, SecretReconciliationObservation, SecretRef,
     SecretStoreCapabilities,
 };
 pub use self::preferred::{
@@ -117,6 +119,57 @@ pub trait SecretStore: fmt::Debug + Send + Sync {
         control: &SecretOperationControl,
     ) -> Result<SecretStoreCapabilities, LocalSecretStoreError>;
 
+    /// Selects and validates one exact create target without storing credential material.
+    fn plan_create(
+        &self,
+        key: &SecretKey,
+        generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError>;
+
+    /// Selects and validates one exact replacement target without storing credential material.
+    fn plan_replace(
+        &self,
+        key: &SecretKey,
+        current: &SecretRef,
+        candidate_generation: SecretGeneration,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationPlan, LocalSecretStoreError>;
+
+    /// Executes only the backend and locator retained by an already durable plan.
+    fn execute_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        value: SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretMutationDisposition, SecretMutationFailure>;
+
+    /// Observes whether an exact planned target exists without returning credential material.
+    fn inspect_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError>;
+
+    /// Constant-work compares one resubmitted value with the exact planned target.
+    fn matches_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        expected: &SecretValue,
+        control: &SecretOperationControl,
+    ) -> Result<SecretReconciliationObservation, LocalSecretStoreError>;
+
+    /// Deletes only the planned target and treats an already absent target as reconciled.
+    fn delete_planned(
+        &self,
+        key: &SecretKey,
+        plan: &SecretMutationPlan,
+        control: &SecretOperationControl,
+    ) -> Result<SecretDeletionDisposition, SecretMutationFailure>;
+
     /// Creates one exact generation and rejects an existing locator.
     fn create(
         &self,
@@ -155,6 +208,121 @@ pub trait SecretStore: fmt::Debug + Send + Sync {
 
     /// Loads one secret into zeroizing, redacted memory.
     fn load(&self, key: &SecretKey) -> Result<SecretValue, LocalSecretStoreError>;
+}
+
+fn execute_exact_plan(
+    store: &dyn SecretStore,
+    backend: SecretBackend,
+    key: &SecretKey,
+    plan: &SecretMutationPlan,
+    value: SecretValue,
+    control: &SecretOperationControl,
+) -> Result<SecretMutationDisposition, SecretMutationFailure> {
+    plan.validate_for(key)
+        .map_err(SecretMutationFailure::no_effect)?;
+    if plan.target().backend() != backend {
+        return Err(SecretMutationFailure::no_effect(
+            LocalSecretStoreError::InvalidReference,
+        ));
+    }
+    match store.read(plan.target(), control) {
+        Ok(existing) => {
+            return if secret_values_match(&existing, &value) {
+                Ok(SecretMutationDisposition::AlreadyMatches)
+            } else {
+                Err(SecretMutationFailure::no_effect(
+                    LocalSecretStoreError::Conflict,
+                ))
+            };
+        }
+        Err(LocalSecretStoreError::NotFound) => {}
+        Err(error) => return Err(SecretMutationFailure::no_effect(error)),
+    }
+    let stored = match plan.kind() {
+        SecretMutationKind::Create => store.create(key, plan.target().generation(), value, control),
+        SecretMutationKind::Replace { current } => {
+            store.replace(key, current, plan.target().generation(), value, control)
+        }
+    }
+    .map_err(SecretMutationFailure::from_store_error)?;
+    if stored == *plan.target() {
+        Ok(SecretMutationDisposition::Stored)
+    } else {
+        Err(SecretMutationFailure::may_have_applied(
+            LocalSecretStoreError::InvalidReference,
+        ))
+    }
+}
+
+fn inspect_exact_plan(
+    store: &dyn SecretStore,
+    backend: SecretBackend,
+    key: &SecretKey,
+    plan: &SecretMutationPlan,
+    control: &SecretOperationControl,
+) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+    plan.validate_for(key)?;
+    if plan.target().backend() != backend {
+        return Err(LocalSecretStoreError::InvalidReference);
+    }
+    match store.read(plan.target(), control) {
+        Ok(_value) => Ok(SecretReconciliationObservation::PresentUnverified),
+        Err(LocalSecretStoreError::NotFound) => Ok(SecretReconciliationObservation::Absent),
+        Err(error) => Err(error),
+    }
+}
+
+fn match_exact_plan(
+    store: &dyn SecretStore,
+    backend: SecretBackend,
+    key: &SecretKey,
+    plan: &SecretMutationPlan,
+    expected: &SecretValue,
+    control: &SecretOperationControl,
+) -> Result<SecretReconciliationObservation, LocalSecretStoreError> {
+    plan.validate_for(key)?;
+    if plan.target().backend() != backend {
+        return Err(LocalSecretStoreError::InvalidReference);
+    }
+    match store.read(plan.target(), control) {
+        Ok(value) if secret_values_match(&value, expected) => {
+            Ok(SecretReconciliationObservation::Matches)
+        }
+        Ok(_value) => Ok(SecretReconciliationObservation::Mismatch),
+        Err(LocalSecretStoreError::NotFound) => Ok(SecretReconciliationObservation::Absent),
+        Err(error) => Err(error),
+    }
+}
+
+fn delete_exact_plan(
+    store: &dyn SecretStore,
+    backend: SecretBackend,
+    key: &SecretKey,
+    plan: &SecretMutationPlan,
+    control: &SecretOperationControl,
+) -> Result<SecretDeletionDisposition, SecretMutationFailure> {
+    plan.validate_for(key)
+        .map_err(SecretMutationFailure::no_effect)?;
+    if plan.target().backend() != backend {
+        return Err(SecretMutationFailure::no_effect(
+            LocalSecretStoreError::InvalidReference,
+        ));
+    }
+    match store.delete(plan.target(), control) {
+        Ok(()) => Ok(SecretDeletionDisposition::Deleted),
+        Err(LocalSecretStoreError::NotFound) => Ok(SecretDeletionDisposition::AlreadyAbsent),
+        Err(error) => Err(SecretMutationFailure::from_store_error(error)),
+    }
+}
+
+fn secret_values_match(left: &SecretValue, right: &SecretValue) -> bool {
+    let left = left.expose_secret().as_bytes();
+    let right = right.expose_secret().as_bytes();
+    let mut difference = left.len() ^ right.len();
+    for (left, right) in left.iter().zip(right) {
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 /// Durable authority selected while resolving an interrupted unlock rotation.

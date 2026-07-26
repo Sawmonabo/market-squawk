@@ -15,8 +15,8 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, BudgetUnavailableReason, CaptureGenerationCapabilities,
-    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, RegisteredSource,
-    RegistryError, SessionId, SourceError,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, ProviderRateAuthority,
+    RegisteredSource, RegistryError, SessionId, SourceError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -73,6 +73,7 @@ pub(super) struct ProductionSourceSupervisor {
 }
 
 impl ProductionSourceSupervisor {
+    #[cfg(test)]
     pub(super) fn try_new(
         config: &AppConfig,
         profile: ProductionSourceProfile,
@@ -82,11 +83,42 @@ impl ProductionSourceSupervisor {
         routes: Vec<ShardKey>,
         route_buffer_limits: RouteBufferLimits,
     ) -> Result<Self, ProductionSupervisorError> {
+        let provider_rate =
+            crate::provider_rate::open_provider_rate_authority(paths.control_root()?.root())?;
+        Self::try_new_with_provider_rate(
+            config,
+            profile,
+            paths,
+            capture_process,
+            live_ingress,
+            routes,
+            route_buffer_limits,
+            provider_rate,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent live-plane dependencies stay explicit at supervisor composition"
+    )]
+    pub(super) fn try_new_with_provider_rate(
+        config: &AppConfig,
+        profile: ProductionSourceProfile,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        live_ingress: LiveRuntimeIngress,
+        routes: Vec<ShardKey>,
+        route_buffer_limits: RouteBufferLimits,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionSupervisorError> {
         let registered_at = system_timestamp()?;
         let authority_store = LocalAuthorityStateStore::try_open(
             paths.root().join("authority").join(profile.source_key()),
         )?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_durable(authority_store)?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
+            authority_store,
+            provider_rate,
+        )?;
         let registered = match registry
             .register_or_resume_exact(profile.metadata().clone(), registered_at)
         {
@@ -445,6 +477,10 @@ pub enum ProductionSupervisorError {
     ProviderBackoff(#[from] ProviderBackoffError),
     #[error(transparent)]
     AuthorityStore(#[from] LocalAuthorityStateStoreError),
+    #[error(transparent)]
+    Paths(#[from] market_squawk_platform::PathError),
+    #[error(transparent)]
+    ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
     #[error("source registration failed and clean registry rollback also failed")]

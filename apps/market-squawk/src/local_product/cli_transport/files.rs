@@ -82,6 +82,11 @@ pub(super) async fn ingest_local_file(
         limits,
         ownership_evidence,
     );
+    let activation_guard = product
+        .provider_activation_state()
+        .acquire_activation("local.files")
+        .await
+        .map_err(|_| CliProductError::RequestShape)?;
     let activated = product
         .provider_activation()
         .activate_ready_profile(
@@ -94,6 +99,7 @@ pub(super) async fn ingest_local_file(
     let ProviderActivationOutcome::Research(activated) = activated else {
         return Err(CliProductError::RequestShape);
     };
+    drop(activation_guard);
     let provider = activated.profile().as_str().to_owned();
     let mut discovery_arguments = json_object(json!({
         "provider": provider,

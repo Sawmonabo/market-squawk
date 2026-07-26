@@ -230,12 +230,7 @@ impl<A: LifecycleAtomic> LifecycleWord<A> {
                     );
                     if self
                         .atomic
-                        .compare_exchange_weak(
-                            current,
-                            next,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         return TerminalWriterClaim::Owner;
@@ -390,9 +385,7 @@ impl AuthorityDurabilitySession {
                 let _terminal = self.persist_terminal_and_detach();
                 Err(AuthorityPersistenceError::SessionUnavailable)
             }
-            AdmissionTransition::Unavailable => {
-                Err(AuthorityPersistenceError::SessionUnavailable)
-            }
+            AdmissionTransition::Unavailable => Err(AuthorityPersistenceError::SessionUnavailable),
         }
     }
 
@@ -431,10 +424,7 @@ impl AuthorityDurabilitySession {
         self.lifecycle.latch_terminal();
     }
 
-    fn latch_terminal_from_admitted_operation(
-        &self,
-        admission: &AuthorityOperationAdmission,
-    ) {
+    fn latch_terminal_from_admitted_operation(&self, admission: &AuthorityOperationAdmission) {
         if admission.belongs_to(self) {
             self.lifecycle.latch_terminal();
         }
@@ -553,61 +543,59 @@ mod tests {
             model.location = false;
             model.log = false;
             model.check(|| {
-            let lifecycle = LoomArc::new(LifecycleWord {
-                atomic: LoomAtomicU64::new(lifecycle_word(
-                    AuthorityLifecyclePhase::Active,
-                    0,
-                )),
-            });
-            let terminal_writers = LoomArc::new(AtomicUsize::new(0));
+                let lifecycle = LoomArc::new(LifecycleWord {
+                    atomic: LoomAtomicU64::new(lifecycle_word(AuthorityLifecyclePhase::Active, 0)),
+                });
+                let terminal_writers = LoomArc::new(AtomicUsize::new(0));
 
-            let admitted_lifecycle = LoomArc::clone(&lifecycle);
-            let admitted_writers = LoomArc::clone(&terminal_writers);
-            let admitted = thread::spawn(move || {
-                if admitted_lifecycle.try_admit() == AdmissionTransition::Admitted {
-                    let _latched = admitted_lifecycle.latch_terminal();
-                    if admitted_lifecycle.claim_terminal_writer() == TerminalWriterClaim::Owner {
-                        admitted_writers.fetch_add(1, Ordering::AcqRel);
-                        admitted_lifecycle.finish_terminal_write(true);
+                let admitted_lifecycle = LoomArc::clone(&lifecycle);
+                let admitted_writers = LoomArc::clone(&terminal_writers);
+                let admitted = thread::spawn(move || {
+                    if admitted_lifecycle.try_admit() == AdmissionTransition::Admitted {
+                        let _latched = admitted_lifecycle.latch_terminal();
+                        if admitted_lifecycle.claim_terminal_writer() == TerminalWriterClaim::Owner
+                        {
+                            admitted_writers.fetch_add(1, Ordering::AcqRel);
+                            admitted_lifecycle.finish_terminal_write(true);
+                        }
+                        admitted_lifecycle.release(false);
                     }
-                    admitted_lifecycle.release(false);
-                }
-            });
+                });
 
-            let fault_lifecycle = LoomArc::clone(&lifecycle);
-            let fault_writers = LoomArc::clone(&terminal_writers);
-            let fault = thread::spawn(move || {
-                let _latched = fault_lifecycle.latch_terminal();
-                if fault_lifecycle.claim_terminal_writer() == TerminalWriterClaim::Owner {
-                    fault_writers.fetch_add(1, Ordering::AcqRel);
-                    fault_lifecycle.finish_terminal_write(true);
-                }
-            });
+                let fault_lifecycle = LoomArc::clone(&lifecycle);
+                let fault_writers = LoomArc::clone(&terminal_writers);
+                let fault = thread::spawn(move || {
+                    let _latched = fault_lifecycle.latch_terminal();
+                    if fault_lifecycle.claim_terminal_writer() == TerminalWriterClaim::Owner {
+                        fault_writers.fetch_add(1, Ordering::AcqRel);
+                        fault_lifecycle.finish_terminal_write(true);
+                    }
+                });
 
-            let close_lifecycle = LoomArc::clone(&lifecycle);
-            let close = thread::spawn(move || {
-                if close_lifecycle.begin_clean_close() {
-                    close_lifecycle.finish_clean_close(true);
-                }
-            });
+                let close_lifecycle = LoomArc::clone(&lifecycle);
+                let close = thread::spawn(move || {
+                    if close_lifecycle.begin_clean_close() {
+                        close_lifecycle.finish_clean_close(true);
+                    }
+                });
 
-            assert!(admitted.join().is_ok());
-            assert!(fault.join().is_ok());
-            assert!(close.join().is_ok());
+                assert!(admitted.join().is_ok());
+                assert!(fault.join().is_ok());
+                assert!(close.join().is_ok());
 
-            let word = lifecycle.atomic.load(Ordering::Acquire);
-            let phase = lifecycle_phase(word);
-            assert_eq!(admitted_count(word), 0);
-            assert!(matches!(
-                phase,
-                AuthorityLifecyclePhase::TerminalPersisted | AuthorityLifecyclePhase::Closed
-            ));
-            let writers = terminal_writers.load(Ordering::Acquire);
-            assert!(writers <= 1);
-            assert_eq!(
-                writers,
-                usize::from(phase == AuthorityLifecyclePhase::TerminalPersisted)
-            );
+                let word = lifecycle.atomic.load(Ordering::Acquire);
+                let phase = lifecycle_phase(word);
+                assert_eq!(admitted_count(word), 0);
+                assert!(matches!(
+                    phase,
+                    AuthorityLifecyclePhase::TerminalPersisted | AuthorityLifecyclePhase::Closed
+                ));
+                let writers = terminal_writers.load(Ordering::Acquire);
+                assert!(writers <= 1);
+                assert_eq!(
+                    writers,
+                    usize::from(phase == AuthorityLifecyclePhase::TerminalPersisted)
+                );
             });
         }
     }

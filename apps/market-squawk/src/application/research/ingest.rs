@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     sync::{Arc, Mutex},
@@ -24,12 +25,14 @@ use market_squawk_sources::{
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
+    built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::{
     ResearchIngestCoordinator, ResearchSourceDiscoveryCoordinator, encode_hex, manifest_value,
@@ -39,9 +42,16 @@ use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 use super::super::domain_support::DomainLifecycle;
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
+const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
+mod provider_runtime;
 mod selection;
 
+use provider_runtime::ResearchProviderAdmission;
+pub use provider_runtime::ResearchProviderRuntimeGeneration;
+pub(crate) use provider_runtime::{
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+};
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceObjectListing,
@@ -248,6 +258,74 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
     ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError>;
 }
 
+/// Rights-bound static research adapter sealed before its coordinator is published.
+///
+/// This value is intentionally non-cloneable. It can only be consumed by a prepublication
+/// coordinator or local-product constructor and cannot recover runtime mutation authority.
+pub struct PrepublishedResearchSourceRegistration {
+    profile: SourceIdentifier,
+    metadata: SourceMetadata,
+    source: Box<dyn ManagedResearchExtractionSource>,
+    rights: ResearchRightsAuthority,
+}
+
+impl PrepublishedResearchSourceRegistration {
+    /// Seals one embedded, user-owned, or licensed adapter for prepublication composition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects source/rights identity mismatch and every code-owned onboarding profile.
+    pub fn try_new<S>(
+        profile: SourceIdentifier,
+        source: S,
+        rights: ResearchRightsAuthority,
+    ) -> Result<Self, ResearchIngestCompositionError>
+    where
+        S: ManagedResearchExtractionSource,
+    {
+        let metadata = source.metadata().clone();
+        if metadata.source_id() != &rights.source_id {
+            return Err(ResearchIngestCompositionError::SourceRightsMismatch);
+        }
+        let built_in_profiles = built_in_provider_profiles()
+            .map_err(|_error| ResearchIngestCompositionError::ProviderProfilesUnavailable)?;
+        if built_in_profiles.get(profile.as_str()).is_some() {
+            return Err(ResearchIngestCompositionError::BuiltInProfileRequiresOnboarding);
+        }
+        Ok(Self {
+            profile,
+            metadata,
+            source: Box::new(source),
+            rights,
+        })
+    }
+
+    fn validate(
+        &self,
+        built_in_profiles: &market_squawk_sources::ProviderProfileRegistry,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if self.source.metadata() != &self.metadata
+            || self.metadata.source_id() != &self.rights.source_id
+        {
+            return Err(ResearchIngestCompositionError::SourceRightsMismatch);
+        }
+        if built_in_profiles.get(self.profile.as_str()).is_some() {
+            return Err(ResearchIngestCompositionError::BuiltInProfileRequiresOnboarding);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PrepublishedResearchSourceRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrepublishedResearchSourceRegistration")
+            .field("profile", &self.profile)
+            .field("source_id", self.metadata.source_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSource {
     fn revision_plan(
         &self,
@@ -317,11 +395,14 @@ struct RegisteredExtractionSource {
     metadata: SourceMetadata,
     registration: RegisteredSource,
     rights: ResearchRightsAuthority,
+    generation: Option<ResearchProviderRuntimeGeneration>,
+    admission: ResearchProviderAdmission,
 }
 
 struct CoordinatorAuthority {
     registry: Option<AuthoritativeSourceRegistry>,
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
+    pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
     selections: RetainedDiscoverySelections,
 }
 
@@ -348,38 +429,117 @@ impl ProductionResearchIngestCoordinator {
             authority: Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
                 sources: BTreeMap::new(),
+                pending_replacements: BTreeMap::new(),
                 selections: RetainedDiscoverySelections::new(),
             }),
         }
     }
 
-    /// Registers one exact adapter revision and its retained persistence-rights evidence.
+    /// Consumes a bounded static adapter composition before publishing the coordinator.
     ///
-    /// Registration is intentionally explicit so onboarding can construct an adapter only after
-    /// every required credential, endpoint, terms, and local-root capability is available.
+    /// No post-publication static registration handle is retained or exposed.
     ///
     /// # Errors
     ///
-    /// Rejects duplicate profile identities, source/rights mismatch, shutdown, or durable source
-    /// registry failure without publishing a callable adapter entry.
-    pub fn register_source<S>(
+    /// Rejects oversized, duplicate, changed, built-in, rights-mismatched, or registry-rejected
+    /// registrations without returning a coordinator.
+    pub fn try_new_with_prepublished_sources<I>(
+        registry: AuthoritativeSourceRegistry,
+        research: Arc<ResearchService>,
+        limits: ResearchExtractionLimits,
+        registrations: I,
+    ) -> Result<Self, ResearchIngestCompositionError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
+        let built_in_profiles = built_in_provider_profiles()
+            .map_err(|_error| ResearchIngestCompositionError::ProviderProfilesUnavailable)?;
+        let mut registrations_by_profile = BTreeMap::new();
+        for registration in registrations {
+            if registrations_by_profile.len() >= MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES {
+                return Err(ResearchIngestCompositionError::PrepublishedSourceLimitExceeded);
+            }
+            registration.validate(&built_in_profiles)?;
+            if registrations_by_profile
+                .insert(registration.profile.clone(), registration)
+                .is_some()
+            {
+                return Err(ResearchIngestCompositionError::DuplicateProfile);
+            }
+        }
+
+        let coordinator = Self::new(registry, research, limits);
+        for registration in registrations_by_profile.into_values() {
+            coordinator.register_prepublished_source(registration)?;
+        }
+        Ok(coordinator)
+    }
+
+    /// Constructs the production coordinator together with its one sealed provider-mutation
+    /// authority. The authority cannot be recovered from the coordinator after composition.
+    pub(crate) fn try_new_with_provider_runtime_authority<I>(
+        registry: AuthoritativeSourceRegistry,
+        research: Arc<ResearchService>,
+        limits: ResearchExtractionLimits,
+        registrations: I,
+    ) -> Result<(Arc<Self>, ResearchProviderRuntimeMutationAuthority), ResearchIngestCompositionError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
+        let coordinator = Arc::new(Self::try_new_with_prepublished_sources(
+            registry,
+            research,
+            limits,
+            registrations,
+        )?);
+        let authority = ResearchProviderRuntimeMutationAuthority::new(Arc::clone(&coordinator));
+        Ok((coordinator, authority))
+    }
+
+    fn register_source_inner<S>(
         &self,
         profile: SourceIdentifier,
         source: S,
         rights: ResearchRightsAuthority,
+        generation: Option<ResearchProviderRuntimeGeneration>,
     ) -> Result<(), ResearchIngestCompositionError>
     where
         S: ManagedResearchExtractionSource,
     {
+        let metadata = source.metadata().clone();
+        self.register_source_arc_inner(profile, metadata, Arc::new(source), rights, generation)
+    }
+
+    fn register_prepublished_source(
+        &self,
+        registration: PrepublishedResearchSourceRegistration,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        let PrepublishedResearchSourceRegistration {
+            profile,
+            metadata,
+            source,
+            rights,
+        } = registration;
+        self.register_source_arc_inner(profile, metadata, Arc::from(source), rights, None)
+    }
+
+    fn register_source_arc_inner(
+        &self,
+        profile: SourceIdentifier,
+        metadata: SourceMetadata,
+        source: Arc<dyn ManagedResearchExtractionSource>,
+        rights: ResearchRightsAuthority,
+        generation: Option<ResearchProviderRuntimeGeneration>,
+    ) -> Result<(), ResearchIngestCompositionError> {
         if self.lifecycle.shutdown_token().is_cancelled() {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
-        let metadata = source.metadata().clone();
         if metadata.source_id() != &rights.source_id {
             return Err(ResearchIngestCompositionError::SourceRightsMismatch);
         }
         let registered_at = system_timestamp()
             .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+        let admission = ResearchProviderAdmission::new(generation.as_ref())?;
         let mut authority = self
             .authority
             .lock()
@@ -398,10 +558,12 @@ impl ProductionResearchIngestCoordinator {
         authority.sources.insert(
             profile,
             RegisteredExtractionSource {
-                source: Arc::new(source),
+                source,
                 metadata,
                 registration,
                 rights,
+                generation,
+                admission,
             },
         );
         Ok(())
@@ -422,7 +584,10 @@ impl ProductionResearchIngestCoordinator {
         if authority.registry.is_none() {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
-        Ok(authority.sources.contains_key(profile))
+        Ok(authority
+            .sources
+            .get(profile)
+            .is_some_and(|source| source.admission.ensure_live().is_ok()))
     }
 
     /// Lists exact source objects from one registered provider without minting receipts.
@@ -502,6 +667,7 @@ impl ProductionResearchIngestCoordinator {
             profile,
             &prepared.metadata,
             &prepared.rights,
+            &prepared.admission,
             discovery,
             self.limits.duration,
             observed_monotonic,
@@ -542,10 +708,15 @@ impl ProductionResearchIngestCoordinator {
                 .discover(prepared.authority.clone(), request, operation.clone()),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
         ensure_operation_live(operation_deadline, operation)?;
+        prepared
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         if discovery.objects().iter().any(|object| {
             object.source_id() != prepared.metadata.source_id()
                 || object.metadata_revision() != prepared.metadata.revision()
@@ -606,6 +777,10 @@ impl ProductionResearchIngestCoordinator {
             .sources
             .get(profile)
             .ok_or(ServiceError::NotFound)?;
+        registered
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         let extraction = registry
             .extraction_authority(&registered.registration, registered.source.as_ref())
             .map_err(map_registry_error)?;
@@ -614,6 +789,7 @@ impl ProductionResearchIngestCoordinator {
             metadata: registered.metadata.clone(),
             rights: registered.rights.clone(),
             authority: extraction,
+            admission: registered.admission.clone(),
         })
     }
 
@@ -643,6 +819,7 @@ impl ProductionResearchIngestCoordinator {
             ),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
@@ -703,6 +880,7 @@ impl ProductionResearchIngestCoordinator {
             rights,
             authority,
             object,
+            admission,
         } = prepared;
         self.extract_prepared_object(
             PreparedExtraction {
@@ -710,6 +888,7 @@ impl ProductionResearchIngestCoordinator {
                 metadata,
                 rights,
                 authority,
+                admission,
             },
             object,
             context,
@@ -742,6 +921,7 @@ impl ProductionResearchIngestCoordinator {
                 .extract(prepared.authority, extraction_request, operation.clone()),
             context,
             operation,
+            &prepared.admission,
             operation_deadline,
         )
         .await?;
@@ -753,12 +933,17 @@ impl ProductionResearchIngestCoordinator {
         let retrieved_at = system_timestamp()?;
         let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
         ensure_operation_live(operation_deadline, operation)?;
+        prepared
+            .admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
             batch,
             revisions,
             payload_digest,
             rights,
+            admission: prepared.admission,
         })
     }
 
@@ -769,6 +954,10 @@ impl ProductionResearchIngestCoordinator {
                 .lock()
                 .map_err(|_error| ServiceError::Unavailable)?;
             authority.selections.clear();
+            authority.pending_replacements.clear();
+            for registered in authority.sources.values() {
+                registered.admission.revoke();
+            }
             authority.sources.clear();
             authority.registry.take()
         };
@@ -858,6 +1047,7 @@ struct PreparedExtraction {
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
     authority: market_squawk_sources::ExtractionAuthority,
+    admission: ResearchProviderAdmission,
 }
 
 struct AuthorizedExtraction {
@@ -866,6 +1056,7 @@ struct AuthorizedExtraction {
     revisions: Option<ExtractionRevisionPlan>,
     payload_digest: EvidenceDigest,
     rights: RightsDecisionInput,
+    admission: ResearchProviderAdmission,
 }
 
 #[async_trait]
@@ -894,45 +1085,58 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
                 operation_deadline,
             )
             .await?;
-        let idempotency_key =
-            ingest_identity(&profile, &dataset, &object_id, extracted.payload_digest);
-        let ingest = match extracted.revisions {
+        let AuthorizedExtraction {
+            metadata: source_metadata,
+            batch,
+            revisions,
+            payload_digest,
+            rights,
+            admission,
+        } = extracted;
+        let publication = admission
+            .acquire_publication_lease()
+            .await
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let idempotency_key = ingest_identity(&profile, &dataset, &object_id, payload_digest);
+        let ingest = match revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
-                extracted.metadata.clone(),
-                extracted.rights,
+                source_metadata.clone(),
+                rights,
                 idempotency_key,
-                extracted.batch,
+                batch,
                 revisions,
             ),
             None => ResearchIngestRequest::locally_observed(
-                extracted.metadata.clone(),
-                extracted.rights,
+                source_metadata.clone(),
+                rights,
                 idempotency_key,
-                extracted.batch,
+                batch,
             ),
         }
-        .map_err(map_research_error)?;
+        .map_err(map_research_error)?
+        .with_precommit_authority(Arc::new(publication));
         let committed = await_publication(
             self.research.ingest(ingest, operation.clone()),
             context,
             &operation,
+            &admission,
             operation_deadline,
         )
         .await?;
         let manifest = committed.manifest();
         let plan = committed.pinned().plan();
         let coverage = json!({
-            "sourceId": extracted.metadata.source_id(),
-            "provider": extracted.metadata.provider(),
+            "sourceId": source_metadata.source_id(),
+            "provider": source_metadata.provider(),
             "profile": profile,
             "providerDataset": dataset,
             "objectId": object_id,
-            "metadataRevision": extracted.metadata.revision(),
-            "payloadDigest": encode_hex(extracted.payload_digest.bytes()),
+            "metadataRevision": source_metadata.revision(),
+            "payloadDigest": encode_hex(payload_digest.bytes()),
             "manifest": manifest_value(manifest),
         });
         let quality = json!({
-            "qualityCeiling": extracted.metadata.quality_ceiling(),
+            "qualityCeiling": source_metadata.quality_ceiling(),
             "recordLevelProvenance": true,
             "executionEligible": false,
         });
@@ -947,6 +1151,9 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         });
         let result = TypedToolResult::try_new(content, 1, metadata, limits)?;
         ensure_operation_live(operation_deadline, &operation)?;
+        admission
+            .ensure_live()
+            .map_err(|_error| ServiceError::Unavailable)?;
         Ok(result)
     }
 
@@ -965,6 +1172,7 @@ async fn await_extraction<T>(
     future: impl Future<Output = Result<T, ExtractionSourceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
     if Instant::now() >= operation_deadline {
@@ -978,6 +1186,10 @@ async fn await_extraction<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = admission.cancellation().cancelled() => {
+            operation.cancel();
+            Err(ServiceError::Unavailable)
+        }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
@@ -990,6 +1202,7 @@ async fn await_publication<T>(
     future: impl Future<Output = Result<T, ResearchServiceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
     if Instant::now() >= operation_deadline {
@@ -1003,6 +1216,10 @@ async fn await_publication<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = admission.cancellation().cancelled() => {
+            operation.cancel();
+            Err(ServiceError::Unavailable)
+        }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
@@ -1134,7 +1351,8 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::RevisionEvidenceRequired
         | IngestError::InvalidDataset
         | IngestError::ContentIdentity(_) => ServiceError::InvalidResult,
-        IngestError::Plan(_)
+        IngestError::PublicationAuthorityRevoked
+        | IngestError::Plan(_)
         | IngestError::Parquet(_)
         | IngestError::Arrow(_)
         | IngestError::Manifest(_)
@@ -1182,6 +1400,15 @@ pub enum ResearchIngestCompositionError {
     /// A profile identity is already bound to an adapter.
     #[error("research extraction profile is already registered")]
     DuplicateProfile,
+    /// Static composition exceeded the code-owned adapter ceiling.
+    #[error("prepublished research source limit exceeded")]
+    PrepublishedSourceLimitExceeded,
+    /// A code-owned provider profile can only be published through exact onboarding.
+    #[error("built-in research provider profile requires onboarding")]
+    BuiltInProfileRequiresOnboarding,
+    /// The code-owned provider profile registry could not be constructed.
+    #[error("built-in research provider profiles are unavailable")]
+    ProviderProfilesUnavailable,
     /// Shutdown has closed registration authority.
     #[error("research extraction coordinator is shutting down")]
     ShuttingDown,
@@ -1191,6 +1418,24 @@ pub enum ResearchIngestCompositionError {
     /// In-process source authority serialization is unavailable.
     #[error("research extraction authority is unavailable")]
     AuthorityUnavailable,
+    /// A provider adapter is not bound to a complete non-secret runtime generation.
+    #[error("research provider runtime generation is invalid")]
+    InvalidRuntimeGeneration,
+    /// A registered source does not expose generation-bound provider authority.
+    #[error("research provider runtime generation is unavailable")]
+    RuntimeGenerationUnavailable,
+    /// A provider replacement is not an exact, fully constructed successor.
+    #[error("research provider runtime replacement is invalid")]
+    InvalidRuntimeReplacement,
+    /// Another replacement already owns the exact provider publication slot.
+    #[error("research provider runtime replacement is already in progress")]
+    ReplacementInProgress,
+    /// The expected runtime generation is no longer callable.
+    #[error("research provider runtime generation is stale")]
+    StaleRuntimeGeneration,
+    /// A replacement cannot publish while its predecessor still admits requests.
+    #[error("research provider runtime generation is still callable")]
+    RuntimeGenerationStillCallable,
     /// The restart-durable source registry rejected registration.
     #[error("research source registration failed: {0}")]
     Registry(#[from] RegistryError),

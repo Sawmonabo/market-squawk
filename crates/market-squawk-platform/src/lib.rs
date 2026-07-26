@@ -67,7 +67,9 @@ pub use secrets::{
     EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileSecretStore,
     EncryptedFileUnlockCapability, LocalSecretStoreError, OsKeyringSecretStore,
     PreferredSecretStore, RotationAuthority, RotationOutcome, SecretBackend, SecretCancellation,
-    SecretDeadlineCapability, SecretGeneration, SecretInteractionCapability,
-    SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretRef, SecretStore,
+    SecretDeadlineCapability, SecretDeletionDisposition, SecretGeneration,
+    SecretInteractionCapability, SecretInteractionPolicy, SecretKey, SecretMutationDisposition,
+    SecretMutationEffect, SecretMutationFailure, SecretMutationKind, SecretMutationPlan,
+    SecretOperationControl, SecretReconciliationObservation, SecretRef, SecretStore,
     SecretStoreCapabilities,
 };

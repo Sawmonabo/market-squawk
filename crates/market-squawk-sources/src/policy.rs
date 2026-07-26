@@ -767,4 +767,14 @@ impl<'de> Deserialize<'de> for HttpClientProfile {
 
 include!("policy/endpoint.rs");
 include!("policy/budget.rs");
+#[path = "policy/provider_rate.rs"]
+mod provider_rate;
+pub use provider_rate::{
+    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
+    ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId, ProviderRatePermitId,
+    ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
+};
+pub(in crate::policy) use provider_rate::{
+    ProviderRateBinding, ProviderRatePermit, wall_deadline_to_monotonic,
+};
 include!("policy/tests.rs");

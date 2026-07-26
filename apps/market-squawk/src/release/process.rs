@@ -66,6 +66,7 @@ pub(super) struct ProcessTreeRssObservation {
 }
 
 impl ProcessTreeRssObservation {
+    #[cfg(feature = "release-evidence")]
     pub(super) fn admitted_observed_maximum_rss_bytes(&self) -> Result<u64> {
         if self.successful_sample_count == 0
             || self.configured_poll_sleep_millis != process_tree_rss_poll_sleep_millis()

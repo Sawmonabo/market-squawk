@@ -23,6 +23,7 @@ use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
 };
+use market_squawk_sources::ProviderRateAuthority;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
@@ -33,7 +34,7 @@ use super::source::SourceRuntimeView;
 use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
     AppConfig, ProductionSourceProvider,
-    paper_bot::{ProductionPaperBotRuntime, local_paper_bot},
+    paper_bot::{ProductionPaperBotRuntime, local_paper_bot_with_provider_rate},
 };
 
 const BOT_GET_STATUS: &str = "Bot.GetStatus";
@@ -53,9 +54,13 @@ pub struct PaperApplicationServices {
 impl PaperApplicationServices {
     /// Creates a stopped paper controller from validated effective configuration.
     #[must_use]
-    pub fn new(config: AppConfig, live_fair_value: Arc<LiveFairValueObservationBuffer>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        live_fair_value: Arc<LiveFairValueObservationBuffer>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Self {
         Self {
-            controller: Arc::new(PaperController::new(config, live_fair_value)),
+            controller: Arc::new(PaperController::new(config, live_fair_value, provider_rate)),
         }
     }
 
@@ -217,6 +222,7 @@ impl ApplicationDomainService for ExecutionDomainService {
 struct PaperController {
     config: AppConfig,
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
+    provider_rate: ProviderRateAuthority,
     accepting: AtomicBool,
     lifecycle: CancellationToken,
     state: Mutex<PaperState>,
@@ -224,11 +230,16 @@ struct PaperController {
 }
 
 impl PaperController {
-    fn new(config: AppConfig, live_fair_value: Arc<LiveFairValueObservationBuffer>) -> Self {
+    fn new(
+        config: AppConfig,
+        live_fair_value: Arc<LiveFairValueObservationBuffer>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Self {
         let (changed, _initial_receiver) = watch::channel(0);
         Self {
             config,
             live_fair_value,
+            provider_rate,
             accepting: AtomicBool::new(true),
             lifecycle: CancellationToken::new(),
             state: Mutex::new(PaperState::Stopped {
@@ -305,11 +316,12 @@ impl PaperController {
         }
         self.signal_change();
 
-        let composition = match local_paper_bot(
+        let composition = match local_paper_bot_with_provider_rate(
             self.config.clone(),
             provider,
             initial_cash,
             fee_basis_points,
+            self.provider_rate.clone(),
         ) {
             Ok(composition) => composition,
             Err(_error) => {

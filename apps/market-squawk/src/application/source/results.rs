@@ -348,8 +348,11 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         | ProviderOnboardingError::InvalidRequest
         | ProviderOnboardingError::AdministrativeContactRequired
         | ProviderOnboardingError::SecretImportUnavailable
+        | ProviderOnboardingError::RenewalUnavailable
         | ProviderOnboardingError::InvalidSecretShape => ServiceError::InvalidRequest,
         ProviderOnboardingError::OperationCancelled => ServiceError::Cancelled,
+        ProviderOnboardingError::ProbeRateLimited => ServiceError::ResourceExhausted,
+        ProviderOnboardingError::ProbeDeadlineExceeded => ServiceError::DeadlineExceeded,
         ProviderOnboardingError::Catalog(
             CatalogError::InvalidLimit
             | CatalogError::ResultByteLimitExceeded
@@ -364,6 +367,8 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         ProviderOnboardingError::RightsBlocked => ServiceError::Unauthorized,
         ProviderOnboardingError::SecretVerificationFailed
         | ProviderOnboardingError::SecretOperationUnavailable
+        | ProviderOnboardingError::SecretCleanupUnavailable
+        | ProviderOnboardingError::RemoteReconciliationRequired
         | ProviderOnboardingError::InvalidSessionState
         | ProviderOnboardingError::ClientConfiguration
         | ProviderOnboardingError::ProbeUnavailable
