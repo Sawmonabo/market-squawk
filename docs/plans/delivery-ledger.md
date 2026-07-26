@@ -10,9 +10,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `a3609b3aa4890fe6970d3994abf2bd172f9d3239`
-  (`fix(sources): restore adapter dependency boundary`), tree
-  `ef62a12c7b9be1172b57d2f0d7dc609cd28c7509`.
+  `4ac54d261401320d8e18eac7eadc7b86501cb852`
+  (`feat(release): add exact-head product demonstration`), tree
+  `571ff42e54c61839bcaa73fd2da6b95577d2afba`.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -97,6 +97,20 @@ evidence; it does not replace the README capability truth or the canonical relea
   gate, 264 existing sources/live/Coinbase unit tests, strict affected-package Clippy, application
   compile, formatting, and diff integrity passed. Issues `#10` and `#24` and their Project 5 items
   are closed/Done.
+- Task 20's exact-head product demonstration is integrated at `4ac54d2`. The shipping
+  `release demonstrate` path composes the production local application, storage and point-in-time
+  selection, DataFusion query, signed Python environments, native and ONNX inference, research
+  backtest, live integrity and features, central strategy/risk/dispatch, realistic paper
+  execution, portfolio analytics, fair-value evidence, CLI operations, and the sole typed stdio
+  MCP registry. Its closer verifies immutable repository, executable, provider, Python, inventory,
+  artifact, and result identities and fails closed on a dirty or changed head, incomplete
+  evidence, stopped-operation success, credential-bearing output, or missing paper fill.
+- Focused demonstration evidence passed the consolidated offline-admission test, the existing
+  next-snapshot partial-fill backtest test, affected-package all-target/all-feature Clippy with
+  warnings denied, application all-target/all-feature compile, formatting, diff integrity, the
+  fuzz workspace's locked offline metadata admission, and ownership-map JSON validation. The
+  demonstration proves the complete offline product surface without fabricating the separately
+  required authorized Coinbase Direct trace or provider persistence/training rights.
 - The accepted research/model worktree and its 9.0 GiB generated target are removed; the merged
   local feature branch is deleted, no matching origin branch existed, and worktree/remote metadata
   is pruned. The accepted Coinbase target and worktree are likewise removed, its merged local
@@ -112,6 +126,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   matching origin branch existed, and metadata was pruned. Only the release worktree remains. Its
   generated target is approximately 13 GiB, below the enforced 20 GiB ceiling; `.worktrees` is
   empty, the root incremental directory is approximately 9 MiB, and approximately 114 GiB is free.
+  The release-demonstration lane then reclaimed 7.1 GiB before its clean worktree and merged local
+  branch were removed; no matching origin branch existed, and worktree/remote metadata was pruned.
 - Dependabot pull requests `#2`, `#32`, `#33`, `#34`, and `#35` are merged; superseded updates
   `#3` and `#4` are closed. No dependency pull request or Dependabot branch remains open locally or
   on origin.
@@ -122,6 +138,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Hosted Actions run `30197493366` at `ed86d4f` created `verify`, `macos`, and `windows` jobs with
   empty step lists. No checkout, build, lint, or test step ran; each check reported the external
   account payment/spending-limit blocker. That run contains no code-owned CI failure to remediate.
+- Hosted Actions run `30201225241` at demonstration head `4ac54d2` repeated that exact condition:
+  all three jobs have empty step lists and the account payment/spending-limit annotation. The
+  workflow scheduled at the current code head, but GitHub rejected every job before checkout.
 - Documentation execution source head:
   `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
@@ -519,10 +538,11 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is provider/Task 19A acceptance, followed by Task 20's integrated
-demonstration, evidence, final review, exact-head release gate, publication, and cleanup. Neither
-Task 19 acceptance nor the completed documentation portal claims that the Market Squawk product
-release is complete.
+The next delivery event is provider/Task 19A acceptance, followed by Task 20's exact-head
+production measurements, fuzz/security evidence, full release gate, grouped review, publication,
+and repository closeout. The integrated product demonstration is a required internal predicate;
+it does not claim that the Market Squawk product release is complete while the external provider
+predicates remain open.
 
 ## Active Quarter 4 closeout sequence
 

@@ -932,3 +932,38 @@ steps; all three were rejected before checkout by the GitHub account payment/spe
 annotation. Repository workflow enablement, trigger configuration, PR ancestry, and current-head
 scheduling are therefore healthy; hosted execution remains externally blocked until the account
 state is repaired.
+
+## 2026-07-26 exact-head product-demonstration checkpoint
+
+Release capability head `4ac54d261401320d8e18eac7eadc7b86501cb852`, tree
+`571ff42e54c61839bcaa73fd2da6b95577d2afba`, integrates the shipping Task 20 product
+demonstration. One offline command now exercises the production local application, durable
+research storage and point-in-time selection, DataFusion query, sealed CPython environments,
+native and ONNX inference, policy-bound research backtesting, live integrity and features,
+strategy, central risk, dispatch, realistic paper execution, portfolio analytics, fair-value
+classification and evidence, CLI services, and the sole typed stdio MCP registry.
+
+The demonstration and closer are release authorities rather than a synthetic showcase. They bind
+the clean Git head and tree, running executable, provider and Python reports, tool inventory,
+artifacts, policy metadata, and semantic result digests; publish by no-clobber commit; and reject
+changed identities or incomplete predicates. A successful paper proof requires an actually filled
+centrally approved order. Public Coinbase and Kraken remain non-execution evidence. Stopped bot
+and execution commands must fail closed. The command requires explicit offline admission because
+the authorized Coinbase Direct and provider-rights acceptance predicates remain separately open.
+
+Focused verification passed the existing consolidated offline-admission and backtest tests,
+affected-package strict Clippy, application all-target/all-feature compile, formatting, diff
+integrity, locked offline fuzz metadata, and ownership-map JSON parsing. No new test executable,
+prose checker, or broad duplicate workspace gate was added.
+
+After integration and push, the release-demonstration lane reclaimed 9,430 generated files and
+7.1 GiB. Its clean worktree and merged local branch were removed, no matching origin branch
+existed, and worktree/remote metadata was pruned. Only the release worktree remains. The root
+target is 13,237,884 KiB, below the 20 GiB ceiling, and `.worktrees` is empty.
+
+Release PR `#26` remains the sole open pull request and is mergeable. No Dependabot pull request
+or dependency branch is open. Actions run `30201225241` scheduled against the exact capability
+head, but its `verify`, `macos`, and `windows` jobs each contain zero steps and the account
+payment/spending-limit annotation; no repository code executed and no code-owned CI defect is
+present in that run. Issues `#7`, `#25`, and `#31` remain open and In Progress until their actual
+Coinbase Direct, provider-rights, and exact-candidate release predicates close.
