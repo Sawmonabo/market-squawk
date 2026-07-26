@@ -189,6 +189,7 @@ Fair-value classification never changes market-data quality or creates live exec
 | `release evidence benchmark` | Supervises the production live/storage measurement worker and atomically publishes `performance.json` |
 | `release evidence providers` | Exercises the selected authorized production provider surfaces and creates `providers/provider-evidence.json` |
 | `release demonstrate --offline` | Composes the complete local product against the exact provider/Python evidence and atomically publishes `demo.json` |
+| `release evidence gate` | Supervises the exact checked-in full gate and binds its repository, executable, script, log, process limits, and target usage in `full-gate.json` |
 | `release evidence close` | Validates the complete exact-HEAD directory and atomically publishes its terminal `manifest.json` |
 
 Exact-head producers accept `--head` and `--tree`, reject a dirty or changing repository, and use
@@ -260,11 +261,22 @@ live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/do
 paths. Public-source fixtures remain `DirectUnverified`; the local product starts with the paper bot
 stopped and proves execution operations fail closed until a running source owns authority.
 
+`release evidence gate` requires exact `--head`, `--tree`, `--binary`, absent
+`--gate-log <HEAD-ROOT>/full-gate.log`, and absent
+`--output-file <HEAD-ROOT>/full-gate.json`. The running selected release executable
+parent-supervises the exact checked-in `scripts/verify.sh` with an eight-hour deadline, a 16 GiB
+process-tree RSS ceiling, a log-only 64 MiB file-size ceiling, and no-clobber log creation. It binds
+the script and completed log by SHA-256 and byte count, records observed process evidence,
+revalidates its immutable inputs, and rejects target usage above 20 GiB.
+
 `release evidence close` accepts only the exact HEAD-keyed root containing `fuzz.json`,
-`performance.json`, `providers/`, `python/`, `demo.json`, and `full-gate.log`. Its
+`performance.json`, `providers/`, `python/`, `demo.json`, `full-gate.log`, and `full-gate.json`. Its
 `--output-file` must be the absent `<HEAD-ROOT>/manifest.json`. The closer rejects missing or extra
 root entries, credentials, symlinks, parent traversal, cross-HEAD artifacts, binary mismatches,
-failed thresholds, incomplete product predicates, or incomplete provider rights/action evidence.
+failed semantic fuzz/performance/gate predicates, incomplete product predicates, or incomplete
+provider rights/action evidence. Python release evidence must bind the same selected application
+binary. The final artifact inventory and every external immutable input are revalidated on both
+sides of pending-manifest preparation.
 
 The reproducible sequence and current blockers are in the
 [exact-head release gate](../verification/usable-release-gate.md).

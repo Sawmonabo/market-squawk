@@ -24,7 +24,8 @@ It is not approval evidence until the exact candidate and every required group a
 
 The review begins only after provider acceptance, candidate freeze, and a complete exact-head
 evidence run. Reviewers inspect the same commit, tree, release binary, provider report, signed
-Python releases, fuzz report, performance report, demonstration, and full-gate log.
+Python releases, fuzz report, performance report, demonstration, full-gate log, typed full-gate
+receipt, and closed artifact inventory.
 
 Review is read-only. Reviewers do not edit the candidate, create parallel fix branches, rerun broad
 gates, or approve a different commit.

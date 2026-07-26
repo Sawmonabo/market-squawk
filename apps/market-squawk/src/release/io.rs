@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use super::identity::RepositoryIdentity;
+
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAXIMUM_REPORT_BYTES: usize = 64 * 1024 * 1024;
 const PENDING_CREATION_ATTEMPTS: usize = 8;
@@ -33,17 +35,27 @@ struct OwnedEvidenceEnvelope {
     payload: Value,
 }
 
-pub(super) fn publish_report<T: Serialize>(
-    output: &Path,
-    kind: &'static str,
-    payload: &T,
-) -> Result<PublishedReport> {
-    let bytes = report_bytes(kind, payload)?;
-    let mut pending = PendingReport::create(output, &bytes)?;
-    if let Err(error) = pending.write_and_sync(&bytes) {
-        return Err(pending.fail(error));
+/// Strict repository identity decoded from an untrusted evidence payload.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RecordedRepositoryIdentity {
+    pub(super) head: String,
+    pub(super) tree: String,
+    pub(super) clean: bool,
+}
+
+impl RecordedRepositoryIdentity {
+    pub(super) fn validate_exact(&self, expected: &RepositoryIdentity) -> Result<()> {
+        if !valid_object_id(&self.head)
+            || !valid_object_id(&self.tree)
+            || !self.clean
+            || self.head != expected.head
+            || self.tree != expected.tree
+        {
+            bail!("recorded release-evidence repository identity is not the exact clean candidate");
+        }
+        Ok(())
     }
-    pending.publish()
 }
 
 pub(super) fn publish_report_with_identity_barrier<T, F>(
@@ -56,14 +68,27 @@ where
     T: Serialize,
     F: FnMut() -> Result<()>,
 {
+    publish_report_with_pending_identity_barrier(output, kind, payload, |_| revalidate())
+}
+
+pub(super) fn publish_report_with_pending_identity_barrier<T, F>(
+    output: &Path,
+    kind: &'static str,
+    payload: &T,
+    mut revalidate: F,
+) -> Result<PublishedReport>
+where
+    T: Serialize,
+    F: FnMut(Option<&Path>) -> Result<()>,
+{
     let bytes = report_bytes(kind, payload)?;
-    revalidate().context("release-evidence pre-publication identity barrier failed")?;
+    revalidate(None).context("release-evidence pre-publication identity barrier failed")?;
     let mut pending = PendingReport::create(output, &bytes)?;
     if let Err(error) = pending.write_and_sync(&bytes) {
         return Err(pending.fail(error));
     }
-    if let Err(error) =
-        revalidate().context("release-evidence post-preparation identity barrier failed")
+    if let Err(error) = revalidate(Some(&pending.pending_path))
+        .context("release-evidence post-preparation identity barrier failed")
     {
         return Err(pending.fail(error));
     }
@@ -693,6 +718,19 @@ pub(super) struct StableFileIdentity {
     pub(super) byte_count: u64,
 }
 
+impl StableFileIdentity {
+    pub(super) fn validate(&self, maximum_bytes: u64, label: &str) -> Result<()> {
+        if !valid_sha256(&self.sha256) || self.byte_count == 0 || self.byte_count > maximum_bytes {
+            bail!("{label} contains an invalid bounded file identity");
+        }
+        Ok(())
+    }
+
+    pub(super) fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
 struct HashPass {
     sha256: String,
     byte_count: u64,
@@ -756,7 +794,7 @@ fn new_pending_path(final_path: &Path) -> Result<PathBuf> {
     )))
 }
 
-fn is_pending_report_path(path: &Path) -> bool {
+pub(super) fn is_pending_report_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
@@ -786,4 +824,20 @@ pub(super) fn hex_digest(digest: [u8; 32]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+pub(super) fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }

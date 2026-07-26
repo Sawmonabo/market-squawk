@@ -620,6 +620,8 @@ pub enum ReleaseEvidenceCommand {
     BenchmarkWorker(ReleaseBenchmarkArguments),
     /// Collect authorized evidence from configured provider interfaces.
     Providers(ReleaseProviderArguments),
+    /// Bind one successful full verification gate to its exact inputs.
+    Gate(ReleaseGateArguments),
     /// Validate and seal a complete exact-head evidence directory.
     Close(ReleaseCloseArguments),
 }
@@ -715,6 +717,27 @@ pub struct ReleaseProviderArguments {
         id = "provider_output_directory",
         long = "output-directory",
         value_name = "OUTPUT_DIRECTORY"
+    )]
+    pub output: PathBuf,
+}
+
+/// Full verification-gate receipt arguments.
+#[derive(Debug, Args)]
+pub struct ReleaseGateArguments {
+    /// Exact clean repository identity represented by the completed gate.
+    #[command(flatten)]
+    pub repository: ReleaseRepositoryArguments,
+    /// Exact release executable represented by the completed gate.
+    #[arg(long)]
+    pub binary: PathBuf,
+    /// Absent no-clobber destination for supervised full-gate output.
+    #[arg(long)]
+    pub gate_log: PathBuf,
+    /// New no-clobber full-gate.json beside the finalized log.
+    #[arg(
+        id = "full_gate_output_file",
+        long = "output-file",
+        value_name = "OUTPUT_FILE"
     )]
     pub output: PathBuf,
 }

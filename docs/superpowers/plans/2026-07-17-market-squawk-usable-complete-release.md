@@ -2675,6 +2675,7 @@ not a substitute for any command in the block:
 
 ```bash
 set -euo pipefail
+export CARGO_INCREMENTAL=0
 test -z "$(git status --porcelain)"
 HEAD_SHA="$(git rev-parse HEAD)"
 TREE_SHA="$(git rev-parse HEAD^{tree})"
@@ -2711,8 +2712,13 @@ cargo run -p market-squawk --release --all-features --locked -- \
   --provider-evidence "$EVIDENCE_DIR/providers" \
   --python-evidence "$EVIDENCE_DIR/python/market-squawk-release.json" \
   --output-file "$EVIDENCE_DIR/demo.json"
-./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
-cargo run -p market-squawk --release --all-features --locked -- \
+target/release/market-squawk \
+  release evidence gate \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --binary target/release/market-squawk \
+  --gate-log "$EVIDENCE_DIR/full-gate.log" \
+  --output-file "$EVIDENCE_DIR/full-gate.json"
+target/release/market-squawk \
   release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \

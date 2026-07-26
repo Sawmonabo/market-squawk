@@ -541,12 +541,13 @@ fn validate_arguments(arguments: &ReleaseBenchmarkArguments) -> Result<EvidenceA
     }
     let exact = arguments.repository.head.is_some() && arguments.repository.tree.is_some();
     if exact
-        && (arguments.warm_up_events < EXACT_WARM_UP_EVENTS
-            || arguments.events < EXACT_EVENTS
-            || arguments.storage_rows < EXACT_STORAGE_ROWS
-            || arguments.min_events_per_second < 100_000
-            || arguments.max_tail_growth_mib > MAXIMUM_TAIL_GROWTH_MIB
-            || arguments.max_tail_growth_percent > MAXIMUM_TAIL_GROWTH_PERCENT)
+        && (arguments.warm_up_events != EXACT_WARM_UP_EVENTS
+            || arguments.events != EXACT_EVENTS
+            || arguments.storage_rows != EXACT_STORAGE_ROWS
+            || arguments.min_events_per_second != 100_000
+            || arguments.max_warmed_p99_ns != 999_999
+            || arguments.max_tail_growth_mib != MAXIMUM_TAIL_GROWTH_MIB
+            || arguments.max_tail_growth_percent != MAXIMUM_TAIL_GROWTH_PERCENT)
     {
         bail!("exact-head release performance requires the full acceptance workload and limits");
     }

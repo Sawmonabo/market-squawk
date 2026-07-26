@@ -78,10 +78,10 @@ pub(super) async fn run(
     validate_report_identity(&provider, &repository)?;
     validate_provider_evidence(&provider.payload)?;
     reject_credentials(&provider.payload)?;
-    validate_python_evidence(&layout.python_directory)?;
 
     let executable = std::env::current_exe().context("release executable path is unavailable")?;
     let application_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
+    validate_python_evidence(&layout.python_directory, &application_binary)?;
     validate_provider_binary(&provider.payload, &application_binary)?;
     let python_release_manifest = hash_stable_file(&layout.python_manifest, MAXIMUM_REPORT_BYTES)?;
     let python_release_evidence = hash_stable_file(
@@ -217,7 +217,7 @@ fn revalidate_inputs(
     if provider.file != payload.inputs.provider_report {
         bail!("release demonstration provider report changed");
     }
-    validate_python_evidence(&layout.python_directory)?;
+    validate_python_evidence(&layout.python_directory, &payload.inputs.application_binary)?;
     local::revalidate_training_matrix(&layout.python_directory)?;
     if hash_stable_file(&layout.python_manifest, MAXIMUM_REPORT_BYTES)?
         != payload.inputs.python_release_manifest

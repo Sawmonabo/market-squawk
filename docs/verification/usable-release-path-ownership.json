@@ -275,6 +275,7 @@
       "owner_id": "release-hardening",
       "tasks": [20],
       "paths": [
+        "apps/market-squawk/src/cli.rs",
         "apps/market-squawk/src/release/mod.rs",
         "apps/market-squawk/src/release/identity.rs",
         "apps/market-squawk/src/release/io.rs",
@@ -289,8 +290,11 @@
         "apps/market-squawk/src/release/demonstrate/local.rs",
         "apps/market-squawk/src/release/demonstrate/mcp.rs",
         "apps/market-squawk/src/release/close.rs",
+        "apps/market-squawk/src/release/close_performance.rs",
         "apps/market-squawk/src/release/close_demonstration.rs",
+        "apps/market-squawk/src/release/close_quality.rs",
         "apps/market-squawk/src/release/close_provider.rs",
+        "apps/market-squawk/src/release/gate.rs",
         "apps/market-squawk/src/live_source/release_support.rs",
         "apps/market-squawk/tests/harnesses/control_plane.rs",
         "apps/market-squawk/tests/release_demonstration.rs",
@@ -310,6 +314,7 @@
         "docs/verification/usable-release-demonstration.md",
         "docs/verification/usable-release-performance.md",
         "docs/verification/usable-release-gate.md",
+        "docs/reference/cli.md",
         "docs/reports/usable-release-review.md"
       ],
       "focused_gate": [
@@ -392,7 +397,8 @@
     {"task": 17, "wave": "wave-4b", "quarter": "quarter-3-of-4", "dependencies": [13, 16], "owner_ids": ["backtesting", "integration-root"]},
     {"task": 18, "wave": "wave-4b", "quarter": "quarter-3-of-4", "dependencies": [11, 12, 16], "owner_ids": ["fair-value"]},
     {"task": 19, "wave": "wave-5", "quarter": "quarter-4-of-4", "dependencies": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], "owner_ids": ["services-mcp", "platform-control", "integration-root"]},
-    {"task": 20, "wave": "wave-6", "quarter": "quarter-4-of-4", "dependencies": [19], "owner_ids": ["research-data", "release-hardening", "integration-root"]}
+    {"task": "19A", "wave": "wave-5", "quarter": "quarter-4-of-4", "dependencies": [19], "owner_ids": ["domain-source-live", "platform-control", "research-data", "integration-root"]},
+    {"task": 20, "wave": "wave-6", "quarter": "quarter-4-of-4", "dependencies": [19, "19A"], "owner_ids": ["research-data", "release-hardening", "integration-root"]}
   ],
   "waves": [
     {"id": "wave-0", "start_barrier": "approved live/capture exact head", "parallel_groups": [["integration-root"], ["policy-boundaries", "research-governance"]], "merge_sequence": ["integration-root:task-0", "policy-boundaries", "research-governance", "integration-root:wave-close"]},
@@ -409,7 +415,7 @@
     {"id": "quarter-1-of-4", "tasks": [0, 1, 2, 3, 4, 5, 6], "review": "one frozen exact commit; grouped fresh read-only review; every substantiated Critical, Important, and Minor finding blocks approval"},
     {"id": "quarter-2-of-4", "tasks": [7, 8, 9, 10, 11, 12], "review": "one frozen exact commit; grouped fresh read-only review; every substantiated Critical, Important, and Minor finding blocks approval"},
     {"id": "quarter-3-of-4", "tasks": [13, 14, 15, 16, 17, 18], "review": "one frozen exact commit; grouped fresh read-only review; every substantiated Critical, Important, and Minor finding blocks approval"},
-    {"id": "quarter-4-of-4", "tasks": [19, 20], "review": "one frozen exact commit; complete local release gate and grouped fresh read-only approval before publication"}
+    {"id": "quarter-4-of-4", "tasks": [19, "19A", 20], "review": "one frozen exact commit; complete local release gate and grouped fresh read-only approval before publication"}
   ],
   "retired_at_anchor": {
     "task": 0,

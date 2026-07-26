@@ -10,11 +10,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::close_demonstration::validate_demonstration_evidence;
+use super::close_performance::validate_performance_evidence;
 pub(super) use super::close_provider::{validate_provider_binary, validate_provider_evidence};
+use super::close_quality::{validate_fuzz_evidence, validate_gate_evidence};
 use super::identity::RepositoryIdentity;
 use super::io::{
-    PublishedReport, StableFileIdentity, VerifiedReport, hash_stable_file, publish_report,
-    read_report, read_stable_bytes,
+    PublishedReport, StableFileIdentity, VerifiedReport, hash_stable_file, is_pending_report_path,
+    publish_report_with_pending_identity_barrier, read_report, read_stable_bytes,
 };
 use crate::cli::ReleaseCloseArguments;
 
@@ -23,8 +25,9 @@ const MAXIMUM_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAXIMUM_EVIDENCE_FILES: usize = 10_000;
 const MAXIMUM_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
-const REQUIRED_ROOT_ENTRIES: [&str; 6] = [
+const REQUIRED_ROOT_ENTRIES: [&str; 7] = [
     "demo.json",
+    "full-gate.json",
     "full-gate.log",
     "fuzz.json",
     "performance.json",
@@ -41,7 +44,7 @@ struct ClosedEvidence {
     artifacts: Vec<ArtifactIdentity>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactIdentity {
     path: String,
@@ -56,7 +59,7 @@ pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
     let repository = RepositoryIdentity::admit(&arguments.repository)?;
     let evidence_root = admit_evidence_root(&arguments.evidence_dir, &repository)?;
     admit_output_path(&evidence_root, &arguments.output)?;
-    validate_root_entries(&evidence_root)?;
+    validate_root_entries(&evidence_root, None)?;
     let reports = [
         (
             "fuzz.json",
@@ -94,6 +97,15 @@ pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
                 "market_squawk.release.demonstration",
             )?,
         ),
+        (
+            "full-gate.json",
+            "market_squawk.release.full_gate",
+            read_report(
+                &evidence_root.join("full-gate.json"),
+                MAXIMUM_REPORT_BYTES,
+                "market_squawk.release.full_gate",
+            )?,
+        ),
     ];
     for (path, kind, report) in &reports {
         validate_report_identity(report, &repository)
@@ -103,18 +115,31 @@ pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
             bail!("release-evidence report identity is invalid");
         }
     }
-    validate_provider_evidence(&reports[2].2.payload)?;
-    validate_python_evidence(&evidence_root.join("python"))?;
-    validate_gate_log(&evidence_root.join("full-gate.log"))?;
-    let (artifacts, total_artifact_bytes) = inventory_artifacts(&evidence_root)?;
     let binary = hash_stable_file(&arguments.binary, MAXIMUM_BINARY_BYTES)?;
+    let verify_path = repository.root().join("scripts/verify.sh");
+    let verify_script = hash_stable_file(&verify_path, MAXIMUM_REPORT_BYTES)?;
+    let gate_log_path = evidence_root.join("full-gate.log");
+    validate_gate_log(&gate_log_path)?;
+    let full_gate_log = hash_stable_file(&gate_log_path, MAXIMUM_REPORT_BYTES)?;
+    validate_fuzz_evidence(&reports[0].2.payload, &repository, &binary)?;
+    validate_performance_evidence(&reports[1].2.payload, &repository, &binary)?;
+    validate_provider_evidence(&reports[2].2.payload)?;
     validate_provider_binary(&reports[2].2.payload, &binary)?;
+    validate_python_evidence(&evidence_root.join("python"), &binary)?;
     validate_demonstration_evidence(
         &reports[3].2.payload,
         &reports[2].2.file,
         &evidence_root.join("python"),
         &binary,
     )?;
+    validate_gate_evidence(
+        &reports[4].2.payload,
+        &repository,
+        &binary,
+        &verify_script,
+        &full_gate_log,
+    )?;
+    let (artifacts, total_artifact_bytes) = inventory_artifacts(&evidence_root, None)?;
     repository.verify_unchanged()?;
     let payload = ClosedEvidence {
         repository,
@@ -123,12 +148,50 @@ pub(super) fn run(arguments: ReleaseCloseArguments) -> Result<Value> {
         total_artifact_bytes,
         artifacts,
     };
-    let published = publish_report(
+    let published = publish_report_with_pending_identity_barrier(
         &arguments.output,
         "market_squawk.release.closed_manifest",
         &payload,
+        |pending| {
+            revalidate_closure_inputs(
+                &arguments,
+                &evidence_root,
+                &verify_script,
+                &full_gate_log,
+                &payload,
+                pending,
+            )
+        },
     )?;
     Ok(publication_value(&published))
+}
+
+fn revalidate_closure_inputs(
+    arguments: &ReleaseCloseArguments,
+    evidence_root: &Path,
+    verify_script: &StableFileIdentity,
+    full_gate_log: &StableFileIdentity,
+    payload: &ClosedEvidence,
+    permitted_pending: Option<&Path>,
+) -> Result<()> {
+    if admit_evidence_root(&arguments.evidence_dir, &payload.repository)? != evidence_root {
+        bail!("release-evidence root changed at the publication barrier");
+    }
+    validate_root_entries(evidence_root, permitted_pending)?;
+    let verify_path = payload.repository.root().join("scripts/verify.sh");
+    let gate_log_path = evidence_root.join("full-gate.log");
+    validate_gate_log(&gate_log_path)?;
+    if hash_stable_file(&arguments.binary, MAXIMUM_BINARY_BYTES)? != payload.binary
+        || hash_stable_file(&verify_path, MAXIMUM_REPORT_BYTES)? != *verify_script
+        || hash_stable_file(&gate_log_path, MAXIMUM_REPORT_BYTES)? != *full_gate_log
+    {
+        bail!("release-closure immutable input changed at the publication barrier");
+    }
+    let (artifacts, total_artifact_bytes) = inventory_artifacts(evidence_root, permitted_pending)?;
+    if artifacts != payload.artifacts || total_artifact_bytes != payload.total_artifact_bytes {
+        bail!("release-evidence artifact inventory changed at the publication barrier");
+    }
+    payload.repository.verify_unchanged()
 }
 
 pub(super) fn string_set(values: &[Value], label: &str) -> Result<BTreeSet<String>> {
@@ -186,10 +249,16 @@ fn admit_output_path(root: &Path, requested: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_root_entries(root: &Path) -> Result<()> {
+fn validate_root_entries(root: &Path, permitted_pending: Option<&Path>) -> Result<()> {
     let mut actual = BTreeSet::new();
     for entry in fs::read_dir(root).context("release-evidence root cannot be read")? {
         let entry = entry.context("release-evidence root entry cannot be read")?;
+        if permitted_pending.is_some_and(|path| entry.path() == path) {
+            continue;
+        }
+        if is_pending_report_path(&entry.path()) {
+            bail!("release-evidence root contains an unexpected pending report");
+        }
         let name = entry
             .file_name()
             .into_string()
@@ -238,7 +307,10 @@ pub(super) fn validate_report_identity(
     Ok(())
 }
 
-pub(super) fn validate_python_evidence(directory: &Path) -> Result<()> {
+pub(super) fn validate_python_evidence(
+    directory: &Path,
+    application_binary: &StableFileIdentity,
+) -> Result<()> {
     let evidence_path = directory.join("market-squawk-release-evidence.json");
     let release_path = directory.join("market-squawk-release.json");
     let evidence_bytes = read_stable_bytes(&evidence_path, MAXIMUM_REPORT_BYTES)?;
@@ -264,26 +336,35 @@ pub(super) fn validate_python_evidence(directory: &Path) -> Result<()> {
     if declared != release_identity.sha256 {
         bail!("Python evidence does not bind its exact release manifest");
     }
+    if release
+        .pointer("/payload/application/sha256")
+        .and_then(Value::as_str)
+        != Some(application_binary.sha256.as_str())
+        || release
+            .pointer("/payload/application/size_bytes")
+            .and_then(Value::as_u64)
+            != Some(application_binary.byte_count)
+    {
+        bail!("Python release manifest does not bind the selected application binary");
+    }
     reject_credentials(&evidence)?;
     reject_credentials(&release)?;
     Ok(())
 }
 
-fn validate_gate_log(path: &Path) -> Result<()> {
+pub(super) fn validate_gate_log(path: &Path) -> Result<()> {
     let bytes = read_stable_bytes(path, MAXIMUM_REPORT_BYTES)?;
     if bytes.is_empty() || bytes.contains(&0) {
         bail!("full release-gate log is empty or invalid");
     }
     let text = std::str::from_utf8(&bytes).context("full release-gate log is not UTF-8")?;
-    for marker in ["offline mock smoke test passed", "MCP smoke test passed"] {
-        if !text.contains(marker) {
-            bail!("full release-gate log omitted a terminal verification marker");
-        }
-    }
     reject_secret_text(text)
 }
 
-fn inventory_artifacts(root: &Path) -> Result<(Vec<ArtifactIdentity>, u64)> {
+fn inventory_artifacts(
+    root: &Path,
+    permitted_pending: Option<&Path>,
+) -> Result<(Vec<ArtifactIdentity>, u64)> {
     let mut pending = vec![root.to_path_buf()];
     let mut paths = Vec::new();
     while let Some(directory) = pending.pop() {
@@ -291,6 +372,12 @@ fn inventory_artifacts(root: &Path) -> Result<(Vec<ArtifactIdentity>, u64)> {
             fs::read_dir(&directory).context("release artifact directory cannot be read")?
         {
             let entry = entry.context("release artifact entry cannot be read")?;
+            if permitted_pending.is_some_and(|path| entry.path() == path) {
+                continue;
+            }
+            if is_pending_report_path(&entry.path()) {
+                bail!("release evidence contains an unexpected pending report");
+            }
             let file_type = entry
                 .file_type()
                 .context("release artifact type is unavailable")?;

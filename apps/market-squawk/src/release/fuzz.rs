@@ -11,23 +11,25 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use super::identity::RepositoryIdentity;
-use super::io::{PublishedReport, StableFileIdentity, hash_stable_file, publish_report};
+use super::io::{
+    PublishedReport, StableFileIdentity, hash_stable_file, publish_report_with_identity_barrier,
+};
 use super::process::{ProcessEvidence, ProcessLimits, ProcessRequest};
 use crate::cli::ReleaseFuzzArguments;
 
-const FUZZ_TOOLCHAIN: &str = "nightly-2026-07-15";
-const CARGO_FUZZ_VERSION: &str = "cargo-fuzz 0.13.2";
+pub(super) const FUZZ_TOOLCHAIN: &str = "nightly-2026-07-15";
+pub(super) const CARGO_FUZZ_VERSION: &str = "cargo-fuzz 0.13.2";
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAXIMUM_CAMPAIGN_SECONDS: u64 = 60 * 60;
 const MINIMUM_RSS_MIB: u64 = 64;
 const MAXIMUM_RSS_MIB: u64 = 8 * 1024;
-const MAXIMUM_FUZZ_TARGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub(super) const MAXIMUM_FUZZ_TARGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAXIMUM_INPUT_FILE_BYTES: u64 = 1024 * 1024;
-const MAXIMUM_CORPUS_BYTES: u64 = 256 * 1024 * 1024;
-const MAXIMUM_CORPUS_FILES: usize = 100_000;
+pub(super) const MAXIMUM_CORPUS_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAXIMUM_CORPUS_FILES: usize = 100_000;
 
-const TARGETS: [FuzzTarget; 6] = [
+pub(super) const TARGETS: [FuzzTarget; 6] = [
     FuzzTarget {
         name: "capture_records",
         feature: "capture",
@@ -61,16 +63,17 @@ const TARGETS: [FuzzTarget; 6] = [
 ];
 
 #[derive(Clone, Copy)]
-struct FuzzTarget {
-    name: &'static str,
-    feature: &'static str,
-    maximum_input_bytes: usize,
+pub(super) struct FuzzTarget {
+    pub(super) name: &'static str,
+    pub(super) feature: &'static str,
+    pub(super) maximum_input_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FuzzEvidence {
     repository: RepositoryIdentity,
+    evidence_authority: &'static str,
     application_binary: StableFileIdentity,
     fuzz_manifest: StableFileIdentity,
     fuzz_lock: StableFileIdentity,
@@ -107,12 +110,16 @@ struct FuzzTargetEvidence {
 
 pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> {
     validate_arguments(&arguments)?;
+    let evidence_authority =
+        if arguments.repository.head.is_some() && arguments.repository.tree.is_some() {
+            "exact_head"
+        } else {
+            "provisional"
+        };
     let repository = RepositoryIdentity::admit(&arguments.repository)?;
     let started_at = now();
-    let application_binary = hash_stable_file(
-        &std::env::current_exe().context("running executable path is unavailable")?,
-        MAXIMUM_EXECUTABLE_BYTES,
-    )?;
+    let executable = std::env::current_exe().context("running executable path is unavailable")?;
+    let application_binary = hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?;
     let fuzz_root = repository.root().join("fuzz");
     let manifest = hash_stable_file(&fuzz_root.join("Cargo.toml"), MAXIMUM_INPUT_FILE_BYTES)?;
     let lock = hash_stable_file(&fuzz_root.join("Cargo.lock"), MAXIMUM_INPUT_FILE_BYTES)?;
@@ -243,6 +250,7 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
     repository.verify_unchanged()?;
     let payload = FuzzEvidence {
         repository,
+        evidence_authority,
         application_binary,
         fuzz_manifest: manifest,
         fuzz_lock: lock,
@@ -261,7 +269,27 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
         completed_at: now(),
         targets,
     };
-    let published = publish_report(&arguments.output, "market_squawk.release.fuzz", &payload)?;
+    let published = publish_report_with_identity_barrier(
+        &arguments.output,
+        "market_squawk.release.fuzz",
+        &payload,
+        || {
+            if hash_stable_file(&executable, MAXIMUM_EXECUTABLE_BYTES)?
+                != payload.application_binary
+                || hash_stable_file(&fuzz_root.join("Cargo.toml"), MAXIMUM_INPUT_FILE_BYTES)?
+                    != payload.fuzz_manifest
+                || hash_stable_file(&fuzz_root.join("Cargo.lock"), MAXIMUM_INPUT_FILE_BYTES)?
+                    != payload.fuzz_lock
+                || hash_stable_file(
+                    &fuzz_root.join("rust-toolchain.toml"),
+                    MAXIMUM_INPUT_FILE_BYTES,
+                )? != payload.fuzz_toolchain_file
+            {
+                bail!("release fuzz immutable inputs changed at the publication barrier");
+            }
+            payload.repository.verify_unchanged()
+        },
+    )?;
     Ok(publication_value(&published))
 }
 
@@ -275,6 +303,11 @@ fn validate_arguments(arguments: &ReleaseFuzzArguments) -> Result<()> {
     }
     if !(MINIMUM_RSS_MIB..=MAXIMUM_RSS_MIB).contains(&arguments.rss_limit_mib) {
         bail!("fuzz RSS limit is outside its fixed bound");
+    }
+    if arguments.repository.head.is_some()
+        && (arguments.seconds_per_target != 120 || arguments.rss_limit_mib != 2_048)
+    {
+        bail!("exact-head fuzz evidence requires the full campaign duration and RSS limit");
     }
     Ok(())
 }

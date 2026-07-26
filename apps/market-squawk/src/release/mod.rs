@@ -4,10 +4,13 @@
 mod benchmark;
 mod close;
 mod close_demonstration;
+mod close_performance;
 mod close_provider;
+mod close_quality;
 #[cfg(feature = "release-evidence")]
 mod demonstrate;
 mod fuzz;
+mod gate;
 mod identity;
 mod io;
 mod process;
@@ -63,6 +66,9 @@ pub async fn execute_release_command(config: AppConfig, command: ReleaseCommand)
         ReleaseCommand::Evidence {
             command: ReleaseEvidenceCommand::Providers(arguments),
         } => providers::run(config, arguments).await,
+        ReleaseCommand::Evidence {
+            command: ReleaseEvidenceCommand::Gate(arguments),
+        } => gate::run(arguments),
         ReleaseCommand::Demonstrate(arguments) => {
             #[cfg(feature = "release-evidence")]
             {

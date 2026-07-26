@@ -6,9 +6,9 @@ This page defines the sole terminal gate for the first complete local Market Squ
 | --- | --- |
 | Document type | Release gate and evidence contract |
 | Audience | Release owner, reviewers, maintainers, and auditors |
-| Status | Gate implemented in parts; terminal execution blocked |
+| Status | Gate authority implemented; terminal execution blocked |
 | Last substantive review | 2026-07-26 |
-| Implementation review base | `094172d4c6d32b73eecbdc6823ab284bdf09ad26` plus the release-demonstration change |
+| Implementation review base | `d738500e8ad4d7b1ad4f19410ba3f64b573206db` plus the release-evidence authority change |
 
 ## Contents
 
@@ -59,7 +59,9 @@ flowchart TD
     Providers["providers/provider-evidence.json"]
     Python["python signed releases"]
     Demo["demo.json"]
-    Gate["full-gate.log"]
+    Gate["Supervised full gate"]
+    GateLog["full-gate.log"]
+    GateReceipt["full-gate.json"]
     Review["Grouped Quarter 4 review"]
     Close["manifest.json"]
     Publish["Publish release and close project items"]
@@ -72,12 +74,14 @@ flowchart TD
     Providers --> Demo
     Python --> Demo
     Build --> Gate
+    Gate --> GateLog
+    Gate --> GateReceipt
     Fuzz --> Close
     Perf --> Close
     Providers --> Close
     Python --> Close
     Demo --> Close
-    Gate --> Close
+    GateReceipt --> Close
     Review --> Close
     Close --> Publish
 ```
@@ -111,9 +115,14 @@ cargo run -p market-squawk --release --all-features --locked -- \
   --python-evidence "$EVIDENCE_DIR/python/market-squawk-release.json" \
   --output-file "$EVIDENCE_DIR/demo.json"
 
-./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
+target/release/market-squawk \
+  release evidence gate \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --binary target/release/market-squawk \
+  --gate-log "$EVIDENCE_DIR/full-gate.log" \
+  --output-file "$EVIDENCE_DIR/full-gate.json"
 
-cargo run -p market-squawk --release --all-features --locked -- \
+target/release/market-squawk \
   release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \
@@ -124,8 +133,9 @@ git diff --exit-code
 test -z "$(git status --porcelain)"
 ```
 
-`scripts/verify.sh` is the existing build/security gate. No second wrapper, command-order test, or
-prose validator is part of the release contract.
+`scripts/verify.sh` remains the sole checked-in build/security program. The Rust gate command is
+its bounded authority supervisor and evidence publisher; no second shell wrapper, command-order
+test, or prose validator is part of the release contract.
 
 ## Closure invariants
 
@@ -134,6 +144,7 @@ Before writing `manifest.json`, the closer requires exactly:
 ```text
 <HEAD>/
 ├── demo.json
+├── full-gate.json
 ├── full-gate.log
 ├── fuzz.json
 ├── performance.json
@@ -148,19 +159,30 @@ Before writing `manifest.json`, the closer requires exactly:
 
 It validates:
 
-- report kinds, schemas, exact repository identities, and content hashes;
+- report kinds, strict schemas, exact repository identities, and content hashes;
+- the exact six-target fuzz campaign, bounded successful child processes, corpus limits, and
+  immutable fuzz inputs;
+- the fixed 60-million-event/10-million-row workload, measured latency and throughput, queue and
+  RSS bounds, storage/PIT/Python predicates, threshold decisions, worker binding, and immutable
+  benchmark inputs;
 - mandatory provider surfaces, restart recovery, Coinbase Direct action authority, public-source
   non-promotion, and admitted FRED/ALFRED persistence/training rights;
 - exact provider and demonstration binding to the release executable;
-- signed Python environments and manifest binding;
+- signed Python environments plus exact Python-manifest binding to the selected application
+  executable;
 - production live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/doctor,
   and MCP predicates;
-- full-gate terminal markers and credential rejection;
+- a typed `full-gate.json` receipt binding the selected executable, `scripts/verify.sh`, finalized
+  no-clobber log, successful observed process evidence, fixed timeout/RSS limits, ordered
+  timestamps, and target usage below 20 GiB;
+- a log-only 64 MiB file-size ceiling, bounded UTF-8 full-gate output, and credential rejection;
 - bounded file count and total bytes; and
 - no missing, extra, symlinked, cross-HEAD, clobbered, or parent-traversing artifact.
 
 The published closed manifest inventories every evidence artifact by relative path, SHA-256, and
-byte count.
+byte count. Immediately before atomic publication, the closer revalidates the repository,
+executable, verification script, gate log, exact root topology, and complete artifact inventory on
+both sides of pending-file preparation.
 
 ## Failure and restart policy
 
