@@ -459,7 +459,7 @@ impl SupervisorDropCancellation {
         Self { token }
     }
 
-    fn cancel(&self) {
+    pub(super) fn cancel(&self) {
         self.token.cancel();
     }
 }

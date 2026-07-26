@@ -132,6 +132,25 @@ impl CoinbaseDirectAccountActivation {
     pub fn data_dir(&self) -> &Path {
         self.app_config.data_dir()
     }
+
+    pub(crate) const fn app_config(&self) -> &AppConfig {
+        &self.app_config
+    }
+
+    pub(crate) const fn onboarding(&self) -> &Arc<ProviderOnboardingService> {
+        &self.onboarding
+    }
+
+    pub(crate) const fn provider_rate(&self) -> &ProviderRateAuthority {
+        &self._provider_rate
+    }
+
+    pub(crate) fn take_products(
+        &mut self,
+    ) -> [Option<CoinbaseDirectProductActivation>; COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS] {
+        self.product_count = 0;
+        std::array::from_fn(|index| self.products[index].take())
+    }
 }
 
 impl fmt::Debug for CoinbaseDirectAccountActivation {
@@ -258,11 +277,15 @@ fn checked_runtime_admission(
             .map_err(|_| CoinbaseDirectActivationSpecError::MemoryAdmission)?,
         QUEUE_RECORD_OVERHEAD_BYTES,
     )?;
+    let transient_capture_payload_bytes = capture_payload_bytes;
+    let transient_capture_record_bytes = capture_record_bytes;
     let required = [
         ACCOUNT_SUPERVISOR_FIXED_BYTES,
         session_bytes,
         capture_payload_bytes,
         capture_record_bytes,
+        transient_capture_payload_bytes,
+        transient_capture_record_bytes,
         supervisor_payload_bytes,
         supervisor_record_bytes,
     ]

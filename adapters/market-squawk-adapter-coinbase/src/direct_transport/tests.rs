@@ -17,9 +17,10 @@ use market_squawk_live::{DirectBookLimits, DirectSyncPhase};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecoderEvidence, FreshnessPolicy,
-    LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy, ProviderDecimalLexeme,
-    ProviderObservationPayload, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
+    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
+    FreshnessPolicy, LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy,
+    ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame, RawMarketSink, SessionId,
+    SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -251,6 +252,20 @@ impl RawMarketSink for RecordingOutput {
 }
 
 impl CoinbaseDirectOutput for RecordingOutput {
+    fn try_publish_subscription_acknowledgement(
+        &mut self,
+        acknowledgement: DecodedControlFrame,
+    ) -> Result<(), SinkError> {
+        if self
+            .frames
+            .last()
+            .is_none_or(|frame| frame.frame_id() != acknowledgement.evidence().frame_id())
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        Ok(())
+    }
+
     fn try_publish_product(
         &mut self,
         evidence: CoinbaseDirectProductEvidence,

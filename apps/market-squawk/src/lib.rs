@@ -51,7 +51,8 @@ pub use domain::{
 };
 pub use live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 pub use live_source::{
-    ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
+    CoinbaseDirectLiveRuntime, CoinbaseDirectOutputFailure, CoinbaseDirectProductRuntimeError,
+    CoinbaseDirectSupervisorError, ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };

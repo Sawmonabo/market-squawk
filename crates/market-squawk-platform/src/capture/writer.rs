@@ -55,7 +55,7 @@ pub use lifecycle::{
 pub use runtime::{WriterFixedStorageReceipt, WriterRuntimeProofError};
 pub use sink::{
     CaptureIoContext, CaptureSink, CaptureSinkError, CaptureStorageErrorClass, MemoryCaptureSink,
-    MemoryCaptureSinkConstructionError,
+    MemoryCaptureSinkConstructionError, RollingMemoryCaptureSink,
 };
 
 /// Final supervised writer outcome.

@@ -24,14 +24,15 @@ use market_squawk_live::{
 };
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, ChecksumValidationProfile,
-    DecodedProviderBatch, DecoderEvidence, HttpCaptureMethod, LiveSourceGeneration,
-    NetworkAccessPolicy, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
-    ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink, SegmentedHttpCaptureError,
-    SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SequenceValidationProfile,
-    SharedProviderBudget, SinkError, SourceError, SourceMetadata, SourceMetadataProvider,
-    SourceProtocolProfile, TlsProviderCapability, TransportFrameKind, apply_http_retry_after,
+    ControlFrameKind, DecodedControlFrame, DecodedProviderBatch, DecoderEvidence,
+    HttpCaptureMethod, LiveSourceGeneration, NetworkAccessPolicy, ProviderBookChange,
+    ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink,
+    SegmentedHttpCaptureError, SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt,
+    SequenceValidationProfile, SharedProviderBudget, SinkError, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceProtocolProfile, TlsProviderCapability, TransportFrameKind,
+    apply_http_retry_after,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -495,6 +496,16 @@ fn direct_book_identifier(
 /// await downstream work. Raw frames are accepted through [`RawMarketSink`] before any decoded
 /// outcome mutates the session.
 pub trait CoinbaseDirectOutput: RawMarketSink {
+    /// Accepts the exact captured and validated signed `full` acknowledgement.
+    ///
+    /// The adapter invokes this only after [`RawMarketSink::try_publish`] accepted the same raw
+    /// frame. Implementations must pair `evidence` with that capture receipt before admitting
+    /// coverage; a payload digest without the receipt is insufficient.
+    fn try_publish_subscription_acknowledgement(
+        &mut self,
+        acknowledgement: DecodedControlFrame,
+    ) -> Result<(), SinkError>;
+
     /// Accepts current provider product/status/tick/lot evidence without qualifying it.
     fn try_publish_product(
         &mut self,
@@ -1210,14 +1221,25 @@ impl CoinbaseDirectSession {
         } else {
             None
         };
-        let decoded = {
+        let decoded = (|| {
             let validated = self.authority.validate_live_frame(&frame)?;
             if mode == InboundMode::AwaitingAck {
-                validate_subscription_ack(validated.frame().payload(), self.config.product())
-                    .map(|()| None)
+                validate_subscription_ack(validated.frame().payload(), self.config.product())?;
+                let SourceProtocolProfile::Live(protocol) =
+                    self.config.metadata().protocol_profile()
+                else {
+                    return Err(CoinbaseDirectSessionError::Subscription);
+                };
+                Ok((
+                    None,
+                    Some(DecoderEvidence::from_validated_frame(
+                        &validated,
+                        protocol.decoder_rule().clone(),
+                    )),
+                ))
             } else {
                 match self.decoder.decode(&validated) {
-                    Ok(outcome) => Ok(Some(outcome)),
+                    Ok(outcome) => Ok((Some(outcome), None)),
                     Err(CoinbaseDirectDecodeError::UnsupportedMessage)
                         if validate_subscription_ack(
                             validated.frame().payload(),
@@ -1230,12 +1252,21 @@ impl CoinbaseDirectSession {
                     Err(error) => Err(error.into()),
                 }
             }
-        };
+        })();
         output.try_publish(frame).map_err(SourceError::Sink)?;
-        let Some(decoded) = decoded? else {
+        let (decoded, validated_acknowledgement) = decoded?;
+        if let Some(evidence) = validated_acknowledgement {
+            output
+                .try_publish_subscription_acknowledgement(DecodedControlFrame::new(
+                    evidence,
+                    ControlFrameKind::SubscriptionAcknowledgement,
+                    None,
+                ))
+                .map_err(SourceError::Sink)?;
             self.acknowledgement_evidence = acknowledgement_evidence;
             return Ok(MessageDisposition::Acknowledged);
-        };
+        }
+        let decoded = decoded.ok_or(CoinbaseDirectSessionError::Subscription)?;
         match decoded {
             CoinbaseDirectDecodeOutcome::Sequenced(event) => {
                 let sequence = event.sequence();
