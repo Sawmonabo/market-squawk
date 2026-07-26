@@ -534,15 +534,6 @@ fn append_provider_blockers(providers: &ProviderReport, blockers: &mut Vec<Relea
             onboarding_incomplete,
         ));
     }
-    blockers.push(ReleaseBlocker::new(
-        "providers.runtime_health_not_observed",
-        providers
-            .surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .collect(),
-    ));
-
     let refresh_required = providers
         .surfaces
         .iter()

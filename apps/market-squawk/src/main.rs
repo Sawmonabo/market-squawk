@@ -201,6 +201,7 @@ async fn main() -> Result<()> {
             if !matches!(command, None | Some(McpCommand::Serve)) {
                 anyhow::bail!("unsupported MCP operation");
             }
+            let termination = TerminationSignals::install()?;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             let product = LocalProduct::try_new(config)?;
             let composition = LocalMcpComposition::try_new(
@@ -208,7 +209,7 @@ async fn main() -> Result<()> {
                 product.application(),
                 product.artifacts(),
             )?;
-            let _exit = composition.serve_stdio(CancellationToken::new()).await?;
+            run_mcp_until_termination(composition, termination).await?;
         }
         Command::Release { command } => {
             let benchmark_worker = matches!(
@@ -270,6 +271,122 @@ where
     }
 }
 
+fn finish_with_cleanup<T>(primary: Result<T>, cleanup_failure: Option<anyhow::Error>) -> Result<T> {
+    match (primary, cleanup_failure) {
+        (Ok(value), None) => Ok(value),
+        (Ok(_value), Some(cleanup)) => Err(cleanup),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(cleanup)) => {
+            Err(error.context(format!("cleanup also failed: {cleanup:#}")))
+        }
+    }
+}
+
+async fn run_mcp_until_termination(
+    composition: LocalMcpComposition,
+    mut termination: TerminationSignals,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let mut serving = Box::pin(composition.serve_stdio(cancellation.clone()));
+    tokio::select! {
+        result = &mut serving => {
+            result?;
+            Ok(())
+        }
+        signal = termination.wait() => {
+            cancellation.cancel();
+            let completion = serving.await.map(|_exit| ()).map_err(anyhow::Error::from);
+            match signal {
+                Ok(()) => completion,
+                Err(error) => finish_with_cleanup(Err(error), completion.err()),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TerminationSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn install() -> Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("failed to install the SIGINT listener")?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to install the SIGTERM listener")?,
+        })
+    }
+
+    async fn wait(&mut self) -> Result<()> {
+        tokio::select! {
+            observed = self.interrupt.recv() => {
+                observed.ok_or_else(|| anyhow!("SIGINT listener closed before observing a signal"))
+            }
+            observed = self.terminate.recv() => {
+                observed.ok_or_else(|| anyhow!("SIGTERM listener closed before observing a signal"))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct TerminationSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    ctrl_close: tokio::signal::windows::CtrlClose,
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl TerminationSignals {
+    fn install() -> Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()
+                .context("failed to install the Windows Ctrl-C listener")?,
+            ctrl_break: tokio::signal::windows::ctrl_break()
+                .context("failed to install the Windows Ctrl-Break listener")?,
+            ctrl_close: tokio::signal::windows::ctrl_close()
+                .context("failed to install the Windows Ctrl-Close listener")?,
+            ctrl_logoff: tokio::signal::windows::ctrl_logoff()
+                .context("failed to install the Windows Ctrl-Logoff listener")?,
+            ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()
+                .context("failed to install the Windows Ctrl-Shutdown listener")?,
+        })
+    }
+
+    async fn wait(&mut self) -> Result<()> {
+        tokio::select! {
+            observed = self.ctrl_c.recv() => observed,
+            observed = self.ctrl_break.recv() => observed,
+            observed = self.ctrl_close.recv() => observed,
+            observed = self.ctrl_logoff.recv() => observed,
+            observed = self.ctrl_shutdown.recv() => observed,
+        }
+        .ok_or_else(|| anyhow!("Windows termination listener closed before observing a signal"))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct TerminationSignals;
+
+#[cfg(not(any(unix, windows)))]
+impl TerminationSignals {
+    const fn install() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) -> Result<()> {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for the platform termination signal")
+    }
+}
+
 fn load_config(
     config_file: Option<&std::path::Path>,
     cli_overrides: ConfigOverrides,
@@ -328,13 +445,21 @@ async fn run_product_command(
     };
     let deadline = std::time::Instant::now()
         .checked_add(application.shutdown_timeout())
-        .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
-    let shutdown = application.shutdown(deadline).await;
-    let result = result.map_err(anyhow::Error::from)?;
-    portal_outcome?;
-    if !shutdown.is_complete() {
-        anyhow::bail!("local application shutdown was incomplete: {shutdown:?}");
-    }
+        .ok_or_else(|| anyhow!("application shutdown deadline overflow"));
+    application.begin_shutdown();
+    let cleanup_failure = match deadline {
+        Ok(deadline) => {
+            let shutdown = application.shutdown(deadline).await;
+            (!shutdown.is_complete())
+                .then(|| anyhow!("local application shutdown was incomplete: {shutdown:?}"))
+        }
+        Err(error) => Some(error),
+    };
+    let result = match result {
+        Ok(result) => portal_outcome.map(|()| result),
+        Err(error) => Err(anyhow::Error::from(error)),
+    };
+    let result = finish_with_cleanup(result, cleanup_failure)?;
     if opens_onboarding_portal {
         Ok(())
     } else {
@@ -738,7 +863,7 @@ mod tests {
     use super::{
         Cli, PipelineShutdownReport, RunMode, RunSourceDisposition, SourceEventShutdownReport,
         cancel_and_shutdown_paper_bot, capture_identity, compose_deferred_capture_error,
-        compose_pipeline_error, run_source, shutdown_source_then_event,
+        compose_pipeline_error, finish_with_cleanup, run_source, shutdown_source_then_event,
     };
 
     const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
@@ -819,6 +944,29 @@ mod tests {
         assert!(shutdown_awaited.load(Ordering::Acquire));
         assert!(rendered.contains("injected signal-listener failure"));
         assert!(rendered.contains("shutdown was incomplete"));
+        Ok(())
+    }
+
+    #[test]
+    fn command_failure_preserves_incomplete_application_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const COMMAND_FAILURE: &str = "injected command failure";
+        const SHUTDOWN_FAILURE: &str = "injected shutdown failure";
+
+        let result = finish_with_cleanup::<()>(
+            Err(anyhow::anyhow!(COMMAND_FAILURE)),
+            Some(anyhow::anyhow!(SHUTDOWN_FAILURE)),
+        );
+        let error = match result {
+            Ok(()) => {
+                return Err("the primary command and cleanup failures must remain terminal".into());
+            }
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(COMMAND_FAILURE));
+        assert!(rendered.contains(SHUTDOWN_FAILURE));
         Ok(())
     }
 
