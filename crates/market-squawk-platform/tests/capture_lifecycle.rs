@@ -1,6 +1,6 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use market_squawk_domain::{
@@ -731,23 +731,33 @@ async fn post_fence_startup_failure_retains_destination_until_helper_reap()
         ))
     ));
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (_successor_publisher, _successor_control, successor_writer) = test_capture_channel(
-        NonZeroUsize::MIN,
-        DiagnosticCaptureBundle::new(identity(1)?),
-    )?;
-    let successor_process = ProcessJournalCaptureConfig::try_new_for_test(
-        paths.root(),
-        source,
-        env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
-        ProcessCaptureHelperTestBehavior::StallAfterAppend,
-        Duration::from_secs(1),
-    )?;
-    let successor = spawn_process_journal_capture_writer(
-        successor_writer,
-        successor_process,
-        CaptureWriterPolicy::default(),
-    )?;
+    let reacquisition_deadline = Instant::now() + Duration::from_secs(2);
+    let (_successor_publisher, _successor_control, successor) = loop {
+        let (publisher, control, writer) = test_capture_channel(
+            NonZeroUsize::MIN,
+            DiagnosticCaptureBundle::new(identity(1)?),
+        )?;
+        let process = ProcessJournalCaptureConfig::try_new_for_test(
+            paths.root(),
+            source,
+            env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
+            ProcessCaptureHelperTestBehavior::StallAfterAppend,
+            Duration::from_secs(1),
+        )?;
+        match spawn_process_journal_capture_writer(writer, process, CaptureWriterPolicy::default())
+        {
+            Ok(successor) => break (publisher, control, successor),
+            Err(ProcessCaptureWriterSpawnError::CaptureWriter(
+                CaptureWriterSpawnError::DestinationFence {
+                    source: market_squawk_platform::CaptureDestinationFenceError::Busy,
+                    ..
+                },
+            )) if Instant::now() < reacquisition_deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let shutdown = successor
         .shutdown(ProcessCaptureShutdownPolicy::try_new(
             Duration::from_secs(1),
