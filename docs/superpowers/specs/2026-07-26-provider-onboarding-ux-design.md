@@ -1,7 +1,7 @@
 # Market Squawk Provider Onboarding UX Design
 
-Date: 2026-07-26  
-Status: Approved design  
+Date: 2026-07-26
+Status: Approved design
 Audience: Product, engineering, security, and release reviewers
 
 ## Purpose
