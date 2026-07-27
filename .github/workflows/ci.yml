@@ -108,4 +108,6 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: rustc --version
       - run: cargo --version
-      - run: cargo test --workspace --all-features --locked
+      # The optional capture-benchmark evidence runner requires Linux/macOS process-group
+      # containment. Windows validates the complete shipping/default workspace instead.
+      - run: cargo test --workspace --locked
