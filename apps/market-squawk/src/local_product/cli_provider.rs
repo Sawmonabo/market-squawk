@@ -294,6 +294,7 @@ impl ProviderResearchActivationService {
                 }
                 let activation =
                     build_research_activation(&paths, &lease, &request_bytes, request, &evidence)?;
+                let provider_dataset_identifier = activation.provider_dataset_identifier().cloned();
                 publish_research_activation(
                     &state,
                     &activation_authority,
@@ -312,9 +313,10 @@ impl ProviderResearchActivationService {
                 let active = onboarding
                     .activation_lease(session_id)
                     .map_err(CliProviderActivationError::Onboarding)?;
-                Ok(ProviderPortalActivationView::from_lease(
+                Ok(ProviderPortalActivationView::from_research_lease(
                     active.surface_id().clone(),
                     &active,
+                    provider_dataset_identifier,
                 ))
             }))
             .await?;
@@ -1298,6 +1300,16 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .map_err(map_portal_activation_error)
     }
 
+    fn provider_dataset_identifier(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ProviderPortalActivationError> {
+        self.activation
+            .registered_discovery_dataset(profile)
+            .map_err(CliProviderActivationError::Activation)
+            .map_err(map_portal_activation_error)
+    }
+
     async fn cancel(
         &self,
         session_id: Uuid,
@@ -1374,6 +1386,7 @@ pub(super) async fn activate_research_provider(
         request,
         &evidence,
     )?;
+    let provider_dataset_identifier = activation.provider_dataset_identifier().cloned();
     if cancellation.is_cancelled() {
         return Err(CliProviderActivationError::Cancelled);
     }
@@ -1393,7 +1406,11 @@ pub(super) async fn activate_research_provider(
         .reconcile_cleanup(session_id, cancellation)
         .await
         .map_err(CliProviderActivationError::Onboarding)?;
-    Ok(activation_result(lease.surface_id(), &lease))
+    Ok(activation_result(
+        lease.surface_id(),
+        &lease,
+        provider_dataset_identifier.as_ref(),
+    ))
 }
 
 pub(super) fn restore_research_providers(
@@ -2082,9 +2099,10 @@ fn build_research_activation(
                 exact_endpoint_policy(endpoint, 16 * 1024 * 1024)?,
                 bls_budget(lease, authorization_mode, plan.limits().daily_queries())?,
             )?;
-            ProviderAdapterActivationRequest::Bls(BlsAdapterActivation::new(
-                metadata, series, start_year, end_year,
-            ))
+            ProviderAdapterActivationRequest::Bls(
+                BlsAdapterActivation::try_new(metadata, tier, series, start_year, end_year)
+                    .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?,
+            )
         }
         ProviderRequest::TreasuryFiscal {
             first_record_date,
@@ -2154,9 +2172,15 @@ fn build_research_activation(
     Ok(activation)
 }
 
-fn activation_result(profile: &SourceIdentifier, lease: &ProviderActivationLease) -> Value {
+fn activation_result(
+    profile: &SourceIdentifier,
+    lease: &ProviderActivationLease,
+    provider_dataset_identifier: Option<&SourceIdentifier>,
+) -> Value {
     json!({
         "profile": profile.as_str(),
+        "providerDatasetIdentifier": provider_dataset_identifier
+            .map(SourceIdentifier::as_str),
         "sessionId": lease.session_id().to_string(),
         "capabilityRevision": lease.capability_revision().get(),
         "capabilityEvidence": lease.capability_digest(),
@@ -2963,6 +2987,38 @@ pub(super) fn treasury_daily_rate_release_year(
     TreasurySourceConfig::daily_rates_all_families(start_year, end_year)
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok(end_year)
+}
+
+pub(super) fn treasury_fiscal_release_query(
+    state: &DurableProviderActivationState,
+) -> Result<(TreasuryFiscalQuery, EvidenceDigest), CliProviderActivationError> {
+    let recipe = state
+        .load_recipe(TREASURY_FISCAL_SURFACE)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+    let DurableActivationRecipeState::Desired(recipe) = recipe else {
+        return Err(CliProviderActivationError::StateUnavailable);
+    };
+    let request = decode_request(&recipe.request_bytes)?;
+    if request.session_id != recipe.session_id {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    let ProviderRequest::TreasuryFiscal {
+        first_record_date,
+        last_record_date,
+        page_size,
+    } = request.provider
+    else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    let page_size =
+        NonZeroU16::new(page_size).ok_or(CliProviderActivationError::ProviderConfiguration)?;
+    let query = TreasuryFiscalQuery::average_interest_rates_v2(
+        first_record_date,
+        last_record_date,
+        page_size,
+    )
+    .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+    Ok((query, recipe.runtime_generation_digest))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -4822,6 +4878,118 @@ mod tests {
         ));
         assert!(
             product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bls_activation_returns_its_exact_discovery_dataset() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("data")),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let product = crate::LocalProduct::try_new(config.clone())?;
+        let lease = prepared_lease(
+            &product,
+            BLS_PUBLIC_SURFACE,
+            "public-bls-dataset",
+            ProviderPublicConfiguration::try_new(BTreeMap::from([(
+                "registration_mode".to_owned(),
+                "unregistered_v1".to_owned(),
+            )]))?,
+        )
+        .await?;
+        let request = serde_json::from_value(json!({
+            "kind": "bls",
+            "series": [{
+                "series_id": "LNS14000000",
+                "title": "Unemployment Rate",
+                "unit": "percent",
+                "frequency": "monthly",
+                "seasonal_adjustment": "seasonally-adjusted",
+                "measure": "unemployment-rate"
+            }],
+            "start_year": 2025,
+            "end_year": 2025
+        }))?;
+        let activation = ProviderResearchActivationService::new(
+            product.paths().clone(),
+            product.provider_onboarding(),
+            product.provider_activation(),
+            product.provider_activation_state().clone(),
+        );
+
+        let activated = activation
+            .activate_from_portal(lease.session_id(), request, CancellationToken::new())
+            .await?;
+        let value = serde_json::to_value(activated)?;
+        let dataset = value
+            .get("provider_dataset_identifier")
+            .and_then(Value::as_str)
+            .ok_or("BLS activation did not return its provider dataset identifier")?;
+        let dataset = SourceIdentifier::try_from(dataset)?;
+        assert!(dataset.as_str().starts_with("bls:timeseries:public-v1:"));
+        assert!(
+            market_squawk_adapter_bls::BlsSource::analytical_dataset_identifier(&dataset).is_ok()
+        );
+        assert!(
+            product
+                .research_ingest()
+                .is_profile_registered(lease.surface_id())?
+        );
+        drop(activation);
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        drop(product);
+
+        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered_activation = ProviderResearchActivationService::new(
+            recovered.paths().clone(),
+            recovered.provider_onboarding(),
+            recovered.provider_activation(),
+            recovered.provider_activation_state().clone(),
+        );
+        assert_eq!(
+            recovered_activation.provider_dataset_identifier(lease.surface_id())?,
+            Some(dataset.clone())
+        );
+        let status = crate::local_product::execute_cli_command(
+            &recovered,
+            crate::cli::Command::Source {
+                command: crate::cli::SourceCommand::Status {
+                    provider: Some(BLS_PUBLIC_SURFACE.to_owned()),
+                },
+            },
+        )
+        .await?;
+        let rows = status
+            .value()
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or("source status did not return rows")?;
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get("providerDatasetIdentifier"))
+                .and_then(Value::as_str),
+            Some(dataset.as_str())
+        );
+        drop(recovered_activation);
+        assert!(
+            recovered
                 .application()
                 .shutdown(Instant::now() + Duration::from_secs(5))
                 .await

@@ -224,7 +224,7 @@ impl TreasurySourceConfig {
     }
 }
 
-fn fiscal_provider_dataset(
+pub(crate) fn fiscal_provider_dataset(
     query: &TreasuryFiscalQuery,
 ) -> Result<SourceIdentifier, TreasurySourceError> {
     SourceIdentifier::try_from(format!(
@@ -234,7 +234,7 @@ fn fiscal_provider_dataset(
     .map_err(|_| TreasurySourceError::InvalidProtocol)
 }
 
-fn fiscal_analytical_dataset(
+pub(crate) fn fiscal_analytical_dataset(
     query: &TreasuryFiscalQuery,
 ) -> Result<SourceIdentifier, TreasurySourceError> {
     SourceIdentifier::try_from(format!(

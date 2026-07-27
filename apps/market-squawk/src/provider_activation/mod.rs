@@ -39,6 +39,7 @@ use market_squawk_sources::{
     ExtractionRequest, ExtractionSource, FRED_ALFRED_API_SURFACE_ID, ProviderRateAuthority,
     ProviderRateDeclaration, SourceMetadata, SourceMetadataProvider,
 };
+use specs::BlsAdapterConfiguration;
 
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub use specs::{
@@ -285,6 +286,16 @@ impl ProviderAdapterActivation {
     ) -> Result<Option<ResearchProviderRuntimeGeneration>, ProviderAdapterActivationError> {
         self.research
             .provider_runtime_generation(profile)
+            .map_err(Into::into)
+    }
+
+    /// Returns the exact fixed discovery dataset carried by one callable research adapter.
+    pub(crate) fn registered_discovery_dataset(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ProviderAdapterActivationError> {
+        self.research
+            .registered_discovery_dataset(profile)
             .map_err(Into::into)
     }
 
@@ -557,6 +568,18 @@ impl ProviderAdapterActivation {
         let prepared = match request {
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
+                let BlsAdapterActivation {
+                    metadata,
+                    configuration,
+                } = spec;
+                let BlsAdapterConfiguration::Registered {
+                    series,
+                    start_year,
+                    end_year,
+                } = configuration
+                else {
+                    return Err(ProviderAdapterActivationError::SurfaceMismatch);
+                };
                 let secret = self
                     .onboarding
                     .read_secret_for_activation_request(&lease, cancellation.clone())
@@ -564,14 +587,9 @@ impl ProviderAdapterActivation {
                 let authorization = BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
                     secret.expose_secret().to_owned(),
                 )?);
-                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-                let config = BlsSourceConfig::try_new(
-                    authorization,
-                    spec.series,
-                    spec.start_year,
-                    spec.end_year,
-                )?;
-                let source = BlsSource::try_new(spec.metadata, config)?;
+                let rights = provider_research_rights(&lease, metadata.source_id())?;
+                let config = BlsSourceConfig::try_new(authorization, series, start_year, end_year)?;
+                let source = BlsSource::try_new(metadata, config)?;
                 self.prepare_runtime_replacement(
                     &lease,
                     expected,
@@ -795,23 +813,37 @@ impl ProviderAdapterActivation {
         spec: BlsAdapterActivation,
         cancellation: CancellationToken,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
-        let authorization = match lease.surface_id().as_str() {
-            BLS_PUBLIC_SURFACE => BlsAuthorization::PublicV1,
-            BLS_REGISTERED_SURFACE => {
+        let BlsAdapterActivation {
+            metadata,
+            configuration,
+        } = spec;
+        let config = match (lease.surface_id().as_str(), configuration) {
+            (BLS_PUBLIC_SURFACE, BlsAdapterConfiguration::Public(config)) => config,
+            (
+                BLS_REGISTERED_SURFACE,
+                BlsAdapterConfiguration::Registered {
+                    series,
+                    start_year,
+                    end_year,
+                },
+            ) => {
                 let secret = self
                     .onboarding
                     .read_secret_for_activation_request(&lease, cancellation)
                     .await?;
-                BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
-                    secret.expose_secret().to_owned(),
-                )?)
+                BlsSourceConfig::try_new(
+                    BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
+                        secret.expose_secret().to_owned(),
+                    )?),
+                    series,
+                    start_year,
+                    end_year,
+                )?
             }
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
-        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-        let config =
-            BlsSourceConfig::try_new(authorization, spec.series, spec.start_year, spec.end_year)?;
-        let source = BlsSource::try_new(spec.metadata, config)?;
+        let rights = provider_research_rights(&lease, metadata.source_id())?;
+        let source = BlsSource::try_new(metadata, config)?;
         self.register(lease, source, rights)
     }
 
@@ -820,17 +852,19 @@ impl ProviderAdapterActivation {
         lease: ProviderActivationLease,
         spec: BlsAdapterActivation,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
-        let authorization = match lease.surface_id().as_str() {
-            BLS_PUBLIC_SURFACE => BlsAuthorization::PublicV1,
-            BLS_REGISTERED_SURFACE => {
+        let BlsAdapterActivation {
+            metadata,
+            configuration,
+        } = spec;
+        let config = match (lease.surface_id().as_str(), configuration) {
+            (BLS_PUBLIC_SURFACE, BlsAdapterConfiguration::Public(config)) => config,
+            (BLS_REGISTERED_SURFACE, BlsAdapterConfiguration::Registered { .. }) => {
                 return Err(ProviderAdapterActivationError::ExplicitResumeRequired);
             }
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
-        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-        let config =
-            BlsSourceConfig::try_new(authorization, spec.series, spec.start_year, spec.end_year)?;
-        let source = BlsSource::try_new(spec.metadata, config)?;
+        let rights = provider_research_rights(&lease, metadata.source_id())?;
+        let source = BlsSource::try_new(metadata, config)?;
         self.register(lease, source, rights)
     }
 

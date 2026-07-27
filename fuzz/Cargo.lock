@@ -3083,7 +3083,7 @@ checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "market-squawk-adapter-coinbase"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-files"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-kraken"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -3150,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-sec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cap-fs-ext",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-analytics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "market-squawk-domain",
  "rust_decimal",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-data"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3216,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-domain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitcoin",
  "bs58",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "market-squawk-services",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-modeling"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cap-std",
  "csv",
@@ -3288,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -3319,20 +3319,22 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-services"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
 name = "market-squawk-sources"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "bytes",

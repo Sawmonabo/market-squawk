@@ -2,10 +2,12 @@
 
 ## Supported release
 
-The release candidate is developed on `release/market-squawk-v0.1.0`. No complete local release is
-currently approved or tagged. Security corrections are integrated into the active release branch
-and then into `main` through the reviewed release pull request. This is research infrastructure and
-not a production brokerage or live-order execution system.
+The `0.2.0` release candidate is developed on the historically named
+`release/market-squawk-v0.1.0` integration branch; that branch name is retained for audit
+continuity and does not define the package version. No complete local release is currently approved
+or tagged. Security corrections are integrated into the active release branch and then into `main`
+through the reviewed release pull request. This is research infrastructure and not a production
+brokerage or live-order execution system.
 
 ## Reporting
 

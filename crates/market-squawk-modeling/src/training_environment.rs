@@ -598,7 +598,7 @@ fn verify_distributions(
     foundation: &FoundationWire,
 ) -> Result<(), TrainingEnvironmentError> {
     if environment.project_distribution.name != "market-squawk"
-        || environment.project_distribution.version != "0.1.0"
+        || environment.project_distribution.version != "0.2.0"
         || environment.runtime_distributions.len() != foundation.runtime_distributions.len()
     {
         return Err(TrainingEnvironmentError::InstalledDistribution);
@@ -684,7 +684,7 @@ fn verify_distribution(
     let mut entries = BTreeMap::new();
     let mut saw_record = false;
     let require_training_driver =
-        distribution.name == "market-squawk" && distribution.version == "0.1.0";
+        distribution.name == "market-squawk" && distribution.version == "0.2.0";
     let mut saw_training_driver = false;
     let mut total_bytes = 0_u64;
     for row in reader.records() {

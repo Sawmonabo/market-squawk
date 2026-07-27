@@ -67,7 +67,7 @@ release blockers and provider-qualification status remain in the
 Examples use:
 
 ```bash
-MSQ=/absolute/operator-owned/market-squawk/0.1.0-836aae6/bin/market-squawk
+MSQ=/absolute/operator-owned/market-squawk/0.2.0-REVIEWED7/bin/market-squawk
 CONFIG=/absolute/operator-owned/market-squawk/config.toml
 ```
 

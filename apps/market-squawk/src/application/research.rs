@@ -93,6 +93,16 @@ pub trait ResearchSourceDiscoveryCoordinator: Send + Sync + 'static {
     /// Hard object ceiling configured on this exact coordinator.
     fn maximum_discovery_objects(&self) -> NonZeroU16;
 
+    /// Returns the exact discovery dataset carried by one currently admitted provider runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded service error when current runtime authority cannot be inspected.
+    fn registered_discovery_dataset(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ServiceError>;
+
     /// Revokes exactly one discovery batch that could not be published to its caller.
     ///
     /// Implementations must leave every receipt outside `discovery` unchanged. This operation is

@@ -30,6 +30,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Source.GetStatus" => nullable_rows(signature(vec![
             ("profile", record()),
             ("currentSession", nullable(record())),
+            ("providerDatasetIdentifier", nullable(text())),
             ("runtime", record()),
         ])),
         "Source.GetCoverage" => nullable_rows(signature(vec![

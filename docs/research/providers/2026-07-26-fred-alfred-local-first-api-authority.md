@@ -90,5 +90,6 @@ route for the unemployment-data release predicate.
 - [BLS public data API](https://www.bls.gov/developers/) — direct zero-fee programmatic source for
   `LNS14000000`; reviewed 2026-07-26.
 
-The 2021 “Ethical Use of Data With FRED” article is retained only as historical context. It does not
+The 2021 [“Ethical Use of Data With FRED” article](https://www.stlouisfed.org/publications/page-one-economics/2021/10/15/ethical-use-of-data-with-fred)
+is retained only as historical context. It recommends the API instead of scraping, but does not
 override the current legal terms and is not admission authority.

@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Prepared `0.2.0` as the usable local-release candidate while preserving the published `0.1.0`
+  foundation tag unchanged.
 - Established the Rust 1.97.1 Edition 2024 virtual workspace and shared invariant-preserving
   domain crate.
 - Rejected Rust 1.97.0 for release evidence after the Rust project classified an x86-64 LLVM

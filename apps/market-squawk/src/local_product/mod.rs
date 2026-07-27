@@ -14,13 +14,14 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use market_squawk_adapter_treasury::TreasuryFiscalQuery;
 use market_squawk_analytics::{
     BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies, FeatureMetadataError,
     MissingValuePolicy, ShockComposition, VarianceConvention, WeightPolicy,
 };
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
-use market_squawk_domain::RoundingPolicy;
+use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
 use market_squawk_services::{ArtifactError, ArtifactRepository};
@@ -356,6 +357,28 @@ impl LocalProduct {
         &self,
     ) -> Result<u16, CliProviderActivationError> {
         cli_provider::treasury_daily_rate_release_year(&self.provider_activation_state)
+    }
+
+    /// Returns the exact Fiscal Data query owned by the desired, currently published runtime.
+    pub(crate) fn treasury_fiscal_release_query(
+        &self,
+    ) -> Result<TreasuryFiscalQuery, CliProviderActivationError> {
+        let (query, expected_runtime) =
+            cli_provider::treasury_fiscal_release_query(&self.provider_activation_state)?;
+        let profile = SourceIdentifier::try_from("treasury.fiscal-data")
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        let runtime = self
+            .provider_activation
+            .research_runtime_generation(&profile)
+            .map_err(CliProviderActivationError::Activation)?
+            .ok_or(CliProviderActivationError::StateUnavailable)?;
+        let actual_runtime = runtime
+            .generation_digest()
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        if actual_runtime != expected_runtime {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        Ok(query)
     }
 
     /// Returns the durable portfolio service used by direct CLI publication boundaries.

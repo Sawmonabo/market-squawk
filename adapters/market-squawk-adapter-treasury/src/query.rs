@@ -1,10 +1,10 @@
 use std::num::NonZeroU16;
 
-use market_squawk_domain::CalendarDate;
+use market_squawk_domain::{CalendarDate, SourceIdentifier};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::TreasuryProtocolError;
+use crate::{TreasuryProtocolError, TreasurySourceError};
 
 const FISCAL_DATA_BASE: &str = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service";
 const AVERAGE_RATES_ENDPOINT: &str = "/v2/accounting/od/avg_interest_rates";
@@ -155,6 +155,41 @@ impl TreasuryFiscalQuery {
     /// Returns the canonical query-family digest.
     pub const fn query_digest(&self) -> [u8; 32] {
         self.query_digest
+    }
+
+    /// Returns the exact provider selector accepted by the configured source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreasurySourceError::InvalidProtocol`] if the canonical selector cannot be
+    /// represented by the shared source-identity contract.
+    pub fn dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
+        crate::source::fiscal_provider_dataset(self)
+    }
+
+    /// Returns the storage-safe analytical identity derived from this exact provider selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreasurySourceError::InvalidProtocol`] if the canonical analytical identity
+    /// cannot be represented by the shared dataset contract.
+    pub fn analytical_dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
+        crate::source::fiscal_analytical_dataset(self)
+    }
+
+    /// Returns the inclusive first record date.
+    pub const fn first_record_date(&self) -> CalendarDate {
+        self.first_record_date
+    }
+
+    /// Returns the inclusive final record date.
+    pub const fn last_record_date(&self) -> CalendarDate {
+        self.last_record_date
+    }
+
+    /// Returns the exact bounded page size.
+    pub const fn page_size(&self) -> NonZeroU16 {
+        self.page_size
     }
 }
 

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    num::NonZeroU16,
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -11,13 +12,15 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
 use market_squawk_adapter_bls::BlsSource;
 use market_squawk_adapter_fred::FredSource;
-use market_squawk_adapter_treasury::{TreasuryDailyRateFamily, TreasuryDailyRateQuery};
+use market_squawk_adapter_treasury::{
+    TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryFiscalQuery,
+};
 use market_squawk_data::{
     CatalogLimit, DatasetId, FeatureLabelDataset, GenerationParentRelation, SourceOperation,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, PayloadReference,
-    ResearchObservation, SourceIdentifier,
+    AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
+    PayloadReference, ResearchObservation, SourceIdentifier,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -71,6 +74,7 @@ const TREASURY_FISCAL: &str = "treasury.fiscal-data";
 const BLS_UNEMPLOYMENT_SERIES: &str = "LNS14000000";
 const BLS_PUBLIC_MAXIMUM_ACCEPTANCE_ROWS: u64 = 10 * 13;
 const BLS_REGISTERED_MAXIMUM_ACCEPTANCE_ROWS: u64 = 20 * 13;
+const MAXIMUM_TREASURY_FISCAL_RELEASE_PAGES: usize = REQUEST_MAXIMUM_ITEMS - 1;
 
 const ADMITTED_SURFACES: [&str; 9] = [
     COINBASE_PUBLIC,
@@ -193,6 +197,7 @@ struct ResearchPublicationEvidence {
     temporal_semantics: ResearchPublicationTemporalSemantics,
     sec: Option<SecPublicationEvidence>,
     fred: Option<FredPublicationEvidence>,
+    treasury_fiscal: Option<TreasuryFiscalPublicationEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -232,6 +237,28 @@ struct FredPageEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+struct TreasuryFiscalPublicationEvidence {
+    first_record_date: CalendarDate,
+    last_record_date: CalendarDate,
+    page_size: u16,
+    query_digest: String,
+    provider_row_count: u64,
+    pages: Vec<TreasuryFiscalPageEvidence>,
+    observation_query: QueryRowEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TreasuryFiscalPageEvidence {
+    source_object_id: String,
+    source_payload_digest: EvidenceDigest,
+    page_number: u64,
+    request_digest: String,
+    returned_rows: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QueryRowEvidence {
     row_count: u64,
     content_sha256: String,
@@ -245,6 +272,7 @@ enum ResearchPublicationTemporalSemantics {
     ProviderReportedVintages,
     LocallyObservedCurrentSnapshot,
     LocallyObservedSecDisclosure,
+    TreasuryFiscalEffectiveObservations,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -383,7 +411,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     surfaces.sort_by(|left, right| left.surface_id.cmp(&right.surface_id));
     repository.verify_unchanged()?;
     let payload = ProviderEvidence {
-        schema_version: 4,
+        schema_version: 5,
         repository: repository.clone(),
         executable,
         collected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -480,6 +508,15 @@ async fn collect_provider_evidence(
                     .context("Treasury daily-rate activation does not cover all five families")?;
                 (
                     exercise_treasury_research(product.application().as_ref(), acceptance_year)
+                        .await?,
+                    None,
+                )
+            } else if *surface_id == TREASURY_FISCAL {
+                let query = product
+                    .treasury_fiscal_release_query()
+                    .context("Treasury Fiscal Data activation has no exact admitted query")?;
+                (
+                    exercise_treasury_fiscal_research(product.application().as_ref(), &query)
                         .await?,
                     None,
                 )
@@ -850,6 +887,154 @@ async fn exercise_treasury_research(
         evidence.push(publication);
     }
     Ok(evidence)
+}
+
+async fn exercise_treasury_fiscal_research(
+    application: &Application,
+    query: &TreasuryFiscalQuery,
+) -> Result<Vec<ResearchPublicationEvidence>> {
+    let dataset = query
+        .dataset()
+        .context("Treasury Fiscal Data provider dataset is invalid")?;
+    let analytical_dataset = query
+        .analytical_dataset()
+        .context("Treasury Fiscal Data analytical dataset is invalid")?;
+    DatasetId::try_from(analytical_dataset.as_str())
+        .context("Treasury Fiscal Data analytical dataset identity is invalid")?;
+    let discovery = invoke(
+        application,
+        "Source.Discover",
+        json_object(json!({
+            "provider": TREASURY_FISCAL,
+            "dataset": dataset.as_str(),
+            "confirm": true,
+            "sourceCoverage": [TREASURY_FISCAL],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
+    if discovery.profile().as_str() != TREASURY_FISCAL
+        || discovery.request().dataset() != &dataset
+        || discovery.objects().is_empty()
+        || discovery.objects().len() > MAXIMUM_TREASURY_FISCAL_RELEASE_PAGES
+        || !discovery.rights().persistence_operation_admitted()
+    {
+        bail!(
+            "Treasury Fiscal Data discovery did not produce a complete bounded \
+             persistence-authorized page chain"
+        );
+    }
+
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(discovery.objects().len())?;
+    let mut final_publication = None;
+    for (index, object) in discovery.objects().iter().enumerate() {
+        let source_object = object.source_object();
+        let page_number = index
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data page number overflow"))?;
+        let (object_page, request_digest, payload_digest) =
+            parse_treasury_fiscal_object_id(source_object.object_id().as_str())?;
+        let expected_request = query
+            .page(page_number)
+            .context("Treasury Fiscal Data page request is invalid")?;
+        if object_page != page_number
+            || request_digest != expected_request.request_digest()
+            || source_object.evidence().content_digest().algorithm() != DigestAlgorithm::Sha256
+            || source_object.evidence().content_digest().bytes() != payload_digest
+        {
+            bail!("Treasury Fiscal Data discovery returned an invalid exact page identity");
+        }
+        let source_object_id = source_object.object_id().as_str().to_owned();
+        let source_payload_digest = source_object.evidence().content_digest();
+        let ingestion = invoke(
+            application,
+            "Research.IngestSource",
+            json_object(json!({
+                "provider": TREASURY_FISCAL,
+                "object": source_object_id,
+                "dataset": dataset.as_str(),
+                "discoveryReceipt": object.discovery_receipt(),
+                "confirm": true,
+                "sourceCoverage": [TREASURY_FISCAL],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let publication = parse_research_publication(
+            TREASURY_FISCAL,
+            "average_interest_rates_v2",
+            dataset.as_str(),
+            source_object_id.clone(),
+            source_payload_digest,
+            &ingestion,
+        )?;
+        if publication.analytical_dataset_id != analytical_dataset.as_str()
+            || publication.object_count
+                > u64::try_from(discovery.objects().len())
+                    .context("Treasury Fiscal Data object count overflow")?
+        {
+            bail!("Treasury Fiscal Data publication is not bound to its exact provider query");
+        }
+        pages.push(TreasuryFiscalPageEvidence {
+            source_object_id,
+            source_payload_digest,
+            page_number: u64::try_from(page_number)
+                .context("Treasury Fiscal Data page number overflow")?,
+            request_digest: lower_hex(request_digest),
+            returned_rows: 0,
+        });
+        final_publication = Some(publication);
+    }
+
+    let mut publication =
+        final_publication.ok_or_else(|| anyhow!("Treasury Fiscal Data publication is absent"))?;
+    if publication.object_count
+        != u64::try_from(pages.len()).context("Treasury Fiscal Data object count overflow")?
+        || pages.last().is_none_or(|page| {
+            page.source_object_id != publication.source_object_id
+                || page.source_payload_digest != publication.source_payload_digest
+        })
+    {
+        bail!("Treasury Fiscal Data final manifest does not cover the discovered page chain");
+    }
+    let observations = query_row_evidence(&query_publication(application, &publication).await?)?;
+    if observations.row_count != publication.row_count {
+        bail!("Treasury Fiscal Data query did not return the complete published row set");
+    }
+    let TreasuryFiscalQueryValidation { page_rows, series } =
+        validate_treasury_fiscal_query_rows(&observations.rows, query, &pages)?;
+    for page in &mut pages {
+        let payload_digest = page.source_payload_digest.bytes();
+        page.returned_rows = page_rows
+            .get(&payload_digest)
+            .copied()
+            .filter(|rows| *rows > 0)
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data page has no published observations"))?;
+    }
+    let accounted_rows = pages.iter().try_fold(0_u64, |total, page| {
+        total
+            .checked_add(page.returned_rows)
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data row count overflow"))
+    })?;
+    if accounted_rows != observations.row_count {
+        bail!("Treasury Fiscal Data page evidence does not account for every published row");
+    }
+    publication.observation_query_row_count = observations.row_count;
+    publication.series_ids = series;
+    publication.temporal_semantics =
+        ResearchPublicationTemporalSemantics::TreasuryFiscalEffectiveObservations;
+    publication.treasury_fiscal = Some(TreasuryFiscalPublicationEvidence {
+        first_record_date: query.first_record_date(),
+        last_record_date: query.last_record_date(),
+        page_size: query.page_size().get(),
+        query_digest: lower_hex(query.query_digest()),
+        provider_row_count: observations.row_count,
+        pages,
+        observation_query: observations,
+    });
+    Ok(vec![publication])
 }
 
 async fn exercise_sec_research(
@@ -1316,6 +1501,7 @@ fn parse_research_publication(
         temporal_semantics: ResearchPublicationTemporalSemantics::EffectiveObservations,
         sec: None,
         fred: None,
+        treasury_fiscal: None,
     })
 }
 
@@ -1778,6 +1964,273 @@ fn validate_fred_query_rows(
         bail!("FRED/ALFRED query rows do not exactly cover the discovered page chain");
     }
     Ok(())
+}
+
+fn parse_treasury_fiscal_object_id(value: &str) -> Result<(usize, [u8; 32], [u8; 32])> {
+    let mut fields = value.split(':');
+    if fields.next() != Some("treasury-page") || fields.next() != Some("fiscal") {
+        bail!("Treasury Fiscal Data source object identity is invalid");
+    }
+    let page_number = fields
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("Treasury Fiscal Data page number is invalid"))?;
+    let request_digest = fields
+        .next()
+        .ok_or_else(|| anyhow!("Treasury Fiscal Data request digest is absent"))
+        .and_then(|value| decode_lower_sha256(value, "Treasury Fiscal Data request digest"))?;
+    let payload_digest = fields
+        .next()
+        .ok_or_else(|| anyhow!("Treasury Fiscal Data payload digest is absent"))
+        .and_then(|value| decode_lower_sha256(value, "Treasury Fiscal Data payload digest"))?;
+    if fields.next().is_some() {
+        bail!("Treasury Fiscal Data source object identity has trailing fields");
+    }
+    Ok((page_number, request_digest, payload_digest))
+}
+
+struct TreasuryFiscalQueryValidation {
+    page_rows: BTreeMap<[u8; 32], u64>,
+    series: Vec<String>,
+}
+
+fn validate_treasury_fiscal_query_rows(
+    rows: &[Value],
+    query: &TreasuryFiscalQuery,
+    pages: &[TreasuryFiscalPageEvidence],
+) -> Result<TreasuryFiscalQueryValidation> {
+    const TREASURY_FISCAL_SOURCE_ID: &str = "treasury-treasury.fiscal-data";
+
+    let mut expected_pages = BTreeMap::new();
+    for page in pages {
+        let request_digest = decode_lower_sha256(
+            &page.request_digest,
+            "Treasury Fiscal Data page request digest",
+        )?;
+        if page.source_payload_digest.algorithm() != DigestAlgorithm::Sha256
+            || page.source_payload_digest.bytes() == [0; 32]
+            || expected_pages
+                .insert(page.source_payload_digest.bytes(), request_digest)
+                .is_some()
+        {
+            bail!("Treasury Fiscal Data page payload evidence is invalid or duplicated");
+        }
+    }
+    let mut observed_pages = BTreeMap::<[u8; 32], u64>::new();
+    let mut identities = BTreeSet::new();
+    let mut series = BTreeSet::new();
+    for row in rows {
+        let row = row
+            .as_object()
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data query row is invalid"))?;
+        let payload = required_lower_hex_bytes(
+            row.get("payload_json"),
+            "Treasury Fiscal Data canonical payload",
+        )?;
+        let declared_payload_digest = required_lower_hex_bytes(
+            row.get("payload_sha256"),
+            "Treasury Fiscal Data canonical payload digest",
+        )?;
+        let payload_digest: [u8; 32] = Sha256::digest(&payload).into();
+        if declared_payload_digest.as_slice() != payload_digest {
+            bail!("Treasury Fiscal Data canonical payload digest is invalid");
+        }
+        let observation: ResearchObservation = serde_json::from_slice(&payload)
+            .context("Treasury Fiscal Data canonical payload could not be decoded")?;
+        let ResearchObservation::Macro(observation) = observation else {
+            bail!("Treasury Fiscal Data query returned a non-macro observation");
+        };
+        let request_digest = required_lower_hex_bytes(
+            row.get("request_sha256"),
+            "Treasury Fiscal Data request digest",
+        )?;
+        let lineage = required_lower_hex_bytes(
+            row.get("extraction_lineage_json"),
+            "Treasury Fiscal Data extraction lineage",
+        )?;
+        let context = observation.context();
+        let provenance = context.provenance();
+        let effective = context
+            .time()
+            .effective()
+            .calendar_date_value()
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data effective date precision was lost"))?;
+        let source_identifier = provenance.source_identifier().as_str();
+        let expected_prefix = format!("treasury-fiscal-rate:{effective}:");
+        let page_digest = match provenance.payload_reference() {
+            PayloadReference::ContentHash(hash) if hash.algorithm() == DigestAlgorithm::Sha256 => {
+                hash.digest()
+            }
+            _ => bail!("Treasury Fiscal Data row omitted exact provider-page evidence"),
+        };
+        let expected_request_digest = expected_pages.get(&page_digest).ok_or_else(|| {
+            anyhow!(
+                "Treasury Fiscal Data row references a payload outside the discovered page chain"
+            )
+        })?;
+        let observed = observed_pages.entry(page_digest).or_default();
+        *observed = observed
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Treasury Fiscal Data page row count overflow"))?;
+        if request_digest.as_slice() != expected_request_digest.as_slice()
+            || serde_json::from_slice::<Value>(&lineage)
+                .ok()
+                .is_none_or(|value| value.is_null())
+            || row.keys().any(|field| !research_row_field_allowed(field))
+            || effective < query.first_record_date()
+            || effective > query.last_record_date()
+            || !source_identifier.starts_with(&expected_prefix)
+            || !treasury_fiscal_revision_matches(source_identifier, effective)
+            || provenance.source_id().as_str() != TREASURY_FISCAL_SOURCE_ID
+            || provenance.instrument_id().is_some()
+            || provenance.venue_id().is_some()
+            || provenance.source_timestamp().is_some()
+            || provenance.quality() != DataQuality::OfficialDelayed
+            || provenance.ingested_at() < provenance.received_at()
+            || !matches!(
+                provenance.availability(),
+                AvailabilityEvidence::LocalFirstObserved { observed_at }
+                    if *observed_at == provenance.received_at()
+            )
+            || context.time().published().is_some()
+            || context.time().superseded().is_some()
+            || context.time().revision().get() != 1
+            || !treasury_fiscal_series_valid(observation.series().as_str())
+            || observation.unit().as_str() != "percent"
+            || observation.value().observed_value().is_none()
+            || observation.value().missing_value().is_some()
+            || row.get("schema_version").and_then(Value::as_u64) != Some(3)
+            || row.get("observation_kind").and_then(Value::as_str) != Some("macro")
+            || row.get("source_id").and_then(Value::as_str) != Some(TREASURY_FISCAL_SOURCE_ID)
+            || row.get("source_identifier").and_then(Value::as_str) != Some(source_identifier)
+            || row.get("received_at") != row.get("available_at")
+            || row.get("availability_kind").and_then(Value::as_str) != Some("local_first_observed")
+            || row.get("effective_precision").and_then(Value::as_str) != Some("calendar_date")
+            || row.get("effective_date").and_then(Value::as_str)
+                != Some(effective.to_string().as_str())
+            || row.get("revision").and_then(Value::as_u64) != Some(1)
+            || row.get("quality").and_then(Value::as_str) != Some("official_delayed")
+            || row.get("value_state").and_then(Value::as_str) != Some("observed")
+            || row.get("unit").and_then(Value::as_str) != Some("percent")
+            || row
+                .get("instrument_id")
+                .is_some_and(|value| !value.is_null())
+            || row.get("venue_id").is_some_and(|value| !value.is_null())
+            || row
+                .get("source_timestamp")
+                .is_some_and(|value| !value.is_null())
+            || row
+                .get("published_precision")
+                .is_some_and(|value| !value.is_null())
+            || row
+                .get("superseded_precision")
+                .is_some_and(|value| !value.is_null())
+            || !identities.insert((source_identifier.to_owned(), payload_digest))
+        {
+            bail!(
+                "Treasury Fiscal Data row lost exact source, time, quality, or payload authority"
+            );
+        }
+        series.insert(observation.series().as_str().to_owned());
+    }
+    if observed_pages.len() != expected_pages.len()
+        || expected_pages
+            .keys()
+            .any(|digest| !observed_pages.contains_key(digest))
+        || series.is_empty()
+    {
+        bail!("Treasury Fiscal Data rows do not exactly cover every discovered provider page");
+    }
+    Ok(TreasuryFiscalQueryValidation {
+        page_rows: observed_pages,
+        series: series.into_iter().collect(),
+    })
+}
+
+fn treasury_fiscal_revision_matches(identity: &str, effective: CalendarDate) -> bool {
+    let mut fields = identity.split(':');
+    fields.next() == Some("treasury-fiscal-rate")
+        && fields.next() == Some(effective.to_string().as_str())
+        && fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|line| line > 0)
+        && fields
+            .next()
+            .is_some_and(|digest| decode_lower_sha256(digest, "row identity").is_ok())
+        && fields.next().is_none()
+}
+
+fn treasury_fiscal_series_valid(series: &str) -> bool {
+    let mut fields = series.split(':');
+    fields.next() == Some("treasury")
+        && fields.next() == Some("average-interest-rate")
+        && fields.next() == Some("v2")
+        && fields.next().is_some_and(|value| !value.is_empty())
+        && fields.next().is_some_and(|value| !value.is_empty())
+        && fields.next().is_none()
+}
+
+fn research_row_field_allowed(field: &str) -> bool {
+    matches!(
+        field,
+        "schema_version"
+            | "request_sha256"
+            | "extraction_lineage_json"
+            | "observation_kind"
+            | "source_id"
+            | "instrument_id"
+            | "venue_id"
+            | "source_identifier"
+            | "source_timestamp"
+            | "received_at"
+            | "available_at"
+            | "availability_reported_or_inferred_at"
+            | "availability_kind"
+            | "availability_evidence"
+            | "availability_method"
+            | "ingested_at"
+            | "effective_precision"
+            | "effective_at"
+            | "effective_date"
+            | "effective_period_scheme"
+            | "effective_period_year"
+            | "effective_period_ordinal"
+            | "effective_period_code"
+            | "published_precision"
+            | "published_at"
+            | "published_date"
+            | "published_period_scheme"
+            | "published_period_year"
+            | "published_period_ordinal"
+            | "published_period_code"
+            | "revision"
+            | "superseded_precision"
+            | "superseded_at"
+            | "superseded_date"
+            | "superseded_period_scheme"
+            | "superseded_period_year"
+            | "superseded_period_ordinal"
+            | "superseded_period_code"
+            | "quality"
+            | "value_state"
+            | "missing_marker"
+            | "missing_reason"
+            | "value_mantissa"
+            | "value_scale"
+            | "unit"
+            | "currency"
+            | "payload_sha256"
+            | "payload_json"
+    )
+}
+
+fn decode_lower_sha256(value: &str, field: &str) -> Result<[u8; 32]> {
+    let decoded = required_lower_hex_bytes(Some(&Value::String(value.to_owned())), field)?;
+    decoded
+        .try_into()
+        .map_err(|_bytes: Vec<u8>| anyhow!("{field} is not a SHA-256 digest"))
 }
 
 fn query_result_row_count(result: &Value) -> Option<u64> {
@@ -2326,6 +2779,13 @@ async fn verify_restart_recovery(
                             }
                             observations.row_count
                         }
+                        ResearchPublicationTemporalSemantics::TreasuryFiscalEffectiveObservations => {
+                            verify_treasury_fiscal_recovery(
+                                product.application().as_ref(),
+                                publication,
+                            )
+                            .await?
+                        }
                     };
                     if observation_count != publication.observation_query_row_count {
                         bail!(
@@ -2350,6 +2810,49 @@ async fn verify_restart_recovery(
         }
     }
     Ok(())
+}
+
+async fn verify_treasury_fiscal_recovery(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+) -> Result<u64> {
+    let expected = publication
+        .treasury_fiscal
+        .as_ref()
+        .ok_or_else(|| anyhow!("Treasury Fiscal Data recovery evidence is absent"))?;
+    let page_size = NonZeroU16::new(expected.page_size)
+        .ok_or_else(|| anyhow!("Treasury Fiscal Data recovery page size is invalid"))?;
+    let query = TreasuryFiscalQuery::average_interest_rates_v2(
+        expected.first_record_date,
+        expected.last_record_date,
+        page_size,
+    )
+    .context("Treasury Fiscal Data recovery query is invalid")?;
+    let provider_dataset = query
+        .dataset()
+        .context("Treasury Fiscal Data recovery provider dataset is invalid")?;
+    let analytical_dataset = query
+        .analytical_dataset()
+        .context("Treasury Fiscal Data recovery analytical dataset is invalid")?;
+    if lower_hex(query.query_digest()) != expected.query_digest
+        || provider_dataset.as_str() != publication.provider_dataset
+        || analytical_dataset.as_str() != publication.analytical_dataset_id
+    {
+        bail!("Treasury Fiscal Data recovery selector does not match the published generation");
+    }
+    let observations = query_row_evidence(&query_publication(application, publication).await?)?;
+    let TreasuryFiscalQueryValidation { page_rows, series } =
+        validate_treasury_fiscal_query_rows(&observations.rows, &query, &expected.pages)?;
+    if observations != expected.observation_query
+        || observations.row_count != expected.provider_row_count
+        || series != publication.series_ids
+        || expected.pages.iter().any(|page| {
+            page_rows.get(&page.source_payload_digest.bytes()).copied() != Some(page.returned_rows)
+        })
+    {
+        bail!("Treasury Fiscal Data query evidence changed during restart");
+    }
+    Ok(observations.row_count)
 }
 
 fn verify_python_training_recovery(

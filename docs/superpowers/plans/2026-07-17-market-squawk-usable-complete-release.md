@@ -2626,6 +2626,11 @@ PROVIDER_SURFACES="coinbase.public-market-data,coinbase.exchange-direct-market-d
 cargo run -p market-squawk --release --all-features --locked -- \
   release evidence providers --providers "$PROVIDER_SURFACES" \
   --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --sec-cik "$SEC_CIK" \
+  --fred-dataset "$FRED_DATASET" \
+  --fred-training-request "$FRED_TRAINING_REQUEST" \
+  --bls-dataset "$BLS_DATASET" \
+  --bls-training-request "$BLS_TRAINING_REQUEST" \
   --require-direct-verified-action --require-fred-alfred-rights \
   --output-directory target/release-evidence/provisional/providers
 ```
@@ -2682,47 +2687,61 @@ TREE_SHA="$(git rev-parse HEAD^{tree})"
 EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
 mkdir -p "$EVIDENCE_DIR"
 
-cargo run -p market-squawk --release --all-features --locked -- \
+MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
+python3 -I scripts/build_python_release.py \
+  --lock python/wheelhouse-lock.json \
+  --artifact-root "$EVIDENCE_DIR/python" \
+  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
+  --prepare-cache-only
+python3 -I scripts/build_python_release.py \
+  --lock python/wheelhouse-lock.json \
+  --artifact-root "$EVIDENCE_DIR/python" \
+  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
+  --offline
+SELECTED_BINARY="$EVIDENCE_DIR/python/release-cp312/bin/market-squawk"
+test -x "$SELECTED_BINARY"
+
+test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
+test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+PROVIDER_SURFACES="coinbase.public-market-data,coinbase.exchange-direct-market-data,kraken.spot-public-market-data,sec.edgar-public,fred-alfred.api-v1-v2,bls.v1-unregistered,treasury.daily-rates-xml,treasury.fiscal-data"
+"$SELECTED_BINARY" \
+  release evidence providers --providers "$PROVIDER_SURFACES" \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --sec-cik "$SEC_CIK" \
+  --fred-dataset "$FRED_DATASET" \
+  --fred-training-request "$FRED_TRAINING_REQUEST" \
+  --bls-dataset "$BLS_DATASET" \
+  --bls-training-request "$BLS_TRAINING_REQUEST" \
+  --require-direct-verified-action --require-fred-alfred-rights \
+  --output-directory "$EVIDENCE_DIR/providers"
+
+"$SELECTED_BINARY" \
   release evidence fuzz --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --toolchain nightly-2026-07-15 --seconds-per-target 120 \
   --rss-limit-mib 2048 --output-file "$EVIDENCE_DIR/fuzz.json"
-cargo run -p market-squawk --release --all-features --locked -- \
+"$SELECTED_BINARY" \
   release evidence benchmark --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --warm-up-events 1000000 --events 60000000 --storage-rows 10000000 \
   --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
   --output-file "$EVIDENCE_DIR/performance.json"
 
-test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
-test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
-PROVIDER_SURFACES="coinbase.public-market-data,coinbase.exchange-direct-market-data,kraken.spot-public-market-data,sec.edgar-public,fred-alfred.api-v1-v2,bls.v1-unregistered,treasury.daily-rates-xml,treasury.fiscal-data"
-cargo run -p market-squawk --release --all-features --locked -- \
-  release evidence providers --providers "$PROVIDER_SURFACES" \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --require-direct-verified-action --require-fred-alfred-rights \
-  --output-directory "$EVIDENCE_DIR/providers"
-
-python3 scripts/build_python_release.py \
-  --lock python/wheelhouse-lock.json \
-  --artifact-root "$EVIDENCE_DIR/python" \
-  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
-  --offline
-cargo run -p market-squawk --release --all-features --locked -- \
+"$SELECTED_BINARY" \
   release demonstrate --offline --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --provider-evidence "$EVIDENCE_DIR/providers" \
   --python-evidence "$EVIDENCE_DIR/python/market-squawk-release.json" \
   --output-file "$EVIDENCE_DIR/demo.json"
-target/release/market-squawk \
+"$SELECTED_BINARY" \
   release evidence gate \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --binary target/release/market-squawk \
+  --binary "$SELECTED_BINARY" \
   --gate-log "$EVIDENCE_DIR/full-gate.log" \
   --output-file "$EVIDENCE_DIR/full-gate.json"
-target/release/market-squawk \
+"$SELECTED_BINARY" \
   release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \
-  --binary target/release/market-squawk --output-file "$EVIDENCE_DIR/manifest.json"
+  --binary "$SELECTED_BINARY" --output-file "$EVIDENCE_DIR/manifest.json"
 git diff --exit-code
 test -z "$(git status --porcelain)"
 git status --short --branch
@@ -2732,16 +2751,18 @@ Expected: every command exits 0; Git remains clean because every generated artif
 the manifest binds the complete artifact set to the unchanged candidate. The retained validators
 check real artifacts and measurements. No wrapper tests command ordering or plan text.
 
-- [ ] **Step 7: Run grouped review and repeat the full evidence block after any remediation**
+- [ ] **Step 7: Review the closed artifact set and repeat the full evidence block after remediation**
 
 Dispatch non-mutating reviewers in maximum parallel batches for: live/source/qualification/risk/
 paper; catalog/storage/PIT/provider rights; analytics/Python/modeling/backtest/portfolio/fair value;
 MCP/CLI/security/operations/supply chain; and performance/evidence/release truth. Freeze the candidate
-between batches. Reviewers return findings without editing the candidate. The integrator unions and
-deduplicates every finding into one concise `usable-release-review.md`, remediates every substantiated
-Critical/Important release blocker in disjoint lanes, and commits the report with the remediation
-and any truthful README changes. A Minor or cosmetic note is recorded once as nonblocking and does
-not trigger a rebuild/review loop unless it demonstrates a violated release predicate. Do not create
+between batches. Reviewers inspect the unchanged HEAD, selected executable, closed `manifest.json`,
+and every manifest-bound artifact. They return findings without editing the candidate. The
+integrator unions and deduplicates every finding, remediates every substantiated Critical/Important
+release blocker in disjoint lanes, and updates the prepared review record before freezing the
+replacement candidate. Every substantiated Critical, Important, or Minor finding blocks approval.
+A cosmetic observation that does not demonstrate a product, evidence, documentation, or release
+contract defect is recorded once but is not mislabeled as a finding. Do not create
 per-task report files or a report-generation script.
 
 Before each remediation commit, the integration owner copies the exact approved paths from

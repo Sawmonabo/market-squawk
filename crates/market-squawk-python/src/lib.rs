@@ -192,7 +192,7 @@ fn add_public_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
         &["TrainingProposal", "TrainingRun"],
     )?;
     module.add("__all__", PyList::new(module.py(), PUBLIC_API)?)?;
-    module.add("__version__", "0.1.0")
+    module.add("__version__", "0.2.0")
 }
 
 #[pymodule]

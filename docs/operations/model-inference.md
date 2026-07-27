@@ -110,11 +110,12 @@ separate authorities: `modelKind` is `linear` or `logistic`, while `artifactForm
 
 ## Prepare the signed Python training release
 
-The supported `v0.1.0` target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or newer on arm64.
+The supported `v0.2.0` target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or newer on arm64.
 Supply absolute paths to both interpreters. The first command explicitly prepares the locked public
 dependency cache; the second is the sealed offline build:
 
 ```bash
+MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
 python3 -I scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
   --artifact-root /absolute/path/to/python-release \

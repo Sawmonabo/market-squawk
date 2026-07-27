@@ -53,7 +53,7 @@ make that decision.
 ```mermaid
 flowchart TD
     Freeze["Freeze clean candidate HEAD/tree"]
-    Build["Locked release build"]
+    Build["Signed Python release build and selected executable"]
     Fuzz["fuzz.json"]
     Perf["performance.json"]
     Providers["providers/provider-evidence.json"]
@@ -62,8 +62,8 @@ flowchart TD
     Gate["Supervised full gate"]
     GateLog["full-gate.log"]
     GateReceipt["full-gate.json"]
-    Review["Grouped Quarter 4 review"]
     Close["manifest.json"]
+    Review["Grouped Quarter 4 review"]
     Publish["Publish release and close project items"]
 
     Freeze --> Build
@@ -82,8 +82,8 @@ flowchart TD
     Python --> Close
     Demo --> Close
     GateReceipt --> Close
-    Review --> Close
-    Close --> Publish
+    Close --> Review
+    Review --> Publish
 ```
 
 Any remediation returns the flow to `Freeze` with a new commit and invalidates all prior
@@ -105,33 +105,38 @@ TREE_SHA="$(git rev-parse HEAD^{tree})"
 EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
 mkdir -p "$EVIDENCE_DIR"
 
-# Produce fuzz.json, performance.json, and providers/provider-evidence.json
-# with the exact --head and --tree. Build both signed Python releases.
+# Build both signed Python releases first. Use the immutable CPython 3.12
+# application copy as SELECTED_BINARY for every Rust evidence producer.
+SELECTED_BINARY="$EVIDENCE_DIR/python/release-cp312/bin/market-squawk"
 
-cargo run -p market-squawk --release --all-features --locked -- \
+"$SELECTED_BINARY" \
   release demonstrate --offline \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --provider-evidence "$EVIDENCE_DIR/providers" \
   --python-evidence "$EVIDENCE_DIR/python/market-squawk-release.json" \
   --output-file "$EVIDENCE_DIR/demo.json"
 
-target/release/market-squawk \
+"$SELECTED_BINARY" \
   release evidence gate \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --binary target/release/market-squawk \
+  --binary "$SELECTED_BINARY" \
   --gate-log "$EVIDENCE_DIR/full-gate.log" \
   --output-file "$EVIDENCE_DIR/full-gate.json"
 
-target/release/market-squawk \
+"$SELECTED_BINARY" \
   release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \
-  --binary target/release/market-squawk \
+  --binary "$SELECTED_BINARY" \
   --output-file "$EVIDENCE_DIR/manifest.json"
 
 git diff --exit-code
 test -z "$(git status --porcelain)"
 ```
+
+The grouped review starts only after `manifest.json` closes the exact artifact inventory. Review
+approval is a read-only attestation over that unchanged HEAD, selected executable, manifest, and
+artifact set; it is not inserted into the already closed directory.
 
 `scripts/verify.sh` remains the sole checked-in build/security program. The Rust gate command is
 its bounded authority supervisor and evidence publisher; no second shell wrapper, command-order

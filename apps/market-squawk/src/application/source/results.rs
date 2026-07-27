@@ -26,11 +26,14 @@ pub(super) fn inactive_row(
     profile: &ProviderProfileView,
     profile_value: &Value,
     session: Option<Value>,
+    provider_dataset_identifier: Option<&SourceIdentifier>,
 ) -> Result<Value, ServiceError> {
     Ok(match kind {
         SourceReadKind::Status => json!({
             "profile": profile_value,
             "currentSession": session,
+            "providerDatasetIdentifier": provider_dataset_identifier
+                .map(SourceIdentifier::as_str),
             "runtime": {"state": "not_active"},
         }),
         SourceReadKind::Coverage => json!({
@@ -57,12 +60,15 @@ pub(super) fn runtime_row(
     profile: &ProviderProfileView,
     profile_value: &Value,
     session: Option<Value>,
+    provider_dataset_identifier: Option<&SourceIdentifier>,
     runtime: &SourceRuntimeSnapshot,
 ) -> Result<Value, ServiceError> {
     Ok(match kind {
         SourceReadKind::Status => json!({
             "profile": profile_value,
             "currentSession": session,
+            "providerDatasetIdentifier": provider_dataset_identifier
+                .map(SourceIdentifier::as_str),
             "runtime": runtime_status_value(runtime)?,
         }),
         SourceReadKind::Coverage => json!({

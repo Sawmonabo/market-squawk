@@ -22,5 +22,5 @@ __all__ = [
     "open_dataset",
     "training_environment_receipt",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __market_squawk_build_identity__ = _native.__market_squawk_build_identity__

@@ -8,8 +8,9 @@ historical datasets to originate from or reproduce the live feed.
 
 ## Status
 
-`v0.1.0` is a runnable local product foundation under final release construction. It is not yet the
-usable complete Market Squawk release and it is not a production brokerage system. The linked
+`v0.2.0` is the active usable-release candidate. The existing `v0.1.0` tag remains the historical
+runnable foundation and will not be moved or reused. The candidate is not yet the usable complete
+Market Squawk release and it is not a production brokerage system. The linked
 [historical state audit](docs/audits/architecture/2026-07-15-current-state-anchor.md) records its own rejected audit anchor;
 it is not an exact-head inventory. The dated
 [release baseline](docs/verification/usable-release-baseline.md) is also historical audit evidence.
@@ -111,6 +112,10 @@ work is bound by the single canonical
   workflow covers all five official families across a bounded year range, validates exact
   family-specific XML and all-history pagination, publishes precision-preserving
   `market-squawk-research-v3` observations, and recovers the exact research runtime after restart.
+  SEC EDGAR production ingestion is available through a truthful non-secret application/contact
+  identity and exact registrant CIK. Public BLS v1 production ingestion requires no account or key;
+  activation and status return the exact adapter-owned dataset identity needed by release evidence,
+  and portal restart recovers that identity without reconstructing it in the application.
   FRED/ALFRED now has a working bounded `source inspect` path from the guided local onboarding
   session to the official API, exact page validation, canonical observations, and typed CLI/MCP
   output without research-dataset persistence. Persistence, caching, archival, and training remain
@@ -214,8 +219,8 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The revision-4 profile is rights-limited. Current FRED terms prohibit durable storage and software/model training. Completion requires exact written St. Louis Fed permission covering Market Squawk, the FRED API, each selected series and operation, a hash-bound local review, independent exact-series authority, and a real official-API publication/restart/analytics proof. An API key or public-domain series alone cannot close this | Task 9 / Task 20 |
 | `Missing` | execution-eligible paper acceptance | Coinbase Direct is wired through the existing feature, strategy, central-risk, dispatcher, audit, checkpoint, and realistic paper engine. The required authorized unchanged-head live-to-paper demonstration has not yet been accepted | Issue `#7` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | The accepted control plane and loopback portal own guided provider handoff, no-credential and typed provider setup, shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, local-authority removal, OS-keyring-first routing, encrypted fallback, and working Treasury research activation. Release acceptance remains blocked by unfinished official SEC/BLS evidence, FRED/ALFRED's two-gate durable authority and real workflow, the authorized Coinbase Direct trace, and one unchanged-head provider evidence run | Issue `#31` / Task 19A |
-| `Missing` | complete official research-provider workflows | Treasury Fiscal Data and all five Treasury daily-rate families have real local workflows. FRED/ALFRED is rights-limited and durable use remains blocked until exact Bank service permission and exact-series authority are both present; SEC EDGAR and BLS acceptance also remain open. The complete provider set therefore remains release-blocking | Issue `#31` / Tasks 19A–20 |
+| `Missing` | complete provider-onboarding acceptance | The accepted control plane and loopback portal own guided provider handoff, no-credential and typed provider setup, shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, local-authority removal, OS-keyring-first routing, encrypted fallback, and working SEC, public-BLS, and Treasury research activation. Release acceptance remains blocked by exact unchanged-candidate official-response evidence for SEC/BLS/Treasury, FRED/ALFRED's two-gate durable authority and real workflow, the authorized Coinbase Direct trace, and one closed provider evidence run | Issue `#31` / Task 19A |
+| `Missing` | complete official research-provider acceptance | Treasury Fiscal Data, all five Treasury daily-rate families, SEC EDGAR, and public BLS v1 have production ingest/publication/query/restart workflows. Their final unchanged-candidate official-network evidence is still open. FRED/ALFRED durable use remains blocked until exact Bank service permission and exact-series authority are both present and the same durable workflow succeeds. The complete provider set therefore remains release-blocking | Issue `#31` / Tasks 19A–20 |
 | `Missing` | release security/fuzz/performance gate | Task 19's local control plane and corrected source-adapter dependency boundary are accepted. The hardened fuzz, measurement, provider, offline all-vertical demonstration, and strict atomic evidence-closure producers are implemented, but no final unchanged-head provider/Python/demo/performance/security evidence set, grouped release review, publication, or closeout exists | Issue `#25` / Task 20 |
 
 This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
@@ -249,12 +254,13 @@ outside the live path. Python is never placed between a live event and an automa
 
 ## Python research and training quick start
 
-The supported `v0.1.0` Python release target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or
+The supported `v0.2.0` Python release target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or
 newer on arm64. Supply absolute paths to both interpreters. The first command performs the explicit
 one-time preparation of free, hash-pinned public dependency caches; the second build is fully
 offline and produces isolated release environments plus a machine-readable evidence manifest.
 
 ```bash
+MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
 python3 -I scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
   --artifact-root .agents/python-release \

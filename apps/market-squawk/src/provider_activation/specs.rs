@@ -4,7 +4,9 @@ use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
-use market_squawk_adapter_bls::BlsSeriesMetadata;
+use market_squawk_adapter_bls::{
+    BlsAccessTier, BlsAuthorization, BlsSeriesMetadata, BlsSourceConfig,
+};
 use market_squawk_adapter_coinbase::{
     CoinbaseConfigError, CoinbaseDirectLimits, CoinbaseProductMapping,
 };
@@ -13,7 +15,7 @@ use market_squawk_adapter_fred::FredRightsPolicy;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
-use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct};
+use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
 use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
     BoundedInput, LocalAuthorityStateStore, SecretReference, UserAuthorizedInputRoot,
@@ -220,25 +222,61 @@ impl fmt::Debug for SecAdapterActivation {
 #[derive(Debug)]
 pub struct BlsAdapterActivation {
     pub(super) metadata: SourceMetadata,
-    pub(super) series: Vec<BlsSeriesMetadata>,
-    pub(super) start_year: u16,
-    pub(super) end_year: u16,
+    pub(super) configuration: BlsAdapterConfiguration,
+}
+
+/// Public BLS retains the exact adapter configuration; registered BLS defers secret binding.
+#[derive(Debug)]
+pub(super) enum BlsAdapterConfiguration {
+    Public(BlsSourceConfig),
+    Registered {
+        series: Vec<BlsSeriesMetadata>,
+        start_year: u16,
+        end_year: u16,
+    },
 }
 
 impl BlsAdapterActivation {
     /// Retains the exact request universe, years, metadata, and persistence evidence.
-    #[must_use]
-    pub fn new(
+    ///
+    /// Public-v1 activation constructs and retains the exact configuration later admitted by the
+    /// adapter. Registered-v2 activation defers configuration until the foreground credential
+    /// read, so it never invents or exposes credential-independent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the public request cannot produce one exact bounded dataset.
+    pub fn try_new(
         metadata: SourceMetadata,
+        tier: BlsAccessTier,
         series: Vec<BlsSeriesMetadata>,
         start_year: u16,
         end_year: u16,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, market_squawk_adapter_bls::BlsSourceError> {
+        let configuration = match tier {
+            BlsAccessTier::PublicV1 => BlsAdapterConfiguration::Public(BlsSourceConfig::try_new(
+                BlsAuthorization::PublicV1,
+                series,
+                start_year,
+                end_year,
+            )?),
+            BlsAccessTier::RegisteredV2 => BlsAdapterConfiguration::Registered {
+                series,
+                start_year,
+                end_year,
+            },
+        };
+        Ok(Self {
             metadata,
-            series,
-            start_year,
-            end_year,
+            configuration,
+        })
+    }
+
+    /// Returns the exact provider discovery identity carried by the admitted public configuration.
+    pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        match &self.configuration {
+            BlsAdapterConfiguration::Public(configuration) => Some(configuration.dataset()),
+            BlsAdapterConfiguration::Registered { .. } => None,
         }
     }
 }
@@ -398,6 +436,22 @@ pub enum ProviderAdapterActivationRequest {
     LocalFiles(LocalFileAdapterActivation),
     /// User-owned portfolio holdings and transactions extraction.
     Portfolio(PortfolioAdapterActivation),
+}
+
+impl ProviderAdapterActivationRequest {
+    /// Returns the exact provider discovery identity retained by this activation request.
+    pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        match self {
+            Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Live(_)
+            | Self::CoinbaseDirect(_)
+            | Self::Sec(_)
+            | Self::Treasury(_)
+            | Self::Fred(_)
+            | Self::LocalFiles(_)
+            | Self::Portfolio(_) => None,
+        }
+    }
 }
 
 /// Provider activation or adapter construction failure.

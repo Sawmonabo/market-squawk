@@ -766,8 +766,22 @@ impl SourceController {
             );
             let profile_value = to_json(profile)?;
             let session_value = sessions.get(profile.id()).map(to_json).transpose()?;
+            let provider_dataset_identifier = if matches!(kind, SourceReadKind::Status) {
+                let profile_identifier = SourceIdentifier::try_from(profile.id())
+                    .map_err(|_error| ServiceError::InvalidResult)?;
+                self.discovery
+                    .registered_discovery_dataset(&profile_identifier)?
+            } else {
+                None
+            };
             if selected_runtime.is_empty() {
-                rows.push(inactive_row(kind, profile, &profile_value, session_value)?);
+                rows.push(inactive_row(
+                    kind,
+                    profile,
+                    &profile_value,
+                    session_value,
+                    provider_dataset_identifier.as_ref(),
+                )?);
             } else {
                 rows.try_reserve(selected_runtime.len())
                     .map_err(|_error| ServiceError::ResourceExhausted)?;
@@ -777,6 +791,7 @@ impl SourceController {
                         profile,
                         &profile_value,
                         session_value.clone(),
+                        provider_dataset_identifier.as_ref(),
                         record,
                     )?);
                 }

@@ -13,7 +13,7 @@ from typing import Any
 
 
 EXPECTED_PACKAGE_FIELDS = {
-    "version": "0.1.0",
+    "version": "0.2.0",
     "edition": "2024",
     "rust_version": "1.97.1",
     "license": "Apache-2.0 OR MIT",

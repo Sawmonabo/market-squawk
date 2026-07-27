@@ -355,6 +355,12 @@ pub struct ResearchRevisionPlanError;
 
 /// Production extraction adapter plus its source-specific revision authority.
 pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'static {
+    /// Returns the exact provider dataset used to begin discovery, when one fixed dataset is
+    /// carried by the admitted adapter configuration.
+    fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        None
+    }
+
     /// Returns an exact provider rights subject for a dataset, when the adapter uses scoped rights.
     fn rights_subject(
         &self,
@@ -494,6 +500,10 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource 
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
+    fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
+        Some(self.dataset())
+    }
+
     fn analytical_dataset(
         &self,
         batch: &ExtractionBatch,
@@ -754,6 +764,30 @@ impl ProductionResearchIngestCoordinator {
             .sources
             .get(profile)
             .is_some_and(|source| source.admission.ensure_live().is_ok()))
+    }
+
+    /// Returns the exact fixed discovery dataset carried by one callable provider adapter.
+    pub fn registered_discovery_dataset(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ResearchIngestCompositionError> {
+        if self.lifecycle.shutdown_token().is_cancelled() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.registry.is_none() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let Some(source) = authority.sources.get(profile) else {
+            return Ok(None);
+        };
+        if source.admission.ensure_live().is_err() {
+            return Ok(None);
+        }
+        Ok(source.source.discovery_dataset_identifier().cloned())
     }
 
     /// Lists exact source objects from one registered provider without minting receipts.
@@ -1172,6 +1206,14 @@ impl std::fmt::Debug for ProductionResearchIngestCoordinator {
 impl ResearchSourceDiscoveryCoordinator for ProductionResearchIngestCoordinator {
     fn maximum_discovery_objects(&self) -> NonZeroU16 {
         self.limits.discovery_objects
+    }
+
+    fn registered_discovery_dataset(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ServiceError> {
+        ProductionResearchIngestCoordinator::registered_discovery_dataset(self, profile)
+            .map_err(|_error| ServiceError::Unavailable)
     }
 
     fn revoke_discovery_receipts(

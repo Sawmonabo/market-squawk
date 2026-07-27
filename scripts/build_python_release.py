@@ -1159,46 +1159,12 @@ def _build_release(
     bootstrap_environment["MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT"] = foundation.decode(
         "ascii"
     )
-    _run(
-        [
-            str(_bound_tool(toolchain, "cargo")),
-            "build",
-            "-p",
-            "market-squawk",
-            "--bin",
-            "market-squawk",
-            "-p",
-            "market-squawk-modeling",
-            "--bin",
-            "market-squawk-model-validator",
-            "--bin",
-            "market-squawk-onnx-worker",
-            "--release",
-            "--locked",
-        ],
+    built_executables = _build_native_release_executables(
         root,
+        toolchain,
         bootstrap_environment,
     )
-    validator = root / "target/release/market-squawk-model-validator"
-    application = root / "target/release/market-squawk"
-    onnx_worker = root / "target/release/market-squawk-onnx-worker"
-    executables = NativeReleaseExecutables(
-        application=application,
-        onnx_worker=onnx_worker,
-        validator=validator,
-    )
-    if any(
-        path.is_symlink() or not path.is_file()
-        for path in (
-            executables.application,
-            executables.onnx_worker,
-            executables.validator,
-        )
-    ):
-        raise ReleaseBuildError("bound Rust release executables were not produced")
-    validator_size, validator_sha256 = _file_digest(validator)
-    application_size, application_sha256 = _file_digest(application)
-    onnx_worker_size, onnx_worker_sha256 = _file_digest(onnx_worker)
+    validator_size, validator_sha256 = _file_digest(built_executables.validator)
     build_python = _create_venv(
         build_runtime,
         layout.build_venv,
@@ -1239,7 +1205,7 @@ def _build_release(
         root / "python",
         environment,
     )
-    project_wheels = list(layout.distribution.glob("market_squawk-0.1.0-*.whl"))
+    project_wheels = list(layout.distribution.glob("market_squawk-0.2.0-*.whl"))
     if len(project_wheels) != 1:
         raise ReleaseBuildError("maturin did not create exactly one project wheel")
     project_wheel = project_wheels[0]
@@ -1253,17 +1219,7 @@ def _build_release(
         raise ReleaseBuildError(
             "project wheel does not carry the exact pinned cp310-abi3 macOS platform tag"
         )
-    release_manifest, release_manifest_sha256 = build_release_manifest(
-        foundation_sha256,
-        project_wheel,
-        python_tag,
-        abi_tag,
-        platform_tag,
-        executables,
-        signer,
-    )
-    (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
-    matrix_evidence = []
+    prepared_releases = []
     for runtime, (minor, release_venv) in zip(runtimes, layout.releases, strict=True):
         if runtime.version[:2] != minor:
             raise ReleaseBuildError("release environment and interpreter identity differ")
@@ -1274,6 +1230,52 @@ def _build_release(
             root,
             bootstrap_environment,
         )
+        installed_executables = _copy_native_release_executables(
+            built_executables,
+            release_venv,
+        )
+        prepared_releases.append(
+            (
+                runtime,
+                minor,
+                release_venv,
+                release_python,
+                installed_executables,
+            )
+        )
+    if (
+        not prepared_releases
+        or prepared_releases[0][1] != (3, 12)
+        or prepared_releases[0][2] != layout.root / "release-cp312"
+    ):
+        raise ReleaseBuildError("canonical CPython 3.12 release is unavailable")
+    canonical_executables = prepared_releases[0][4]
+    application_size, application_sha256 = _file_digest(
+        canonical_executables.application
+    )
+    onnx_worker_size, onnx_worker_sha256 = _file_digest(
+        canonical_executables.onnx_worker
+    )
+    canonical_validator_size, canonical_validator_sha256 = _file_digest(
+        canonical_executables.validator
+    )
+    if (
+        (canonical_validator_size, canonical_validator_sha256)
+        != (validator_size, validator_sha256)
+    ):
+        raise ReleaseBuildError("canonical release validator identity changed")
+    release_manifest, release_manifest_sha256 = build_release_manifest(
+        foundation_sha256,
+        project_wheel,
+        python_tag,
+        abi_tag,
+        platform_tag,
+        prepared_releases[0][2],
+        signer,
+    )
+    (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
+    matrix_evidence = []
+    for runtime, minor, release_venv, release_python, installed_executables in prepared_releases:
         runtime_environment = dict(bootstrap_environment)
         _run(
             [
@@ -1308,20 +1310,19 @@ def _build_release(
             root,
             runtime_environment,
         )
-        for executable, expected_identity in (
-            (application, (application_size, application_sha256)),
-            (onnx_worker, (onnx_worker_size, onnx_worker_sha256)),
-            (validator, (validator_size, validator_sha256)),
+        if (
+            _file_digest(installed_executables.application)
+            != (application_size, application_sha256)
+            or _file_digest(installed_executables.onnx_worker)
+            != (onnx_worker_size, onnx_worker_sha256)
+            or _file_digest(installed_executables.validator)
+            != (canonical_validator_size, canonical_validator_sha256)
         ):
-            destination = release_venv / "bin" / executable.name
-            shutil.copy2(executable, destination)
-            destination.chmod(0o755)
-            if _file_digest(destination) != expected_identity:
-                raise ReleaseBuildError("installed native release identity changed")
+            raise ReleaseBuildError("installed native release identity changed")
         distribution = inspect_installed_distribution(
             release_venv,
             runtime,
-            RuntimeRequirement("market-squawk", "0.1.0"),
+            RuntimeRequirement("market-squawk", "0.2.0"),
             native_prefix="market_squawk/__init__.",
             require_training_driver=True,
         )
@@ -1436,6 +1437,84 @@ def _build_release(
     )
     _remove_owned_child(layout.build_venv, layout.root, "build-venv")
     _remove_owned_child(layout.build_home, layout.root, "build-home")
+
+
+def _build_native_release_executables(
+    root: Path,
+    toolchain: dict[str, object],
+    environment: dict[str, str],
+) -> NativeReleaseExecutables:
+    _run(
+        [
+            str(_bound_tool(toolchain, "cargo")),
+            "build",
+            "-p",
+            "market-squawk",
+            "--bin",
+            "market-squawk",
+            "-p",
+            "market-squawk-modeling",
+            "--bin",
+            "market-squawk-model-validator",
+            "--bin",
+            "market-squawk-onnx-worker",
+            "--no-default-features",
+            "--features",
+            "market-squawk/release-evidence",
+            "--release",
+            "--locked",
+        ],
+        root,
+        environment,
+    )
+    release = root / "target/release"
+    executables = NativeReleaseExecutables(
+        application=release / "market-squawk",
+        onnx_worker=release / "market-squawk-onnx-worker",
+        validator=release / "market-squawk-model-validator",
+    )
+    if any(
+        path.is_symlink() or not path.is_file()
+        for path in (
+            executables.application,
+            executables.onnx_worker,
+            executables.validator,
+        )
+    ):
+        raise ReleaseBuildError("bound Rust release executables were not produced")
+    return executables
+
+
+def _copy_native_release_executables(
+    executables: NativeReleaseExecutables,
+    release_root: Path,
+) -> NativeReleaseExecutables:
+    native_bin = release_root / "bin"
+    if native_bin.is_symlink() or not native_bin.is_dir():
+        raise ReleaseBuildError("release executable directory is invalid")
+    installed = NativeReleaseExecutables(
+        application=native_bin / "market-squawk",
+        onnx_worker=native_bin / "market-squawk-onnx-worker",
+        validator=native_bin / "market-squawk-model-validator",
+    )
+    for source, destination in (
+        (executables.application, installed.application),
+        (executables.onnx_worker, installed.onnx_worker),
+        (executables.validator, installed.validator),
+    ):
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or destination.exists()
+            or destination.is_symlink()
+        ):
+            raise ReleaseBuildError("native release executable identity is invalid")
+        expected_identity = _file_digest(source)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o555)
+        if _file_digest(destination) != expected_identity:
+            raise ReleaseBuildError("installed native release identity changed")
+    return installed
 
 
 def _marker_content(path: Path, purpose: str) -> str:
@@ -1788,20 +1867,24 @@ def build_release_manifest(
     python_tag: str,
     abi_tag: str,
     platform_tag: str,
-    executables: NativeReleaseExecutables,
+    canonical_release: Path,
     signer: ReleaseSigner,
 ) -> tuple[bytes, str]:
-    """Bind the exact wheel and native product without a self-referential digest."""
+    """Bind the exact wheel and canonical CPython 3.12 native product."""
 
     _sha256(foundation_sha256)
     wheel_size, wheel_sha256 = _file_digest(project_wheel)
+    if canonical_release.name != "release-cp312":
+        raise ReleaseBuildError("native release executable identity is not canonical")
+    _admit_owned_child(canonical_release, canonical_release.parent, "release-cp312")
     expected_names = {
         "application": "market-squawk",
         "onnx_worker": "market-squawk-onnx-worker",
         "validator": "market-squawk-model-validator",
     }
     native_files = {
-        name: getattr(executables, name) for name in expected_names
+        name: canonical_release / "bin" / executable
+        for name, executable in expected_names.items()
     }
     if any(
         path.name != expected_names[name] or path.is_symlink() or not path.is_file()

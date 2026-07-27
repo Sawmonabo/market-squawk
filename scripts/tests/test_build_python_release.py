@@ -136,6 +136,53 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             Path("/owned/release-cp312/bin/python"), (3, 12, 12), ROOT, None
         )
 
+    def test_native_release_build_enables_only_application_release_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cargo = root / "cargo"
+            cargo.write_bytes(b"cargo")
+            release = root / "target" / "release"
+            release.mkdir(parents=True)
+            for name in (
+                "market-squawk",
+                "market-squawk-model-validator",
+                "market-squawk-onnx-worker",
+            ):
+                (release / name).write_bytes(name.encode("ascii"))
+            environment = {"CARGO_INCREMENTAL": "0"}
+
+            with mock.patch.object(builder, "_run") as run:
+                executables = builder._build_native_release_executables(
+                    root,
+                    {"cargo": builder._tool_binding(cargo)},
+                    environment,
+                )
+
+            run.assert_called_once_with(
+                [
+                    str(cargo),
+                    "build",
+                    "-p",
+                    "market-squawk",
+                    "--bin",
+                    "market-squawk",
+                    "-p",
+                    "market-squawk-modeling",
+                    "--bin",
+                    "market-squawk-model-validator",
+                    "--bin",
+                    "market-squawk-onnx-worker",
+                    "--no-default-features",
+                    "--features",
+                    "market-squawk/release-evidence",
+                    "--release",
+                    "--locked",
+                ],
+                root,
+                environment,
+            )
+            self.assertEqual(executables.application, release / "market-squawk")
+
     def test_training_receipts_bind_build_foundation_and_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -165,14 +212,36 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 "44" * 32,
                 "55" * 32,
             )
-            project_wheel = root / "market_squawk-0.1.0-cp310-abi3-macosx_12_0_arm64.whl"
+            project_wheel = root / "market_squawk-0.2.0-cp310-abi3-macosx_12_0_arm64.whl"
             project_wheel.write_bytes(b"wheel")
-            application = root / "market-squawk"
-            application.write_bytes(b"application")
-            onnx_worker = root / "market-squawk-onnx-worker"
-            onnx_worker.write_bytes(b"onnx-worker")
-            validator = root / "market-squawk-model-validator"
-            validator.write_bytes(b"validator")
+            layout = builder.admit_artifact_root(root / "artifacts", ROOT)
+            canonical_release = layout.releases[0][1]
+            builder._admit_owned_child(
+                canonical_release,
+                layout.root,
+                "release-cp312",
+            )
+            native_bin = canonical_release / "bin"
+            native_bin.mkdir()
+            built_bin = root / "target" / "release"
+            built_bin.mkdir(parents=True)
+            built = builder.NativeReleaseExecutables(
+                application=built_bin / "market-squawk",
+                onnx_worker=built_bin / "market-squawk-onnx-worker",
+                validator=built_bin / "market-squawk-model-validator",
+            )
+            built.application.write_bytes(b"application")
+            built.onnx_worker.write_bytes(b"onnx-worker")
+            built.validator.write_bytes(b"validator")
+            installed = builder._copy_native_release_executables(
+                built,
+                canonical_release,
+            )
+            application = installed.application
+            onnx_worker = installed.onnx_worker
+            validator = installed.validator
+            self.assertEqual(application.stat().st_mode & 0o777, 0o555)
+            self.assertNotEqual(application.stat().st_ino, built.application.stat().st_ino)
             signer = mock.Mock()
             signer.sign.return_value = "66" * 64
             manifest, manifest_digest = builder.build_release_manifest(
@@ -181,11 +250,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 "cp310",
                 "abi3",
                 "macosx_12_0_arm64",
-                builder.NativeReleaseExecutables(
-                    application=application,
-                    onnx_worker=onnx_worker,
-                    validator=validator,
-                ),
+                canonical_release,
                 signer,
             )
 
@@ -250,6 +315,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 ),
             ):
                 with self.subTest(executable=executable.name):
+                    executable.chmod(0o755)
                     with executable.open("r+b") as oversized:
                         oversized.truncate(maximum_bytes + 1)
                     signer.reset_mock()
@@ -260,15 +326,12 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                             "cp310",
                             "abi3",
                             "macosx_12_0_arm64",
-                            builder.NativeReleaseExecutables(
-                                application=application,
-                                onnx_worker=onnx_worker,
-                                validator=validator,
-                            ),
+                            canonical_release,
                             signer,
                         )
                     signer.sign.assert_not_called()
                     executable.write_bytes(original)
+                    executable.chmod(0o555)
 
 
 if __name__ == "__main__":

@@ -209,16 +209,21 @@ separate from ordinary source setup and requires:
 - `MARKET_SQUAWK_EXTERNAL_NETWORK=1` and
   `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED=1`;
 - a nonempty, duplicate-free list of exact built-in surface identifiers;
+- `--sec-cik <CIK>` containing the exact nonzero ten-digit registrant selected during SEC setup;
 - `--fred-dataset <PROVIDER_DATASET>` containing one bounded
   `fred:series-observations:<SERIES>:<START>:<END>` or `alfred:` selector;
 - `--fred-training-request <REQUEST_FILE>` containing the existing bounded typed PIT dataset-build
   contract;
+- `--bls-dataset <PROVIDER_DATASET>` containing the exact
+  `bls:timeseries:public-v1:<PLAN_SHA256>` identity returned by BLS setup/status;
+- `--bls-training-request <REQUEST_FILE>` containing the bounded typed PIT dataset-build contract
+  for the exact published BLS manifest;
 - an existing parent for `--output-directory`, while the output directory itself must not exist;
   and
 - portal-prepared active sessions and callable research runtimes for surfaces that require
   contacts, credentials, series/query configuration, or admitted durable-use rights.
 
-The closed surface identifiers are:
+The exact terminal-closing surface set is:
 
 ```text
 coinbase.public-market-data
@@ -227,10 +232,13 @@ kraken.spot-public-market-data
 sec.edgar-public
 fred-alfred.api-v1-v2
 bls.v1-unregistered
-bls.v2-registered
 treasury.daily-rates-xml
 treasury.fiscal-data
 ```
+
+The producer also recognizes `bls.v2-registered` for bounded provisional diagnostics. It does not
+replace the mandatory public-v1 path and cannot appear as an extra surface in a terminal provider
+report.
 
 The producer can establish no-credential onboarding for public Coinbase and public Kraken. It
 requires a portal-prepared Treasury daily research runtime with all five official families and an

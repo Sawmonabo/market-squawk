@@ -338,6 +338,7 @@ const state = {
   csrf: '',
   profiles: [],
   sessions: new Map(),
+  providerDatasets: new Map(),
   fallback: 'disabled',
   route: 'welcome',
   goals: new Set(),
@@ -793,6 +794,27 @@ function renderConnectedPanel(profile, session) {
       return copy;
     })()
   );
+  const providerDataset =
+    profile.id === 'bls.v1-unregistered'
+      ? state.providerDatasets.get(profile.id) ||
+        (state.technical && state.technical.profile === profile.id
+          ? state.technical.provider_dataset_identifier
+          : null)
+      : null;
+  if (providerDataset) {
+    const dataset = element('div', 'technical-block');
+    dataset.append(
+      element('h3', '', 'Your exact BLS dataset'),
+      element(
+        'p',
+        '',
+        'Keep this value for the release workflow. It is the exact dataset admitted by the BLS adapter.'
+      ),
+      element('pre', 'technical-data', providerDataset),
+      element('pre', 'technical-data', `--bls-dataset ${providerDataset}`)
+    );
+    panel.append(dataset);
+  }
   if (
     state.providerMode === 'advanced' &&
     session &&
@@ -2460,6 +2482,16 @@ function applyBootstrap(data) {
       session.surface_id,
       session
     ])
+  );
+  state.providerDatasets = new Map(
+    (Array.isArray(data.provider_datasets) ? data.provider_datasets : [])
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry.profile === 'string' &&
+          typeof entry.provider_dataset_identifier === 'string'
+      )
+      .map((entry) => [entry.profile, entry.provider_dataset_identifier])
   );
   state.fallback = data.encrypted_file_fallback;
   if (state.plan.length > 0) {

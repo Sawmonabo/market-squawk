@@ -125,9 +125,10 @@ selectable installation path.
 Create or use a dedicated source checkout, then detach it at the reviewed commit:
 
 ```bash
-git clone https://github.com/Sawmonabo/market-squawk.git market-squawk-0.1.0
-cd market-squawk-0.1.0
-git checkout --detach 836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd
+git clone https://github.com/Sawmonabo/market-squawk.git market-squawk-0.2.0
+cd market-squawk-0.2.0
+REVIEWED_COMMIT=REPLACE_WITH_40_CHARACTER_COMMIT_FROM_DELIVERY_LEDGER
+git checkout --detach "$REVIEWED_COMMIT"
 git rev-parse HEAD
 git rev-parse 'HEAD^{tree}'
 git status --short
@@ -135,9 +136,9 @@ git status --short
 
 Expected output:
 
-- `git rev-parse HEAD` prints
-  `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd`;
-- the tree is `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`;
+- `git rev-parse HEAD` prints the exact 40-character commit selected above;
+- `git rev-parse 'HEAD^{tree}'` matches the tree recorded for that candidate in the
+  [delivery ledger](../plans/delivery-ledger.md);
 - `git status --short` prints nothing.
 
 If the commit is already present in a trusted local clone, a second network clone is unnecessary.
@@ -198,7 +199,8 @@ upgrade never overwrites executables underneath a running process:
 
 ```bash
 INSTALL_PARENT=/absolute/operator-owned/market-squawk
-INSTALL_ROOT="$INSTALL_PARENT/0.1.0-836aae6"
+REVIEWED_SHORT=$(git rev-parse --short=7 HEAD)
+INSTALL_ROOT="$INSTALL_PARENT/0.2.0-$REVIEWED_SHORT"
 
 (
   set -eu
@@ -300,7 +302,7 @@ There is no implicit configuration-file discovery.
 - Both Cargo commands exit `0`.
 - The three expected release executables exist.
 - The installed executables are regular sibling files in the same versioned `bin` directory.
-- `market-squawk --version` prints `market-squawk 0.1.0`.
+- `market-squawk --version` prints `market-squawk 0.2.0`.
 
 ### Configuration and initialization
 

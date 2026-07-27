@@ -403,6 +403,8 @@ pub(crate) enum FredPortalEvidenceInput {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderPortalActivationView {
     profile: SourceIdentifier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_dataset_identifier: Option<SourceIdentifier>,
     session_id: Uuid,
     capability_revision: u64,
     capability_digest: EvidenceDigest,
@@ -417,8 +419,17 @@ pub struct ProviderPortalActivationView {
 
 impl ProviderPortalActivationView {
     pub(crate) fn from_lease(profile: SourceIdentifier, lease: &ProviderActivationLease) -> Self {
+        Self::from_research_lease(profile, lease, None)
+    }
+
+    pub(crate) fn from_research_lease(
+        profile: SourceIdentifier,
+        lease: &ProviderActivationLease,
+        provider_dataset_identifier: Option<SourceIdentifier>,
+    ) -> Self {
         Self {
             profile,
+            provider_dataset_identifier,
             session_id: lease.session_id(),
             capability_revision: lease.capability_revision().get(),
             capability_digest: lease.capability_digest(),

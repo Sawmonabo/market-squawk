@@ -18,6 +18,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use market_squawk_data::CatalogLimit;
+use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::{EncryptedFileFallbackStatus, LocalSecretStoreError, SecretValue};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
@@ -49,6 +50,14 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         request: ProviderPortalActivationRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError>;
+
+    /// Returns the exact fixed discovery dataset carried by one callable provider runtime.
+    fn provider_dataset_identifier(
+        &self,
+        _profile: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ProviderPortalActivationError> {
+        Ok(None)
+    }
 
     /// Revokes callable runtime authority before deterministic onboarding cleanup.
     async fn cancel(
@@ -436,11 +445,29 @@ async fn dispatch(
     }
     if method == Method::GET && path == "/api/v1/bootstrap" {
         let session_limit = CatalogLimit::new(32).map_err(ProviderOnboardingError::from)?;
+        let sessions = service.current_sessions(session_limit)?;
+        let mut provider_datasets = Vec::new();
+        provider_datasets
+            .try_reserve(sessions.len())
+            .map_err(|_error| PortalRequestError::Internal)?;
+        for session in &sessions {
+            let profile = SourceIdentifier::try_from(session.surface_id())
+                .map_err(|_error| PortalRequestError::Internal)?;
+            if let Some(provider_dataset_identifier) =
+                activation.provider_dataset_identifier(&profile)?
+            {
+                provider_datasets.push(ProviderDatasetBootstrapView {
+                    profile,
+                    provider_dataset_identifier,
+                });
+            }
+        }
         let response = BootstrapResponse {
             csrf_token: &security.csrf_token,
             encrypted_file_fallback: service.encrypted_file_fallback_status()?,
             profiles: service.profiles(),
-            sessions: service.current_sessions(session_limit)?,
+            sessions,
+            provider_datasets,
         };
         return with_session_cookie(json_response(StatusCode::OK, &response), &security);
     }
@@ -914,6 +941,13 @@ struct BootstrapResponse<'a> {
     encrypted_file_fallback: EncryptedFileFallbackStatus,
     profiles: Vec<ProviderProfileView>,
     sessions: Vec<OnboardingSessionView>,
+    provider_datasets: Vec<ProviderDatasetBootstrapView>,
+}
+
+#[derive(Serialize)]
+struct ProviderDatasetBootstrapView {
+    profile: SourceIdentifier,
+    provider_dataset_identifier: SourceIdentifier,
 }
 
 #[derive(Serialize)]
