@@ -688,7 +688,7 @@ fn publish_staged_artifact(
         {
             guard.remove()
         }
-        Err(_error) | Ok(()) => Err(ArtifactError::Unavailable),
+        Err(_) | Ok(()) => Err(ArtifactError::Unavailable),
     }
 }
 
