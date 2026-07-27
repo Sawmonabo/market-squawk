@@ -42,6 +42,7 @@ def create_ephemeral_execution(
     parent = source.parent
     name = f".market-squawk-bound-{secrets.token_hex(16)}"
     descriptor = -1
+    writable_descriptor = -1
     path = parent / name
     immutable = False
     directory = os.open(parent, os.O_RDONLY | DIRECTORY | NOFOLLOW)
@@ -56,7 +57,7 @@ def create_ephemeral_execution(
             != (current_directory.st_dev, current_directory.st_ino)
         ):
             raise GateError("ephemeral execution directory authority is unsafe")
-        descriptor = os.open(
+        writable_descriptor = os.open(
             name,
             os.O_RDWR | os.O_CREAT | os.O_EXCL | NOFOLLOW,
             0o500,
@@ -64,15 +65,15 @@ def create_ephemeral_execution(
         )
         written = 0
         while written < len(contents):
-            count = os.write(descriptor, contents[written:])
+            count = os.write(writable_descriptor, contents[written:])
             if count <= 0:
                 raise GateError("ephemeral executable copy write made no progress")
             written += count
-        os.fchmod(descriptor, 0o500)
-        os.fsync(descriptor)
+        os.fchmod(writable_descriptor, 0o500)
+        os.fsync(writable_descriptor)
         immutable_flag = getattr(stat, "UF_IMMUTABLE", 0)
         if immutable_flag and hasattr(os, "chflags"):
-            current_flags = getattr(os.fstat(descriptor), "st_flags", 0)
+            current_flags = getattr(os.fstat(writable_descriptor), "st_flags", 0)
             try:
                 os.chflags(path, current_flags | immutable_flag, follow_symlinks=False)
             except OSError as error:
@@ -87,6 +88,20 @@ def create_ephemeral_execution(
         copied = identity_provider(path, execution_strategy="ephemeral-copy")
         if copied["sha256"] != identity["sha256"] or copied["size"] != identity["size"]:
             raise GateError("ephemeral executable differs from its source binding")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | NOFOLLOW,
+            dir_fd=directory,
+        )
+        retained_metadata = os.fstat(descriptor)
+        if execution_identity_from_metadata(
+            path,
+            retained_metadata,
+            _descriptor_digest(descriptor, retained_metadata.st_size),
+        ) != execution_identity(copied):
+            raise GateError("ephemeral executable changed before its read-only binding")
+        os.close(writable_descriptor)
+        writable_descriptor = -1
         if immutable:
             protection = "user-immutable-flag"
         else:
@@ -117,7 +132,7 @@ def create_ephemeral_execution(
         except BaseException as error:
             if cleanup_failure is None:
                 cleanup_failure = error
-        for opened in (descriptor, directory):
+        for opened in (descriptor, writable_descriptor, directory):
             if opened < 0:
                 continue
             try:

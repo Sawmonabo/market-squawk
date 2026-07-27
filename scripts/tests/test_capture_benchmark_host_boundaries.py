@@ -515,6 +515,9 @@ class ObservationContractTest(unittest.TestCase):
             self.assertEqual(
                 binding["protection"], "exclusive-current-uid-attestation"
             )
+            with self.assertRaises(OSError) as failure:
+                os.write(binding["descriptor"], b"\0")
+            self.assertEqual(failure.exception.errno, errno.EBADF)
         finally:
             if binding is not None:
                 execution.remove_ephemeral_execution(binding)
