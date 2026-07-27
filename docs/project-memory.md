@@ -1119,3 +1119,40 @@ grouped application-boundary inspection vertical, production MCP composition, of
 demonstration, strict affected-package Clippy, source-lock admission for 854 identities,
 formatting, and final focused review with zero Critical and zero Important findings. This is
 implementation evidence, not completion of externally controlled provider or release predicates.
+
+## 2026-07-26 candidate-version and provider-evidence invariant
+
+The active usable-release package candidate is `0.2.0`. The published `v0.1.0` tag is historical,
+immutable, and must never be moved or reused. The historically named
+`release/market-squawk-v0.1.0` integration branch remains only for audit continuity; it does not
+define the package or release version.
+
+Capability commit `ce304b59a79e3bd422fb4ca58a93fc8780bb320b`, tree
+`e59391ae85768e95dea8303c3e9a56e6c833b588`, establishes these durable contracts:
+
+- Terminal provider evidence contains exactly the eight mandatory surfaces. Optional or
+  provisional surfaces cannot enter the closed set.
+- Public BLS v1 dataset identity is adapter-owned. Application, portal, CLI, status, and recovery
+  surfaces may transport that exact identity but must not reconstruct its hash or derive a parallel
+  identifier.
+- Treasury Fiscal release evidence must cover the complete bounded official page chain through
+  production discovery, ingestion, analytical publication, query, and restart. Every page request,
+  payload, object, row, manifest, lineage, and recovery identity is fail-closed.
+- The signed release application is the immutable
+  `release-cp312/bin/market-squawk` copy inside the builder-owned Python release root. The mutable
+  Cargo output cannot be the signing authority or a downstream evidence producer after the copy is
+  sealed.
+- The source lock binds the complete build closure. At this checkpoint it contains 854 exact
+  source identities.
+
+These are implementation facts, not approval evidence. Final release still requires one clean,
+unchanged candidate with authorized Coinbase Direct credentials, truthful SEC setup identity and
+CIK, exact FRED written service permission and exact-series authority, fresh official provider
+responses, the complete evidence block, Quarter 4 grouped review, publication, and issue closeout.
+No provider credential, permission, identity, response, or exact-head approval may be inferred from
+this checkpoint.
+
+Generated-cache discipline remains binding. The root cache reached 19.14 GiB during the necessary
+0.2.0 version rebuild, so the integration owner stopped before another Cargo gate, confirmed no
+Cargo process was active, removed only reproducible debug/test output, and resumed from an
+approximately 800 MiB cache. Only the root worktree exists and `.worktrees` is empty.

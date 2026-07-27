@@ -10,9 +10,17 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `ca3d6b6162f4488da8af8224f983ef2f4a7993e2`
-  (`Harden exact-head release evidence authority`), tree
-  `e4ac5a66f7ec1d5bb6f801db421280faa5405e98`.
+  `ce304b59a79e3bd422fb4ca58a93fc8780bb320b`
+  (`Harden provider evidence and candidate identity`), tree
+  `e59391ae85768e95dea8303c3e9a56e6c833b588`.
+- The active package candidate is `0.2.0`; the published `v0.1.0` foundation tag remains immutable.
+  Public BLS v1 now exposes its exact adapter-owned dataset identity through activation, status,
+  portal bootstrap, and restart recovery. Treasury Fiscal Data now performs the complete bounded
+  discover/ingest/publish/query/restart workflow and binds every page, request, payload, manifest,
+  row, and lineage identity into schema-version-5 provider evidence. The sealed Python builder
+  copies the application, ONNX worker, and validator into both retained environments before
+  signing and selects the immutable CPython 3.12 application copy for all downstream evidence.
+  Terminal provider closure accepts exactly the eight mandatory surfaces.
 - Research/model first use is integrated at that exact head. Verified non-inline DataFusion results
   are republished as durable content-addressed Parquet for bounded CLI/MCP retrieval. Compact Arrow
   results whose JSON envelope exceeds the inline ceiling retain the exact hard-result budget and
@@ -801,3 +809,67 @@ until the authorized Coinbase Direct trace, required SEC/BLS/FRED official-provi
 FRED durable authorities, final unchanged-candidate provider report, Task 20 gate, Quarter 4
 review, and release publication actually close. Hosted Actions remains externally stopped before
 checkout by the GitHub account payment/spending-limit state.
+
+## 2026-07-26 0.2.0 provider-evidence and immutable-binary checkpoint
+
+Capability commit `ce304b59a79e3bd422fb4ca58a93fc8780bb320b`, tree
+`e59391ae85768e95dea8303c3e9a56e6c833b588`, integrates three release-critical corrections:
+
+1. Public BLS v1 constructs one exact adapter-owned configuration, returns its exact provider
+   dataset through portal and CLI activation, exposes it through `Source.GetStatus`, and recovers
+   it from the callable runtime after process restart. Registered BLS v2 remains a separate
+   provisional `refresh_required` surface and cannot replace public v1 in terminal evidence.
+2. Treasury Fiscal Data derives the release query from the durable desired recipe and current
+   runtime, discovers every bounded official page, ingests every page through the production
+   application service, queries the published analytical generation, and repeats the same
+   manifest-bound read after restart. Provider evidence schema version 5 binds the canonical query,
+   page/request/payload/object chain, row provenance, manifest, lineage, and restart equality.
+3. The sealed Python builder compiles the application with the exact release-evidence feature,
+   copies all three native executables as independent read/execute-only files into CPython 3.12 and
+   3.13 release roots before signing, and signs the canonical CPython 3.12 copies. Every downstream
+   provider, fuzz, performance, demonstration, gate, and closer command uses that immutable
+   application rather than mutable `target/release` output.
+
+The workspace, internal dependency requirements, Python distribution, native extension, training
+environment, lockfiles, documentation, and issue template now consistently identify candidate
+version `0.2.0`. The existing `v0.1.0` tag was not moved or reused. The Python source lock admits
+854 exact source identities.
+
+Fresh focused candidate evidence passed:
+
+```text
+python3 -I scripts/tests/test_build_python_release.py
+result: 10 passed
+
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --lib --locked \
+  local_product::cli_provider::tests::public_bls_activation_returns_its_exact_discovery_dataset \
+  -- --exact
+result: 1 passed
+
+CARGO_INCREMENTAL=0 cargo test -p market-squawk-adapter-treasury --lib --locked \
+  source::tests::authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records -- --exact
+result: 1 passed
+
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --lib --features release-evidence --locked \
+  release::close_provider::tests::treasury_fiscal_runtime_requires_durable_publication_evidence \
+  -- --exact
+result: 1 passed
+
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk-adapter-treasury --lib --locked -- -D warnings
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk --lib --features release-evidence \
+  --locked -- -D warnings
+result: passed
+```
+
+The complete 854-file source closure, root and fuzz lock/version metadata, workspace boundaries,
+Rust formatting, portal JavaScript syntax, Python compilation, tracked prohibited-phrase scan, and
+diff integrity also passed. The root debug/test cache reached 19.14 GiB during the version rebuild,
+was safely cleaned after confirming no Cargo process was active, and is now approximately 800 MiB;
+`.worktrees` remains empty.
+
+This is a verified implementation checkpoint, not final unchanged-head release approval. The
+terminal provider report still requires the authorized Coinbase Direct credential trace, truthful
+SEC identity and CIK, exact FRED written service permission plus exact-series authority, and fresh
+official-provider responses against one unchanged candidate. The complete release evidence block,
+Quarter 4 grouped review, publication, and issue closeout remain open. Hosted Actions remains
+externally blocked before checkout by the GitHub account payment/spending-limit state.
