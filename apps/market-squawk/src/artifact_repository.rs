@@ -421,6 +421,11 @@ impl<'directory> StagingGuard<'directory> {
         self.armed = false;
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for StagingGuard<'_> {
@@ -622,7 +627,7 @@ fn configure_nonblocking_read(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn configure_nonblocking_read(_options: &mut OpenOptions) {}
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn publish_staged_artifact(
     _root: &ArtifactRoot,
     directory: &Dir,
@@ -636,6 +641,53 @@ fn publish_staged_artifact(
         Err(_error) => return Err(ArtifactError::Unavailable),
     }
     guard.remove()
+}
+
+#[cfg(windows)]
+fn publish_staged_artifact(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    artifact_path: &Path,
+    guard: &mut StagingGuard<'_>,
+) -> Result<(), ArtifactError> {
+    if staging_path.parent() != artifact_path.parent() {
+        return Err(ArtifactError::Unavailable);
+    }
+    drop(
+        root.resolve(staging_path)
+            .map_err(|_| ArtifactError::Unavailable)?,
+    );
+    drop(
+        root.resolve(artifact_path)
+            .map_err(|_| ArtifactError::Unavailable)?,
+    );
+    let parent = staging_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(ArtifactError::Unavailable)?;
+    let _pinned_parent = directory
+        .open_dir(parent)
+        .map_err(|_| ArtifactError::Unavailable)?;
+    root.try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?;
+
+    let source = root.root().join(staging_path);
+    let destination = root.root().join(artifact_path);
+    let publication = atomicwrites::move_atomic(&source, &destination);
+
+    root.try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    let source_exists = windows_regular_entry_exists(directory, staging_path)?;
+    let destination_exists = windows_regular_entry_exists(directory, artifact_path)?;
+    match publication {
+        Ok(()) if !source_exists && destination_exists => {
+            guard.disarm();
+            Ok(())
+        }
+        Err(_error) if source_exists && destination_exists => guard.remove(),
+        Err(_error) | Ok(()) => Err(ArtifactError::Unavailable),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -695,6 +747,16 @@ fn synchronize_publication_directories(
     _artifact_path: &Path,
 ) -> Result<(), ArtifactError> {
     Err(ArtifactError::Unavailable)
+}
+
+#[cfg(windows)]
+fn windows_regular_entry_exists(directory: &Dir, path: &Path) -> Result<bool, ArtifactError> {
+    match directory.symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(ArtifactError::Unavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_error) => Err(ArtifactError::Unavailable),
+    }
 }
 
 #[cfg(test)]
