@@ -739,3 +739,65 @@ reserved, failed, duplicate, or second-generation record.
 This is successful dirty-candidate behavioral evidence, not final release approval: the worktree
 contained concurrent uncommitted release-lane changes. The unchanged clean exact-head provider run
 must still repeat and bind this proof through the release evidence producer before Task 19A closes.
+
+## 2026-07-26 bounded provider-research and onboarding checkpoint
+
+Capability commit `c64eb49035115b0805fe8de7493acc8227d802cb` completes the current provider
+implementation wave without closing the externally controlled release predicates. The shipping
+application now exposes 63 typed CLI/MCP operations, including bounded `Source.Inspect` retrieval
+for the active FRED/ALFRED onboarding session. Inspection performs credentialed official-API
+retrieval without durable research publication, returns canonical macro observations plus exact
+page evidence, enforces page/record/result/cancellation limits, and validates the complete nested
+result against a closed descriptor before publication.
+
+`FRED_ALFRED_API_SURFACE_ID` is the single Rust authority for the canonical
+`fred-alfred.api-v1-v2` surface across the built-in profile, production activation, ephemeral
+inspection, and structured-result schema. Durable FRED/ALFRED authority remains two-gated and
+HTTPS-only: the exact imported Bank permission bytes must match a fresh application-owned
+reacquisition from the exact official URL, and the selected series must carry independent exact
+series authority. Unauthenticated email files or headers are not an admitted permission channel.
+The dark onboarding portal presents this boundary directly, retains write-only secret handling,
+and keeps durable actions disabled until both gates exist.
+
+The same candidate integrates the bounded BLS, SEC, Treasury daily-rate, provider-rate,
+research-publication, restart, point-in-time, Python-admission, and release-evidence corrections
+developed in this provider wave. The sealed Python release lock now admits 854 exact source
+identities. The maintained FRED/ALFRED authority report has SHA-256
+`658324385cd927d258890028838b59dde5335a29f82a0346c1f23736abe5668b`.
+
+Verification on the unchanged capability tree includes:
+
+```text
+CARGO_INCREMENTAL=0 cargo test -p market-squawk-adapter-fred --lib --tests --locked
+result: 17 passed; one controlled exact-evidence test ignored by contract
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --lib --locked
+result: 54 passed
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --test control_plane --locked \
+  research_vertical::registered_provider_discovery_returns_exact_ingestible_object_and_rights_evidence \
+  -- --exact
+result: passed
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --test control_plane --locked \
+  production_mcp_composition::shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_controlled_artifacts \
+  -- --exact
+result: passed
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --test control_plane --all-features --locked \
+  release_demonstration::usable_release_vertical_requires_explicit_offline_admission -- --exact
+result: passed
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk-services -p market-squawk-sources \
+  -p market-squawk-adapter-fred -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings
+result: passed
+```
+
+Rust formatting, diff integrity, portal JavaScript syntax, Python builder syntax, source-lock
+admission, and both requested tracked-phrase scans passed. The final focused staff re-review closed
+at zero Critical and zero Important findings. No new integration-test executable or worktree was
+created. `.worktrees` is empty and root generated state is `14,839,000 KiB`, below the 20 GiB
+ceiling.
+
+This checkpoint makes the workflows runnable; it does not manufacture provider permission,
+credentials, or unchanged-candidate external evidence. Issues `#7`, `#25`, and `#31` remain open
+until the authorized Coinbase Direct trace, required SEC/BLS/FRED official-provider proof, exact
+FRED durable authorities, final unchanged-candidate provider report, Task 20 gate, Quarter 4
+review, and release publication actually close. Hosted Actions remains externally stopped before
+checkout by the GitHub account payment/spending-limit state.

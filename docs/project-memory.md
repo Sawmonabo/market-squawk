@@ -1089,3 +1089,33 @@ evidence and retain BLS rather than FRED provenance.
 
 The maintained research basis is
 [`docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md`](research/providers/2026-07-26-fred-alfred-local-first-api-authority.md).
+
+## 2026-07-26 provider-inspection and permission-authority invariant
+
+Capability commit `c64eb49035115b0805fe8de7493acc8227d802cb` establishes one canonical Rust
+surface identity, `FRED_ALFRED_API_SURFACE_ID`, for `fred-alfred.api-v1-v2`. Built-in onboarding,
+production activation, ephemeral inspection, and the `Source.Inspect` output contract must consume
+that shared identity. Reintroducing a local short name or duplicate surface literal at an
+authority/schema boundary can make a real result unpublishable and is prohibited.
+
+`Source.Inspect` is the bounded, non-persistent application authority for previewing one exact
+FRED/ALFRED provider page during an active onboarding session. Its dedicated discovery scope
+requires exact provider coverage and bounded result limits. The output schema is closed through
+page digest/locator evidence, canonical FRED macro provenance, calendar coordinates, revision,
+availability, value-or-missing semantics, and fixed-width SHA-256 bytes. Application publication
+must reject missing or additional nested fields. The existing grouped control-plane research
+vertical owns the production-shaped authority-to-descriptor proof; do not create a separate test
+executable for this contract.
+
+Shipping FRED permission admission is official HTTPS only. Imported permission bytes must equal a
+fresh bounded application-owned reacquisition from the exact reviewed official URL. Local `.eml`
+files, sender text, and Message-ID text are not authenticated delivery provenance and cannot enter
+activation, recovery, or policy construction. A future authenticated messaging channel would
+require its own reviewed design and trusted provenance boundary rather than restoring header-only
+admission.
+
+The provider capability tree passed the FRED adapter suite, complete application library suite,
+grouped application-boundary inspection vertical, production MCP composition, offline release
+demonstration, strict affected-package Clippy, source-lock admission for 854 identities,
+formatting, and final focused review with zero Critical and zero Important findings. This is
+implementation evidence, not completion of externally controlled provider or release predicates.
