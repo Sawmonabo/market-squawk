@@ -888,23 +888,37 @@ fn validate_repository_writer(
     path: &str,
     lock: &std::fs::File,
 ) -> Result<(), PaperCheckpointRepositoryError> {
-    let opened = lock
-        .metadata()
-        .map_err(|source| io_error("inspect opened paper checkpoint repository lock", source))?;
+    let opened = cap_std::fs::File::from_std(
+        lock.try_clone()
+            .map_err(|source| io_error("clone paper checkpoint repository lock", source))?,
+    )
+    .metadata()
+    .map_err(|source| io_error("inspect opened paper checkpoint repository lock", source))?;
     let named = directory
         .symlink_metadata(path)
         .map_err(|source| io_error("inspect named paper checkpoint repository lock", source))?;
-    if !opened.is_file()
-        || !named.is_file()
-        || opened.nlink() != 1
-        || named.nlink() != 1
-        || opened.len() != 0
-        || named.len() != 0
+    if !safe_repository_writer_metadata(&opened)
+        || !safe_repository_writer_metadata(&named)
         || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
     {
         return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
     }
     Ok(())
+}
+
+fn safe_repository_writer_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 fn ensure_checkpoint_namespace(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {

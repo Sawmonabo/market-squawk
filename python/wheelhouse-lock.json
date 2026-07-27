@@ -462,8 +462,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/checkpoint_repository.rs",
-      "sha256": "c5d6ade051c602851247508a9e56c684f55bcb566f0069f1fbc1234ff50745c5",
-      "size_bytes": 79013
+      "sha256": "5d91dd20100517ac3e260e040e40297e274f78be72120b12bdea13b54e511fe5",
+      "size_bytes": 79521
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/config.rs",
