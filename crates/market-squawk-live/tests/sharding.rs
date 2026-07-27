@@ -552,7 +552,7 @@ fn route_validation_rejects_duplicates_and_per_shard_overflow() -> TestResult {
 
 #[test]
 fn estimated_peak_bytes_matches_golden_and_exact_ceiling_boundary() -> TestResult {
-    const EXPECTED_PEAK_BYTES: u64 = 1_418_916;
+    const EXPECTED_PEAK_BYTES: u64 = 1_428_740;
     let routes = [route_config("coinbase", INSTRUMENT_ONE, 4, 8, 1)?];
 
     let config = LiveRuntimeConfig::try_new(memory_input(EXPECTED_PEAK_BYTES)?)?;

@@ -626,6 +626,8 @@ fn synchronize_publication_directories(
     directory: &Dir,
     artifact_path: &Path,
 ) -> Result<(), ArtifactError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
     let parent = artifact_path.parent().ok_or(ArtifactError::Unavailable)?;
     let namespace = parent.parent().ok_or(ArtifactError::Unavailable)?;
     for path in [
@@ -635,10 +637,14 @@ fn synchronize_publication_directories(
         Path::new("mcp"),
         Path::new("."),
     ] {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         directory
-            .open_dir(path)
-            .map(Dir::into_std_file)
-            .and_then(|file| file.sync_all())
+            .open_with(path, &options)
+            .map(cap_std::fs::File::into_std)
+            .and_then(|opened| opened.sync_all())
             .map_err(|_| ArtifactError::Unavailable)?;
     }
     Ok(())

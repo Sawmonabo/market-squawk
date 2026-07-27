@@ -300,7 +300,7 @@ fn run_audit_worker(
 
 fn open_audit_file(directory: &Dir, name: &str) -> Result<File, ProductionAuditError> {
     let mut options = OpenOptions::new();
-    options.write(true).append(true).create(true);
+    options.read(true).write(true).append(true).create(true);
     options.follow(FollowSymlinks::No);
     configure_private_creation(&mut options);
     let file = directory

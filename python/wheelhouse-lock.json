@@ -462,8 +462,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/checkpoint_repository.rs",
-      "sha256": "5d91dd20100517ac3e260e040e40297e274f78be72120b12bdea13b54e511fe5",
-      "size_bytes": 79521
+      "sha256": "0efedcaf0b9e77f7d0bd249dadfd5e8778b30ae8502208bbf7ad474759504289",
+      "size_bytes": 79843
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/config.rs",
@@ -1022,8 +1022,8 @@
     },
     {
       "path": "apps/market-squawk/src/artifact_repository.rs",
-      "sha256": "bd57fb144126ec31995ae7ce7fd9e160730507a0c1b87a8a6d861955c577d833",
-      "size_bytes": 25517
+      "sha256": "5f1f3fa53a65c6e9843d32494ecd545aef3b3bd627fddb9afd7faa8bedbc0d57",
+      "size_bytes": 25788
     },
     {
       "path": "apps/market-squawk/src/backtest_service.rs",
@@ -1267,8 +1267,8 @@
     },
     {
       "path": "apps/market-squawk/src/mcp/audit.rs",
-      "sha256": "205c6e6df9450633fb0468cc6644f281e90dd4fa09682ff4ddb2652240528faf",
-      "size_bytes": 30152
+      "sha256": "45b4c4ce217ffac82e5d2dddfec9a057789317f6a4cebe2cf2798def55df99f0",
+      "size_bytes": 30202
     },
     {
       "path": "apps/market-squawk/src/mcp/journal_worker.rs",
@@ -1292,8 +1292,8 @@
     },
     {
       "path": "apps/market-squawk/src/paper_bot/audit.rs",
-      "sha256": "897abf2268f75a8088c846584b3c6cdcd3d96f523e2ae72ce22bfdf9183e1507",
-      "size_bytes": 23985
+      "sha256": "846e005cbd8b610ccb10620ba6443e6551000fe4af44dd9e7b622efe8826bcd8",
+      "size_bytes": 23996
     },
     {
       "path": "apps/market-squawk/src/paper_bot/benchmark_support.rs",
@@ -3262,8 +3262,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/authority_state/filesystem.rs",
-      "sha256": "a464688f0cfaec3202635c8e92fa1740c7cf08c8e14fc12b8811a63f981aad15",
-      "size_bytes": 20304
+      "sha256": "cb293081a874bf999b68fad6907d01f89306f27cf52e26c12fd966c862360ad1",
+      "size_bytes": 20577
     },
     {
       "path": "crates/market-squawk-platform/src/authority_state/recovery.rs",
@@ -3537,8 +3537,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/paths/catalog/restore.rs",
-      "sha256": "bef440d6b814a7129be5b4b18fc77694d28b6e0edeb45e515e28645e36110425",
-      "size_bytes": 13691
+      "sha256": "7111cd14380ca8148306517661df5280adad674ddd4b0ba3622ca57ed52558d5",
+      "size_bytes": 13944
     },
     {
       "path": "crates/market-squawk-platform/src/raw_record.rs",

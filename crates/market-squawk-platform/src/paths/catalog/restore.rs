@@ -343,11 +343,17 @@ fn publish_catalog_restore_stage(
 
 #[cfg(unix)]
 fn synchronize_catalog_parent(location: &CatalogLocation) -> Result<(), PathError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     location
         .root_capability
-        .try_clone()
-        .map_err(|source| PathError::io("failed to clone catalog parent", source))?
-        .into_std_file()
+        .open_with(".", &options)
+        .map_err(|source| PathError::io("failed to open synchronizable catalog parent", source))?
+        .into_std()
         .sync_all()
         .map_err(|source| PathError::io("failed to synchronize catalog parent", source))
 }

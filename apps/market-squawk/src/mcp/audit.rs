@@ -392,9 +392,8 @@ fn validate_private_permissions(
     use cap_std::fs::MetadataExt as _;
     use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
     use windows_permissions::{
-        WindowsSecure as _,
-        constants::{AccessRights, AceType, SecurityInformation},
-        wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor,
+        constants::{AccessRights, AceType, SeObjectType, SecurityInformation},
+        wrappers::{ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo},
     };
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -405,9 +404,12 @@ fn validate_private_permissions(
     let current_user = SecurityIdentifier::get_current_user_sid()
         .map_err(|_| LocalAuditError::PermissionProofUnavailable)?
         .to_string();
-    let security = file
-        .security_descriptor(SecurityInformation::Owner | SecurityInformation::Dacl)
-        .map_err(LocalAuditError::Io)?;
+    let security = GetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )
+    .map_err(LocalAuditError::Io)?;
     let owner = security
         .owner()
         .ok_or(LocalAuditError::PermissionProofUnavailable)?;

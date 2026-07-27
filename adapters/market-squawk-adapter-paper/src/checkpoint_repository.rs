@@ -991,14 +991,38 @@ fn checkpoint_namespace_contains_only_writer_lock(
     Ok(metadata.is_file() && metadata.nlink() == 1 && metadata.len() == 0)
 }
 
+#[cfg(unix)]
 fn synchronize_directory(
     directory: &Dir,
     context: &'static str,
 ) -> Result<(), PaperCheckpointRepositoryError> {
+    synchronize_directory_path(directory, Path::new("."), context)
+}
+
+#[cfg(not(unix))]
+fn synchronize_directory(
+    _directory: &Dir,
+    _context: &'static str,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn synchronize_directory_path(
+    directory: &Dir,
+    path: &Path,
+    context: &'static str,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     directory
-        .try_clone()
-        .map(Dir::into_std_file)
-        .and_then(|root| root.sync_all())
+        .open_with(path, &options)
+        .map(cap_std::fs::File::into_std)
+        .and_then(|opened| opened.sync_all())
         .map_err(|source| io_error(context, source))
 }
 
@@ -1102,11 +1126,7 @@ fn cleanup_stale_staging(directory: &Dir) -> Result<(), PaperCheckpointRepositor
         changed = true;
     }
     if changed {
-        directory
-            .try_clone()
-            .map(Dir::into_std_file)
-            .and_then(|root| root.sync_all())
-            .map_err(|source| io_error("synchronize stale-stage cleanup", source))?;
+        synchronize_directory(directory, "synchronize stale-stage cleanup")?;
     }
     Ok(())
 }
@@ -1483,11 +1503,11 @@ fn synchronize_publication_directories(
         Path::new("paper-checkpoints"),
         Path::new("."),
     ] {
-        directory
-            .open_dir(path)
-            .map(Dir::into_std_file)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| io_error("synchronize paper checkpoint object directory", source))?;
+        synchronize_directory_path(
+            directory,
+            path,
+            "synchronize paper checkpoint object directory",
+        )?;
     }
     Ok(())
 }
@@ -1501,11 +1521,7 @@ fn synchronize_current_manifest_directories(
         Path::new("paper-checkpoints"),
         Path::new("."),
     ] {
-        directory
-            .open_dir(path)
-            .map(Dir::into_std_file)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| io_error("synchronize current manifest directory", source))?;
+        synchronize_directory_path(directory, path, "synchronize current manifest directory")?;
     }
     Ok(())
 }

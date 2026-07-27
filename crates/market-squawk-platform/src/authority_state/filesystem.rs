@@ -237,10 +237,16 @@ impl StateFiles {
 
     #[cfg(unix)]
     fn synchronize_directory(&self) -> Result<(), LocalAuthorityStateStoreError> {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         self.directory
-            .try_clone()
-            .map_err(|source| io_error("clone authority directory", source))?
-            .into_std_file()
+            .open_with(".", &options)
+            .map_err(|source| io_error("open synchronizable authority directory", source))?
+            .into_std()
             .sync_all()
             .map_err(|source| io_error("synchronize authority directory", source))
     }
