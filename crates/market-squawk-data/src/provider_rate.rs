@@ -586,13 +586,15 @@ fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRa
     let named = directory
         .symlink_metadata(OWNER_LOCK_FILE)
         .map_err(|_| ProviderRateStoreError::Unavailable)?;
-    if !metadata.is_file()
-        || !named.is_file()
+    if !safe_owner_metadata(&metadata)
+        || !safe_owner_metadata(&named)
         || (metadata.dev(), metadata.ino()) != (named.dev(), named.ino())
-        || metadata.nlink() != 1
     {
         return Err(ProviderRateStoreError::Unavailable);
     }
+    let identity_file = file
+        .try_clone()
+        .map_err(|_| ProviderRateStoreError::Unavailable)?;
     let file = file.into_std();
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
@@ -601,16 +603,15 @@ fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRa
         }
         Err(_) => return Err(ProviderRateStoreError::Unavailable),
     }
-    let locked = file
+    let locked = identity_file
         .metadata()
         .map_err(|_| ProviderRateStoreError::Unavailable)?;
     let named = directory
         .symlink_metadata(OWNER_LOCK_FILE)
         .map_err(|_| ProviderRateStoreError::Unavailable)?;
-    if !locked.is_file()
-        || !named.is_file()
+    if !safe_owner_metadata(&locked)
+        || !safe_owner_metadata(&named)
         || (locked.dev(), locked.ino()) != (named.dev(), named.ino())
-        || locked.nlink() != 1
     {
         return Err(ProviderRateStoreError::Unavailable);
     }
@@ -623,11 +624,26 @@ fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRa
 
 fn reject_unsafe_owner_entry(directory: &Dir) -> Result<(), ProviderRateStoreError> {
     match directory.symlink_metadata(OWNER_LOCK_FILE) {
-        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Ok(()),
+        Ok(metadata) if safe_owner_metadata(&metadata) => Ok(()),
         Ok(_) => Err(ProviderRateStoreError::Unavailable),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(ProviderRateStoreError::Unavailable),
     }
+}
+
+fn safe_owner_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 impl SqliteProviderRateStore {

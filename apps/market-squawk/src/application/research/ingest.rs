@@ -40,6 +40,7 @@ use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 use super::super::domain_support::DomainLifecycle;
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
+const STANDARD_DISCOVERY_RECEIPT_RETENTION: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 
 mod provider_runtime;
@@ -61,25 +62,29 @@ pub struct ResearchExtractionLimits {
     discovery_objects: NonZeroU16,
     records: NonZeroU32,
     bytes: NonZeroU64,
-    duration: Duration,
+    operation_duration: Duration,
+    discovery_receipt_retention: Duration,
 }
 
 impl ResearchExtractionLimits {
-    /// Constructs bounded discovery and extraction ceilings.
+    /// Constructs bounded discovery, extraction, and receipt-retention ceilings.
     ///
     /// # Errors
     ///
-    /// Rejects any ceiling above the canonical in-memory extraction contracts or a zero duration.
+    /// Rejects any ceiling above the canonical in-memory extraction contracts or either zero
+    /// duration.
     pub fn try_new(
         discovery_objects: NonZeroU16,
         records: NonZeroU32,
         bytes: NonZeroU64,
-        duration: Duration,
+        operation_duration: Duration,
+        discovery_receipt_retention: Duration,
     ) -> Result<Self, ResearchIngestCompositionError> {
         if usize::from(discovery_objects.get()) > MAX_DISCOVERY_OBJECTS
             || usize::try_from(records.get()).map_or(true, |value| value > MAX_EXTRACTION_RECORDS)
             || bytes.get() > MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES
-            || duration.is_zero()
+            || operation_duration.is_zero()
+            || discovery_receipt_retention.is_zero()
         {
             return Err(ResearchIngestCompositionError::InvalidLimits);
         }
@@ -87,7 +92,8 @@ impl ResearchExtractionLimits {
             discovery_objects,
             records,
             bytes,
-            duration,
+            operation_duration,
+            discovery_receipt_retention,
         })
     }
 
@@ -98,7 +104,8 @@ impl ResearchExtractionLimits {
                 .unwrap_or(NonZeroU16::MIN),
             records: NonZeroU32::new(MAX_EXTRACTION_RECORDS as u32).unwrap_or(NonZeroU32::MIN),
             bytes: NonZeroU64::new(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES).unwrap_or(NonZeroU64::MIN),
-            duration: STANDARD_EXTRACTION_DURATION,
+            operation_duration: STANDARD_EXTRACTION_DURATION,
+            discovery_receipt_retention: STANDARD_DISCOVERY_RECEIPT_RETENTION,
         }
     }
 }
@@ -803,7 +810,7 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
     ) -> Result<ResearchSourceObjectListing, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.duration)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
         let (prepared, discovery, _observed_monotonic, _observed_wall) = self
             .discover_registered_batch(
@@ -843,7 +850,7 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
     ) -> Result<ResearchSourceDiscovery, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.duration)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
         let (prepared, discovery, observed_monotonic, observed_wall) = self
             .discover_registered_batch(
@@ -869,7 +876,7 @@ impl ProductionResearchIngestCoordinator {
             &prepared.rights,
             &prepared.admission,
             discovery,
-            self.limits.duration,
+            self.limits.discovery_receipt_retention,
             observed_monotonic,
             observed_wall,
             operation_deadline,
@@ -955,7 +962,7 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
     ) -> Result<ExtractionBatch, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.duration)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
         self.extract_exact(
             profile,
@@ -1293,7 +1300,7 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         limits: ServiceLimits,
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.duration)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
         let profile = required_identifier(request, "provider")?;
         let dataset = required_identifier(request, "dataset")?;
         let object_id = required_identifier(request, "object")?;

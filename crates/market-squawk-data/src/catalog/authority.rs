@@ -945,34 +945,19 @@ fn required_array<const SIZE: usize>(value: Option<Vec<u8>>) -> Result<[u8; SIZE
         .map_err(|_| CatalogError::ArtifactRootAuthorityChainInvalid)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn exact_catalog_file_binding(
     file: &File,
     path: &Path,
 ) -> Result<[u8; 32], CatalogError> {
-    use std::os::unix::fs::MetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
-    let metadata = file.metadata()?;
+    let metadata = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
     Ok(hash_catalog_file_identity(
         path,
         metadata.dev(),
         metadata.ino(),
     ))
-}
-
-#[cfg(windows)]
-pub(crate) fn exact_catalog_file_binding(
-    file: &File,
-    path: &Path,
-) -> Result<[u8; 32], CatalogError> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    let metadata = file.metadata()?;
-    let volume = metadata
-        .volume_serial_number()
-        .ok_or(CatalogError::UnsafePath)?;
-    let index = metadata.file_index().ok_or(CatalogError::UnsafePath)?;
-    Ok(hash_catalog_file_identity(path, u64::from(volume), index))
 }
 
 #[cfg(not(any(unix, windows)))]

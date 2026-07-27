@@ -144,9 +144,9 @@ pub(crate) fn verify_artifact_inventory(
         }
         let named_after =
             named_identity(&directory, artifact.relative_reference, artifact.size_bytes)?;
-        let opened_after = file.metadata()?;
-        validate_private_std_regular_file(&opened_after, artifact.size_bytes)?;
-        if named_after != identity || !identity.matches_std(&opened_after) {
+        let opened_after = opened_file_metadata(&file)?;
+        validate_private_regular_file(&opened_after, artifact.size_bytes)?;
+        if named_after != identity || FileIdentity::from_metadata(&opened_after) != identity {
             return Err(EvidenceError::UnsafeArtifact);
         }
         file.seek(SeekFrom::Start(0))?;
@@ -274,9 +274,11 @@ fn validate_private_permissions(metadata: &Metadata) -> Result<(), EvidenceError
 
 #[cfg(windows)]
 fn validate_private_permissions(metadata: &Metadata) -> Result<(), EvidenceError> {
+    use cap_std::fs::MetadataExt as _;
+
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-    if cap_fs_ext::MetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
         Ok(())
     } else {
         Err(EvidenceError::UnsafeArtifact)
@@ -288,50 +290,10 @@ fn validate_private_permissions(_metadata: &Metadata) -> Result<(), EvidenceErro
     Err(EvidenceError::UnsafeArtifact)
 }
 
-#[cfg(unix)]
-fn validate_private_std_regular_file(
-    metadata: &std::fs::Metadata,
-    size: u64,
-) -> Result<(), EvidenceError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if metadata.is_file()
-        && metadata.len() == size
-        && metadata.nlink() == 1
-        && metadata.mode() & 0o077 == 0
-    {
-        Ok(())
-    } else {
-        Err(EvidenceError::UnsafeArtifact)
-    }
-}
-
-#[cfg(windows)]
-fn validate_private_std_regular_file(
-    metadata: &std::fs::Metadata,
-    size: u64,
-) -> Result<(), EvidenceError> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-    if metadata.is_file()
-        && metadata.len() == size
-        && metadata.number_of_links() == Some(1)
-        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-    {
-        Ok(())
-    } else {
-        Err(EvidenceError::UnsafeArtifact)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_private_std_regular_file(
-    _metadata: &std::fs::Metadata,
-    _size: u64,
-) -> Result<(), EvidenceError> {
-    Err(EvidenceError::UnsafeArtifact)
+fn opened_file_metadata(file: &File) -> Result<Metadata, EvidenceError> {
+    cap_std::fs::File::from_std(file.try_clone()?)
+        .metadata()
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -346,27 +308,6 @@ impl FileIdentity {
             device: cap_fs_ext::MetadataExt::dev(metadata),
             inode: cap_fs_ext::MetadataExt::ino(metadata),
         }
-    }
-
-    #[cfg(unix)]
-    fn matches_std(self, metadata: &std::fs::Metadata) -> bool {
-        self.device == std::os::unix::fs::MetadataExt::dev(metadata)
-            && self.inode == std::os::unix::fs::MetadataExt::ino(metadata)
-    }
-
-    #[cfg(windows)]
-    fn matches_std(self, metadata: &std::fs::Metadata) -> bool {
-        use std::os::windows::fs::MetadataExt as _;
-
-        metadata
-            .volume_serial_number()
-            .zip(metadata.file_index())
-            .is_some_and(|(device, inode)| self.device == u64::from(device) && self.inode == inode)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn matches_std(self, _metadata: &std::fs::Metadata) -> bool {
-        false
     }
 }
 
@@ -494,17 +435,19 @@ mod tests {
             .mode(0o600)
             .open(&path)?;
         file.set_len(4)?;
-        assert!(super::validate_private_std_regular_file(&file.metadata()?, 4).is_ok());
+        assert!(
+            super::validate_private_regular_file(&super::opened_file_metadata(&file)?, 4).is_ok()
+        );
 
         file.set_len(5)?;
         assert!(matches!(
-            super::validate_private_std_regular_file(&file.metadata()?, 4),
+            super::validate_private_regular_file(&super::opened_file_metadata(&file)?, 4),
             Err(super::EvidenceError::UnsafeArtifact)
         ));
         file.set_len(4)?;
         hard_link(&path, &linked)?;
         assert!(matches!(
-            super::validate_private_std_regular_file(&file.metadata()?, 4),
+            super::validate_private_regular_file(&super::opened_file_metadata(&file)?, 4),
             Err(super::EvidenceError::UnsafeArtifact)
         ));
         Ok(())

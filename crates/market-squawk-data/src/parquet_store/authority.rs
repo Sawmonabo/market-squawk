@@ -37,12 +37,12 @@ use platform::{publish_prepared_root_record, recover_committed_root_record};
 const ROOT_AUTHORITY_LOCK: &str = ".analytical-root-authority.lock";
 const LEGACY_PAPER_REPOSITORY_LOCK: &str = ".market-squawk-paper-checkpoints.lock";
 const ROOT_IDENTITY_MARKER: &str = ".analytical-root.identity";
-#[cfg(test)]
+#[cfg(any(test, windows))]
 const ROOT_IDENTITY_PENDING: &str = ".analytical-root.identity.pending";
 const ROOT_IDENTITY_MARKER_V2: &str = ".analytical-root.identity.v2";
 const ROOT_IDENTITY_PENDING_V2: &str = ".analytical-root.identity.v2.pending";
 const ROOT_CATALOG_BINDING: &str = ".analytical-root-catalog.binding";
-#[cfg(test)]
+#[cfg(any(test, windows))]
 const ROOT_CATALOG_BINDING_PENDING: &str = ".analytical-root-catalog.binding.pending";
 const ROOT_RECORD_VERSION: u16 = 1;
 const ROOT_RECORD_BYTES: usize = 106;
@@ -1521,7 +1521,7 @@ fn validate_root_control_file(
 ) -> Result<(), ParquetStoreError> {
     use cap_fs_ext::MetadataExt as _;
 
-    let opened = file.metadata()?;
+    let opened = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
     let named = directory.symlink_metadata(name)?;
     validate_named_root_control_metadata(&named, links)?;
     if !opened.is_file()
@@ -1605,7 +1605,7 @@ fn root_identity(
     use cap_fs_ext::MetadataExt as _;
 
     let root = directory.dir_metadata()?;
-    let marker = marker.metadata()?;
+    let marker = cap_std::fs::File::from_std(marker.try_clone()?).metadata()?;
     let path = root_path.as_os_str().as_encoded_bytes();
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/analytical-root-identity/v1");

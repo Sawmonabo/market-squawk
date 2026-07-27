@@ -2078,6 +2078,20 @@ pub(super) fn validate_provider_binary(payload: &Value, binary: &StableFileIdent
     Ok(())
 }
 
+fn nonzero_evidence_digest(value: &Value) -> bool {
+    value.pointer("/algorithm").and_then(Value::as_str) == Some("sha256")
+        && value
+            .pointer("/bytes")
+            .and_then(Value::as_array)
+            .is_some_and(|bytes| {
+                bytes.len() == 32
+                    && bytes
+                        .iter()
+                        .all(|byte| byte.as_u64().is_some_and(|byte| byte <= u64::from(u8::MAX)))
+                    && bytes.iter().any(|byte| byte.as_u64() != Some(0))
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -2110,28 +2124,15 @@ mod tests {
             },
         });
 
-        let error = validate_provider_surface_runtime("treasury.fiscal-data", &surface)
-            .expect_err("Fiscal Data without a durable publication must fail closed");
-
         assert!(
-            error
-                .to_string()
-                .contains("Treasury Fiscal Data publication evidence is absent"),
-            "unexpected closer error: {error:#}",
+            matches!(
+                validate_provider_surface_runtime("treasury.fiscal-data", &surface),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("Treasury Fiscal Data publication evidence is absent")
+            ),
+            "Fiscal Data without a durable publication must fail closed",
         );
     }
-}
-
-fn nonzero_evidence_digest(value: &Value) -> bool {
-    value.pointer("/algorithm").and_then(Value::as_str) == Some("sha256")
-        && value
-            .pointer("/bytes")
-            .and_then(Value::as_array)
-            .is_some_and(|bytes| {
-                bytes.len() == 32
-                    && bytes
-                        .iter()
-                        .all(|byte| byte.as_u64().is_some_and(|byte| byte <= u64::from(u8::MAX)))
-                    && bytes.iter().any(|byte| byte.as_u64() != Some(0))
-            })
 }

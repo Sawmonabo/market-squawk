@@ -352,7 +352,9 @@ fn is_valid_audit_record(record: &[u8]) -> bool {
 fn validate_private_file_identity(control: &Dir, file: &File) -> Result<(), LocalAuditError> {
     use cap_fs_ext::MetadataExt as _;
 
-    let opened = file.metadata().map_err(LocalAuditError::Io)?;
+    let opened = cap_std::fs::File::from_std(file.try_clone().map_err(LocalAuditError::Io)?)
+        .metadata()
+        .map_err(LocalAuditError::Io)?;
     let named = control
         .symlink_metadata(AUDIT_FILE_NAME)
         .map_err(LocalAuditError::Io)?;
@@ -369,15 +371,13 @@ fn validate_private_file_identity(control: &Dir, file: &File) -> Result<(), Loca
 
 #[cfg(unix)]
 fn validate_private_permissions(
-    metadata: &std::fs::Metadata,
+    metadata: &cap_std::fs::Metadata,
     _file: &File,
 ) -> Result<(), LocalAuditError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
+    if cap_fs_ext::OsMetadataExt::uid(metadata) != rustix::process::geteuid().as_raw() {
         return Err(LocalAuditError::OwnerMismatch);
     }
-    if metadata.mode() & 0o077 == 0 {
+    if cap_fs_ext::OsMetadataExt::mode(metadata) & 0o077 == 0 {
         Ok(())
     } else {
         Err(LocalAuditError::InsecurePermissions)
@@ -386,10 +386,10 @@ fn validate_private_permissions(
 
 #[cfg(windows)]
 fn validate_private_permissions(
-    metadata: &std::fs::Metadata,
+    metadata: &cap_std::fs::Metadata,
     file: &File,
 ) -> Result<(), LocalAuditError> {
-    use std::os::windows::fs::MetadataExt as _;
+    use cap_std::fs::MetadataExt as _;
     use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
     use windows_permissions::{
         WindowsSecure as _,
@@ -398,9 +398,7 @@ fn validate_private_permissions(
     };
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    if metadata.number_of_links() != Some(1)
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(LocalAuditError::UnsafeFileIdentity);
     }
 
@@ -447,7 +445,7 @@ fn validate_private_permissions(
 
 #[cfg(not(any(unix, windows)))]
 fn validate_private_permissions(
-    _metadata: &std::fs::Metadata,
+    _metadata: &cap_std::fs::Metadata,
     _file: &File,
 ) -> Result<(), LocalAuditError> {
     Err(LocalAuditError::PermissionProofUnavailable)

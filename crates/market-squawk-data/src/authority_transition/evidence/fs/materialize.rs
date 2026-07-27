@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(unix)]
 use std::path::{Component, Path};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -12,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     EvidenceError, FileIdentity, HASH_BUFFER_BYTES, MAX_PARQUET_METADATA_BYTES, VerifiedArtifact,
-    VerifiedArtifactInventory, validate_parquet, validate_private_regular_file,
-    validate_private_std_regular_file,
+    VerifiedArtifactInventory, opened_file_metadata, validate_parquet,
+    validate_private_regular_file,
 };
 use crate::Sha256Digest;
 use crate::parquet_store::VerifiedRestoreControlSubset;
@@ -348,10 +349,10 @@ fn materialize_one(
     target.sync_all()?;
     let named = parent.symlink_metadata(filename)?;
     validate_private_regular_file(&named, artifact.size_bytes)?;
-    let opened_metadata = target.metadata()?;
-    validate_private_std_regular_file(&opened_metadata, artifact.size_bytes)?;
+    let opened_metadata = opened_file_metadata(&target)?;
+    validate_private_regular_file(&opened_metadata, artifact.size_bytes)?;
     if FileIdentity::from_metadata(&named) != target_identity
-        || !target_identity.matches_std(&opened_metadata)
+        || FileIdentity::from_metadata(&opened_metadata) != target_identity
         || hash_file(&mut target, cancellation)? != artifact.content_hash
         || validate_parquet(&mut target, artifact.size_bytes, MAX_PARQUET_METADATA_BYTES)?
             != artifact.row_count
@@ -360,10 +361,10 @@ fn materialize_one(
     }
     let named_after = parent.symlink_metadata(filename)?;
     validate_private_regular_file(&named_after, artifact.size_bytes)?;
-    let opened_after = target.metadata()?;
-    validate_private_std_regular_file(&opened_after, artifact.size_bytes)?;
+    let opened_after = opened_file_metadata(&target)?;
+    validate_private_regular_file(&opened_after, artifact.size_bytes)?;
     if FileIdentity::from_metadata(&named_after) != target_identity
-        || !target_identity.matches_std(&opened_after)
+        || FileIdentity::from_metadata(&opened_after) != target_identity
     {
         return Err(EvidenceError::ArtifactMetadataMismatch);
     }
@@ -399,9 +400,10 @@ fn verify_existing(
     }
     let named_after = parent.symlink_metadata(filename)?;
     validate_private_regular_file(&named_after, artifact.size_bytes)?;
-    let opened_after = file.metadata()?;
-    validate_private_std_regular_file(&opened_after, artifact.size_bytes)?;
-    if FileIdentity::from_metadata(&named_after) != identity || !identity.matches_std(&opened_after)
+    let opened_after = opened_file_metadata(&file)?;
+    validate_private_regular_file(&opened_after, artifact.size_bytes)?;
+    if FileIdentity::from_metadata(&named_after) != identity
+        || FileIdentity::from_metadata(&opened_after) != identity
     {
         return Err(EvidenceError::DestinationConflict);
     }

@@ -465,75 +465,67 @@ fn configure_private_backup_creation(options: &mut OpenOptions) {
 #[cfg(not(any(unix, windows)))]
 fn configure_private_backup_creation(_options: &mut OpenOptions) {}
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackupFileIdentity {
     device: u64,
     inode: u64,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn backup_file_identity(opened: &File) -> Result<BackupFileIdentity, std::io::Error> {
-    use std::os::unix::fs::MetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
-    let opened = opened.metadata()?;
+    let opened = cap_std::fs::File::from_std(opened.try_clone()?).metadata()?;
+    if !safe_backup_metadata(&opened) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backup file identity is unsafe",
+        ));
+    }
     Ok(BackupFileIdentity {
         device: opened.dev(),
         inode: opened.ino(),
     })
 }
 
+#[cfg(any(unix, windows))]
+fn path_has_backup_identity(
+    identity: &BackupFileIdentity,
+    path: &Path,
+) -> Result<bool, std::io::Error> {
+    use cap_fs_ext::MetadataExt as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup path has no parent directory",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup path has no file name",
+        )
+    })?;
+    let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let named = directory.symlink_metadata(name)?;
+    Ok(safe_backup_metadata(&named)
+        && identity.device == named.dev()
+        && identity.inode == named.ino())
+}
+
 #[cfg(unix)]
-fn path_has_backup_identity(
-    identity: &BackupFileIdentity,
-    path: &Path,
-) -> Result<bool, std::io::Error> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let named = fs::symlink_metadata(path)?;
-    Ok(named.is_file() && identity.device == named.dev() && identity.inode == named.ino())
+fn safe_backup_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BackupFileIdentity {
-    volume: u32,
-    index: u64,
-}
-
-#[cfg(windows)]
-fn backup_file_identity(opened: &File) -> Result<BackupFileIdentity, std::io::Error> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    let opened = opened.metadata()?;
-    let volume = opened.volume_serial_number().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing backup volume identity",
-        )
-    })?;
-    let index = opened.file_index().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing backup file identity",
-        )
-    })?;
-    Ok(BackupFileIdentity { volume, index })
-}
-
-#[cfg(windows)]
-fn path_has_backup_identity(
-    identity: &BackupFileIdentity,
-    path: &Path,
-) -> Result<bool, std::io::Error> {
-    use std::os::windows::fs::MetadataExt as _;
+fn safe_backup_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let named = fs::symlink_metadata(path)?;
-    Ok(named.is_file()
-        && named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        && Some(identity.volume) == named.volume_serial_number()
-        && Some(identity.index) == named.file_index())
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
 
 #[cfg(not(any(unix, windows)))]

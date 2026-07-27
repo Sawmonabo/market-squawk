@@ -312,6 +312,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
                 NonZeroU32::new(16).ok_or("record bound is zero")?,
                 NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
                 Duration::from_secs(60),
+                Duration::from_secs(5 * 60),
             )?,
             [
                 primary_registration,
@@ -1056,6 +1057,7 @@ async fn coordinator_duration_bounds_discovery_and_receipt_extraction_before_con
             NonZeroU32::new(16).ok_or("record bound is zero")?,
             NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
             Duration::from_millis(50),
+            Duration::from_secs(5),
         )?,
         [discovery_registration, extraction_registration],
     )?;

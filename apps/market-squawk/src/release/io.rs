@@ -445,22 +445,22 @@ fn configure_private_report_creation(options: &mut OpenOptions) {
 #[cfg(not(any(unix, windows)))]
 fn configure_private_report_creation(_options: &mut OpenOptions) {}
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReportFileIdentity {
     device: u64,
     inode: u64,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn report_file_identity(opened: &File) -> Result<ReportFileIdentity, std::io::Error> {
-    use std::os::unix::fs::MetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
-    let opened = opened.metadata()?;
-    if !opened.is_file() {
+    let opened = cap_std::fs::File::from_std(opened.try_clone()?).metadata()?;
+    if !safe_report_metadata(&opened) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "release-evidence output is not a regular file",
+            "release-evidence output is not a regular non-reparse file",
         ));
     }
     Ok(ReportFileIdentity {
@@ -469,67 +469,43 @@ fn report_file_identity(opened: &File) -> Result<ReportFileIdentity, std::io::Er
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn path_has_report_identity(
     identity: &ReportFileIdentity,
     path: &Path,
 ) -> Result<bool, std::io::Error> {
-    use std::os::unix::fs::MetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
-    let named = fs::symlink_metadata(path)?;
-    Ok(!named.file_type().is_symlink()
-        && named.is_file()
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release-evidence path has no parent directory",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release-evidence path has no file name",
+        )
+    })?;
+    let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let named = directory.symlink_metadata(name)?;
+    Ok(safe_report_metadata(&named)
         && identity.device == named.dev()
         && identity.inode == named.ino())
 }
 
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReportFileIdentity {
-    volume: u32,
-    index: u64,
+#[cfg(unix)]
+fn safe_report_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 #[cfg(windows)]
-fn report_file_identity(opened: &File) -> Result<ReportFileIdentity, std::io::Error> {
-    use std::os::windows::fs::MetadataExt as _;
+fn safe_report_metadata(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let opened = opened.metadata()?;
-    if !opened.is_file() || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "release-evidence output is not a regular non-reparse file",
-        ));
-    }
-    let volume = opened.volume_serial_number().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "release-evidence output volume identity is unavailable",
-        )
-    })?;
-    let index = opened.file_index().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "release-evidence output file identity is unavailable",
-        )
-    })?;
-    Ok(ReportFileIdentity { volume, index })
-}
-
-#[cfg(windows)]
-fn path_has_report_identity(
-    identity: &ReportFileIdentity,
-    path: &Path,
-) -> Result<bool, std::io::Error> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let named = fs::symlink_metadata(path)?;
-    Ok(named.is_file()
-        && named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        && Some(identity.volume) == named.volume_serial_number()
-        && Some(identity.index) == named.file_index())
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
 
 #[cfg(not(any(unix, windows)))]
