@@ -686,7 +686,7 @@ fn publish_staged_artifact(
             Ok(())
         }
         Err(_error) if source_exists && destination_exists => guard.remove(),
-        Err(_error) | Ok(()) => Err(ArtifactError::Unavailable),
+        Err(_) | Ok(()) => Err(ArtifactError::Unavailable),
     }
 }
 
