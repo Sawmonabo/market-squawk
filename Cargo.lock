@@ -3552,6 +3552,7 @@ dependencies = [
 name = "market-squawk-adapter-paper"
 version = "0.2.0"
 dependencies = [
+ "atomicwrites",
  "cap-fs-ext",
  "cap-std",
  "chrono-tz",

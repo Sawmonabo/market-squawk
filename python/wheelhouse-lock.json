@@ -82,8 +82,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "66e12579cfe8746874628d76b7c87700e2766613ecf5b8786c705fbc3739c135",
-      "size_bytes": 178455
+      "sha256": "8a98bf873813005c7aa75ebb0ff9a0b1cd89ec21940645f6ffe167275ad547d0",
+      "size_bytes": 178472
     },
     {
       "path": "Cargo.toml",
@@ -442,13 +442,13 @@
     },
     {
       "path": "adapters/market-squawk-adapter-kraken/src/session_tests.rs",
-      "sha256": "d7e4c89858f2690b4b34bc2450062be10cd4f2524e51070eab03ea30faeeace2",
-      "size_bytes": 15172
+      "sha256": "53198e8c9035a8a81763657084e377dea59ed8cb2bd7f7934d369e93e7114319",
+      "size_bytes": 14982
     },
     {
       "path": "adapters/market-squawk-adapter-paper/Cargo.toml",
-      "sha256": "7d4040d73c3aa156fda2d23c10f70b52e0e152c517ca8c7787419441554fd671",
-      "size_bytes": 963
+      "sha256": "3706b736104ef454739ca960eb7b2fd9841a9b7ad2c0850612ce878b73e3983e",
+      "size_bytes": 993
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/adapter.rs",
@@ -462,8 +462,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/checkpoint_repository.rs",
-      "sha256": "0efedcaf0b9e77f7d0bd249dadfd5e8778b30ae8502208bbf7ad474759504289",
-      "size_bytes": 79843
+      "sha256": "0aaf27ce9e29c1d9e52fdac29a89404b77ea5f3c78d541399c73cd9e0bd7da54",
+      "size_bytes": 88474
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/config.rs",

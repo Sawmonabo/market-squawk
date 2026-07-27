@@ -9,6 +9,7 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+atomicwrites.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 chrono-tz.workspace = true

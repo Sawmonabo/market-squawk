@@ -134,18 +134,42 @@ impl PaperCheckpointRepository {
         serde_json::to_writer(&mut output, &marker)
             .map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
         let bytes = output.into_inner();
+        let repository_hex = hex_bytes(&self.repository_id)?;
+        let staged_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(PaperCheckpointRepositoryError::GenerationExhausted)?;
+        let stage_nonce = random_hex()?;
+        let staging_reference = format!(
+            "{CHECKPOINT_OBJECT_ROOT}/run-dirty-stage-{repository_hex}-{staged_generation}-{stage_nonce}.tmp",
+        );
+        let staging_path = Path::new(&staging_reference);
+        let run_dirty_path = Path::new(RUN_DIRTY_PATH);
+        drop(self.root.resolve(staging_path)?);
+        drop(self.root.resolve(run_dirty_path)?);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         options.follow(FollowSymlinks::No);
         configure_private_creation(&mut options);
         let mut file = directory
-            .open_with(RUN_DIRTY_PATH, &options)
-            .map_err(|source| io_error("create paper run-dirty authority", source))?;
+            .open_with(staging_path, &options)
+            .map_err(|source| io_error("create staged paper run-dirty authority", source))?;
+        let mut staging_guard = StagingGuard::new(&directory, staging_path);
         file.write_all(&bytes)
             .map_err(|source| io_error("write paper run-dirty authority", source))?;
         file.sync_all()
             .map_err(|source| io_error("synchronize paper run-dirty authority", source))?;
         drop(file);
+        if publish_new_staged_file(
+            &self.root,
+            &directory,
+            staging_path,
+            run_dirty_path,
+            &mut staging_guard,
+        )? == NewFilePublication::DestinationExists
+        {
+            return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged);
+        }
         synchronize_current_manifest_directories(&directory)?;
         let persisted = read_bounded_regular(
             &directory,
@@ -257,18 +281,14 @@ impl PaperCheckpointRepository {
         drop(staging);
         publication_checkpoint(PaperCheckpointPublicationPoint::AfterStagedFileSync)?;
 
-        match directory.hard_link(staging_path, &directory, artifact_path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(io_error(
-                    "publish immutable paper checkpoint object",
-                    source,
-                ));
-            }
-        }
+        let _publication = publish_new_staged_file(
+            &self.root,
+            &directory,
+            staging_path,
+            artifact_path,
+            &mut staging_guard,
+        )?;
         publication_checkpoint(PaperCheckpointPublicationPoint::AfterPublication)?;
-        staging_guard.remove()?;
         synchronize_publication_directories(&directory, artifact_path)?;
         publication_checkpoint(PaperCheckpointPublicationPoint::AfterDirectorySync)?;
         publication_checkpoint(PaperCheckpointPublicationPoint::BeforeVerifiedReadback)?;
@@ -302,6 +322,7 @@ impl PaperCheckpointRepository {
         // bytes; reopening recovers the manifest generation that actually became current.
         self.generation = generation.get();
         publish_current_manifest(
+            &self.root,
             &directory,
             &manifest,
             &repository_hex,
@@ -360,9 +381,7 @@ impl PaperCheckpointRepository {
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
             return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged);
         }
-        directory
-            .remove_file(RUN_DIRTY_PATH)
-            .map_err(|source| io_error("clear paper run-dirty authority", source))?;
+        remove_run_dirty_authority(&self.root, &directory, self.repository_id, self.generation)?;
         synchronize_current_manifest_directories(&directory)?;
         match directory.symlink_metadata(RUN_DIRTY_PATH) {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -790,6 +809,7 @@ fn same_financial_state(left: &ReconciledAccountState, right: &ReconciledAccount
 }
 
 fn publish_current_manifest(
+    root: &ArtifactRoot,
     directory: &Dir,
     manifest: &CurrentManifestWire,
     repository_hex: &str,
@@ -822,10 +842,13 @@ fn publish_current_manifest(
         .sync_all()
         .map_err(|source| io_error("synchronize current paper checkpoint manifest", source))?;
     drop(staging);
-    directory
-        .rename(staging_path, directory, current_path)
-        .map_err(|source| io_error("publish current paper checkpoint manifest", source))?;
-    staging_guard.disarm();
+    publish_replacing_staged_file(
+        root,
+        directory,
+        staging_path,
+        current_path,
+        &mut staging_guard,
+    )?;
     synchronize_current_manifest_directories(directory)?;
     let persisted = read_bounded_regular(directory, current_path, maximum_bytes)?;
     if persisted != bytes {
@@ -1048,7 +1071,7 @@ fn cleanup_stale_staging(directory: &Dir) -> Result<(), PaperCheckpointRepositor
             .file_type()
             .map_err(|source| io_error("inspect paper checkpoint staging entry", source))?;
         let reference = format!("{CHECKPOINT_OBJECT_ROOT}/{name}");
-        if is_current_stage_name(&name) {
+        if is_current_stage_name(&name) || is_run_dirty_stage_name(&name) {
             if !file_type.is_file() {
                 return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
             }
@@ -1133,6 +1156,11 @@ fn cleanup_stale_staging(directory: &Dir) -> Result<(), PaperCheckpointRepositor
 
 fn is_current_stage_name(name: &str) -> bool {
     name.strip_prefix("current-stage-")
+        .is_some_and(is_stage_suffix)
+}
+
+fn is_run_dirty_stage_name(name: &str) -> bool {
+    name.strip_prefix("run-dirty-stage-")
         .is_some_and(is_stage_suffix)
 }
 
@@ -1407,6 +1435,257 @@ impl Drop for StagingGuard<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NewFilePublication {
+    Published,
+    DestinationExists,
+}
+
+#[cfg(unix)]
+fn publish_new_staged_file(
+    _root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    destination_path: &Path,
+    staging_guard: &mut StagingGuard<'_>,
+) -> Result<NewFilePublication, PaperCheckpointRepositoryError> {
+    let publication = match directory.hard_link(staging_path, directory, destination_path) {
+        Ok(()) => NewFilePublication::Published,
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            NewFilePublication::DestinationExists
+        }
+        Err(source) => {
+            return Err(io_error("publish immutable paper checkpoint file", source));
+        }
+    };
+    staging_guard.remove()?;
+    Ok(publication)
+}
+
+#[cfg(windows)]
+fn publish_new_staged_file(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    destination_path: &Path,
+    staging_guard: &mut StagingGuard<'_>,
+) -> Result<NewFilePublication, PaperCheckpointRepositoryError> {
+    let publication = windows_atomic_move(
+        root,
+        directory,
+        staging_path,
+        destination_path,
+        false,
+        "publish immutable paper checkpoint file",
+    )?;
+    match publication {
+        NewFilePublication::Published => staging_guard.disarm(),
+        NewFilePublication::DestinationExists => staging_guard.remove()?,
+    }
+    Ok(publication)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_new_staged_file(
+    _root: &ArtifactRoot,
+    _directory: &Dir,
+    _staging_path: &Path,
+    _destination_path: &Path,
+    _staging_guard: &mut StagingGuard<'_>,
+) -> Result<NewFilePublication, PaperCheckpointRepositoryError> {
+    Err(PaperCheckpointRepositoryError::UnsupportedDurability)
+}
+
+#[cfg(unix)]
+fn publish_replacing_staged_file(
+    _root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    destination_path: &Path,
+    staging_guard: &mut StagingGuard<'_>,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    directory
+        .rename(staging_path, directory, destination_path)
+        .map_err(|source| io_error("publish current paper checkpoint manifest", source))?;
+    staging_guard.disarm();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_replacing_staged_file(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    destination_path: &Path,
+    staging_guard: &mut StagingGuard<'_>,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    if windows_atomic_move(
+        root,
+        directory,
+        staging_path,
+        destination_path,
+        true,
+        "publish current paper checkpoint manifest",
+    )? != NewFilePublication::Published
+    {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    staging_guard.disarm();
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_replacing_staged_file(
+    _root: &ArtifactRoot,
+    _directory: &Dir,
+    _staging_path: &Path,
+    _destination_path: &Path,
+    _staging_guard: &mut StagingGuard<'_>,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    Err(PaperCheckpointRepositoryError::UnsupportedDurability)
+}
+
+#[cfg(unix)]
+fn remove_run_dirty_authority(
+    _root: &ArtifactRoot,
+    directory: &Dir,
+    _repository_id: [u8; 32],
+    _generation: u64,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    directory
+        .remove_file(RUN_DIRTY_PATH)
+        .map_err(|source| io_error("clear paper run-dirty authority", source))
+}
+
+#[cfg(windows)]
+fn remove_run_dirty_authority(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    repository_id: [u8; 32],
+    generation: u64,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    if generation == 0 {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    let repository_hex = hex_bytes(&repository_id)?;
+    let stage_nonce = random_hex()?;
+    let staging_reference = format!(
+        "{CHECKPOINT_OBJECT_ROOT}/run-dirty-stage-{repository_hex}-{generation}-{stage_nonce}.tmp",
+    );
+    let staging_path = Path::new(&staging_reference);
+    drop(root.resolve(staging_path)?);
+    if windows_atomic_move(
+        root,
+        directory,
+        Path::new(RUN_DIRTY_PATH),
+        staging_path,
+        false,
+        "durably clear paper run-dirty authority",
+    )? != NewFilePublication::Published
+    {
+        return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged);
+    }
+    let mut staging_guard = StagingGuard::new(directory, staging_path);
+    staging_guard.remove()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_run_dirty_authority(
+    _root: &ArtifactRoot,
+    _directory: &Dir,
+    _repository_id: [u8; 32],
+    _generation: u64,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    Err(PaperCheckpointRepositoryError::UnsupportedDurability)
+}
+
+#[cfg(windows)]
+fn windows_atomic_move(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+    context: &'static str,
+) -> Result<NewFilePublication, PaperCheckpointRepositoryError> {
+    if source.parent() != destination.parent() {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    drop(root.resolve(source)?);
+    drop(root.resolve(destination)?);
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(PaperCheckpointRepositoryError::VerificationFailed)?;
+    let _pinned_parent = directory
+        .open_dir(parent)
+        .map_err(|source| io_error("pin paper checkpoint publication directory", source))?;
+    validate_windows_root_endpoint(root, directory)?;
+    let source_path = root.root().join(source);
+    let destination_path = root.root().join(destination);
+    // `atomicwrites` requests MoveFileExW with WRITE_THROUGH. The retained root and pinned
+    // parent remain the authority; these ambient paths only bridge that Windows durability
+    // primitive and the root identity plus exact publication state are revalidated around it.
+    let publication = if replace {
+        atomicwrites::replace_atomic(&source_path, &destination_path)
+    } else {
+        atomicwrites::move_atomic(&source_path, &destination_path)
+    };
+    validate_windows_root_endpoint(root, directory)?;
+    let source_exists = windows_regular_entry_exists(directory, source)?;
+    let destination_exists = windows_regular_entry_exists(directory, destination)?;
+    match publication {
+        Ok(()) if !source_exists && destination_exists => Ok(NewFilePublication::Published),
+        Err(error)
+            if !replace
+                && error.kind() == std::io::ErrorKind::AlreadyExists
+                && source_exists
+                && destination_exists =>
+        {
+            Ok(NewFilePublication::DestinationExists)
+        }
+        Err(error) => Err(io_error(context, error)),
+        Ok(()) => Err(PaperCheckpointRepositoryError::VerificationFailed),
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_root_endpoint(
+    root: &ArtifactRoot,
+    directory: &Dir,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    let retained = directory
+        .dir_metadata()
+        .map_err(|source| io_error("inspect retained paper checkpoint root", source))?;
+    let displayed = root
+        .try_clone_directory()?
+        .dir_metadata()
+        .map_err(|source| io_error("inspect displayed paper checkpoint root", source))?;
+    if !retained.is_dir()
+        || !displayed.is_dir()
+        || (retained.dev(), retained.ino()) != (displayed.dev(), displayed.ino())
+    {
+        return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_regular_entry_exists(
+    directory: &Dir,
+    path: &Path,
+) -> Result<bool, PaperCheckpointRepositoryError> {
+    match directory.symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Ok(true),
+        Ok(_) => Err(PaperCheckpointRepositoryError::UnsafeArtifact),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error(
+            "inspect paper checkpoint publication endpoint",
+            source,
+        )),
+    }
+}
+
 fn read_bounded_regular(
     directory: &Dir,
     path: &Path,
@@ -1526,17 +1805,24 @@ fn synchronize_current_manifest_directories(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn synchronize_current_manifest_directories(
     _directory: &Dir,
 ) -> Result<(), PaperCheckpointRepositoryError> {
-    Err(PaperCheckpointRepositoryError::UnsupportedDurability)
+    Ok(())
 }
 
 #[cfg(windows)]
 fn synchronize_publication_directories(
     _directory: &Dir,
     _artifact_path: &Path,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn synchronize_current_manifest_directories(
+    _directory: &Dir,
 ) -> Result<(), PaperCheckpointRepositoryError> {
     Err(PaperCheckpointRepositoryError::UnsupportedDurability)
 }
@@ -1584,22 +1870,6 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     assert_not_impl_any!(PaperCheckpointReceipt: Clone, Copy);
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_directory_durability_fails_closed() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let paths = LocalPaths::prepare(directory.path().join("data"))?;
-        let capability = paths.artifacts()?.try_clone_directory()?;
-        assert!(matches!(
-            super::synchronize_publication_directories(
-                &capability,
-                std::path::Path::new("paper-checkpoints/v1/00/object.json"),
-            ),
-            Err(PaperCheckpointRepositoryError::UnsupportedDurability)
-        ));
-        Ok(())
-    }
 
     #[test]
     fn receipt_requires_every_durability_boundary_and_exact_existing_recovery() -> TestResult {

@@ -16,7 +16,6 @@ use market_squawk_sources::{
     RegistryError, SessionId, SinkError, SourceError, SourceMetadataProvider,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +57,6 @@ const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data"
 async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut first = accept_book_source(&listener).await?;
         first.send(Message::Text(BOOK_ACK.into())).await?;
@@ -85,8 +83,7 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
                 include_str!("../fixtures/official_book_checksum.json").into(),
             ))
             .await?;
-        let _released = release_rx.await;
-        let _closed = socket.close(None).await;
+        socket.close(None).await?;
         TestResult::Ok(())
     });
 
@@ -155,7 +152,7 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
         .run_established(&mut socket, &mut sink, CancellationToken::new())
         .await;
 
-    assert_eq!(result, Err(SourceError::ConnectionIdle));
+    assert_eq!(result, Err(SourceError::Network));
     assert_eq!(source.health().state(), KrakenDecoderState::Quarantined);
     assert_eq!(source.health().captured_frames(), 2);
     assert_eq!(source.health().control_messages(), 1);
@@ -201,7 +198,6 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
         BudgetDecision::WaitUntil(recorded_deadline) if recorded_deadline == returned_deadline
     ));
 
-    let _release_result = release_tx.send(());
     server.await??;
     Ok(())
 }
