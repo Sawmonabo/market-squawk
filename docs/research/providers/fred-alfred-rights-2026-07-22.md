@@ -1,7 +1,7 @@
 # FRED and ALFRED API rights decision — 2026-07-22
 
 > Superseded on 2026-07-26 by the
-> [FRED/ALFRED local-first API authority](2026-07-26-fred-alfred-local-first-api-authority.md).
+> [FRED/ALFRED self-hosted API authority](2026-07-26-fred-alfred-self-hosted-api-authority.md).
 > This file remains immutable historical evidence of the earlier blanket-blocked decision.
 
 Status: historical, superseded release decision

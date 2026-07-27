@@ -83,7 +83,7 @@ answers a different question.
 | Effective or reference | What economic date, instant, or provider period does the observation describe? | Constrains the feature, label, reporting, or measurement window; it does not prove knowledge |
 | Published | When did the source identify the release or revision as published? | A known exact publication after `as_of` is excluded; publication alone does not prove local availability |
 | Available | When does source or audit evidence establish that the information was usable by a consumer? | `Evidenced` availability is admitted when it is at or before `as_of` |
-| Local first observed | When did this installation first obtain the object when earlier availability cannot be proved? | A conservative local lower bound admitted as availability for this installation |
+| First observed locally | When did this installation first obtain the object when earlier availability cannot be proved? | A conservative local lower bound admitted as availability for this installation |
 | Received | When did the source payload reach the local process? | Transport provenance; it is not automatically the provider's publication time |
 | Ingested | When did the canonical record enter local research storage? | Must not precede received or reported availability; it is not used to backdate knowledge |
 | Revision | Which one-based source revision is this within its natural observation family? | Selects or labels a knowable revision; it is an identity, not a clock |

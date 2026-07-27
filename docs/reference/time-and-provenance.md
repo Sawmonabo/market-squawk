@@ -126,7 +126,8 @@ immutability, or future retrievability.
 | `inferred` | `inferred_at` plus versioned inference method | Retained but excluded by default |
 | `unknown` | None | Excluded by default |
 
-Only evidenced and local-first-observed variants yield `conservative_available_at()`. This is why
+Only evidenced variants and records first observed locally yield `conservative_available_at()`.
+This is why
 the analytical `available_at` column is nullable even though the availability classification is
 always present. Inferred time is projected separately as reported/inferred evidence and is not
 silently promoted into the conservative column.

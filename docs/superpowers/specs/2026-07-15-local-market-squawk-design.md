@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a zero-mandatory-license-cost, local-first Rust platform that consumes live and historical financial data, journals source-faithful raw events, maintains validated market state, supports deterministic modeling and replay, and exposes bounded analysis through MCP.
+Build a zero-mandatory-license-cost, self-hosted Rust platform that consumes live and historical financial data, journals source-faithful raw events, maintains validated market state, supports deterministic modeling and replay, and exposes bounded analysis through MCP.
 
 ## First-release boundary
 

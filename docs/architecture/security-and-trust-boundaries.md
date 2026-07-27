@@ -1,6 +1,6 @@
 # Security and Trust Boundaries
 
-Market Squawk is local-first, but local does not mean trusted. Provider responses, imported files,
+Market Squawk is self-hosted, but local does not mean trusted. Provider responses, imported files,
 model artifacts, CLI/MCP requests, browser-originated onboarding requests, persisted state, and
 execution intent all cross explicit validation or authority boundaries before they can affect
 durable state or an order adapter.

@@ -26,7 +26,7 @@ pub enum AvailabilityEvidence {
     },
     /// The local system first observed the object at this time.
     LocalFirstObserved {
-        /// Conservative local first-observed bound.
+        /// Conservative bound based on the first local observation.
         observed_at: Timestamp,
     },
     /// A time was inferred but is not admitted as point-in-time evidence by default.
@@ -49,7 +49,7 @@ impl AvailabilityEvidence {
         }
     }
 
-    /// Constructs conservative local first-observed evidence.
+    /// Constructs conservative evidence from the first local observation.
     pub const fn local_first_observed(observed_at: Timestamp) -> Self {
         Self::LocalFirstObserved { observed_at }
     }
@@ -69,7 +69,8 @@ impl AvailabilityEvidence {
 
     /// Returns a safe default point-in-time cutoff.
     ///
-    /// Evidenced and local-first-observed times are conservative. Inferred and unknown times return
+    /// Evidenced times and times first observed locally are conservative. Inferred and unknown
+    /// times return
     /// `None` so a default point-in-time builder fails closed rather than admitting look-ahead.
     pub const fn conservative_available_at(&self) -> Option<Timestamp> {
         match self {

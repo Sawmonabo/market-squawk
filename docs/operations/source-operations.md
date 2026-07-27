@@ -141,7 +141,7 @@ generation/reference, issuance time, and optional verification expiry. Callers c
 lease from a provider name or a profile's quality ceiling.
 
 A successful handoff or network probe never widens `retrieve`, `display`, `persist`,
-`model_training`, `export`, or `redistribute` rights. FRED/ALFRED revision 4 admits bounded
+`model_training`, `export`, or `redistribute` rights. FRED/ALFRED revision 5 admits bounded
 ephemeral retrieval. Durable operations require both exact written St. Louis Fed service permission
 with a hash-bound local review and independent authority for every exact series and operation.
 
@@ -681,4 +681,4 @@ for what the product currently admits.
 | [FRED API key documentation](https://fred.stlouisfed.org/docs/api/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-26 |
 | [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API-specific storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |
 | [FRED permissions contact route](https://fred.stlouisfed.org/contactus/) | Official route for requesting permission; a submission or acknowledgement is not permission | 2026-07-26 |
-| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |
+| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |

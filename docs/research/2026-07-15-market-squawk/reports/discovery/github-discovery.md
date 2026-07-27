@@ -15,7 +15,7 @@
 
 This discovery identifies a deliberately small set of open-source repositories that can inform or
 accelerate the evolution of Market Squawk from its current single-crate Rust application into the
-specified local-first live-execution and research platform. It is anchored to **2026-07-15** in the
+specified self-hosted live-execution and research platform. It is anchored to **2026-07-15** in the
 `America/New_York` time zone. Repository statistics were captured through the GitHub API on that
 date; GitHub reports activity timestamps in UTC, so a few pushes appear as `2026-07-16` UTC.
 

@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Standardized self-hosted product positioning across the README, CLI, onboarding portal,
+  architecture, operations, reference, planning, and research material; advanced the current
+  FRED/ALFRED capability to revision 5 while preserving revision 4's exact durable identity.
 - Prepared `0.2.0` as the usable local-release candidate while preserving the published `0.1.0`
   foundation tag unchanged.
 - Established the Rust 1.97.1 Edition 2024 virtual workspace and shared invariant-preserving

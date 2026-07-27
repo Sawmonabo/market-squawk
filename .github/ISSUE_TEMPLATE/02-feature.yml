@@ -66,7 +66,7 @@ body:
     attributes:
       label: Product constraints
       options:
-        - label: The proposal preserves the zero-mandatory-cost and local-first product boundary.
+        - label: The proposal preserves the zero-mandatory-cost and self-hosted product boundary.
           required: true
         - label: Any new authority is explicit, bounded, fail-closed, and cannot bypass risk.
           required: true

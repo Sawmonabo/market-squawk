@@ -14,7 +14,7 @@
 
 This discovery is anchored to **2026-07-15** and selects official or project-owned
 documentation needed to make implementation decisions for Market Squawk's local Rust
-platform. The decision context is a no-mandatory-cost, local-first system with two separate
+platform. The decision context is a no-mandatory-cost, self-hosted system with two separate
 pipelines: an integrity-gated live path and a point-in-time research path. The inventory is
 intentionally consolidated into 15 source families so later deep-dive batches can review the
 material without duplicating large documentation trees.
@@ -118,7 +118,7 @@ site and followed to related official pages.
   endpoint allowlists, and TLS features; deserialize into source DTOs before `TryFrom` validation;
   drive WebSocket read/write halves under a source supervisor and forward only to bounded queues.
 - **Limits/prerequisites:** Reqwest system proxies are enabled by default in current docs, so a
-  local-first security posture should explicitly decide whether to disable them. None of these
+  self-hosted security posture should explicitly decide whether to disable them. None of these
   libraries supplies venue sequence/checksum semantics. Crate feature selection and exact MSRV
   still require a locked build test.
 - **Relevance:** establishes the transport boundary while leaving financial validation in domain

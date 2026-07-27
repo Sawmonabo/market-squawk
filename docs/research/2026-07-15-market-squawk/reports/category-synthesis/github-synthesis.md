@@ -236,7 +236,7 @@ disagreement:
 2. **Broad provider coverage versus point-in-time preservation.** OpenBB exposes many providers and
    strong fetch lifecycle patterns, yet the inspected FRED transformation discards real-time bounds.
    Breadth does not imply revision/vintage correctness.
-3. **Convenient defaults versus local-first security.** `ort` defaults to binary downloading and TLS,
+3. **Convenient defaults versus self-hosted security.** `ort` defaults to binary downloading and TLS,
    which conflicts with Market Squawk's no-hidden-outbound/reproducible-build constraint. The
    wrapper remains usable only after disabling that behavior.
 4. **SDK documentation versus workspace version.** The MCP Rust SDK's README dependency example

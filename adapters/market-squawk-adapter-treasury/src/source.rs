@@ -284,7 +284,7 @@ impl TreasurySourceHealth {
     }
 }
 
-/// A fetched Fiscal Data page retaining exact bytes and local-first-observation evidence.
+/// A fetched Fiscal Data page retaining exact bytes and evidence of its first local observation.
 #[derive(Clone, Debug)]
 pub struct RetrievedFiscalDataPage {
     received_at: Timestamp,
@@ -293,7 +293,7 @@ pub struct RetrievedFiscalDataPage {
 }
 
 impl RetrievedFiscalDataPage {
-    /// Returns the local first-observation time for this exact response.
+    /// Returns when this installation first observed the exact response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
     }
@@ -309,7 +309,7 @@ impl RetrievedFiscalDataPage {
     }
 }
 
-/// A fetched daily-rate page retaining exact bytes and local-first-observation evidence.
+/// A fetched daily-rate page retaining exact bytes and evidence of its first local observation.
 #[derive(Clone, Debug)]
 pub struct RetrievedDailyRatePage {
     received_at: Timestamp,
@@ -318,7 +318,7 @@ pub struct RetrievedDailyRatePage {
 }
 
 impl RetrievedDailyRatePage {
-    /// Returns the local first-observation time for this exact response.
+    /// Returns when this installation first observed the exact response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
     }

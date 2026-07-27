@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Market Squawk is a local-first market-data, research, analytics, modeling, portfolio, valuation,
+Market Squawk is a self-hosted market-data, research, analytics, modeling, portfolio, valuation,
 and paper-execution system. This page defines its system boundary, architectural drivers, and
 runtime containers before the reader descends into crate or protocol detail.
 
@@ -40,7 +40,7 @@ for release blockers and acceptance state.
 
 ## Architectural drivers
 
-### Local-first cost and deployment boundary
+### Self-hosted cost and deployment boundary
 
 The complete release requires no paid software, paid API, cloud service, external database
 service, container runtime, or telemetry infrastructure. Hardware, local storage, electricity, and

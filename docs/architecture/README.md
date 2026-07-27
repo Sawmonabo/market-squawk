@@ -29,7 +29,7 @@ flowchart LR
     Deployment --> Decisions
 ```
 
-Start with the [overview](overview.md) for the system boundary, architectural drivers, local-first
+Start with the [overview](overview.md) for the system boundary, architectural drivers, self-hosted
 cost model, and runtime containers. The pages below are current explanations of the reviewed
 implementation, not release-status journals or operator runbooks.
 

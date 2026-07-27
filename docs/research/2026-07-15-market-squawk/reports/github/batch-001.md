@@ -25,7 +25,7 @@ claims were checked against repository pages and commit-pinned source files rath
 snippets. GitHub timestamps are UTC; therefore activity late on July 15 in New York can appear as
 July 16 UTC.
 
-The decision context is Market Squawk's hardened local-first design: independent live and research
+The decision context is Market Squawk's hardened self-hosted design: independent live and research
 planes; strict execution-data qualification; deterministic single-writer live state; bounded
 queues; non-bypassable risk; Arrow/Parquet/DataFusion research storage; and no analytical, Python,
 MCP, database, or arbitrary I/O in the event-to-action path.

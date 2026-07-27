@@ -2,375 +2,236 @@
 
 **Turn market noise into market state.**
 
-A local-first market platform with independent live-execution and research-data planes. They share
-invariant-preserving financial, identity, time, quality, and provenance contracts without requiring
-historical datasets to originate from or reproduce the live feed.
+[![GitHub Actions](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml/badge.svg)](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml)
+[![Rust 1.97.1](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
+[![Version 0.2.0 candidate](https://img.shields.io/badge/version-0.2.0%20candidate-f59e0b)](Cargo.toml)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-2563eb)](#license)
 
-## Status
+Market Squawk is a self-hosted platform for live market data, investment research, financial
+analytics, modeling, portfolio analysis, fair-value work, and risk-controlled paper execution. It
+keeps its catalog, analytical datasets, models, artifacts, and audit records on the operator's
+machine and requires no paid software, paid API, cloud service, hosted database, container runtime,
+or telemetry service.
 
-`v0.2.0` is the active usable-release candidate. The existing `v0.1.0` tag remains the historical
-runnable foundation and will not be moved or reused. The candidate is not yet the usable complete
-Market Squawk release and it is not a production brokerage system. The linked
-[historical state audit](docs/audits/architecture/2026-07-15-current-state-anchor.md) records its own rejected audit anchor;
-it is not an exact-head inventory. The dated
-[release baseline](docs/verification/usable-release-baseline.md) is also historical audit evidence.
-The sections below are the current product inventory and user-facing truth. All mandatory remaining
-work is bound by the single canonical
-[usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
+The application is operated through a complete command-line interface and a local stdio
+[Model Context Protocol (MCP)](docs/reference/mcp.md) server. Provider setup uses a guided,
+temporary browser portal bound to the local machine.
 
-## Documentation
+> [!IMPORTANT]
+> Market Squawk has not published `v1.0.0`. The workspace currently carries the `0.2.0`
+> development candidate; the existing `v0.1.0` tag is a historical development snapshot. Provider
+> acceptance and the final unchanged-candidate release verification still block the first complete
+> release. See the [delivery ledger](docs/plans/delivery-ledger.md) for current details.
 
-- [Documentation portal](docs/README.md) — route by reader intent and document type.
-- [Architecture](docs/architecture/README.md) — context, runtime planes, trust boundaries,
-  deployment, quality attributes, and decisions.
-- [Operations](docs/operations/README.md) — current runnable local procedures and recovery.
-- [Reference](docs/reference/README.md) — exact CLI, configuration, MCP, source, quality, and time
-  contracts.
-- [Delivery ledger](docs/plans/delivery-ledger.md) — accepted evidence, active blockers, and the next
-  release barrier.
+## Table of contents
 
-## Runnable now
+- [What Market Squawk provides](#what-market-squawk-provides)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Use Market Squawk](#use-market-squawk)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Local data, privacy, and cost](#local-data-privacy-and-cost)
+- [Security](#security)
+- [License](#license)
+- [Financial-use notice](#financial-use-notice)
 
-- Rust 1.97.1 workspace with invariant-preserving domain, identity, time, financial, quality,
-  provenance, source-authority, sharding, transactional-book, and bounded-snapshot foundations.
-- Public Coinbase Exchange WebSocket diagnostic capture with explicit single-venue, partial
-  coverage. This is not a production `DirectVerified` adapter.
-- A separate bounded Coinbase Exchange WebSocket v1 production-source crate with strict endpoint
-  policy, capture-before-decode, exact decimal lexemes, bounded subscriptions and frames,
-  cancellation, pinned protocol fixtures, source metadata, explicit single-venue partial coverage,
-  durable generation/revision authority, and authoritative application composition into the
-  instrument-owned live runtime. Its current qualification ceiling remains intentionally
-  `DirectUnverified`, so it remains execution-ineligible.
-- A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
-  capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
-  source metadata, exact registry-session/budget binding, one-use connection generations, and
-  fresh-snapshot recovery after quarantine. Its current qualification ceiling is intentionally
-  `DirectUnverified` because Kraken does not supply the venue sequence required by the current
-  execution policy. The application authority layer therefore never invokes strategy, approval,
-  dispatch, or paper execution for Kraken observations. An independent canonical risk probe also
-  proves both `SourceQuality` and unsupported-settlement rejection before any paper cash,
-  availability, position, or account-risk state can change.
-- Level 2 price-level snapshots and updates, heartbeat tracking separated from market freshness,
-  match/trade capture, fixed-point prices and quantities, and in-memory order books.
-- MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
-  compatibility, and optional Coinbase diagnostic reconstruction.
-- A durable local SQLite control catalog with versioned migrations, rights-bound records, immutable
-  authority history, backup/restore recovery, and tamper-evident catalog state.
-- Versioned Arrow analytical interchange plus authority-bound immutable Parquet publication,
-  manifests, lineage, compaction, recovery, and bounded read-only DataFusion queries with
-  point-in-time availability filtering. The leakage-bounded feature/label dataset builder composes
-  exact input generations, source-authored historical-universe evidence, revision selection,
-  corporate-action policy, chronological splits, controlled output publication, and replay-safe
-  application authority. Verified query results that cross an admitted inline ceiling are
-  republished as opaque, durable, content-addressed Parquet in the shared artifact repository and
-  remain retrievable through `query artifact` or `Analysis.ReadArtifact` without exposing a path.
-- Complete pure-Rust batch analytics for returns, risk, regression, fundamentals, macro, exposure,
-  attribution, and scenarios. Exact-rate and monetary-basis contracts isolate accounting values
-  from statistical floating-point calculations, while cadence-aware series and typed statistical
-  location/dispersion prevent incompatible units or annualization from crossing model boundaries.
-  A code-owned registry publishes 43 versioned batch-feature contracts and the live-feature
-  contracts with complete input schemas, policies, warm-up/null behavior, time semantics, and
-  semantic digests.
-- Capability-scoped, immutable model bundles with bounded metadata/artifact admission, complete
-  Task 11 dataset and Task 12 feature-identity validation, SHA-256 evidence, atomic retained-model
-  registry limits, and deterministic native linear/logistic inference. Live inputs are reusable and
-  borrowed, successful inference does not allocate output identity, every model failure maps to
-  zero order intents, and the paper-bot audit worker durably records the typed no-action evidence in
-  an explicit v2 stream without modifying historical v1 audit files.
-- Required local ONNX inference through the self-contained Rust `TractOnnxBackend`. Exact graph,
-  operator, tensor, shape, artifact, compute, queue, process, deadline, warm-up, and output contracts
-  are validated before a model generation is published; runtime failure is quarantined and produces
-  no action. The modeling library also contains a descriptor-verified ONNX Runtime 1.24.4
-  implementation for Linux arm64/x86-64, but the current product composition does not select it;
-  tract is the shipping ONNX path. No external runtime, account, service, download, or network call
-  is required for ONNX support.
-- Implemented offline Python financial-research and deterministic-training components for
-  GIL-enabled CPython
-  3.12 and 3.13 on macOS 12+ arm64. The tracked `python/` package opens only catalog-authorized,
-  manifest-bound point-in-time Parquet exports; preserves Decimal128 as `decimal.Decimal` with exact
-  scale; exposes bounded Rust financial kernels; produces deterministic native linear/logistic
-  candidates; and validates publication through an exact, digest-bound Rust validator. Final model
-  metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
-  identities are bound before external authority is accepted. The sealed builder verifies the
-  complete exact source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
-  project wheel; builds and signs the application, validator, and ONNX worker; and then installs and
-  tests without network access. A native package-root initializer verifies the signed Market Squawk,
-  PyArrow, interpreter, and native-library file sets before any shipped mutable Python module
-  executes. Dataset publication now returns the exact Python export digest and registers the
-  durable feature dataset for point-in-time selection. The installed, repository-owned
-  `market-squawk-train` driver deterministically proposes, authority-finalizes, Rust-validates, and
-  admits sealed linear/regression and logistic/binary-probability ONNX candidates. Logistic graphs
-  bind a terminal `Sigmoid`; the signed application constructs the tract backend before durable
-  admission, and inference remains finite, bounded, and fail-closed.
-- A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
-  formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
-  Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
-  authority, precision-preserving research time, immutable representation evidence, and the
-  analytical ingestion service are composed end to end.
-- Evidence-bound Treasury Fiscal Data and daily-rate onboarding, activation, and research
-  ingestion through the local portal without an account, key, or paid service. The daily-rate
-  workflow covers all five official families across a bounded year range, validates exact
-  family-specific XML and all-history pagination, publishes precision-preserving
-  `market-squawk-research-v3` observations, and recovers the exact research runtime after restart.
-  SEC EDGAR production ingestion is available through a truthful non-secret application/contact
-  identity and exact registrant CIK. Public BLS v1 production ingestion requires no account or key;
-  activation and status return the exact adapter-owned dataset identity needed by release evidence,
-  and portal restart recovers that identity without reconstructing it in the application.
-  FRED/ALFRED now has a working bounded `source inspect` path from the guided local onboarding
-  session to the official API, exact page validation, canonical observations, and typed CLI/MCP
-  output without research-dataset persistence. Persistence, caching, archival, and training remain
-  closed unless exact written St. Louis Fed service permission and independent exact-series
-  authority are both present. Direct BLS is the zero-fee durable macro path; complete durable
-  FRED/ALFRED authority and unchanged-candidate acceptance remain release blockers.
-- A bounded loopback onboarding portal for every built-in provider profile. It opens the exact
-  provider handoff automatically, commits no-credential Coinbase public and Kraken sessions,
-  activates Treasury XML as a real five-family research source, collects the three Coinbase Direct
-  credential fields as one write-only versioned secret, supports renewal/replacement and
-  local-authority removal, and keeps refresh- or rights-blocked profiles disabled. Research
-  adapter configuration remains provider-specific.
-- Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
-  pre-trade calculation, and paper-only momentum diagnostics.
-- Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
-  exact cash, position, exposure, leverage, capital, loss, drawdown, rate, idempotency, freshness,
-  eligibility, price, slippage, and expiry checks; private approval minting; one-time dispatch;
-  price-bound reconciliation; and terminal, bounded audit evidence. No public unchecked order
-  submission or approval-minting surface exists.
-- A deterministic, bounded realistic paper-execution engine with configurable fees, latency,
-  slippage, partial fills, rejections, cancellations, balances, positions, reservations,
-  reconciliation, versioned recovery checkpoints, and fail-closed shutdown. The `paper-bot`
-  command composes the production Coinbase source, instrument-owned live runtime, canonical risk,
-  one-use dispatcher, evidence-bound initial sandbox portfolio, fee-aware book-imbalance strategy,
-  and paper worker under one lifecycle. Coinbase remains `DirectUnverified`, so source
-  qualification prevents the strategy from producing an executable intent or paper order.
-- Immutable portfolio accounting revisions over source-evidenced normalized transactions, with
-  long/short lots, FIFO and specific identification, cash flows, income, exact gains, explicit
-  complete/incomplete basis measurements, corporate-action snapshots, source-total reconciliation,
-  performance, exposure, attribution, portfolio risk, scenarios, and proposal-only rebalancing.
-  The local CLI imports a confined versioned holdings or transactions manifest through the real
-  portfolio adapter, research-ingestion authority, immutable artifact boundary, and shared
-  `Portfolio.Import` service before exposing bounded holdings, transactions, performance, exposure,
-  and risk reads.
-  Execution-owned risk loads the current opaque portfolio revision immediately before approval,
-  derives financial limits from its complete projection, binds the exact revision and publication
-  generation into the approved order, and rechecks that authority immediately before one-time
-  dispatch. Missing, stale, retired, or revoked portfolio state fails closed before adapter access.
-- Governed point-in-time research backtesting over exact catalog-authorized dataset/partition
-  generations, source-authored historical universes, event/availability time, bounded strategies,
-  realistic research execution assumptions, deterministic portfolio accounting and reconciliation.
-  The application-owned service reserves every trial before execution, publishes bounded immutable
-  artifacts, commits exactly one success/failure terminal, binds executable/model/configuration and
-  data identities, and supports cohort, deflated-performance, and overfitting diagnostics without
-  promoting research results into execution authority.
-- Durable ASC 820/IFRS 13 fair-value analysis over producer-issued live, research, feature, and
-  portfolio evidence. The code-owned ruleset enforces point-in-time availability, strict Level 1
-  identity/quotation/adjustment/activity/access/freshness predicates, and separate Level 2, Level 3,
-  and `Unclassified` outcomes. Reporting-entity market access requires durable dual approval and
-  separation of duties; immutable overrides cannot promote Level 1 or cure `Unclassified`
-  evidence. Approvals, revocations, audit chains, stale-writer protection, bounded recovery, and
-  global catalog limits persist in SQLite. The current CLI and shared application service expose
-  bounded measurement, classification, explanation, evidence, approval-status, and approval
-  workflows over genuine live, research, analytics, or portfolio producers.
-- A complete local CLI hierarchy over the production `LocalProduct` composition for configuration,
-  sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
-  paper execution, fair value, MCP, and readiness diagnosis. `init` owns initialization, migration,
-  recovery, journal preparation, and bounded shutdown; configuration reads expose redacted
-  provenance; and `doctor` inspects only existing storage through bounded query-only diagnostics
-  without creating, migrating, recovering, or locking product authorities. Mutating operations
-  retain explicit confirmation, typed request admission, shared application-service authority, and
-  bounded output.
-- A sole production local stdio MCP composition spanning all 11 required domains and 62 code-owned
-  typed tools. The shared application descriptors enforce operation-specific input and output
-  schemas, runtime output validation, authorization, evidence and artifact policy, bounds,
-  deadlines, cancellation, durable audit, controlled artifacts, protocol-correct tool errors, and
-  lifecycle-owned shutdown. Unix and Windows termination listeners are installed before product
-  composition so signals received during startup still trigger the bounded MCP, application, and
-  audit drain. The CLI and MCP call the same transport-neutral application services, including
-  digest-bound, chunked reads of opaque controlled artifacts without exposing paths.
-- A deterministic mock source for offline diagnostic verification. It is never represented as a
-  production source.
+## What Market Squawk provides
 
-The app-local Coinbase reader remains a compatibility path. Its app-local `QualityState::Valid` is
-not canonical `DataQuality::DirectVerified` and cannot authorize an order. The MCP command uses the
-sole hardened application MCP composition over that authority-free diagnostic state; there is no
-second legacy MCP server or unchecked application-local handler. The integrated Coinbase Direct
-integrity core supplies bounded snapshot evidence, order-level ownership, closed sequence domains,
-contiguous replay, currentness evidence, and fail-closed quarantine. Its authenticated Direct
-transport now performs the bounded HTTP bootstrap, queues and validates authenticated sequenced
-frames through the handoff frontier, and transfers the same integrity owner to live supervision.
-The shipping application now composes that path from an exact active
-`coinbase.exchange-direct-market-data` onboarding session through the current signing capability,
-shared provider-rate and account authority, canonical `BookSnapshot`/`BookDelta` publication,
-central qualification, strategy, risk, dispatcher, and realistic paper execution. `Bot.Start`
-selects it explicitly as `coinbase-direct`; the public Coinbase and Kraken compatibility sources
-remain separate and `DirectUnverified`. Direct market observations are not exported into research
-or fair-value persistence because the current scoped rights admit retrieval/display, not those
-uses. Release acceptance still requires an authorized unchanged-head external trace and the
-clean-machine provider workflow. All fills remain local paper simulation; no broker adapter or live
-order authority is enabled.
-
-## Required but missing
-
-Every row below is currently `Missing`. A row becomes `Runnable` only when its real producer,
-terminal consumer, focused verification, immutable evidence, and exact commit exist together.
-
-| State | Mandatory capability | Current blocker | Closing task |
-| --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source release acceptance | The distinct credential/session, signer, shared rate/account authority, canonical publication, central qualification, and risk-paper composition are implemented. Release acceptance lacks an authorized unchanged-head external trace proving the configured Coinbase products reach qualified live state and the paper terminal without changing source | Task 2 / Task 20 |
-| `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
-| `Missing` | FRED/ALFRED durable local consumption | The revision-4 profile is rights-limited. Current FRED terms prohibit durable storage and software/model training. Completion requires exact written St. Louis Fed permission covering Market Squawk, the FRED API, each selected series and operation, a hash-bound local review, independent exact-series authority, and a real official-API publication/restart/analytics proof. An API key or public-domain series alone cannot close this | Task 9 / Task 20 |
-| `Missing` | execution-eligible paper acceptance | Coinbase Direct is wired through the existing feature, strategy, central-risk, dispatcher, audit, checkpoint, and realistic paper engine. The required authorized unchanged-head live-to-paper demonstration has not yet been accepted | Issue `#7` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | The accepted control plane and loopback portal own guided provider handoff, no-credential and typed provider setup, shared provider-rate authority, generation-bound activation, transactional replacement, sealed recovery, candidate-preferred renewal, local-authority removal, OS-keyring-first routing, encrypted fallback, and working SEC, public-BLS, and Treasury research activation. Release acceptance remains blocked by exact unchanged-candidate official-response evidence for SEC/BLS/Treasury, FRED/ALFRED's two-gate durable authority and real workflow, the authorized Coinbase Direct trace, and one closed provider evidence run | Issue `#31` / Task 19A |
-| `Missing` | complete official research-provider acceptance | Treasury Fiscal Data, all five Treasury daily-rate families, SEC EDGAR, and public BLS v1 have production ingest/publication/query/restart workflows. Their final unchanged-candidate official-network evidence is still open. FRED/ALFRED durable use remains blocked until exact Bank service permission and exact-series authority are both present and the same durable workflow succeeds. The complete provider set therefore remains release-blocking | Issue `#31` / Tasks 19A–20 |
-| `Missing` | release security/fuzz/performance gate | Task 19's local control plane and corrected source-adapter dependency boundary are accepted. The hardened fuzz, measurement, provider, offline all-vertical demonstration, and strict atomic evidence-closure producers are implemented, but no final unchanged-head provider/Python/demo/performance/security evidence set, grouped release review, publication, or closeout exists | Issue `#25` / Task 20 |
-
-This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
-not endorsed or certified by the Federal Reserve Bank of St. Louis.
-
-Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
-execution-qualification verticals remain release-blocking above. The tracked Python package,
-sealed-release components, production training driver, ONNX producer, and signed application
-handoff form the supported model first-use path. Python files under `scripts/` remain build,
-verification, and protocol-smoke utilities rather than financial product APIs.
-
-## Release blocked until implemented
-
-Market Squawk is not a usable complete release until every mandatory capability above is a working,
-bounded producer-to-consumer vertical slice; runs together locally through the CLI and complete typed
-MCP where applicable; and passes the clean, unchanged exact-head release gate. Traits, schemas,
-empty crates, mocks, synthetic sources, diagnostic compatibility paths, plans, and focused lane tests
-do not count as implemented production capabilities.
-
-Only paid or licensed provider adapters, explicitly authorized live-money execution adapters, replay
-beyond diagnostic and decoder-validation needs, and a possible observability adapter beyond required
-local structured tracing are optional after the usable complete release. Distributed deployment,
-commercial consolidated-feed coverage, and OpenTelemetry infrastructure are not release blockers.
-
-## Why Rust
-
-The live path needs predictable memory use, native execution, safe concurrency, fixed-point
-financial values, and a single local binary. Python research, financial analytics, visualization,
-and deterministic training consume point-in-time Arrow/Parquet data and bounded pure-Rust kernels
-outside the live path. Python is never placed between a live event and an automated decision.
-
-## Python research and training quick start
-
-The supported `v0.2.0` Python release target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or
-newer on arm64. Supply absolute paths to both interpreters. The first command performs the explicit
-one-time preparation of free, hash-pinned public dependency caches; the second build is fully
-offline and produces isolated release environments plus a machine-readable evidence manifest.
-
-```bash
-MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
-python3 -I scripts/build_python_release.py \
-  --lock python/wheelhouse-lock.json \
-  --artifact-root .agents/python-release \
-  --python /absolute/path/to/python3.12 \
-  --python /absolute/path/to/python3.13 \
-  --prepare-cache-only
-
-python3 -I scripts/build_python_release.py \
-  --lock python/wheelhouse-lock.json \
-  --artifact-root .agents/python-release \
-  --python /absolute/path/to/python3.12 \
-  --python /absolute/path/to/python3.13 \
-  --offline
-```
-
-After the offline build, a local financial-kernel call is available immediately:
-
-```bash
-.agents/python-release/release-cp312/bin/python -I - <<'PY'
-from decimal import Decimal
-from market_squawk.finance import OperationContext, simple_returns
-
-result = simple_returns(
-    [Decimal("100.00"), Decimal("101.25")],
-    [1_000_000_000, 2_000_000_000],
-    "USD",
-    context=OperationContext(60_000, 100_000),
-)
-print(result.values)
-PY
-```
-
-For point-in-time dataset access and visualization, see `python/examples/pit_research.py`; it
-requires an existing locally admitted Task 11 dataset root and exact export SHA-256. Training uses
-the same admitted dataset receipt and returns a finalized model proposal that must match an external
-authority file before the digest-bound Rust validator will publish it. The signed release's
-`market-squawk-train` command owns the supported `propose`, `finalize`, and `admit` handoff; follow
-the [model training and inference runbook](docs/operations/model-inference.md) rather than calling
-training internals or constructing an admission request by hand.
-
-## Diagnostic foundation quick start
-
-These Rust commands demonstrate only the authority-free diagnostic entry points. They do not
-demonstrate production execution quality, portfolio/fair-value/backtest/model workflows through the
-complete CLI, provider onboarding, or complete MCP coverage. The research datasets, native and ONNX
-model inference, Python product, portfolio accounting, backtesting, and fair-value libraries listed
-above are independently runnable now.
-
-Prerequisites:
-
-- Rust 1.97.1 (pinned by `rust-toolchain.toml`)
-- Cargo Deny 0.20.2
-- Cargo Audit 0.22.2
-- Gitleaks 8.30.1
-- Internet access only for dependency installation and live Coinbase capture
-
-Install the pinned Rust security tools locally with:
-
-```bash
-cargo install cargo-deny --version 0.20.2 --locked
-cargo install cargo-audit --version 0.22.2 --locked
-```
-
-Install Gitleaks 8.30.1 from its
-[upstream release](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1), place the binary on
-`PATH`, and verify the downloaded archive against the release checksum file. The current archive
-SHA-256 values used by supported local/CI hosts are:
-
-| Archive | SHA-256 |
+| Area | Capabilities |
 | --- | --- |
-| `gitleaks_8.30.1_darwin_arm64.tar.gz` | `b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5` |
-| `gitleaks_8.30.1_darwin_x64.tar.gz` | `dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709` |
-| `gitleaks_8.30.1_linux_x64.tar.gz` | `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb` |
+| Live markets | Coinbase and Kraken adapters, trades, quotes, price-level books, source integrity, online features, deterministic instrument sharding, freshness checks, and fail-closed quality transitions |
+| Research data | Local files, SEC EDGAR, BLS, US Treasury, FRED/ALFRED inspection, versioned Arrow interchange, Parquet datasets, DataFusion queries, lineage, revisions, and point-in-time filtering |
+| Analytics and models | Returns, risk, regression, fundamentals, macro features, native and ONNX inference, optional Python research and training, and governed point-in-time backtesting |
+| Portfolios | Holdings and transaction imports, cost basis, gains, income, performance, exposure, attribution, scenarios, and portfolio risk |
+| Risk and execution | Typed order intents, mandatory central risk checks, realistic local paper execution, fees, latency, slippage, partial fills, cancellation, reconciliation, and recovery |
+| Fair value | Evidence-backed ASC 820 and IFRS 13 measurements with separate Level 1, Level 2, Level 3, and unclassified outcomes |
+| Local interfaces | A cohesive CLI and a typed local stdio MCP server spanning source, market, research, fundamental, macro, portfolio, analysis, model, fair-value, bot, execution, and risk operations |
 
-**Diagnostic only — build and compatibility commands:**
+Provider coverage, authentication needs, data quality, and current limitations are documented in
+[Source coverage](docs/reference/source-coverage.md). Only observations that satisfy the complete
+`DirectVerified` qualification contract are eligible for immediate automated action; connecting to
+a provider does not grant that quality or execution authority.
 
-```bash
-cargo build --workspace --all-features --release --locked
+## Architecture
 
-# Create local state
-./target/release/market-squawk init
+Market Squawk separates latency-sensitive live processing from historical and analytical research.
+The two planes share domain contracts and mathematical kernels, but neither depends on the other's
+data pipeline.
 
-# Fully offline deterministic smoke run
-./target/release/market-squawk mock --events 100
+```mermaid
+flowchart TB
+    Operator["Operator or local application"]
+    LiveSources["Venue and broker interfaces"]
+    ResearchSources["Files, filings, macro, portfolios, and historical providers"]
 
-# Diagnostic capture of Coinbase Exchange single-venue, partial-coverage data for 30 seconds
-./target/release/market-squawk capture \
-  --products BTC-USD,ETH-USD \
-  --seconds 30
+    subgraph Local["Market Squawk on the local machine"]
+        Control["CLI and local stdio MCP"]
+        Services["Shared application services"]
+        Domain["Shared domain contracts<br/>identity · time · money · quality · provenance"]
 
-# Optionally validate a capture journal and reconstruct ending state for diagnostics
-./target/release/market-squawk replay --source coinbase-exchange
+        subgraph Live["Live execution plane"]
+            LiveAdapters["Live adapters"]
+            Integrity["Decode, sequence, checksum, and freshness validation"]
+            State["Instrument-owned books and online features"]
+            Decision["Strategy or model"]
+            Risk["Central risk authority"]
+            Paper["Paper execution"]
+        end
+
+        subgraph Research["Research data plane"]
+            Extractors["Extraction adapters"]
+            Normalize["Parse, validate, and normalize"]
+            Storage["Arrow · Parquet · SQLite catalog"]
+            Analytics["DataFusion · Rust analytics · Python"]
+        end
+    end
+
+    Operator --> Control
+    Control --> Services
+    Services --> LiveAdapters
+    Services --> Extractors
+    Domain --> LiveAdapters
+    Domain --> Extractors
+    LiveSources --> LiveAdapters
+    LiveAdapters --> Integrity --> State --> Decision --> Risk --> Paper
+    ResearchSources --> Extractors
+    Extractors --> Normalize --> Storage --> Analytics
 ```
 
-All local data defaults to `.market-squawk/`. Override it with `--data-dir` or `MARKET_SQUAWK_DATA_DIR`.
+SQLite, DataFusion, Parquet, Python, MCP requests, and arbitrary filesystem work remain outside the
+live event-to-action path. Strategies and models emit intents; only central risk can approve an
+order for the execution adapter.
 
-## Local MCP server
+Start with the [architecture overview](docs/architecture/overview.md) for the system context,
+runtime boundaries, failure behavior, and links to the focused architecture pages and decisions.
 
-Market Squawk ships one typed local stdio MCP server over the same application services used by the
-CLI. It enforces bounded schemas and results, cancellation and deadlines, durable local audit,
-controlled artifacts, and bounded worker lifecycle. Starting the server prepares local product
-state; provider access occurs only through the corresponding configured application operation.
+## Quick start
+
+The commands below build and start the current source checkout. For a versioned production-style
+installation, supported-platform details, and success checks, follow
+[Installation and local bootstrap](docs/operations/installation-and-bootstrap.md).
+
+### 1. Get the source and toolchain
 
 ```bash
-market-squawk mcp serve
+git clone https://github.com/Sawmonabo/market-squawk.git
+cd market-squawk
+rustup show active-toolchain
 ```
 
-For compatibility, `market-squawk mcp` starts the same production server. The former diagnostic
-`--offline`, `--products`, `--paper-bot`, and `Journal.GetSummary` MCP surface has been retired;
-immutable capture journals remain available through the local `replay` command.
+The repository pins Rust `1.97.1` with `rustfmt` and Clippy in
+[`rust-toolchain.toml`](rust-toolchain.toml).
+
+### 2. Build the local executable bundle
+
+```bash
+CARGO_INCREMENTAL=0 cargo build --locked --release \
+  --package market-squawk \
+  --bin market-squawk \
+  --bin market-squawk-capture-helper
+
+CARGO_INCREMENTAL=0 cargo build --locked --release \
+  --package market-squawk-modeling \
+  --features onnx-tract \
+  --bin market-squawk-onnx-worker
+```
+
+The three executables are written to `target/release/`. The application, capture helper, and ONNX
+worker should remain sibling files when installed.
+
+### 3. Initialize a local instance
+
+```bash
+MSQ="$PWD/target/release/market-squawk"
+DATA_ROOT="$PWD/.market-squawk"
+
+"$MSQ" --data-dir "$DATA_ROOT" config validate
+"$MSQ" --data-dir "$DATA_ROOT" init
+"$MSQ" --data-dir "$DATA_ROOT" doctor
+```
+
+The default local state is stored under `.market-squawk/`, which is ignored by Git. Use an absolute,
+operator-owned `--data-dir` for a durable installation.
+
+### 4. Open the guided provider setup
+
+Treasury Fiscal Data is a practical first source because it requires no provider account or API
+key:
+
+```bash
+"$MSQ" --data-dir "$DATA_ROOT" \
+  source setup treasury.fiscal-data --confirm
+```
+
+Market Squawk opens a temporary portal at `http://127.0.0.1:<port>`. Keep the launching terminal
+open, complete the guided setup in the browser, and then press Ctrl-C after the portal reports a
+successful activation. If the browser does not open automatically, use the exact loopback URL
+printed to stderr.
+
+Verify the local provider state:
+
+```bash
+"$MSQ" --data-dir "$DATA_ROOT" source status treasury.fiscal-data
+"$MSQ" --data-dir "$DATA_ROOT" source coverage treasury.fiscal-data
+"$MSQ" --data-dir "$DATA_ROOT" source health treasury.fiscal-data
+```
+
+Continue with [Source operations](docs/operations/source-operations.md) to set up other providers
+and [Research ingestion](docs/operations/research-ingestion.md) to discover, ingest, publish, and
+query provider data.
+
+## Use Market Squawk
+
+### Explore the CLI
+
+```bash
+"$MSQ" --help
+"$MSQ" source --help
+"$MSQ" dataset --help
+"$MSQ" portfolio --help
+"$MSQ" model --help
+```
+
+The top-level hierarchy covers configuration, sources, capture, ingestion, datasets, queries,
+features, models, portfolios, backtests, bots, execution, fair value, MCP, and readiness checks.
+The [CLI reference](docs/reference/cli.md) documents the complete command surface and confirmation
+rules.
+
+### Capture a public market-data sample
+
+This command captures a bounded, single-venue Coinbase Exchange diagnostic stream:
+
+```bash
+"$MSQ" --data-dir "$DATA_ROOT" \
+  capture --products BTC-USD,ETH-USD --seconds 30
+```
+
+Public diagnostic capture does not establish execution-quality data. Use
+[Source operations](docs/operations/source-operations.md) for the authenticated and
+quality-qualified provider workflows.
+
+### Run research and analytics
+
+Market Squawk supports two primary research entry points:
+
+- Import user-owned files and portfolios through the bounded local adapters.
+- Discover and ingest supported official provider datasets after guided source setup.
+
+Published observations flow through the local catalog into Arrow and Parquet datasets, bounded
+DataFusion queries, point-in-time feature construction, models, and backtests. Follow these
+task-oriented guides:
+
+- [Research ingestion](docs/operations/research-ingestion.md)
+- [Datasets and query](docs/operations/datasets-and-query.md)
+- [Model training and inference](docs/operations/model-inference.md)
+- [Portfolio and paper execution](docs/operations/portfolio-and-paper-execution.md)
+
+### Start the local MCP server
+
+```bash
+"$MSQ" --data-dir "$DATA_ROOT" mcp serve
+```
 
 Generic MCP client configuration:
 
@@ -381,7 +242,7 @@ Generic MCP client configuration:
       "command": "/absolute/path/to/market-squawk",
       "args": [
         "--data-dir",
-        "/absolute/path/to/market-data",
+        "/absolute/path/to/market-squawk-data",
         "mcp",
         "serve"
       ]
@@ -390,281 +251,108 @@ Generic MCP client configuration:
 }
 ```
 
-The server writes protocol responses only to stdout. Operational logs go to stderr. Local stdio
-access inherits the operating-system identity of the process that launches it. Tool calls are
-schema-validated, rate-limited, deadline- and cancellation-aware, result-bounded, and durably
-audited before accepted mutations are reported complete.
+The server communicates over local stdio. Protocol responses use stdout and operational logs use
+stderr. See the [MCP reference](docs/reference/mcp.md) for tool domains, schemas, limits, audit
+behavior, controlled artifacts, and client integration.
 
-### MCP tool domains
+## Documentation
 
-The shipping capability registry exposes typed tools in the `Source`, `Market`, `Research`,
-`Fundamental`, `Macro`, `Portfolio`, `Analysis`, `Model`, `FairValue`, `Bot`, `Execution`, and `Risk`
-domains. The exact server list is generated from the application capability registry so CLI and MCP
-operations share the same service and authority boundaries. Read-only DataFusion SQL remains a local
-CLI operation.
+The [documentation portal](docs/README.md) is the complete entry point. Use these direct routes:
 
-## Independent data planes
+| I want to… | Read |
+| --- | --- |
+| Understand the system and its boundaries | [Architecture](docs/architecture/README.md) |
+| Install and initialize Market Squawk | [Installation and bootstrap](docs/operations/installation-and-bootstrap.md) |
+| Configure local paths and secrets | [Configuration and secrets](docs/operations/configuration-and-secrets.md) |
+| Set up and operate data sources | [Source operations](docs/operations/source-operations.md) |
+| Ingest filings, macro data, files, and portfolios | [Research ingestion](docs/operations/research-ingestion.md) |
+| Build and query analytical datasets | [Datasets and query](docs/operations/datasets-and-query.md) |
+| Train or run local models | [Model inference](docs/operations/model-inference.md) |
+| Import portfolios or run paper execution | [Portfolio and paper execution](docs/operations/portfolio-and-paper-execution.md) |
+| Look up exact CLI, MCP, configuration, quality, or time contracts | [Reference](docs/reference/README.md) |
+| See current release blockers and accepted evidence | [Delivery ledger](docs/plans/delivery-ledger.md) |
+| Review release verification requirements | [Exact-head release gate](docs/verification/usable-release-gate.md) |
 
-```text
-                         shared domain contracts
-            instruments · time · money · quality · provenance
-                              │
-              ┌───────────────┴────────────────┐
-              │                                │
-       live execution plane             research data plane
-       direct source adapters           extraction adapters
-              │                                │
-       bounded live state               Arrow/Parquet datasets
-              │                                │
-       strategy and risk                point-in-time analytics
-              └───────────────┬────────────────┘
-                              │
-                    local CLI, catalog, MCP
-```
+Architecture pages explain design and decisions. Operations pages contain runnable procedures.
+Reference pages define exact current interfaces. Plans, reports, research, and verification retain
+delivery and evidence history.
 
-The planes may reuse pure mathematical kernels, but neither pipeline is a transport or persistence
-requirement for the other. Historical sources may differ from live sources. Journal replay is
-optional diagnostic tooling for integrity investigation and decoder reprocessing, not the research
-architecture or a completion dependency.
+## Development
 
-The research plane currently has a working local SQLite catalog, versioned Arrow interchange,
-authority-bound immutable Parquet publication and compaction, manifests, lineage, recovery, and
-bounded read-only DataFusion queries. Its point-in-time dataset service performs revision-aware,
-availability-bounded selection over exact parent manifests, validates source-authored historical
-universe membership, applies explicit corporate-action policy, produces leakage-bounded
-feature/label generations, and exposes the same application authority to ingestion and analytical
-consumers. The remaining mandatory capabilities are listed below and still block release.
+The workspace uses Rust Edition 2024, Cargo resolver 3, inherited workspace lints, and a committed
+lockfile. Crates are grouped by product responsibility:
 
-## Diagnostic compatibility data path
+| Path | Responsibility |
+| --- | --- |
+| `apps/market-squawk/` | CLI, application composition, local portal, and process lifecycle |
+| `crates/` | Shared domain, live, storage, analytics, modeling, portfolio, execution, valuation, services, and MCP |
+| `adapters/` | Provider, file, portfolio, and paper-execution boundaries |
+| `python/` | Optional point-in-time research, finance, visualization, and deterministic training |
+| `docs/` | Architecture, operations, reference, research, plans, reports, and verification |
 
-This runnable path exists for local capture, display, and paper simulation. It is not the
-production current-authority plane and never produces `DirectVerified` data.
+Before contributing:
 
-```text
-Coinbase Exchange WebSocket (single venue, partial coverage)
-        │
-        ▼
-raw JSON frame ──► bounded capture-admission queue ──► asynchronous CRC-framed journal writer
-        │
-        ▼
-decoder
-        │
-        ▼
-canonical market event
-        │
-        ▼
-order book ─► incremental features ─► optional paper bot
-        │                                  │
-        └────────► quality state           ▼
-                                       diagnostic calculation
-                                           │
-                                           ▼
-                                      paper fill only
-```
-
-No database, LLM, MCP request, notebook, or filesystem query is in the event-to-decision path.
-Before decode, the source synchronously attempts nonblocking admission of the exact raw frame to a
-count- and byte-bounded in-process queue. A returned diagnostic capture receipt means the frame
-passed diagnostic capture identity, generation, and integrity admission checks and entered that
-queue; it is never current live or source-registry authority and is not a writer or durability
-acknowledgement.
-Saturation, a stopped or closed writer, authority failure, or a generation change fails publication
-closed. The dedicated writer appends and flushes asynchronously outside the event-to-decision path.
-Writer, storage, or shutdown-deadline failure marks capture incomplete and prevents execution-quality
-qualification; explicit flush checkpoints and shutdown avoid an fsync on every frame.
-
-## Diagnostic data-integrity model
-
-The engine distinguishes source capture from market truth. Frames successfully appended to the local
-journal can be checksummed, replayed, and traced to their raw source bytes. Queue admission alone is
-not a durability claim. Capture health records an incomplete generation when asynchronous
-persistence cannot complete. No external venue or free provider is assumed globally complete or
-infallible.
-
-The compatibility engine's app-local `QualityState` values include:
-
-- `INITIALIZING`
-- `VALID`
-- `STALE`
-- `GAP_DETECTED`
-- `CHECKSUM_FAILED`
-- `DIVERGENT`
-- `QUARANTINED`
-
-Diagnostic paper intents are rejected unless the compatibility book is app-locally `VALID`,
-recently updated by a snapshot or delta, within calculation limits, and the diagnostic kill switch
-is inactive. `VALID` never means canonical `DirectVerified` and grants no production order
-authority. Heartbeats are tracked separately and never make a stale book fresh.
-
-## Journal format
-
-Each `.msj` file starts with `MSJ1`, followed by records:
-
-```text
-u32 little-endian payload length
-u32 little-endian payload CRC
-UTF-8 JSON RawEnvelope payload
-```
-
-Readers retain bounded compatibility with legacy `MEJ1/.mej` journals, but writers never create or
-append that format. If a source has both formats, replay and offline MCP fail closed until the user
-selects `--journal-format current` or `--journal-format legacy`; initialization never creates an
-empty current journal that would shadow a sole legacy file.
-
-The raw envelope preserves:
-
-- Event ID
-- Source
-- Connection ID
-- Source sequence when supplied
-- Exchange timestamp when supplied
-- Local receive timestamp
-- Exact raw payload bytes
-
-Optional MSJ journal-format evolution may add segmentation, cryptographic segment manifests, or
-compression while retaining independent compatibility. That diagnostic-journal evolution is
-separate from the runnable research ingestion, point-in-time dataset, and Parquet compaction
-services.
-
-## Paper execution modes
-
-The legacy optional flag exercises the authority-free compatibility path without risking capital:
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the binding
+   [project memory](docs/project-memory.md).
+2. Keep provider-specific schemas in adapters and keep analytical or control-plane work outside the
+   live event-to-action path.
+3. Run focused checks while developing.
+4. Run the repository gate before submitting an integration change:
 
 ```bash
-market-squawk capture --products BTC-USD --paper-bot
+CARGO_INCREMENTAL=0 ./scripts/verify.sh
 ```
 
-It is intentionally simple and not an investment recommendation. It generates fixed-size momentum
-intents after a warm-up window. Every intent passes through a diagnostic calculation before a
-paper-only simulated fill is recorded. It has no broker connection or production execution
-authority.
+The verification entry point runs repository-input and workspace-boundary checks, dependency and
+license policy, vulnerability and credential scanning, formatting, strict Clippy, locked tests,
+concurrency-model checks, release builds, and local CLI/MCP smoke checks while enforcing the
+repository's build-storage ceiling.
 
-The production-owned paper service is a separate command:
+See [CHANGELOG.md](CHANGELOG.md) for noteworthy changes.
 
-```bash
-market-squawk paper-bot \
-  --seconds 30 \
-  --initial-cash 100000 \
-  --fee-basis-points 100
-```
+## Local data, privacy, and cost
 
-It starts and shuts down the sealed Coinbase-to-live-to-risk-to-dispatch-to-paper graph. The graph
-uses the realistic paper engine, an evidence-bound initial sandbox portfolio, the fee-aware
-book-imbalance strategy, and canonical risk contracts. It still produces no executable orders
-because the integrated Coinbase source is `DirectUnverified`; source qualification stops the path
-before strategy intent can receive approval. This command demonstrates production ownership and
-lifecycle behavior, not an execution-eligible source-to-fill result.
+- No telemetry or analytics beacon is enabled.
+- Product state, research datasets, models, portfolios, controlled artifacts, and audit records are
+  local by default.
+- No paid software, paid API, cloud service, hosted database, container runtime, or external
+  telemetry infrastructure is mandatory.
+- Some optional provider modes require a user-owned free account or API key. Public and local-file
+  workflows remain available without a paid subscription.
+- External providers retain their own availability, coverage, terms, rate limits, and data-quality
+  constraints. Market Squawk records those separately from fair-value hierarchy and market depth.
 
-## Local verification
-
-```bash
-./scripts/verify.sh
-```
-
-This runs focused Python tests for repository-input hygiene, immutable CI action references, and the
-MCP smoke harness; workspace-boundary and generated-artifact gates; Cargo Deny, Cargo Audit, and
-Gitleaks tree/history scans; workspace-wide formatting, strict Clippy, tests, release build, and
-rustdoc; then CLI, offline mock, and timeout-bounded local MCP smoke tests. All Cargo operations that
-consume dependencies use the committed lockfile.
-
-To exercise MCP after building:
-
-```bash
-python3 scripts/smoke_mcp.py ./target/debug/market-squawk
-```
-
-## Repository boundaries
+Configuration precedence is:
 
 ```text
-apps/
-└── market-squawk/                 CLI, current live application, MCP, journal, and compatibility tests
-crates/
-├── market-squawk-analytics/       exact live feature kernels and versioned feature metadata
-├── market-squawk-backtesting/     PIT research execution and immutable experiment governance
-├── market-squawk-data/            SQLite catalog, Arrow, Parquet, DataFusion, and lineage
-├── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
-├── market-squawk-execution/       typed intents and bounded pre-authority account/risk coordination
-├── market-squawk-live/            production authority, sharding, books, and bounded snapshots
-├── market-squawk-mcp/             bounded local stdio MCP protocol and lifecycle foundation
-├── market-squawk-modeling/        immutable bundles, native inference, registry, and validator
-├── market-squawk-platform/        local paths, lifecycle, capture, persistence, and operations
-├── market-squawk-portfolio/       immutable accounting, reconciliation, analytics, and risk state
-├── market-squawk-python/          stable-ABI bindings for bounded research and dataset admission
-├── market-squawk-services/        shared application-service contracts
-├── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
-└── market-squawk-valuation/       ASC 820/IFRS 13 evidence, classification, and approval workflow
-adapters/
-├── market-squawk-adapter-bls/       BLS public and registered-tier extraction
-├── market-squawk-adapter-coinbase/  Coinbase Exchange v1 source and protocol fixtures
-├── market-squawk-adapter-files/     CSV/TSV/JSON/NDJSON/XML/Excel/SQLite/OFX/QFX/Parquet extraction
-├── market-squawk-adapter-fred/      FRED/ALFRED observations and vintage extraction
-├── market-squawk-adapter-kraken/    Kraken v2 transport, decoder, checksum, and session source
-├── market-squawk-adapter-paper/     realistic paper execution, accounting, audit, and recovery
-├── market-squawk-adapter-portfolio/ raw-preserving holdings and transaction normalization
-├── market-squawk-adapter-sec/       SEC submissions, filings, Company Facts, and inline XBRL
-└── market-squawk-adapter-treasury/  Fiscal Data and five-family daily-rate extraction
-python/                             local PIT data, finance, visualization, training, and examples
-scripts/                            deterministic local/CI policy and smoke gates
-docs/                               architecture, operations, reference, plans, research, and evidence
+safe defaults
+→ explicit local configuration file
+→ MARKET_SQUAWK_* environment variables
+→ CLI overrides
 ```
 
-The [documentation portal](docs/README.md) owns current architecture, operations, and reference
-navigation. Required implementations are listed under **Required but missing**.
+Credentials are entered only through supported local setup flows and are redacted from
+configuration, logs, CLI/MCP results, and release evidence. See
+[Configuration and secrets](docs/operations/configuration-and-secrets.md).
 
-## Zero-cost boundary
+## Security
 
-The project has no mandatory paid software, API, cloud, telemetry, or hosted database. Existing
-hardware, storage, electricity, and internet access are outside the software-cost claim. External
-market providers retain their own coverage, availability, licensing, and rate constraints.
+Please report vulnerabilities privately according to [SECURITY.md](SECURITY.md). Do not place
+provider credentials, portfolio data, proprietary datasets, or sensitive logs in a public issue,
+pull request, command line, configuration file, or chat.
 
-The architecture removes avoidable vendor dependence through adapters, local persistence, caching,
-explicit coverage, source health, and fail-closed degradation.
+Market Squawk currently provides paper execution only. No live-money broker adapter or unchecked
+order-submission path is enabled.
 
 ## License
 
 Market Squawk is available under your choice of the
 [Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT)
-(`Apache-2.0 OR MIT`). Contributions are accepted under those same terms unless explicitly stated
-otherwise.
+(`Apache-2.0 OR MIT`).
 
-## Release-blocking implementation map
+## Financial-use notice
 
-The [usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md)
-is the executable delivery contract. Stages and Waves describe dependency/parallel ownership inside
-exactly four production-weighted review quarters:
-
-1. **Quarter 1 of 4 — Stages 0–1 / Waves 0–1B:** close the live/capture prerequisite; refresh truth,
-   dependencies, rights, and ownership; then complete production Coinbase/risk/paper execution,
-   SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
-2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
-   compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
-3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** accepted at exact pushed head `c6f0124` after model
-   bundles, native/ONNX inference, portfolio accounting and execution binding, the sealed Python
-   product, point-in-time backtesting, fair-value analysis, grouped exact-head review, and the full
-   nonincremental release gate passed.
-4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** shared services, the complete CLI and typed MCP
-   domains, the first evidence-bound provider activations, and the product documentation portal are
-   implemented. The complete offline demonstration and strict closure producers are also
-   implemented. Remaining provider workflows, clean-machine activation evidence, exact-head
-   demonstration/fuzz/performance/security and supply-chain evidence, prerequisite-issue
-   reconciliation, grouped review, publication, and cleanup still block the complete release.
-
-Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
-clean exact commit with grouped independent review and remediation of every substantiated Critical,
-Important, or Minor finding.
-No per-task review rounds or fifth delivery quarter are part of the plan. Stage, Wave, and percentage
-describe progress; none authorizes a partial-release stop.
-
-## Primary references
-
-- [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels)
-- [Kraken Spot WebSocket v2 book checksum guide](https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/)
-- [MCP stdio transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-- [Rust installation](https://rustup.rs/)
-
-## Financial-use warning
-
-This project is research infrastructure. Free market data may be incomplete, delayed,
-venue-specific, revised, or unavailable. Validate data rights, source quality, execution
-assumptions, fees, slippage, liquidity, and risk controls before relying on any result. No software
-can guarantee investment outcomes or universal market-data accuracy.
+Market Squawk is financial research infrastructure, not investment advice. Free market data may be
+incomplete, delayed, venue-specific, revised, or unavailable. Validate source quality, data rights,
+model assumptions, fees, slippage, liquidity, portfolio inputs, and risk controls before relying on
+any result. No software can guarantee investment outcomes or universal market-data accuracy.

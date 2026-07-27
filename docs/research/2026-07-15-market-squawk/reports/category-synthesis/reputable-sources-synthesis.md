@@ -185,7 +185,7 @@ There is no direct conflict among the sources; apparent conflicts come from scop
   Market Squawk data quality qualifies feeds for use. These must not be collapsed.
 - **Provider-policy variance:** SEC's cross-machine aggregate limit and BLS's tiered quotas require
   provider-specific policy objects, not one hard-coded rate.
-- **Local-first versus hosted assurance:** SLSA Build L2/L3 relies on hosted build infrastructure,
+- **Self-hosted versus hosted assurance:** SLSA Build L2/L3 relies on hosted build infrastructure,
   while Market Squawk cannot require cloud. Resolve this with a complete local build and an optional
   hosted assurance channel, without claiming L2/L3 for local artifacts.
 - **Guidance applicability:** Supervisory model/stress principles inform engineering but do not

@@ -158,7 +158,7 @@ license, credential, and reproducibility checks remain separate because SLSA doe
 2. **Inference:** Every exception—fair-value override, access-policy override, security-control N/A,
    failed release gate—needs an owner, reason, timestamp, approval, and expiration. No exception may
    bypass pre-trade risk.
-3. **Inference:** Local-first does not mean unverifiable: manifests, hashes, attestations, audit logs,
+3. **Inference:** Self-hosted does not mean unverifiable: manifests, hashes, attestations, audit logs,
    test results, and source snapshots can all remain local and use free tooling.
 
 ## Limitations and Non-Findings

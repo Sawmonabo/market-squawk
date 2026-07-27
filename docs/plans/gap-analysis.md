@@ -69,7 +69,7 @@ below describe the audit anchor; in-flight remediation is not counted as impleme
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| P-01 | Local-first platform | Partial | Current capture, journal, CLI, and MCP are local; most product domains are missing. | 1-7 |
+| P-01 | Self-hosted platform | Partial | Current capture, journal, CLI, and MCP are local; most product domains are missing. | 1-7 |
 | P-02 | Direct live market ingestion | Partial | Coinbase public WebSocket works; required Kraken and broader contracts are missing. | 2 |
 | P-03 | Low-latency signals and automated actions | Partial | Qualification, current authority, deterministic sharding, and state processing exist. Q2-I01, Q2-I04–Q2-I07, and Q2-I09 still block checkpoint readiness; Task 8 intentionally returns `NoStrategy`, and features/risk/execution remain. | 1-2, 5 |
 | P-04 | Historical and point-in-time research | Missing | No research storage, observations, revisions, or PIT builder. | 3-4 |

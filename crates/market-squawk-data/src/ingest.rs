@@ -110,10 +110,10 @@ pub fn extraction_batch_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest
 /// Returns the exact provider payload digest that owns one normalized extraction.
 ///
 /// This identity deliberately comes from the discovered source object rather than normalized
-/// record bytes. Normalized rows retain receive, ingestion, and local-first availability times,
-/// which are truthful attempt provenance but must not turn a retry of the same immutable provider
-/// object into a second ingest. The source-object contract already binds the exact provider bytes
-/// and extraction rejects a refetch whose bytes do not match that evidence.
+/// record bytes. Normalized rows retain receive, ingestion, and locally observed availability
+/// times, which are truthful attempt provenance but must not turn a retry of the same immutable
+/// provider object into a second ingest. The source-object contract already binds the exact
+/// provider bytes and extraction rejects a refetch whose bytes do not match that evidence.
 pub fn extraction_provider_payload_digest(batch: &ExtractionBatch) -> EvidenceDigest {
     batch.request().object().evidence().content_digest()
 }

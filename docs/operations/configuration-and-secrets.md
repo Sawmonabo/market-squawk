@@ -269,7 +269,7 @@ limited to 8192 characters.
 At this reviewed source head, the credentialed profiles have different release states:
 
 - `bls.v2-registered` is `refresh_required`;
-- `fred-alfred.api-v1-v2` revision 4 is `rights_limited`: bounded ephemeral retrieval is available,
+- `fred-alfred.api-v1-v2` revision 5 is `rights_limited`: bounded ephemeral retrieval is available,
   while persistence and training require exact written St. Louis Fed service permission plus
   independent exact-series public-domain or owner-permission evidence.
 

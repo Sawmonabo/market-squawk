@@ -112,7 +112,7 @@ pub struct BlsNormalizedPage {
 }
 
 impl BlsNormalizedPage {
-    /// Returns the process-local first-observation time for this exact source response.
+    /// Returns when this process first observed the exact source response.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
     }

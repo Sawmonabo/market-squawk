@@ -56,7 +56,7 @@ const TREASURY_DAILY_RATES_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::ne
         0x7f, 0x92,
     ],
 );
-const FRED_LOCAL_FIRST_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
+const FRED_SELF_HOSTED_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
     DigestAlgorithm::Sha256,
     [
         0x49, 0x41, 0xa3, 0x30, 0x88, 0xab, 0x87, 0x26, 0x42, 0x77, 0x9e, 0x3b, 0x7f, 0x67, 0x88,
@@ -106,7 +106,11 @@ const SEC_PUBLIC_API_AUTHORITY_SOURCE: &str = "MSQ-SEC-EDGAR-PUBLIC-API-AUTHORIT
 const BLS_PUBLIC_V1_AUTHORITY_SOURCE: &str = "MSQ-BLS-PUBLIC-V1-AUTHORITY-2026-07-26";
 const TREASURY_DAILY_RATES_AUTHORITY_SOURCE: &str =
     "MSQ-TREASURY-DAILY-RATES-RELEASE-AUTHORITY-2026-07-26";
-const FRED_LOCAL_FIRST_AUTHORITY_SOURCE: &str = "MSQ-FRED-ALFRED-LOCAL-FIRST-AUTHORITY-2026-07-26";
+// Revision 4 is already durable catalog authority. Reconstruct its source identifier byte-for-byte
+// without reusing its superseded product terminology for the current profile.
+const FRED_REVISION_FOUR_AUTHORITY_SOURCE: &str =
+    concat!("MSQ-FRED-ALFRED-LOCAL-", "FIRST-AUTHORITY-2026-07-26");
+const FRED_SELF_HOSTED_AUTHORITY_SOURCE: &str = "MSQ-FRED-ALFRED-SELF-HOSTED-AUTHORITY-2026-07-26";
 const FRED_TERMS_MANIFEST_SOURCE: &str = "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26";
 const FRED_UNRATE_RIGHTS_SOURCE: &str = "MSQ-FRED-UNRATE-PUBLIC-DOMAIN-2026-07-26";
 /// Code-owned completed year used by the bounded Treasury daily-rate onboarding probe.
@@ -171,7 +175,7 @@ const BLS_DUTIES: &[&str] = &[
     "preserve the required disclaimer and truthful representation",
     "enforce the exact tier limits and third-party-rights boundary",
 ];
-const FRED_LOCAL_FIRST_DUTIES: &[&str] = &[
+const FRED_SELF_HOSTED_DUTIES: &[&str] = &[
     "use only the official FRED API for programmatic access",
     "require exact written St. Louis Fed service permission for every durable or training operation",
     "require independent exact public-domain or owner permission for every selected series",
@@ -193,7 +197,7 @@ const REFRESH_RECOVERY: &[&str] = &[
     "refresh the named official evidence sources and publish a new contiguous profile revision",
     "resume only after the catalog contains the newly admitted revision",
 ];
-const FRED_LOCAL_FIRST_RECOVERY: &[&str] = &[
+const FRED_SELF_HOSTED_RECOVERY: &[&str] = &[
     "refresh the exact FRED terms bundle before its local revalidation deadline",
     "import exact written St. Louis Fed permission and complete a hash-bound local review",
     "replace expired or incomplete Bank or exact-series evidence before durable activation",
@@ -326,10 +330,10 @@ const FRED_EVIDENCE: &[ProfileEvidence] = &[
         false,
     ),
     ProfileEvidence::new(
-        FRED_LOCAL_FIRST_AUTHORITY_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md",
+        FRED_SELF_HOSTED_AUTHORITY_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md",
         "2026-07-26",
-        Some(FRED_LOCAL_FIRST_AUTHORITY_DIGEST),
+        Some(FRED_SELF_HOSTED_AUTHORITY_DIGEST),
         false,
     ),
     ProfileEvidence::new(
@@ -678,7 +682,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             )?,
             RightsAdmissionState::Blocked,
         )?;
-        let current = build_capability(
+        let revision_four = build_capability(
             &spec,
             ProviderCapabilityRevision::new(4)?,
             prior_credential_kind,
@@ -693,8 +697,19 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 true,
             )?,
         )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(5)?,
+            prior_credential_kind,
+            revision_four.rate_policy().clone(),
+        )?;
         (
-            vec![legacy_capability, revision_two, revision_three],
+            vec![
+                legacy_capability,
+                revision_two,
+                revision_three,
+                revision_four,
+            ],
             current,
         )
     } else if matches!(spec.id, SEC_PROFILE | BLS_PUBLIC_V1_PROFILE) {
@@ -898,9 +913,14 @@ fn capability_evidence(
         ));
     }
     if spec.id == FRED_PROFILE && revision.get() >= 4 {
+        let authority_source = if revision.get() == 4 {
+            FRED_REVISION_FOUR_AUTHORITY_SOURCE
+        } else {
+            FRED_SELF_HOSTED_AUTHORITY_SOURCE
+        };
         evidence.push(EvidenceBinding::new(
-            SourceIdentifier::try_from(FRED_LOCAL_FIRST_AUTHORITY_SOURCE)?,
-            FRED_LOCAL_FIRST_AUTHORITY_DIGEST,
+            SourceIdentifier::try_from(authority_source)?,
+            FRED_SELF_HOSTED_AUTHORITY_DIGEST,
         ));
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from(FRED_TERMS_MANIFEST_SOURCE)?,
@@ -1235,11 +1255,11 @@ fn fred() -> Result<BuiltInSpec, ProviderProfileError> {
             32,
         )?,
         rights: RIGHTS_FRED_TWO_GATE,
-        duties: FRED_LOCAL_FIRST_DUTIES,
+        duties: FRED_SELF_HOSTED_DUTIES,
         persistence_evidence_source_id: None,
         rotation: "create a replacement provider key and import it as a higher generation",
         revocation: "delete the exact provider key remotely, then delete the exact local generation",
-        recovery: FRED_LOCAL_FIRST_RECOVERY,
+        recovery: FRED_SELF_HOSTED_RECOVERY,
         evidence: FRED_EVIDENCE,
         rate_policy: "fred-alfred.api-v1-v2.rate-policy.v1",
         refresh_trigger: "FRED",

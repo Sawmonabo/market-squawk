@@ -329,7 +329,7 @@ network sources, the basis comes from the active onboarding lease and its provid
 or ownership evidence. A CLI `--confirm` is consent to execute the already-authorized operation; it
 is not a substitute for rights.
 
-FRED is additionally fail-closed through independent service and series gates. Revision 4 admits
+FRED is additionally fail-closed through independent service and series gates. Revision 5 admits
 persistence or model training only when exact written St. Louis Fed permission reacquired from its
 official HTTPS URL and exact-series authority both cover the requested operation and their validity
 windows intersect the current terms. API-key validity, email headers, a contact receipt, or
@@ -459,7 +459,7 @@ manifest and acquisition evidence according to the operator's retention policy.
 - [Backup and recovery](backup-and-recovery.md)
 - [Mutable delivery ledger](../plans/delivery-ledger.md)
 - [FRED rights decision](../verification/fred-rights-decision.json)
-- [FRED/ALFRED local-first API authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md)
+- [FRED/ALFRED self-hosted API authority](../research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md)
 - [`application/research/ingest.rs`](../../apps/market-squawk/src/application/research/ingest.rs)
 - [`local_product/cli_transport/files.rs`](../../apps/market-squawk/src/local_product/cli_transport/files.rs)
 - [`data/ingest.rs`](../../crates/market-squawk-data/src/ingest.rs)

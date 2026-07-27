@@ -33,12 +33,12 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         fred.capability().rights_state(),
         RightsAdmissionState::Pending
     );
-    assert_eq!(fred.capability().revision().get(), 4);
+    assert_eq!(fred.capability().revision().get(), 5);
     assert_eq!(
         fred.capability_history()
             .map(|capability| capability.revision().get())
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
     );
     assert!(
         fred.capability_history()
@@ -65,7 +65,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
             .is_err()
     );
     for source in [
-        "MSQ-FRED-ALFRED-LOCAL-FIRST-AUTHORITY-2026-07-26",
+        "MSQ-FRED-ALFRED-SELF-HOSTED-AUTHORITY-2026-07-26",
         "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26",
     ] {
         assert!(
@@ -75,6 +75,25 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
                 .any(|binding| binding.source_id().as_str() == source)
         );
     }
+    let revision_four = fred
+        .capability_history()
+        .find(|capability| capability.revision().get() == 4)
+        .ok_or("missing immutable FRED/ALFRED revision 4")?;
+    let revision_four_source = concat!("MSQ-FRED-ALFRED-LOCAL-", "FIRST-AUTHORITY-2026-07-26");
+    assert!(
+        revision_four
+            .evidence()
+            .iter()
+            .any(|binding| { binding.source_id().as_str() == revision_four_source })
+    );
+    assert_eq!(
+        revision_four.content_digest().bytes(),
+        [
+            0x63, 0xc7, 0x72, 0x79, 0x5a, 0x8e, 0x54, 0xd7, 0x21, 0x5f, 0xd0, 0x39, 0x5b, 0x41,
+            0xc9, 0x75, 0x67, 0xa8, 0x1d, 0x95, 0x39, 0x5b, 0x8f, 0xb9, 0x36, 0xd3, 0x2b, 0x00,
+            0x90, 0x28, 0x4d, 0xd9,
+        ]
+    );
     for (profile_id, evidence_source, evidence_digest) in [
         (
             "sec.edgar-public",
@@ -568,12 +587,12 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             binding.source_id().as_str() == "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25"
         }));
     }
-    assert_eq!(fred.capability().revision().get(), 4);
+    assert_eq!(fred.capability().revision().get(), 5);
     assert_eq!(
         fred.capability_history()
             .map(|capability| capability.revision().get())
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
     );
     assert_eq!(treasury_fiscal.capability().revision().get(), 4);
     assert_eq!(

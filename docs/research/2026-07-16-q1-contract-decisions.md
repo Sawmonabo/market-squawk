@@ -79,7 +79,7 @@ the venue and venue symbol. Every provider-native assertion is retained as a ver
 - mandatory algorithm-qualified content evidence plus zero or more bounded canonical version-pinned
   locators (`ProviderIdentityEvidence::MAX_LOCATORS = 64`); these are non-substantive retrieval
   metadata and never replace the digest, so a bare or mutable URL is not evidence;
-- provider source timestamp when supplied and local first-`observed_at` timestamp;
+- provider source timestamp when supplied and the local `observed_at` timestamp;
 - caller/source-supplied revision and predecessor claims bound to exact content evidence;
 - asserted effective interval and later supersession evidence.
 

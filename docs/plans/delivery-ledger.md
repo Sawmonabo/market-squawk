@@ -679,7 +679,7 @@ through this shipping path together with every other required provider predicate
 Current official FRED Services and API terms prohibit storage, caching, archival, database
 incorporation, and software or model training. The revision-4 profile is therefore
 `rights_limited`, not generally available for durable use. The maintained authority decision is
-`docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md`, SHA-256
+`docs/research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md`, SHA-256
 `658324385cd927d258890028838b59dde5335a29f82a0346c1f23736abe5668b`.
 
 Durable activation now requires both exact written St. Louis Fed service permission and independent

@@ -60,7 +60,7 @@ decisions can be audited without relying on conversation history.
 - [Treasury daily rates release authority](providers/2026-07-26-treasury-daily-rates-release-authority.md)
   — official five-family feed coverage, CC0 durable-use authority, current implementation gap,
   and mandatory V1 release evidence.
-- [FRED and ALFRED local-first API authority](providers/2026-07-26-fred-alfred-local-first-api-authority.md)
+- [FRED and ALFRED self-hosted API authority](providers/2026-07-26-fred-alfred-self-hosted-api-authority.md)
   — current two-gate durable-use decision, official source basis, and mandatory working real-data
   release proof.
 - [Historical FRED and ALFRED blocked decision](providers/fred-alfred-rights-2026-07-22.md) —

@@ -126,7 +126,7 @@
       "freshness_signals": "Live page accessed 2026-07-22.",
       "key_finding": "Sensitive data retention should be minimized, and secure storage supplied by the operating system or framework should be preferred to configuration files.",
       "implementation_implication": "Use the OS credential store as the default boundary; any fallback must be encrypted, authenticated, user-unlocked, and explicit, never a plaintext file or long-lived environment-variable substitute.",
-      "selection_rationale": "Directly informs a local-first secure-storage boundary without adding a paid or cloud dependency.",
+      "selection_rationale": "Directly informs a self-hosted secure-storage boundary without adding a paid or cloud dependency.",
       "limitations": "Platform-specific availability, prompts, access controls, and deletion behavior require primary OS documentation and testing.",
       "legal_review_dependency": false,
       "priority": "P0",

@@ -130,7 +130,7 @@ fn filing_family(filing: &SecFiling) -> (String, String) {
 /// Normalizes every numeric Company Facts occurrence with conservative availability semantics.
 ///
 /// SEC acceptance and filing dates are retained by their source records but are not silently
-/// promoted to first-public-availability evidence. The raw response's local first-observed time is
+/// promoted to first-public-availability evidence. The raw response's first local observation is
 /// therefore the default point-in-time cutoff for online retrievals, while offline imports remain
 /// explicitly unknown. Amendments and later occurrences for the same concept/unit/period receive
 /// increasing revision numbers and are never overwritten.

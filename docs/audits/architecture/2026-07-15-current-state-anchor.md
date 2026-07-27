@@ -338,7 +338,7 @@ p99 claim is made before Task 14 measures the integrated pipeline on documented 
 
 ## Security and access boundary
 
-The application remains local-first with no mandatory paid software/API, cloud, external database,
+The application remains self-hosted with no mandatory paid software/API, cloud, external database,
 container runtime, telemetry, or OpenTelemetry dependency. Outbound source connections are explicit;
 there is no analytics beacon.
 

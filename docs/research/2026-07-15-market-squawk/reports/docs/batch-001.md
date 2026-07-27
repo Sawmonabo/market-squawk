@@ -279,7 +279,7 @@ coverage. Those checks must precede `DirectVerified` and any immediate automated
    versions using declared Rust compatibility. **Inference:** `Cargo.lock`, explicit Cargo
    features, Rust 1.97 locked builds, and dependency audits are a single release evidence set.
 
-5. **Ambient networking settings can violate local-first expectations.** **Confirmed:** Reqwest
+5. **Ambient networking settings can violate self-hosted expectations.** **Confirmed:** Reqwest
    enables system proxies by default and follows redirects by default. **Inference:** endpoint
    allowlists, redirect restrictions, and an explicit proxy decision are necessary to meet the
    no-hidden-outbound-request requirement.

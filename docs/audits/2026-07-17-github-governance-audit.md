@@ -27,7 +27,7 @@ or release claims.
 - GitHub Actions was enabled with all actions permitted. GitHub's repository-level
   `sha_pinning_required` field was `false`; the version-controlled workflow policy therefore remains
   the active control that rejects mutable action references.
-- The repository exposed the expected local-first, Rust, market-data, portfolio, risk, and MCP topic
+- The repository exposed the expected self-hosted, Rust, market-data, portfolio, risk, and MCP topic
   metadata. These topics are descriptive and do not establish implemented capability.
 - A separate repository-setup pass created the Q2, platform, sources, authority-risk, remediation,
   and checkpoint labels; applied the three applicable Q2/remediation/authority-risk labels to pull

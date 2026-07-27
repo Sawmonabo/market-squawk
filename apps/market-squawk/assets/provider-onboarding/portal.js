@@ -487,7 +487,7 @@ function guidedReturnRoute() {
 
 function renderWelcome() {
   const root = element('section', 'hero');
-  const eyebrow = element('p', 'eyebrow', 'Private, local-first setup');
+  const eyebrow = element('p', 'eyebrow', 'Secure, self-hosted setup');
   const heading = element('h1', '', 'Connect your free data sources');
   heading.dataset.pageHeading = '';
   const copy = element(

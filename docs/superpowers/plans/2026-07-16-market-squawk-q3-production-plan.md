@@ -87,7 +87,7 @@ implementation stops until the integration owner repairs both at one commit.
   coverage, quality ceiling, and known gaps are persisted under `docs/research/providers/`.
 - Preserve raw frames and exact provider lexemes; the adapter never duplicates live tick/lot
   qualification.
-- Preserve local-first/no-mandatory-paid/cloud/database/container/telemetry operation.
+- Preserve self-hosted/no-mandatory-paid/cloud/database/container/telemetry operation.
 - Do not claim 100,000 events/s or sub-millisecond p99 before measured evidence on documented
   hardware.
 

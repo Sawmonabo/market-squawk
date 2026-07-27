@@ -493,7 +493,7 @@ system never silently starts paper accounting from an empty state.
 
 ## Privacy and local operation
 
-Q3 preserves local-first operation, no mandatory cloud/database/container/telemetry dependency,
+Q3 preserves self-hosted operation, no mandatory cloud/database/container/telemetry dependency,
 endpoint allowlists, secret redaction, local structured tracing, and controlled artifacts.
 
 Rate limits and refusal responses use the registry-coordinated `SharedProviderBudget`, provider

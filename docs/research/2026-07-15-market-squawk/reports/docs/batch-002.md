@@ -194,7 +194,7 @@ explicit audit-data policy and must not silently corrupt execution-critical stat
    foreign keys default off, and Parquet settings are generic.
 3. SQLite should publish immutable dataset manifests; DataFusion should query only
    published versions; Arrow schemas should be checked against those manifests.
-4. Local-first still requires cancellation, resource caps, compaction, checkpoints,
+4. Self-hosted still requires cancellation, resource caps, compaction, checkpoints,
    and layered integrity checks.
 5. A bounded asynchronous boundary is mandatory between deterministic live state and
    research/control-plane persistence.

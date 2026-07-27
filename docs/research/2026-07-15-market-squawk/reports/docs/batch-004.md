@@ -122,7 +122,7 @@ delays possible at peaks. ([SEC developer FAQ](https://www.sec.gov/about/webmast
 
 **Inference.** An acceptance/filing timestamp is not proof of when Market Squawk could
 observe the record. Store source timestamps plus `received_at`/`ingested_at`; set
-`available_at` only from defensible source evidence or local first-successful fetch.
+`available_at` only from defensible source evidence or the first successful local fetch.
 Keep raw payload hashes so amended filings and changed facts become new revisions,
 never destructive overwrites.
 
@@ -208,7 +208,7 @@ health, not assert volatile observation values.
 
 ## Cross-Source Patterns
 
-1. A source timestamp, revision date, and local first-observed time are different.
+1. A source timestamp, revision date, and time first observed locally are different.
 2. Backfills and incremental APIs overlap; content identity and manifests prevent
    duplication without erasing revisions.
 3. Public access still requires honest identity, quotas, caching, and bounded backoff.

@@ -396,7 +396,7 @@ At the reviewed commit, release and rights gates have concrete consequences:
   declared contact and the exact CIK-to-instrument mapping consumed by normalization.
 - Registered BLS v2 remains a distinct `refresh_required`, provider-keyed surface; BLS v1
   availability does not authorize or activate v2.
-- FRED revision 4 is rights-limited. The shipping `Source.Inspect` boundary performs bounded
+- FRED revision 5 is rights-limited. The shipping `Source.Inspect` boundary performs bounded
   ephemeral official-API retrieval without research-dataset persistence. Current terms permit that
   boundary, while durable operations require exact written Bank service permission with an
   explicit hash-bound local review plus independent public-domain or owner-permission evidence for
@@ -579,7 +579,7 @@ contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Current API-specific durable-storage/training prohibitions and independent series-owner boundary | 2026-07-26 |
 | [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |
 | [FRED permissions contact route](https://fred.stlouisfed.org/contactus/) | Official request route; submission and acknowledgement are not permission | 2026-07-26 |
-| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |
+| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |
 | [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five provider families, start years, selectors, and zero-based all-history pagination | 2026-07-26 |
 | [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Matching public-access Data.gov records and CC0 durable-use admission | 2026-07-26 |
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Dataset-specific public API, query, paging, and provenance surface | 2026-07-23 |

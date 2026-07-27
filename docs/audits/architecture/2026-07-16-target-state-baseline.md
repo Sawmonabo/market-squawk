@@ -301,7 +301,7 @@ wire rejects `DirectVerified` without one, but provenance does not dereference o
 assessment relationship. It remains an audit assertion that the stateful live plane must revalidate.
 
 Every research observation additionally includes effective/reference time, publication time when
-known, availability time when evidenced, local first-observed time, revision identity, and
+known, availability time when evidenced, time first observed locally, revision identity, and
 superseded time. Unknown historical availability remains unknown; ingestion code does not invent it
 from a filing acceptance or observation date.
 

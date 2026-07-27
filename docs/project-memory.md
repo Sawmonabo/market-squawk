@@ -15,6 +15,14 @@ evidence standard: invariant-preserving contracts, fail-closed authority, bounde
 checked financial arithmetic, deterministic lifecycle control, durable audit/recovery semantics,
 adversarial tests, and verification at the exact reviewed commit.
 
+Market Squawk's product category is **self-hosted**: operators install and run it on infrastructure
+they control, application and analytical data remain local by default, and external provider
+connections are direct and explicitly configured. Use this category consistently in product
+positioning.
+The existing `LocalFirstObserved` provenance type is unrelated terminology: it means the first time
+this installation observed a record and remains a stable serialized financial-data contract. Prose
+describing that type should say "first observed locally."
+
 Do not choose compatibility scaffolding, a cheap shortcut, or an artificial deferral when the
 current architectural boundary is the correct place to implement the complete contract. Do not
 silently broaden scope either: significant new authority or product decisions still require an
@@ -246,7 +254,7 @@ Squawk must remain operable and approvable without a mandatory cloud service.
 
 ## GitHub publication discipline
 
-The canonical collaboration remote is the private GitHub repository
+The canonical collaboration remote is the public GitHub repository
 [`Sawmonabo/market-squawk`](https://github.com/Sawmonabo/market-squawk). The local repository keeps
 the imported bundle as `bundle-backup`; `origin` is the GitHub SSH remote.
 
@@ -1051,7 +1059,7 @@ acceptance decision is
 
 ## 2026-07-26 FRED/ALFRED mandatory working-release rule
 
-FRED/ALFRED local research is a mandatory V1 capability. Revision 4 permits bounded ephemeral
+FRED/ALFRED local research is a mandatory V1 capability. Revision 5 permits bounded ephemeral
 official-API retrieval while durable storage, caching, archival, database incorporation, and
 software or model training remain closed under the current terms. Durable activation requires two
 independent, concurrent authorities: exact written St. Louis Fed service permission covering
@@ -1088,7 +1096,7 @@ zero-fee durable unemployment-data path; true point-in-time vintages require arc
 evidence and retain BLS rather than FRED provenance.
 
 The maintained research basis is
-[`docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md`](research/providers/2026-07-26-fred-alfred-local-first-api-authority.md).
+[`docs/research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md`](research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md).
 
 ## 2026-07-26 provider-inspection and permission-authority invariant
 

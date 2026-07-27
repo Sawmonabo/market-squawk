@@ -1,6 +1,6 @@
 #![cfg_attr(all(test, target_os = "macos"), allow(linker_messages))]
 
-//! Local-first Market Squawk application composition.
+//! Self-hosted Market Squawk application composition.
 //!
 //! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
 //! event model is explicitly diagnostic and remains isolated from current execution authority.

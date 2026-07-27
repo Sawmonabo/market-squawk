@@ -47,7 +47,7 @@ and arbitrary filesystem/network work stay outside the live path.
 ## Research Scope and Date
 
 The decision context was the migration from the existing single-crate v0.1 toward the specified
-complete zero-mandatory-cost, local-first release. Research was frozen **as of 2026-07-15** and
+complete zero-mandatory-cost, self-hosted release. Research was frozen **as of 2026-07-15** and
 covered architecture, live Coinbase/Kraken data, research providers, storage, analytics, temporal
 correctness, models, backtesting, risk, paper execution, portfolio implications, fair value, MCP,
 security, supply chain, and performance evidence. It did not inspect or modify application code and
@@ -95,7 +95,7 @@ introduced in this final synthesis.
 4. **Risk dimensions are non-substitutable.** **Inference.** Data quality, accounting hierarchy,
    model validation, statistical risk, scenario results, and order eligibility answer different
    questions. No score or classification may bypass risk.
-5. **Local-first still needs explicit bounds.** **Confirmed.** Tokio, Reqwest, DataFusion, SQLite,
+5. **Self-hosted still needs explicit bounds.** **Confirmed.** Tokio, Reqwest, DataFusion, SQLite,
    and MCP expose mechanisms whose defaults do not define Market Squawk's queue, timeout, memory,
    disk, concurrency, result, or cancellation policy
    ([Tokio](https://docs.rs/tokio/latest/tokio/sync/mpsc/),

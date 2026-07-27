@@ -10,7 +10,7 @@ use uuid::Uuid;
 /// Market Squawk's complete local command-line surface.
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk")]
-#[command(about = "Local-first market data, research, analytics, and paper execution")]
+#[command(about = "Self-hosted market data, research, analytics, and paper execution")]
 #[command(version)]
 pub struct Cli {
     /// Local Market Squawk data root.

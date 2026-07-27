@@ -228,7 +228,7 @@ budget, bounded concurrency, caching, backoff, paginator, schema validation, and
 source-health state. Use SEC bulk plus API reconciliation; pin every FRED real-time and
 transformation parameter; chunk BLS deterministically and inspect each requested
 series; keep separate Treasury REST/XML paginators and guard against projection
-aggregation. Immutable raw payload hashes, request parameters, local first-observed
+aggregation. Immutable raw payload hashes, request parameters, time first observed locally,
 times, parser/schema revisions, and manifests make overlapping retrieval idempotent
 without erasing amendments or revisions.
 
@@ -349,7 +349,7 @@ contract differences that a generic abstraction must not erase:
 3. **Version and provenance are part of meaning.** Rust/Cargo versions, Cargo features,
    MCP version, provider schema/methodology eras, data vintages, parser revisions,
    model opsets, and artifact hashes belong in manifests and audit evidence.
-4. **Local-first does not mean resource-free.** Bounded memory, temporary disk,
+4. **Self-hosted does not mean resource-free.** Bounded memory, temporary disk,
    concurrency, result size, request budgets, checkpoints, cancellation, and
    compaction remain necessary without cloud infrastructure.
 5. **Live and research planes have different qualification standards.** Direct feed

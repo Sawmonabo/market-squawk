@@ -23,7 +23,7 @@ The official sources were reviewed again for the V1 provider gate:
 - BLS still states that its publications are public domain except previously copyrighted
   photographs and illustrations, and asks users to cite BLS as the source.
 - The API still provides current published historical observations, not a historical-vintage
-  interface. Market Squawk must retain direct BLS provenance and local-first availability and must
+  interface. Market Squawk must retain direct BLS provenance and locally observed availability and
   not present those responses as reconstructed vintages.
 
 For the unemployment release vertical, the exact source series is `LNS14000000`. Durable
@@ -72,7 +72,7 @@ bind any derived training dataset to that exact BLS parent.
   adapter requests and accepts identity encoding only, then counts every streamed response byte.
 - Partial responses, missing or extra series, duplicates, out-of-window observations, changed
   refetch content, and provider messages/empty series invalidate the normalized batch.
-- Raw-response SHA-256, request-plan identity, source/revision metadata, local first-observation
+- Raw-response SHA-256, request-plan identity, source/revision metadata, first local observation
   time, preliminary/latest flags, lexical value, decimal value, and footnotes are preserved.
 - The request-plan identity binds each series metadata payload digest and authorization reference.
   Missing, duplicate, malformed, mismatched-digest, or schema-unknown metadata fails closed; the

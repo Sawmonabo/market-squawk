@@ -14,7 +14,7 @@
 
 This discovery is anchored to **2026-07-15**. It selects eight primary or highly
 authoritative source families that can constrain implementation and governance decisions for
-Market Squawk's zero-mandatory-cost, local-first market-data, research, modeling, portfolio,
+Market Squawk's zero-mandatory-cost, self-hosted market-data, research, modeling, portfolio,
 execution, and fair-value platform. The selected organizations are public data providers,
 standards bodies, public-sector security authorities, a vendor-neutral security foundation, and
 financial regulators or supervisory standard setters.

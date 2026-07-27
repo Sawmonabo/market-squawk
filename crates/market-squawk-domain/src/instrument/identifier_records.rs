@@ -180,7 +180,7 @@ pub struct ExternalIdentifierRecordInput {
     pub source_evidence: ExactPayloadEvidence,
     /// Source timestamp when supplied.
     pub source_timestamp: Option<Timestamp>,
-    /// Local first-observation time.
+    /// Time when this installation first observed the record.
     pub observed_at: Timestamp,
     /// Half-open interval during which this attachment applies.
     pub validity: EffectiveInterval,
@@ -245,7 +245,7 @@ impl ExternalIdentifierRecord {
         self.source_timestamp
     }
 
-    /// Returns local first-observation time.
+    /// Returns when this installation first observed the record.
     pub const fn observed_at(&self) -> Timestamp {
         self.observed_at
     }

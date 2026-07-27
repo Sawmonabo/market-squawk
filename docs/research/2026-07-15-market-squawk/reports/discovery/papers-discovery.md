@@ -16,7 +16,7 @@
 This discovery report identifies a focused evidence set for the architecture and correctness of
 Market Squawk as of **2026-07-15**. The decision context is not “which paper has the best trading
 returns,” but “which research results should shape implementable invariants, validation tests, and
-explicit limitations” in a zero-mandatory-cost, local-first market-data, research, risk, execution,
+explicit limitations” in a zero-mandatory-cost, self-hosted market-data, research, risk, execution,
 and valuation platform.
 
 The selected set covers:

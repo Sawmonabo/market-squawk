@@ -1761,7 +1761,7 @@
       "notes": "Excluded as duplicative: primary OS documentation plus OWASP Secrets Management provide the relevant storage boundary.",
       "priority": "P0",
       "retrieval_date": "2026-07-22",
-      "selection_rationale": "Directly informs a local-first secure-storage boundary without adding a paid or cloud dependency.",
+      "selection_rationale": "Directly informs a self-hosted secure-storage boundary without adding a paid or cloud dependency.",
       "source_type": "vendor-neutral cryptographic-storage guidance",
       "status": "excluded",
       "title": "OWASP Cryptographic Storage Cheat Sheet",

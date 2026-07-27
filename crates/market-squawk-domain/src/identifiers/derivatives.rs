@@ -393,7 +393,7 @@ pub struct FuturesContractIdentityInput {
     /// Source-authored timestamp when the definition carries one.
     #[serde(default)]
     pub source_timestamp: Option<Timestamp>,
-    /// Local first-observation timestamp for this payload.
+    /// Timestamp when this installation first observed the payload.
     pub observed_at: Timestamp,
     /// Venue namespace in which the security identity is valid.
     pub venue_id: VenueId,
