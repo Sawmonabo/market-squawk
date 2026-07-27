@@ -1,5 +1,9 @@
 # Provider release-evidence refresh — 2026-07-25
 
+> Historical audit snapshot. FRED/ALFRED conclusions were superseded on 2026-07-26 by the
+> [local-first exact-series authority](2026-07-26-fred-alfred-local-first-api-authority.md).
+> The original audit base, evidence, and conclusions below are retained as recorded.
+
 This report freezes the current official evidence for Market Squawk's zero-mandatory-fee provider
 surfaces and reconciles it against the repository at one exact audit base. It is a release decision
 record, not an authorized production probe or a substitute for provider-controlled credentials.

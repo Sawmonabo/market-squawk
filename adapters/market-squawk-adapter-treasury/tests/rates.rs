@@ -79,6 +79,21 @@ fn daily_par_yield_curve_is_civil_dated_and_official_delayed() -> TestResult {
         page.response_payload_digest(),
         <[u8; 32]>::from(Sha256::digest(exact_payload))
     );
+    let payload_without_redundant_ids = std::str::from_utf8(exact_payload)?
+        .replace(
+            "    <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve&amp;id=140</id>\n",
+            "",
+        )
+        .replace("        <d:Id m:type=\"Edm.Int32\">140</d:Id>\n", "");
+    let page_without_redundant_ids = DailyParYieldCurvePage::parse(
+        payload_without_redundant_ids.as_bytes(),
+        &request,
+        FiscalDataParseLimits::production_defaults(),
+    )?;
+    assert_eq!(
+        page_without_redundant_ids.observations()[0].source_record_id(),
+        "date:2026-01-02"
+    );
     assert!(
         profile
             .methodology_url()
@@ -206,6 +221,10 @@ fn daily_rate_queries_bind_all_five_official_datasets_and_periods() -> TestResul
             year.dataset().as_str(),
             format!("treasury:{dataset_token}:2025")
         );
+        assert_eq!(
+            year.analytical_dataset().as_str(),
+            format!("treasury.{dataset_token}.2025")
+        );
         let year_page = year.page(0)?;
         assert!(year_page.url().contains(&format!("data={provider_key}")));
         assert!(year_page.url().contains("field_tdr_date_value=2025"));
@@ -216,6 +235,10 @@ fn daily_rate_queries_bind_all_five_official_datasets_and_periods() -> TestResul
         assert_eq!(
             month.dataset().as_str(),
             format!("treasury:{dataset_token}:2026-01")
+        );
+        assert_eq!(
+            month.analytical_dataset().as_str(),
+            format!("treasury.{dataset_token}.2026-01")
         );
         assert!(
             month
@@ -229,6 +252,10 @@ fn daily_rate_queries_bind_all_five_official_datasets_and_periods() -> TestResul
         assert_eq!(
             all.dataset().as_str(),
             format!("treasury:{dataset_token}:all")
+        );
+        assert_eq!(
+            all.analytical_dataset().as_str(),
+            format!("treasury.{dataset_token}.all")
         );
         assert!(
             all.page(0)?
@@ -315,6 +342,16 @@ fn five_daily_rate_schemas_preserve_typed_rates_and_provider_metadata() -> TestR
         real_rate.extrapolation_factor(),
         Some(TreasuryExtrapolationFactor::NotApplicable)
     );
+    let long_term_history =
+        TreasuryDailyRateQuery::all_history(TreasuryDailyRateFamily::LongTermRates)?;
+    let long_term_history_page = TreasuryDailyRatePage::parse(
+        include_bytes!("../fixtures/daily_long_term_rates.xml"),
+        &long_term_history.page(0)?,
+        limits,
+    )?;
+    let mut long_term_tracker =
+        TreasuryDailyRatePaginationTracker::try_new(&long_term_history, 2, 600)?;
+    assert!(!long_term_tracker.accept(&long_term_history_page)?);
 
     let real_curve = TreasuryDailyRatePage::parse(
         include_bytes!("../fixtures/daily_real_par_yield_curve.xml"),

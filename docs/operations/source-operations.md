@@ -23,6 +23,7 @@ authority-free source status views.
 - [Run the supported Treasury Fiscal Data setup](#run-the-supported-treasury-fiscal-data-setup)
 - [Run the supported Treasury daily-rates setup](#run-the-supported-treasury-daily-rates-setup)
 - [Understand the source activate boundary](#understand-the-source-activate-boundary)
+- [Inspect one FRED or ALFRED page without persistence](#inspect-one-fred-or-alfred-page-without-persistence)
 - [Discover and ingest an exact provider object](#discover-and-ingest-an-exact-provider-object)
 - [Exchange sources, capture, and bot authority](#exchange-sources-capture-and-bot-authority)
 - [Expected success evidence](#expected-success-evidence)
@@ -43,12 +44,14 @@ source coverage [PROVIDER]
 source health [PROVIDER]
 source setup <PROVIDER> --confirm
 source discover <PROVIDER> --dataset <DATASET>
+source inspect <PROVIDER> --onboarding-session-id <UUID> \
+  --dataset-identifier <DATASET> [--page-index <0..63>] [--max-records <1..1024>]
 source activate <REQUEST> --confirm
 ```
 
-This page covers those exact commands and the usable Treasury Fiscal Data and five-family
-daily-rates portal paths. It explains how the same source surface can have distinct profile,
-onboarding, extraction, and live-runtime states.
+This page covers those exact commands, the bounded FRED/ALFRED inspection path, and the usable
+Treasury Fiscal Data and five-family daily-rates portal paths. It explains how the same source
+surface can have distinct profile, onboarding, extraction, and live-runtime states.
 
 At the reviewed commit there is no generic:
 
@@ -138,9 +141,9 @@ generation/reference, issuance time, and optional verification expiry. Callers c
 lease from a provider name or a profile's quality ceiling.
 
 A successful handoff or network probe never widens `retrieve`, `display`, `persist`,
-`model_training`, `export`, or `redistribute` rights. In particular, FRED/ALFRED remains fail-closed
-until affirmative scope-specific and per-series rights are admitted by a future code-owned
-revision.
+`model_training`, `export`, or `redistribute` rights. FRED/ALFRED revision 4 admits bounded
+ephemeral retrieval. Durable operations require both exact written St. Louis Fed service permission
+with a hash-bound local review and independent authority for every exact series and operation.
 
 ## Current code-owned source surfaces
 
@@ -152,9 +155,9 @@ ledger.
 | `coinbase.public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; persistence, modeling, export, and redistribution remain pending, and the shipping live adapter remains `DirectUnverified` |
 | `coinbase.exchange-direct-market-data` | `rights_limited` | `direct_verified` | Import and verify one View-only Exchange key envelope through the local portal; start the live-to-paper runtime only with the exact active session UUID; research/fair-value persistence, modeling, export, and redistribution remain pending |
 | `kraken.spot-public-market-data` | `rights_limited` | `direct_verified` | No-credential portal probe and source-session activation; the shipping book-v2 adapter remains `DirectUnverified` |
-| `sec.edgar-public` | `refresh_required` | `official_delayed` | SEC adapter and declared-contact onboarding are implemented, but portal activation is disabled until refreshed official evidence is published in a new code-owned revision |
-| `fred-alfred.api-v1-v2` | `rights_blocked` | `official_delayed` | All data-use operations are blocked; no key import, extraction, persistence, training, export, or redistribution procedure is authorized |
-| `bls.v1-unregistered` | `refresh_required` | `official_delayed` | BLS v1 extraction/onboarding is implemented but portal activation is disabled pending evidence refresh |
+| `sec.edgar-public` | `available` | `official_delayed` | Start zero-fee public setup with a truthful non-secret organization and monitored administrative email; activation and ingestion still require the exact CIK-to-instrument mapping and bounded official probe |
+| `fred-alfred.api-v1-v2` | `rights_limited` | `official_delayed` | Import a provider-issued zero-fee API key through guided setup, then use bounded `source inspect` with the active session. Durable activation additionally requires current terms, an exact Bank permission response matched against a fresh reacquisition from its official HTTPS URL, a hash-bound local review of exact series/operations/conditions, and independent exact-series authority |
+| `bls.v1-unregistered` | `available` | `official_delayed` | Start the zero-fee, no-account public-v1 setup; activation remains bounded to exact series metadata, inclusive years, and the public-v1 request budget |
 | `bls.v2-registered` | `refresh_required` | `official_delayed` | BLS v2 registered-tier and key lifecycle are implemented but portal secret import and activation are disabled pending evidence refresh |
 | `treasury.daily-rates-xml` | `available` | `official_delayed` | No-credential five-family research activation, durable publication, query, and restart recovery |
 | `treasury.fiscal-data` | `available` | `official_delayed` | Current supported portal workflow; no account, key, or paid service required |
@@ -166,9 +169,9 @@ The portal lists every profile with its handoff instruction, release state, and 
 full rights, duties, coverage, and evidence remain available in `source status` and
 `source coverage`. Setup is enabled only for `available` or `rights_limited` profiles with an
 exact source-session or research-adapter request. Public Coinbase, Coinbase Direct, Kraken,
-Treasury daily XML and Treasury Fiscal Data therefore have guided setup; SEC and both BLS
-profiles remain disabled while `refresh_required`, and FRED/ALFRED remains disabled while
-`rights_blocked`.
+SEC, unregistered BLS v1, Treasury daily XML, Treasury Fiscal Data, and scoped FRED/ALFRED
+therefore have guided setup. Registered BLS v2 remains disabled while `refresh_required`; public
+v1 availability does not authorize the registered surface.
 
 ## Read source status, coverage, and health
 
@@ -407,15 +410,43 @@ The closed provider kinds are:
 | `bls` | Exact series-metadata file references and hashes, inclusive start/end years, and either BLS surface lease |
 | `treasury_fiscal` | Inclusive first/last dates and page size for the exact Fiscal Data query |
 | `treasury_daily_rates` | Inclusive first/last years; every official family available in that range is activated |
-| `fred_alfred` | Exact rights artifact, API terms, services legal terms, privacy policy, per-series owner grants, operations, and validity intervals |
+| `fred_alfred` | Exact current terms artifact; exact official-HTTPS Bank response bytes verified by fresh reacquisition; explicit hash-bound review with reviewer, issuer, grantee, service, exact series, operations, conditions, and revalidation; independent per-series public-domain or owner evidence |
 
-Credential bytes are never part of this request. FRED's request shape does not override its
-`rights_blocked` profile; without an admitted active lease, the command fails closed.
+Credential bytes are never part of this request. FRED's request shape does not create rights:
+without an admitted active lease and both exact authority gates, the command fails closed. A
+contact-form submission or receipt is request-route provenance, not permission.
 
 Request bytes and referenced evidence digests are part of durable recipe identity. Do not
 reconstruct or reformat a portal request from status output, and do not use `source activate` after
 a portal activation to try to “make it more active.” An exact idempotent replay is accepted;
 competing configuration for an already active surface is rejected.
+
+## Inspect one FRED or ALFRED page without persistence
+
+Complete the guided `fred-alfred.api-v1-v2` setup first and retain the active onboarding session
+UUID returned by the product. Then request one bounded page:
+
+```bash
+"$MSQ" --config "$CONFIG" --output json \
+  source inspect fred-alfred.api-v1-v2 \
+  --onboarding-session-id "$SESSION_UUID" \
+  --dataset-identifier fred:series-observations:UNRATE:2024-01-01:2024-12-31 \
+  --page-index 0 \
+  --max-records 256
+```
+
+The command calls `Source.Inspect`. It reacquires and validates the code-owned current terms,
+binds the exact active onboarding session and its foreground credential access, validates the
+complete provider pagination contract, refetches the selected page under the same bounded request
+authority, and returns only canonical observations plus exact object and payload evidence. The
+selected object identifier has the closed form
+`fred-page-v2:<OFFSET>:<LIMIT>:<RETURNED>:<TOTAL>:<TERMINAL>:<PAGE_SHA256>:<METADATA_SHA256>`.
+
+This path does not create a research manifest, write provider bytes to Parquet, or mint ingestion
+authority. `page-index` is limited to `0..63`; `max-records` is limited to `1..1024` and remains
+subject to the application/MCP byte ceiling. A stale session, mismatched dataset, incomplete page
+sequence, invalid metadata, deadline, cancellation, or provider refusal fails the request without
+partial publication.
 
 ## Discover and ingest an exact provider object
 
@@ -524,6 +555,8 @@ extraction completed or that a dataset was published.
 
 - `source discover` returns a bounded exact-object listing with complete source metadata and no
   authority receipt.
+- `source inspect` returns one bounded FRED/ALFRED page with exact evidence and no durable
+  publication or ingestion receipt.
 - For an active, rights-admitted provider, `ingest source` rediscovers and binds the exact selected
   object before immutable publication.
 - Provider, dataset, object, metadata, coverage, quality, and receipt identity remain consistent;
@@ -567,9 +600,10 @@ the data root, and never remove files or catalog rows by hand.
 | Browser does not open | Local browser integration failed | Use only the exact loopback URL emitted on stdout/stderr while the command remains running |
 | Portal returns expired/unauthorized/CSRF error | Portal lifetime or local session boundary ended | Close the page and run a new confirmed `source setup` |
 | Official probe fails | DNS, TLS, endpoint, provider health, rate budget, or policy mismatch | Preserve the bounded error; retry only after the named condition clears |
-| SEC or BLS cannot activate | Reviewed profiles are `refresh_required` | Wait for a new code-owned evidence revision; implementation presence is not release availability |
-| FRED key/import or use is rejected | Profile is `rights_blocked` or per-series evidence is insufficient | Do not import a key; obtain qualified rights and a reviewed profile revision first |
-| Treasury XML cannot publish durably | Its separate rights profile admits retrieve/display but not persistence | Use the available Fiscal Data surface when its dataset fits; never inherit rights across surfaces |
+| SEC or public BLS v1 cannot activate | SEC declared contact or CIK mapping, BLS exact series metadata/year scope, the bounded official probe, or provider health is invalid | Correct the exact rejected input or provider condition; do not weaken the profile or substitute fixture evidence |
+| Registered BLS v2 cannot activate | The distinct keyed profile remains `refresh_required`, or its foreground credential is unavailable | Use public v1 within its limits or wait for an admitted registered-v2 revision; never treat v1 authority as v2 authority |
+| FRED key/import or use is rejected | API-key format, current terms, exact written Bank permission, hash-bound local review, exact-series authority, requested operations, or validity intersection is missing or mismatched | Correct the exact rejected authority or key generation; a successful key probe or contact receipt cannot replace either rights gate |
+| Treasury XML cannot publish durably | Family/query authority, CC0 evidence, official response, or publication integrity is incomplete | Preserve the exact error and rerun only after correcting the named family or authority input; never inherit rights across surfaces |
 | Discovery or ingestion rejects an object | Provider activation, rights, exact dataset/object identity, metadata, or the fresh process-local receipt no longer matches | Read current source status, rerun the bounded listing, and retry the exact confirmed ingestion; never fabricate or reuse a receipt |
 | Status shows `currentSession: active` and `runtime: not_active` | Research extraction adapter is active but no live market runtime exists in this process | Treat session/activation evidence as extraction status; do not fabricate live health |
 | Public Coinbase/Kraken coverage says `direct_verified` but runtime quality does not | Profile ceiling was confused with evidence-derived current qualification | Use runtime quality and the data-quality gate; those public shipping paths remain `DirectUnverified` |
@@ -622,9 +656,9 @@ configure a remote log exporter by default.
 
 ## Official sources
 
-These provider sources were reviewed directly on 2026-07-23. They describe upstream interfaces,
-limits, and terms; the reviewed Market Squawk profile revision remains the authority for what the
-product currently admits.
+These provider sources were reviewed directly through 2026-07-26. They describe upstream
+interfaces, limits, and terms; the reviewed Market Squawk profile revision remains the authority
+for what the product currently admits.
 
 | Source | Applied fact | Reviewed |
 | --- | --- | --- |
@@ -633,13 +667,18 @@ product currently admits.
 | [Coinbase Exchange WebSocket authentication](https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication) | Signed subscription fields for the authenticated Direct feed | 2026-07-25 |
 | [Coinbase Market Data Terms](https://www.coinbase.com/legal/market_data) | Current scoped-use and downstream-use boundary retained by the code-owned rights profile | 2026-07-25 |
 | [Kraken WebSocket v2 book checksum](https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2) | Optional CRC32 validation over the top ten price levels and exact local-book maintenance order | 2026-07-23 |
-| [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions/XBRL API boundary, no API key for these data APIs, and automated-access policy reference | 2026-07-23 |
-| [SEC developer resources](https://www.sec.gov/about/developer-resources) | Aggregate fair-access ceiling of no more than ten requests per second and declared-bot requirement | 2026-07-23 |
-| [BLS Public Data API FAQ](https://www.bls.gov/developers/api_faqs.htm) | Registered versus unregistered API behavior, limits, and registration lifecycle | 2026-07-23 |
+| [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions/XBRL API boundary, no API key for these data APIs, and automated-access policy reference | 2026-07-26 |
+| [SEC developer resources](https://www.sec.gov/about/developer-resources) | Aggregate fair-access ceiling of no more than ten requests per second and declared-bot requirement | 2026-07-26 |
+| [SEC EDGAR public API authority](../research/providers/sec-edgar-public-api-2026-07-26.md) | Exact zero-fee setup authority and mandatory real-response acceptance boundary | 2026-07-26 |
+| [BLS Public Data API FAQ](https://www.bls.gov/developers/api_faqs.htm) | Registered versus unregistered API behavior, limits, and registration lifecycle | 2026-07-26 |
 | [BLS API v2 signatures](https://www.bls.gov/developers/api_signature_v2.htm) | Exact registered-v2 request family, series identifiers, years, and registration-key field | 2026-07-23 |
-| [BLS terms of service](https://www.bls.gov/developers/termsOfService.htm) | Official API-use duties retained by the BLS profile | 2026-07-23 |
+| [BLS terms of service](https://www.bls.gov/developers/termsOfService.htm) | Official API-use duties retained by the BLS profile | 2026-07-26 |
+| [BLS Public Data API authority](../research/providers/bls-public-data-api-2026-07-21.md) | Available zero-fee public-v1 decision and distinct registered-v2 boundary | 2026-07-26 |
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Official Fiscal Service API query and pagination contract | 2026-07-23 |
 | [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five XML families, year/month selectors, and zero-based 300-row all-history pagination | 2026-07-26 |
 | [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Dataset-level public-access and CC0 evidence for durable local use | 2026-07-26 |
 | [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Required API key, mutable terms, usage restrictions, and obligations that prevent implied durable rights | 2026-07-23 |
-| [FRED API key documentation](https://fred.stlouisfed.org/docs/api/fred/v2/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-23 |
+| [FRED API key documentation](https://fred.stlouisfed.org/docs/api/api_key.html) | Provider-controlled account/key boundary; application users require their own keys | 2026-07-26 |
+| [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API-specific storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |
+| [FRED permissions contact route](https://fred.stlouisfed.org/contactus/) | Official route for requesting permission; a submission or acknowledgement is not permission | 2026-07-26 |
+| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |

@@ -73,6 +73,15 @@ impl ProviderBudgetPool {
         })
     }
 
+    pub(crate) fn new_in_memory_with_provider_rate(provider_rate: ProviderRateAuthority) -> Self {
+        Self {
+            budgets: Vec::new(),
+            durability: None,
+            provider_rate: Some(provider_rate),
+            local_coordinator: Some(ProcessBudgetCoordinator::new(MAX_PROCESS_BUDGET_SCOPES)),
+        }
+    }
+
     pub(crate) fn new_durable(session: Arc<AuthorityDurabilitySession>) -> Self {
         Self {
             budgets: Vec::new(),

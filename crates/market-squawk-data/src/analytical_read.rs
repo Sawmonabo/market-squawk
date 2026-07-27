@@ -302,6 +302,8 @@ impl AnalyticalFeatureDatasetPage {
 pub enum AnalyticalObservationTemplate {
     /// Every canonical research observation, including all retained revisions.
     All,
+    /// Regulatory and issuer filing observations.
+    Filing,
     /// Reported fundamental and XBRL fact observations.
     Fundamental,
     /// Macroeconomic series observations and revisions.
@@ -314,6 +316,7 @@ impl AnalyticalObservationTemplate {
     const fn storage_name(self) -> Option<&'static str> {
         match self {
             Self::All => None,
+            Self::Filing => Some("filing"),
             Self::Fundamental => Some("fundamental"),
             Self::Macro => Some("macro"),
             Self::AlternativeData => Some("alternative_data"),

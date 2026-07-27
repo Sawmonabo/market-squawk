@@ -249,6 +249,31 @@ pub enum SourceCommand {
         #[arg(long)]
         dataset: String,
     },
+    /// Inspect one bounded provider page without persisting it as a research dataset.
+    Inspect {
+        /// Active configured provider identifier.
+        provider: String,
+        /// Exact active onboarding session that owns the supplied credential.
+        #[arg(long)]
+        onboarding_session_id: Uuid,
+        /// Exact provider dataset identifier.
+        #[arg(long)]
+        dataset_identifier: String,
+        /// Zero-based provider page index.
+        #[arg(
+            long,
+            default_value_t = 0,
+            value_parser = clap::value_parser!(u8).range(..=63)
+        )]
+        page_index: u8,
+        /// Maximum provider observations returned from the selected page.
+        #[arg(
+            long,
+            default_value_t = 256,
+            value_parser = clap::value_parser!(u16).range(1..=1024)
+        )]
+        max_records: u16,
+    },
 }
 
 /// Direct capture arguments.
@@ -712,6 +737,21 @@ pub struct ReleaseProviderArguments {
     /// Require admitted FRED and ALFRED persistence and training rights.
     #[arg(long)]
     pub require_fred_alfred_rights: bool,
+    /// Exact zero-padded ten-digit CIK exercised through SEC filings and Company Facts.
+    #[arg(long, value_name = "CIK")]
+    pub sec_cik: Option<String>,
+    /// Exact FRED or ALFRED provider dataset exercised through durable release acceptance.
+    #[arg(long, value_name = "PROVIDER_DATASET")]
+    pub fred_dataset: Option<String>,
+    /// Bounded typed PIT build request that consumes the exact published FRED generation.
+    #[arg(long, value_name = "REQUEST_FILE")]
+    pub fred_training_request: Option<PathBuf>,
+    /// Exact BLS request-plan dataset exercised through durable release acceptance.
+    #[arg(long, value_name = "PROVIDER_DATASET")]
+    pub bls_dataset: Option<String>,
+    /// Bounded typed PIT build request that consumes the exact published BLS generation.
+    #[arg(long, value_name = "REQUEST_FILE")]
+    pub bls_training_request: Option<PathBuf>,
     /// New empty directory that will own provider evidence.
     #[arg(
         id = "provider_output_directory",

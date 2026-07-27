@@ -203,6 +203,7 @@ pub struct TreasuryDailyRateQuery {
     family: TreasuryDailyRateFamily,
     period: TreasuryDailyRatePeriod,
     dataset: SourceIdentifier,
+    analytical_dataset: SourceIdentifier,
     query_digest: [u8; 32],
 }
 
@@ -253,11 +254,18 @@ impl TreasuryDailyRateQuery {
             period.dataset_suffix()
         ))
         .map_err(|_| TreasuryProtocolError::InvalidQuery)?;
+        let analytical_dataset = SourceIdentifier::try_from(format!(
+            "treasury.{}.{}",
+            family.dataset_family_token(),
+            period.dataset_suffix()
+        ))
+        .map_err(|_| TreasuryProtocolError::InvalidQuery)?;
         let query_digest = query_digest(family, period, &dataset);
         Ok(Self {
             family,
             period,
             dataset,
+            analytical_dataset,
             query_digest,
         })
     }
@@ -323,9 +331,14 @@ impl TreasuryDailyRateQuery {
         self.period.is_all_history()
     }
 
-    /// Returns the canonical Market Squawk dataset identity.
+    /// Returns the canonical provider dataset identity accepted by discovery.
     pub const fn dataset(&self) -> &SourceIdentifier {
         &self.dataset
+    }
+
+    /// Returns the storage-safe analytical identity for this exact provider dataset.
+    pub const fn analytical_dataset(&self) -> &SourceIdentifier {
+        &self.analytical_dataset
     }
 
     /// Returns the exact query-family digest.
@@ -362,7 +375,7 @@ impl TreasuryDailyRatePageRequest {
         self.period
     }
 
-    /// Returns the canonical Market Squawk dataset identity.
+    /// Returns the canonical provider dataset identity bound to this request.
     pub const fn dataset(&self) -> &SourceIdentifier {
         &self.dataset
     }

@@ -5,6 +5,7 @@ mod request_dto;
 
 use std::path::{Path, PathBuf};
 
+use market_squawk_data::FeatureLabelDataset;
 use market_squawk_platform::{UserAuthorizedInputRoot, UserOwnedInputEvidence};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -53,14 +54,7 @@ pub(super) async fn build_point_in_time_dataset(
     if !confirmed {
         return Err(CliDatasetError::ConfirmationRequired);
     }
-    let (bytes, ownership) = read_request(request)?;
-    let request: DatasetBuildRequestDto =
-        serde_json::from_slice(bytes.as_bytes()).map_err(|_| CliDatasetError::RequestJson)?;
-    let admitted = request.into_domain(ownership)?;
-    let built = product
-        .research()
-        .build_dataset(admitted, CancellationToken::new())
-        .await?;
+    let built = build_point_in_time_dataset_from_file(product, request).await?;
     let manifest = built.manifest();
     let splits = built.split_counts();
     let python_export_sha256 = built.python_export()?.content_hash();
@@ -83,6 +77,25 @@ pub(super) async fn build_point_in_time_dataset(
             "test": splits.test_examples(),
         },
     }))
+}
+
+/// Admits one bounded request file and publishes its immutable PIT feature/label generation.
+///
+/// Callers must establish their own explicit mutation authority before invoking this shared
+/// production path.
+pub(crate) async fn build_point_in_time_dataset_from_file(
+    product: &LocalProduct,
+    request: &Path,
+) -> Result<FeatureLabelDataset, CliDatasetError> {
+    let (bytes, ownership) = read_request(request)?;
+    let request: DatasetBuildRequestDto =
+        serde_json::from_slice(bytes.as_bytes()).map_err(|_| CliDatasetError::RequestJson)?;
+    let admitted = request.into_domain(ownership)?;
+    product
+        .research()
+        .build_dataset(admitted, CancellationToken::new())
+        .await
+        .map_err(Into::into)
 }
 
 fn read_request(

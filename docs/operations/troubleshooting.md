@@ -145,7 +145,7 @@ market-squawk --output json query dataset <DATASET_ID> --maximum-rows 100
 | --- | --- | --- |
 | Research provider is unavailable after restart | Activation recipe or adapter evidence could not be restored | Inspect source status and re-run explicit provider activation with current evidence |
 | Ingest rights fail | Source rights are missing, expired, incompatible with persistence, or do not match the payload | Obtain and record a valid current rights basis; retry the exact payload only after admission succeeds |
-| FRED durable ingest is denied | Current FRED/ALFRED rights evidence does not admit durable persistence | Treat it as the tracked release blocker; do not substitute successful extraction for persistence authority |
+| FRED durable ingest is denied | Exact written St. Louis Fed service permission with a current local review, or independent exact-series authority, is absent or stale | Treat it as the tracked release blocker; an API key, contact receipt, or successful ephemeral extraction is not durable authority |
 | Dataset not found | No current catalog/manifest authority exists for that identity | Confirm ingest/build publication and use the exact returned dataset identity |
 | Point-in-time build rejects the request | Knowledge cutoff, revision, source closure, universe, corporate action, or fixed resource contract failed | Correct the governed request or inputs; do not remove cutoff/revision semantics to obtain output |
 | Query is truncated | Result ceiling is below available rows or bytes | Narrow time/instrument scope or deliberately raise `--maximum-rows` within the fixed process limits |
@@ -197,7 +197,7 @@ MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on
 | --- | --- | --- |
 | Client receives no tools | Initialization handshake or `tools/list` did not complete | Send a supported initialize request, initialized notification, then `tools/list` in order |
 | JSON parse/frame failure | A non-protocol writer contaminated stdout or the frame exceeded bounds | Remove wrapper output from stdout, preserve stderr separately, and restart a fresh session |
-| Unknown tool | Name differs from the exact 62-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
+| Unknown tool | Name differs from the exact 63-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
 | Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain the complete reference and read bounded chunks with `Analysis.ReadArtifact` or `query artifact`; never derive or open a filesystem path |

@@ -9,7 +9,7 @@
     <content type="application/xml">
       <m:properties>
         <d:DailyTreasuryBillRateDataId m:type="Edm.Int32">140</d:DailyTreasuryBillRateDataId>
-        <d:INDEX_DATE m:type="Edm.DateTime">2026-01-02T00:00:00</d:INDEX_DATE>
+        <d:INDEX_DATE m:type="Edm.DateTime">2026-01-05T00:00:00</d:INDEX_DATE>
         <d:ROUND_B1_CLOSE_4WK_2 m:type="Edm.Double">3.58</d:ROUND_B1_CLOSE_4WK_2>
         <d:ROUND_B1_YIELD_4WK_2 m:type="Edm.Double">3.64</d:ROUND_B1_YIELD_4WK_2>
         <d:ROUND_B1_CLOSE_6WK_2 m:type="Edm.Double">3.57</d:ROUND_B1_CLOSE_6WK_2>
@@ -39,8 +39,8 @@
         <d:CUSIP_17WK>912797TL1</d:CUSIP_17WK>
         <d:CUSIP_26WK>912797TF4</d:CUSIP_26WK>
         <d:CUSIP_52WK>912797TC1</d:CUSIP_52WK>
-        <d:QUOTE_DATE m:type="Edm.DateTime">2026-01-02T00:00:00</d:QUOTE_DATE>
-        <d:CF_NEW_DATE>01/02/2026</d:CF_NEW_DATE>
+        <d:QUOTE_DATE m:type="Edm.DateTime">2026-01-05T00:00:00</d:QUOTE_DATE>
+        <d:CF_NEW_DATE>01/05/2026</d:CF_NEW_DATE>
         <d:CS_4WK_CLOSE_AVG m:type="Edm.Double">3.58</d:CS_4WK_CLOSE_AVG>
         <d:CS_4WK_YIELD_AVG m:type="Edm.Double">3.64</d:CS_4WK_YIELD_AVG>
         <d:CS_6WK_CLOSE_AVG m:type="Edm.Double">3.57</d:CS_6WK_CLOSE_AVG>
@@ -55,7 +55,7 @@
         <d:CS_26WK_YIELD_AVG m:type="Edm.Double">3.61</d:CS_26WK_YIELD_AVG>
         <d:CS_52WK_CLOSE_AVG m:type="Edm.Double">3.34</d:CS_52WK_CLOSE_AVG>
         <d:CS_52WK_YIELD_AVG m:type="Edm.Double">3.47</d:CS_52WK_YIELD_AVG>
-        <d:CF_WEEK m:type="Edm.Int32">202601</d:CF_WEEK>
+        <d:CF_WEEK m:type="Edm.Int32">202602</d:CF_WEEK>
       </m:properties>
     </content>
   </entry>

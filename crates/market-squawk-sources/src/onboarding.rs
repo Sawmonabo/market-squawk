@@ -1,5 +1,8 @@
 //! Evidence-bound provider capabilities and onboarding lifecycle authority.
 
+/// Canonical onboarding and application surface identifier for the FRED/ALFRED API capability.
+pub const FRED_ALFRED_API_SURFACE_ID: &str = "fred-alfred.api-v1-v2";
+
 mod built_in_profiles;
 mod capability;
 mod lifecycle;

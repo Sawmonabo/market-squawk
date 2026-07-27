@@ -100,9 +100,11 @@ For a network provider:
 
 Before any FRED or ALFRED persistence, review the tracked
 [`fred-rights-decision.json`](../verification/fred-rights-decision.json). At the reviewed commit it
-has `series_scope: "unresolved"` and `disposition: "blocked_unknown_rights"` for persistence,
-caching, archival, and training. The current `rights_blocked` profile cannot be activated. A future
-code-owned revision may separately admit scoped retrieval without admitting durable use.
+has `series_scope: "exact_service_and_series_grants"` and
+`disposition: "service_permission_required"`. Revision 4 keeps persistence and training closed
+unless activation binds exact current terms, a written St. Louis Fed permission response matched
+byte-for-byte against a fresh reacquisition from its official HTTPS URL, a hash-bound local review,
+and independent public-domain or owner-permission evidence for every selected series and operation.
 
 ## Choose a supported ingestion path
 
@@ -111,16 +113,20 @@ code-owned revision may separately admit scoped retrieval without admitting dura
 | User-owned CSV, JSON, NDJSON, or Parquet | `ingest file` | Both identities come from manifest schema version 3 | Complete CLI path |
 | SEC submissions | Activate `sec.edgar-public`, then `ingest source` | Dataset `sec.submissions.cik.<10-digit-CIK>`; object `sec.submissions.composite.CIK<10-digit-CIK>` | Adapter path is implemented, but the profile is currently `refresh_required`; a new code-owned evidence revision must make activation available |
 | SEC company facts | Activate `sec.edgar-public`, then `ingest source` | Dataset `sec.company-facts.cik.<10-digit-CIK>`; object is the exact `https://data.sec.gov/api/xbrl/companyfacts/CIK<10-digit-CIK>.json` locator | Adapter path is implemented, but the profile is currently `refresh_required`; a new code-owned evidence revision must make activation available |
-| FRED/ALFRED | Registered adapter only | Dataset `fred:series-observations:<SERIES>:<REALTIME_START>:<REALTIME_END>` or the `alfred:` form; object `fred-page:<OFFSET>:10000:<PAGE_SHA256>:<METADATA_SHA256>` | The CLI does not list discovery objects, and the tracked rights decision blocks durable use |
-| BLS v1/v2 | Registered adapter only | Activated plan chooses `bls:timeseries:<public-v1\|registered-v2>:<PLAN_SHA256>`; object `bls:<CHUNK_INDEX>:<RESPONSE_SHA256>` | The CLI does not expose the plan-bound dataset or discovered response digest |
-| Treasury Fiscal Data | Portal setup, `source discover`, then `ingest source` | Dataset `treasury:fiscal-data:average-interest-rates-v2:<QUERY_SHA256>`; object `treasury-page:fiscal:<PAGE>=1+:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path |
-| Treasury daily rates | Portal setup, `source discover`, then `ingest source` | Datasets `treasury:daily-par-yield-curve:<YEAR>`, `treasury:daily-bill-rates:<YEAR>`, `treasury:daily-long-term-rates:<YEAR>`, `treasury:daily-real-par-yield-curve:<YEAR>`, and `treasury:daily-real-long-term-rates:<YEAR>`; object `treasury-page:daily-rate:0:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path for every configured year across all five families |
+| FRED/ALFRED | Portal setup and bounded `source inspect`; durable `ingest source` only after both authority gates pass | Provider selector `fred:series-observations:<SERIES>:<REALTIME_START>:<REALTIME_END>` or the `alfred:` form; local analytical dataset uses the same fields with dots; object `fred-page-v2:<OFFSET>:<LIMIT>:<RETURNED>:<TOTAL>:<TERMINAL>:<PAGE_SHA256>:<METADATA_SHA256>` | Ephemeral inspection is runnable and writes no research dataset; durable use requires current terms, exact written St. Louis Fed service permission with local review, exact-series authority, a zero-fee API key, and explicit foreground credential work |
+| BLS v1/v2 | Portal setup, `source discover`, then `ingest source` after release admission | Provider selector `bls:timeseries:<public-v1\|registered-v2>:<PLAN_SHA256>`; local analytical dataset `bls.timeseries.<public-v1\|registered-v2>.<PLAN_SHA256>`; object `bls:<CHUNK_INDEX>:<RESPONSE_SHA256>` | Profiles remain release-gated by their current evidence revision |
+| Treasury Fiscal Data | Portal setup, `source discover`, then `ingest source` | Provider selector `treasury:fiscal-data:average-interest-rates-v2:<QUERY_SHA256>`; local analytical dataset `treasury.fiscal-data.average-interest-rates-v2.<QUERY_SHA256>`; object `treasury-page:fiscal:<PAGE>=1+:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path |
+| Treasury daily rates | Portal setup, `source discover`, then `ingest source` | Provider selectors use `treasury:<FAMILY>:<YEAR>`; local analytical datasets use `treasury.<FAMILY>.<YEAR>`; object `treasury-page:daily-rate:0:<REQUEST_SHA256>:<PAYLOAD_SHA256>` | Complete no-credential local path for every configured year across all five families |
 | Portfolio export | `portfolio import <PATH> --account <ID> --confirm` | Dedicated portfolio manifest and account authority | Portfolio evidence enters through the dedicated workflow in [Portfolio and paper execution](portfolio-and-paper-execution.md) |
 
 The digest-bearing forms above describe what the adapters validate. They become selectable only
-when accepted application discovery evidence returns the exact identity. Treasury's portal and
-`source discover` command provide that authority. FRED/ALFRED and BLS remain unavailable for the
-release-state reasons in [Source coverage](../reference/source-coverage.md).
+when accepted `source discover` evidence returns the exact identity. Provider selectors and source
+provenance retain their provider grammar; analytical publication uses a separate storage-safe
+`DatasetId`. Do not substitute one identity for the other.
+
+FRED/ALFRED is the exception for non-persistent first use: `source inspect` accepts the exact
+provider selector and active onboarding session directly, then returns a bounded canonical page
+and its evidence without creating a selectable research object or manifest.
 
 ## Ingest a user-owned file
 
@@ -305,10 +311,9 @@ ingest source <PROFILE> <OBJECT> --dataset <DATASET> --confirm
 Do not use the older three-positional rendering of this command. The frozen CLI implementation
 declares `--dataset` as a named option.
 
-For FRED/ALFRED, BLS, or Treasury, the command is runnable only when accepted application evidence
-already contains the complete digest-bearing object ID and the profile's current rights authorize
-persistence. The current product does not provide a discovery-list command, so no first-use CLI
-sequence exists for those adapters at the reviewed commit.
+For FRED/ALFRED, BLS, or Treasury, run `source discover <PROFILE> --dataset <PROVIDER_DATASET>`
+first. Confirmed ingestion must use the complete returned object ID, fresh discovery receipt, same
+provider selector, and a profile whose current rights authorize persistence.
 
 ## Rights, availability, and revisions
 
@@ -323,11 +328,11 @@ network sources, the basis comes from the active onboarding lease and its provid
 or ownership evidence. A CLI `--confirm` is consent to execute the already-authorized operation; it
 is not a substitute for rights.
 
-FRED is additionally fail-closed per series and per operation. At the reviewed commit, the tracked
-terms bundle does not establish exact-series persistence authority, so `ingest source
-fred-alfred.api-v1-v2 ... --confirm` remains blocked even if the API key and network request are
-otherwise valid. Check the [delivery ledger](../plans/delivery-ledger.md) for status after the
-reviewed commit rather than copying status prose from this runbook.
+FRED is additionally fail-closed through independent service and series gates. Revision 4 admits
+persistence or model training only when exact written St. Louis Fed permission reacquired from its
+official HTTPS URL and exact-series authority both cover the requested operation and their validity
+windows intersect the current terms. API-key validity, email headers, a contact receipt, or
+public-domain status alone is insufficient. Unrestricted export and redistribution remain blocked.
 
 ### Availability
 
@@ -419,7 +424,7 @@ content-addressed object or edit `catalog.sqlite3` by hand.
 | Profile not found | The exact provider profile is not active in this process | Inspect status and perform supported activation/resume |
 | Object not found | Discovery did not return the supplied exact object ID | Re-establish accepted discovery evidence; only its returned exact identity has selection authority |
 | Unauthorized | Rights are absent, expired, or do not cover persistence | Stop; update rights through onboarding after an independent review |
-| FRED persistence rejected | Per-series durable rights remain unresolved or stale | Follow `fred-rights-decision.json` and the delivery ledger; ephemeral retrieval is not durable authority |
+| FRED persistence rejected | Current terms, exact written Bank service permission, its hash-bound local review, exact-series authority, requested operation, validity intersection, object receipt, or credential generation is missing or stale | Correct the exact rejected authority and rediscover; an API key or contact submission is not durable-use permission |
 | Generation resynchronization required | Refetched provider bytes or metadata no longer match the selected object evidence | Treat the earlier object as stale and obtain a newly admitted object identity |
 | Deadline, cancellation, or unavailable | Work did not prove a durable terminal before the caller stopped observing it | Preserve state, inspect the manifest, then make one exact retry |
 | Replay or generation conflict | The same immutable coordinate is being associated with different inputs | Preserve both evidence sets and create a new truthful version; do not overwrite |
@@ -453,6 +458,7 @@ manifest and acquisition evidence according to the operator's retention policy.
 - [Backup and recovery](backup-and-recovery.md)
 - [Mutable delivery ledger](../plans/delivery-ledger.md)
 - [FRED rights decision](../verification/fred-rights-decision.json)
+- [FRED/ALFRED local-first API authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md)
 - [`application/research/ingest.rs`](../../apps/market-squawk/src/application/research/ingest.rs)
 - [`local_product/cli_transport/files.rs`](../../apps/market-squawk/src/local_product/cli_transport/files.rs)
 - [`data/ingest.rs`](../../crates/market-squawk-data/src/ingest.rs)
@@ -474,6 +480,8 @@ rights evidence and frozen source remain authoritative for what the product may 
 - [FRED/ALFRED API overview](https://fred.stlouisfed.org/docs/api/fred/overview.html)
 - [FRED series-observations endpoint](https://fred.stlouisfed.org/docs/api/fred/series_observations.html)
 - [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html)
+- [Current FRED legal terms](https://fred.stlouisfed.org/legal/)
+- [FRED permissions contact route](https://fred.stlouisfed.org/contactus/)
 - [BLS Public Data API](https://www.bls.gov/developers/home.htm)
 - [BLS API signatures](https://www.bls.gov/developers/api_signature.htm)
 - [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/)

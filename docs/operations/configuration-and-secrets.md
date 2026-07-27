@@ -266,14 +266,19 @@ a credential is stored and which generation is active. The platform secret value
 `1..=65536` bytes; the portal's provider-key field, when a profile is release-enabled, is further
 limited to 8192 characters.
 
-At this reviewed source head, the current code-owned credentialed profiles are not release
-available:
+At this reviewed source head, the credentialed profiles have different release states:
 
 - `bls.v2-registered` is `refresh_required`;
-- `fred-alfred.api-v1-v2` is `rights_blocked`.
+- `fred-alfred.api-v1-v2` revision 4 is `rights_limited`: bounded ephemeral retrieval is available,
+  while persistence and training require exact written St. Louis Fed service permission plus
+  independent exact-series public-domain or owner-permission evidence.
 
-The portal therefore provides no current credential-import procedure for either profile. Do not
-weaken the release gate or use another provider's slot.
+The portal keeps BLS v2 disabled while its evidence refresh is incomplete. FRED accepts a
+provider-issued zero-fee API key only through its typed foreground setup. Durable activation also
+requires an exact Bank response matched byte-for-byte against a fresh reacquisition from its
+official HTTPS URL, a hash-bound local review of its grantee/service/series/operation scope, and
+exact series-rights evidence. Storing a key, presenting email headers, or submitting the permissions
+contact form cannot create persistence, training, or redistribution authority.
 
 ### Encrypted fallback lifecycle
 

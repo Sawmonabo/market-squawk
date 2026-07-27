@@ -364,7 +364,9 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         ProviderOnboardingError::Catalog(CatalogError::OnboardingDeadlineExceeded) => {
             ServiceError::DeadlineExceeded
         }
-        ProviderOnboardingError::RightsBlocked => ServiceError::Unauthorized,
+        ProviderOnboardingError::RightsBlocked | ProviderOnboardingError::CredentialRejected => {
+            ServiceError::Unauthorized
+        }
         ProviderOnboardingError::SecretVerificationFailed
         | ProviderOnboardingError::SecretOperationUnavailable
         | ProviderOnboardingError::SecretCleanupUnavailable
@@ -372,6 +374,7 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         | ProviderOnboardingError::InvalidSessionState
         | ProviderOnboardingError::ClientConfiguration
         | ProviderOnboardingError::ProbeUnavailable
+        | ProviderOnboardingError::OfficialDocumentUnavailable
         | ProviderOnboardingError::EvidenceRefreshRequired
         | ProviderOnboardingError::ActivationUnavailable
         | ProviderOnboardingError::ActivationExpired

@@ -26,7 +26,7 @@ use market_squawk_data::{
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
     ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
     RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_batch_digest,
+    UniverseMembership, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -615,7 +615,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let batch = extraction_batch()?;
     let revisions = provider_revision_plan(&batch)?;
-    let payload_digest = extraction_batch_digest(&batch)?;
+    let payload_digest = extraction_provider_payload_digest(&batch);
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
         payload_digest,
@@ -640,10 +640,12 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
     )?;
+    let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
 
     let first = service
         .ingest_with_revision_plan(
             reservation.clone(),
+            analytical_dataset.clone(),
             batch.clone(),
             revisions.clone(),
             CancellationToken::new(),
@@ -651,7 +653,13 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         .await?;
     assert_eq!(first.manifest().schema_version().get(), 3);
     let replay = service
-        .ingest_with_revision_plan(reservation, batch, revisions, CancellationToken::new())
+        .ingest_with_revision_plan(
+            reservation,
+            analytical_dataset,
+            batch,
+            revisions,
+            CancellationToken::new(),
+        )
         .await?;
     assert_eq!(first, replay);
     let batches = service
@@ -1471,7 +1479,7 @@ async fn initialized_service_with_batch(
         &local_source_for("market-squawk.derived")?,
         Timestamp::from_unix_nanos(10),
     )?;
-    let payload_digest = extraction_batch_digest(&batch)?;
+    let payload_digest = extraction_provider_payload_digest(&batch);
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
         payload_digest,
@@ -1502,8 +1510,14 @@ async fn initialized_service_with_batch(
         paths.artifacts()?.clone(),
         store_config,
     )?;
+    let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
     let committed = service
-        .ingest(reservation, batch, CancellationToken::new())
+        .ingest(
+            reservation,
+            analytical_dataset,
+            batch,
+            CancellationToken::new(),
+        )
         .await?;
     Ok((service, committed))
 }

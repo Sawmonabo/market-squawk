@@ -300,7 +300,8 @@ stage remains runnable and advances only on deterministic tests plus separate op
   override, approval, and review; the sources do not provide a self-executing compliance engine.
 - **Security/licensing:** exact dependency features, transitive licenses, credential store,
   encrypted fallback, endpoint allowlists, parser limits, hostile-file behavior, and formal
-  ASVS/SLSA applicability remain unresolved. License observations are not legal advice.
+  ASVS/SLSA applicability remain unresolved. License observations are engineering research
+  summaries and do not determine legal rights or obligations.
 - **Performance:** queue sizes, DataFusion limits, Parquet layout, model threading, and every live
   percentile/throughput/memory claim require measured target-hardware evidence.
 

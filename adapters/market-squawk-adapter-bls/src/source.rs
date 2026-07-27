@@ -73,6 +73,43 @@ impl std::fmt::Debug for BlsSource {
 }
 
 impl BlsSource {
+    /// Derives the storage-safe analytical identity for one exact BLS request-plan dataset.
+    ///
+    /// The colon-delimited input remains the provider request and provenance identity. The
+    /// returned dotted identity is a separate local analytical namespace that preserves the
+    /// provider tier and complete request-plan digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlsSourceError::InvalidConfiguration`] when the input is not an exact bounded BLS
+    /// timeseries request-plan identity.
+    pub fn analytical_dataset_identifier(
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, BlsSourceError> {
+        let mut fields = provider_dataset.as_str().split(':');
+        if fields.next() != Some("bls") || fields.next() != Some("timeseries") {
+            return Err(BlsSourceError::InvalidConfiguration);
+        }
+        let tier = fields
+            .next()
+            .filter(|value| matches!(*value, "public-v1" | "registered-v2"))
+            .ok_or(BlsSourceError::InvalidConfiguration)?;
+        let digest = fields
+            .next()
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(BlsSourceError::InvalidConfiguration)?;
+        if fields.next().is_some() {
+            return Err(BlsSourceError::InvalidConfiguration);
+        }
+        SourceIdentifier::try_from(format!("bls.timeseries.{tier}.{digest}"))
+            .map_err(|_| BlsSourceError::InvalidConfiguration)
+    }
+
     /// Builds honest local-observation revision authority for a normalized BLS batch.
     ///
     /// The BLS timeseries response does not publish a per-observation version or publication

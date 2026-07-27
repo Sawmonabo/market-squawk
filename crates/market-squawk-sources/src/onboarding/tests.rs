@@ -7,7 +7,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
 fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
-    for profile in built_in_provider_profiles()?.iter() {
+    let profiles = built_in_provider_profiles()?;
+    for profile in profiles.iter() {
         let persists = profile.rights().0.iter().any(|right| {
             right.operation() == DataUseOperation::Persist
                 && right.admission() == OperationAdmission::Admitted
@@ -22,6 +23,106 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
                 assert_eq!(evidence.source_id(), "DOC-031");
             }
         }
+    }
+    let fred = profiles
+        .get("fred-alfred.api-v1-v2")
+        .ok_or("missing FRED/ALFRED profile")?;
+    assert_eq!(fred.zero_fee(), ZeroFeeStatus::Confirmed);
+    assert_eq!(fred.release_state(), ProfileReleaseState::RightsLimited);
+    assert_eq!(
+        fred.capability().rights_state(),
+        RightsAdmissionState::Pending
+    );
+    assert_eq!(fred.capability().revision().get(), 4);
+    assert_eq!(
+        fred.capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert!(
+        fred.capability_history()
+            .filter(|capability| capability.revision().get() < 4)
+            .all(|capability| capability.rights_state() == RightsAdmissionState::Blocked)
+    );
+    assert!(fred.persistence_evidence().is_none());
+    let fred_probe_policy = fred
+        .probe()
+        .endpoint_policy()
+        .ok_or("FRED credential probe omitted its endpoint policy")?;
+    assert!(
+        fred_probe_policy
+            .authorize_request(
+                "https://api.stlouisfed.org/fred/series?series_id=UNRATE&file_type=json&api_key=0123456789abcdef0123456789abcdef"
+            )
+            .is_ok()
+    );
+    assert!(
+        fred_probe_policy
+            .authorize_request(
+                "https://api.stlouisfed.org/fred/series?series_id=GDP&file_type=json&api_key=0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+    );
+    for source in [
+        "MSQ-FRED-ALFRED-LOCAL-FIRST-AUTHORITY-2026-07-26",
+        "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26",
+    ] {
+        assert!(
+            fred.capability()
+                .evidence()
+                .iter()
+                .any(|binding| binding.source_id().as_str() == source)
+        );
+    }
+    for (profile_id, evidence_source, evidence_digest) in [
+        (
+            "sec.edgar-public",
+            "MSQ-SEC-EDGAR-PUBLIC-API-AUTHORITY-2026-07-26",
+            EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [
+                    0xf4, 0x25, 0x65, 0x04, 0x19, 0x56, 0xc1, 0x33, 0x45, 0xae, 0xc3, 0xa3, 0xb5,
+                    0x5e, 0x52, 0x83, 0x4d, 0xc1, 0x5a, 0x78, 0x97, 0xe9, 0x26, 0xf6, 0x90, 0xc7,
+                    0x56, 0xd1, 0x0d, 0x2f, 0x4a, 0x80,
+                ],
+            ),
+        ),
+        (
+            "bls.v1-unregistered",
+            "MSQ-BLS-PUBLIC-V1-AUTHORITY-2026-07-26",
+            EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [
+                    0x8c, 0xd0, 0x23, 0x7b, 0x36, 0x23, 0x23, 0x79, 0x58, 0x65, 0x10, 0xcc, 0x5c,
+                    0x3b, 0xd3, 0x7d, 0x6c, 0x64, 0xf9, 0x7b, 0x89, 0x79, 0xab, 0x4a, 0x23, 0xa7,
+                    0x80, 0x28, 0x1a, 0x08, 0xf1, 0x82,
+                ],
+            ),
+        ),
+    ] {
+        let profile = profiles
+            .get(profile_id)
+            .ok_or("missing public provider profile")?;
+        assert_eq!(profile.zero_fee(), ZeroFeeStatus::Confirmed);
+        assert_eq!(profile.release_state(), ProfileReleaseState::Available);
+        assert_eq!(profile.capability().revision().get(), 4);
+        assert_eq!(
+            profile
+                .capability_history()
+                .map(|capability| capability.revision().get())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        let persistence_evidence = profile
+            .persistence_evidence()
+            .ok_or("public profile omitted persistence evidence")?;
+        assert_eq!(persistence_evidence.source_id(), evidence_source);
+        assert_eq!(persistence_evidence.content_digest(), Some(evidence_digest));
+        assert!(!persistence_evidence.refresh_required());
+        assert!(profile.capability().evidence().iter().any(|binding| {
+            binding.source_id().as_str() == evidence_source && binding.digest() == evidence_digest
+        }));
     }
     Ok(())
 }
@@ -454,19 +555,53 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     let treasury_fiscal = profiles
         .get("treasury.fiscal-data")
         .ok_or("missing Treasury Fiscal Data profile")?;
-    for profile in [sec, fred, bls_public, treasury_fiscal] {
-        assert_eq!(profile.capability().revision().get(), 3);
+    for profile in [sec, bls_public] {
+        assert_eq!(profile.capability().revision().get(), 4);
         assert_eq!(
             profile
                 .capability_history()
                 .map(|capability| capability.revision().get())
                 .collect::<Vec<_>>(),
-            [1, 2, 3]
+            [1, 2, 3, 4]
         );
         assert!(profile.capability().evidence().iter().any(|binding| {
             binding.source_id().as_str() == "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25"
         }));
     }
+    assert_eq!(fred.capability().revision().get(), 4);
+    assert_eq!(
+        fred.capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(treasury_fiscal.capability().revision().get(), 4);
+    assert_eq!(
+        treasury_fiscal
+            .capability_history()
+            .map(|capability| capability.revision().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        treasury_fiscal.probe().endpoint(),
+        Some(
+            "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates?page%5Bsize%5D=1"
+        )
+    );
+    assert_eq!(
+        treasury_fiscal.capability().verifier_revision().as_str(),
+        "treasury.fiscal-data.probe.v2"
+    );
+    assert_eq!(
+        treasury_fiscal
+            .capability_history()
+            .find(|capability| capability.revision().get() == 3)
+            .ok_or("Treasury Fiscal profile omitted revision 3")?
+            .verifier_revision()
+            .as_str(),
+        "treasury.fiscal-data.probe.v1"
+    );
     assert_eq!(
         bls_public.capability().setup_mode(),
         SetupMode::NoCredential

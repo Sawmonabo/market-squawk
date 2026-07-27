@@ -1048,3 +1048,44 @@ release closer. A source-only onboarding session, fixture, synthetic response, c
 declaration, or provisional run cannot close this requirement. The maintained source and
 acceptance decision is
 [`docs/research/providers/2026-07-26-treasury-daily-rates-release-authority.md`](research/providers/2026-07-26-treasury-daily-rates-release-authority.md).
+
+## 2026-07-26 FRED/ALFRED mandatory working-release rule
+
+FRED/ALFRED local research is a mandatory V1 capability. Revision 4 permits bounded ephemeral
+official-API retrieval while durable storage, caching, archival, database incorporation, and
+software or model training remain closed under the current terms. Durable activation requires two
+independent, concurrent authorities: exact written St. Louis Fed service permission covering
+Market Squawk, the FRED API, every selected series, and every requested durable operation; and
+exact public-domain or series-owner evidence for the same scope. The exact Bank response must be
+bound to an explicit local review decision with reviewer, scope, conditions, validity, and finite
+revalidation. The shipping release accepts that response only when its imported bytes match a fresh
+application-owned reacquisition from the exact official HTTPS URL; email headers are not delivery
+authenticity evidence. An API key, contact receipt, or public-domain series alone cannot create
+durable authority.
+
+The release condition is a working real-data flow, not an adapter, contract, fixture, or future
+task. One unchanged release candidate must:
+
+1. discover and retrieve a bounded exact FRED or ALFRED observations request from the official API;
+2. preserve every returned page, observation, real-time vintage, revision, provenance field, and
+   payload identity in local Arrow/Parquet research storage;
+3. query nonempty observations and vintages from the exact published manifest;
+4. shut down, restart, and reproduce those exact manifest-bound query results;
+5. build a derived point-in-time feature/label generation whose complete parent set includes the
+   exact published FRED manifest and genuine historical-universe evidence;
+6. produce nonempty train, validation, and test splits plus a nonzero canonical Python-export
+   digest; and
+7. restart and reopen the same derived generation with identical manifest, build, policy,
+   universe, Python-export, parent, and split evidence.
+
+The release producer therefore requires explicit bounded `--fred-dataset` and
+`--fred-training-request` inputs. It must not invent an instrument identity, treat a macro series
+as an instrument, record a Python digest on raw ingestion, or accept zero-row/mismatched-parent
+evidence. Missing provider access, current terms, exact Bank service permission, current series
+authority, real external responses, durable publication, restart proof, or PIT/Python handoff
+blocks V1. None of these predicates is optional or deferrable. Direct BLS `LNS14000000` is the
+zero-fee durable unemployment-data path; true point-in-time vintages require archived BLS release
+evidence and retain BLS rather than FRED provenance.
+
+The maintained research basis is
+[`docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md`](research/providers/2026-07-26-fred-alfred-local-first-api-authority.md).

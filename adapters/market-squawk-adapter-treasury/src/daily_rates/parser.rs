@@ -13,7 +13,7 @@ use crate::fiscal_data::FiscalDataParseLimits;
 use crate::query::update_component;
 
 use super::schema::{
-    PropertyValue, date_field, decode_row, id_field, required_provider_date, required_typed,
+    PropertyValue, date_field, decode_row, id_field, optional_typed, required_provider_date,
 };
 use super::{
     TreasuryDailyRateFamily, TreasuryDailyRateObservation, TreasuryDailyRatePageRequest,
@@ -259,6 +259,15 @@ impl TreasuryDailyRatePage {
         {
             return Err(TreasuryProtocolError::DuplicateRecordIdentity);
         }
+        if supports_date_source_identity(request.family()) {
+            let mut dates = BTreeSet::new();
+            if observations
+                .iter()
+                .any(|observation| !dates.insert(observation.record_date()))
+            {
+                return Err(TreasuryProtocolError::DuplicateRecordIdentity);
+            }
+        }
         Ok(Self {
             family: request.family(),
             period: request.period(),
@@ -393,23 +402,45 @@ impl EntryBuilder {
         source_payload_digest: [u8; 32],
     ) -> Result<TreasuryDailyRateObservation, TreasuryProtocolError> {
         let family = request.family();
-        let entry_id = self
+        let entry_record_id = self
             .entry_id
             .as_deref()
-            .ok_or(TreasuryProtocolError::SchemaDrift)?;
-        let prefix = format!("{}&id=", family.feed_identity());
-        let source_record_id = entry_id
-            .strip_prefix(&prefix)
-            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            .ok_or(TreasuryProtocolError::SchemaDrift)?
-            .to_owned();
-        if let Some(id_field) = id_field(family)
-            && required_typed(&self.properties, id_field, "Edm.Int32")? != source_record_id
+            .map(|entry_id| {
+                let prefix = format!("{}&id=", family.feed_identity());
+                let record_id = entry_id
+                    .strip_prefix(&prefix)
+                    .ok_or(TreasuryProtocolError::SchemaDrift)?;
+                match valid_numeric_record_id(record_id) {
+                    Some(record_id) => Ok(Some(record_id)),
+                    None if record_id.is_empty() && supports_date_source_identity(family) => {
+                        Ok(None)
+                    }
+                    None => Err(TreasuryProtocolError::SchemaDrift),
+                }
+            })
+            .transpose()?
+            .flatten();
+        let property_record_id = id_field(family)
+            .map(|field| optional_typed(&self.properties, field, "Edm.Int32"))
+            .transpose()?
+            .flatten()
+            .map(|value| valid_numeric_record_id(value).ok_or(TreasuryProtocolError::SchemaDrift))
+            .transpose()?;
+        if entry_record_id
+            .zip(property_record_id)
+            .is_some_and(|(entry, property)| entry != property)
         {
             return Err(TreasuryProtocolError::SchemaDrift);
         }
         let record_date = required_provider_date(&self.properties, date_field(family))?;
         bind_query_period(record_date, request)?;
+        let source_record_id = entry_record_id
+            .or(property_record_id)
+            .map(str::to_owned)
+            .or_else(|| {
+                supports_date_source_identity(family).then(|| format!("date:{record_date}"))
+            })
+            .ok_or(TreasuryProtocolError::SchemaDrift)?;
         let decoded = decode_row(family, &self.properties, record_date)?;
         let source_published_at = parse_atom_timestamp(
             self.published_at
@@ -432,6 +463,14 @@ impl EntryBuilder {
             source_payload_digest,
         ))
     }
+}
+
+fn valid_numeric_record_id(value: &str) -> Option<&str> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())).then_some(value)
+}
+
+fn supports_date_source_identity(family: TreasuryDailyRateFamily) -> bool {
+    !matches!(family, TreasuryDailyRateFamily::LongTermRates)
 }
 
 fn bind_query_period(

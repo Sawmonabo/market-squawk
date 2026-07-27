@@ -5,13 +5,15 @@ use std::sync::Arc;
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
     CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
-    FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
+    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
     IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
     ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
-    RightsError, SourceOperation, extraction_batch_digest,
+    RightsError, SourceOperation, extraction_provider_payload_digest,
 };
+use market_squawk_domain::{DigestAlgorithm, ExactPayloadEvidence};
 use market_squawk_platform::{LocalPaths, PathError};
 use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +24,7 @@ pub struct ResearchIngestRequest {
     registered_at: market_squawk_domain::Timestamp,
     rights: RightsDecisionInput,
     identity: IngestIdentity,
+    analytical_dataset: DatasetId,
     batch: ExtractionBatch,
     revisions: Option<ExtractionRevisionPlan>,
     precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
@@ -32,39 +35,42 @@ impl ResearchIngestRequest {
     pub fn locally_observed(
         source: SourceMetadata,
         rights: RightsDecisionInput,
-        idempotency_key: impl Into<String>,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(source, rights, idempotency_key, batch, None)
+        Self::try_new(source, rights, analytical_dataset, batch, None)
     }
 
     /// Constructs an ingest with one explicit provider revision decision per normalized record.
     pub fn with_provider_revisions(
         source: SourceMetadata,
         rights: RightsDecisionInput,
-        idempotency_key: impl Into<String>,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revisions: ExtractionRevisionPlan,
     ) -> Result<Self, ResearchServiceError> {
-        Self::try_new(source, rights, idempotency_key, batch, Some(revisions))
+        Self::try_new(source, rights, analytical_dataset, batch, Some(revisions))
     }
 
     fn try_new(
         source: SourceMetadata,
         rights: RightsDecisionInput,
-        idempotency_key: impl Into<String>,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revisions: Option<ExtractionRevisionPlan>,
     ) -> Result<Self, ResearchServiceError> {
-        let payload_digest = extraction_batch_digest(&batch)?;
-        let source_id = batch.request().object().source_id();
+        let object = batch.request().object();
+        let payload_digest = extraction_provider_payload_digest(&batch);
+        let source_id = object.source_id();
         if source.source_id() != source_id
+            || source.revision() != object.metadata_revision()
             || &rights.source_id != source_id
             || rights.payload_digest != payload_digest
         {
             return Err(ResearchServiceError::IngestAuthorityMismatch);
         }
         let registered_at = rights.retrieved_at;
+        let idempotency_key = provider_object_ingest_key(&source, &analytical_dataset, &batch)?;
         let identity = IngestIdentity::try_new(
             source_id.clone(),
             payload_digest,
@@ -76,6 +82,7 @@ impl ResearchIngestRequest {
             registered_at,
             rights,
             identity,
+            analytical_dataset,
             batch,
             revisions,
             precommit_authority: None,
@@ -89,6 +96,80 @@ impl ResearchIngestRequest {
         self.precommit_authority = Some(precommit_authority);
         self
     }
+}
+
+fn provider_object_ingest_key(
+    source: &SourceMetadata,
+    analytical_dataset: &DatasetId,
+    batch: &ExtractionBatch,
+) -> Result<String, ResearchServiceError> {
+    let object = batch.request().object();
+    if source.source_id() != object.source_id() || source.revision() != object.metadata_revision() {
+        return Err(ResearchServiceError::IngestAuthorityMismatch);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-object-ingest/v3");
+    update_identity(&mut digest, object.source_id().as_str())?;
+    update_identity(
+        &mut digest,
+        object.metadata_revision().as_source_identifier().as_str(),
+    )?;
+    update_evidence(&mut digest, source.revision_evidence().payload_evidence())?;
+    update_identity(&mut digest, object.dataset().as_str())?;
+    update_identity(&mut digest, analytical_dataset.as_str())?;
+    update_identity(&mut digest, object.object_id().as_str())?;
+    update_identity(&mut digest, object.media_type().as_str())?;
+    update_evidence(&mut digest, object.evidence())?;
+    match object.expected_bytes() {
+        Some(bytes) => {
+            digest.update([1]);
+            digest.update(bytes.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    Ok(format!(
+        "provider-object-v3-{}",
+        encode_lower_hex(digest.finalize().into())
+    ))
+}
+
+fn update_evidence(
+    digest: &mut Sha256,
+    evidence: &ExactPayloadEvidence,
+) -> Result<(), ResearchServiceError> {
+    let content = evidence.content_digest();
+    digest.update([match content.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    digest.update(content.bytes());
+    match evidence.version_pinned_locator() {
+        Some(locator) => {
+            digest.update([1]);
+            update_identity(digest, locator.reference().as_str())?;
+            update_identity(digest, locator.version().as_str())?;
+        }
+        None => digest.update([0]),
+    }
+    Ok(())
+}
+
+fn update_identity(digest: &mut Sha256, value: &str) -> Result<(), ResearchServiceError> {
+    let length =
+        u64::try_from(value.len()).map_err(|_error| ResearchServiceError::IdentityOverflow)?;
+    digest.update(length.to_be_bytes());
+    digest.update(value.as_bytes());
+    Ok(())
+}
+
+fn encode_lower_hex(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 /// Single application authority for local analytical storage and dataset construction.
@@ -173,6 +254,7 @@ impl ResearchService {
                 .analytical
                 .ingest_with_revision_plan_and_precommit_authority(
                     reservation,
+                    request.analytical_dataset,
                     request.batch,
                     revisions,
                     cancellation,
@@ -182,13 +264,20 @@ impl ResearchService {
                 .map_err(Into::into),
             (Some(revisions), None) => self
                 .analytical
-                .ingest_with_revision_plan(reservation, request.batch, revisions, cancellation)
+                .ingest_with_revision_plan(
+                    reservation,
+                    request.analytical_dataset,
+                    request.batch,
+                    revisions,
+                    cancellation,
+                )
                 .await
                 .map_err(Into::into),
             (None, Some(precommit_authority)) => self
                 .analytical
                 .ingest_with_precommit_authority(
                     reservation,
+                    request.analytical_dataset,
                     request.batch,
                     cancellation,
                     precommit_authority,
@@ -197,7 +286,12 @@ impl ResearchService {
                 .map_err(Into::into),
             (None, None) => self
                 .analytical
-                .ingest(reservation, request.batch, cancellation)
+                .ingest(
+                    reservation,
+                    request.analytical_dataset,
+                    request.batch,
+                    cancellation,
+                )
                 .await
                 .map_err(Into::into),
         }
@@ -266,4 +360,7 @@ pub enum ResearchServiceError {
     /// The idempotency identity is invalid.
     #[error("research ingest identity failed: {0}")]
     Rights(#[from] RightsError),
+    /// A provider-object identity field could not be represented in the canonical hash framing.
+    #[error("research ingest identity length overflow")]
+    IdentityOverflow,
 }

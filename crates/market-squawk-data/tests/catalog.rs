@@ -136,6 +136,11 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     let reservation = catalog.reserve_ingest(&identity, &rights)?;
     let repeated = catalog.reserve_ingest(&identity, &rights)?;
     assert_eq!(reservation.run_id(), repeated.run_id());
+    let mut retry_rights_input = test_rights_input(source.source_id().clone(), payload, i64::MAX)?;
+    retry_rights_input.retrieved_at = Timestamp::from_unix_nanos(16);
+    let retry_rights = catalog.admit_source_rights(retry_rights_input)?;
+    let retried = catalog.reserve_ingest(&identity, &retry_rights)?;
+    assert_eq!(reservation.run_id(), retried.run_id());
     let unpublished = catalog.reserve_ingest(
         &IngestIdentity::try_new(
             source.source_id().clone(),

@@ -36,7 +36,7 @@ use crate::{
     CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
     IngestIdentity, ObjectStoreConfig, ParquetStoreError, QueryArtifactReservationInput,
     QueryLimits, QueryRequest, QueryResult, ResearchIngestService, RightsBasis,
-    RightsDecisionInput, Sha256Digest, SourceOperation, extraction_batch_digest,
+    RightsDecisionInput, Sha256Digest, SourceOperation, extraction_provider_payload_digest,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -529,7 +529,7 @@ async fn published_dataset_fixture()
     let source = local_source()?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let batch = extraction_batch()?;
-    let payload_digest = extraction_batch_digest(&batch)?;
+    let payload_digest = extraction_provider_payload_digest(&batch);
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
         payload_digest,
@@ -554,8 +554,14 @@ async fn published_dataset_fixture()
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
     )?;
+    let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
     let committed = service
-        .ingest(reservation, batch, CancellationToken::new())
+        .ingest(
+            reservation,
+            analytical_dataset,
+            batch,
+            CancellationToken::new(),
+        )
         .await?;
     let pinned = committed.pinned().clone();
     Ok((directory, service, pinned))

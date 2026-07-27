@@ -162,6 +162,31 @@ async fn source(
             }))?,
             "source objects discovered",
         ),
+        SourceCommand::Inspect {
+            provider,
+            onboarding_session_id,
+            dataset_identifier,
+            page_index,
+            max_records,
+        } => {
+            let maximum_items = usize::from(max_records);
+            let mut arguments = json_object(json!({
+                "provider": provider,
+                "onboardingSessionId": onboarding_session_id,
+                "datasetIdentifier": dataset_identifier,
+                "pageIndex": page_index,
+                "maxRecords": max_records,
+                "sourceCoverage": [provider],
+            }))?;
+            return invoke(
+                product,
+                "Source.Inspect",
+                &mut arguments,
+                Some(maximum_items),
+                "source page inspected",
+            )
+            .await;
+        }
         SourceCommand::Activate { request, confirm } => {
             let value = cli_provider::activate_research_provider(
                 product,

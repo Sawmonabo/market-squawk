@@ -301,7 +301,11 @@ impl TreasuryDailyRateObservation {
         self.family
     }
 
-    /// Returns Treasury's stable source-row identifier.
+    /// Returns the stable source-row identifier.
+    ///
+    /// This is Treasury's numeric identifier when supplied. For the date-unique datasets where
+    /// Treasury omits redundant identifier metadata, it is the documented official record date
+    /// prefixed with `date:`.
     pub fn source_record_id(&self) -> &str {
         &self.source_record_id
     }

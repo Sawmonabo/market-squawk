@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{Datelike, NaiveDate};
 use market_squawk_domain::CalendarDate;
 use rust_decimal::Decimal;
 
@@ -204,6 +205,13 @@ fn bill_points(
     properties: &BTreeMap<String, PropertyValue>,
     record_date: CalendarDate,
 ) -> Result<(Vec<TreasuryDailyRatePoint>, Option<String>), TreasuryProtocolError> {
+    let civil_date = NaiveDate::from_ymd_opt(
+        i32::from(record_date.year()),
+        u32::from(record_date.month()),
+        u32::from(record_date.day()),
+    )
+    .ok_or(TreasuryProtocolError::SchemaDrift)?;
+    let iso_week = civil_date.iso_week();
     if required_provider_date(properties, "QUOTE_DATE")? != record_date
         || required_untyped(properties, "CF_NEW_DATE")?
             != format!(
@@ -213,7 +221,7 @@ fn bill_points(
                 record_date.year()
             )
         || required_typed(properties, "CF_WEEK", "Edm.Int32")?
-            != format!("{:04}{:02}", record_date.year(), record_date.month())
+            != format!("{:04}{:02}", iso_week.year(), iso_week.week())
     {
         return Err(TreasuryProtocolError::SchemaDrift);
     }
@@ -432,7 +440,7 @@ pub(super) fn required_typed<'a>(
     optional_typed(properties, name, data_type)?.ok_or(TreasuryProtocolError::SchemaDrift)
 }
 
-fn optional_typed<'a>(
+pub(super) fn optional_typed<'a>(
     properties: &'a BTreeMap<String, PropertyValue>,
     name: &str,
     data_type: &str,

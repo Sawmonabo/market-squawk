@@ -289,7 +289,7 @@ impl Catalog {
         rights.authorize_at(request, requested_at)?;
         require_admitted_rights(&transaction, &rights)?;
         if let Some(existing) = existing_reservation(&transaction, request, self.catalog_id)? {
-            if existing.matches(request, &rights) {
+            if existing.matches(request) {
                 return Ok(existing.reservation);
             }
             return Err(CatalogError::IdempotencyConflict);

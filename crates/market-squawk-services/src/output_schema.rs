@@ -162,6 +162,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
                 | "maxItems"
                 | "minProperties"
                 | "maxProperties"
+                | "format"
                 | "description"
         )
     }) {
@@ -177,6 +178,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
         _ => false,
     };
     type_is_supported
+        && string_format_is_supported(schema, schema_type)
         && numeric_keyword_is_number(schema, "minimum")
         && numeric_keyword_is_number(schema, "maximum")
         && unsigned_keyword_is_integer(schema, "minLength")
@@ -188,6 +190,16 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
         && schema
             .get("enum")
             .is_none_or(|values| values.as_array().is_some_and(|values| !values.is_empty()))
+}
+
+fn string_format_is_supported(schema: &Map<String, Value>, schema_type: &str) -> bool {
+    match schema.get("format") {
+        None => true,
+        Some(Value::String(format)) if schema_type == "string" => {
+            matches!(format.as_str(), "uuid" | "date-time")
+        }
+        Some(_) => false,
+    }
 }
 
 fn object_schema_is_supported(schema: &Map<String, Value>, root: bool) -> bool {
@@ -268,7 +280,7 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
                 value.chars().count() as u64,
                 schema.get("minLength"),
                 schema.get("maxLength"),
-            )
+            ) && string_format_matches(schema.get("format"), value)
         }),
         Some("integer") => {
             (value.as_i64().is_some() || value.as_u64().is_some())
@@ -290,6 +302,16 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
             .as_object()
             .is_some_and(|value| validate_object_instance(schema, value)),
         _ => false,
+    }
+}
+
+fn string_format_matches(format: Option<&Value>, value: &str) -> bool {
+    match format.and_then(Value::as_str) {
+        None => true,
+        Some("uuid") => uuid::Uuid::parse_str(value)
+            .is_ok_and(|parsed| parsed.hyphenated().to_string() == value),
+        Some("date-time") => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+        Some(_) => false,
     }
 }
 
@@ -368,5 +390,21 @@ mod tests {
         assert!(validate_data_schema(&schema));
         assert!(validate_data(&schema, &json!({"expected": true})));
         assert!(!validate_data(&schema, &json!({"unexpected": true})));
+
+        let uuid_schema = json!({"type": "string", "format": "uuid"});
+        assert!(validate_data_schema(&uuid_schema));
+        assert!(validate_data(
+            &uuid_schema,
+            &json!("c127919d-6540-47f8-9f6b-902523578cb5")
+        ));
+        assert!(!validate_data(&uuid_schema, &json!("not-a-uuid")));
+
+        let timestamp_schema = json!({"type": "string", "format": "date-time"});
+        assert!(validate_data_schema(&timestamp_schema));
+        assert!(validate_data(
+            &timestamp_schema,
+            &json!("2026-07-26T12:34:56.123456789Z")
+        ));
+        assert!(!validate_data(&timestamp_schema, &json!("2026-07-26")));
     }
 }

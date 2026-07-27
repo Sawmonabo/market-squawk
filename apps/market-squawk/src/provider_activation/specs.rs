@@ -460,4 +460,13 @@ pub enum ProviderAdapterActivationError {
     /// Durable provider authorization-subject admission was unavailable or inconsistent.
     #[error(transparent)]
     ProviderRate(#[from] market_squawk_sources::ProviderRateStoreError),
+    /// Process-local bounded extraction authority was unavailable or inconsistent.
+    #[error(transparent)]
+    Registry(#[from] market_squawk_sources::RegistryError),
+    /// A bounded extraction request violated its closed contract.
+    #[error(transparent)]
+    ExtractionContract(#[from] market_squawk_sources::ExtractionError),
+    /// The provider rejected or could not complete bounded extraction.
+    #[error(transparent)]
+    ExtractionSource(#[from] market_squawk_sources::ExtractionSourceError),
 }

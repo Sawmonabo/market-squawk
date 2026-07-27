@@ -52,9 +52,10 @@ pub(crate) use research::{
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use source::{
-    SourceApplicationError, SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshot,
-    SourceRuntimeSnapshotBatch, SourceRuntimeSnapshotError, SourceRuntimeView,
-    SourceRuntimeViewError,
+    EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
+    EphemeralSourceInspectionResult, SourceApplicationError, SourceDomainService,
+    SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
+    SourceRuntimeSnapshotError, SourceRuntimeView, SourceRuntimeViewError,
 };
 
 const REQUIRED_DOMAINS: [ServiceDomain; 11] = [

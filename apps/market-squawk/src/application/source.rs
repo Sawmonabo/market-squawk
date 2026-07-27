@@ -3,14 +3,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU64},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use market_squawk_data::CatalogLimit;
-use market_squawk_domain::SourceIdentifier;
+use market_squawk_domain::{ExactPayloadEvidence, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
@@ -24,6 +25,7 @@ use tokio::{
     time::{Instant as TokioInstant, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::{
     ApplicationDomainService, ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator,
@@ -57,12 +59,173 @@ const SOURCE_GET_HEALTH: &str = "Source.GetHealth";
 const SOURCE_SETUP: &str = "Source.Setup";
 const SOURCE_LIST_OBJECTS: &str = "Source.ListObjects";
 const SOURCE_DISCOVER: &str = "Source.Discover";
+const SOURCE_INSPECT: &str = "Source.Inspect";
 
 const MAX_CURRENT_SESSIONS: usize = 32;
+const MAXIMUM_INSPECTION_PAGE_INDEX: u16 = 63;
+const MAXIMUM_INSPECTION_RECORDS: u16 = 1_024;
 const PORTAL_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const PORTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PORTAL_MAX_REQUESTS: u64 = 512;
 const PORTAL_MAX_CONNECTIONS: usize = 16;
+
+/// Validated authority request for one non-persistent provider page inspection.
+pub struct EphemeralSourceInspectionRequest {
+    provider: SourceIdentifier,
+    onboarding_session_id: Uuid,
+    dataset_identifier: SourceIdentifier,
+    page_index: u16,
+    max_records: NonZeroU16,
+    max_bytes: NonZeroU64,
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl EphemeralSourceInspectionRequest {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all identity, lifecycle, and resource bounds remain explicit"
+    )]
+    fn try_new(
+        provider: SourceIdentifier,
+        onboarding_session_id: Uuid,
+        dataset_identifier: SourceIdentifier,
+        page_index: u16,
+        max_records: NonZeroU16,
+        max_bytes: NonZeroU64,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ServiceError> {
+        if page_index > MAXIMUM_INSPECTION_PAGE_INDEX
+            || max_records.get() > MAXIMUM_INSPECTION_RECORDS
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(Self {
+            provider,
+            onboarding_session_id,
+            dataset_identifier,
+            page_index,
+            max_records,
+            max_bytes,
+            deadline,
+            cancellation,
+        })
+    }
+
+    /// Returns the exact code-owned provider profile.
+    pub const fn provider(&self) -> &SourceIdentifier {
+        &self.provider
+    }
+
+    /// Returns the onboarding session that owns credential authority.
+    pub const fn onboarding_session_id(&self) -> Uuid {
+        self.onboarding_session_id
+    }
+
+    /// Returns the exact provider dataset grammar admitted by the adapter.
+    pub const fn dataset_identifier(&self) -> &SourceIdentifier {
+        &self.dataset_identifier
+    }
+
+    /// Returns the zero-based provider page index.
+    pub const fn page_index(&self) -> u16 {
+        self.page_index
+    }
+
+    /// Returns the hard observation count ceiling.
+    pub const fn max_records(&self) -> NonZeroU16 {
+        self.max_records
+    }
+
+    /// Returns the hard inline deep-byte ceiling.
+    pub const fn max_bytes(&self) -> NonZeroU64 {
+        self.max_bytes
+    }
+
+    /// Returns the monotonic request deadline.
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Returns request-owned cancellation authority.
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+impl fmt::Debug for EphemeralSourceInspectionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EphemeralSourceInspectionRequest")
+            .field("provider", &self.provider)
+            .field("onboarding_session_id", &self.onboarding_session_id)
+            .field("dataset_identifier", &self.dataset_identifier)
+            .field("page_index", &self.page_index)
+            .field("max_records", &self.max_records)
+            .field("max_bytes", &self.max_bytes)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact provider result returned by the sole ephemeral inspection authority.
+#[derive(Debug)]
+pub struct EphemeralSourceInspectionResult {
+    provider: SourceIdentifier,
+    onboarding_session_id: Uuid,
+    dataset_identifier: SourceIdentifier,
+    object_id: SourceIdentifier,
+    page_index: u16,
+    page_evidence: ExactPayloadEvidence,
+    received_at: Timestamp,
+    observations: Vec<Value>,
+}
+
+impl EphemeralSourceInspectionResult {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all provider lineage fields remain explicit"
+    )]
+    /// Builds the exact result returned after provider-page revalidation.
+    #[must_use]
+    pub fn new(
+        provider: SourceIdentifier,
+        onboarding_session_id: Uuid,
+        dataset_identifier: SourceIdentifier,
+        object_id: SourceIdentifier,
+        page_index: u16,
+        page_evidence: ExactPayloadEvidence,
+        received_at: Timestamp,
+        observations: Vec<Value>,
+    ) -> Self {
+        Self {
+            provider,
+            onboarding_session_id,
+            dataset_identifier,
+            object_id,
+            page_index,
+            page_evidence,
+            received_at,
+            observations,
+        }
+    }
+}
+
+/// Sole application authority for bounded credentialed inspection without persistence.
+#[async_trait]
+pub trait EphemeralSourceInspectionAuthority: Send + Sync {
+    /// Retrieves one exact bounded page without creating durable research publication state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded service error when onboarding authority, provider access, validation,
+    /// request lifecycle, or result construction fails.
+    async fn inspect(
+        &self,
+        request: EphemeralSourceInspectionRequest,
+    ) -> Result<EphemeralSourceInspectionResult, ServiceError>;
+}
 
 /// Transport-neutral Source-domain service over onboarding and current runtime evidence.
 pub struct SourceDomainService {
@@ -80,6 +243,7 @@ impl SourceDomainService {
         runtime: Arc<dyn SourceRuntimeView>,
         discovery: Arc<dyn ResearchSourceDiscoveryCoordinator>,
         portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
+        inspection: Arc<dyn EphemeralSourceInspectionAuthority>,
     ) -> Result<Self, SourceApplicationError> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_error| SourceApplicationError::AsyncRuntimeUnavailable)?;
@@ -95,6 +259,7 @@ impl SourceDomainService {
                 runtime,
                 discovery,
                 portal_activation,
+                inspection,
                 lifecycle: DomainLifecycle::new(),
                 session_limit: CatalogLimit::new(MAX_CURRENT_SESSIONS)
                     .map_err(|_error| SourceApplicationError::InvalidCodeOwnedLimit)?,
@@ -137,6 +302,7 @@ impl ApplicationDomainService for SourceDomainService {
                     .await
             }
             SOURCE_DISCOVER => self.controller.discover(&request, &context, limits).await,
+            SOURCE_INSPECT => self.controller.inspect(&request, &context, limits).await,
             SOURCE_GET_STATUS => {
                 self.controller
                     .read(&request, &context, limits, SourceReadKind::Status)
@@ -185,6 +351,7 @@ struct SourceController {
     runtime: Arc<dyn SourceRuntimeView>,
     discovery: Arc<dyn ResearchSourceDiscoveryCoordinator>,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
+    inspection: Arc<dyn EphemeralSourceInspectionAuthority>,
     lifecycle: Arc<DomainLifecycle>,
     session_limit: CatalogLimit,
     portal_state: Arc<Mutex<PortalState>>,
@@ -193,6 +360,112 @@ struct SourceController {
 }
 
 impl SourceController {
+    async fn inspect(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        ensure_request_live(context, &self.lifecycle)?;
+        let provider = required_identifier(request, "provider")?;
+        ensure_exact_provider_scope(request, &provider)?;
+        let onboarding_session_id = request
+            .arguments()
+            .get("onboardingSessionId")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::InvalidRequest)
+            .and_then(|value| {
+                Uuid::parse_str(value).map_err(|_error| ServiceError::InvalidRequest)
+            })?;
+        let dataset_identifier = required_identifier(request, "datasetIdentifier")?;
+        let page_index = request
+            .arguments()
+            .get("pageIndex")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(ServiceError::InvalidRequest)?;
+        let max_records = request
+            .arguments()
+            .get("maxRecords")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .and_then(NonZeroU16::new)
+            .ok_or(ServiceError::InvalidRequest)?;
+        if usize::from(max_records.get()) > limits.maximum_inline_items()
+            || usize::from(max_records.get()) > limits.maximum_result_items()
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let maximum_bytes = limits
+            .maximum_inline_bytes()
+            .min(limits.maximum_result_bytes());
+        let maximum_bytes = u64::try_from(maximum_bytes)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let inspection_request = EphemeralSourceInspectionRequest::try_new(
+            provider.clone(),
+            onboarding_session_id,
+            dataset_identifier.clone(),
+            page_index,
+            max_records,
+            maximum_bytes,
+            context.deadline(),
+            context.cancellation().clone(),
+        )?;
+        let deadline = TokioInstant::from_std(context.deadline());
+        let inspected = tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            () = self.lifecycle.shutdown_token().cancelled() => {
+                return Err(ServiceError::Unavailable);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            result = self.inspection.inspect(inspection_request) => result?,
+        };
+        ensure_request_live(context, &self.lifecycle)?;
+        if inspected.provider != provider
+            || inspected.onboarding_session_id != onboarding_session_id
+            || inspected.dataset_identifier != dataset_identifier
+            || inspected.page_index != page_index
+            || inspected.observations.len() > usize::from(max_records.get())
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        let item_count = inspected.observations.len();
+        let content = json!({
+            "provider": inspected.provider.as_str(),
+            "onboardingSessionId": inspected.onboarding_session_id.to_string(),
+            "datasetIdentifier": inspected.dataset_identifier.as_str(),
+            "objectId": inspected.object_id.as_str(),
+            "pageIndex": inspected.page_index,
+            "pageEvidence": to_json(&inspected.page_evidence)?,
+            "receivedAt": DateTime::<Utc>::from_timestamp_nanos(
+                inspected.received_at.unix_nanos()
+            ).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            "observations": inspected.observations,
+        });
+        let metadata = ToolResultMetadata::try_complete(
+            json!({
+                "provider": provider.as_str(),
+                "dataset": dataset_identifier.as_str(),
+                "operation": "ephemeral_inspection",
+                "persistence": "none",
+            }),
+            json!({
+                "quality": "official_delayed",
+                "executionEligible": false,
+            }),
+        )
+        .map_err(|_error| ServiceError::InvalidResult)?;
+        let result = TypedToolResult::try_new(content, item_count, metadata, limits)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        Ok(result)
+    }
+
     async fn list_objects(
         &self,
         request: &TypedToolRequest,
@@ -701,6 +974,7 @@ impl fmt::Debug for SourceController {
             .field("onboarding", &self.onboarding)
             .field("runtime", &"[AUTHORITY-FREE RUNTIME VIEW]")
             .field("portal_activation", &"[DURABLE ADAPTER AUTHORITY]")
+            .field("inspection", &"[EPHEMERAL EXTRACTION AUTHORITY]")
             .field("lifecycle", &self.lifecycle)
             .field("session_limit", &self.session_limit)
             .finish_non_exhaustive()

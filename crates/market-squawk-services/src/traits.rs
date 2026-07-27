@@ -19,6 +19,7 @@ const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
 const MAXIMUM_TOOLS: usize = 256;
 const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 64 * 1024;
+const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 32;
 const MAXIMUM_DESCRIPTOR_METADATA_BYTES: usize = 8 * 1024;
 const MAXIMUM_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
@@ -172,8 +173,9 @@ impl ToolDescriptor {
         {
             return Err(ServiceCapabilityError::InvalidSchema);
         }
-        let schema_limits = JsonStructureLimits::try_new(16, 8 * 1024, 1_000, 1_000)
-            .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
+        let schema_limits =
+            JsonStructureLimits::try_new(MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH, 8 * 1024, 1_000, 1_000)
+                .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
         let bounded_schema = Value::Object(input_schema);
         let input_schema_bytes = validate_json_contract(
             &bounded_schema,

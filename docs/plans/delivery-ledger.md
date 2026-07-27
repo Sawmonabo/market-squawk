@@ -665,3 +665,77 @@ created. `.worktrees` remains empty and the root target is approximately 11 GiB,
 This checkpoint completes implementation, not the mandatory external proof. Task 19A and release
 closure remain blocked until the unchanged candidate exercises fresh official Treasury responses
 through this shipping path together with every other required provider predicate.
+
+## 2026-07-26 FRED/ALFRED two-gate authority correction
+
+Current official FRED Services and API terms prohibit storage, caching, archival, database
+incorporation, and software or model training. The revision-4 profile is therefore
+`rights_limited`, not generally available for durable use. The maintained authority decision is
+`docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md`, SHA-256
+`658324385cd927d258890028838b59dde5335a29f82a0346c1f23736abe5668b`.
+
+Durable activation now requires both exact written St. Louis Fed service permission and independent
+exact-series authority. The raw Bank response must be matched byte-for-byte against a fresh
+application-owned reacquisition from its exact official HTTPS URL and remain bound to an explicit
+local review containing reviewer, issuer, grantee, service, exact series, operations, conditions,
+effective date, optional document expiry, and finite revalidation. Email headers, a contact
+submission, API key, public-domain series, or caller-declared operation list cannot independently
+unlock persistence or training. Legacy schema-version-2 recipes decode for recovery but cannot
+bypass either current gate.
+
+The adapter, distinct provider/analytical identities, revision-preserving publication path,
+restart checks, and PIT/Python acceptance producer remain implemented. They are not releasable for
+durable FRED/ALFRED data until both gates and the real official-provider proof pass unchanged-head
+verification. Direct BLS `LNS14000000` is the zero-fee durable unemployment-data route and must
+retain BLS provenance; true point-in-time vintages require archived BLS release evidence.
+
+Fresh focused verification of the corrected implementation passed:
+
+```text
+CARGO_INCREMENTAL=0 cargo test -p market-squawk-adapter-fred --lib --tests --locked
+result: 16 passed; one controlled local-evidence test ignored by contract
+CARGO_INCREMENTAL=0 cargo test -p market-squawk-sources \
+  available_persistence_is_bound_to_exact_current_evidence --locked
+result: 1 passed
+CARGO_INCREMENTAL=0 cargo test -p market-squawk --lib \
+  fred_request_v3_is_closed_and_v2_recovers_as_legacy_owner_permission --locked
+result: 1 passed
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk-adapter-fred \
+  --all-targets --all-features --locked -- -D warnings
+CARGO_INCREMENTAL=0 cargo clippy -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings
+CARGO_INCREMENTAL=0 cargo check -p market-squawk --all-features --locked
+result: passed
+```
+
+Rust formatting and diff integrity also passed. This verifies the fail-closed local implementation;
+it does not supply the external permission or the required working real-data release proof.
+FRED/ALFRED remains an open mandatory V1 release blocker; it is not optional, deferred, or complete
+merely because its adapter or acceptance producer exists.
+
+## 2026-07-26 Treasury five-family fresh-root provider proof
+
+The shipping CLI binary with SHA-256
+`8fb722ace4dc1d5c5fb0f233d3f06c7db53b257c870856d081d9d00d7f769a6d` completed a fresh
+official-provider run in `/private/tmp/market-squawk-treasury-final.v8eRP4`. The no-credential
+Treasury profile reopened as `active_scoped`, with all five 2025 families and an
+`OfficialDelayed` quality ceiling.
+
+| Analytical dataset | Generation | Objects | Rows | Manifest content SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| `treasury.daily-par-yield-curve.2025` | 1 | 1 | 3,455 | `16287e151a6fcad2aa792e4d39ef2028a7842b08b34ac9b5ceee79f130e0aae8` |
+| `treasury.daily-bill-rates.2025` | 1 | 1 | 6,848 | `7d017269b7d6ff6cdaffd0126910853f7b00d9233cb91ef9c6f4f2e65ce07222` |
+| `treasury.daily-long-term-rates.2025` | 1 | 1 | 747 | `d7b204bc9ef702923de562577b2aaea629ff662e8e68c909821e298c51d2d104` |
+| `treasury.daily-real-par-yield-curve.2025` | 1 | 1 | 1,245 | `7125de5d5e3b1451428bd56789ca82a8acb348503d1240fbc05a7ed085b715ef` |
+| `treasury.daily-real-long-term-rates.2025` | 1 | 1 | 249 | `711ed1a05c3629ef659e838e29a2d27dc0585dbbe54f36cba5264d14657b9017` |
+
+Each official object was rediscovered with the same exact identity and payload digest, then
+reingested. Every retry returned the original manifest version, content and lineage hashes, row
+count, byte count, and one-object count. A cold reopen recovered all five manifests, and a bounded
+DataFusion `COUNT(*)` exactly matched every reported row count. The catalog retained five succeeded
+ingest runs, five payloads, five manifests, one generation and one object per family, and no
+reserved, failed, duplicate, or second-generation record.
+
+This is successful dirty-candidate behavioral evidence, not final release approval: the worktree
+contained concurrent uncommitted release-lane changes. The unchanged clean exact-head provider run
+must still repeat and bind this proof through the release evidence producer before Task 19A closes.

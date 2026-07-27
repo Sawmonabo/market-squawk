@@ -37,7 +37,7 @@ use crate::{
     PointInTimePolicy, PointInTimeRevisionMode, PythonDatasetVerificationLimits,
     ResearchIngestService, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
     RightsBasis, RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_batch_digest, verify_python_dataset,
+    UniverseMembership, extraction_provider_payload_digest, verify_python_dataset,
 };
 
 type FixtureResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -80,7 +80,7 @@ pub(super) async fn measure(
     let membership_identity =
         CanonicalObservationPayload::try_from_observation(&membership)?.identity();
     let batch = extraction_batch(membership)?;
-    let payload_digest = extraction_batch_digest(&batch)?;
+    let payload_digest = extraction_provider_payload_digest(&batch);
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
         payload_digest,
@@ -118,8 +118,14 @@ pub(super) async fn measure(
             Duration::from_secs(240),
         )?,
     )?;
+    let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
     let parent = service
-        .ingest(reservation, batch, CancellationToken::new())
+        .ingest(
+            reservation,
+            analytical_dataset,
+            batch,
+            CancellationToken::new(),
+        )
         .await?;
     let request = build_request(
         parent.manifest().clone(),

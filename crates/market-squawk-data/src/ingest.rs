@@ -107,6 +107,17 @@ pub fn extraction_batch_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest
         .map_err(IngestError::ContentIdentity)
 }
 
+/// Returns the exact provider payload digest that owns one normalized extraction.
+///
+/// This identity deliberately comes from the discovered source object rather than normalized
+/// record bytes. Normalized rows retain receive, ingestion, and local-first availability times,
+/// which are truthful attempt provenance but must not turn a retry of the same immutable provider
+/// object into a second ingest. The source-object contract already binds the exact provider bytes
+/// and extraction rejects a refetch whose bytes do not match that evidence.
+pub fn extraction_provider_payload_digest(batch: &ExtractionBatch) -> EvidenceDigest {
+    batch.request().object().evidence().content_digest()
+}
+
 /// Process-local authority that must remain live through the durable ingest commit boundary.
 pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
     /// Revalidates the exact caller authority immediately before catalog and manifest commit.
@@ -123,6 +134,7 @@ pub trait ResearchIngestService {
     async fn ingest(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError>;
@@ -131,6 +143,7 @@ pub trait ResearchIngestService {
     async fn ingest_with_revision_plan(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
@@ -988,15 +1001,16 @@ impl AnalyticalDataService {
     async fn ingest_batch(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revision_plan: Option<ExtractionRevisionPlan>,
         cancellation: CancellationToken,
         precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<CommittedDataset, IngestError> {
-        let payload_digest = extraction_batch_digest(&batch)?;
+        let payload_digest = extraction_provider_payload_digest(&batch);
         let source_id = batch.request().object().source_id().clone();
-        let dataset_name = batch.request().object().dataset().clone();
-        let dataset_id = DatasetId::try_from(dataset_name.as_str())?;
+        let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
+            .map_err(|_| IngestError::InvalidDataset)?;
         {
             let authority = self.lock_authority()?;
             let run =
@@ -1004,9 +1018,12 @@ impl AnalyticalDataService {
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
-            if let Some(committed) =
-                self.reconcile_committed_run(&authority, &reservation, run.state(), &dataset_id)?
-            {
+            if let Some(committed) = self.reconcile_committed_run(
+                &authority,
+                &reservation,
+                run.state(),
+                &analytical_dataset,
+            )? {
                 return Ok(committed);
             }
         }
@@ -1050,7 +1067,7 @@ impl AnalyticalDataService {
         let lineage = converted.lineage_digest()?;
         let converted = DatasetArrowBatch::from(converted);
         self.manifests
-            .validate_append_schema(&dataset_id, &schema)?;
+            .validate_append_schema(&analytical_dataset, &schema)?;
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -1085,13 +1102,15 @@ impl AnalyticalDataService {
             &authority,
             &reservation,
             run.state(),
-            &dataset_id,
+            &analytical_dataset,
             &schema,
             &object,
         )? {
             return Ok(committed);
         }
-        let plan = self.manifests.preview_append(dataset_id, &schema, object)?;
+        let plan = self
+            .manifests
+            .preview_append(analytical_dataset, &schema, object)?;
         self.commit_plan(
             &authority,
             &reservation,
@@ -1109,12 +1128,14 @@ impl AnalyticalDataService {
     pub async fn ingest_with_precommit_authority(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         cancellation: CancellationToken,
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
     ) -> Result<CommittedDataset, IngestError> {
         self.ingest_batch(
             reservation,
+            analytical_dataset,
             batch,
             None,
             cancellation,
@@ -1127,6 +1148,7 @@ impl AnalyticalDataService {
     pub async fn ingest_with_revision_plan_and_precommit_authority(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
@@ -1134,6 +1156,7 @@ impl AnalyticalDataService {
     ) -> Result<CommittedDataset, IngestError> {
         self.ingest_batch(
             reservation,
+            analytical_dataset,
             batch,
             Some(revisions),
             cancellation,
@@ -1321,22 +1344,38 @@ impl ResearchIngestService for AnalyticalDataService {
     async fn ingest(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, None, cancellation, None)
-            .await
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            None,
+            cancellation,
+            None,
+        )
+        .await
     }
 
     async fn ingest_with_revision_plan(
         &self,
         reservation: IngestReservation,
+        analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, Some(revisions), cancellation, None)
-            .await
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            cancellation,
+            None,
+        )
+        .await
     }
 }
 

@@ -3,8 +3,34 @@
 Audit base: `069ccc39add6d5f185fefb1d3a51e96505a5773d` (macro adapter lane rebased
 onto release `6960e41`).
 
+Last official-source review: 2026-07-26.
+
 Refresh this note before release when BLS changes its API signatures, terms, quota table, or
 response schema. Network smoke tests remain opt-in; deterministic fixtures are the default suite.
+
+## 2026-07-26 release decision
+
+The official sources were reviewed again for the V1 provider gate:
+
+- BLS still describes v1 as unregistered and open for public use. It is the required zero-fee
+  release path.
+- The current FAQ still publishes 25 daily queries, 25 series per query, 10 years per query, and
+  50 requests per 10 seconds for v1. Registered v2 remains an optional higher-limit path with 500
+  daily queries, 50 series, 20 years, an emailed registration key, and annual renewal.
+- The API terms still say downloaded data should not carry end-use controls. They require the
+  retrieval date, the BLS post-retrieval disclaimer, truthful representation, and limit
+  compliance.
+- BLS still states that its publications are public domain except previously copyrighted
+  photographs and illustrations, and asks users to cite BLS as the source.
+- The API still provides current published historical observations, not a historical-vintage
+  interface. Market Squawk must retain direct BLS provenance and local-first availability and must
+  not present those responses as reconstructed vintages.
+
+For the unemployment release vertical, the exact source series is `LNS14000000`. Durable
+persistence, analytics, and model-input use are admitted for direct BLS-authored observations with
+the duties above. A real release run must retrieve the official v1 response, publish one immutable
+Arrow/Parquet generation, query it through the analytical service, recover it after restart, and
+bind any derived training dataset to that exact BLS parent.
 
 ## Provider facts used by the adapter
 
@@ -60,3 +86,5 @@ response schema. Network smoke tests remain opt-in; deterministic fixtures are t
 - BLS API FAQ and quota table: https://www.bls.gov/developers/api_faqs.htm
 - BLS API features and daily reset behavior: https://www.bls.gov/bls/api_features.htm
 - BLS API terms of service: https://www.bls.gov/developers/termsOfService.htm
+- BLS copyright information: https://www.bls.gov/opub/copyright-information.htm
+- BLS series `LNS14000000`: https://data.bls.gov/timeseries/LNS14000000

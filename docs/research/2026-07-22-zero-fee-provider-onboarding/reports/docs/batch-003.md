@@ -100,7 +100,7 @@ quota/features; it neither enlarges nor reduces the underlying data-use terms.
 
 ## Limitations and Non-Findings
 
-- This is engineering evidence analysis, not legal advice.
+- This is engineering evidence analysis and does not determine legal rights or obligations.
 - No BLS runtime, registration, key email, or annual renewal was exercised.
 - No selected source establishes that every third-party datum reachable through a government site is
   Government-authored or covered by the same terms.

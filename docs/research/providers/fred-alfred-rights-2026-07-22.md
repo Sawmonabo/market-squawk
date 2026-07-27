@@ -1,6 +1,10 @@
 # FRED and ALFRED API rights decision — 2026-07-22
 
-Status: current release authority  
+> Superseded on 2026-07-26 by the
+> [FRED/ALFRED local-first API authority](2026-07-26-fred-alfred-local-first-api-authority.md).
+> This file remains immutable historical evidence of the earlier blanket-blocked decision.
+
+Status: historical, superseded release decision
 Scope: FRED and ALFRED API access, durable local storage, analytical use, and model use  
 Review trigger: any change to the cited terms, API-key contract, requested operation, or series owner
 

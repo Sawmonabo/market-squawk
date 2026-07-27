@@ -5,9 +5,9 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use market_squawk_domain::{DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 
 use super::{
-    AuthoritySet, CredentialKind, EvidenceBinding, HumanBoundary, LifecycleSupport,
-    ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision, RatePolicyDescriptor,
-    RightsAdmissionState, SetupMode,
+    AuthoritySet, CredentialKind, EvidenceBinding, FRED_ALFRED_API_SURFACE_ID, HumanBoundary,
+    LifecycleSupport, ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision,
+    RatePolicyDescriptor, RightsAdmissionState, SetupMode,
 };
 use crate::onboarding::profile::{
     DataUseOperation, DataUseRight, OperationAdmission, ProbeTransport, ProfileActivationMode,
@@ -56,10 +56,59 @@ const TREASURY_DAILY_RATES_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::ne
         0x7f, 0x92,
     ],
 );
+const FRED_LOCAL_FIRST_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0x49, 0x41, 0xa3, 0x30, 0x88, 0xab, 0x87, 0x26, 0x42, 0x77, 0x9e, 0x3b, 0x7f, 0x67, 0x88,
+        0x12, 0xd4, 0xed, 0x7d, 0x1a, 0xf0, 0x43, 0x42, 0x05, 0x4d, 0x0a, 0x0c, 0x93, 0xbf, 0x7f,
+        0x81, 0xb4,
+    ],
+);
+const FRED_TERMS_MANIFEST_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0xc2, 0xf5, 0x35, 0x99, 0x30, 0x7d, 0x77, 0x39, 0x87, 0x99, 0xcc, 0xda, 0x16, 0xec, 0xa3,
+        0x4c, 0x78, 0xdf, 0xa2, 0x16, 0xb9, 0x83, 0xae, 0x95, 0xda, 0xab, 0xae, 0x68, 0x94, 0x98,
+        0x2e, 0x77,
+    ],
+);
+const FRED_UNRATE_RIGHTS_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0xa7, 0x6a, 0xb0, 0x03, 0x4e, 0xba, 0x4b, 0x87, 0x8b, 0x00, 0xa6, 0xec, 0xf2, 0x9f, 0x02,
+        0x62, 0x70, 0x63, 0x9d, 0x23, 0x0c, 0x07, 0x4a, 0x29, 0x15, 0x2a, 0x1b, 0x29, 0x89, 0xff,
+        0x7f, 0x0a,
+    ],
+);
+const SEC_PUBLIC_API_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0xf4, 0x25, 0x65, 0x04, 0x19, 0x56, 0xc1, 0x33, 0x45, 0xae, 0xc3, 0xa3, 0xb5, 0x5e, 0x52,
+        0x83, 0x4d, 0xc1, 0x5a, 0x78, 0x97, 0xe9, 0x26, 0xf6, 0x90, 0xc7, 0x56, 0xd1, 0x0d, 0x2f,
+        0x4a, 0x80,
+    ],
+);
+const BLS_PUBLIC_V1_AUTHORITY_DIGEST: EvidenceDigest = EvidenceDigest::new(
+    DigestAlgorithm::Sha256,
+    [
+        0x8c, 0xd0, 0x23, 0x7b, 0x36, 0x23, 0x23, 0x79, 0x58, 0x65, 0x10, 0xcc, 0x5c, 0x3b, 0xd3,
+        0x7d, 0x6c, 0x64, 0xf9, 0x7b, 0x89, 0x79, 0xab, 0x4a, 0x23, 0xa7, 0x80, 0x28, 0x1a, 0x08,
+        0xf1, 0x82,
+    ],
+);
 const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
+const SEC_PROFILE: &str = "sec.edgar-public";
+const BLS_PUBLIC_V1_PROFILE: &str = "bls.v1-unregistered";
+const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
 const TREASURY_DAILY_RATES_PROFILE: &str = "treasury.daily-rates-xml";
+const TREASURY_FISCAL_PROFILE: &str = "treasury.fiscal-data";
+const SEC_PUBLIC_API_AUTHORITY_SOURCE: &str = "MSQ-SEC-EDGAR-PUBLIC-API-AUTHORITY-2026-07-26";
+const BLS_PUBLIC_V1_AUTHORITY_SOURCE: &str = "MSQ-BLS-PUBLIC-V1-AUTHORITY-2026-07-26";
 const TREASURY_DAILY_RATES_AUTHORITY_SOURCE: &str =
     "MSQ-TREASURY-DAILY-RATES-RELEASE-AUTHORITY-2026-07-26";
+const FRED_LOCAL_FIRST_AUTHORITY_SOURCE: &str = "MSQ-FRED-ALFRED-LOCAL-FIRST-AUTHORITY-2026-07-26";
+const FRED_TERMS_MANIFEST_SOURCE: &str = "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26";
+const FRED_UNRATE_RIGHTS_SOURCE: &str = "MSQ-FRED-UNRATE-PUBLIC-DOMAIN-2026-07-26";
 /// Code-owned completed year used by the bounded Treasury daily-rate onboarding probe.
 pub const TREASURY_DAILY_RATES_PROBE_YEAR: u16 = 2025;
 
@@ -71,14 +120,6 @@ const RIGHTS_LIMITED: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Export, OperationAdmission::Pending),
     DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Pending),
 ];
-const RIGHTS_BLOCKED: &[DataUseRight] = &[
-    DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Blocked),
-    DataUseRight::new(DataUseOperation::Display, OperationAdmission::Blocked),
-    DataUseRight::new(DataUseOperation::Persist, OperationAdmission::Blocked),
-    DataUseRight::new(DataUseOperation::ModelTraining, OperationAdmission::Blocked),
-    DataUseRight::new(DataUseOperation::Export, OperationAdmission::Blocked),
-    DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Blocked),
-];
 const RIGHTS_BLS: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Admitted),
     DataUseRight::new(DataUseOperation::Display, OperationAdmission::Admitted),
@@ -89,6 +130,14 @@ const RIGHTS_BLS: &[DataUseRight] = &[
     ),
     DataUseRight::new(DataUseOperation::Export, OperationAdmission::Pending),
     DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Pending),
+];
+const RIGHTS_FRED_TWO_GATE: &[DataUseRight] = &[
+    DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Admitted),
+    DataUseRight::new(DataUseOperation::Display, OperationAdmission::Pending),
+    DataUseRight::new(DataUseOperation::Persist, OperationAdmission::Pending),
+    DataUseRight::new(DataUseOperation::ModelTraining, OperationAdmission::Pending),
+    DataUseRight::new(DataUseOperation::Export, OperationAdmission::Pending),
+    DataUseRight::new(DataUseOperation::Redistribute, OperationAdmission::Blocked),
 ];
 const RIGHTS_ALL: &[DataUseRight] = &[
     DataUseRight::new(DataUseOperation::Retrieve, OperationAdmission::Admitted),
@@ -122,6 +171,14 @@ const BLS_DUTIES: &[&str] = &[
     "preserve the required disclaimer and truthful representation",
     "enforce the exact tier limits and third-party-rights boundary",
 ];
+const FRED_LOCAL_FIRST_DUTIES: &[&str] = &[
+    "use only the official FRED API for programmatic access",
+    "require exact written St. Louis Fed service permission for every durable or training operation",
+    "require independent exact public-domain or owner permission for every selected series",
+    "bind raw Bank evidence to an explicit local review decision and finite revalidation deadline",
+    "retain exact series, vintage, provider, payload, and terms-bundle provenance",
+    "keep durable use, export, and redistribution closed whenever either authority gate is absent",
+];
 const LOCAL_DUTIES: &[&str] = &[
     "retain the imported source record",
     "the user remains responsible for rights they do not own",
@@ -136,9 +193,11 @@ const REFRESH_RECOVERY: &[&str] = &[
     "refresh the named official evidence sources and publish a new contiguous profile revision",
     "resume only after the catalog contains the newly admitted revision",
 ];
-const RIGHTS_RECOVERY: &[&str] = &[
-    "record a qualified scope-specific rights decision before importing a key",
-    "obtain any required series-owner permission and publish a new contiguous profile revision",
+const FRED_LOCAL_FIRST_RECOVERY: &[&str] = &[
+    "refresh the exact FRED terms bundle before its local revalidation deadline",
+    "import exact written St. Louis Fed permission and complete a hash-bound local review",
+    "replace expired or incomplete Bank or exact-series evidence before durable activation",
+    "resume the provider credential through the explicit foreground secret boundary",
 ];
 const LOCAL_RECOVERY: &[&str] = &[
     "repair the selected local path or input record",
@@ -223,6 +282,13 @@ const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
 ];
 const SEC_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        SEC_PUBLIC_API_AUTHORITY_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/sec-edgar-public-api-2026-07-26.md",
+        "2026-07-26",
+        Some(SEC_PUBLIC_API_AUTHORITY_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
         "DOC-019",
         "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
         "2026-07-25",
@@ -246,6 +312,34 @@ const SEC_EVIDENCE: &[ProfileEvidence] = &[
 ];
 const FRED_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        FRED_TERMS_MANIFEST_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/verification/fred-rights-decision.json",
+        "2026-07-26",
+        Some(FRED_TERMS_MANIFEST_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        FRED_UNRATE_RIGHTS_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/verification/fred-unrate-public-domain-rights.json",
+        "2026-07-26",
+        Some(FRED_UNRATE_RIGHTS_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        FRED_LOCAL_FIRST_AUTHORITY_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/2026-07-26-fred-alfred-local-first-api-authority.md",
+        "2026-07-26",
+        Some(FRED_LOCAL_FIRST_AUTHORITY_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
+        "FRED-PERMISSIONS-CONTACT",
+        "https://fred.stlouisfed.org/contactus/",
+        "2026-07-26",
+        None,
+        true,
+    ),
+    ProfileEvidence::new(
         "DOC-021",
         "https://fred.stlouisfed.org/docs/api/api_key.html",
         REVIEW_DATE,
@@ -261,13 +355,20 @@ const FRED_EVIDENCE: &[ProfileEvidence] = &[
     ),
     ProfileEvidence::new(
         "DOC-025",
-        "https://fred.stlouisfed.org/legal/terms/",
+        "https://fred.stlouisfed.org/legal/",
         "2026-07-25",
         None,
         true,
     ),
 ];
 const BLS_V1_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        BLS_PUBLIC_V1_AUTHORITY_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/bls-public-data-api-2026-07-21.md",
+        "2026-07-26",
+        Some(BLS_PUBLIC_V1_AUTHORITY_DIGEST),
+        false,
+    ),
     ProfileEvidence::new(
         "DOC-026",
         "https://www.bls.gov/developers/api_faqs.htm",
@@ -459,7 +560,12 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
     } else {
         CredentialKind::None
     };
-    let legacy_capability = build_capability(
+    let historical_rights_state = if spec.id == FRED_PROFILE {
+        RightsAdmissionState::Blocked
+    } else {
+        spec.rights_state
+    };
+    let legacy_capability = build_capability_with_rights_state(
         &spec,
         ProviderCapabilityRevision::new(1)?,
         prior_credential_kind,
@@ -468,8 +574,9 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             LEGACY_REPORT_DIGEST,
             true,
         )?,
+        historical_rights_state,
     )?;
-    let revision_two = build_capability(
+    let revision_two = build_capability_with_rights_state(
         &spec,
         ProviderCapabilityRevision::new(2)?,
         prior_credential_kind,
@@ -483,6 +590,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             built_in_budget(&spec, false)?,
             spec.probe.transport() != ProbeTransport::Local,
         )?,
+        historical_rights_state,
     )?;
     let (historical_capabilities, capability) = if spec.id == COINBASE_DIRECT_PROFILE {
         let current = build_capability(
@@ -515,6 +623,94 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 PROVIDER_RELEASE_REPORT_DIGEST,
                 built_in_budget(&spec, true)?,
                 spec.probe.transport() != ProbeTransport::Local,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            revision_three.rate_policy().clone(),
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
+    } else if spec.id == TREASURY_FISCAL_PROFILE {
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            revision_three.rate_policy().clone(),
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
+    } else if spec.id == FRED_PROFILE {
+        let revision_three = build_capability_with_rights_state(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                prior_fred_budget()?,
+                true,
+            )?,
+            RightsAdmissionState::Blocked,
+        )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(4)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
+            )?,
+        )?;
+        (
+            vec![legacy_capability, revision_two, revision_three],
+            current,
+        )
+    } else if matches!(spec.id, SEC_PROFILE | BLS_PUBLIC_V1_PROFILE) {
+        let revision_three = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(3)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(2)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                built_in_budget(&spec, true)?,
+                true,
             )?,
         )?;
         let current = build_capability(
@@ -584,6 +780,22 @@ fn build_capability(
     credential_kind: CredentialKind,
     rate_policy: RatePolicyDescriptor,
 ) -> Result<ProviderCapability, ProviderProfileError> {
+    build_capability_with_rights_state(
+        spec,
+        revision,
+        credential_kind,
+        rate_policy,
+        spec.rights_state,
+    )
+}
+
+fn build_capability_with_rights_state(
+    spec: &BuiltInSpec,
+    revision: ProviderCapabilityRevision,
+    credential_kind: CredentialKind,
+    rate_policy: RatePolicyDescriptor,
+    rights_state: RightsAdmissionState,
+) -> Result<ProviderCapability, ProviderProfileError> {
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
     let authority = spec.authority.map(SourceIdentifier::try_from).transpose()?;
     let minimum_authority =
@@ -609,14 +821,16 @@ fn build_capability(
         verifier_revision: SourceIdentifier::try_from(format!(
             "{}.probe.v{}",
             spec.id,
-            if spec.id == "treasury.daily-rates-xml" && revision.get() >= 3 {
+            if (spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 3)
+                || (spec.id == TREASURY_FISCAL_PROFILE && revision.get() >= 4)
+            {
                 2
             } else {
                 1
             }
         ))?,
         rate_policy,
-        rights_state: spec.rights_state,
+        rights_state,
         lifecycle_support: if matches!(
             spec.id,
             "bls.v2-registered" | "coinbase.exchange-direct-market-data"
@@ -627,8 +841,14 @@ fn build_capability(
         },
         evidence: capability_evidence(spec, revision)?,
         refresh_trigger: SourceIdentifier::try_from(
-            if spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 4 {
+            if spec.id == SEC_PROFILE && revision.get() >= 4 {
+                SEC_PUBLIC_API_AUTHORITY_SOURCE
+            } else if spec.id == BLS_PUBLIC_V1_PROFILE && revision.get() >= 4 {
+                BLS_PUBLIC_V1_AUTHORITY_SOURCE
+            } else if spec.id == TREASURY_DAILY_RATES_PROFILE && revision.get() >= 4 {
                 "TREASURY-XML-AUTHORITY-2026-07-26"
+            } else if spec.id == FRED_PROFILE && revision.get() >= 4 {
+                FRED_TERMS_MANIFEST_SOURCE
             } else {
                 spec.refresh_trigger
             },
@@ -665,6 +885,28 @@ fn capability_evidence(
             TREASURY_DAILY_RATES_AUTHORITY_DIGEST,
         ));
     }
+    if spec.id == SEC_PROFILE && revision.get() >= 4 {
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(SEC_PUBLIC_API_AUTHORITY_SOURCE)?,
+            SEC_PUBLIC_API_AUTHORITY_DIGEST,
+        ));
+    }
+    if spec.id == BLS_PUBLIC_V1_PROFILE && revision.get() >= 4 {
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(BLS_PUBLIC_V1_AUTHORITY_SOURCE)?,
+            BLS_PUBLIC_V1_AUTHORITY_DIGEST,
+        ));
+    }
+    if spec.id == FRED_PROFILE && revision.get() >= 4 {
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(FRED_LOCAL_FIRST_AUTHORITY_SOURCE)?,
+            FRED_LOCAL_FIRST_AUTHORITY_DIGEST,
+        ));
+        evidence.push(EvidenceBinding::new(
+            SourceIdentifier::try_from(FRED_TERMS_MANIFEST_SOURCE)?,
+            FRED_TERMS_MANIFEST_DIGEST,
+        ));
+    }
     Ok(evidence)
 }
 
@@ -698,7 +940,7 @@ fn built_in_budget(
         "sec.edgar-public" => simple_budget("us-sec-edgar", None, 8, SECOND_NANOS, 4, backoff),
         "bls.v1-unregistered" => bls_budget(None, 25, backoff),
         "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 500, backoff),
-        "fred-alfred.api-v1-v2" if current_revision => fred_budget(backoff),
+        FRED_PROFILE if current_revision => fred_budget(backoff, "fred.onboarding-api-key"),
         "fred-alfred.api-v1-v2" => simple_budget(
             "fred",
             Some("fred.onboarding-rights-blocked"),
@@ -762,7 +1004,17 @@ fn simple_budget(
     )?)
 }
 
-fn fred_budget(backoff: BackoffPolicy) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+fn prior_fred_budget() -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    fred_budget(
+        BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?,
+        "fred.onboarding-rights-blocked",
+    )
+}
+
+fn fred_budget(
+    backoff: BackoffPolicy,
+    account: &str,
+) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
     // The one-second window is Market Squawk's conservative ceiling for the combined v1/v2
     // profile. The retained official evidence is specific to v2, so it is not represented as a
     // provider-published v1 limit.
@@ -781,7 +1033,7 @@ fn fred_budget(backoff: BackoffPolicy) -> Result<ProviderBudgetPolicy, ProviderP
     Ok(ProviderBudgetPolicy::try_new_conjunctive(
         BudgetScope::with_authorization_account(
             SourceIdentifier::try_from("fred")?,
-            SourceIdentifier::try_from("fred.onboarding-rights-blocked")?,
+            SourceIdentifier::try_from(account)?,
         ),
         &windows,
         NonZeroU16::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
@@ -926,14 +1178,14 @@ fn kraken() -> Result<BuiltInSpec, ProviderProfileError> {
 
 fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: "sec.edgar-public",
+        id: SEC_PROFILE,
         display_name: "SEC EDGAR submissions and XBRL",
         official_entry: "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
         setup: ProfileActivationMode::NoCredential,
         zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::NotRequired,
         contact: Requirement::RequiredNonSecret,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
@@ -949,62 +1201,62 @@ fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
             "declare an application/company and administrative contact in User-Agent",
             "retain public EDGAR provenance and enforce the aggregate fair-access limit",
         ],
-        persistence_evidence_source_id: Some("DOC-020"),
+        persistence_evidence_source_id: Some(SEC_PUBLIC_API_AUTHORITY_SOURCE),
         rotation: "update the declared non-secret contact when administrative ownership changes",
         revocation: "remove the source configuration locally",
-        recovery: REFRESH_RECOVERY,
+        recovery: COMMON_RECOVERY,
         evidence: SEC_EVIDENCE,
         rate_policy: "sec.edgar-public.aggregate-rate-policy.v1",
         refresh_trigger: "SEC",
-        handoff_instruction: "Provide a valid non-secret organization and administrative email after evidence refresh.",
+        handoff_instruction: "Provide a truthful non-secret organization and monitored administrative email, then continue with the bounded public probe.",
     })
 }
 
 fn fred() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: "fred-alfred.api-v1-v2",
-        display_name: "FRED and ALFRED API v1/v2",
+        id: FRED_PROFILE,
+        display_name: "FRED and ALFRED API v1",
         official_entry: "https://fred.stlouisfed.org/docs/api/api_key.html",
         setup: ProfileActivationMode::ManualSecretImport,
-        zero_fee: ZeroFeeStatus::FreeAccountRightsBlocked,
+        zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RightsBlocked,
-        rights_state: RightsAdmissionState::Blocked,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::Pending,
         authority: Some("fred.series.read"),
         permissions: &["series.read"],
-        coverage: "FRED series and ALFRED vintages; third-party series may carry separate rights",
+        coverage: "Bounded ephemeral FRED/ALFRED retrieval; durable use requires exact written St. Louis Fed service permission plus independent exact-series authority",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::network(
+        probe: VerificationProbe::network_secret_query(
             ProbeTransport::HttpGet,
             "https://api.stlouisfed.org/fred/series",
-            None,
+            &[("series_id", "UNRATE"), ("file_type", "json")],
+            "api_key",
+            32,
         )?,
-        rights: RIGHTS_BLOCKED,
-        duties: &[
-            "a successful key check does not admit storage, modeling, export, or AI-facing use",
-        ],
+        rights: RIGHTS_FRED_TWO_GATE,
+        duties: FRED_LOCAL_FIRST_DUTIES,
         persistence_evidence_source_id: None,
         rotation: "create a replacement provider key and import it as a higher generation",
         revocation: "delete the exact provider key remotely, then delete the exact local generation",
-        recovery: RIGHTS_RECOVERY,
+        recovery: FRED_LOCAL_FIRST_RECOVERY,
         evidence: FRED_EVIDENCE,
         rate_policy: "fred-alfred.api-v1-v2.rate-policy.v1",
         refresh_trigger: "FRED",
-        handoff_instruction: "Use the official key page only after qualified rights admission; Market Squawk cannot issue this key.",
+        handoff_instruction: "Create a zero-fee provider API key for ephemeral access. Durable activation additionally requires exact written St. Louis Fed permission and exact-series authority.",
     })
 }
 
 fn bls_v1() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: "bls.v1-unregistered",
+        id: BLS_PUBLIC_V1_PROFILE,
         display_name: "BLS public API v1 unregistered",
         official_entry: "https://www.bls.gov/developers/api_signature.htm",
         setup: ProfileActivationMode::NoCredential,
-        zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
+        zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
@@ -1017,14 +1269,14 @@ fn bls_v1() -> Result<BuiltInSpec, ProviderProfileError> {
         )?,
         rights: RIGHTS_BLS,
         duties: BLS_DUTIES,
-        persistence_evidence_source_id: Some("DOC-029"),
+        persistence_evidence_source_id: Some(BLS_PUBLIC_V1_AUTHORITY_SOURCE),
         rotation: "not applicable: this surface has no credential",
         revocation: "not applicable: this surface has no credential",
-        recovery: REFRESH_RECOVERY,
+        recovery: COMMON_RECOVERY,
         evidence: BLS_V1_EVIDENCE,
         rate_policy: "bls.v1-unregistered.rate-policy.v1",
         refresh_trigger: "BLS-V1",
-        handoff_instruction: "No account or key is requested; activation waits for evidence refresh.",
+        handoff_instruction: "No account or key is required; continue with the bounded public v1 probe.",
     })
 }
 
@@ -1104,7 +1356,7 @@ fn treasury_xml() -> Result<BuiltInSpec, ProviderProfileError> {
 
 fn fiscal_data() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: "treasury.fiscal-data",
+        id: TREASURY_FISCAL_PROFILE,
         display_name: "U.S. Treasury Fiscal Data API",
         official_entry: "https://fiscaldata.treasury.gov/api-documentation/",
         setup: ProfileActivationMode::NoCredential,
@@ -1117,10 +1369,11 @@ fn fiscal_data() -> Result<BuiltInSpec, ProviderProfileError> {
         permissions: &[],
         coverage: "Fiscal Data API datasets with dataset/version-specific provenance",
         quality: DataQuality::OfficialDelayed,
-        probe: VerificationProbe::network(
+        probe: VerificationProbe::network_exact_public_query(
             ProbeTransport::HttpGet,
-            "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/avg_interest_rates",
-            None,
+            "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates",
+            "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates?page%5Bsize%5D=1",
+            &[("page[size]", "1")],
         )?,
         rights: RIGHTS_ALL,
         duties: &[

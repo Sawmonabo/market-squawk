@@ -336,7 +336,8 @@ The following are consolidated **Inferences**:
   audited, and security/performance claims were not independently replicated.
 - No repository proves Market Squawk's Rust 1.97 all-feature build, 100,000 events/s,
   sub-millisecond warmed p99, bounded burst memory, fuzz/audit coverage, or release readiness.
-- License observations are not legal advice. Exact packaged releases, notices, feature graphs,
+- License observations are engineering research summaries and do not determine legal rights or
+  obligations. Exact packaged releases, notices, feature graphs,
   transitive licenses, and LGPL/AGPL linkage/derivative-work questions require release-specific
   review.
 

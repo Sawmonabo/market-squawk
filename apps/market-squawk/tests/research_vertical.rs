@@ -15,7 +15,8 @@ use bytes::Bytes;
 use clap::Parser;
 use futures_util::future::BoxFuture;
 use market_squawk::application::{
-    ApplicationDomainService, ManagedResearchExtractionSource,
+    ApplicationDomainService, EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
+    EphemeralSourceInspectionResult, ManagedResearchExtractionSource,
     PrepublishedResearchSourceRegistration, ProductionResearchIngestCoordinator,
     ResearchExtractionLimits, ResearchIngestCoordinator, ResearchRevisionPlanError,
     ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator, SourceDomainService,
@@ -36,11 +37,13 @@ use market_squawk_data::{
     SqliteProviderRateStore,
 };
 use market_squawk_domain::{
-    AuthorizationBasis, AvailabilityEvidence, ChecksumCapability, CoverageDelay, DataQuality,
-    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    MacroObservation, MetadataRevision, PayloadReference, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionBoundPayloadEvidence,
-    RevisionNumber, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, Timestamp,
+    AuthorizationBasis, AvailabilityEvidence, CalendarDate, ChecksumCapability, CoverageDelay,
+    DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, MacroObservation, MetadataRevision, PayloadHash, PayloadReference,
+    ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTemporalCoordinate, ResearchTime, RevisionBoundPayloadEvidence, RevisionNumber,
+    SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, Timestamp,
+    VersionPinnedSourceLocator,
 };
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileFallbackStatus,
@@ -55,10 +58,10 @@ use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
     CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch,
     ExtractionRecord, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
-    ExtractionSourceError, FreshnessPolicy, HistoricalCapability, MAX_DISCOVERY_OBJECTS,
-    NetworkAccessPolicy, ProviderRateAuthority, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile,
+    ExtractionSourceError, FRED_ALFRED_API_SURFACE_ID, FreshnessPolicy, HistoricalCapability,
+    MAX_DISCOVERY_OBJECTS, NetworkAccessPolicy, ProviderRateAuthority, SourceCapabilities,
+    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider,
+    SourceObject, SourceProtocolProfile,
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use rust_decimal::Decimal;
@@ -87,6 +90,93 @@ impl ProviderPortalActivationAuthority for UnusedAdapterActivation {
         _cancellation: CancellationToken,
     ) -> Result<market_squawk::OnboardingSessionView, ProviderPortalActivationError> {
         Err(ProviderPortalActivationError::Unavailable)
+    }
+}
+
+#[async_trait]
+impl EphemeralSourceInspectionAuthority for UnusedAdapterActivation {
+    async fn inspect(
+        &self,
+        _request: EphemeralSourceInspectionRequest,
+    ) -> Result<EphemeralSourceInspectionResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalFredInspection;
+
+#[async_trait]
+impl EphemeralSourceInspectionAuthority for CanonicalFredInspection {
+    async fn inspect(
+        &self,
+        request: EphemeralSourceInspectionRequest,
+    ) -> Result<EphemeralSourceInspectionResult, ServiceError> {
+        let received_at = Timestamp::from_unix_nanos(1_000);
+        let ingested_at = Timestamp::from_unix_nanos(1_001);
+        let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("fred-fred-alfred.api-v1-v2")
+                .map_err(|_error| ServiceError::InvalidResult)?,
+            instrument_id: None,
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from("fred:UNRATE:2026-06-01:2026-07-03")
+                .map_err(|_error| ServiceError::InvalidResult)?,
+            source_timestamp: None,
+            received_at,
+            ingested_at,
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                DigestAlgorithm::Sha256,
+                [9; 32],
+            )),
+            availability: AvailabilityEvidence::local_first_observed(received_at),
+        })
+        .map_err(|_error| ServiceError::InvalidResult)?;
+        let effective = ResearchTemporalCoordinate::calendar_date(
+            CalendarDate::new(2026, 6, 1).map_err(|_error| ServiceError::InvalidResult)?,
+        );
+        let published = ResearchTemporalCoordinate::calendar_date(
+            CalendarDate::new(2026, 7, 3).map_err(|_error| ServiceError::InvalidResult)?,
+        );
+        let time = ResearchTime::try_new_with_coordinates(
+            effective,
+            Some(published),
+            RevisionNumber::new(1).map_err(|_error| ServiceError::InvalidResult)?,
+            None,
+        )
+        .map_err(|_error| ServiceError::InvalidResult)?;
+        let context =
+            ResearchContext::new(provenance, time).map_err(|_error| ServiceError::InvalidResult)?;
+        let observation = serde_json::to_value(ResearchObservation::Macro(MacroObservation::new(
+            context,
+            SourceIdentifier::try_from("UNRATE").map_err(|_error| ServiceError::InvalidResult)?,
+            Decimal::new(41, 1),
+            SourceIdentifier::try_from("fred-unit:v1:Percent")
+                .map_err(|_error| ServiceError::InvalidResult)?,
+        )))
+        .map_err(|_error| ServiceError::InvalidResult)?;
+        let page_evidence = ExactPayloadEvidence::with_version_pinned_locator(
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+            VersionPinnedSourceLocator::new(
+                SourceIdentifier::try_from("https://api.stlouisfed.org/fred/series/observations")
+                    .map_err(|_error| ServiceError::InvalidResult)?,
+                SourceIdentifier::try_from(
+                    "0707070707070707070707070707070707070707070707070707070707070707",
+                )
+                .map_err(|_error| ServiceError::InvalidResult)?,
+            ),
+        );
+        Ok(EphemeralSourceInspectionResult::new(
+            request.provider().clone(),
+            request.onboarding_session_id(),
+            request.dataset_identifier().clone(),
+            SourceIdentifier::try_from("fred-page-v2:0:1:1:1:1:fixture")
+                .map_err(|_error| ServiceError::InvalidResult)?,
+            request.page_index(),
+            page_evidence,
+            received_at,
+            vec![observation],
+        ))
     }
 }
 
@@ -279,8 +369,41 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         Arc::new(EmptySourceRuntime),
         discovery,
         Arc::new(UnusedAdapterActivation),
+        Arc::new(CanonicalFredInspection),
     )?;
     let capabilities = application_capabilities()?;
+    let inspect = capabilities
+        .find("Source.Inspect")
+        .ok_or("Source.Inspect is not registered")?;
+    let inspection_session_id = Uuid::new_v4();
+    let inspected = source_service
+        .call(
+            inspect.admit(
+                json!({
+                    "provider": FRED_ALFRED_API_SURFACE_ID,
+                    "onboardingSessionId": inspection_session_id,
+                    "datasetIdentifier": "fred:series:UNRATE",
+                    "pageIndex": 0,
+                    "maxRecords": 1,
+                    "sourceCoverage": [FRED_ALFRED_API_SURFACE_ID],
+                    "resultLimits": {"maximumItems": 1, "maximumBytes": 1024 * 1024},
+                })
+                .as_object()
+                .cloned()
+                .ok_or("inspection arguments must be an object")?,
+            )?,
+            discovery_context()?,
+        )
+        .await?;
+    inspected.validate_for(inspect)?;
+    assert!(
+        inspected.structured_content()["provider"] == FRED_ALFRED_API_SURFACE_ID
+            && inspected.structured_content()["onboardingSessionId"]
+                == inspection_session_id.to_string()
+            && inspected.structured_content()["observations"]
+                .as_array()
+                .is_some_and(|observations| observations.len() == 1)
+    );
     let discover = capabilities
         .find("Source.Discover")
         .ok_or("Source.Discover is not registered")?;
@@ -1086,6 +1209,31 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     )
     .await?;
     let base_url = portal.base_url().to_owned();
+    let stylesheet_response = client.get(format!("{base_url}/portal.css")).send().await?;
+    assert_eq!(stylesheet_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stylesheet_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .ok_or("portal stylesheet did not declare a content type")?
+            .to_str()?,
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        stylesheet_response
+            .headers()
+            .get("cache-control")
+            .ok_or("portal stylesheet did not declare a cache policy")?
+            .to_str()?,
+        "no-store"
+    );
+    let content_security_policy = stylesheet_response
+        .headers()
+        .get("content-security-policy")
+        .ok_or("portal stylesheet did not declare a content security policy")?
+        .to_str()?;
+    assert!(content_security_policy.contains("style-src 'self'"));
+    assert!(!content_security_policy.contains("'unsafe-inline'"));
     let bootstrap_response = client
         .get(format!("{base_url}/api/v1/bootstrap"))
         .send()

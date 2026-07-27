@@ -30,6 +30,8 @@ const MAXIMUM_FAIR_VALUE_ACTOR_BYTES: usize = 128;
 const MAXIMUM_FAIR_VALUE_ROW_OFFSET: u64 = 999_999;
 const MAXIMUM_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_ARTIFACT_CHUNK_BYTES: u64 = 32 * 1024;
+const MAXIMUM_SOURCE_INSPECTION_PAGE_INDEX: u64 = 63;
+const MAXIMUM_SOURCE_INSPECTION_RECORDS: u64 = 1_024;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -80,6 +82,25 @@ const PROVIDER_ARGUMENT: &[ArgumentSpec] =
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
+];
+const SOURCE_INSPECTION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("provider", ArgumentKind::Identifier),
+    ArgumentSpec::required("onboardingSessionId", ArgumentKind::Uuid),
+    ArgumentSpec::required("datasetIdentifier", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "pageIndex",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: MAXIMUM_SOURCE_INSPECTION_PAGE_INDEX,
+        },
+    ),
+    ArgumentSpec::required(
+        "maxRecords",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: MAXIMUM_SOURCE_INSPECTION_RECORDS,
+        },
+    ),
 ];
 const ACCOUNT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "accountId",
@@ -238,6 +259,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Source,
         SOURCE_DISCOVERY_SCOPE,
         SOURCE_DISCOVERY_ARGUMENTS,
+    ),
+    source_listing(
+        "Source.Inspect",
+        "Inspect one bounded provider page without persisting provider data.",
+        ServiceDomain::Source,
+        SOURCE_DISCOVERY_SCOPE,
+        SOURCE_INSPECTION_ARGUMENTS,
     ),
     source_discovery(
         "Source.Discover",
@@ -887,6 +915,7 @@ impl ArgumentSpec {
 #[derive(Clone, Copy)]
 enum ArgumentKind {
     Identifier,
+    Uuid,
     Sha256,
     Text,
     Decimal,
@@ -1017,6 +1046,10 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "type": "string",
             "minLength": 1,
             "maxLength": MAXIMUM_IDENTIFIER_BYTES
+        }),
+        ArgumentKind::Uuid => json!({
+            "type": "string",
+            "format": "uuid"
         }),
         ArgumentKind::Sha256 => json!({
             "type": "string",
@@ -1216,6 +1249,11 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::Identifier => value
             .as_str()
             .filter(|value| valid_identifier(value))
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Uuid => value
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Sha256 => value

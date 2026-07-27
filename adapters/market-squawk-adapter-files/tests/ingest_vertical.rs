@@ -20,9 +20,10 @@ use market_squawk_adapter_files::{
 };
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
-    CatalogError, CatalogLimit, CatalogResultLimits, IngestIdentity, ObjectStoreConfig,
+    CatalogError, CatalogLimit, CatalogResultLimits, DatasetId, IngestIdentity, ObjectStoreConfig,
     QueryLimits, QueryRequest, QueryResult, ResearchIngestService, ResearchQueryEngine,
     RightsBasis, RightsDecisionInput, SourceOperation, extraction_batch_digest,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -600,7 +601,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     let mut admitted = Vec::with_capacity(EXPECTED_FORMAT_ROWS);
     for batch in batches {
         let key = idempotency_key(&batch);
-        let payload_digest = extraction_batch_digest(&batch)?;
+        let payload_digest = extraction_provider_payload_digest(&batch);
         let rights = admit_rights(
             &authority,
             metadata.source_id().clone(),
@@ -662,7 +663,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
             &CancellationToken::new(),
         )
         .await?;
-    let restarted_digest = extraction_batch_digest(&restarted_batch)?;
+    let restarted_digest = extraction_provider_payload_digest(&restarted_batch);
     let restarted_rights = admit_rights(
         &authority,
         metadata.source_id().clone(),
@@ -679,7 +680,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         &restarted_rights,
     )?;
 
-    let changed_digest = extraction_batch_digest(&changed_csv)?;
+    let changed_digest = extraction_provider_payload_digest(&changed_csv);
     let changed_rights = admit_rights(
         &authority,
         metadata.source_id().clone(),
@@ -708,11 +709,22 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     let mut committed_csv = None;
     for (reservation, batch) in admitted {
         let is_csv = batch.request().object().object_id().as_str() == "csv-fixture";
+        let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
         let committed = service
-            .ingest(reservation.clone(), batch.clone(), CancellationToken::new())
+            .ingest(
+                reservation.clone(),
+                analytical_dataset.clone(),
+                batch.clone(),
+                CancellationToken::new(),
+            )
             .await?;
         let replayed = service
-            .ingest(reservation, batch, CancellationToken::new())
+            .ingest(
+                reservation,
+                analytical_dataset,
+                batch,
+                CancellationToken::new(),
+            )
             .await?;
         assert_eq!(replayed, committed);
         if is_csv {
@@ -723,6 +735,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     let restarted_commit = service
         .ingest(
             restarted_reservation,
+            DatasetId::try_from(restarted_batch.request().object().dataset().as_str())?,
             restarted_batch,
             CancellationToken::new(),
         )

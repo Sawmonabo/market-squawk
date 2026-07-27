@@ -11,7 +11,7 @@ use thiserror::Error;
 use super::{CredentialKind, ProviderCapability, RightsAdmissionState, SetupMode};
 use crate::{
     ApiEndpointRule, EndpointPolicy, HttpRequestBounds, NetworkPolicyError, PathScope,
-    QueryParameterRule,
+    QueryParameterRule, QuerySensitivity,
 };
 
 const MAX_PROFILES: usize = 32;
@@ -277,6 +277,71 @@ impl VerificationProbe {
             body: None,
             semantic_expectation: "successful bounded response matching the exact provider family and year schema",
             endpoint_policy: Some(policy),
+        })
+    }
+
+    /// Constructs a fixed GET whose public selector is exact and whose credential remains secret.
+    pub(crate) fn network_secret_query(
+        transport: ProbeTransport,
+        base_endpoint: &'static str,
+        exact_public_query: &[(&str, &str)],
+        secret_query_key: &str,
+        secret_maximum_bytes: u16,
+    ) -> Result<Self, NetworkPolicyError> {
+        if transport != ProbeTransport::HttpGet
+            || exact_public_query.is_empty()
+            || secret_query_key.is_empty()
+        {
+            return Err(NetworkPolicyError::InvalidRequestBounds);
+        }
+        let seconds =
+            |value| NonZeroU64::new(value).ok_or(NetworkPolicyError::InvalidRequestBounds);
+        let bounds = HttpRequestBounds::try_new(
+            seconds(5_000_000_000)?,
+            seconds(10_000_000_000)?,
+            seconds(10_000_000_000)?,
+            0,
+            seconds(1024 * 1024)?,
+        )?;
+        let mut query_rules = exact_public_query
+            .iter()
+            .map(|(key, value)| {
+                QueryParameterRule::try_new_exact_public(
+                    SourceIdentifier::try_from(*key)
+                        .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?,
+                    SourceIdentifier::try_from(*value)
+                        .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if exact_public_query
+            .iter()
+            .any(|(key, _value)| *key == secret_query_key)
+        {
+            return Err(NetworkPolicyError::InvalidRequestBounds);
+        }
+        query_rules.push(QueryParameterRule::try_new(
+            SourceIdentifier::try_from(secret_query_key)
+                .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?,
+            secret_maximum_bytes,
+            false,
+            QuerySensitivity::Secret,
+        )?);
+        let maximum_query_parameters = u8::try_from(query_rules.len())
+            .map_err(|_| NetworkPolicyError::InvalidRequestBounds)?;
+        let rule = ApiEndpointRule::try_new(
+            base_endpoint,
+            PathScope::Exact,
+            query_rules,
+            maximum_query_parameters,
+            512,
+        )?;
+        Ok(Self {
+            transport,
+            endpoint: Some(base_endpoint),
+            body: None,
+            semantic_expectation: "successful bounded response matching the exact credential probe selector",
+            endpoint_policy: Some(EndpointPolicy::try_from_api_rules(vec![rule], bounds)?),
         })
     }
 

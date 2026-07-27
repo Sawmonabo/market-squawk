@@ -190,31 +190,58 @@ impl TreasurySourceConfig {
 
     fn accepts_dataset(&self, dataset: &SourceIdentifier) -> Result<bool, TreasurySourceError> {
         match self {
-            Self::AverageInterestRates(query) => {
-                let expected = SourceIdentifier::try_from(format!(
-                    "treasury:fiscal-data:average-interest-rates-v2:{}",
-                    lower_hex(query.query_digest())
-                ))
-                .map_err(|_| TreasurySourceError::InvalidProtocol)?;
-                Ok(dataset == &expected)
-            }
+            Self::AverageInterestRates(query) => Ok(dataset == &fiscal_provider_dataset(query)?),
             Self::DailyRates(config) => Ok(config.query(dataset).is_some()),
         }
     }
 
     fn single_dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
         match self {
-            Self::AverageInterestRates(query) => SourceIdentifier::try_from(format!(
-                "treasury:fiscal-data:average-interest-rates-v2:{}",
-                lower_hex(query.query_digest())
-            ))
-            .map_err(|_| TreasurySourceError::InvalidProtocol),
+            Self::AverageInterestRates(query) => fiscal_provider_dataset(query),
             Self::DailyRates(config) if config.queries().len() == 1 => {
                 Ok(config.queries()[0].dataset().clone())
             }
             Self::DailyRates(_) => Err(TreasurySourceError::InvalidProtocol),
         }
     }
+
+    fn analytical_dataset(
+        &self,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, TreasurySourceError> {
+        match self {
+            Self::AverageInterestRates(query) => {
+                if provider_dataset != &fiscal_provider_dataset(query)? {
+                    return Err(TreasurySourceError::QueryBindingMismatch);
+                }
+                fiscal_analytical_dataset(query)
+            }
+            Self::DailyRates(config) => config
+                .query(provider_dataset)
+                .map(|query| query.analytical_dataset().clone())
+                .ok_or(TreasurySourceError::QueryBindingMismatch),
+        }
+    }
+}
+
+fn fiscal_provider_dataset(
+    query: &TreasuryFiscalQuery,
+) -> Result<SourceIdentifier, TreasurySourceError> {
+    SourceIdentifier::try_from(format!(
+        "treasury:fiscal-data:average-interest-rates-v2:{}",
+        lower_hex(query.query_digest())
+    ))
+    .map_err(|_| TreasurySourceError::InvalidProtocol)
+}
+
+fn fiscal_analytical_dataset(
+    query: &TreasuryFiscalQuery,
+) -> Result<SourceIdentifier, TreasurySourceError> {
+    SourceIdentifier::try_from(format!(
+        "treasury.fiscal-data.average-interest-rates-v2.{}",
+        lower_hex(query.query_digest())
+    ))
+    .map_err(|_| TreasurySourceError::InvalidProtocol)
 }
 
 /// Stable local health state for the bounded research producer.
@@ -457,6 +484,22 @@ impl TreasurySource {
     /// Returns [`TreasurySourceError::InvalidProtocol`] for a multi-dataset configuration.
     pub fn dataset(&self) -> Result<SourceIdentifier, TreasurySourceError> {
         self.config.single_dataset()
+    }
+
+    /// Derives the storage-safe analytical identity for one exact configured provider dataset.
+    ///
+    /// Provider selectors, source-object identities, and record provenance remain unchanged. This
+    /// method only supplies the separate local dataset identity used by analytical publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreasurySourceError::QueryBindingMismatch`] when the provider dataset is not part
+    /// of this source's exact configured query set.
+    pub fn analytical_dataset_identifier(
+        &self,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, TreasurySourceError> {
+        self.config.analytical_dataset(provider_dataset)
     }
 
     /// Returns a bounded copy of local producer health.

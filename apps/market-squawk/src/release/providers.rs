@@ -9,15 +9,23 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
+use market_squawk_adapter_bls::BlsSource;
+use market_squawk_adapter_fred::FredSource;
 use market_squawk_adapter_treasury::{TreasuryDailyRateFamily, TreasuryDailyRateQuery};
-use market_squawk_data::CatalogLimit;
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
+use market_squawk_data::{
+    CatalogLimit, DatasetId, FeatureLabelDataset, GenerationParentRelation, SourceOperation,
+};
+use market_squawk_domain::{
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, PayloadReference,
+    ResearchObservation, SourceIdentifier,
+};
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
 };
 use market_squawk_sources::{DataUseOperation, OnboardingState};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -36,6 +44,7 @@ const REPORT_KIND: &str = "market_squawk.release.providers";
 const EXTERNAL_NETWORK_GATE: &str = "MARKET_SQUAWK_EXTERNAL_NETWORK";
 const PROVIDER_TERMS_GATE: &str = "MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED";
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAXIMUM_TRAINING_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
 const REQUEST_MAXIMUM_BYTES: usize = 1024 * 1024;
 const REQUEST_MAXIMUM_ITEMS: usize = 1024;
@@ -49,11 +58,19 @@ const COINBASE_PUBLIC: &str = "coinbase.public-market-data";
 const COINBASE_DIRECT: &str = "coinbase.exchange-direct-market-data";
 const KRAKEN_PUBLIC: &str = "kraken.spot-public-market-data";
 const SEC_EDGAR: &str = "sec.edgar-public";
+const SEC_SOURCE_ID: &str = "sec-sec.edgar-public";
+const SEC_SUBMISSIONS_FAMILY: &str = "sec_submissions_filings";
+const SEC_COMPANY_FACTS_FAMILY: &str = "sec_company_facts";
+const SEC_SUBMISSIONS_OPERATION: &str = "Fundamental.GetFilings";
+const SEC_COMPANY_FACTS_OPERATION: &str = "Fundamental.GetFacts";
 const FRED_ALFRED: &str = "fred-alfred.api-v1-v2";
 const BLS_PUBLIC: &str = "bls.v1-unregistered";
 const BLS_REGISTERED: &str = "bls.v2-registered";
 const TREASURY_XML: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL: &str = "treasury.fiscal-data";
+const BLS_UNEMPLOYMENT_SERIES: &str = "LNS14000000";
+const BLS_PUBLIC_MAXIMUM_ACCEPTANCE_ROWS: u64 = 10 * 13;
+const BLS_REGISTERED_MAXIMUM_ACCEPTANCE_ROWS: u64 = 20 * 13;
 
 const ADMITTED_SURFACES: [&str; 9] = [
     COINBASE_PUBLIC,
@@ -143,15 +160,21 @@ struct ResearchRuntimeEvidence {
     session_id: String,
     capability_revision: u64,
     capability_digest: EvidenceDigest,
+    parent_rights_authorization_digest: EvidenceDigest,
     rights_authorization_digest: EvidenceDigest,
+    rights_authorization_expires_at_unix_nanos: Option<i64>,
+    rights_subjects: Vec<String>,
+    rights_operations: Vec<&'static str>,
     runtime_generation_digest: EvidenceDigest,
     authority_effective_at_unix_nanos: i64,
     publications: Vec<ResearchPublicationEvidence>,
+    python_training: Option<PythonTrainingEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResearchPublicationEvidence {
+    surface_id: String,
     family: String,
     provider_dataset: String,
     source_object_id: String,
@@ -163,6 +186,95 @@ struct ResearchPublicationEvidence {
     total_bytes: u64,
     object_count: u64,
     lineage_digest: String,
+    python_export_sha256: Option<String>,
+    observation_query_row_count: u64,
+    vintage_query_row_count: Option<u64>,
+    series_ids: Vec<String>,
+    temporal_semantics: ResearchPublicationTemporalSemantics,
+    sec: Option<SecPublicationEvidence>,
+    fred: Option<FredPublicationEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecPublicationEvidence {
+    cik: String,
+    instrument_id: String,
+    observation_kind: String,
+    quality: String,
+    query_operation: String,
+    provenance_verified_rows: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredPublicationEvidence {
+    series_id: String,
+    realtime_start: String,
+    realtime_end: String,
+    provider_row_count: u64,
+    pages: Vec<FredPageEvidence>,
+    observation_query: QueryRowEvidence,
+    vintage_query: QueryRowEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredPageEvidence {
+    source_object_id: String,
+    source_payload_digest: EvidenceDigest,
+    offset: u64,
+    limit: u64,
+    returned_rows: u64,
+    provider_row_count: u64,
+    terminal: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QueryRowEvidence {
+    row_count: u64,
+    content_sha256: String,
+    rows: Vec<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResearchPublicationTemporalSemantics {
+    EffectiveObservations,
+    ProviderReportedVintages,
+    LocallyObservedCurrentSnapshot,
+    LocallyObservedSecDisclosure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PythonTrainingEvidence {
+    request_sha256: String,
+    request_byte_count: u64,
+    dataset_id: String,
+    manifest_version: u64,
+    manifest_content_hash: String,
+    source_surface_id: String,
+    source_parent_dataset_id: String,
+    source_parent_manifest_version: u64,
+    source_parent_content_hash: String,
+    parents: Vec<PythonTrainingParentEvidence>,
+    build_spec_digest: String,
+    policy_digest: String,
+    universe_digest: String,
+    python_export_sha256: String,
+    train_examples: usize,
+    validation_examples: usize,
+    test_examples: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PythonTrainingParentEvidence {
+    dataset_id: String,
+    manifest_version: u64,
+    manifest_content_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +316,10 @@ struct FredAlfredRightsEvidence {
     selected: bool,
     persistence_admitted: bool,
     model_training_admitted: bool,
+    parent_authorization_digest: Option<EvidenceDigest>,
+    authorization_digest: Option<EvidenceDigest>,
+    authorization_expires_at_unix_nanos: Option<i64>,
+    exact_series: Vec<String>,
     admitted: bool,
 }
 
@@ -267,7 +383,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     surfaces.sort_by(|left, right| left.surface_id.cmp(&right.surface_id));
     repository.verify_unchanged()?;
     let payload = ProviderEvidence {
-        schema_version: 1,
+        schema_version: 4,
         repository: repository.clone(),
         executable,
         collected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -335,6 +451,10 @@ async fn collect_provider_evidence(
     let mut direct_order_count = 0_usize;
     let mut fred_persistence = false;
     let mut fred_training = false;
+    let mut fred_parent_authorization = None;
+    let mut fred_authorization = None;
+    let mut fred_authorization_expires_at = None;
+    let mut fred_exact_series = Vec::new();
 
     for surface_id in selected {
         let profile = profiles
@@ -354,21 +474,69 @@ async fn collect_provider_evidence(
             let runtime = activation
                 .research_runtime_generation(&profile_id)?
                 .ok_or_else(|| anyhow!("provider research runtime is not active: {surface_id}"))?;
-            let publications = if *surface_id == TREASURY_XML {
+            let (publications, python_training) = if *surface_id == TREASURY_XML {
                 let acceptance_year = product
                     .treasury_daily_rate_release_year()
                     .context("Treasury daily-rate activation does not cover all five families")?;
-                exercise_treasury_research(product.application().as_ref(), acceptance_year).await?
+                (
+                    exercise_treasury_research(product.application().as_ref(), acceptance_year)
+                        .await?,
+                    None,
+                )
+            } else if *surface_id == SEC_EDGAR {
+                let cik = admit_sec_release_cik(arguments)?;
+                (
+                    exercise_sec_research(product.application().as_ref(), cik).await?,
+                    None,
+                )
+            } else if *surface_id == FRED_ALFRED {
+                let (dataset, training_request) = admit_fred_release_inputs(arguments)?;
+                let publications =
+                    exercise_fred_research(product.application().as_ref(), &dataset).await?;
+                let training = exercise_python_training(
+                    product,
+                    FRED_ALFRED,
+                    "FRED/ALFRED",
+                    training_request,
+                    &publications,
+                )
+                .await?;
+                (publications, Some(training))
+            } else if matches!(*surface_id, BLS_PUBLIC | BLS_REGISTERED) {
+                let (dataset, training_request) = admit_bls_release_inputs(arguments, surface_id)?;
+                let publications =
+                    exercise_bls_research(product.application().as_ref(), surface_id, &dataset)
+                        .await?;
+                let training = exercise_python_training(
+                    product,
+                    surface_id,
+                    "BLS",
+                    training_request,
+                    &publications,
+                )
+                .await?;
+                (publications, Some(training))
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
-            Some(research_runtime_evidence(&runtime, publications)?)
+            Some(research_runtime_evidence(
+                &runtime,
+                publications,
+                python_training,
+            )?)
         } else {
             None
         };
         if *surface_id == FRED_ALFRED {
-            fred_persistence = lease.admits(DataUseOperation::Persist);
-            fred_training = lease.admits(DataUseOperation::ModelTraining);
+            let runtime = research_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow!("FRED/ALFRED research runtime evidence is absent"))?;
+            fred_persistence = runtime.rights_operations.contains(&"persist");
+            fred_training = runtime.rights_operations.contains(&"train");
+            fred_parent_authorization = Some(runtime.parent_rights_authorization_digest);
+            fred_authorization = Some(runtime.rights_authorization_digest);
+            fred_authorization_expires_at = runtime.rights_authorization_expires_at_unix_nanos;
+            fred_exact_series.clone_from(&runtime.rights_subjects);
         }
         let live_runtime = if is_live_surface(surface_id) {
             let evidence = exercise_live_surface(
@@ -412,7 +580,18 @@ async fn collect_provider_evidence(
         bail!("required DirectVerified risk-approved paper action was not observed");
     }
     let fred_selected = selected.contains(&FRED_ALFRED);
-    let fred_admitted = fred_persistence && fred_training;
+    let collected_at_unix_nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("provider collection time is outside nanosecond range"))?;
+    let fred_admitted = fred_selected
+        && fred_persistence
+        && fred_training
+        && fred_parent_authorization.is_some_and(|digest| digest.bytes() != [0; 32])
+        && fred_authorization.is_some_and(|digest| {
+            digest.bytes() != [0; 32] && Some(digest) != fred_parent_authorization
+        })
+        && fred_authorization_expires_at.is_some_and(|expiry| expiry > collected_at_unix_nanos)
+        && fred_exact_series.len() == 1;
     if arguments.require_fred_alfred_rights && !fred_admitted {
         bail!("required FRED and ALFRED persistence and model-training rights are not admitted");
     }
@@ -430,6 +609,10 @@ async fn collect_provider_evidence(
             selected: fred_selected,
             persistence_admitted: fred_persistence,
             model_training_admitted: fred_training,
+            parent_authorization_digest: fred_parent_authorization,
+            authorization_digest: fred_authorization,
+            authorization_expires_at_unix_nanos: fred_authorization_expires_at,
+            exact_series: fred_exact_series,
             admitted: fred_admitted,
         },
     ))
@@ -555,17 +738,55 @@ fn activation_evidence(lease: &ProviderActivationLease) -> ActivationEvidence {
 fn research_runtime_evidence(
     runtime: &ResearchProviderRuntimeGeneration,
     publications: Vec<ResearchPublicationEvidence>,
+    python_training: Option<PythonTrainingEvidence>,
 ) -> Result<ResearchRuntimeEvidence> {
+    let rights_operations = [
+        SourceOperation::Retrieve,
+        SourceOperation::Display,
+        SourceOperation::Persist,
+        SourceOperation::Cache,
+        SourceOperation::Redistribute,
+        SourceOperation::Train,
+    ]
+    .into_iter()
+    .filter(|operation| runtime.rights_admits(*operation))
+    .map(source_operation_name)
+    .collect();
     Ok(ResearchRuntimeEvidence {
         source_id: runtime.metadata().source_id().as_str().to_owned(),
         session_id: runtime.session_id().to_string(),
         capability_revision: runtime.capability_revision().get(),
         capability_digest: runtime.capability_digest(),
+        parent_rights_authorization_digest: runtime.parent_rights_authorization_evidence(),
         rights_authorization_digest: runtime.rights_authorization_evidence(),
+        rights_authorization_expires_at_unix_nanos: runtime
+            .rights_authorization_expires_at()
+            .map(market_squawk_domain::Timestamp::unix_nanos),
+        rights_subjects: runtime
+            .rights_exact_subjects()
+            .map_or_else(Vec::new, |subjects| {
+                subjects
+                    .iter()
+                    .map(|subject| subject.as_str().to_owned())
+                    .collect()
+            }),
+        rights_operations,
         runtime_generation_digest: runtime.generation_digest()?,
         authority_effective_at_unix_nanos: runtime.authority_effective_at().unix_nanos(),
         publications,
+        python_training,
     })
+}
+
+const fn source_operation_name(operation: SourceOperation) -> &'static str {
+    match operation {
+        SourceOperation::Retrieve => "retrieve",
+        SourceOperation::Display => "display",
+        SourceOperation::Persist => "persist",
+        SourceOperation::Cache => "cache",
+        SourceOperation::Redistribute => "redistribute",
+        SourceOperation::Train => "train",
+    }
 }
 
 async fn exercise_treasury_research(
@@ -616,20 +837,432 @@ async fn exercise_treasury_research(
             RESEARCH_ACCEPTANCE_TIMEOUT,
         )
         .await?;
-        let publication = parse_research_publication(
+        let mut publication = parse_research_publication(
+            TREASURY_XML,
             family,
             dataset_text,
             source_object_id,
             source_payload_digest,
             &ingestion,
         )?;
-        verify_queryable_publication(application, &publication).await?;
+        publication.observation_query_row_count =
+            verify_queryable_publication(application, &publication).await?;
         evidence.push(publication);
     }
     Ok(evidence)
 }
 
+async fn exercise_sec_research(
+    application: &Application,
+    cik: &str,
+) -> Result<Vec<ResearchPublicationEvidence>> {
+    let specifications = [
+        (
+            SEC_SUBMISSIONS_FAMILY,
+            format!("sec.submissions.cik.{cik}"),
+            format!("sec.submissions.composite.CIK{cik}"),
+            SEC_SUBMISSIONS_OPERATION,
+            "filing",
+        ),
+        (
+            SEC_COMPANY_FACTS_FAMILY,
+            format!("sec.company-facts.cik.{cik}"),
+            format!("https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"),
+            SEC_COMPANY_FACTS_OPERATION,
+            "fundamental",
+        ),
+    ];
+    let mut evidence = Vec::with_capacity(specifications.len());
+    for (family, dataset_text, expected_object, operation, observation_kind) in specifications {
+        let dataset = SourceIdentifier::try_from(dataset_text.as_str())
+            .context("SEC release dataset identity is invalid")?;
+        DatasetId::try_from(dataset.as_str())
+            .context("SEC release analytical dataset identity is invalid")?;
+        let discovery = invoke(
+            application,
+            "Source.Discover",
+            json_object(json!({
+                "provider": SEC_EDGAR,
+                "dataset": dataset.as_str(),
+                "confirm": true,
+                "sourceCoverage": [SEC_EDGAR],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
+        if discovery.profile().as_str() != SEC_EDGAR
+            || discovery.request().dataset() != &dataset
+            || discovery.objects().len() != 1
+            || !discovery.rights().persistence_operation_admitted()
+        {
+            bail!("SEC discovery did not produce one persistence-authorized exact object");
+        }
+        let object = discovery
+            .objects()
+            .first()
+            .ok_or_else(|| anyhow!("SEC discovery object is absent"))?;
+        let source_object = object.source_object();
+        let source_object_id = source_object.object_id().as_str().to_owned();
+        if source_object_id != expected_object {
+            bail!("SEC discovery returned an object outside the exact requested CIK dataset");
+        }
+        let source_payload_digest = source_object.evidence().content_digest();
+        if source_payload_digest.algorithm() != DigestAlgorithm::Sha256
+            || source_payload_digest.bytes() == [0; 32]
+        {
+            bail!("SEC discovery omitted exact SHA-256 source payload evidence");
+        }
+        let ingestion = invoke(
+            application,
+            "Research.IngestSource",
+            json_object(json!({
+                "provider": SEC_EDGAR,
+                "object": source_object_id,
+                "dataset": dataset.as_str(),
+                "discoveryReceipt": object.discovery_receipt(),
+                "confirm": true,
+                "sourceCoverage": [SEC_EDGAR],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let mut publication = parse_research_publication(
+            SEC_EDGAR,
+            family,
+            dataset.as_str(),
+            source_object_id,
+            source_payload_digest,
+            &ingestion,
+        )?;
+        if publication.analytical_dataset_id != dataset.as_str() {
+            bail!("SEC analytical publication is not bound to its exact provider dataset");
+        }
+        let sec =
+            verify_sec_publication(application, &publication, cik, operation, observation_kind)
+                .await?;
+        publication.observation_query_row_count = sec.provenance_verified_rows;
+        publication.temporal_semantics =
+            ResearchPublicationTemporalSemantics::LocallyObservedSecDisclosure;
+        publication.sec = Some(sec);
+        evidence.push(publication);
+    }
+    if evidence.len() != 2
+        || evidence[0].provider_dataset == evidence[1].provider_dataset
+        || evidence[0].source_object_id == evidence[1].source_object_id
+        || evidence[0].analytical_dataset_id == evidence[1].analytical_dataset_id
+        || evidence[0].manifest_content_hash == evidence[1].manifest_content_hash
+    {
+        bail!("SEC acceptance did not produce two distinct filings and Company Facts publications");
+    }
+    Ok(evidence)
+}
+
+async fn exercise_fred_research(
+    application: &Application,
+    dataset: &SourceIdentifier,
+) -> Result<Vec<ResearchPublicationEvidence>> {
+    let dataset_text = dataset.as_str();
+    let series = FredSource::rights_subject_identifier(dataset)
+        .context("FRED/ALFRED dataset has no exact rights subject")?;
+    let (realtime_start, realtime_end) = FredSource::dataset_realtime_interval(dataset)
+        .context("FRED/ALFRED dataset has no exact real-time interval")?;
+    let discovery = invoke(
+        application,
+        "Source.Discover",
+        json_object(json!({
+            "provider": FRED_ALFRED,
+            "dataset": dataset_text,
+            "confirm": true,
+            "sourceCoverage": [FRED_ALFRED],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
+    if discovery.profile().as_str() != FRED_ALFRED
+        || discovery.request().dataset() != dataset
+        || discovery.objects().is_empty()
+        || !discovery.rights().persistence_operation_admitted()
+        || !discovery.rights().model_training_operation_admitted()
+        || discovery.rights().source_wide()
+        || discovery.rights().exact_subjects() != std::slice::from_ref(&series)
+    {
+        bail!(
+            "FRED/ALFRED discovery did not retain exact-series persistence and training authority"
+        );
+    }
+
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(discovery.objects().len())?;
+    let mut final_publication = None;
+    let mut expected_offset = 0_usize;
+    let mut provider_row_count = None;
+    for object in discovery.objects() {
+        let source_object = object.source_object();
+        let identity = FredSource::page_object_identity(source_object.object_id())
+            .context("FRED/ALFRED discovery returned an invalid page identity")?;
+        if identity.offset() != expected_offset
+            || identity.page_digest() != source_object.evidence().content_digest().bytes()
+            || provider_row_count.is_some_and(|count| count != identity.total())
+            || identity.terminal() != (pages.len() + 1 == discovery.objects().len())
+        {
+            bail!("FRED/ALFRED discovery returned an incomplete or inconsistent page chain");
+        }
+        provider_row_count = Some(identity.total());
+        expected_offset = expected_offset
+            .checked_add(identity.returned())
+            .ok_or_else(|| anyhow!("FRED/ALFRED page offset overflow"))?;
+        let source_object_id = source_object.object_id().as_str().to_owned();
+        let source_payload_digest = source_object.evidence().content_digest();
+        let ingestion = invoke(
+            application,
+            "Research.IngestSource",
+            json_object(json!({
+                "provider": FRED_ALFRED,
+                "object": source_object_id,
+                "dataset": dataset_text,
+                "discoveryReceipt": object.discovery_receipt(),
+                "confirm": true,
+                "sourceCoverage": [FRED_ALFRED],
+            }))?,
+            RESEARCH_ACCEPTANCE_TIMEOUT,
+        )
+        .await?;
+        let publication = parse_research_publication(
+            FRED_ALFRED,
+            "fred_alfred_vintages",
+            dataset_text,
+            source_object_id,
+            source_payload_digest,
+            &ingestion,
+        )?;
+        pages.push(FredPageEvidence {
+            source_object_id: source_object.object_id().as_str().to_owned(),
+            source_payload_digest,
+            offset: u64::try_from(identity.offset()).context("FRED/ALFRED page offset overflow")?,
+            limit: u64::try_from(identity.limit()).context("FRED/ALFRED page limit overflow")?,
+            returned_rows: u64::try_from(identity.returned())
+                .context("FRED/ALFRED page row count overflow")?,
+            provider_row_count: u64::try_from(identity.total())
+                .context("FRED/ALFRED provider row count overflow")?,
+            terminal: identity.terminal(),
+        });
+        final_publication = Some(publication);
+    }
+    let provider_row_count = provider_row_count
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| anyhow!("FRED/ALFRED provider row count is unavailable"))?;
+    if u64::try_from(expected_offset).ok() != Some(provider_row_count) {
+        bail!("FRED/ALFRED page chain did not consume the provider-declared result");
+    }
+    let mut publication =
+        final_publication.ok_or_else(|| anyhow!("FRED/ALFRED publication is absent"))?;
+    if publication.row_count != provider_row_count
+        || publication.object_count != u64::try_from(pages.len())?
+        || pages.last().is_none_or(|page| {
+            page.source_object_id != publication.source_object_id
+                || page.source_payload_digest != publication.source_payload_digest
+                || !page.terminal
+        })
+    {
+        bail!("FRED/ALFRED final publication is not the complete discovered dataset");
+    }
+    let observations = query_row_evidence(&query_publication(application, &publication).await?)?;
+    let vintages = verify_fred_vintage_publication(application, &publication).await?;
+    if observations.row_count != provider_row_count || vintages.row_count != provider_row_count {
+        bail!("FRED/ALFRED analytical queries did not return the complete published row set");
+    }
+    validate_fred_query_rows(&observations.rows, dataset, &series, &pages)?;
+    validate_fred_query_rows(&vintages.rows, dataset, &series, &pages)?;
+    if observations != vintages {
+        bail!("FRED/ALFRED observation and vintage queries did not return one exact row set");
+    }
+    publication.observation_query_row_count = observations.row_count;
+    publication.vintage_query_row_count = Some(vintages.row_count);
+    publication.series_ids = vec![series.as_str().to_owned()];
+    publication.temporal_semantics = ResearchPublicationTemporalSemantics::ProviderReportedVintages;
+    publication.fred = Some(FredPublicationEvidence {
+        series_id: series.as_str().to_owned(),
+        realtime_start: realtime_start.to_string(),
+        realtime_end: realtime_end.to_string(),
+        provider_row_count,
+        pages,
+        observation_query: observations,
+        vintage_query: vintages,
+    });
+    Ok(vec![publication])
+}
+
+async fn exercise_bls_research(
+    application: &Application,
+    surface_id: &'static str,
+    dataset: &SourceIdentifier,
+) -> Result<Vec<ResearchPublicationEvidence>> {
+    let dataset_text = dataset.as_str();
+    let discovery = invoke(
+        application,
+        "Source.Discover",
+        json_object(json!({
+            "provider": surface_id,
+            "dataset": dataset_text,
+            "confirm": true,
+            "sourceCoverage": [surface_id],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
+    if discovery.profile().as_str() != surface_id
+        || discovery.request().dataset() != dataset
+        || discovery.objects().len() != 1
+        || !discovery.rights().persistence_operation_admitted()
+    {
+        bail!("BLS discovery did not produce one persistence-authorized exact object");
+    }
+    let object = discovery
+        .objects()
+        .first()
+        .ok_or_else(|| anyhow!("BLS discovery object is absent"))?;
+    let source_object = object.source_object();
+    let source_object_id = source_object.object_id().as_str().to_owned();
+    let source_payload_digest = source_object.evidence().content_digest();
+    let ingestion = invoke(
+        application,
+        "Research.IngestSource",
+        json_object(json!({
+            "provider": surface_id,
+            "object": source_object_id,
+            "dataset": dataset_text,
+            "discoveryReceipt": object.discovery_receipt(),
+            "confirm": true,
+            "sourceCoverage": [surface_id],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let mut publication = parse_research_publication(
+        surface_id,
+        "bls_unemployment_rate_current_snapshot",
+        dataset_text,
+        source_object_id,
+        source_payload_digest,
+        &ingestion,
+    )?;
+    publication.observation_query_row_count =
+        verify_bls_current_snapshot_publication(application, &publication).await?;
+    publication.series_ids = vec![BLS_UNEMPLOYMENT_SERIES.to_owned()];
+    publication.temporal_semantics =
+        ResearchPublicationTemporalSemantics::LocallyObservedCurrentSnapshot;
+    Ok(vec![publication])
+}
+
+async fn exercise_python_training(
+    product: &LocalProduct,
+    source_surface_id: &'static str,
+    source_label: &'static str,
+    request: &Path,
+    publications: &[ResearchPublicationEvidence],
+) -> Result<PythonTrainingEvidence> {
+    if publications.is_empty()
+        || publications.iter().any(|publication| {
+            publication.surface_id != source_surface_id
+                || publication.python_export_sha256.is_some()
+        })
+    {
+        bail!("{source_label} publication evidence is invalid for a derived training handoff");
+    }
+    let request_before =
+        hash_stable_file(request, MAXIMUM_TRAINING_REQUEST_BYTES).with_context(|| {
+            format!("{source_label} training request is not a stable bounded regular file")
+        })?;
+    let built =
+        crate::local_product::cli_dataset::build_point_in_time_dataset_from_file(product, request)
+            .await
+            .with_context(|| {
+                format!("{source_label} point-in-time training dataset could not be built")
+            })?;
+    let request_after = hash_stable_file(request, MAXIMUM_TRAINING_REQUEST_BYTES)
+        .with_context(|| format!("{source_label} training request could not be revalidated"))?;
+    if request_before != request_after {
+        bail!("{source_label} training request changed while the dataset was built");
+    }
+    python_training_evidence(
+        &built,
+        source_surface_id,
+        source_label,
+        publications,
+        request_before,
+    )
+}
+
+fn python_training_evidence(
+    built: &FeatureLabelDataset,
+    source_surface_id: &'static str,
+    source_label: &'static str,
+    publications: &[ResearchPublicationEvidence],
+    request: StableFileIdentity,
+) -> Result<PythonTrainingEvidence> {
+    let mut matching_parents = built.pinned().parents().iter().filter(|parent| {
+        parent.relation() == GenerationParentRelation::DerivedInput
+            && publications.iter().any(|publication| {
+                parent.manifest().dataset_id().as_str() == publication.analytical_dataset_id
+                    && parent.manifest().manifest_version() == publication.manifest_version
+                    && lower_hex(parent.manifest().content_hash().bytes())
+                        == publication.manifest_content_hash
+            })
+    });
+    let source_parent = matching_parents.next().ok_or_else(|| {
+        anyhow!("training dataset omitted the exact published {source_label} parent")
+    })?;
+    if matching_parents.next().is_some() {
+        bail!("training dataset contains ambiguous {source_label} parent generations");
+    }
+    let splits = built.split_counts();
+    if splits.train_examples() == 0
+        || splits.validation_examples() == 0
+        || splits.test_examples() == 0
+    {
+        bail!("training dataset must contain nonempty train, validation, and test splits");
+    }
+    let manifest = built.manifest();
+    let parents = built
+        .pinned()
+        .parents()
+        .iter()
+        .map(|parent| PythonTrainingParentEvidence {
+            dataset_id: parent.manifest().dataset_id().as_str().to_owned(),
+            manifest_version: parent.manifest().manifest_version(),
+            manifest_content_hash: lower_hex(parent.manifest().content_hash().bytes()),
+        })
+        .collect();
+    let python_export_sha256 = built
+        .python_export()
+        .context("canonical Python training descriptor could not be reproduced")?
+        .content_hash();
+    Ok(PythonTrainingEvidence {
+        request_sha256: request.sha256,
+        request_byte_count: request.byte_count,
+        dataset_id: manifest.dataset_id().as_str().to_owned(),
+        manifest_version: manifest.manifest_version(),
+        manifest_content_hash: lower_hex(manifest.content_hash().bytes()),
+        source_surface_id: source_surface_id.to_owned(),
+        source_parent_dataset_id: source_parent.manifest().dataset_id().as_str().to_owned(),
+        source_parent_manifest_version: source_parent.manifest().manifest_version(),
+        source_parent_content_hash: lower_hex(source_parent.manifest().content_hash().bytes()),
+        parents,
+        build_spec_digest: lower_hex(built.build_spec_digest().digest().bytes()),
+        policy_digest: lower_hex(built.policy_digest().bytes()),
+        universe_digest: lower_hex(built.universe_digest().bytes()),
+        python_export_sha256: lower_hex(python_export_sha256.bytes()),
+        train_examples: splits.train_examples(),
+        validation_examples: splits.validation_examples(),
+        test_examples: splits.test_examples(),
+    })
+}
+
 fn parse_research_publication(
+    surface_id: &str,
     family: &str,
     provider_dataset: &str,
     source_object_id: String,
@@ -639,27 +1272,32 @@ fn parse_research_publication(
     let manifest = ingestion
         .get("manifest")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("Treasury ingestion manifest is absent"))?;
+        .ok_or_else(|| anyhow!("research ingestion manifest is absent"))?;
     let analytical_dataset_id = required_text(manifest.get("datasetId"), "dataset id")?;
     let manifest_content_hash = required_sha256(
         manifest.get("contentHash"),
-        "Treasury manifest content hash",
+        "research manifest content hash",
     )?;
     let manifest_version =
-        required_nonzero_u64(manifest.get("manifestVersion"), "Treasury manifest version")?;
+        required_nonzero_u64(manifest.get("manifestVersion"), "research manifest version")?;
     let row_count =
-        required_nonzero_u64(ingestion.get("rowCount"), "Treasury publication row count")?;
+        required_nonzero_u64(ingestion.get("rowCount"), "research publication row count")?;
     let total_bytes = required_nonzero_u64(
         ingestion.get("totalBytes"),
-        "Treasury publication byte count",
+        "research publication byte count",
     )?;
     let object_count = required_nonzero_u64(
         ingestion.get("objectCount"),
-        "Treasury publication object count",
+        "research publication object count",
     )?;
     let lineage_digest =
-        required_sha256(ingestion.get("lineageDigest"), "Treasury lineage digest")?;
+        required_sha256(ingestion.get("lineageDigest"), "research lineage digest")?;
+    let python_export_sha256 = optional_sha256(
+        ingestion.get("pythonExportSha256"),
+        "research Python export digest",
+    )?;
     Ok(ResearchPublicationEvidence {
+        surface_id: surface_id.to_owned(),
         family: family.to_owned(),
         provider_dataset: provider_dataset.to_owned(),
         source_object_id,
@@ -671,19 +1309,43 @@ fn parse_research_publication(
         total_bytes,
         object_count,
         lineage_digest,
+        python_export_sha256,
+        observation_query_row_count: 0,
+        vintage_query_row_count: None,
+        series_ids: Vec::new(),
+        temporal_semantics: ResearchPublicationTemporalSemantics::EffectiveObservations,
+        sec: None,
+        fred: None,
     })
 }
 
 async fn verify_queryable_publication(
     application: &Application,
     publication: &ResearchPublicationEvidence,
-) -> Result<()> {
+) -> Result<u64> {
+    let observations = query_publication(application, publication).await?;
+    query_result_row_count(&observations)
+        .ok_or_else(|| anyhow!("research publication is not queryable"))
+}
+
+async fn query_publication(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+) -> Result<Value> {
+    query_publication_with_operation(application, publication, "Macro.GetObservations").await
+}
+
+async fn query_publication_with_operation(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+    operation: &str,
+) -> Result<Value> {
     let observations = invoke(
         application,
-        "Macro.GetObservations",
+        operation,
         json_object(json!({
             "dataset": publication.analytical_dataset_id,
-            "sourceCoverage": [TREASURY_XML],
+            "sourceCoverage": [publication.surface_id],
         }))?,
         RESEARCH_ACCEPTANCE_TIMEOUT,
     )
@@ -691,7 +1353,7 @@ async fn verify_queryable_publication(
     let manifest = observations
         .get("manifest")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("Treasury query manifest is absent"))?;
+        .ok_or_else(|| anyhow!("research query manifest is absent"))?;
     if manifest.get("datasetId").and_then(Value::as_str)
         != Some(publication.analytical_dataset_id.as_str())
         || manifest.get("manifestVersion").and_then(Value::as_u64)
@@ -699,20 +1361,457 @@ async fn verify_queryable_publication(
         || manifest.get("contentHash").and_then(Value::as_str)
             != Some(publication.manifest_content_hash.as_str())
     {
-        bail!("Treasury query did not use the exact published manifest");
+        bail!("research query did not use the exact published manifest");
     }
-    let has_rows = observations
+    Ok(observations)
+}
+
+async fn verify_sec_publication(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+    cik: &str,
+    operation: &str,
+    observation_kind: &str,
+) -> Result<SecPublicationEvidence> {
+    let observations =
+        query_publication_with_operation(application, publication, operation).await?;
+    let rows = observations
         .get("rows")
         .and_then(Value::as_array)
-        .is_some_and(|rows| !rows.is_empty());
-    let has_artifact_rows = observations
-        .pointer("/artifact/rowCount")
-        .and_then(Value::as_u64)
-        .is_some_and(|rows| rows > 0);
-    if !has_rows && !has_artifact_rows {
-        bail!("Treasury publication is not queryable");
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| anyhow!("SEC query was not returned as a nonempty inline row set"))?;
+    let row_count = u64::try_from(rows.len()).context("SEC observation row count overflow")?;
+    if row_count != publication.row_count {
+        bail!("SEC query did not return the exact published row set");
+    }
+    let mut instruments = BTreeSet::new();
+    for row in rows {
+        let row = row
+            .as_object()
+            .ok_or_else(|| anyhow!("SEC query row is invalid"))?;
+        let payload = required_lower_hex_bytes(row.get("payload_json"), "SEC canonical payload")?;
+        let payload_digest =
+            required_lower_hex_bytes(row.get("payload_sha256"), "SEC canonical payload digest")?;
+        let expected_payload_digest: [u8; 32] = Sha256::digest(&payload).into();
+        if payload_digest.as_slice() != expected_payload_digest {
+            bail!("SEC canonical row payload digest is invalid");
+        }
+        let observation: ResearchObservation = serde_json::from_slice(&payload)
+            .context("SEC canonical row payload could not be decoded")?;
+        let (context, source_specific_valid) = match (&observation, observation_kind) {
+            (ResearchObservation::Filing(value), "filing") => {
+                let context = value.context();
+                let provenance = context.provenance();
+                let published = context.time().published();
+                let published_matches = match provenance.source_timestamp() {
+                    Some(timestamp) => {
+                        published.and_then(|value| value.exact_timestamp()) == Some(timestamp)
+                    }
+                    None => published.is_some_and(|value| value.calendar_date_value().is_some()),
+                };
+                (
+                    context,
+                    value.accession() == provenance.source_identifier()
+                        && !value.form_type().as_str().is_empty()
+                        && context.time().effective().calendar_date_value().is_some()
+                        && published_matches,
+                )
+            }
+            (ResearchObservation::Fundamental(value), "fundamental") => {
+                let context = value.context();
+                let provenance = context.provenance();
+                (
+                    context,
+                    sec_fact_identity_matches(
+                        provenance.source_identifier().as_str(),
+                        value.concept().as_str(),
+                        value.unit().as_str(),
+                    ) && provenance.source_timestamp().is_none()
+                        && context.time().effective().calendar_date_value().is_some()
+                        && context
+                            .time()
+                            .published()
+                            .is_some_and(|value| value.calendar_date_value().is_some()),
+                )
+            }
+            _ => bail!("SEC query returned the wrong canonical observation family"),
+        };
+        let provenance = context.provenance();
+        let instrument_id = provenance
+            .instrument_id()
+            .ok_or_else(|| anyhow!("SEC observation omitted stable instrument identity"))?
+            .to_string();
+        let payload_matches = matches!(
+            provenance.payload_reference(),
+            PayloadReference::ContentHash(hash)
+                if hash.algorithm() == publication.source_payload_digest.algorithm()
+                    && hash.digest() == publication.source_payload_digest.bytes()
+        );
+        let availability_matches = matches!(
+            provenance.availability(),
+            AvailabilityEvidence::LocalFirstObserved { observed_at }
+                if *observed_at == provenance.received_at()
+        );
+        if !source_specific_valid
+            || provenance.source_id().as_str() != SEC_SOURCE_ID
+            || provenance.venue_id().is_some()
+            || provenance.quality() != DataQuality::OfficialDelayed
+            || provenance.ingested_at() < provenance.received_at()
+            || !payload_matches
+            || !availability_matches
+            || row.get("observation_kind").and_then(Value::as_str) != Some(observation_kind)
+            || row.get("source_id").and_then(Value::as_str) != Some(SEC_SOURCE_ID)
+            || row.get("instrument_id").and_then(Value::as_str) != Some(instrument_id.as_str())
+            || row.get("venue_id").is_some_and(|value| !value.is_null())
+            || row.get("source_identifier").and_then(Value::as_str)
+                != Some(provenance.source_identifier().as_str())
+            || row.get("received_at") != row.get("available_at")
+            || row.get("availability_kind").and_then(Value::as_str) != Some("local_first_observed")
+            || row.get("quality").and_then(Value::as_str) != Some("official_delayed")
+            || row.get("revision").and_then(Value::as_u64)
+                != Some(u64::from(context.time().revision().get()))
+            || row.get("effective_precision").and_then(Value::as_str) != Some("calendar_date")
+        {
+            bail!("SEC canonical row lost direct source, time, quality, or payload provenance");
+        }
+        instruments.insert(instrument_id);
+    }
+    if instruments.len() != 1 {
+        bail!("SEC publication does not bind one stable instrument identity");
+    }
+    let instrument_id = instruments
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("SEC publication does not bind one stable instrument identity"))?;
+    Ok(SecPublicationEvidence {
+        cik: cik.to_owned(),
+        instrument_id,
+        observation_kind: observation_kind.to_owned(),
+        quality: "official_delayed".to_owned(),
+        query_operation: operation.to_owned(),
+        provenance_verified_rows: row_count,
+    })
+}
+
+fn sec_fact_identity_matches(identity: &str, concept: &str, unit: &str) -> bool {
+    let mut fields = identity.split(':');
+    fields.next().is_some_and(|accession| !accession.is_empty())
+        && fields.next() == Some(concept)
+        && fields.next() == Some(unit)
+        && fields
+            .next()
+            .is_some_and(|start| start == "instant" || valid_iso_date(start))
+        && fields.next().is_some_and(valid_iso_date)
+        && fields.next().is_none()
+}
+
+fn valid_iso_date(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+fn required_lower_hex_bytes(value: Option<&Value>, field: &str) -> Result<Vec<u8>> {
+    let value = value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len().is_multiple_of(2))
+        .ok_or_else(|| anyhow!("{field} is absent or has an invalid length"))?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(value.len() / 2)
+        .with_context(|| format!("{field} allocation failed"))?;
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = lower_hex_nibble(pair[0]).ok_or_else(|| anyhow!("{field} is not lower hex"))?;
+        let low = lower_hex_nibble(pair[1]).ok_or_else(|| anyhow!("{field} is not lower hex"))?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+const fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+async fn verify_bls_current_snapshot_publication(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+) -> Result<u64> {
+    let maximum_rows = if publication
+        .provider_dataset
+        .starts_with("bls:timeseries:public-v1:")
+    {
+        BLS_PUBLIC_MAXIMUM_ACCEPTANCE_ROWS
+    } else if publication
+        .provider_dataset
+        .starts_with("bls:timeseries:registered-v2:")
+    {
+        BLS_REGISTERED_MAXIMUM_ACCEPTANCE_ROWS
+    } else {
+        bail!("BLS current-snapshot publication has an unknown access tier");
+    };
+    if publication.row_count > maximum_rows {
+        bail!("BLS unemployment acceptance exceeds one bounded provider year window");
+    }
+    let observations = query_publication(application, publication).await?;
+    let rows = observations
+        .get("rows")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| anyhow!("BLS current-snapshot query was not returned inline"))?;
+    if u64::try_from(rows.len()).context("BLS observation row count overflow")?
+        != publication.row_count
+    {
+        bail!("BLS current-snapshot query did not return the exact published row set");
+    }
+    let payload_digest = lower_hex(publication.source_payload_digest.bytes());
+    for row in rows {
+        let row = row
+            .as_object()
+            .ok_or_else(|| anyhow!("BLS current-snapshot query row is invalid"))?;
+        let source_identifier = row
+            .get("source_identifier")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("BLS current-snapshot provenance is absent"))?;
+        if !bls_observation_identity_matches(
+            source_identifier,
+            BLS_UNEMPLOYMENT_SERIES,
+            &payload_digest,
+        ) || row.get("observation_kind").and_then(Value::as_str) != Some("macro")
+            || row.get("availability_kind").and_then(Value::as_str) != Some("local_first_observed")
+            || row.get("available_at").is_none_or(Value::is_null)
+            || row.get("received_at") != row.get("available_at")
+            || row
+                .get("source_timestamp")
+                .is_some_and(|value| !value.is_null())
+            || row
+                .get("published_precision")
+                .is_some_and(|value| !value.is_null())
+            || row.get("revision").and_then(Value::as_u64) == Some(0)
+            || row.get("revision").and_then(Value::as_u64).is_none()
+            || row.get("effective_period_scheme").and_then(Value::as_str) != Some("bls-monthly")
+            || row.get("unit").and_then(Value::as_str) != Some("percent")
+            || row.get("quality").and_then(Value::as_str) != Some("official_delayed")
+        {
+            bail!("BLS query mislabeled current revised observations or lost direct provenance");
+        }
+    }
+    u64::try_from(rows.len()).context("BLS observation row count overflow")
+}
+
+fn bls_observation_identity_matches(identity: &str, series: &str, payload_digest: &str) -> bool {
+    let mut fields = identity.split(':');
+    fields.next() == Some("bls")
+        && fields.next() == Some(series)
+        && fields
+            .next()
+            .and_then(|year| year.parse::<u16>().ok())
+            .is_some_and(|year| (1900..=9999).contains(&year))
+        && fields.next().is_some_and(|period| {
+            period.len() == 3
+                && period.starts_with('M')
+                && period[1..]
+                    .parse::<u8>()
+                    .is_ok_and(|month| (1..=13).contains(&month))
+        })
+        && fields.next() == Some(payload_digest)
+        && fields.next().is_none()
+}
+
+async fn verify_fred_vintage_publication(
+    application: &Application,
+    publication: &ResearchPublicationEvidence,
+) -> Result<QueryRowEvidence> {
+    let vintages = invoke(
+        application,
+        "Macro.GetVintages",
+        json_object(json!({
+            "dataset": publication.analytical_dataset_id,
+            "sourceCoverage": [FRED_ALFRED],
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    let manifest = vintages
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("FRED/ALFRED vintage query manifest is absent"))?;
+    if manifest.get("datasetId").and_then(Value::as_str)
+        != Some(publication.analytical_dataset_id.as_str())
+        || manifest.get("manifestVersion").and_then(Value::as_u64)
+            != Some(publication.manifest_version)
+        || manifest.get("contentHash").and_then(Value::as_str)
+            != Some(publication.manifest_content_hash.as_str())
+    {
+        bail!("FRED/ALFRED vintage query did not use the exact published manifest");
+    }
+    query_row_evidence(&vintages)
+}
+
+fn validate_fred_query_rows(
+    rows: &[Value],
+    provider_dataset: &SourceIdentifier,
+    series: &SourceIdentifier,
+    pages: &[FredPageEvidence],
+) -> Result<()> {
+    const FRED_SOURCE_ID: &str = "fred-fred-alfred.api-v1-v2";
+    const DAYS_FROM_YEAR_ONE_TO_UNIX_EPOCH: i32 = 719_163;
+
+    let namespace = provider_dataset
+        .as_str()
+        .split(':')
+        .next()
+        .filter(|value| matches!(*value, "fred" | "alfred"))
+        .ok_or_else(|| anyhow!("FRED/ALFRED dataset namespace is invalid"))?;
+    let mut expected_page_rows = BTreeMap::new();
+    for page in pages {
+        if page.source_payload_digest.algorithm() != DigestAlgorithm::Sha256
+            || page.source_payload_digest.bytes() == [0; 32]
+            || expected_page_rows
+                .insert(page.source_payload_digest.bytes(), page.returned_rows)
+                .is_some()
+        {
+            bail!("FRED/ALFRED page payload evidence is invalid or duplicated");
+        }
+    }
+
+    let mut observed_page_rows = BTreeMap::<[u8; 32], u64>::new();
+    let mut identities = BTreeSet::new();
+    for row in rows {
+        let row = row
+            .as_object()
+            .ok_or_else(|| anyhow!("FRED/ALFRED query row is invalid"))?;
+        let payload =
+            required_lower_hex_bytes(row.get("payload_json"), "FRED/ALFRED canonical payload")?;
+        let payload_digest = required_lower_hex_bytes(
+            row.get("payload_sha256"),
+            "FRED/ALFRED canonical payload digest",
+        )?;
+        let expected_payload_digest: [u8; 32] = Sha256::digest(&payload).into();
+        if payload_digest.as_slice() != expected_payload_digest {
+            bail!("FRED/ALFRED canonical row payload digest is invalid");
+        }
+        let observation: ResearchObservation = serde_json::from_slice(&payload)
+            .context("FRED/ALFRED canonical row payload could not be decoded")?;
+        let ResearchObservation::Macro(observation) = observation else {
+            bail!("FRED/ALFRED query returned a non-macro observation");
+        };
+        let context = observation.context();
+        let provenance = context.provenance();
+        let effective = context
+            .time()
+            .effective()
+            .calendar_date_value()
+            .ok_or_else(|| anyhow!("FRED/ALFRED effective date precision was lost"))?;
+        let published = context
+            .time()
+            .published()
+            .and_then(|value| value.calendar_date_value())
+            .ok_or_else(|| anyhow!("FRED/ALFRED vintage date precision was lost"))?;
+        if context
+            .time()
+            .superseded()
+            .is_some_and(|value| value.calendar_date_value().is_none())
+        {
+            bail!("FRED/ALFRED supersession date precision was lost");
+        }
+        let expected_revision = published
+            .days_since_unix_epoch()
+            .checked_add(DAYS_FROM_YEAR_ONE_TO_UNIX_EPOCH)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow!("FRED/ALFRED vintage revision is invalid"))?;
+        let source_identifier = format!("{namespace}:{series}:{effective}:{published}");
+        let page_digest = match provenance.payload_reference() {
+            PayloadReference::ContentHash(hash) if hash.algorithm() == DigestAlgorithm::Sha256 => {
+                hash.digest()
+            }
+            _ => bail!("FRED/ALFRED row omitted exact provider-page evidence"),
+        };
+        if !expected_page_rows.contains_key(&page_digest) {
+            bail!("FRED/ALFRED row references a payload outside the discovered page chain");
+        }
+        let observed = observed_page_rows.entry(page_digest).or_default();
+        *observed = observed
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("FRED/ALFRED page row count overflow"))?;
+        if observation.series() != series
+            || provenance.source_id().as_str() != FRED_SOURCE_ID
+            || provenance.instrument_id().is_some()
+            || provenance.venue_id().is_some()
+            || provenance.source_identifier().as_str() != source_identifier
+            || provenance.source_timestamp().is_some()
+            || provenance.quality() != DataQuality::OfficialDelayed
+            || provenance.ingested_at() < provenance.received_at()
+            || !matches!(
+                provenance.availability(),
+                AvailabilityEvidence::LocalFirstObserved { observed_at }
+                    if *observed_at == provenance.received_at()
+            )
+            || context.time().revision().get() != expected_revision
+            || row.get("observation_kind").and_then(Value::as_str) != Some("macro")
+            || row.get("source_id").and_then(Value::as_str) != Some(FRED_SOURCE_ID)
+            || row.get("source_identifier").and_then(Value::as_str)
+                != Some(source_identifier.as_str())
+            || row
+                .get("instrument_id")
+                .is_some_and(|value| !value.is_null())
+            || row.get("venue_id").is_some_and(|value| !value.is_null())
+            || row
+                .get("source_timestamp")
+                .is_some_and(|value| !value.is_null())
+            || row.get("received_at") != row.get("available_at")
+            || row.get("availability_kind").and_then(Value::as_str) != Some("local_first_observed")
+            || row.get("effective_precision").and_then(Value::as_str) != Some("calendar_date")
+            || row.get("published_precision").and_then(Value::as_str) != Some("calendar_date")
+            || row.get("revision").and_then(Value::as_u64) != Some(u64::from(expected_revision))
+            || row.get("quality").and_then(Value::as_str) != Some("official_delayed")
+            || row.get("unit").and_then(Value::as_str) != Some(observation.unit().as_str())
+        {
+            bail!("FRED/ALFRED canonical row lost exact series, time, quality, or provenance");
+        }
+        if !identities.insert((source_identifier, expected_payload_digest)) {
+            bail!("FRED/ALFRED query repeats a canonical observation identity");
+        }
+    }
+    if observed_page_rows != expected_page_rows {
+        bail!("FRED/ALFRED query rows do not exactly cover the discovered page chain");
     }
     Ok(())
+}
+
+fn query_result_row_count(result: &Value) -> Option<u64> {
+    let inline_rows = result
+        .get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| u64::try_from(rows.len()).ok())
+        .filter(|rows| *rows > 0);
+    let artifact_rows = result
+        .pointer("/artifact/rowCount")
+        .and_then(Value::as_u64)
+        .filter(|rows| *rows > 0);
+    inline_rows.or(artifact_rows)
+}
+
+fn query_row_evidence(result: &Value) -> Result<QueryRowEvidence> {
+    let rows = result
+        .get("rows")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| anyhow!("release query must return one complete bounded inline row set"))?;
+    if result
+        .get("artifact")
+        .is_some_and(|artifact| !artifact.is_null())
+    {
+        bail!("release query returned an opaque artifact instead of independently verifiable rows");
+    }
+    let row_count = u64::try_from(rows.len()).context("query result row count overflow")?;
+    let canonical = serde_json::to_vec(rows).context("query rows could not be canonicalized")?;
+    Ok(QueryRowEvidence {
+        row_count,
+        content_sha256: lower_hex(Sha256::digest(canonical).into()),
+        rows: rows.clone(),
+    })
 }
 
 fn treasury_acceptance_datasets(
@@ -766,6 +1865,23 @@ fn required_sha256(value: Option<&Value>, field: &str) -> Result<String> {
         })
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("{field} is not a lowercase SHA-256 digest"))
+}
+
+fn optional_sha256(value: Option<&Value>, field: &str) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => required_sha256(Some(value), field).map(Some),
+    }
+}
+
+fn lower_hex(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 async fn exercise_live_surface(
@@ -1129,12 +2245,96 @@ async fn verify_restart_recovery(
                     })?;
                 let mut expected_identity = expected_runtime.clone();
                 expected_identity.publications.clear();
-                if research_runtime_evidence(&runtime, Vec::new())? != expected_identity {
+                expected_identity.python_training = None;
+                if research_runtime_evidence(&runtime, Vec::new(), None)? != expected_identity {
                     bail!("provider research runtime changed during restart: {surface_id}");
                 }
                 for publication in &expected_runtime.publications {
-                    verify_queryable_publication(product.application().as_ref(), publication)
-                        .await?;
+                    let observation_count = match publication.temporal_semantics {
+                        ResearchPublicationTemporalSemantics::LocallyObservedCurrentSnapshot => {
+                            verify_bls_current_snapshot_publication(
+                                product.application().as_ref(),
+                                publication,
+                            )
+                            .await?
+                        }
+                        ResearchPublicationTemporalSemantics::LocallyObservedSecDisclosure => {
+                            let expected_sec = publication.sec.as_ref().ok_or_else(|| {
+                                anyhow!("SEC publication recovery evidence is absent")
+                            })?;
+                            let recovered_sec = verify_sec_publication(
+                                product.application().as_ref(),
+                                publication,
+                                &expected_sec.cik,
+                                &expected_sec.query_operation,
+                                &expected_sec.observation_kind,
+                            )
+                            .await?;
+                            if recovered_sec != *expected_sec {
+                                bail!(
+                                    "SEC publication provenance changed during restart: \
+                                     {surface_id}"
+                                );
+                            }
+                            recovered_sec.provenance_verified_rows
+                        }
+                        ResearchPublicationTemporalSemantics::EffectiveObservations => {
+                            verify_queryable_publication(
+                                product.application().as_ref(),
+                                publication,
+                            )
+                            .await?
+                        }
+                        ResearchPublicationTemporalSemantics::ProviderReportedVintages => {
+                            let expected_fred = publication.fred.as_ref().ok_or_else(|| {
+                                anyhow!("FRED/ALFRED recovery evidence is absent")
+                            })?;
+                            let observations = query_row_evidence(
+                                &query_publication(product.application().as_ref(), publication)
+                                    .await?,
+                            )?;
+                            let vintages = verify_fred_vintage_publication(
+                                product.application().as_ref(),
+                                publication,
+                            )
+                            .await?;
+                            let provider_dataset =
+                                SourceIdentifier::try_from(publication.provider_dataset.as_str())
+                                    .context("recovered FRED/ALFRED provider dataset is invalid")?;
+                            let series =
+                                SourceIdentifier::try_from(expected_fred.series_id.as_str())
+                                    .context("recovered FRED/ALFRED series is invalid")?;
+                            validate_fred_query_rows(
+                                &observations.rows,
+                                &provider_dataset,
+                                &series,
+                                &expected_fred.pages,
+                            )?;
+                            validate_fred_query_rows(
+                                &vintages.rows,
+                                &provider_dataset,
+                                &series,
+                                &expected_fred.pages,
+                            )?;
+                            if observations != expected_fred.observation_query
+                                || vintages != expected_fred.vintage_query
+                            {
+                                bail!(
+                                    "FRED/ALFRED query evidence changed during restart: \
+                                     {surface_id}"
+                                );
+                            }
+                            observations.row_count
+                        }
+                    };
+                    if observation_count != publication.observation_query_row_count {
+                        bail!(
+                            "provider publication row count changed during restart: {surface_id}"
+                        );
+                    }
+                }
+                if let Some(training) = &expected_runtime.python_training {
+                    verify_python_training_recovery(product, training)?;
                 }
             }
             None => {
@@ -1148,6 +2348,57 @@ async fn verify_restart_recovery(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn verify_python_training_recovery(
+    product: &LocalProduct,
+    expected: &PythonTrainingEvidence,
+) -> Result<()> {
+    let dataset_id = DatasetId::try_from(expected.dataset_id.as_str())
+        .context("recorded Python training dataset identity is invalid")?;
+    let deadline = Instant::now()
+        .checked_add(APPLICATION_REQUEST_TIMEOUT)
+        .ok_or_else(|| anyhow!("Python training recovery deadline overflow"))?;
+    let cancellation = CancellationToken::new();
+    let recovered = product
+        .research()
+        .analytical_reader()
+        .feature_dataset(&dataset_id, deadline, &cancellation)
+        .context("Python training generation could not be reopened after restart")?
+        .ok_or_else(|| anyhow!("Python training generation is absent after restart"))?;
+    let generation = recovered.generation();
+    let manifest = generation.manifest();
+    let recovered_parents = generation.parents();
+    if manifest.manifest_version() != expected.manifest_version
+        || lower_hex(manifest.content_hash().bytes()) != expected.manifest_content_hash
+        || generation
+            .build_spec_digest()
+            .is_none_or(|digest| lower_hex(digest.digest().bytes()) != expected.build_spec_digest)
+        || lower_hex(recovered.policy_digest().bytes()) != expected.policy_digest
+        || lower_hex(recovered.universe_digest().bytes()) != expected.universe_digest
+        || lower_hex(recovered.python_export_sha256().bytes()) != expected.python_export_sha256
+        || recovered_parents.len() != expected.parents.len()
+        || recovered_parents
+            .iter()
+            .zip(&expected.parents)
+            .any(|(actual, recorded)| {
+                actual.relation() != GenerationParentRelation::DerivedInput
+                    || actual.manifest().dataset_id().as_str() != recorded.dataset_id
+                    || actual.manifest().manifest_version() != recorded.manifest_version
+                    || lower_hex(actual.manifest().content_hash().bytes())
+                        != recorded.manifest_content_hash
+            })
+    {
+        bail!("Python training generation changed during restart");
+    }
+    let splits = recovered.split_counts();
+    if splits.train_examples() != expected.train_examples
+        || splits.validation_examples() != expected.validation_examples
+        || splits.test_examples() != expected.test_examples
+    {
+        bail!("Python training split evidence changed during restart");
     }
     Ok(())
 }
@@ -1198,10 +2449,100 @@ fn admit_selected_surfaces(arguments: &ReleaseProviderArguments) -> Result<Vec<&
     if arguments.require_fred_alfred_rights && !requested.contains(FRED_ALFRED) {
         bail!("FRED and ALFRED rights evidence requires the exact FRED/ALFRED surface");
     }
+    if requested.contains(FRED_ALFRED) {
+        admit_fred_release_inputs(arguments)?;
+    } else if arguments.fred_dataset.is_some() || arguments.fred_training_request.is_some() {
+        bail!("FRED/ALFRED release inputs require the selected FRED/ALFRED surface");
+    }
+    if requested.contains(SEC_EDGAR) {
+        admit_sec_release_cik(arguments)?;
+    } else if arguments.sec_cik.is_some() {
+        bail!("SEC release inputs require the selected SEC surface");
+    }
+    let selected_bls = [BLS_PUBLIC, BLS_REGISTERED]
+        .into_iter()
+        .filter(|surface| requested.contains(*surface))
+        .collect::<Vec<_>>();
+    match selected_bls.as_slice() {
+        [] => {
+            if arguments.bls_dataset.is_some() || arguments.bls_training_request.is_some() {
+                bail!("BLS release inputs require one selected BLS surface");
+            }
+        }
+        [surface] => {
+            admit_bls_release_inputs(arguments, surface)?;
+        }
+        _ => bail!("provider release evidence accepts one BLS access tier per run"),
+    }
     Ok(ADMITTED_SURFACES
         .into_iter()
         .filter(|surface| requested.contains(surface))
         .collect())
+}
+
+fn admit_sec_release_cik(arguments: &ReleaseProviderArguments) -> Result<&str> {
+    arguments
+        .sec_cik
+        .as_deref()
+        .filter(|cik| {
+            cik.len() == 10
+                && cik.bytes().all(|byte| byte.is_ascii_digit())
+                && cik.bytes().any(|byte| byte != b'0')
+        })
+        .ok_or_else(|| {
+            anyhow!("selected SEC surface requires one exact nonzero 10-digit --sec-cik")
+        })
+}
+
+fn admit_fred_release_inputs(
+    arguments: &ReleaseProviderArguments,
+) -> Result<(SourceIdentifier, &Path)> {
+    let provider_dataset = arguments
+        .fred_dataset
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected FRED/ALFRED surface requires --fred-dataset"))
+        .and_then(|value| {
+            SourceIdentifier::try_from(value).context("FRED/ALFRED provider dataset is invalid")
+        })?;
+    let analytical_dataset = FredSource::analytical_dataset_identifier(&provider_dataset)
+        .context("FRED/ALFRED provider dataset is not an exact bounded observations request")?;
+    DatasetId::try_from(analytical_dataset.as_str())
+        .context("FRED/ALFRED analytical dataset identity is invalid")?;
+    let training = arguments
+        .fred_training_request
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected FRED/ALFRED surface requires --fred-training-request"))?;
+    Ok((provider_dataset, training))
+}
+
+fn admit_bls_release_inputs<'a>(
+    arguments: &'a ReleaseProviderArguments,
+    surface_id: &str,
+) -> Result<(SourceIdentifier, &'a Path)> {
+    let provider_dataset = arguments
+        .bls_dataset
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected BLS surface requires --bls-dataset"))
+        .and_then(|value| {
+            SourceIdentifier::try_from(value).context("BLS provider dataset is invalid")
+        })?;
+    let expected_tier = match surface_id {
+        BLS_PUBLIC => "bls:timeseries:public-v1:",
+        BLS_REGISTERED => "bls:timeseries:registered-v2:",
+        _ => bail!("BLS release inputs require one exact BLS surface"),
+    };
+    if !provider_dataset.as_str().starts_with(expected_tier) {
+        bail!("BLS provider dataset does not match the selected access tier");
+    }
+    let analytical_dataset = BlsSource::analytical_dataset_identifier(&provider_dataset)
+        .context("BLS provider dataset is not an exact bounded timeseries request")?;
+    DatasetId::try_from(analytical_dataset.as_str())
+        .context("BLS analytical dataset identity is invalid")?;
+    let training = arguments
+        .bls_training_request
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected BLS surface requires --bls-training-request"))?;
+    Ok((provider_dataset, training))
 }
 
 fn is_live_surface(surface_id: &str) -> bool {

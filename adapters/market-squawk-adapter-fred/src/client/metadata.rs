@@ -16,7 +16,7 @@ use crate::{FredOperation, FredParseLimits, FredRightsDisposition};
 
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
-use super::{FredDataset, FredHttpRequest, FredSource, FredSourceError};
+use super::{FredDataset, FredHttpRequest, FredSource, FredSourceError, acquire_request_permit};
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
 const MAX_METADATA_STRING_BYTES: usize = 8 * 1024;
@@ -147,6 +147,23 @@ impl FredSeriesMetadata {
     pub fn notes(&self) -> Option<&str> {
         self.notes.as_deref()
     }
+
+    /// Parses one bounded credential-probe response for an exact code-owned series selector.
+    ///
+    /// This uses the same strict one-series schema and civil-date consistency checks as normal
+    /// extraction without manufacturing a durable dataset or rights decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::Protocol`] when the body, schema, series identity, strings, or
+    /// provider realtime interval is invalid.
+    pub fn parse_probe_response(
+        bytes: &[u8],
+        expected_series: &SourceIdentifier,
+        limits: FredParseLimits,
+    ) -> Result<Self, FredSourceError> {
+        parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
+    }
 }
 
 /// One exact FRED series-metadata response bound to its source and dataset identities.
@@ -261,7 +278,13 @@ impl FredSource {
         authorization_target
             .query_pairs_mut()
             .append_pair("api_key", self.api_key.expose());
-        let permit = authority.try_network_request(authorization_target.as_str())?;
+        let permit = acquire_request_permit(
+            authority,
+            authorization_target.as_str(),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
         let in_flight = permit.authorize_send(authorization_target.as_str())?;
         drop(authorization_target);
         let wall_remaining = deadline
@@ -340,6 +363,20 @@ fn parse_series_metadata(
     dataset: &FredDataset,
     limits: FredParseLimits,
 ) -> Result<FredSeriesMetadata, FredSourceError> {
+    let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)?;
+    if series.realtime_start != dataset.realtime_start()
+        || series.realtime_end != dataset.realtime_end()
+    {
+        return Err(FredSourceError::Protocol);
+    }
+    Ok(series)
+}
+
+fn parse_series_metadata_for_series(
+    bytes: &[u8],
+    expected_series: &str,
+    limits: FredParseLimits,
+) -> Result<FredSeriesMetadata, FredSourceError> {
     admit_body(bytes, limits).map_err(|_| FredSourceError::Protocol)?;
     let wire: SeriesResponseWire =
         serde_json::from_slice(bytes).map_err(|_| FredSourceError::Protocol)?;
@@ -374,9 +411,7 @@ fn parse_series_metadata(
         parse_date(&row.observation_start).map_err(|_| FredSourceError::Protocol)?;
     let observation_end =
         parse_date(&row.observation_end).map_err(|_| FredSourceError::Protocol)?;
-    if series_id.as_str() != dataset.series_id()
-        || page_start != dataset.realtime_start()
-        || page_end != dataset.realtime_end()
+    if series_id.as_str() != expected_series
         || realtime_start != page_start
         || realtime_end != page_end
         || observation_start > observation_end

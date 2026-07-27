@@ -31,7 +31,6 @@ pub(super) struct ExistingReservation {
     payload_algorithm: i64,
     payload_digest: Vec<u8>,
     operation: String,
-    rights_id: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,13 +93,12 @@ impl ResultBudget {
 }
 
 impl ExistingReservation {
-    pub(super) fn matches(&self, request: &IngestIdentity, rights: &SourceRightsDecision) -> bool {
+    pub(super) fn matches(&self, request: &IngestIdentity) -> bool {
         let (algorithm, digest) = digest_columns(request.payload_digest());
         self.source_id == request.source_id().as_str()
             && self.payload_algorithm == algorithm
             && self.payload_digest == digest
             && SourceOperation::from_database_name(&self.operation) == Some(request.operation())
-            && self.rights_id == rights.fingerprint()
     }
 }
 
@@ -522,7 +520,7 @@ pub(super) fn existing_reservation(
     let row = transaction
         .query_row(
             "SELECT run_id, source_id, payload_algorithm, payload_digest, operation,
-                    rights_id, requested_at_ns
+                    requested_at_ns
              FROM ingest_runs
              WHERE source_id=?1 AND operation=?2 AND idempotency_key=?3",
             params![
@@ -537,28 +535,24 @@ pub(super) fn existing_reservation(
                     row.get::<_, i64>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?;
-    row.map(
-        |(run, source, algorithm, digest, operation, rights, requested)| {
-            Ok(ExistingReservation {
-                reservation: IngestReservation {
-                    run_id: Uuid::parse_str(&run).map_err(|_| CatalogError::CorruptCatalog)?,
-                    requested_at: Timestamp::from_unix_nanos(requested),
-                    catalog_id,
-                },
-                source_id: source,
-                payload_algorithm: algorithm,
-                payload_digest: digest,
-                operation,
-                rights_id: rights,
-            })
-        },
-    )
+    row.map(|(run, source, algorithm, digest, operation, requested)| {
+        Ok(ExistingReservation {
+            reservation: IngestReservation {
+                run_id: Uuid::parse_str(&run).map_err(|_| CatalogError::CorruptCatalog)?,
+                requested_at: Timestamp::from_unix_nanos(requested),
+                catalog_id,
+            },
+            source_id: source,
+            payload_algorithm: algorithm,
+            payload_digest: digest,
+            operation,
+        })
+    })
     .transpose()
 }
 

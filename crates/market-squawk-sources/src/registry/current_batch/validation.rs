@@ -145,6 +145,9 @@ pub enum RegistryError {
     /// A previous run did not publish a clean marker, so new live authority is terminally barred.
     #[error("source authority predecessor did not shut down cleanly")]
     UncleanAuthorityPredecessor,
+    /// A non-durable extraction/inspection registry attempted to mint live session authority.
+    #[error("bounded in-memory extraction registry cannot mint live session authority")]
+    LiveAuthorityUnavailableForExtractionRegistry,
     /// Trusted credential/entitlement subject resolution failed.
     #[error("source authorization subject could not be resolved")]
     AuthorizationSubjectResolution,

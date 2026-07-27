@@ -22,7 +22,8 @@ impl AuthoritativeSourceRegistry {
             AuthorityComposition::Durable(durability) => durability
                 .persist_registry(candidate, wall)
                 .map_err(map_authority_persistence_error),
-            AuthorityComposition::EphemeralDiagnostic => Ok(()),
+            AuthorityComposition::InMemoryDiagnostic
+            | AuthorityComposition::InMemoryExtractionInspection => Ok(()),
         }
     }
 }

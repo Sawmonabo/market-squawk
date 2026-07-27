@@ -1,3 +1,4 @@
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +9,11 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthorizationMode, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, DiscoveryBatch,
-    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    HistoricalCapability, NetworkAccessPolicy, ObservedProviderOrder, ObservedRevisionError,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
-    payload_matches_exact_evidence,
+    DiscoveryRequest, ExtractionAuthority, ExtractionAuthorityError, ExtractionBatch,
+    ExtractionRecord, ExtractionRequest, ExtractionRequestPermit, ExtractionRevisionEvidence,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
+    NetworkAccessPolicy, ObservedProviderOrder, ObservedRevisionError, SourceClass, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceObject, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -33,11 +34,14 @@ pub use metadata::{FredSeriesMetadata, FredSeriesMetadataDocument, fred_series_e
 use http::{
     FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport, system_timestamp,
 };
+pub use lineage::FredPageObjectIdentity;
 use lineage::{evidence_for_payload, map_adapter_error, page_object_id, parse_object_id};
 use normalize::{CanonicalPageContext, canonical_observation_payloads};
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
 const DISCOVERY_PAGE_RECORDS: usize = 10_000;
+/// Maximum provider rows retained in one key-only inspection page.
+pub const MAX_FRED_EPHEMERAL_PAGE_RECORDS: u16 = 1_024;
 
 /// User-owned FRED API credential retained only in zeroizing memory.
 #[derive(Clone)]
@@ -152,13 +156,7 @@ impl FredDataset {
         let series_id = fields.next().ok_or(FredSourceError::InvalidDataset)?;
         let realtime_start = fields.next().ok_or(FredSourceError::InvalidDataset)?;
         let realtime_end = fields.next().ok_or(FredSourceError::InvalidDataset)?;
-        if fields.next().is_some()
-            || series_id.is_empty()
-            || series_id.len() > 120
-            || series_id
-                .bytes()
-                .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.'))
-        {
+        if fields.next().is_some() || crate::rights::validate_exact_series_id(series_id).is_err() {
             return Err(FredSourceError::InvalidDataset);
         }
         let realtime_start =
@@ -253,6 +251,98 @@ impl FredSource {
         };
         let transport = Arc::new(ReqwestFredTransport::try_new(bounds)?);
         Self::try_new_with_transport(metadata, api_key, rights, transport, DISCOVERY_PAGE_RECORDS)
+    }
+
+    /// Builds a production HTTP source whose page size is bounded for non-durable inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidConfiguration`] when the source contract is invalid or
+    /// `page_records` exceeds [`MAX_FRED_EPHEMERAL_PAGE_RECORDS`].
+    pub fn try_new_for_ephemeral_inspection(
+        metadata: SourceMetadata,
+        api_key: FredApiKey,
+        rights: FredRightsPolicy,
+        page_records: NonZeroU16,
+    ) -> Result<Self, FredSourceError> {
+        if page_records.get() > MAX_FRED_EPHEMERAL_PAGE_RECORDS {
+            return Err(FredSourceError::InvalidConfiguration);
+        }
+        let bounds = match metadata.network_policy() {
+            NetworkAccessPolicy::Allowlisted(policy) => policy.request_bounds(),
+            NetworkAccessPolicy::Denied => return Err(FredSourceError::InvalidConfiguration),
+        };
+        let transport = Arc::new(ReqwestFredTransport::try_new(bounds)?);
+        Self::try_new_with_transport(
+            metadata,
+            api_key,
+            rights,
+            transport,
+            usize::from(page_records.get()),
+        )
+    }
+
+    /// Derives the storage-safe analytical identity for one exact provider dataset.
+    ///
+    /// The colon-delimited input remains the provider request and provenance identity. The
+    /// returned dotted identity is a separate local analytical namespace that preserves every
+    /// provider field without lossy replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidDataset`] when the input is not an exact bounded
+    /// FRED/ALFRED observations request.
+    pub fn analytical_dataset_identifier(
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, FredSourceError> {
+        let dataset = FredDataset::parse(provider_dataset)?;
+        let namespace = match dataset.namespace {
+            FredNamespace::Fred => "fred",
+            FredNamespace::Alfred => "alfred",
+        };
+        SourceIdentifier::try_from(format!(
+            "{namespace}.series-observations.{}.{}.{}",
+            dataset.series_id, dataset.realtime_start, dataset.realtime_end
+        ))
+        .map_err(|_| FredSourceError::InvalidDataset)
+    }
+
+    /// Derives the exact series identity used by scoped runtime-rights admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidDataset`] unless the provider dataset is one exact
+    /// bounded FRED/ALFRED observations request.
+    pub fn rights_subject_identifier(
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<SourceIdentifier, FredSourceError> {
+        let dataset = FredDataset::parse(provider_dataset)?;
+        SourceIdentifier::try_from(dataset.series_id).map_err(|_| FredSourceError::InvalidDataset)
+    }
+
+    /// Returns the exact closed real-time interval encoded by one provider dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidDataset`] unless the provider dataset is one exact
+    /// bounded FRED/ALFRED observations request.
+    pub fn dataset_realtime_interval(
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<(CalendarDate, CalendarDate), FredSourceError> {
+        let dataset = FredDataset::parse(provider_dataset)?;
+        Ok((dataset.realtime_start, dataset.realtime_end))
+    }
+
+    /// Parses the exact provider-page identity retained by discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidDataset`] when the object is not a current, complete
+    /// FRED page identity.
+    pub fn page_object_identity(
+        object_id: &SourceIdentifier,
+    ) -> Result<FredPageObjectIdentity, FredSourceError> {
+        parse_object_id(object_id)
     }
 
     /// Builds the exact provider-owned revision authority aligned to an extracted FRED batch.
@@ -365,7 +455,7 @@ impl FredSource {
                 FredOperation::RetrieveEphemeral,
             )
             .await?;
-        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest {
+        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest() {
             return Err(ExtractionSourceError::Source(
                 SourceError::GenerationResynchronizationRequired,
             ));
@@ -375,15 +465,20 @@ impl FredSource {
                 authority,
                 FredPageRequest {
                     dataset: &dataset,
-                    offset: object.offset,
-                    limit: object.limit,
+                    offset: object.offset(),
+                    limit: object.limit(),
                     deadline: request.deadline(),
                     operation: FredOperation::RetrieveEphemeral,
                 },
                 cancellation,
             )
             .await?;
-        if fetched.digest != object.page_digest
+        if fetched.digest != object.page_digest()
+            || fetched.page.offset() != object.offset()
+            || fetched.page.limit() != object.limit()
+            || fetched.page.observations().len() != object.returned()
+            || fetched.page.count() != object.total()
+            || fetched.page.next_offset().is_none() != object.terminal()
             || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
             || request
                 .object()
@@ -467,6 +562,7 @@ impl FredSource {
         let mut expected_count = None;
         let mut previous_observation_date = None;
         let mut previous_realtime_start = None;
+        let mut complete = false;
         while objects.len() < usize::from(request.max_results()) {
             let fetched = self
                 .fetch_page(
@@ -517,6 +613,9 @@ impl FredSource {
             let object_id = page_object_id(
                 offset,
                 self.discovery_page_records,
+                fetched.page.observations().len(),
+                fetched.page.count(),
+                fetched.page.next_offset().is_none(),
                 fetched.digest,
                 metadata_digest,
             )
@@ -540,9 +639,17 @@ impl FredSource {
                 })?),
             )?);
             let Some(next) = fetched.page.next_offset() else {
+                complete = true;
                 break;
             };
             offset = next;
+        }
+        if !complete {
+            return Err(ExtractionSourceError::Contract(
+                market_squawk_sources::ExtractionError::DiscoveryLimitExceeded {
+                    requested: request.max_results(),
+                },
+            ));
         }
         DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
     }
@@ -574,7 +681,7 @@ impl FredSource {
                 FredOperation::Persist,
             )
             .await?;
-        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest {
+        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest() {
             return Err(ExtractionSourceError::Source(
                 SourceError::GenerationResynchronizationRequired,
             ));
@@ -584,15 +691,20 @@ impl FredSource {
                 &authority,
                 FredPageRequest {
                     dataset: &dataset,
-                    offset: object.offset,
-                    limit: object.limit,
+                    offset: object.offset(),
+                    limit: object.limit(),
                     deadline: request.deadline(),
                     operation: FredOperation::Persist,
                 },
                 cancellation,
             )
             .await?;
-        if fetched.digest != object.page_digest
+        if fetched.digest != object.page_digest()
+            || fetched.page.offset() != object.offset()
+            || fetched.page.limit() != object.limit()
+            || fetched.page.observations().len() != object.returned()
+            || fetched.page.count() != object.total()
+            || fetched.page.next_offset().is_none() != object.terminal()
             || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
             || request
                 .object()
@@ -688,14 +800,19 @@ impl FredSource {
             .append_pair("limit", &limit.to_string())
             .append_pair("offset", &offset.to_string())
             .append_pair("sort_order", "asc")
-            .append_pair("order_by", "observation_date")
             .append_pair("output_type", "1")
             .append_pair("file_type", "json");
         let mut authorization_target = public_url.clone();
         authorization_target
             .query_pairs_mut()
             .append_pair("api_key", self.api_key.expose());
-        let permit = authority.try_network_request(authorization_target.as_str())?;
+        let permit = acquire_request_permit(
+            authority,
+            authorization_target.as_str(),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
         let in_flight = permit.authorize_send(authorization_target.as_str())?;
         drop(authorization_target);
         let wall_remaining = deadline
@@ -811,6 +928,43 @@ struct FredPageRequest<'a> {
     limit: usize,
     deadline: Timestamp,
     operation: FredOperation,
+}
+
+async fn acquire_request_permit(
+    authority: &ExtractionAuthority,
+    target: &str,
+    wall_deadline: Timestamp,
+    cancellation: CancellationToken,
+) -> Result<ExtractionRequestPermit, ExtractionSourceError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled);
+        }
+        match authority.try_network_request(target) {
+            Ok(permit) => return Ok(permit),
+            Err(ExtractionAuthorityError::BudgetWaitUntil { deadline }) => {
+                let wait = authority.remaining_budget_wait(deadline)?;
+                let now = system_timestamp().map_err(map_adapter_error)?;
+                let remaining = wall_deadline
+                    .unix_nanos()
+                    .checked_sub(now.unix_nanos())
+                    .and_then(|nanos| u64::try_from(nanos).ok())
+                    .map(Duration::from_nanos)
+                    .ok_or(ExtractionSourceError::DeadlineExceeded)?;
+                if wait > remaining {
+                    return Err(ExtractionSourceError::DeadlineExceeded);
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(ExtractionSourceError::Cancelled);
+                    }
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

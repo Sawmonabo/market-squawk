@@ -37,7 +37,7 @@ service registry.
 The reviewed server:
 
 - uses inherited standard input and standard output only;
-- advertises the MCP tools capability and exactly 62 application operations;
+- advertises the MCP tools capability and exactly 63 application operations;
 - does not advertise or serve MCP resources or prompts;
 - forbids MCP task execution for every tool;
 - does not expose an HTTP, WebSocket, or other network transport; and
@@ -92,7 +92,7 @@ The negotiated capability surface is intentionally narrow:
 
 | MCP feature | Reviewed-head behavior |
 | --- | --- |
-| Tools | Advertised; one complete, deterministic 62-tool list |
+| Tools | Advertised; one complete, deterministic 63-tool list |
 | Tool-list pagination | Unsupported; a non-null cursor is invalid parameters |
 | Tool-list change notifications | Not advertised; the list is immutable for the process |
 | Resources | Not advertised and no resource handlers are registered |
@@ -128,12 +128,13 @@ Every tool has contract version `"1"` and an object input schema with
 `additionalProperties: false`. The descriptor admits the same object again at runtime; JSON Schema
 metadata is not the sole authority check.
 
-Four scope profiles determine the common fields:
+Five scope profiles determine the common fields:
 
 | Scope | `instrumentIds` | `timeRange` | `resultLimits` | `sourceCoverage` |
 | --- | --- | --- | --- | --- |
 | Local | Not accepted | Not accepted | Required | Not accepted |
 | Source | Not accepted | Not accepted | Required | Optional |
+| Source discovery | Not accepted | Not accepted | Required | Required |
 | Data | Optional | Optional | Required | Optional |
 | Portfolio | Optional | Optional | Required | Optional |
 
@@ -222,12 +223,12 @@ combined item count may not exceed 4,096.
 
 ## Complete tool inventory
 
-The production registry contains exactly 62 tools. “Read” means `read_only` authorization and,
+The production registry contains exactly 63 tools. “Read” means `read_only` authorization and,
 unless stated otherwise, opaque artifact fallback on overflow. “Confirm” means local confirmation
 and inline-only result. “Risk” means risk-mediated authorization, still with `confirm: true` and
 inline-only result.
 
-### Source — 7 tools
+### Source — 8 tools
 
 | Tool | Specific arguments | Effect | Purpose |
 | --- | --- | --- | --- |
@@ -237,12 +238,16 @@ inline-only result.
 | `Source.GetHealth` | None | Read | Return bounded connection, integrity, and freshness health |
 | `Source.Setup` | `provider` | Confirm | Start or resume capability-gated local provider onboarding |
 | `Source.ListObjects` | `provider`, `dataset` | Read | List bounded exact provider objects without minting ingestion authority |
+| `Source.Inspect` | `provider`, `onboardingSessionId`, `datasetIdentifier`, `pageIndex`, `maxRecords` | Read | Return one bounded canonical provider page and exact evidence without research-dataset persistence |
 | `Source.Discover` | `provider`, `dataset` | Confirm | Discover bounded exact provider objects and process-local, receipt-bound ingestion authority |
 
-The first five tools use Source scope. `Source.ListObjects` and `Source.Discover` use the dedicated
-source-discovery scope and bind the exact provider and dataset. The listing operation is
-authority-free; the confirmed discovery operation mints a process-local, single-use receipt that
-`Research.IngestSource` must consume. `sourceCoverage`, when supplied to a read, filters the
+The first five tools use Source scope. `Source.ListObjects`, `Source.Inspect`, and
+`Source.Discover` use the dedicated source-discovery scope, which requires `sourceCoverage` and
+binds it to the exact provider together with the requested dataset. The listing operation is
+authority-free. Inspection additionally binds the exact active onboarding session, page index in
+`0..=63`, record ceiling in `1..=1024`, provider page evidence, and non-persistence contract. The
+confirmed discovery operation mints a process-local, single-use receipt that
+`Research.IngestSource` must consume. Optional `sourceCoverage` on other read scopes filters the
 code-owned profile surface identifiers and active runtime source identifiers.
 
 ### Market — 6 tools

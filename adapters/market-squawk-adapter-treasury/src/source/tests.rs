@@ -142,6 +142,10 @@ async fn exercise_source(
     });
     let source =
         TreasurySource::try_new_with_transport(metadata.clone(), config, transport.clone())?;
+    let provider_dataset = source.dataset()?;
+    let analytical_dataset = source.analytical_dataset_identifier(&provider_dataset)?;
+    assert_ne!(provider_dataset, analytical_dataset);
+    assert!(!analytical_dataset.as_str().contains(':'));
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(metadata, now)?;
     let authority = registry.extraction_authority(&registered, &source)?;
@@ -150,7 +154,7 @@ async fn exercise_source(
         .discover(
             authority.clone(),
             DiscoveryRequest::try_new(
-                source.dataset()?,
+                provider_dataset,
                 None,
                 NonZeroU16::new(1).ok_or("nonzero result count")?,
                 deadline,

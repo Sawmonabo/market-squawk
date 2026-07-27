@@ -217,7 +217,6 @@ registered once as PAPER-001 through PAPER-007 and classified as official standa
 | Legacy Treasury XML endpoint variants | [Treasury developer notice](https://home.treasury.gov/developer-notice-xml-changes) | Useful migration history, but the current documented feed and Fiscal Data API are the selected onboarding surfaces. |
 | OAuth RFCs as proof that a provider supports a flow | [RFC Editor](https://www.rfc-editor.org/) | Standards define interoperable behavior; provider documentation or metadata must independently opt into each flow. |
 | Plaintext config files, environment variables as long-lived storage, command-line flags, and clipboard automation | N/A | They do not meet the local-secret requirement and can leak through files, process listings, logs, shell history, or clipboard history. |
-| Automated form submission, CAPTCHA bypass, mailbox scraping, or browser credential interception | N/A | Not an official enrollment path and incompatible with the explicit human/security boundaries in the provider documentation. |
 
 ## Coverage Gaps and Explicit Non-Findings
 

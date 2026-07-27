@@ -4,13 +4,14 @@ use market_squawk_domain::CalendarDate;
 
 use crate::TreasuryProtocolError;
 
-use super::{TreasuryDailyRatePage, TreasuryDailyRateQuery};
+use super::{TreasuryDailyRateFamily, TreasuryDailyRatePage, TreasuryDailyRateQuery};
 
 const PROVIDER_PAGE_ROWS: usize = 300;
 
 /// Bounded cross-page integrity authority for one Treasury all-history query.
 #[derive(Clone, Debug)]
 pub struct TreasuryDailyRatePaginationTracker {
+    family: TreasuryDailyRateFamily,
     query_digest: [u8; 32],
     max_pages: usize,
     max_records: usize,
@@ -38,6 +39,7 @@ impl TreasuryDailyRatePaginationTracker {
             return Err(TreasuryProtocolError::InvalidLimits);
         }
         Ok(Self {
+            family: query.family(),
             query_digest: query.query_digest(),
             max_pages,
             max_records,
@@ -104,10 +106,12 @@ impl TreasuryDailyRatePaginationTracker {
             .filter(|records| *records <= self.max_records)
             .ok_or(TreasuryProtocolError::PaginationLimitExceeded)?;
         for observation in page.observations() {
-            if self
-                .last_record_date
-                .is_some_and(|last| last >= observation.record_date())
-            {
+            let out_of_order = self.last_record_date.is_some_and(|last| {
+                last > observation.record_date()
+                    || (last == observation.record_date()
+                        && self.family != TreasuryDailyRateFamily::LongTermRates)
+            });
+            if out_of_order {
                 return Err(TreasuryProtocolError::PageDrift);
             }
             if !self.accepted_rows.insert(observation.row_identity()) {

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use market_squawk_data::{IngestError, IngestPrecommitAuthority};
+use market_squawk_data::{IngestError, IngestPrecommitAuthority, SourceOperation};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
@@ -121,6 +121,28 @@ impl ResearchProviderRuntimeGeneration {
         self.rights.authorization_evidence
     }
 
+    /// Returns the parent onboarding rights decision that admitted this subordinate authority.
+    pub const fn parent_rights_authorization_evidence(&self) -> EvidenceDigest {
+        self.rights.parent_authorization_evidence
+    }
+
+    /// Returns the finite subordinate authority expiry, when this generation is time-bounded.
+    pub const fn rights_authorization_expires_at(&self) -> Option<Timestamp> {
+        self.rights.authorization_expires_at
+    }
+
+    /// Returns the exact provider subjects, or `None` for a source-wide authority.
+    pub const fn rights_exact_subjects(
+        &self,
+    ) -> Option<&std::collections::BTreeSet<SourceIdentifier>> {
+        self.rights.exact_subjects.as_ref()
+    }
+
+    /// Returns whether the subordinate authority admits one operation.
+    pub fn rights_admits(&self, operation: SourceOperation) -> bool {
+        self.rights.permitted_operations.contains(&operation)
+    }
+
     /// Returns the stable callable slot shared by legitimate generations of one provider source.
     pub fn slot_identity_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
         #[derive(Serialize)]
@@ -141,9 +163,59 @@ impl ResearchProviderRuntimeGeneration {
 
     /// Returns a canonical digest of every non-secret exact-generation authority dimension.
     pub fn generation_digest(&self) -> Result<EvidenceDigest, ResearchIngestCompositionError> {
+        let legacy_source_wide_persistence = self.rights.exact_subjects.is_none()
+            && self.rights.permitted_operations.len() == 1
+            && self
+                .rights
+                .permitted_operations
+                .contains(&SourceOperation::Persist)
+            && self.rights.parent_authorization_evidence == self.rights.authorization_evidence;
+        if legacy_source_wide_persistence {
+            #[derive(Serialize)]
+            #[serde(deny_unknown_fields)]
+            struct RuntimeGenerationWireV2<'a> {
+                slot_identity_digest: EvidenceDigest,
+                profile: &'a SourceIdentifier,
+                session_id: Uuid,
+                capability_revision: ProviderCapabilityRevision,
+                capability_digest: EvidenceDigest,
+                credential_generation: Option<SecretGeneration>,
+                secret_reference: Option<&'a SecretRef>,
+                authority_effective_at: Timestamp,
+                metadata: &'a SourceMetadata,
+                rights_source_id: &'a market_squawk_domain::SourceId,
+                rights_basis_reference: &'a str,
+                rights_basis_digest: EvidenceDigest,
+                rights_root_identity_digest: Option<EvidenceDigest>,
+                rights_authorization_evidence: EvidenceDigest,
+                rights_authorization_expires_at: Option<market_squawk_domain::Timestamp>,
+            }
+
+            return digest_runtime_wire(
+                b"market-squawk/research-provider-runtime-generation/v2\0",
+                &RuntimeGenerationWireV2 {
+                    slot_identity_digest: self.slot_identity_digest()?,
+                    profile: &self.profile,
+                    session_id: self.session_id,
+                    capability_revision: self.capability_revision,
+                    capability_digest: self.capability_digest,
+                    credential_generation: self.credential_generation,
+                    secret_reference: self.secret_reference.as_ref(),
+                    authority_effective_at: self.authority_effective_at,
+                    metadata: &self.metadata,
+                    rights_source_id: &self.rights.source_id,
+                    rights_basis_reference: self.rights.basis.reference(),
+                    rights_basis_digest: self.rights.basis.digest(),
+                    rights_root_identity_digest: self.rights.basis.root_identity_digest(),
+                    rights_authorization_evidence: self.rights.authorization_evidence,
+                    rights_authorization_expires_at: self.rights.authorization_expires_at,
+                },
+            );
+        }
+
         #[derive(Serialize)]
         #[serde(deny_unknown_fields)]
-        struct RuntimeGenerationWire<'a> {
+        struct RuntimeGenerationWireV3<'a> {
             slot_identity_digest: EvidenceDigest,
             profile: &'a SourceIdentifier,
             session_id: Uuid,
@@ -157,13 +229,15 @@ impl ResearchProviderRuntimeGeneration {
             rights_basis_reference: &'a str,
             rights_basis_digest: EvidenceDigest,
             rights_root_identity_digest: Option<EvidenceDigest>,
+            rights_parent_authorization_evidence: EvidenceDigest,
             rights_authorization_evidence: EvidenceDigest,
             rights_authorization_expires_at: Option<market_squawk_domain::Timestamp>,
+            rights_contract_digest: EvidenceDigest,
         }
 
         digest_runtime_wire(
-            b"market-squawk/research-provider-runtime-generation/v2\0",
-            &RuntimeGenerationWire {
+            b"market-squawk/research-provider-runtime-generation/v3\0",
+            &RuntimeGenerationWireV3 {
                 slot_identity_digest: self.slot_identity_digest()?,
                 profile: &self.profile,
                 session_id: self.session_id,
@@ -177,8 +251,10 @@ impl ResearchProviderRuntimeGeneration {
                 rights_basis_reference: self.rights.basis.reference(),
                 rights_basis_digest: self.rights.basis.digest(),
                 rights_root_identity_digest: self.rights.basis.root_identity_digest(),
+                rights_parent_authorization_evidence: self.rights.parent_authorization_evidence,
                 rights_authorization_evidence: self.rights.authorization_evidence,
                 rights_authorization_expires_at: self.rights.authorization_expires_at,
+                rights_contract_digest: rights_contract_digest(&self.rights),
             },
         )
     }
@@ -226,6 +302,59 @@ impl ResearchProviderRuntimeGeneration {
                 }
                 _ => false,
             })
+    }
+}
+
+fn rights_contract_digest(rights: &ResearchRightsAuthority) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/research-rights-contract/v1\0");
+    digest.update(rights.parent_authorization_evidence.bytes());
+    digest.update(rights.authorization_evidence.bytes());
+    match rights.authorization_expires_at {
+        Some(expires_at) => {
+            digest.update([1]);
+            digest.update(expires_at.unix_nanos().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    match &rights.exact_subjects {
+        Some(subjects) => {
+            digest.update([1]);
+            digest.update(
+                u32::try_from(subjects.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes(),
+            );
+            for subject in subjects {
+                update_digest_part(&mut digest, subject.as_str().as_bytes());
+            }
+        }
+        None => digest.update([0]),
+    }
+    digest.update(
+        u32::try_from(rights.permitted_operations.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for operation in &rights.permitted_operations {
+        digest.update([source_operation_tag(*operation)]);
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
+fn update_digest_part(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+const fn source_operation_tag(operation: SourceOperation) -> u8 {
+    match operation {
+        SourceOperation::Retrieve => 1,
+        SourceOperation::Display => 2,
+        SourceOperation::Persist => 3,
+        SourceOperation::Cache => 4,
+        SourceOperation::Redistribute => 5,
+        SourceOperation::Train => 6,
     }
 }
 

@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
-    BlsResponse, BlsSeriesMetadata, BlsSourceConfig, BlsSourceError, BlsVintageCapability,
+    BlsResponse, BlsSeriesMetadata, BlsSource, BlsSourceConfig, BlsSourceError,
+    BlsVintageCapability,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
@@ -215,11 +216,14 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
         2020,
         2026,
     )?;
-    assert!(
-        public
-            .dataset()
-            .as_str()
-            .starts_with("bls:timeseries:public-v1:")
+    let plan_digest = public
+        .dataset()
+        .as_str()
+        .strip_prefix("bls:timeseries:public-v1:")
+        .ok_or("BLS provider dataset prefix")?;
+    assert_eq!(
+        BlsSource::analytical_dataset_identifier(public.dataset())?.as_str(),
+        format!("bls.timeseries.public-v1.{plan_digest}")
     );
     assert_ne!(public.dataset(), other_series.dataset());
     assert_ne!(public.dataset(), registered.dataset());

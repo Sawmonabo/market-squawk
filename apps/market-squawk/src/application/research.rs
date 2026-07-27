@@ -273,10 +273,18 @@ impl ApplicationDomainService for FundamentalDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
         match request.name() {
-            FUNDAMENTAL_GET_FILINGS
-            | FUNDAMENTAL_GET_FACTS
-            | FUNDAMENTAL_GET_STATEMENTS
-            | FUNDAMENTAL_GET_RATIOS => {
+            FUNDAMENTAL_GET_FILINGS => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .observations(
+                        &request,
+                        &context,
+                        limits,
+                        AnalyticalObservationTemplate::Filing,
+                    )
+                    .await
+            }
+            FUNDAMENTAL_GET_FACTS | FUNDAMENTAL_GET_STATEMENTS | FUNDAMENTAL_GET_RATIOS => {
                 let limits = effective_service_limits(&request, &context)?;
                 self.controller
                     .observations(

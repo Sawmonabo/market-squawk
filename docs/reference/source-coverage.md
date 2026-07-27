@@ -259,9 +259,9 @@ operator has an active session or that mutable delivery acceptance is complete.
 | `coinbase.public-market-data` | Live Coinbase Exchange WebSocket used by configured paper operation; diagnostic capture also exists | `rights_limited` | Public; no account, key, or contact | Crypto, configured instruments, one venue, real time, delivery `unknown`; not consolidated | `direct_unverified` |
 | `coinbase.exchange-direct-market-data` | Authenticated `ws-direct` full-channel and REST level-3 bootstrap selected by `Bot.Start` for risk-enforced paper execution | `rights_limited` | User-owned Coinbase Exchange account and View-only key envelope; exact active onboarding session required | Crypto, configured instruments, one Coinbase Exchange venue, real time, `direct_venue`; not consolidated | `direct_verified`, derived only from current runtime evidence |
 | `kraken.spot-public-market-data` | Live Kraken Spot WebSocket v2 used by configured paper operation | `rights_limited` | Public; no account, key, or contact | Crypto, one configured instrument/channel, one venue, real time, `direct_venue`; not consolidated | `direct_unverified` |
-| `sec.edgar-public` | SEC EDGAR extraction adapter | `refresh_required` | Public; non-secret organization/admin contact required | Regulatory filings, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
-| `fred-alfred.api-v1-v2` | FRED/ALFRED extraction and vintage adapter | `rights_blocked` | Provider account and API key; explicit manual secret import | Macroeconomic, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
-| `bls.v1-unregistered` | BLS public API v1 extraction | `refresh_required` | Public; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
+| `sec.edgar-public` | SEC EDGAR extraction adapter | `available` | Zero-fee public API; truthful non-secret organization/admin contact required | Regulatory filings, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
+| `fred-alfred.api-v1-v2` | Guided onboarding plus bounded `Source.Inspect` official-API retrieval with canonical observations and exact page evidence; durable publication and PIT-training code remains fail-closed behind both authority gates | `rights_limited` | Zero-fee provider account/API key; durable use additionally requires exact written St. Louis Fed service permission with hash-bound local review plus independent exact-series authority | Macroeconomic, delayed, non-venue, delivery `unknown`, revision-preserving | `official_delayed` |
+| `bls.v1-unregistered` | BLS public API v1 extraction | `available` | Zero-fee public API; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
 | `bls.v2-registered` | BLS public API v2 extraction | `refresh_required` | Provider registration, API key, and non-secret contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
 | `treasury.daily-rates-xml` | Five-family Treasury daily-rate XML research ingestion | `available` | Public; no account, key, or contact | Macroeconomic; nominal curves from 1990, bills from 2002, long-term and real long-term from 2000, real curves from 2003; delayed, non-venue, historical | `official_delayed` |
 | `treasury.fiscal-data` | Fiscal Data average-interest-rates v2 extraction | `available` | Public; no account, key, or contact | Macroeconomic, delayed, non-venue, delivery `unknown`, historical | `official_delayed` |
@@ -363,18 +363,19 @@ does not become `DirectVerified`.
 
 Research activation requires an active immutable onboarding lease for the exact surface, exact
 source/revision binding, and admitted `persist` rights with non-refresh exact evidence. The CLI
-activation request is a closed schema-version-2 object, capped at 1 MiB. Its provider kinds are
+activation request is a closed schema-version-3 object with schema-version-2 recovery, capped at
+1 MiB. Its provider kinds are
 `sec`, `bls`, `treasury_fiscal`, `treasury_daily_rates`, and `fred_alfred`; each kind has a closed,
-provider-specific scope. The loopback portal exposes SEC, BLS, Treasury Fiscal, and Treasury daily
-research activation plus source-session activation for public Coinbase, Coinbase Direct, and
-Kraken. Source-session activation verifies onboarding authority but does not manufacture a
-research adapter or durable-use right.
+provider-specific scope. The loopback portal exposes these typed research activations plus
+source-session activation for public Coinbase, Coinbase Direct, and Kraken. Source-session
+activation verifies onboarding authority but does not manufacture a research adapter or expand
+durable-use rights beyond the exact evidence admitted by its profile and request.
 
 | Adapter | Extracted scope | Important bounded/authority behavior |
 | --- | --- | --- |
 | SEC EDGAR | Submissions, company facts, and referenced filing/XBRL representations | Exact organization/admin `User-Agent`; endpoint allowlist; shared request budget; raw evidence and representation registry; revision-preserving |
 | BLS v1/v2 | Exact selected series and inclusive year range | Tier-specific endpoint and request plan; at most 1,000 series metadata inputs; v2 secret resolved only in explicit foreground work |
-| FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key plus exact per-series rights; revision-preserving; fail-closed durable rights assessment |
+| FRED/ALFRED | Exact series metadata, observations, vintage dates, and revision history | API key for ephemeral retrieval; durable use additionally requires exact Bank service permission, explicit local review, and exact per-series rights |
 | Treasury Fiscal Data | Average Interest Rates v2 for an exact date interval and page size | Exact endpoint/query allowlist; dataset/version provenance |
 | Treasury daily XML | All five official families over an inclusive year range | Exact family schemas and start years; strict year/month/all-history requests; cross-page integrity; exact payload/revision lineage |
 
@@ -390,26 +391,39 @@ that explicit resume. Invalid evidence, authority, or adapter state quarantines 
 
 At the reviewed commit, release and rights gates have concrete consequences:
 
-- SEC and both BLS profiles require a new admitted evidence refresh revision.
-- FRED is rights-blocked, so an API key alone cannot produce an active lease.
+- SEC EDGAR and unregistered BLS v1 are available under their exact no-key public-profile
+  constraints and digest-bound authority decisions. SEC activation still requires a truthful
+  declared contact and the exact CIK-to-instrument mapping consumed by normalization.
+- Registered BLS v2 remains a distinct `refresh_required`, provider-keyed surface; BLS v1
+  availability does not authorize or activate v2.
+- FRED revision 4 is rights-limited. The shipping `Source.Inspect` boundary performs bounded
+  ephemeral official-API retrieval without research-dataset persistence. Current terms permit that
+  boundary, while durable operations require exact written Bank service permission with an
+  explicit hash-bound local review plus independent public-domain or owner-permission evidence for
+  each exact series.
 - Treasury Fiscal Data and daily-rate XML are available built-in official profiles with all six
   rights operations admitted by their separate dataset-level evidence.
 
 ### FRED durable-rights boundary
 
-FRED's adapter implementation does not weaken the built-in `rights_blocked` state. When a future
-profile revision admits a scope, ephemeral retrieval still requires fresh terms, while durable
-persist, cache/archive, display, model-training, export, or redistribution requires:
+FRED's revision-4 profile admits bounded ephemeral retrieval. Durable use requires:
 
-- an exact grant for each series and requested operation; wildcards are rejected;
-- exact owner-authorization evidence effective through its expiry;
-- one exact digest-bound terms bundle containing the API terms, services legal terms, and privacy
-  policy, each at most 2 MiB;
-- a bounded rights artifact of at most 256 KiB and at most 256 grants; and
+- exact current FRED terms;
+- an exact St. Louis Fed permission response downloaded from its official HTTPS URL and matched
+  byte-for-byte against a fresh application-owned reacquisition;
+- an explicit local review bound to the raw response hash and retaining reviewer, issuer, grantee,
+  service, exact series, confirmed operations, conditions, effective date, optional document
+  expiry, and finite revalidation deadline;
+- independent public-domain or series-owner evidence for every exact series and operation;
+- intersecting current validity across both gates; and
 - the provider API key through the explicit secret boundary.
 
-Every requested series is assessed independently. Missing, expired, mismatched, or insufficient
-rights fail closed. A successful key probe is not a rights decision.
+Every requested series is assessed independently. Missing, duplicated, expired, stale, mismatched,
+or operation-incomplete evidence fails closed. An API key, public-domain series, contact submission,
+or contact receipt is not Bank service permission. Export and redistribution remain blocked. V1
+release acceptance also requires a real official-API publication, nonempty vintage and observation
+queries, restart recovery, and a derived PIT dataset with the exact FRED parent and nonempty
+train/validation/test splits.
 
 ### Local files
 
@@ -470,7 +484,7 @@ redistribute.
 | Coinbase public market data | Admitted | Admitted | Pending | Pending | Pending | Pending |
 | Kraken Spot public market data | Admitted | Admitted | Pending | Pending | Pending | Pending |
 | SEC EDGAR public | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
-| FRED/ALFRED | Blocked | Blocked | Blocked | Blocked | Blocked | Blocked |
+| FRED/ALFRED | Admitted | Pending | Pending, two-gate authority required | Pending, two-gate authority required | Pending | Blocked |
 | BLS v1 unregistered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
 | BLS v2 registered | Admitted | Admitted | Admitted | Admitted | Pending | Pending |
 | Treasury daily-rates XML | Admitted | Admitted | Admitted | Admitted | Admitted | Admitted |
@@ -555,12 +569,17 @@ contracts are in the [CLI reference](cli.md) and [MCP reference](mcp.md).
 | --- | --- | --- |
 | [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels) | `level2`, `matches`, and `heartbeat` provider semantics used by the pinned adapter | 2026-07-23 |
 | [Kraken Spot WebSocket v2 book checksum guide](https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/) | Book checksum canonicalization and supported depth semantics implemented by the Kraken adapter | 2026-07-23 |
-| [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions and company-facts API scope | 2026-07-23 |
-| [SEC webmaster FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions) | Declared `User-Agent` and aggregate fair-access expectations | 2026-07-23 |
-| [BLS public data API](https://www.bls.gov/developers/home.htm) | Unregistered v1 and registered v2 access tiers | 2026-07-23 |
-| [BLS API terms of service](https://www.bls.gov/developers/termsOfService.htm) | BLS provenance, representation, limits, and third-party-rights boundary | 2026-07-23 |
+| [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | Public submissions and company-facts API scope | 2026-07-26 |
+| [SEC webmaster FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions) | Declared `User-Agent` and aggregate fair-access expectations | 2026-07-26 |
+| [SEC EDGAR public API authority](../research/providers/sec-edgar-public-api-2026-07-26.md) | Exact setup authority and mandatory real-response acceptance boundary | 2026-07-26 |
+| [BLS public data API](https://www.bls.gov/developers/home.htm) | Unregistered v1 and registered v2 access tiers | 2026-07-26 |
+| [BLS API terms of service](https://www.bls.gov/developers/termsOfService.htm) | BLS provenance, representation, limits, and third-party-rights boundary | 2026-07-26 |
+| [BLS Public Data API authority](../research/providers/bls-public-data-api-2026-07-21.md) | Available public-v1 decision and distinct registered-v2 boundary | 2026-07-26 |
 | [FRED API documentation](https://fred.stlouisfed.org/docs/api/fred/) | Series, observations, and vintage interfaces implemented by the adapter | 2026-07-23 |
-| [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | API access does not override third-party series rights; scope-specific permission may still be required | 2026-07-23 |
+| [FRED API terms of use](https://fred.stlouisfed.org/docs/api/terms_of_use.html) | Current API-specific durable-storage/training prohibitions and independent series-owner boundary | 2026-07-26 |
+| [Current FRED legal terms](https://fred.stlouisfed.org/legal/) | Current service and API storage, caching, archival, database, software-development, and model-training prohibitions | 2026-07-26 |
+| [FRED permissions contact route](https://fred.stlouisfed.org/contactus/) | Official request route; submission and acknowledgement are not permission | 2026-07-26 |
+| [FRED/ALFRED service-use authority](../research/providers/2026-07-26-fred-alfred-local-first-api-authority.md) | Current two-gate decision and mandatory real release proof | 2026-07-26 |
 | [Treasury daily interest-rate XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed) | Five provider families, start years, selectors, and zero-based all-history pagination | 2026-07-26 |
 | [Treasury daily-rates release authority](../research/providers/2026-07-26-treasury-daily-rates-release-authority.md) | Matching public-access Data.gov records and CC0 durable-use admission | 2026-07-26 |
 | [Treasury Fiscal Data API documentation](https://fiscaldata.treasury.gov/api-documentation/) | Dataset-specific public API, query, paging, and provenance surface | 2026-07-23 |

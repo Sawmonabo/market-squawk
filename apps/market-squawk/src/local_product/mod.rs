@@ -1,7 +1,7 @@
 //! Complete local product composition shared by CLI and MCP transports.
 
 mod cli_backtest;
-mod cli_dataset;
+pub(crate) mod cli_dataset;
 mod cli_model;
 mod cli_portfolio;
 mod cli_provider;
@@ -212,6 +212,7 @@ impl LocalProduct {
             Arc::clone(&onboarding),
             paper.source_runtime_view(),
             source_discovery,
+            portal_activation.clone(),
             portal_activation,
         )?);
         let research_domains = ResearchApplicationServices::new_with_artifacts(

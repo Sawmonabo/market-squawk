@@ -178,6 +178,34 @@ impl AuthoritativeSourceRegistry {
         }
     }
 
+    /// Creates a bounded process-local registry for production extraction and inspection.
+    ///
+    /// The caller must supply both trusted authorization-subject resolution and the product-wide
+    /// provider-rate authority. Every registered provider budget therefore joins the shared
+    /// aggregate authority instead of an isolated quota pool.
+    ///
+    /// This composition intentionally retains no restart state and cannot mint live source-session
+    /// authority. It is suitable only for bounded non-durable extraction or response inspection;
+    /// durable research publication and live execution require their dedicated durable
+    /// compositions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed registry error when the trusted clock or process-local registry identity
+    /// cannot be established.
+    pub fn try_new_in_memory_for_bounded_extraction(
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: crate::ProviderRateAuthority,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_in_memory_with_authority_state_clock_resolver_and_provider_rate(
+            RegistryAuthorityState::empty(),
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            resolver,
+            Some(provider_rate),
+            AuthorityComposition::InMemoryExtractionInspection,
+        )
+    }
+
     /// Creates a diagnostic-only in-memory registry with a process-unique instance identity.
     ///
     /// This constructor does not claim restart persistence, does not publish a clean-run marker,
@@ -202,10 +230,12 @@ impl AuthoritativeSourceRegistry {
     pub fn try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
-        Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
+        Self::try_new_in_memory_with_authority_state_clock_resolver_and_provider_rate(
             RegistryAuthorityState::empty(),
             Arc::new(SystemRawRegistryClock::try_new()?),
             resolver,
+            None,
+            AuthorityComposition::InMemoryDiagnostic,
         )
     }
 
@@ -235,10 +265,12 @@ impl AuthoritativeSourceRegistry {
         state: RegistryAuthorityState,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
-        Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
+        Self::try_new_in_memory_with_authority_state_clock_resolver_and_provider_rate(
             state,
             Arc::new(SystemRawRegistryClock::try_new()?),
             resolver,
+            None,
+            AuthorityComposition::InMemoryDiagnostic,
         )
     }
 
@@ -246,17 +278,21 @@ impl AuthoritativeSourceRegistry {
         state: RegistryAuthorityState,
         clock_source: Arc<dyn RawRegistryClockSource>,
     ) -> Result<Self, RegistryError> {
-        Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
+        Self::try_new_in_memory_with_authority_state_clock_resolver_and_provider_rate(
             state,
             clock_source,
             Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            None,
+            AuthorityComposition::InMemoryDiagnostic,
         )
     }
 
-    fn try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
+    fn try_new_in_memory_with_authority_state_clock_resolver_and_provider_rate(
         state: RegistryAuthorityState,
         clock_source: Arc<dyn RawRegistryClockSource>,
         authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: Option<crate::ProviderRateAuthority>,
+        composition: AuthorityComposition,
     ) -> Result<Self, RegistryError> {
         let clock = Arc::new(SealedRegistryClock::new(clock_source));
         let _initial_time = clock.observe()?;
@@ -265,8 +301,12 @@ impl AuthoritativeSourceRegistry {
                 current.checked_add(1)
             })
             .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
-        let mut budgets =
-            ProviderBudgetPool::new().map_err(|_| RegistryError::BudgetCoordinator)?;
+        let mut budgets = match provider_rate {
+            Some(provider_rate) => {
+                ProviderBudgetPool::new_in_memory_with_provider_rate(provider_rate)
+            }
+            None => ProviderBudgetPool::new().map_err(|_| RegistryError::BudgetCoordinator)?,
+        };
         let resolved_policies = state
             .budget_policies
             .as_slice()
@@ -304,7 +344,7 @@ impl AuthoritativeSourceRegistry {
             history,
             clock,
             authorization_subject_resolver,
-            composition: AuthorityComposition::EphemeralDiagnostic,
+            composition,
         })
     }
 
@@ -401,7 +441,8 @@ impl AuthoritativeSourceRegistry {
                     .close_clean(proof, self.export_authority_state()?, observed.wall())
                     .map_err(map_authority_persistence_error)?;
             }
-            AuthorityComposition::EphemeralDiagnostic => {}
+            AuthorityComposition::InMemoryDiagnostic
+            | AuthorityComposition::InMemoryExtractionInspection => {}
         }
         Ok(())
     }

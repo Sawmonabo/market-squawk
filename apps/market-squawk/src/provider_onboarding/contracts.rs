@@ -1,6 +1,7 @@
 //! Secret-free status contracts shared by local portal and CLI transports.
 
 use market_squawk_adapter_bls::BlsSeriesMetadataInput;
+use market_squawk_adapter_fred::FredOperation;
 use market_squawk_data::ResumedProviderOnboarding;
 use market_squawk_domain::{
     CalendarDate, DataQuality, EvidenceDigest, SourceIdentifier, Timestamp,
@@ -14,7 +15,7 @@ use market_squawk_sources::{
     ProviderPublicConfiguration, RatePolicyDescriptor, RemoteRevocationOutcome, Requirement,
     RightsAdmissionState, SetupMode, ZeroFeeStatus,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 /// Serializable code-owned profile facts for CLI and portal clients.
@@ -216,14 +217,74 @@ pub enum OnboardingNextAction {
     None,
 }
 
+/// Exact zero-padded SEC Central Index Key supplied through local onboarding.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SecCikInput(String);
+
+impl SecCikInput {
+    /// Constructs one nonzero ten-digit SEC CIK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecCikInputError::InvalidFormat`] unless `value` is exactly ten ASCII digits,
+    /// or [`SecCikInputError::Zero`] for the reserved all-zero value.
+    pub fn try_new(value: String) -> Result<Self, SecCikInputError> {
+        if value.len() != 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(SecCikInputError::InvalidFormat);
+        }
+        if value.bytes().all(|byte| byte == b'0') {
+            return Err(SecCikInputError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the exact zero-padded ten-digit CIK.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for SecCikInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecCikInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Invalid SEC CIK accepted at the local onboarding boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SecCikInputError {
+    /// The value was not exactly ten ASCII digits.
+    #[error("SEC CIK must contain exactly ten ASCII digits")]
+    InvalidFormat,
+    /// The all-zero value does not identify an SEC registrant.
+    #[error("SEC CIK must not be all zeros")]
+    Zero,
+}
+
 /// Closed provider-specific configuration accepted by the local onboarding portal.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ProviderPortalActivationRequest {
     /// Commit one verified live source session without a research adapter.
     Source,
-    /// SEC EDGAR needs only the declared contact already retained by onboarding.
-    Sec,
+    /// SEC EDGAR uses one exact registrant identity plus the declared onboarding contact.
+    Sec {
+        /// Exact zero-padded CIK used for both submissions and Company Facts.
+        cik: SecCikInput,
+    },
     /// BLS needs explicit user-verified series semantics and a bounded year range.
     Bls {
         /// Exact series semantics; units and frequency are never inferred.
@@ -248,6 +309,93 @@ pub enum ProviderPortalActivationRequest {
         start_year: u16,
         /// Inclusive final observation year.
         end_year: u16,
+    },
+    /// FRED/ALFRED using typed, exact-series rights evidence.
+    FredAlfred {
+        /// Exact written St. Louis Fed service permission for every durable operation.
+        service_permission: Box<FredPortalServicePermissionInput>,
+        /// Exact rights grants; the guided starter uses reviewed `UNRATE` evidence.
+        grants: Vec<FredPortalGrantInput>,
+    },
+}
+
+/// Exact written St. Louis Fed permission for Market Squawk's durable FRED API operations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FredPortalServicePermissionInput {
+    pub(crate) evidence: FredPortalServiceEvidenceInput,
+    pub(crate) review: FredPortalServiceReviewInput,
+}
+
+/// Exact raw Bank-response evidence imported through the local portal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FredPortalServiceEvidenceInput {
+    pub(crate) channel: FredPortalServicePermissionChannelInput,
+    pub(crate) sha256: String,
+    pub(crate) byte_length: u64,
+    pub(crate) content_base64: String,
+}
+
+/// Closed authentic delivery channel for one exact Bank response.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub(crate) enum FredPortalServicePermissionChannelInput {
+    OfficialHttps {
+        evidence_url: String,
+        authority_url: String,
+    },
+}
+
+/// Explicit local review decision bound to the exact raw Bank response.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FredPortalServiceReviewInput {
+    pub(crate) reviewer: SourceIdentifier,
+    pub(crate) reviewed_at_unix_nanos: String,
+    pub(crate) issuer: SourceIdentifier,
+    pub(crate) application: SourceIdentifier,
+    pub(crate) service: SourceIdentifier,
+    pub(crate) series: Vec<SourceIdentifier>,
+    pub(crate) operations: Vec<FredOperation>,
+    pub(crate) conditions: Vec<String>,
+    pub(crate) effective_at_unix_nanos: String,
+    pub(crate) expires_at_unix_nanos: Option<String>,
+    pub(crate) revalidate_by_unix_nanos: String,
+}
+
+/// One exact FRED series grant accepted from the bounded local portal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FredPortalGrantInput {
+    pub(crate) series: SourceIdentifier,
+    pub(crate) owner: SourceIdentifier,
+    pub(crate) evidence: FredPortalEvidenceInput,
+    pub(crate) effective_at_unix_nanos: String,
+    pub(crate) expires_at_unix_nanos: String,
+}
+
+/// Typed exact evidence accepted for one portal-created FRED series grant.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub(crate) enum FredPortalEvidenceInput {
+    /// The exact code-reviewed BLS public-domain decision for FRED series `UNRATE`.
+    ReviewedUnrate,
+    /// Caller-supplied exact public-domain evidence.
+    PublicDomain {
+        evidence_reference_url: String,
+        authority_url: String,
+        sha256: String,
+        byte_length: u64,
+        content_base64: String,
+    },
+    /// Caller-supplied exact series-owner permission.
+    OwnerPermission {
+        evidence_reference_url: String,
+        authority_url: String,
+        sha256: String,
+        byte_length: u64,
+        content_base64: String,
     },
 }
 

@@ -3,17 +3,23 @@
 mod direct;
 mod specs;
 
-use std::fmt;
-use std::sync::Arc;
+use std::{
+    fmt,
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    sync::Arc,
+};
 
+use bytes::Bytes;
 use market_squawk_adapter_bls::{BlsAuthorization, BlsRegistrationKey, BlsSource, BlsSourceConfig};
 use market_squawk_adapter_files::FileExtractionSource;
-use market_squawk_adapter_fred::{FredApiKey, FredSource};
+use market_squawk_adapter_fred::{FredApiKey, FredOperation, FredRightsPolicy, FredSource};
 use market_squawk_adapter_portfolio::PortfolioManifestExtractionSource;
 use market_squawk_adapter_sec::{SecContact, SecEdgarSource};
 use market_squawk_adapter_treasury::{TreasurySource, TreasurySourceConfig};
-use market_squawk_data::RightsBasis;
-use market_squawk_domain::{EvidenceDigest, SourceId, SourceIdentifier};
+use market_squawk_data::{RightsBasis, SourceOperation};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::AppConfig;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -29,8 +35,9 @@ use crate::{
     ProviderOnboardingError, ProviderOnboardingService,
 };
 use market_squawk_sources::{
-    AuthorizationMode, DataUseOperation, ProviderRateAuthority, ProviderRateDeclaration,
-    SourceMetadata,
+    AuthoritativeSourceRegistry, AuthorizationMode, DataUseOperation, DiscoveryRequest,
+    ExtractionRequest, ExtractionSource, FRED_ALFRED_API_SURFACE_ID, ProviderRateAuthority,
+    ProviderRateDeclaration, SourceMetadata, SourceMetadataProvider,
 };
 
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
@@ -48,9 +55,37 @@ const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
 const BLS_REGISTERED_SURFACE: &str = "bls.v2-registered";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
-const FRED_SURFACE: &str = "fred-alfred.api-v1-v2";
+const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
 const LOCAL_FILES_SURFACE: &str = "local.files";
 const PORTFOLIO_SURFACE: &str = "local.portfolio-imports";
+const MAXIMUM_EPHEMERAL_DISCOVERY_PAGES: u16 = 64;
+
+/// One verified provider page returned without durable research publication.
+#[derive(Clone, Debug)]
+pub(crate) struct FredEphemeralInspectionPage {
+    object_id: SourceIdentifier,
+    page_evidence: ExactPayloadEvidence,
+    received_at: Timestamp,
+    canonical_payloads: Vec<Bytes>,
+}
+
+impl FredEphemeralInspectionPage {
+    pub(crate) const fn object_id(&self) -> &SourceIdentifier {
+        &self.object_id
+    }
+
+    pub(crate) const fn page_evidence(&self) -> &ExactPayloadEvidence {
+        &self.page_evidence
+    }
+
+    pub(crate) const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    pub(crate) fn canonical_payloads(&self) -> &[Bytes] {
+        &self.canonical_payloads
+    }
+}
 
 /// Application-owned activation authority shared by CLI, MCP, and local onboarding transports.
 pub struct ProviderAdapterActivation {
@@ -77,6 +112,98 @@ impl ProviderAdapterActivation {
             research_mutation,
             app_config,
             provider_rate,
+        }
+    }
+
+    /// Retrieves and revalidates one bounded FRED page without publishing durable source state.
+    ///
+    /// The request still uses the product-wide provider-rate authority, an exact active
+    /// onboarding lease, current scoped rights, and the platform-managed credential generation.
+    /// Provider bytes remain process-local and are discarded after the typed result is built.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for a mismatched lease, invalid credential or rights policy, unavailable
+    /// registry authority, incomplete discovery, provider protocol failure, or cancellation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all inspection authority and resource bounds remain explicit"
+    )]
+    pub(crate) async fn inspect_fred_ephemeral(
+        &self,
+        lease: ProviderActivationLease,
+        spec: FredAdapterActivation,
+        dataset: SourceIdentifier,
+        page_index: u16,
+        page_records: NonZeroU16,
+        max_bytes: NonZeroU64,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<FredEphemeralInspectionPage, ProviderAdapterActivationError> {
+        require_surface(&lease, FRED_SURFACE)?;
+        if page_index >= MAXIMUM_EPHEMERAL_DISCOVERY_PAGES {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        if cancellation.is_cancelled() {
+            return Err(ProviderAdapterActivationError::Cancelled);
+        }
+        self.bind_authorization_subject(&spec.metadata)?;
+        let secret = self
+            .onboarding
+            .read_secret_for_activation_request(&lease, cancellation.clone())
+            .await?;
+        let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
+        let source = FredSource::try_new_for_ephemeral_inspection(
+            spec.metadata,
+            key,
+            spec.policy,
+            page_records,
+        )?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
+            Arc::new(self.provider_rate.clone()),
+            self.provider_rate.clone(),
+        )?;
+        let operation = async {
+            let registered = registry.register(source.metadata().clone(), lease.issued_at())?;
+            let authority = registry.extraction_authority(&registered, &source)?;
+            let max_pages = NonZeroU16::new(MAXIMUM_EPHEMERAL_DISCOVERY_PAGES)
+                .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+            let discovery_request = DiscoveryRequest::try_new(dataset, None, max_pages, deadline)?;
+            let discovered = source
+                .discover(authority.clone(), discovery_request, cancellation.clone())
+                .await?;
+            let object = discovered
+                .objects()
+                .get(usize::from(page_index))
+                .cloned()
+                .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+            let max_records = NonZeroU32::new(u32::from(page_records.get()))
+                .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+            let extraction_request =
+                ExtractionRequest::try_new(object.clone(), max_records, max_bytes, deadline)?;
+            let page = source
+                .extract_page_ephemeral(&authority, &extraction_request, cancellation)
+                .await?;
+            Ok::<_, ProviderAdapterActivationError>(FredEphemeralInspectionPage {
+                object_id: object.object_id().clone(),
+                page_evidence: page.page_evidence().clone(),
+                received_at: page.received_at(),
+                canonical_payloads: page.canonical_payloads().to_vec(),
+            })
+        }
+        .await;
+        let shutdown = registry
+            .shutdown()
+            .map_err(ProviderAdapterActivationError::from);
+        match operation {
+            Ok(page) => {
+                shutdown?;
+                Ok(page)
+            }
+            Err(error) => {
+                shutdown?;
+                Err(error)
+            }
         }
     }
 
@@ -387,11 +514,23 @@ impl ProviderAdapterActivation {
         lease: &ProviderActivationLease,
         request: &ProviderAdapterActivationRequest,
     ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
-        let metadata = match request {
-            ProviderAdapterActivationRequest::Sec(spec) => &spec.metadata,
-            ProviderAdapterActivationRequest::Bls(spec) => &spec.metadata,
-            ProviderAdapterActivationRequest::Treasury(spec) => &spec.metadata,
-            ProviderAdapterActivationRequest::Fred(spec) => &spec.metadata,
+        let (metadata, rights) = match request {
+            ProviderAdapterActivationRequest::Sec(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Bls(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Treasury(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Fred(spec) => (
+                &spec.metadata,
+                fred_research_rights(lease, spec.metadata.source_id(), &spec.policy)?,
+            ),
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
@@ -399,7 +538,6 @@ impl ProviderAdapterActivation {
                 return Err(ProviderAdapterActivationError::SourceBinding);
             }
         };
-        let rights = provider_research_rights(lease, metadata.source_id())?;
         runtime_generation(lease, metadata.clone(), rights)
     }
 
@@ -472,7 +610,7 @@ impl ProviderAdapterActivation {
                     .read_secret_for_activation_request(&lease, cancellation.clone())
                     .await?;
                 let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
-                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let rights = fred_research_rights(&lease, spec.metadata.source_id(), &spec.policy)?;
                 let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
                 self.prepare_runtime_replacement(
                     &lease,
@@ -728,7 +866,7 @@ impl ProviderAdapterActivation {
             .read_secret_for_activation_request(&lease, cancellation)
             .await?;
         let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
-        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        let rights = fred_research_rights(&lease, spec.metadata.source_id(), &spec.policy)?;
         let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
         self.register(lease, source, rights)
     }
@@ -1004,7 +1142,7 @@ fn require_runtime_lease(
         && runtime.credential_generation() == lease.generation()
         && runtime.secret_reference() == lease.secret_reference()
         && runtime.authority_effective_at() == lease.authority_effective_at()
-        && runtime.rights_authorization_evidence() == lease.rights_decision_digest()
+        && runtime.parent_rights_authorization_evidence() == lease.rights_decision_digest()
     {
         Ok(())
     } else {
@@ -1044,6 +1182,47 @@ fn provider_research_rights(
         basis,
         lease.rights_decision_digest(),
         lease.verification_expires_at(),
+    )
+    .map_err(Into::into)
+}
+
+fn fred_research_rights(
+    lease: &ProviderActivationLease,
+    source_id: &SourceId,
+    policy: &FredRightsPolicy,
+) -> Result<ResearchRightsAuthority, ProviderAdapterActivationError> {
+    let authority = policy
+        .durable_authority(lease.issued_at())
+        .map_err(|_error| ProviderAdapterActivationError::InvalidRights)?;
+    let subjects = authority.series().cloned().collect::<Vec<_>>();
+    let mut operations = Vec::new();
+    for (fred, source) in [
+        (FredOperation::Display, SourceOperation::Display),
+        (FredOperation::Persist, SourceOperation::Persist),
+        (FredOperation::Cache, SourceOperation::Cache),
+        (FredOperation::Train, SourceOperation::Train),
+        (FredOperation::Redistribute, SourceOperation::Redistribute),
+    ] {
+        if subjects.iter().all(|series| authority.admits(series, fred)) {
+            operations.push(source);
+        }
+    }
+    let basis = RightsBasis::reviewed_terms(
+        authority.terms_reference(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, authority.terms_digest().bytes()),
+    )
+    .map_err(|_error| ProviderAdapterActivationError::InvalidRights)?;
+    ResearchRightsAuthority::try_new_scoped(
+        source_id.clone(),
+        basis,
+        lease.rights_decision_digest(),
+        EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            authority.authorization_digest().bytes(),
+        ),
+        authority.expires_at(),
+        subjects,
+        operations,
     )
     .map_err(Into::into)
 }

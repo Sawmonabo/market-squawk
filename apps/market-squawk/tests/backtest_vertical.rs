@@ -41,7 +41,7 @@ use market_squawk_data::{
     PointInTimePolicy, PointInTimeRevisionMode, QueryLimits, QueryRequest, ResearchQueryEngine,
     ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis,
     RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
-    extraction_batch_digest,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AccountId, AuthorizationBasis, AvailabilityEvidence, BasisPoints, ChecksumCapability,
@@ -174,7 +174,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let (batch, membership_evidence) = fixture_extraction_batch(instrument_id)?;
     let rights = RightsDecisionInput {
         source_id: source.source_id().clone(),
-        payload_digest: extraction_batch_digest(&batch)?,
+        payload_digest: extraction_provider_payload_digest(&batch),
         retrieved_at: Timestamp::from_unix_nanos(15),
         basis: RightsBasis::reviewed_terms("https://example.test/backtest-fixture/v1", digest(31))?,
         authorization_evidence: digest(32),
@@ -204,7 +204,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             ResearchIngestRequest::locally_observed(
                 source,
                 rights,
-                "backtest-reference-authority-v1",
+                DatasetId::try_from("backtest-research")?,
                 batch,
             )?,
             CancellationToken::new(),
@@ -806,7 +806,7 @@ async fn fixture_feature_dataset(
     let (batch, membership_evidence) = fixture_extraction_batch(instrument_id)?;
     let rights = RightsDecisionInput {
         source_id: source.source_id().clone(),
-        payload_digest: extraction_batch_digest(&batch)?,
+        payload_digest: extraction_provider_payload_digest(&batch),
         retrieved_at: Timestamp::from_unix_nanos(15),
         basis: RightsBasis::reviewed_terms("https://example.test/backtest-fixture/v1", digest(31))?,
         authorization_evidence: digest(32),
@@ -834,7 +834,7 @@ async fn fixture_feature_dataset(
             ResearchIngestRequest::locally_observed(
                 source,
                 rights,
-                "legacy-feature-pagination-v1",
+                DatasetId::try_from("backtest-research")?,
                 batch,
             )?,
             CancellationToken::new(),

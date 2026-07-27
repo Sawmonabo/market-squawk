@@ -86,6 +86,7 @@ Configuration precedence, every environment mapping, and the provider-profile co
 | `source health [PROVIDER]` | Provider filter is optional | `Source.GetHealth` |
 | `source setup <PROVIDER> --confirm` | Starts or resumes local onboarding; keeps the bounded loopback portal alive until Ctrl-C or expiry | `Source.Setup` plus the local portal owner |
 | `source discover <PROVIDER> --dataset <DATASET>` | Provider and exact dataset namespace are required | `Source.ListObjects`; bounded listing only, with no ingestion receipt |
+| `source inspect <PROVIDER> --onboarding-session-id <UUID> --dataset-identifier <DATASET>` | Optional `--page-index` defaults to `0` in `0..=63`; optional `--max-records` defaults to `256` in `1..=1024` | `Source.Inspect`; bounded FRED/ALFRED canonical page and exact evidence, with no research-dataset persistence |
 | `source activate <REQUEST> --confirm` | Versioned activation request file, at most 1 MiB | Evidence-bound provider activation and durable restart authority |
 | `capture` | `--products <CSV>` defaults to `BTC-USD`; optional `--seconds <U64>` and `--paper-bot` | Diagnostic Coinbase capture composition, not the production application-service path |
 
@@ -208,6 +209,10 @@ separate from ordinary source setup and requires:
 - `MARKET_SQUAWK_EXTERNAL_NETWORK=1` and
   `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED=1`;
 - a nonempty, duplicate-free list of exact built-in surface identifiers;
+- `--fred-dataset <PROVIDER_DATASET>` containing one bounded
+  `fred:series-observations:<SERIES>:<START>:<END>` or `alfred:` selector;
+- `--fred-training-request <REQUEST_FILE>` containing the existing bounded typed PIT dataset-build
+  contract;
 - an existing parent for `--output-directory`, while the output directory itself must not exist;
   and
 - portal-prepared active sessions and callable research runtimes for surfaces that require
@@ -235,12 +240,24 @@ Treasury query bounds, provider credentials, or FRED/ALFRED rights. Every select
 recover an exact active lease; durable research surfaces must also recover the same callable
 runtime generation after a clean application shutdown and restart.
 
+FRED/ALFRED acceptance is a working-data gate. The producer discovers every page for the exact
+provider selector, persists it under the separate dotted analytical `DatasetId`, queries
+observations and vintages, and repeats those exact queries after restart. It then runs the supplied
+PIT build request through the same production builder used by `dataset build`. That request must
+name the exact published FRED manifest and genuine historical-universe evidence; it must produce
+nonempty train, validation, and test splits plus a durable nonzero Python-export digest. Missing,
+synthetic, zero-row, mismatched-parent, or non-recoverable evidence fails the command. This path
+cannot begin durable publication unless exact current terms, written St. Louis Fed service
+permission with a hash-bound local review, and independent exact-series authority are all present.
+
 Live surfaces are exercised one at a time through the production application. Public Coinbase and
 Kraken must remain `DirectUnverified` and must produce no automated paper order. Coinbase Direct
 must reach `DirectVerified`; `--require-direct-verified-action` additionally requires at least one
 strategy-originated, centrally risk-approved paper order. `--require-fred-alfred-rights` requires
-both persistence and model-training admission for the exact FRED/ALFRED surface. The current
-rights-blocked FRED/ALFRED profile therefore keeps that release predicate closed.
+both persistence and model-training admission for the exact FRED/ALFRED surface. Profile revision
+4 is rights-limited: those operations pass only when the active lease binds both the exact Bank
+service-permission gate and the exact-series gate for the same scope and validity interval. An API
+key, contact receipt, or public-domain series alone cannot satisfy this predicate.
 
 Only after collection, shutdown, restart recovery, executable hashing, and a second repository
 identity barrier does the command create
@@ -248,6 +265,9 @@ identity barrier does the command create
 `release evidence close` command rejects a provider report unless it contains every mandatory
 Coinbase, Kraken, SEC, FRED/ALFRED, BLS v1, Treasury XML, and Treasury Fiscal surface plus the
 required Direct action, FRED/ALFRED rights, restart, and exact-binary evidence.
+For FRED/ALFRED, closure also requires nonempty real publications, observation/vintage queries,
+the exact derived-parent relationship, all three dataset splits, a nonzero Python-export digest,
+and restart recovery of that same derived generation and complete parent set.
 
 ### Demonstration and closure
 

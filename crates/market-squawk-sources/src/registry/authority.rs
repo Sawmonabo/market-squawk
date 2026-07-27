@@ -267,6 +267,29 @@ impl ExtractionAuthority {
         ))
     }
 
+    /// Converts a budget deadline returned by this exact authority into a remaining duration.
+    ///
+    /// The conversion uses the budget's private monotonic epoch. Callers may sleep cooperatively
+    /// for the returned duration and then retry admission; a zero duration means the inclusive
+    /// deadline has already arrived.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, missing budget configuration, or terminal budget state.
+    pub fn remaining_budget_wait(
+        &self,
+        deadline: crate::MonotonicInstant,
+    ) -> Result<std::time::Duration, crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        budget.remaining_wait(deadline).map_err(|reason| {
+            crate::ExtractionAuthorityError::BudgetUnavailable { reason }
+        })
+    }
+
     pub(crate) fn apply_retry_after_header(
         &self,
         field: Option<&[u8]>,

@@ -1,7 +1,7 @@
 //! Registry-authorized extraction and rights-bound analytical publication.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
@@ -11,11 +11,10 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_data::{
-    IngestError, RightsBasis, RightsDecisionInput, SourceOperation, extraction_batch_digest,
+    DatasetId, IngestError, RightsBasis, RightsDecisionInput, SourceOperation,
+    extraction_provider_payload_digest,
 };
-use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
-};
+use market_squawk_domain::{EvidenceDigest, SourceId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -29,7 +28,6 @@ use market_squawk_sources::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -116,8 +114,11 @@ impl Default for ResearchExtractionLimits {
 pub struct ResearchRightsAuthority {
     source_id: SourceId,
     basis: RightsBasis,
+    parent_authorization_evidence: EvidenceDigest,
     authorization_evidence: EvidenceDigest,
     authorization_expires_at: Option<Timestamp>,
+    exact_subjects: Option<BTreeSet<SourceIdentifier>>,
+    permitted_operations: BTreeSet<SourceOperation>,
 }
 
 impl ResearchRightsAuthority {
@@ -138,8 +139,56 @@ impl ResearchRightsAuthority {
         Ok(Self {
             source_id,
             basis,
+            parent_authorization_evidence: authorization_evidence,
             authorization_evidence,
             authorization_expires_at,
+            exact_subjects: None,
+            permitted_operations: BTreeSet::from([SourceOperation::Persist]),
+        })
+    }
+
+    /// Binds one subordinate authority to its parent activation and exact subject scope.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero evidence, empty or duplicated subject/operation scopes, or a scope that does
+    /// not affirmatively include persistence.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "parent, subordinate, scope, operations, and expiry are independent authority dimensions"
+    )]
+    pub fn try_new_scoped(
+        source_id: SourceId,
+        basis: RightsBasis,
+        parent_authorization_evidence: EvidenceDigest,
+        authorization_evidence: EvidenceDigest,
+        authorization_expires_at: Timestamp,
+        exact_subjects: Vec<SourceIdentifier>,
+        permitted_operations: Vec<SourceOperation>,
+    ) -> Result<Self, ResearchIngestCompositionError> {
+        let subject_count = exact_subjects.len();
+        let exact_subjects = exact_subjects.into_iter().collect::<BTreeSet<_>>();
+        let operation_count = permitted_operations.len();
+        let permitted_operations = permitted_operations.into_iter().collect::<BTreeSet<_>>();
+        if basis.digest().bytes() == [0; 32]
+            || parent_authorization_evidence.bytes() == [0; 32]
+            || authorization_evidence.bytes() == [0; 32]
+            || exact_subjects.is_empty()
+            || exact_subjects.len() != subject_count
+            || permitted_operations.is_empty()
+            || permitted_operations.len() != operation_count
+            || !permitted_operations.contains(&SourceOperation::Persist)
+        {
+            return Err(ResearchIngestCompositionError::InvalidRightsEvidence);
+        }
+        Ok(Self {
+            source_id,
+            basis,
+            parent_authorization_evidence,
+            authorization_evidence,
+            authorization_expires_at: Some(authorization_expires_at),
+            exact_subjects: Some(exact_subjects),
+            permitted_operations,
         })
     }
 
@@ -156,7 +205,7 @@ impl ResearchRightsAuthority {
             basis: self.basis.clone(),
             authorization_evidence: self.authorization_evidence,
             authorization_expires_at: self.authorization_expires_at,
-            permitted_operations: vec![SourceOperation::Persist],
+            permitted_operations: self.permitted_operations.iter().copied().collect(),
         })
     }
 
@@ -169,9 +218,20 @@ impl ResearchRightsAuthority {
             basis_reference: self.basis.reference().to_owned(),
             basis_digest: self.basis.digest(),
             root_identity_digest: self.basis.root_identity_digest(),
+            parent_authorization_evidence: self.parent_authorization_evidence,
             authorization_evidence: self.authorization_evidence,
             authorization_expires_at: self.authorization_expires_at,
-            persistence_operation_admitted: true,
+            source_wide: self.exact_subjects.is_none(),
+            exact_subjects: self
+                .exact_subjects
+                .as_ref()
+                .map_or_else(Vec::new, |subjects| subjects.iter().cloned().collect()),
+            persistence_operation_admitted: self
+                .permitted_operations
+                .contains(&SourceOperation::Persist),
+            model_training_operation_admitted: self
+                .permitted_operations
+                .contains(&SourceOperation::Train),
         })
     }
 
@@ -185,13 +245,33 @@ impl ResearchRightsAuthority {
         Ok(())
     }
 
+    fn validate_subject(&self, subject: Option<&SourceIdentifier>) -> Result<(), ServiceError> {
+        match (&self.exact_subjects, subject) {
+            (None, _) => Ok(()),
+            (Some(subjects), Some(subject)) if subjects.contains(subject) => Ok(()),
+            (Some(_), _) => Err(ServiceError::Unauthorized),
+        }
+    }
+
     fn matches_discovery_evidence(&self, evidence: &ResearchSourceDiscoveryRights) -> bool {
         evidence.basis_reference == self.basis.reference()
             && evidence.basis_digest == self.basis.digest()
             && evidence.root_identity_digest == self.basis.root_identity_digest()
+            && evidence.parent_authorization_evidence == self.parent_authorization_evidence
             && evidence.authorization_evidence == self.authorization_evidence
             && evidence.authorization_expires_at == self.authorization_expires_at
+            && evidence.source_wide == self.exact_subjects.is_none()
+            && evidence.exact_subjects
+                == self
+                    .exact_subjects
+                    .as_ref()
+                    .map_or_else(Vec::new, |subjects| subjects.iter().cloned().collect())
             && evidence.persistence_operation_admitted
+                == self
+                    .permitted_operations
+                    .contains(&SourceOperation::Persist)
+            && evidence.model_training_operation_admitted
+                == self.permitted_operations.contains(&SourceOperation::Train)
     }
 }
 
@@ -205,9 +285,13 @@ pub struct ResearchSourceDiscoveryRights {
     basis_reference: String,
     basis_digest: EvidenceDigest,
     root_identity_digest: Option<EvidenceDigest>,
+    parent_authorization_evidence: EvidenceDigest,
     authorization_evidence: EvidenceDigest,
     authorization_expires_at: Option<Timestamp>,
+    source_wide: bool,
+    exact_subjects: Vec<SourceIdentifier>,
     persistence_operation_admitted: bool,
+    model_training_operation_admitted: bool,
 }
 
 impl ResearchSourceDiscoveryRights {
@@ -226,6 +310,11 @@ impl ResearchSourceDiscoveryRights {
         self.root_identity_digest
     }
 
+    /// Returns the parent onboarding rights decision from which this authority was derived.
+    pub const fn parent_authorization_evidence(&self) -> EvidenceDigest {
+        self.parent_authorization_evidence
+    }
+
     /// Returns the exact activation or owner-authorization evidence.
     pub const fn authorization_evidence(&self) -> EvidenceDigest {
         self.authorization_evidence
@@ -236,11 +325,26 @@ impl ResearchSourceDiscoveryRights {
         self.authorization_expires_at
     }
 
+    /// Returns whether the authority covers the complete registered source namespace.
+    pub const fn source_wide(&self) -> bool {
+        self.source_wide
+    }
+
+    /// Returns the exact provider subjects when this is a subordinate scoped authority.
+    pub fn exact_subjects(&self) -> &[SourceIdentifier] {
+        &self.exact_subjects
+    }
+
     /// Returns whether the source-level persistence operation was admitted.
     ///
     /// The existing ingest gate still binds that authority to the exact extracted payload.
     pub const fn persistence_operation_admitted(&self) -> bool {
         self.persistence_operation_admitted
+    }
+
+    /// Returns whether the same exact authority admits local model training.
+    pub const fn model_training_operation_admitted(&self) -> bool {
+        self.model_training_operation_admitted
     }
 }
 
@@ -251,6 +355,27 @@ pub struct ResearchRevisionPlanError;
 
 /// Production extraction adapter plus its source-specific revision authority.
 pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'static {
+    /// Returns an exact provider rights subject for a dataset, when the adapter uses scoped rights.
+    fn rights_subject(
+        &self,
+        _dataset: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ResearchRevisionPlanError> {
+        Ok(None)
+    }
+
+    /// Returns the storage-safe local analytical identity for one exact provider batch.
+    ///
+    /// The default preserves an already storage-safe provider dataset exactly. Adapters whose
+    /// provider grammar uses other delimiters must override this mapping without changing the
+    /// provider request or record provenance.
+    fn analytical_dataset(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<DatasetId, ResearchRevisionPlanError> {
+        DatasetId::try_from(batch.request().object().dataset().as_str())
+            .map_err(|_error| ResearchRevisionPlanError)
+    }
+
     /// Returns provider revision evidence, or `None` only for a user-owned local source.
     fn revision_plan(
         &self,
@@ -338,6 +463,26 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource {
+    fn rights_subject(
+        &self,
+        dataset: &SourceIdentifier,
+    ) -> Result<Option<SourceIdentifier>, ResearchRevisionPlanError> {
+        market_squawk_adapter_fred::FredSource::rights_subject_identifier(dataset)
+            .map(Some)
+            .map_err(|_error| ResearchRevisionPlanError)
+    }
+
+    fn analytical_dataset(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<DatasetId, ResearchRevisionPlanError> {
+        let identifier = market_squawk_adapter_fred::FredSource::analytical_dataset_identifier(
+            batch.request().object().dataset(),
+        )
+        .map_err(|_error| ResearchRevisionPlanError)?;
+        DatasetId::try_from(identifier.as_str()).map_err(|_error| ResearchRevisionPlanError)
+    }
+
     fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -349,6 +494,17 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource 
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
+    fn analytical_dataset(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<DatasetId, ResearchRevisionPlanError> {
+        let identifier = market_squawk_adapter_bls::BlsSource::analytical_dataset_identifier(
+            batch.request().object().dataset(),
+        )
+        .map_err(|_error| ResearchRevisionPlanError)?;
+        DatasetId::try_from(identifier.as_str()).map_err(|_error| ResearchRevisionPlanError)
+    }
+
     fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -360,6 +516,16 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::TreasurySource {
+    fn analytical_dataset(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<DatasetId, ResearchRevisionPlanError> {
+        let identifier = self
+            .analytical_dataset_identifier(batch.request().object().dataset())
+            .map_err(|_error| ResearchRevisionPlanError)?;
+        DatasetId::try_from(identifier.as_str()).map_err(|_error| ResearchRevisionPlanError)
+    }
+
     fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -699,6 +865,11 @@ impl ProductionResearchIngestCoordinator {
         }
         let prepared = self.prepare(profile)?;
         prepared.rights.validate_at(system_timestamp()?)?;
+        let subject = prepared
+            .source
+            .rights_subject(dataset)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        prepared.rights.validate_subject(subject.as_ref())?;
         let deadline = wall_deadline(operation_deadline, operation)?;
         let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
             .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -912,6 +1083,12 @@ impl ProductionResearchIngestCoordinator {
         operation_deadline: Instant,
         deadline: Timestamp,
     ) -> Result<AuthorizedExtraction, ServiceError> {
+        prepared.rights.validate_at(system_timestamp()?)?;
+        let subject = prepared
+            .source
+            .rights_subject(object.dataset())
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        prepared.rights.validate_subject(subject.as_ref())?;
         let extraction_request =
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
                 .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -929,7 +1106,11 @@ impl ProductionResearchIngestCoordinator {
             .source
             .revision_plan(&batch)
             .map_err(|_error| ServiceError::InvalidResult)?;
-        let payload_digest = extraction_batch_digest(&batch).map_err(map_ingest_error)?;
+        let analytical_dataset = prepared
+            .source
+            .analytical_dataset(&batch)
+            .map_err(|_error| ServiceError::InvalidResult)?;
+        let payload_digest = extraction_provider_payload_digest(&batch);
         let retrieved_at = system_timestamp()?;
         let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
         ensure_operation_live(operation_deadline, operation)?;
@@ -941,6 +1122,7 @@ impl ProductionResearchIngestCoordinator {
             metadata: prepared.metadata,
             batch,
             revisions,
+            analytical_dataset,
             payload_digest,
             rights,
             admission: prepared.admission,
@@ -1054,6 +1236,7 @@ struct AuthorizedExtraction {
     metadata: SourceMetadata,
     batch: ExtractionBatch,
     revisions: Option<ExtractionRevisionPlan>,
+    analytical_dataset: DatasetId,
     payload_digest: EvidenceDigest,
     rights: RightsDecisionInput,
     admission: ResearchProviderAdmission,
@@ -1089,6 +1272,7 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             metadata: source_metadata,
             batch,
             revisions,
+            analytical_dataset,
             payload_digest,
             rights,
             admission,
@@ -1097,19 +1281,18 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             .acquire_publication_lease()
             .await
             .map_err(|_error| ServiceError::Unavailable)?;
-        let idempotency_key = ingest_identity(&profile, &dataset, &object_id, payload_digest);
         let ingest = match revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
                 source_metadata.clone(),
                 rights,
-                idempotency_key,
+                analytical_dataset,
                 batch,
                 revisions,
             ),
             None => ResearchIngestRequest::locally_observed(
                 source_metadata.clone(),
                 rights,
-                idempotency_key,
+                analytical_dataset,
                 batch,
             ),
         }
@@ -1302,30 +1485,6 @@ fn system_timestamp() -> Result<Timestamp, ServiceError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
-fn ingest_identity(
-    profile: &SourceIdentifier,
-    dataset: &SourceIdentifier,
-    object: &SourceIdentifier,
-    payload: EvidenceDigest,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/research-ingest/v1");
-    update_identity(&mut digest, profile.as_str());
-    update_identity(&mut digest, dataset.as_str());
-    update_identity(&mut digest, object.as_str());
-    digest.update([match payload.algorithm() {
-        DigestAlgorithm::Sha256 => 1,
-        DigestAlgorithm::Blake3 => 2,
-    }]);
-    digest.update(payload.bytes());
-    format!("research-v1-{}", encode_hex(digest.finalize().into()))
-}
-
-fn update_identity(digest: &mut Sha256, value: &str) {
-    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-    digest.update(value.as_bytes());
-}
-
 fn map_extraction_error(error: ExtractionSourceError) -> ServiceError {
     match error {
         ExtractionSourceError::DeadlineExceeded => ServiceError::DeadlineExceeded,
@@ -1378,6 +1537,7 @@ fn map_research_error(error: ResearchServiceError) -> ServiceError {
         ResearchServiceError::Rights(_) | ResearchServiceError::IngestAuthorityMismatch => {
             ServiceError::Unauthorized
         }
+        ResearchServiceError::IdentityOverflow => ServiceError::Internal,
         ResearchServiceError::Path(_)
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)

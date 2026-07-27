@@ -60,16 +60,21 @@ decisions can be audited without relying on conversation history.
 - [Treasury daily rates release authority](providers/2026-07-26-treasury-daily-rates-release-authority.md)
   — official five-family feed coverage, CC0 durable-use authority, current implementation gap,
   and mandatory V1 release evidence.
-- [FRED and ALFRED API rights decision](providers/fred-alfred-rights-2026-07-22.md) — current API
-  key contract, durable-storage and model-use restrictions, third-party-series boundary, and exact
-  release gate.
+- [FRED and ALFRED local-first API authority](providers/2026-07-26-fred-alfred-local-first-api-authority.md)
+  — current two-gate durable-use decision, official source basis, and mandatory working real-data
+  release proof.
+- [Historical FRED and ALFRED blocked decision](providers/fred-alfred-rights-2026-07-22.md) —
+  superseded audit evidence for the earlier blanket-blocked implementation state.
 - [Coinbase Direct Market Data execution-quality candidate](providers/coinbase-direct-market-data-2026-07-22.md)
   — authenticated direct endpoint, full-channel snapshot/sequence contract, free-tier bound, and
   the exact evidence still required before `DirectVerified` qualification.
 - [Coinbase Exchange public WebSocket v1 decision](providers/coinbase-exchange-websocket-2026-07-16.md)
   — public level2/matches/heartbeat coverage and its immutable `DirectUnverified` ceiling.
-- [BLS Public Data API decision](providers/bls-public-data-api-2026-07-21.md) — registered and
-  unregistered request limits, missing-observation semantics, and source authority.
+- [SEC EDGAR public API authority](providers/sec-edgar-public-api-2026-07-26.md) — zero-fee
+  no-key submissions/company-facts scope, declared-contact and fair-access controls, and mandatory
+  real-response release acceptance.
+- [BLS Public Data API decision](providers/bls-public-data-api-2026-07-21.md) — available zero-fee
+  public v1 scope, distinct registered-v2 lifecycle, exact limits, and source authority.
 - [Local file adapter boundaries](providers/local-file-adapter-boundaries-2026-07-20.md) —
   controlled-root file admission and format-specific source boundaries.
 

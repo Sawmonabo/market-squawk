@@ -233,7 +233,7 @@
       "source_type": "U.S. government research-data governance framework",
       "publisher": "National Institute of Standards and Technology",
       "retrieval_date": "2026-07-22",
-      "authority_assessment": "High governance and terminology authority for research-data management; not legal advice and not provider-specific.",
+      "authority_assessment": "High governance and terminology authority for research-data management; engineering-context evidence rather than a determination of legal rights, and not provider-specific.",
       "credibility_signals": "Final NIST Special Publication with named authors, DOI, and stakeholder-derived version 2.0 framework.",
       "freshness_signals": "Published 2024-02; accessed 2026-07-22.",
       "key_finding": "Data use is governed by ownership, terms, licenses, required permissions, purpose and duration restrictions, security protocols, and citation obligations; some licenses may be machine-actionable.",

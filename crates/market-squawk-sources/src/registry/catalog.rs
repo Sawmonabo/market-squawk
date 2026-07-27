@@ -13,7 +13,8 @@ pub struct AuthoritativeSourceRegistry {
 #[derive(Debug)]
 enum AuthorityComposition {
     Durable(Arc<AuthorityDurabilitySession>),
-    EphemeralDiagnostic,
+    InMemoryDiagnostic,
+    InMemoryExtractionInspection,
 }
 
 impl Drop for AuthoritativeSourceRegistry {
@@ -123,7 +124,8 @@ impl AuthoritativeSourceRegistry {
                     .budgets
                     .register_durable(policy, &candidate_state)
                     .map_err(map_budget_pool_error)?,
-                AuthorityComposition::EphemeralDiagnostic => self
+                AuthorityComposition::InMemoryDiagnostic
+                | AuthorityComposition::InMemoryExtractionInspection => self
                     .budgets
                     .register(policy)
                     .map_err(map_budget_pool_error)?,
@@ -241,7 +243,8 @@ impl AuthoritativeSourceRegistry {
                     .budgets
                     .register_durable(policy, &candidate_state)
                     .map_err(map_budget_pool_error)?,
-                AuthorityComposition::EphemeralDiagnostic => self
+                AuthorityComposition::InMemoryDiagnostic
+                | AuthorityComposition::InMemoryExtractionInspection => self
                     .budgets
                     .register(policy)
                     .map_err(map_budget_pool_error)?,
@@ -334,7 +337,8 @@ impl AuthoritativeSourceRegistry {
                     .budgets
                     .register_durable(policy, &candidate_state)
                     .map_err(map_budget_pool_error)?,
-                AuthorityComposition::EphemeralDiagnostic => self
+                AuthorityComposition::InMemoryDiagnostic
+                | AuthorityComposition::InMemoryExtractionInspection => self
                     .budgets
                     .register(policy)
                     .map_err(map_budget_pool_error)?,
@@ -434,6 +438,12 @@ impl AuthoritativeSourceRegistry {
         generation: ConnectionGeneration,
         at: Timestamp,
     ) -> Result<CurrentSourceSession, RegistryError> {
+        if matches!(
+            &self.composition,
+            AuthorityComposition::InMemoryExtractionInspection
+        ) {
+            return Err(RegistryError::LiveAuthorityUnavailableForExtractionRegistry);
+        }
         self.validate_registered(registered, at)?;
         if matches!(
             &self.composition,
@@ -799,7 +809,6 @@ impl AuthoritativeSourceRegistry {
             session,
         })
     }
-
 }
 
 fn authority_state_from_history(
@@ -850,9 +859,7 @@ fn map_budget_resolution_error(error: BudgetPolicyResolutionError) -> RegistryEr
         BudgetPolicyResolutionError::SubjectResolution(_) => {
             RegistryError::AuthorizationSubjectResolution
         }
-        BudgetPolicyResolutionError::SubjectMismatch => {
-            RegistryError::AuthorizationSubjectMismatch
-        }
+        BudgetPolicyResolutionError::SubjectMismatch => RegistryError::AuthorizationSubjectMismatch,
     }
 }
 
@@ -899,13 +906,9 @@ fn same_persisted_policy_set(
     observed: &[PersistedProviderBudgetPolicy],
 ) -> bool {
     expected.len() == observed.len()
-        && observed
-            .iter()
-            .enumerate()
-            .all(|(index, policy)| {
-                !observed[index.saturating_add(1)..].contains(policy)
-                    && expected.contains(policy)
-            })
+        && observed.iter().enumerate().all(|(index, policy)| {
+            !observed[index.saturating_add(1)..].contains(policy) && expected.contains(policy)
+        })
 }
 
 fn map_authority_persistence_error(error: AuthorityPersistenceError) -> RegistryError {
