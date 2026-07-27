@@ -342,12 +342,13 @@ impl ControlledArtifactRepository {
         drop(staging);
         context.ensure_live()?;
 
-        match directory.hard_link(staging_path, &directory, artifact_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_error) => return Err(ArtifactError::Unavailable),
-        }
-        guard.remove()?;
+        publish_staged_artifact(
+            &self.root,
+            &directory,
+            staging_path,
+            artifact_path,
+            &mut guard,
+        )?;
         synchronize_publication_directories(&directory, artifact_path)?;
         context.ensure_live()?;
         let persisted = read_bounded_regular(&directory, artifact_path, self.maximum_bytes.get())?;
@@ -419,6 +420,11 @@ impl<'directory> StagingGuard<'directory> {
             .map_err(|_| ArtifactError::Unavailable)?;
         self.armed = false;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
@@ -622,6 +628,82 @@ fn configure_nonblocking_read(options: &mut OpenOptions) {
 fn configure_nonblocking_read(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
+fn publish_staged_artifact(
+    _root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    artifact_path: &Path,
+    guard: &mut StagingGuard<'_>,
+) -> Result<(), ArtifactError> {
+    match directory.hard_link(staging_path, directory, artifact_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_error) => return Err(ArtifactError::Unavailable),
+    }
+    guard.remove()
+}
+
+#[cfg(windows)]
+fn publish_staged_artifact(
+    root: &ArtifactRoot,
+    directory: &Dir,
+    staging_path: &Path,
+    artifact_path: &Path,
+    guard: &mut StagingGuard<'_>,
+) -> Result<(), ArtifactError> {
+    if staging_path.parent() != artifact_path.parent() {
+        return Err(ArtifactError::Unavailable);
+    }
+    drop(
+        root.resolve(staging_path)
+            .map_err(|_| ArtifactError::Unavailable)?,
+    );
+    drop(
+        root.resolve(artifact_path)
+            .map_err(|_| ArtifactError::Unavailable)?,
+    );
+    let parent = staging_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(ArtifactError::Unavailable)?;
+    let _pinned_parent = directory
+        .open_dir(parent)
+        .map_err(|_| ArtifactError::Unavailable)?;
+    validate_windows_root_endpoint(root, directory)?;
+    let source = root.root().join(staging_path);
+    let destination = root.root().join(artifact_path);
+    let publication = atomicwrites::move_atomic(&source, &destination);
+    validate_windows_root_endpoint(root, directory)?;
+    let source_exists = windows_regular_entry_exists(directory, staging_path)?;
+    let destination_exists = windows_regular_entry_exists(directory, artifact_path)?;
+    match publication {
+        Ok(()) if !source_exists && destination_exists => {
+            guard.disarm();
+            Ok(())
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && source_exists
+                && destination_exists =>
+        {
+            guard.remove()
+        }
+        Err(_error) | Ok(()) => Err(ArtifactError::Unavailable),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_staged_artifact(
+    _root: &ArtifactRoot,
+    _directory: &Dir,
+    _staging_path: &Path,
+    _artifact_path: &Path,
+    _guard: &mut StagingGuard<'_>,
+) -> Result<(), ArtifactError> {
+    Err(ArtifactError::Unavailable)
+}
+
+#[cfg(unix)]
 fn synchronize_publication_directories(
     directory: &Dir,
     artifact_path: &Path,
@@ -650,12 +732,58 @@ fn synchronize_publication_directories(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn synchronize_publication_directories(
+    _directory: &Dir,
+    _artifact_path: &Path,
+) -> Result<(), ArtifactError> {
+    // Windows publication uses MoveFileExW with WRITE_THROUGH through `atomicwrites`; a second
+    // directory-handle flush is neither required nor supported by the Windows file API.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn synchronize_publication_directories(
     _directory: &Dir,
     _artifact_path: &Path,
 ) -> Result<(), ArtifactError> {
     Err(ArtifactError::Unavailable)
+}
+
+#[cfg(windows)]
+fn validate_windows_root_endpoint(
+    root: &ArtifactRoot,
+    directory: &Dir,
+) -> Result<(), ArtifactError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    let retained = directory
+        .dir_metadata()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    let displayed = root
+        .try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?
+        .dir_metadata()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    if !retained.is_dir()
+        || !displayed.is_dir()
+        || (retained.dev(), retained.ino()) != (displayed.dev(), displayed.ino())
+    {
+        return Err(ArtifactError::Unavailable);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_regular_entry_exists(directory: &Dir, path: &Path) -> Result<bool, ArtifactError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    match directory.symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Ok(true),
+        Ok(_) => Err(ArtifactError::Unavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_error) => Err(ArtifactError::Unavailable),
+    }
 }
 
 #[cfg(test)]

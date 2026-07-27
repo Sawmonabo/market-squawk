@@ -3661,6 +3661,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "fs2",
+ "libc",
  "market-squawk-analytics",
  "market-squawk-data",
  "market-squawk-domain",

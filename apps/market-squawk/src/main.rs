@@ -40,7 +40,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    let application = std::thread::Builder::new()
+        .name("market-squawk-main".to_owned())
+        .stack_size(APPLICATION_MAIN_STACK_BYTES)
+        .spawn(run_application)
+        .context("failed to start the Market Squawk application thread")?;
+    application
+        .join()
+        .map_err(|_| anyhow!("the Market Squawk application thread terminated unexpectedly"))?
+}
+
+fn run_application() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

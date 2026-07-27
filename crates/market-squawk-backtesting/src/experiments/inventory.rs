@@ -828,8 +828,15 @@ fn read_optional_bounded(
 
 #[cfg(unix)]
 fn synchronize_parent(root: &Dir, path: &Path) -> Result<(), ExperimentError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
     let parent = path.parent().ok_or(ExperimentError::Encoding)?;
-    root.open_dir_nofollow(parent)?.into_std_file().sync_all()?;
+    let directory = root.open_dir_nofollow(parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    directory.open_with(".", &options)?.sync_all()?;
     Ok(())
 }
 

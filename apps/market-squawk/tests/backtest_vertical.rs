@@ -170,6 +170,10 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let catalog_config = fixture_catalog_config(&paths)?;
     let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 128, Duration::from_secs(60))?;
     let instrument_id: InstrumentId = "00000000-0000-0000-0000-000000000020".parse()?;
+    let definition_v1 = instrument_definition(instrument_id, 1, "0.01")?;
+    let definition_v2 = instrument_definition(instrument_id, 2, "0.05")?;
+    let extra_id: InstrumentId = "00000000-0000-0000-0000-000000000021".parse()?;
+    let extra_definition = instrument_definition(extra_id, 1, "0.01")?;
     let source = fixture_source("backtest-fixture")?;
     let (batch, membership_evidence) = fixture_extraction_batch(instrument_id)?;
     let rights = RightsDecisionInput {
@@ -196,6 +200,9 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             digest(33),
             Some(Timestamp::from_unix_nanos(i64::MAX)),
         )?)?;
+        catalog.put_instrument(&definition_v1, Timestamp::from_unix_nanos(10))?;
+        catalog.put_instrument(&definition_v2, Timestamp::from_unix_nanos(20))?;
+        catalog.put_instrument(&extra_definition, Timestamp::from_unix_nanos(10))?;
     }
 
     let service = ResearchService::initialize(&paths, catalog_config.clone(), 8, object_config)?;
@@ -525,26 +532,22 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     drop(successor);
     drop(built);
     drop(source_dataset);
-    drop(service);
-
-    let definition_v1 = instrument_definition(instrument_id, 1, "0.01")?;
-    let definition_v2 = instrument_definition(instrument_id, 2, "0.05")?;
-    let extra_id: InstrumentId = "00000000-0000-0000-0000-000000000021".parse()?;
-    let extra_definition = instrument_definition(extra_id, 1, "0.01")?;
-    let catalog = CatalogAuthority::open(catalog_config)?;
-    catalog.put_instrument(&definition_v1, Timestamp::from_unix_nanos(10))?;
-    catalog.put_instrument(&definition_v2, Timestamp::from_unix_nanos(20))?;
-    catalog.put_instrument(&extra_definition, Timestamp::from_unix_nanos(10))?;
-
-    let baseline_definitions = catalog.pin_instrument_definitions(
+    let definitions = service.instrument_definitions();
+    let definition_deadline = Instant::now() + Duration::from_secs(5);
+    let definition_cancellation = CancellationToken::new();
+    let baseline_definitions = definitions.pin(
         &[instrument_id],
         Timestamp::from_unix_nanos(30),
         CatalogLimit::new(2)?,
+        definition_deadline,
+        &definition_cancellation,
     )?;
-    let changed_identity_definitions = catalog.pin_instrument_definitions(
+    let changed_identity_definitions = definitions.pin(
         &[instrument_id],
         Timestamp::from_unix_nanos(31),
         CatalogLimit::new(2)?,
+        definition_deadline,
+        &definition_cancellation,
     )?;
     assert_eq!(
         baseline_definitions.content_identity(),
@@ -565,10 +568,12 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     )?;
     assert_ne!(dataset.identity(), changed_identity_dataset.identity());
 
-    let coverage_mismatch = catalog.pin_instrument_definitions(
+    let coverage_mismatch = definitions.pin(
         &[instrument_id, extra_id],
         Timestamp::from_unix_nanos(30),
         CatalogLimit::new(3)?,
+        definition_deadline,
+        &definition_cancellation,
     )?;
     assert!(matches!(
         BacktestDataset::try_from_pinned_query(coverage_mismatch_output, coverage_mismatch, limits),

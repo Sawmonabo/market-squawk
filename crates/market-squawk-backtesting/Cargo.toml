@@ -18,6 +18,7 @@ arrow.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 fs2.workspace = true
+libc.workspace = true
 market-squawk-analytics.workspace = true
 market-squawk-data.workspace = true
 market-squawk-domain.workspace = true
