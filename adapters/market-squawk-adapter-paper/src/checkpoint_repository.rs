@@ -25,10 +25,18 @@ use crate::{PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionConfig
 const CHECKPOINT_OBJECT_ROOT: &str = "paper-checkpoints/v1";
 const CURRENT_MANIFEST_PATH: &str = "paper-checkpoints/v1/current.json";
 const RUN_DIRTY_PATH: &str = "paper-checkpoints/v1/run-dirty.json";
-const REPOSITORY_LOCK_PATH: &str = ".market-squawk-paper-checkpoints.lock";
+const CHECKPOINT_NAMESPACE: &str = "paper-checkpoints";
+const REPOSITORY_LOCK_PATH: &str = "paper-checkpoints/.repository.lock";
+const LEGACY_REPOSITORY_LOCK_PATH: &str = ".market-squawk-paper-checkpoints.lock";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const RUN_DIRTY_SCHEMA_VERSION: u32 = 1;
 const MAXIMUM_RUN_DIRTY_BYTES: usize = 4 * 1024;
+
+#[derive(Debug)]
+struct RepositoryWriterLocks {
+    _legacy: std::fs::File,
+    _current: std::fs::File,
+}
 
 /// Single-writer durable publisher bound to one artifact root and paper configuration.
 #[derive(Debug)]
@@ -40,7 +48,7 @@ pub struct PaperCheckpointRepository {
     generation: u64,
     recovery: Option<PaperCheckpointRecovery>,
     dirty_authority: Option<[u8; 32]>,
-    _writer_lock: std::fs::File,
+    _writer_locks: RepositoryWriterLocks,
 }
 
 impl PaperCheckpointRepository {
@@ -51,7 +59,7 @@ impl PaperCheckpointRepository {
         maximum_bytes: NonZeroUsize,
     ) -> Result<Self, PaperCheckpointRepositoryError> {
         let directory = root.try_clone_directory()?;
-        let writer_lock = acquire_repository_writer(&directory)?;
+        let writer_locks = acquire_repository_writer(&directory)?;
         cleanup_stale_staging(&directory)?;
         reject_unclean_run(&directory)?;
         if let Some(recovered) = read_current_manifest(&directory, &config, maximum_bytes.get())? {
@@ -66,7 +74,7 @@ impl PaperCheckpointRepository {
                     accounts: recovered.accounts,
                 }),
                 dirty_authority: None,
-                _writer_lock: writer_lock,
+                _writer_locks: writer_locks,
             });
         }
         let mut nonce = [0_u8; 32];
@@ -88,7 +96,7 @@ impl PaperCheckpointRepository {
             generation: 0,
             recovery: None,
             dirty_authority: None,
-            _writer_lock: writer_lock,
+            _writer_locks: writer_locks,
         })
     }
 
@@ -651,6 +659,12 @@ fn read_current_manifest(
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return match directory.symlink_metadata("paper-checkpoints") {
                 Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(metadata)
+                    if metadata.is_dir()
+                        && checkpoint_namespace_contains_only_writer_lock(directory)? =>
+                {
+                    Ok(None)
+                }
                 Ok(_) => Err(PaperCheckpointRepositoryError::PartialState),
                 Err(source) => Err(io_error("inspect paper checkpoint namespace", source)),
             };
@@ -831,21 +845,33 @@ fn publish_current_manifest(
 
 fn acquire_repository_writer(
     directory: &Dir,
+) -> Result<RepositoryWriterLocks, PaperCheckpointRepositoryError> {
+    // Retain the legacy lock for the complete writer lifetime. Older Market Squawk binaries know
+    // only this root-level name, so deleting it would let an old and new writer mutate the same
+    // checkpoint namespace concurrently.
+    let legacy = open_and_lock_repository_writer(directory, LEGACY_REPOSITORY_LOCK_PATH, true)?;
+    ensure_checkpoint_namespace(directory)?;
+    let current = open_and_lock_repository_writer(directory, REPOSITORY_LOCK_PATH, true)?;
+    Ok(RepositoryWriterLocks {
+        _legacy: legacy,
+        _current: current,
+    })
+}
+
+fn open_and_lock_repository_writer(
+    directory: &Dir,
+    path: &str,
+    create: bool,
 ) -> Result<std::fs::File, PaperCheckpointRepositoryError> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(true).create(create);
     options.follow(FollowSymlinks::No);
     configure_private_creation(&mut options);
     let lock = directory
-        .open_with(REPOSITORY_LOCK_PATH, &options)
+        .open_with(path, &options)
         .map_err(|source| io_error("open paper checkpoint repository lock", source))?;
-    let metadata = lock
-        .metadata()
-        .map_err(|source| io_error("inspect paper checkpoint repository lock", source))?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
-    }
     let lock = lock.into_std();
+    validate_repository_writer(directory, path, &lock)?;
     lock.try_lock_exclusive().map_err(|source| {
         if is_lock_contended(&source) {
             PaperCheckpointRepositoryError::RepositoryAlreadyOwned
@@ -853,7 +879,113 @@ fn acquire_repository_writer(
             io_error("acquire paper checkpoint repository lock", source)
         }
     })?;
+    validate_repository_writer(directory, path, &lock)?;
     Ok(lock)
+}
+
+fn validate_repository_writer(
+    directory: &Dir,
+    path: &str,
+    lock: &std::fs::File,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    let opened = lock
+        .metadata()
+        .map_err(|source| io_error("inspect opened paper checkpoint repository lock", source))?;
+    let named = directory
+        .symlink_metadata(path)
+        .map_err(|source| io_error("inspect named paper checkpoint repository lock", source))?;
+    if !opened.is_file()
+        || !named.is_file()
+        || opened.nlink() != 1
+        || named.nlink() != 1
+        || opened.len() != 0
+        || named.len() != 0
+        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+    {
+        return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+    }
+    Ok(())
+}
+
+fn ensure_checkpoint_namespace(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {
+    match directory.symlink_metadata(CHECKPOINT_NAMESPACE) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(PaperCheckpointRepositoryError::UnsafeArtifact),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match directory.create_dir(CHECKPOINT_NAMESPACE) {
+                Ok(()) => {
+                    synchronize_directory(
+                        directory,
+                        "synchronize paper checkpoint namespace creation",
+                    )?;
+                }
+                Err(race) if race.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(io_error("create paper checkpoint namespace", source));
+                }
+            }
+        }
+        Err(source) => return Err(io_error("inspect paper checkpoint namespace", source)),
+    }
+    let named = directory
+        .symlink_metadata(CHECKPOINT_NAMESPACE)
+        .map_err(|source| io_error("reinspect paper checkpoint namespace", source))?;
+    let opened = directory
+        .open_dir(CHECKPOINT_NAMESPACE)
+        .map_err(|source| io_error("open paper checkpoint namespace", source))?;
+    let opened = opened
+        .dir_metadata()
+        .map_err(|source| io_error("inspect opened paper checkpoint namespace", source))?;
+    if !named.is_dir()
+        || !opened.is_dir()
+        || (named.dev(), named.ino()) != (opened.dev(), opened.ino())
+    {
+        return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+    }
+    Ok(())
+}
+
+fn checkpoint_namespace_contains_only_writer_lock(
+    directory: &Dir,
+) -> Result<bool, PaperCheckpointRepositoryError> {
+    let mut entries = directory
+        .read_dir(CHECKPOINT_NAMESPACE)
+        .map_err(|source| io_error("read paper checkpoint namespace", source))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|source| io_error("read paper checkpoint namespace entry", source))?
+    else {
+        return Ok(false);
+    };
+    if entry.file_name() != ".repository.lock"
+        || !entry
+            .file_type()
+            .map_err(|source| io_error("inspect paper checkpoint namespace entry", source))?
+            .is_file()
+        || entries
+            .next()
+            .transpose()
+            .map_err(|source| io_error("bound paper checkpoint namespace", source))?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let metadata = directory
+        .symlink_metadata(REPOSITORY_LOCK_PATH)
+        .map_err(|source| io_error("inspect paper checkpoint repository lock", source))?;
+    Ok(metadata.is_file() && metadata.nlink() == 1 && metadata.len() == 0)
+}
+
+fn synchronize_directory(
+    directory: &Dir,
+    context: &'static str,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    directory
+        .try_clone()
+        .map(Dir::into_std_file)
+        .and_then(|root| root.sync_all())
+        .map_err(|source| io_error(context, source))
 }
 
 fn cleanup_stale_staging(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {
@@ -1394,6 +1526,7 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
 
+    use fs2::FileExt as _;
     use market_squawk_domain::{
         AccountId, ClientOrderId, Currency, Money, OrderId, RuleVersion, SourceIdentifier,
         Timestamp, VenueId,
@@ -1408,9 +1541,9 @@ mod tests {
     use static_assertions::assert_not_impl_any;
 
     use super::{
-        CHECKPOINT_OBJECT_ROOT, PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint,
-        PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
-        hex_bytes, read_bounded_regular,
+        CHECKPOINT_OBJECT_ROOT, LEGACY_REPOSITORY_LOCK_PATH, PaperAccountReplaySnapshot,
+        PaperCheckpointPublicationPoint, PaperCheckpointReceipt, PaperCheckpointRepository,
+        PaperCheckpointRepositoryError, REPOSITORY_LOCK_PATH, hex_bytes, read_bounded_regular,
     };
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,
@@ -1565,11 +1698,29 @@ mod tests {
         let paths = LocalPaths::prepare(directory.path().join("data"))?;
         let (config, _) = checkpoint_fixture()?;
         let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        std::fs::write(
+            paths.artifacts()?.root().join(LEGACY_REPOSITORY_LOCK_PATH),
+            [],
+        )?;
         let repository = PaperCheckpointRepository::try_new(
             paths.artifacts()?.clone(),
             config.clone(),
             maximum_bytes,
         )?;
+        assert!(
+            paths
+                .artifacts()?
+                .root()
+                .join(LEGACY_REPOSITORY_LOCK_PATH)
+                .is_file()
+        );
+        assert!(
+            paths
+                .artifacts()?
+                .root()
+                .join(REPOSITORY_LOCK_PATH)
+                .is_file()
+        );
 
         assert!(matches!(
             PaperCheckpointRepository::try_new(
@@ -1581,6 +1732,20 @@ mod tests {
         ));
 
         drop(repository);
+        let legacy = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.artifacts()?.root().join(LEGACY_REPOSITORY_LOCK_PATH))?;
+        legacy.try_lock_exclusive()?;
+        assert!(matches!(
+            PaperCheckpointRepository::try_new(
+                paths.artifacts()?.clone(),
+                config.clone(),
+                maximum_bytes,
+            ),
+            Err(PaperCheckpointRepositoryError::RepositoryAlreadyOwned)
+        ));
+        drop(legacy);
         let _reopened =
             PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
         Ok(())

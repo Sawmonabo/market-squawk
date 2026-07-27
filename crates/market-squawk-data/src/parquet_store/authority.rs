@@ -35,6 +35,7 @@ use platform::{configure_private_root_control, private_root_control_metadata};
 use platform::{publish_prepared_root_record, recover_committed_root_record};
 
 const ROOT_AUTHORITY_LOCK: &str = ".analytical-root-authority.lock";
+const LEGACY_PAPER_REPOSITORY_LOCK: &str = ".market-squawk-paper-checkpoints.lock";
 const ROOT_IDENTITY_MARKER: &str = ".analytical-root.identity";
 #[cfg(test)]
 const ROOT_IDENTITY_PENDING: &str = ".analytical-root.identity.pending";
@@ -461,7 +462,10 @@ impl PreparedRootAuthority {
     pub(crate) fn require_fresh_initialization_root(&self) -> Result<(), ParquetStoreError> {
         for entry in self.directory.entries()? {
             let entry = entry?;
-            if entry.file_name() != ROOT_AUTHORITY_LOCK {
+            let name = entry.file_name();
+            if name != ROOT_AUTHORITY_LOCK
+                && !is_safe_legacy_paper_repository_lock(&self.directory, &name)?
+            {
                 return Err(ParquetStoreError::RootCatalogMismatch);
             }
         }
@@ -617,6 +621,7 @@ fn require_only_legacy_control_files(directory: &Dir) -> Result<(), ParquetStore
                     | "quarantine"
             )
         ) && !is_safe_shared_artifact_namespace(directory, &name)?
+            && !is_safe_legacy_paper_repository_lock(directory, &name)?
         {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
@@ -787,6 +792,7 @@ fn require_only_expected_v2_control_files(
             && !(prepared.kind()
                 == crate::authority_transition::AuthorityTransitionKind::LegacyMigration
                 && is_safe_shared_artifact_namespace(directory, &name)?)
+            && !is_safe_legacy_paper_repository_lock(directory, &name)?
         {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
@@ -816,6 +822,7 @@ fn require_only_committed_v2_control_files(
             && name != "quarantine"
             && !legacy_control
             && !is_safe_shared_artifact_namespace(directory, &name)?
+            && !is_safe_legacy_paper_repository_lock(directory, &name)?
         {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
@@ -850,6 +857,22 @@ fn is_safe_shared_artifact_namespace(
     let opened_metadata = opened.dir_metadata()?;
     Ok(opened_metadata.is_dir()
         && (metadata.dev(), metadata.ino()) == (opened_metadata.dev(), opened_metadata.ino()))
+}
+
+fn is_safe_legacy_paper_repository_lock(
+    directory: &Dir,
+    name: &OsStr,
+) -> Result<bool, ParquetStoreError> {
+    if name != LEGACY_PAPER_REPOSITORY_LOCK {
+        return Ok(false);
+    }
+    let lock = open_root_control_file(directory, LEGACY_PAPER_REPOSITORY_LOCK, 1)?
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    if lock.metadata()?.len() != 0 {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    validate_root_control_file(directory, LEGACY_PAPER_REPOSITORY_LOCK, &lock, 1)?;
+    Ok(true)
 }
 
 #[allow(
