@@ -40,8 +40,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(run()))
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     initialize_logging(&cli.log, cli.json_logs)?;
     let output = cli.output;

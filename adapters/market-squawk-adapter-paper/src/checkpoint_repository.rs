@@ -1856,10 +1856,12 @@ mod tests {
     use sha2::{Digest, Sha256};
     use static_assertions::assert_not_impl_any;
 
+    #[cfg(unix)]
+    use super::read_bounded_regular;
     use super::{
         CHECKPOINT_OBJECT_ROOT, LEGACY_REPOSITORY_LOCK_PATH, PaperAccountReplaySnapshot,
         PaperCheckpointPublicationPoint, PaperCheckpointReceipt, PaperCheckpointRepository,
-        PaperCheckpointRepositoryError, REPOSITORY_LOCK_PATH, hex_bytes, read_bounded_regular,
+        PaperCheckpointRepositoryError, REPOSITORY_LOCK_PATH, hex_bytes,
     };
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,

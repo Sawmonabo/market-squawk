@@ -462,8 +462,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/checkpoint_repository.rs",
-      "sha256": "0aaf27ce9e29c1d9e52fdac29a89404b77ea5f3c78d541399c73cd9e0bd7da54",
-      "size_bytes": 88474
+      "sha256": "a813e030544d621bdd9655ed642bac89f7529bb7a226198e6948f760e3a1705a",
+      "size_bytes": 88506
     },
     {
       "path": "adapters/market-squawk-adapter-paper/src/config.rs",
@@ -1152,8 +1152,8 @@
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/kraken_vertical.rs",
-      "sha256": "a346f1824715d986a7786504979894a69e19a01a47dc0987f2d6435db4c51737",
-      "size_bytes": 22587
+      "sha256": "4afd15a51eacee7d8ad18ca277f4926053d602c4f974298129b823da4b2f1597",
+      "size_bytes": 22693
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/mod.rs",
@@ -1257,8 +1257,8 @@
     },
     {
       "path": "apps/market-squawk/src/main.rs",
-      "sha256": "de4dbc6f11e02ccd7fb0d25c591ca695021fccd7ddc65e89f68c18c6dc4271f0",
-      "size_bytes": 43893
+      "sha256": "321702e4c7d1a152e41dbd2ed42740c60fbb5f28c9f820127ae0666ea345d3e2",
+      "size_bytes": 44029
     },
     {
       "path": "apps/market-squawk/src/mcp.rs",
@@ -2132,8 +2132,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/parquet_store.rs",
-      "sha256": "15aaf53a92b1bf006736b55910ec8b92010470a21e8e689aaebd38cc09ac79f1",
-      "size_bytes": 53725
+      "sha256": "9472b4c3c69f3c02bb4144e73c744bc4bf7e901a79330fef9c8527b4c8429c83",
+      "size_bytes": 53231
     },
     {
       "path": "crates/market-squawk-data/src/parquet_store/authority.rs",

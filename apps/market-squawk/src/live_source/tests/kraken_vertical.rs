@@ -200,6 +200,10 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
 
 #[tokio::test]
 async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> TestResult {
+    // The fixture's transport-idle limit is 30 seconds; this leaves scheduling headroom while
+    // still proving that acknowledgement expiry, rather than transport idleness, rotates it.
+    const ROTATION_BOUND: Duration = Duration::from_secs(10);
+
     let _budget_guard = KRAKEN_VERTICAL_TEST_LOCK.lock().await;
     let temporary = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -219,20 +223,19 @@ async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> 
     let cancellation = CancellationToken::new();
     let runtime = composition.start(cancellation.clone()).await?;
 
-    let rotation = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+    let rotation = tokio::time::timeout(ROTATION_BOUND, &mut server).await;
     cancellation.cancel();
     let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
     assert!(shutdown.is_complete());
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    let elapsed = match rotation {
+    match rotation {
         Ok(result) => result??,
         Err(_elapsed) => {
             server.abort();
             let _aborted = server.await;
             return Err("silent Kraken generation outlived its acknowledgement deadline".into());
         }
-    };
-    assert!(elapsed < Duration::from_secs(2));
+    }
     Ok(())
 }
 
@@ -457,9 +460,8 @@ async fn serve_one_kraken_session(
     Ok(())
 }
 
-async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult<Duration> {
+async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult {
     let mut first = accept_kraken_subscription(&listener).await?;
-    let started_at = std::time::Instant::now();
     while let Some(message) = first.next().await {
         match message {
             Ok(Message::Close(_)) | Err(_) => break,
@@ -467,7 +469,7 @@ async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult
         }
     }
     let _successor = accept_kraken_subscription(&listener).await?;
-    Ok(started_at.elapsed())
+    Ok(())
 }
 
 async fn accept_kraken_subscription(

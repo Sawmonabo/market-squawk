@@ -1161,34 +1161,16 @@ impl ParquetObjectStore {
         self.root
             .resolve(destination)
             .map_err(std::io::Error::other)?;
-        let source = self.root.root().join(source);
-        let destination = self.root.root().join(destination);
+        let source_path = self.root.root().join(source);
+        let destination_path = self.root.root().join(destination);
         // MoveFileExW WRITE_THROUGH is used without replacement or cross-volume copying. Windows
         // durability is requested, but atomic visibility is not claimed.
-        atomicwrites::move_atomic(&source, &destination)?;
+        atomicwrites::move_atomic(&source_path, &destination_path)?;
         self.root
-            .resolve(
-                destination
-                    .strip_prefix(self.root.root())
-                    .map_err(std::io::Error::other)?,
-            )
+            .resolve(destination)
             .map_err(std::io::Error::other)?;
-        if self
-            .directory
-            .symlink_metadata(
-                source
-                    .strip_prefix(self.root.root())
-                    .map_err(std::io::Error::other)?,
-            )
-            .is_ok()
-            || self
-                .directory
-                .open(
-                    destination
-                        .strip_prefix(self.root.root())
-                        .map_err(std::io::Error::other)?,
-                )
-                .is_err()
+        if self.directory.symlink_metadata(source).is_ok()
+            || self.directory.open(destination).is_err()
         {
             return Err(std::io::Error::other(
                 "Windows publication requires recovery",
