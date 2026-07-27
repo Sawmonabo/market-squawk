@@ -233,6 +233,21 @@ impl RawEvidenceStore {
     fn observe_directory_synced(&self) {}
 }
 
+#[cfg(unix)]
+pub(crate) fn sync_publication_directory(directory: &Dir) -> Result<(), std::io::Error> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    directory
+        .open_with(".", &options)
+        .map(cap_std::fs::File::into_std)
+        .and_then(|opened| opened.sync_all())
+}
+
+#[cfg(not(unix))]
 pub(crate) fn sync_publication_directory(directory: &Dir) -> Result<(), std::io::Error> {
     directory.try_clone()?.into_std_file().sync_all()
 }

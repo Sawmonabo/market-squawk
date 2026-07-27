@@ -15,6 +15,7 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-sources.workspace = true
 quick-xml.workspace = true

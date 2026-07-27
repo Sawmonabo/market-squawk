@@ -45,6 +45,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 const PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
+const LOCAL_SUBSCRIPTION_BOUND: Duration = Duration::from_secs(10);
+const LOCAL_SNAPSHOT_BOUND: Duration = Duration::from_secs(20);
 static KRAKEN_VERTICAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// This integration test preserves the two independent safety layers:
@@ -277,7 +279,9 @@ async fn wait_for_kraken_snapshot(
     snapshots: market_squawk_live::LiveSnapshotReader,
     source: &SourceId,
 ) -> TestResult<ObservedKrakenSession> {
-    tokio::time::timeout(Duration::from_secs(6), async {
+    // This remains below the fixture's 30-second freshness and transport-idle limit while
+    // allowing the heavily parallel cross-platform test runners to schedule both generations.
+    tokio::time::timeout(LOCAL_SNAPSHOT_BOUND, async {
         loop {
             if let Ok(lease) = snapshots.try_load_all() {
                 for shard in lease.snapshots() {
@@ -478,7 +482,7 @@ async fn accept_kraken_subscription(
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
     let Some(Ok(Message::Text(subscription))) =
-        tokio::time::timeout(Duration::from_secs(2), socket.next()).await?
+        tokio::time::timeout(LOCAL_SUBSCRIPTION_BOUND, socket.next()).await?
     else {
         return Err("Kraken source did not send a text subscription".into());
     };

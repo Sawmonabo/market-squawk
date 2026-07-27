@@ -3604,6 +3604,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "futures-util",
+ "libc",
  "market-squawk-domain",
  "market-squawk-sources",
  "quick-xml",

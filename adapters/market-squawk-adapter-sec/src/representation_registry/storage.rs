@@ -266,7 +266,7 @@ pub(super) fn cleanup_old_snapshots(
         }
     }
     if removed {
-        directory.try_clone()?.into_std_file().sync_all()?;
+        sync_publication_directory(directory)?;
     }
     Ok(())
 }
