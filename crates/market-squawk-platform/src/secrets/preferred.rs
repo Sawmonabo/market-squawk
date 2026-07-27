@@ -573,6 +573,15 @@ impl SecretStore for PreferredSecretStore {
     }
 }
 
+fn keyring_is_unavailable(error: &LocalSecretStoreError) -> bool {
+    matches!(
+        error,
+        LocalSecretStoreError::ProviderUnavailable
+            | LocalSecretStoreError::SessionUnavailable
+            | LocalSecretStoreError::UnsupportedOperation
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,13 +640,4 @@ mod tests {
         );
         Ok(())
     }
-}
-
-fn keyring_is_unavailable(error: &LocalSecretStoreError) -> bool {
-    matches!(
-        error,
-        LocalSecretStoreError::ProviderUnavailable
-            | LocalSecretStoreError::SessionUnavailable
-            | LocalSecretStoreError::UnsupportedOperation
-    )
 }

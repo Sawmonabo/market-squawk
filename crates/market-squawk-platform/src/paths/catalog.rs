@@ -496,9 +496,12 @@ fn validate_private_file_identity_with_links(
     use cap_fs_ext::MetadataExt as _;
 
     location.validate_for_open()?;
-    let opened = file
-        .metadata()
-        .map_err(|source| PathError::io("failed to inspect opened catalog control file", source))?;
+    let opened = cap_std::fs::File::from_std(
+        file.try_clone()
+            .map_err(|source| PathError::io("failed to clone catalog control file", source))?,
+    )
+    .metadata()
+    .map_err(|source| PathError::io("failed to inspect opened catalog control file", source))?;
     let named = location
         .root_capability
         .symlink_metadata(name)
@@ -514,9 +517,11 @@ fn validate_private_file_identity_with_links(
 }
 
 fn validate_file_link_count(
-    metadata: &impl cap_fs_ext::MetadataExt,
+    metadata: &cap_std::fs::Metadata,
     expected_links: u64,
 ) -> Result<(), PathError> {
+    use cap_fs_ext::MetadataExt as _;
+
     if metadata.nlink() != expected_links {
         return Err(PathError::PreparedRootChanged);
     }
@@ -580,7 +585,7 @@ fn validate_private_file_metadata_with_links(
     metadata: &cap_std::fs::Metadata,
     expected_links: u64,
 ) -> Result<(), PathError> {
-    use cap_fs_ext::MetadataExt as _;
+    use cap_std::fs::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {

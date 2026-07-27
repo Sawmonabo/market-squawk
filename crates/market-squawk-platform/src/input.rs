@@ -58,6 +58,7 @@ pub struct VerifiedInputFile {
     parent_identities: Vec<FileSystemIdentity>,
     identity: InputFileIdentity,
     file: std::fs::File,
+    identity_file: cap_std::fs::File,
     maximum_bytes: u64,
 }
 
@@ -384,15 +385,16 @@ impl InputFileCapability {
         configure_windows_nofollow(&mut options);
         let file = parent
             .open_with(file_name, &options)
-            .map_err(classify_nofollow_error)?
-            .into_std();
+            .map_err(classify_nofollow_error)?;
         let opened = file.metadata().map_err(InputFileError::io)?;
-        if !opened.is_file() || is_windows_std_reparse(&opened) {
+        if !opened.is_file() || is_windows_reparse(&opened) {
             return Err(InputFileError::NotRegularFile);
         }
-        if InputFileIdentity::from_std_metadata(&opened)? != self.identity {
+        if InputFileIdentity::from_metadata(&opened)? != self.identity {
             return Err(InputFileError::IdentityChanged);
         }
+        let identity_file = file.try_clone().map_err(InputFileError::io)?;
+        let file = file.into_std();
         self.root.validate_root()?;
         Ok(VerifiedInputFile {
             root: self.root,
@@ -400,6 +402,7 @@ impl InputFileCapability {
             parent_identities: self.parent_identities,
             identity: self.identity,
             file,
+            identity_file,
             maximum_bytes,
         })
     }
@@ -423,9 +426,9 @@ impl VerifiedInputFile {
             .last()
             .ok_or(InputFileError::UnsafeComponent)?;
         let named = nofollow_regular_metadata(&parent, file_name)?;
-        let opened = self.file.metadata().map_err(InputFileError::io)?;
+        let opened = self.identity_file.metadata().map_err(InputFileError::io)?;
         if InputFileIdentity::from_metadata(&named)? != self.identity
-            || InputFileIdentity::from_std_metadata(&opened)? != self.identity
+            || InputFileIdentity::from_metadata(&opened)? != self.identity
         {
             return Err(InputFileError::IdentityChanged);
         }
@@ -651,17 +654,6 @@ impl InputFileIdentity {
         })
     }
 
-    fn from_std_metadata(metadata: &std::fs::Metadata) -> Result<Self, InputFileError> {
-        if !metadata.is_file() || is_windows_std_reparse(metadata) {
-            return Err(InputFileError::NotRegularFile);
-        }
-        Ok(Self {
-            filesystem: filesystem_std_identity(metadata),
-            size_bytes: metadata.len(),
-            modified: metadata.modified().ok().map(SystemTime::from_std),
-        })
-    }
-
     /// Returns the exact pre-read file length.
     pub const fn size_bytes(&self) -> u64 {
         self.size_bytes
@@ -819,13 +811,6 @@ fn filesystem_identity(metadata: &cap_std::fs::Metadata) -> FileSystemIdentity {
     }
 }
 
-fn filesystem_std_identity(metadata: &std::fs::Metadata) -> FileSystemIdentity {
-    FileSystemIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
 fn classify_nofollow_error(source: std::io::Error) -> InputFileError {
     if matches!(source.raw_os_error(), Some(libc::ELOOP)) {
         InputFileError::SymlinkOrReparsePoint
@@ -934,19 +919,6 @@ fn is_windows_reparse(metadata: &cap_std::fs::Metadata) -> bool {
 
 #[cfg(not(windows))]
 const fn is_windows_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn is_windows_std_reparse(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-const fn is_windows_std_reparse(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 

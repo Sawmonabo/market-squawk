@@ -10,10 +10,11 @@ use cap_std::fs::OpenOptions;
 
 use crate::PathError;
 
+#[cfg(unix)]
+use super::validate_private_file_identity;
 use super::{
     CATALOG_FILE, CatalogFileGuard, CatalogLocation, CatalogWriterGuard,
-    configure_private_catalog_creation, validate_private_file_identity,
-    validate_private_file_identity_with_links,
+    configure_private_catalog_creation, validate_private_file_identity_with_links,
 };
 
 const RESTORE_STAGE_PREFIX: &str = ".catalog.restore.";

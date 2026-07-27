@@ -3507,8 +3507,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/input.rs",
-      "sha256": "1ffa02c5719d25d9eb3659004d984a3ab4681bd392f0227e313cf1959ffdd10e",
-      "size_bytes": 40375
+      "sha256": "a8032b924953cdebf03968ac314a85da19cbc45579848e66861f197925b3dc77",
+      "size_bytes": 39546
     },
     {
       "path": "crates/market-squawk-platform/src/input/ownership.rs",
@@ -3532,13 +3532,13 @@
     },
     {
       "path": "crates/market-squawk-platform/src/paths/catalog.rs",
-      "sha256": "7fd3778459ef7b35b3c27da09480799fb379232a03d8c957b7e8abebe9c34477",
-      "size_bytes": 23510
+      "sha256": "87d599d907b41d0fe3a682636ab39e0ce2e1fd2eaa86e399a5ac7418c75f18ab",
+      "size_bytes": 23685
     },
     {
       "path": "crates/market-squawk-platform/src/paths/catalog/restore.rs",
-      "sha256": "95d945d586baa4761dbd32eb675a6d5e5e8f64788661fd9ba12c7ac1a8fbbec4",
-      "size_bytes": 13671
+      "sha256": "bef440d6b814a7129be5b4b18fc77694d28b6e0edeb45e515e28645e36110425",
+      "size_bytes": 13691
     },
     {
       "path": "crates/market-squawk-platform/src/raw_record.rs",
@@ -3572,7 +3572,7 @@
     },
     {
       "path": "crates/market-squawk-platform/src/secrets/preferred.rs",
-      "sha256": "b66a9bbc3e1d3d8db633dd9e90d043a57572946e20aea953ab4c42e2c1ee8593",
+      "sha256": "eed3848bb094b8d487622498abeaceb3e5f55ff9795313b6699269c1e7be224d",
       "size_bytes": 22527
     },
     {
