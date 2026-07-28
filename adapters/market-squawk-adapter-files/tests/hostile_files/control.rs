@@ -562,6 +562,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         .ok_or("panicking blocking operation unexpectedly succeeded")?;
     assert_eq!(error, FileAdapterError::BlockingTaskFailed);
 
+    let clock_fault_deadline = Timestamp::from_unix_nanos(60_000_000_000);
     for fail_at in [3, 15] {
         let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
         let manifest_input = root
@@ -588,7 +589,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             SourceIdentifier::try_from("alternative-prices")?,
             None,
             NonZeroU16::new(1).ok_or("nonzero")?,
-            Timestamp::from_unix_nanos(1_000_000_000),
+            clock_fault_deadline,
         )?;
         let error = source
             .discover_files(&request, &CancellationToken::new())
@@ -623,7 +624,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             SourceIdentifier::try_from("alternative-prices")?,
             None,
             NonZeroU16::new(1).ok_or("nonzero")?,
-            Timestamp::from_unix_nanos(1_000_000_000),
+            clock_fault_deadline,
         )?;
         let object = source
             .discover_files(&discovery, &CancellationToken::new())
@@ -636,7 +637,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             object,
             NonZeroU32::new(1).ok_or("nonzero")?,
             NonZeroU64::new(16 * 1024).ok_or("nonzero")?,
-            Timestamp::from_unix_nanos(1_000_000_000),
+            clock_fault_deadline,
         )?;
         let error = source
             .extract_file(&request, &CancellationToken::new())

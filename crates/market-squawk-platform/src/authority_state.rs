@@ -5,7 +5,6 @@ mod filesystem;
 mod recovery;
 
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
@@ -14,7 +13,7 @@ use thiserror::Error;
 
 pub use self::envelope::{AuthorityCommitContext, AuthorityStateSnapshot};
 use self::envelope::{Envelope, next_context, validate_payload_size};
-use self::filesystem::{Slot, StateFiles};
+use self::filesystem::{LifetimeLock, Slot, StateFiles};
 use self::recovery::{Head, publish_envelope, reconcile};
 
 /// A capability-confined, exclusively owned authority-state store.
@@ -25,7 +24,7 @@ use self::recovery::{Head, publish_envelope, reconcile};
 /// anchor and is outside this local-files-only durability contract.
 pub struct LocalAuthorityStateStore {
     files: StateFiles,
-    _lock: fs::File,
+    _lock: LifetimeLock,
     gate: Mutex<StoreGate>,
 }
 

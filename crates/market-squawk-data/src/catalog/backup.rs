@@ -393,13 +393,38 @@ fn append_platform_uri_path(uri: &mut String, path: &Path) -> Result<(), Catalog
 
 #[cfg(windows)]
 fn append_platform_uri_path(uri: &mut String, path: &Path) -> Result<(), CatalogError> {
-    let path = path.to_str().ok_or(CatalogError::UnsafePath)?;
-    if path.starts_with("\\\\") || path.starts_with("//") {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let drive = match components.next() {
+        // `fs::canonicalize` produces `VerbatimDisk` for local Windows paths.
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) if drive.is_ascii_alphabetic() => {
+                drive
+            }
+            _ => return Err(CatalogError::UnsafePath),
+        },
+        _ => return Err(CatalogError::UnsafePath),
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
         return Err(CatalogError::UnsafePath);
     }
+
     uri.push('/');
-    let normalized = path.replace('\\', "/");
-    append_percent_encoded_path(uri, normalized.as_bytes());
+    uri.push(char::from(drive));
+    uri.push_str(":/");
+    let mut first = true;
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(CatalogError::UnsafePath);
+        };
+        let component = component.to_str().ok_or(CatalogError::UnsafePath)?;
+        if !first {
+            uri.push('/');
+        }
+        append_percent_encoded_path(uri, component.as_bytes());
+        first = false;
+    }
     Ok(())
 }
 

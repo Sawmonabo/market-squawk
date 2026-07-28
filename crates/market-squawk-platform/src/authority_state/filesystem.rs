@@ -55,8 +55,20 @@ pub(super) struct StateFiles {
     root_path: PathBuf,
 }
 
+/// Releases the advisory lock before a fork-duplicated descriptor can outlive its logical owner.
+#[derive(Debug)]
+pub(super) struct LifetimeLock(fs::File);
+
+impl Drop for LifetimeLock {
+    fn drop(&mut self) {
+        let _ignored = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 impl StateFiles {
-    pub(super) fn try_open(root: &Path) -> Result<(Self, fs::File), LocalAuthorityStateStoreError> {
+    pub(super) fn try_open(
+        root: &Path,
+    ) -> Result<(Self, LifetimeLock), LocalAuthorityStateStoreError> {
         let directory = open_root(root)?;
         reject_unsafe_entry_if_present(&directory, LOCK_FILE)?;
         let mut options = OpenOptions::new();
@@ -81,6 +93,7 @@ impl StateFiles {
                 io_error("acquire lock", source)
             }
         })?;
+        let lock = LifetimeLock(lock);
         #[cfg(windows)]
         let root_path = fs::canonicalize(root)
             .map_err(|source| io_error("canonicalize retained authority root", source))?;

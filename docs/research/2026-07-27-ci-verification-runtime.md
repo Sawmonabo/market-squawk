@@ -7,9 +7,9 @@ approximately one-hour Linux verification feedback loop.
 | --- | --- |
 | Document type | Research and diagnostic decision record |
 | Audience | Maintainers, CI owners, release reviewers |
-| Status | Audited decision input; correction not yet implemented or measured |
+| Status | Audited decision input; runtime correction not yet implemented or measured |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-27 |
+| Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
@@ -19,7 +19,7 @@ approximately one-hour Linux verification feedback loop.
 - [Executive finding](#executive-finding)
 - [Measured runtime](#measured-runtime)
 - [Root causes](#root-causes)
-- [Current candidate failures](#current-candidate-failures)
+- [Current candidate correctness follow-up](#current-candidate-correctness-follow-up)
 - [Correction design](#correction-design)
 - [Acceptance evidence](#acceptance-evidence)
 - [Risks and rejected shortcuts](#risks-and-rejected-shortcuts)
@@ -36,8 +36,9 @@ This investigation answers two questions:
 
 It covers the current GitHub Actions workflow, local verification scripts, Cargo invalidation,
 Loom execution, cache policy, GitHub run history, and current official Cargo and GitHub guidance.
-It does not approve a release, resolve the current Linux or Windows test failures, or claim
-post-change performance before measurement.
+It does not approve a release or claim post-change performance before measurement. The correctness
+follow-up below records subsequent root-cause evidence for the Linux and Windows failures so this
+maintained report does not preserve an obsolete diagnosis.
 
 ## Executive finding
 
@@ -203,23 +204,92 @@ GitHub supports independent concurrent jobs and a final job that depends on ever
 The current topology therefore delays unrelated evidence and tends to expose one failure per
 candidate.
 
-## Current candidate failures
+## Current candidate correctness follow-up
 
-The runtime diagnosis does not make the exact release candidate green.
-
-At `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45`,
-[run 30332098992](https://github.com/Sawmonabo/market-squawk/actions/runs/30332098992)
+The runtime diagnosis did not make the exact release candidate green. The first frozen run at
+`75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45`,
+[run 30332098992](https://github.com/Sawmonabo/market-squawk/actions/runs/30332098992),
 completed with:
 
-| Job | Result | Current finding |
+| Job | Result | Initial finding |
 | --- | --- | --- |
 | macOS | Passed | Complete current macOS job succeeded |
 | Linux verify | Failed | Platform authority-state test returned `AlreadyLocked` |
 | Windows | Failed | Analytical backup/evidence tests returned indeterminate or invalid evidence |
 
-Those failures require their own systematic correctness investigation. Retries, sleeps, global test
-serialization, or skipped assertions are not established fixes. The CI runtime correction must
-make all failures easier to see; it must not mask them.
+### Linux authority-state lock lifetime
+
+The Linux failure was a production lock-lifecycle defect exposed by concurrent process creation.
+The authority-state store relied on closing its lock-file descriptor to release an `fs2` advisory
+lock. On Linux, `flock` locks belong to an open-file description shared by descriptors duplicated
+across `fork`; closing one descriptor does not release the lock while another duplicate remains
+open. An immediate successor could therefore receive `AlreadyLocked` after the logical owner had
+already dropped. The Linux contract also establishes that an explicit `LOCK_UN` through any
+duplicate releases the shared lock
+([Linux `flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html)).
+
+The correction uses a private RAII guard created immediately after acquisition. Its non-panicking
+drop explicitly unlocks before closing, covering normal destruction and every later
+post-acquisition error path. Genuine contention remains rejected while the guard is alive. The
+existing 64-test platform configuration/security harness and focused Clippy gate pass locally with
+this correction.
+
+### Windows canonical backup paths
+
+Four Windows analytical-backup failures shared one production path-conversion defect.
+`LocalPaths::prepare` canonicalizes its root, and Rust documents that Windows canonicalization
+returns extended-length syntax such as `\\?\D:\...`
+([`std::fs::canonicalize`](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)). The immutable
+SQLite URI builder rejected every double-backslash prefix as UNC, even though Rust distinguishes a
+local `VerbatimDisk` prefix from `UNC`, `VerbatimUNC`, `DeviceNS`, and generic verbatim forms
+([`std::path::Prefix`](https://doc.rust-lang.org/std/path/enum.Prefix.html)).
+
+The correction classifies parsed Windows path prefixes, accepts only absolute `Disk` and
+`VerbatimDisk` paths, converts them to SQLite's `/D:/...` URI-path form, and continues rejecting
+network, device, generic verbatim, relative, and non-UTF-8 paths. SQLite documents the drive-letter
+URI form and the `immutable=1` read contract
+([SQLite URI filenames](https://www.sqlite.org/uri.html),
+[SQLite open flags and URI parameters](https://sqlite.org/c3ref/open.html)). The existing
+38-test data library suite and focused Clippy gate pass locally with this correction.
+
+### Windows clock-fault fixture
+
+A rerun of only the unchanged Windows job exposed an independent test-fixture race before the data
+crate ran:
+[job 90209089614](https://github.com/Sawmonabo/market-squawk/actions/runs/30332098992/job/90209089614)
+failed in
+`control::discovery_control_path_fails_closed_without_blocking_the_runtime`. The original Windows
+job had passed the same executable at the same source, runner, image, and toolchain.
+
+The fault-injection clock captured its monotonic origin before durable representation-authority
+initialization, then requested a synthetic wall deadline only about one second later. On the slower
+run, initialization and scheduling consumed that budget, so the production deadline control
+correctly returned `DeadlineExceeded` before injected clock observation 15 could return
+`ClockFailure`. The assertion label `call 15` identified the configured fault point; it did not
+prove that observation 15 occurred.
+
+The correction changes only those injected clock-failure scenarios to use the standard 60-second
+elapsed ceiling as a noncompeting deadline. It preserves the strict `ClockFailure` assertions and
+does not change production code. The same harness separately retains immediate-expiry,
+one-second saturation, cancellation, and blocking-worker-panic coverage. The exact focused test
+passes locally after this fixture correction. The adjacent hostile-clock panic in the failed log
+was intentional output from an earlier subcase that the test harness buffered; it was not a second
+causal failure.
+
+### Remaining Windows evidence failure
+
+The fifth original Windows data failure,
+`derived_commit_retains_canonical_multi_object_and_parent_evidence`, is separate from backup-path
+handling. Its path is SQLite queries plus pure semantic validation, and the current error mapping
+coarsens multiple internal evidence causes into `AnalyticalEvidenceInvalid`. The focused local
+data suite passes, but the Windows-only cause is not yet substantiated. The Windows rerun stopped in
+the file-adapter harness before it reached the data crate, so it neither reproduced nor cleared
+this finding. No ordering change, retry, serialization, fixture rewrite, or semantic correction is
+justified without a repeated failure that preserves a bounded exact cause.
+
+These corrections have focused local evidence only. Release authority still requires one unchanged
+candidate to pass the complete Linux, macOS, and Windows jobs. The runtime correction must make
+future failures easier to see; it must not mask them.
 
 ## Correction design
 
@@ -351,6 +421,14 @@ The correction therefore does not require a paid runner under the current public
 - [Cargo build timings](https://doc.rust-lang.org/cargo/reference/timings.html)
 - [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
 - [Rust Performance Book: compile times](https://nnethercote.github.io/perf-book/compile-times.html)
+- [Rust Windows canonicalization](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
+- [Rust Windows path-prefix classification](https://doc.rust-lang.org/std/path/enum.Prefix.html)
+
+### Operating-system and analytical-storage contracts
+
+- [Linux `flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html)
+- [SQLite URI filenames](https://www.sqlite.org/uri.html)
+- [SQLite opening connections and immutable URI parameters](https://sqlite.org/c3ref/open.html)
 
 ### Official GitHub documentation and maintained tools
 
