@@ -62,6 +62,10 @@ decisions can be audited without relying on conversation history.
   population, repeated Loom construction, the accepted cross-platform correctness follow-up,
   fail-closed parallel-job design, acceptance evidence, and primary sources for reducing feedback
   time without weakening release coverage.
+- [Cross-platform installation and guided setup](2026-07-28-cross-platform-installation-and-guided-setup.md)
+  — current cargo-dist, Qt Installer Framework, Tauri, uv, native packaging, secure activation,
+  rollback, offline, headless, complete-default, and change-aware CI evidence; records the
+  recommended hybrid direction while the signing and platform-matrix decisions remain pending.
 
 ## Provider decisions
 
