@@ -11,7 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest completed correctness candidate | `d02a2f14bd9e999ef1206b528d79528c72263016` |
+| Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -140,7 +140,14 @@ speedup.
 - The bounded correction keeps live producer acquisition nonblocking while allowing only startup
   recovery to await the sequence mutex under its existing cancellation and deadline. Tokio's
   mutex and `select!` contracts support that design. The unchanged paper and application library
-  surfaces pass locally; hosted exact-candidate evidence remains required.
+  surfaces pass locally.
+- Exact candidate `f8c2569` passed unchanged in
+  [run 30366976240](https://github.com/Sawmonabo/market-squawk/actions/runs/30366976240):
+  Linux `scripts/verify.sh` completed in 49m20s, Windows completed in 15m19s, and macOS completed
+  in 25m50s. Both Kraken production verticals passed on Windows and macOS, and the Linux complete
+  gate passed the corrected paper adapter and application surfaces. This is the required hosted
+  cross-platform correctness evidence for the sequence handoff; it is not terminal release
+  approval or post-redesign runtime evidence.
 
 The retained diagnostic log identities were:
 
@@ -167,6 +174,10 @@ The retained diagnostic log identities were:
 | Candidate `d02a2f1` Windows job `90289414559` | `d55d41d1756751d10ecff1432369dca192837ecacaab2a47e1a34997ec62f697` |
 | Candidate `d02a2f1` macOS job `90289414582` | `8ef872ed2fa60f608c2fcf393e5bd62f5eb2fc79a5d587e50064e65fab29a5f4` |
 | Candidate `d02a2f1` Linux job `90289414652` | `7e5f3677549a5b3432592a27d2a5e6cec2d9fe5b14f98cb50b5a0a7da4e13304` |
+| Candidate `f8c2569` run metadata | `25b4d876a1d3afab388979e3f5e72c182a8bd5039ed252caa03f668144b860dd` |
+| Candidate `f8c2569` Linux job `90300620390` | `cd099473c99177d1b56126def9c57bb1ff6395d93bd7e80a23d4f60edd1dfc45` |
+| Candidate `f8c2569` Windows job `90300620276` | `2ebd8dee2601a747ebfc823887d2a77485c5945761f57d6980e8d15f3bb5b0ce` |
+| Candidate `f8c2569` macOS job `90300620453` | `9ff06329b7ecbc7193e82dda32b919b6d067f5e60ac630561093fc0682058004` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -215,10 +226,9 @@ numerical forecast.
 - Exact candidate `d02a2f1` passed complete Windows and macOS jobs. Windows established the
   platform corrections; Linux exposed the paper-recovery sequence handoff under the representative
   multi-thread runtime.
-- The paper-recovery correction has focused local evidence and a source-backed bounded-wait design,
-  but remains pending hosted exact-candidate proof.
-- The correctness fixes are not release evidence until one unchanged candidate passes Linux,
-  macOS, and Windows.
+- Exact candidate `f8c2569` passed Linux, macOS, and Windows unchanged. The paper-recovery
+  correction and the preceding cross-platform correctness fixes are therefore accepted at that
+  exact code head.
 - The audit verdict approves this report as decision input. It is not release approval and not
   post-change performance evidence.
 
@@ -226,5 +236,6 @@ numerical forecast.
 
 The report is fit to preserve as a date-anchored diagnostic and implementation-decision input. Its
 two repository-specific runtime root causes are directly reproduced, its workflow-shape diagnosis
-is supported by run evidence and official documentation, and its expected runtime is appropriately
-qualified pending post-change measurement.
+is supported by run evidence and official documentation, its cross-platform correctness follow-up
+passed unchanged, and its expected redesigned runtime remains appropriately qualified pending
+post-change measurement.

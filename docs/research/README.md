@@ -59,8 +59,9 @@ decisions can be audited without relying on conversation history.
 
 - [CI verification runtime and build-cache diagnosis](2026-07-27-ci-verification-runtime.md) —
   measured phase timing, the reproduced Cargo invalidation defect, inactive pull-request cache
-  population, repeated Loom construction, fail-closed parallel-job design, acceptance evidence,
-  and primary sources for reducing feedback time without weakening release coverage.
+  population, repeated Loom construction, the accepted cross-platform correctness follow-up,
+  fail-closed parallel-job design, acceptance evidence, and primary sources for reducing feedback
+  time without weakening release coverage.
 
 ## Provider decisions
 

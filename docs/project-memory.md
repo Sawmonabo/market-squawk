@@ -1164,3 +1164,26 @@ Generated-cache discipline remains binding. The root cache reached 19.14 GiB dur
 0.2.0 version rebuild, so the integration owner stopped before another Cargo gate, confirmed no
 Cargo process was active, removed only reproducible debug/test output, and resumed from an
 approximately 800 MiB cache. Only the root worktree exists and `.worktrees` is empty.
+
+## 2026-07-28 cross-platform correctness evidence
+
+Product-capability commit `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae`, tree
+`0a8d5ab177b53d0496d6fecb8672f3262ae8e533`, is the accepted exact code head for the
+paper-recovery sequence correction and the preceding Linux, Windows, and macOS correctness
+remediation. Hosted Actions run `30366976240` completed unchanged with Linux `verify` passing in
+49m20s, Windows passing in 15m19s, and macOS passing in 25m50s. The retained run and job hashes are
+recorded in the delivery ledger and CI runtime evidence audit; raw logs remain untracked temporary
+evidence.
+
+The sequence correction is production behavior: startup recovery may wait for the short sequence
+critical section only under the existing cancellation and deadline, while live and dispatcher
+producers remain nonblocking. No deadline, retry, serialization, queue, or assertion was weakened.
+The existing fixture that leaked SQLite state into the source tree now uses an isolated temporary
+data root; no test or test target was added.
+
+This checkpoint accepts cross-platform correctness only. It is not terminal V1 approval and does
+not close issues `#7`, `#25`, or `#31`. Any later commit, including the documentation record that
+contains this entry, does not inherit `f8c2569` exact-head status; the final release candidate must
+repeat every applicable clean exact-head gate and grouped review. Current generated state is
+6.5 GiB under the 20 GiB ceiling, `.worktrees` is empty, incremental compilation remains disabled,
+and 153 GiB is free.

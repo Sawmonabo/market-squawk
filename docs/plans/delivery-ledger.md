@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-26
+Last updated: 2026-07-28
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -10,9 +10,15 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:
-  `ce304b59a79e3bd422fb4ca58a93fc8780bb320b`
-  (`Harden provider evidence and candidate identity`), tree
-  `e59391ae85768e95dea8303c3e9a56e6c833b588`.
+  `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae`
+  (`Coordinate paper recovery sequence handoff`), tree
+  `0a8d5ab177b53d0496d6fecb8672f3262ae8e533`.
+- Exact candidate `f8c2569` passed unchanged in hosted Actions
+  [run 30366976240](https://github.com/Sawmonabo/market-squawk/actions/runs/30366976240):
+  Linux `scripts/verify.sh` completed in 49m20s, Windows completed in 15m19s, and macOS completed
+  in 25m50s. This accepts the cross-platform paper-recovery and preceding correctness remediation at
+  that code head. It is not terminal V1 approval; the provider and final release predicates below
+  remain open.
 - The active package candidate is `0.2.0`; the published `v0.1.0` foundation tag remains immutable.
   Public BLS v1 now exposes its exact adapter-owned dataset identity through activation, status,
   portal bootstrap, and restart recovery. Treasury Fiscal Data now performs the complete bounded
@@ -221,10 +227,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   findings. The release fast-forward, PR evidence comment, local/origin branch deletion, and
   metadata prune are complete.
 - Product release status: runnable product capabilities exist across every required domain, but the
-  release remains blocked on provider qualification and rights outcomes, complete onboarding
-  workflows and clean-machine evidence, prerequisite-issue reconciliation, and Task 20's integrated
-  demonstration, performance/fuzz/security evidence, final grouped review, exact-head gate,
-  publication, and cleanup.
+  release remains blocked on provider qualification and rights outcomes, complete onboarding and
+  clean-machine evidence, prerequisite-issue reconciliation, performance/fuzz/security evidence,
+  final grouped review, exact-head gate, publication, and cleanup.
 
 ## Documentation candidate and accepted-head truth
 
@@ -637,8 +642,9 @@ remote Dependabot branch remains open.
 This checkpoint does not close issues `#7`, `#25`, or `#31`. The authorized Coinbase Direct
 credential/network trace, provider terms confirmation, unresolved FRED/ALFRED durable-use release
 contract, exact-head provider evidence, final fuzz/performance/full-gate evidence, grouped Quarter
-4 review, and release publication remain open. Hosted Actions remains externally blocked before
-checkout by the GitHub account billing/spending state; it has not exposed a code-owned CI failure.
+4 review, and release publication remain open. At this 2026-07-26 checkpoint, Hosted Actions was
+externally blocked before checkout by the GitHub account billing/spending state and had not exposed
+a code-owned CI failure.
 
 ## 2026-07-26 five-family Treasury and Python release-matrix checkpoint
 
@@ -871,5 +877,45 @@ This is a verified implementation checkpoint, not final unchanged-head release a
 terminal provider report still requires the authorized Coinbase Direct credential trace, truthful
 SEC identity and CIK, exact FRED written service permission plus exact-series authority, and fresh
 official-provider responses against one unchanged candidate. The complete release evidence block,
-Quarter 4 grouped review, publication, and issue closeout remain open. Hosted Actions remains
-externally blocked before checkout by the GitHub account payment/spending-limit state.
+Quarter 4 grouped review, publication, and issue closeout remain open. At this 2026-07-26
+checkpoint, Hosted Actions was externally blocked before checkout by the GitHub account
+payment/spending-limit state.
+
+## 2026-07-28 cross-platform paper-recovery correctness checkpoint
+
+Exact product-capability commit `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae`, tree
+`0a8d5ab177b53d0496d6fecb8672f3262ae8e533`, closes the production paper-recovery sequence
+handoff found after the Kraken verticals adopted the shipping multi-thread Tokio scheduler.
+Startup recovery now waits for the short shared sequence critical section only inside its existing
+cancellation and deadline. Live and dispatcher producers remain nonblocking. No deadline, retry,
+serialization, queue, or assertion was weakened.
+
+Local verification on the clean unchanged code head passed the existing paper-adapter library
+suite (15 of 15), the complete application library suite (56 of 56), strict affected-package
+Clippy, formatting, Python source-closure admission for 862 exact source identities, generated
+artifact inspection, and diff hygiene. The existing typed Kraken-selection fixture now owns an
+isolated temporary data root and no longer leaks SQLite control state into the source tree; no test
+or test target was added.
+
+Hosted Actions
+[run 30366976240](https://github.com/Sawmonabo/market-squawk/actions/runs/30366976240)
+then completed successfully at that exact head:
+
+| Job | Duration | Result | Retained log SHA-256 |
+| --- | ---: | --- | --- |
+| Linux `verify` (`90300620390`) | 49m20s | Passed complete `scripts/verify.sh` | `cd099473c99177d1b56126def9c57bb1ff6395d93bd7e80a23d4f60edd1dfc45` |
+| Windows (`90300620276`) | 15m19s | Passed complete locked workspace test job | `2ebd8dee2601a747ebfc823887d2a77485c5945761f57d6980e8d15f3bb5b0ce` |
+| macOS (`90300620453`) | 25m50s | Passed complete locked all-feature workspace test job | `9ff06329b7ecbc7193e82dda32b919b6d067f5e60ac630561093fc0682058004` |
+
+Run metadata SHA-256 is
+`25b4d876a1d3afab388979e3f5e72c182a8bd5039ed252caa03f668144b860dd`.
+The detailed causal record and primary sources are maintained in the
+[CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) and its
+[evidence audit](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md). Raw hosted logs
+remain transient working evidence and are not tracked.
+
+The root generated target is 6.5 GiB, `.worktrees` is empty, incremental compilation remains
+disabled, and 153 GiB is free. PR `#26` remains the sole open pull request. Issues `#7`, `#25`, and
+`#31` remain open until their actual provider and terminal-release predicates close. This
+cross-platform correctness checkpoint does not close those predicates, does not implement the
+proposed CI sharding/cache redesign, and does not transfer exact-head evidence to a later commit.

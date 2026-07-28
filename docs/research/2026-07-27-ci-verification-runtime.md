@@ -7,11 +7,11 @@ approximately one-hour Linux verification feedback loop.
 | --- | --- |
 | Document type | Research and diagnostic decision record |
 | Audience | Maintainers, CI owners, release reviewers |
-| Status | Audited decision input; pipeline runtime correction not yet implemented or measured; correctness follow-up ongoing |
+| Status | Audited decision input; cross-platform correctness follow-up accepted; pipeline runtime correction not yet implemented or measured |
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest completed correctness candidate | `d02a2f14bd9e999ef1206b528d79528c72263016` |
+| Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -305,9 +305,24 @@ Candidate `d02a2f14bd9e999ef1206b528d79528c72263016` ran in
 
 This candidate supplies the previously missing hosted Windows proof for the platform and ONNX
 corrections. It also demonstrates that matching the Kraken vertical to the shipping multi-thread
-runtime exposed a real paper-recovery sequence handoff race on Linux. The current correction is
-locally verified but is not accepted until a later unchanged candidate passes the complete hosted
-Linux, macOS, and Windows jobs.
+runtime exposed a real paper-recovery sequence handoff race on Linux. The sequence correction was
+initially verified locally; acceptance required a later unchanged candidate to pass the complete
+hosted Linux, macOS, and Windows jobs.
+
+Candidate `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae`, tree
+`0a8d5ab177b53d0496d6fecb8672f3262ae8e533`, ran unchanged in
+[run 30366976240](https://github.com/Sawmonabo/market-squawk/actions/runs/30366976240):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| Linux verify | Passed | Complete job `90300620390` passed `scripts/verify.sh` in 49m20s |
+| Windows | Passed | Complete job `90300620276` passed in 15m19s, including both Kraken production verticals and 48 of 48 platform configuration/security tests |
+| macOS | Passed | Complete all-feature job `90300620453` passed in 25m50s, including both Kraken production verticals |
+
+This unchanged candidate accepts the paper-recovery sequence correction on all three hosted
+operating systems and closes the correctness follow-up described in this report. It does not
+implement or measure the proposed CI topology and cache changes, and it is not the terminal V1
+release approval.
 
 ### Linux authority-state lock lifetime
 
@@ -619,8 +634,11 @@ On paths that reach this wait, no recovery state is mutated before acquisition, 
 deadline expiry remains a no-op at this boundary.
 
 The existing paper-adapter library passed 15 of 15 tests and the complete application library
-passed 56 of 56 tests locally with the correction. This is focused diagnostic evidence, not
-release approval. Hosted Linux proof at the exact committed candidate remains required.
+passed 56 of 56 tests locally with the correction. Exact candidate `f8c2569` then passed the
+complete hosted Linux, Windows, and macOS jobs without a deadline increase, retry, test
+serialization, queue change, or assertion relaxation. This accepts the correction at that exact
+code head; it does not approve the terminal V1 release or transfer exact-head evidence to a later
+commit.
 
 ## Correction design
 
@@ -712,7 +730,7 @@ The correction is acceptable only when all of the following are true:
 6. Cache writes are limited to trusted events, contain no workspace output or secrets, and a cache
    miss remains fully reconstructive.
 7. Linux, macOS, and Windows jobs all report the same exact commit.
-8. The current Linux and Windows correctness failures are root-caused rather than retried away.
+8. The prior Linux and Windows correctness failures are root-caused rather than retried away.
 9. One unchanged candidate completes all required leaves before another candidate is submitted.
 10. Cold and warm wall time, cache transfer time, archive size, hit behavior, and release Cargo
     timing are recorded before any speedup is claimed.
