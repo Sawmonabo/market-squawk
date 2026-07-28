@@ -12,13 +12,13 @@ use std::num::NonZeroUsize;
 #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 use std::time::Duration;
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::atomic::{AtomicBool, AtomicUsize};
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::{Arc, Mutex};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::{Arc, Mutex};
 
 use market_squawk_domain::checked_arc_value_allocation_bytes;
@@ -31,7 +31,7 @@ pub(super) use lifecycle::OperationLifecycle;
         feature = "capture-benchmark",
         any(test, capture_bench_backend = "standard")
     ),
-    all(test, loom)
+    all(test, market_squawk_loom)
 ))]
 pub(super) use lifecycle::OperationRegistrationError;
 pub(super) use receiver::FixedReceiver;
@@ -184,7 +184,7 @@ impl<T> FixedQueue<T> {
             sender_count: AtomicUsize::new(1),
             operation_lifecycle: OperationLifecycle::new(),
             consumer_gate: Mutex::new(()),
-            #[cfg(not(loom))]
+            #[cfg(not(market_squawk_loom))]
             receiver_thread: Mutex::new(None),
             #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
             receiver_test_coordination: ReceiverTestCoordination::new(),
@@ -254,5 +254,5 @@ impl<T> FixedQueueControl<T> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, market_squawk_loom))]
 mod loom_model;

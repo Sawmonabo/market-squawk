@@ -2,13 +2,13 @@
 
 use std::sync::TryLockError;
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::Arc;
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::atomic::Ordering;
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::Arc;
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::atomic::Ordering;
 
 #[cfg(any(
@@ -97,7 +97,7 @@ impl<T> FixedSender<T> {
         }
     }
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(market_squawk_loom)))]
     pub(in crate::capture) fn try_send_after_registration_paused_for_test(
         &self,
         value: T,
@@ -137,7 +137,10 @@ impl<T> FixedSender<T> {
         })
     }
 
-    #[cfg(all(not(loom), any(test, all(feature = "capture-test", debug_assertions))))]
+    #[cfg(all(
+        not(market_squawk_loom),
+        any(test, all(feature = "capture-test", debug_assertions))
+    ))]
     pub(in crate::capture) fn try_clone_after_registration_paused_for_test(
         &self,
         entered: &std::sync::Barrier,

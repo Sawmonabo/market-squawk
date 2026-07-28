@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
 #[derive(Debug)]
 struct StopDuringVerification;
 
@@ -41,12 +44,24 @@ fn bounded_input_is_exact_and_rejects_growth_or_replacement() -> Result<(), Box<
     ));
 
     let growing = root.resolve("source.csv")?.open_bounded(3)?;
-    fs::write(directory.path().join("source.csv"), b"abcd")?;
-    assert!(matches!(
-        growing.read_bounded(),
-        Err(InputFileError::ByteLimitExceeded { max: 3 })
-    ));
-    fs::write(directory.path().join("source.csv"), b"abc")?;
+    match fs::write(directory.path().join("source.csv"), b"abcd") {
+        Ok(()) => {
+            assert!(matches!(
+                growing.read_bounded(),
+                Err(InputFileError::ByteLimitExceeded { max: 3 })
+            ));
+            fs::write(directory.path().join("source.csv"), b"abc")?;
+        }
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
+                drop(growing);
+            }
+            #[cfg(not(windows))]
+            return Err(error.into());
+        }
+    }
 
     let pending = root.resolve("source.csv")?;
     fs::rename(

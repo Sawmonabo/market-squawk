@@ -32,7 +32,7 @@ proptest = { workspace = true }
 static_assertions = { workspace = true }
 tokio = { workspace = true }
 
-[target.'cfg(loom)'.dev-dependencies]
+[target.'cfg(market_squawk_loom)'.dev-dependencies]
 loom = { workspace = true }
 
 [[test]]

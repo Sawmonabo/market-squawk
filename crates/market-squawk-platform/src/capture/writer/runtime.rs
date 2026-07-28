@@ -468,7 +468,7 @@ pub(super) fn prepare_writer_runtime(
     })
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, market_squawk_loom))]
 mod loom_model;
 
 #[cfg(test)]

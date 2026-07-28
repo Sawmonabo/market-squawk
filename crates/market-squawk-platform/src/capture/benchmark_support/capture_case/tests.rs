@@ -1,10 +1,10 @@
 use super::*;
 
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 #[derive(Debug)]
 struct BarrierReleaseGuard(Option<Arc<Barrier>>);
 
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 impl BarrierReleaseGuard {
     fn release(&mut self) {
         if let Some(barrier) = self.0.take() {
@@ -13,7 +13,7 @@ impl BarrierReleaseGuard {
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 impl Drop for BarrierReleaseGuard {
     fn drop(&mut self) {
         self.release();
@@ -201,7 +201,7 @@ fn benchmark_shutdown_timeout_returns_pending_owner_without_blocking_drop()
     Ok(())
 }
 
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 #[test]
 fn shutdown_drains_a_send_admitted_before_close_registration()
 -> Result<(), Box<dyn std::error::Error>> {

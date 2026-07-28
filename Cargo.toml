@@ -157,7 +157,7 @@ unsafe_code = "forbid"
 unreachable_pub = "warn"
 unused_must_use = "deny"
 missing_debug_implementations = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(market_squawk_loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

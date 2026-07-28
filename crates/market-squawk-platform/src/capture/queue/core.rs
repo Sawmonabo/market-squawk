@@ -1,15 +1,15 @@
 //! Queue slot ownership, ring state, and terminal lifecycle transitions.
 
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::TryLockError;
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::Mutex;
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::Mutex;
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::lifecycle::{OperationFinishError, OperationLifecycle, OperationRegistrationError};
@@ -33,7 +33,7 @@ pub(super) struct QueueCore<T> {
     pub(super) sender_count: AtomicUsize,
     pub(super) operation_lifecycle: OperationLifecycle,
     pub(super) consumer_gate: Mutex<()>,
-    #[cfg(not(loom))]
+    #[cfg(not(market_squawk_loom))]
     pub(super) receiver_thread: Mutex<Option<std::thread::Thread>>,
     #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
     pub(super) receiver_test_coordination: ReceiverTestCoordination,
@@ -65,7 +65,7 @@ impl<T> QueueCore<T> {
     }
 
     pub(super) fn notify_receiver(&self) {
-        #[cfg(not(loom))]
+        #[cfg(not(market_squawk_loom))]
         {
             let registered = match self.receiver_thread.try_lock() {
                 Ok(registered) => registered,
@@ -78,7 +78,7 @@ impl<T> QueueCore<T> {
         }
     }
 
-    #[cfg(not(loom))]
+    #[cfg(not(market_squawk_loom))]
     pub(super) fn clear_receiver_thread(&self) -> Result<(), QueueControlError> {
         match self.receiver_thread.lock() {
             Ok(mut registered) => {
@@ -115,9 +115,9 @@ impl<T> QueueCore<T> {
 
     fn wait_for_active_operations(&self) {
         while self.operation_lifecycle.active_operations() != 0 {
-            #[cfg(loom)]
+            #[cfg(market_squawk_loom)]
             loom::thread::yield_now();
-            #[cfg(not(loom))]
+            #[cfg(not(market_squawk_loom))]
             std::thread::yield_now();
         }
     }

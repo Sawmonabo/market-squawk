@@ -2,13 +2,19 @@
 
 use std::time::{Duration, Instant};
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::Arc;
-#[cfg(all(loom, any(test, all(feature = "capture-test", debug_assertions))))]
+#[cfg(all(
+    market_squawk_loom,
+    any(test, all(feature = "capture-test", debug_assertions))
+))]
 use loom::sync::atomic::Ordering;
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::Arc;
-#[cfg(all(not(loom), any(test, all(feature = "capture-test", debug_assertions))))]
+#[cfg(all(
+    not(market_squawk_loom),
+    any(test, all(feature = "capture-test", debug_assertions))
+))]
 use std::sync::atomic::Ordering;
 
 use super::core::QueueCore;
@@ -55,9 +61,9 @@ impl<T> FixedReceiver<T> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
-        #[cfg(not(loom))]
+        #[cfg(not(market_squawk_loom))]
         let mut registered_for_wait = Some(registered_for_wait);
-        #[cfg(loom)]
+        #[cfg(market_squawk_loom)]
         let _registered_for_wait = registered_for_wait;
         loop {
             match self.core.try_pop() {
@@ -83,7 +89,7 @@ impl<T> FixedReceiver<T> {
             if remaining.is_zero() {
                 return Err(RecvTimeoutError::Timeout);
             }
-            #[cfg(not(loom))]
+            #[cfg(not(market_squawk_loom))]
             {
                 let current = std::thread::current();
                 let mut registered = match self.core.receiver_thread.lock() {
@@ -118,7 +124,7 @@ impl<T> FixedReceiver<T> {
                     }
                 }
             }
-            #[cfg(loom)]
+            #[cfg(market_squawk_loom)]
             {
                 before_park();
                 loom::thread::yield_now();
@@ -126,7 +132,7 @@ impl<T> FixedReceiver<T> {
         }
     }
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(market_squawk_loom)))]
     pub(in crate::capture) fn recv_timeout_with_registration_paused_for_test(
         &self,
         timeout: Duration,
@@ -143,7 +149,7 @@ impl<T> FixedReceiver<T> {
         )
     }
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(market_squawk_loom)))]
     pub(in crate::capture) fn recv_timeout_with_each_park_paused_for_test(
         &self,
         timeout: Duration,
@@ -174,7 +180,7 @@ impl<T> FixedReceiver<T> {
 
 impl<T> Drop for FixedReceiver<T> {
     fn drop(&mut self) {
-        #[cfg(not(loom))]
+        #[cfg(not(market_squawk_loom))]
         let _registered_thread = self.core.clear_receiver_thread();
         let _cleanup = self.core.close_and_drain();
     }

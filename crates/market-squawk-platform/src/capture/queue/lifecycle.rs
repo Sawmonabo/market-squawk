@@ -1,8 +1,8 @@
 //! Linearized admission and closure for queue operations.
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CLOSED: usize = 1_usize << (usize::BITS - 1);

@@ -2,13 +2,13 @@
 
 use std::time::{Duration, Instant};
 
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::atomic::{AtomicBool, Ordering};
-#[cfg(loom)]
+#[cfg(market_squawk_loom)]
 use loom::sync::{Condvar, Mutex};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 use std::sync::{Condvar, Mutex};
 use thiserror::Error;
 

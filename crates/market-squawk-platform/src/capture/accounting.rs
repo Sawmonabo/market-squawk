@@ -498,5 +498,5 @@ impl Drop for TransitionGuard<'_> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, market_squawk_loom))]
 mod loom_model;

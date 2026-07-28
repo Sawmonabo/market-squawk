@@ -61,7 +61,7 @@ cap-std = { workspace = true }
 rustix = { workspace = true }
 sha2 = { workspace = true }
 
-[target.'cfg(loom)'.dependencies]
+[target.'cfg(market_squawk_loom)'.dependencies]
 loom = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

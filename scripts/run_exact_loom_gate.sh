@@ -98,7 +98,7 @@ if [[ "$expected_count" != "$expected_unique_count" ]]; then
   exit 2
 fi
 
-export RUSTFLAGS='--cfg loom'
+export RUSTFLAGS='--cfg market_squawk_loom'
 export CARGO_INCREMENTAL=0
 
 common_arguments=(

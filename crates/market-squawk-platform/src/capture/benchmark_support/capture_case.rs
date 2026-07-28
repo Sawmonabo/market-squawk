@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(market_squawk_loom)))]
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -23,7 +23,7 @@ use super::super::{
     CaptureWriterOutcome, CaptureWriterPolicy, DiagnosticCaptureBundle, DiagnosticCaptureFrame,
     RawCaptureControl, benchmark_capture_channel,
 };
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(market_squawk_loom)))]
 use super::fixture::MessageFactory;
 use super::fixture::{
     channel_limits, fixture_identity, next_destination, prepare_fixture, process_infrastructure,

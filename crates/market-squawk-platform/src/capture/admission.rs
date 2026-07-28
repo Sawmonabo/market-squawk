@@ -70,7 +70,7 @@ impl<B: CaptureAuthorityBundle, T: CaptureQueueTransport> CapturePublisherCore<B
         self.sender
     }
 
-    #[cfg(all(test, not(loom), feature = "capture-benchmark"))]
+    #[cfg(all(test, not(market_squawk_loom), feature = "capture-benchmark"))]
     pub(super) fn benchmark_state_for_test(&self) -> Arc<CaptureState<B>> {
         Arc::clone(&self.state)
     }
@@ -457,7 +457,7 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
     ///
     /// This boundary exists only in debug builds with the internal `capture-test` feature. It
     /// exposes no queue state and does not change production clone behavior.
-    #[cfg(all(feature = "capture-test", debug_assertions, not(loom)))]
+    #[cfg(all(feature = "capture-test", debug_assertions, not(market_squawk_loom)))]
     #[doc(hidden)]
     pub fn try_clone_after_registration_paused_for_test(
         &self,

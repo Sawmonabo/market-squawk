@@ -81,7 +81,7 @@ impl LifecycleAtomic for AtomicU64 {
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, market_squawk_loom))]
 impl LifecycleAtomic for loom::sync::atomic::AtomicU64 {
     fn load(&self, ordering: Ordering) -> u64 {
         self.load(ordering)
@@ -519,7 +519,7 @@ mod tests {
         }
     }
 
-    #[cfg(loom)]
+    #[cfg(market_squawk_loom)]
     mod loom_model {
         use std::time::Duration;
 

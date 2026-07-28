@@ -11,9 +11,10 @@ Run the checked-in gate from the repository root:
 ./scripts/check_authority_lifecycle_loom.sh
 ```
 
-The script compiles every `market-squawk-sources` target under `cfg(loom)` with strict Clippy and
-then runs the lifecycle model in release mode on one test runner thread. `scripts/verify.sh` invokes
-the same gate, so the model cannot silently disappear from the documented release verification.
+The script compiles every `market-squawk-sources` target under `cfg(market_squawk_loom)` with strict
+Clippy and then runs the lifecycle model in release mode on one test runner thread.
+`scripts/verify.sh` invokes the same gate, so the model cannot silently disappear from the
+documented release verification.
 
 ## Model boundary
 

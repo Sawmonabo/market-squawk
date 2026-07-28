@@ -178,7 +178,7 @@ fn receiver_drop_rejects_future_sends_and_releases_items() -> Result<(), Box<dyn
 }
 
 #[test]
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 fn receiver_drop_releases_the_registered_thread_from_fixed_queue_storage()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver, control, receipt) = FixedQueue::<u8>::try_new(NonZeroUsize::MIN)?;
@@ -271,7 +271,7 @@ fn ordinary_consumer_slot_overlap_never_refuses_capacity_permitted_send()
 }
 
 #[test]
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 fn waiter_registration_try_lock_miss_is_closed_by_pre_park_recheck()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver, _control, _receipt) = FixedQueue::try_new(NonZeroUsize::MIN)?;
@@ -296,7 +296,7 @@ fn waiter_registration_try_lock_miss_is_closed_by_pre_park_recheck()
 }
 
 #[test]
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 fn receiver_pause_request_cannot_be_lost_during_waiter_registration()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver, control, _receipt) = FixedQueue::try_new(NonZeroUsize::MIN)?;
@@ -342,7 +342,7 @@ fn receiver_pause_request_cannot_be_lost_during_waiter_registration()
 }
 
 #[test]
-#[cfg(not(loom))]
+#[cfg(not(market_squawk_loom))]
 fn final_failed_operation_wakes_a_receiver_that_reparked_before_terminal_close()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver, control, _receipt) = FixedQueue::<u8>::try_new(NonZeroUsize::MIN)?;
