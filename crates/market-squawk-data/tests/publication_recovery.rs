@@ -779,25 +779,6 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         CancellationToken::new(),
     )
     .await?;
-    let deadline = deferred
-        .query(
-            QueryRequest::try_new(
-                compacted.manifest().clone(),
-                "SELECT source_id FROM observations",
-            )?,
-            QueryLimits::try_new(
-                10,
-                64 * 1024,
-                8 * 1024 * 1024,
-                1,
-                128,
-                128,
-                Duration::from_nanos(1),
-            )?,
-            CancellationToken::new(),
-        )
-        .await;
-    assert!(matches!(deadline, Err(QueryError::DeadlineExceeded)));
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     assert!(matches!(

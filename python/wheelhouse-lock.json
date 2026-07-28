@@ -1022,8 +1022,8 @@
     },
     {
       "path": "apps/market-squawk/src/artifact_repository.rs",
-      "sha256": "d59f5308ca96ae22534c2d28093e91caae008dde40bdf802328a90c90fc8b465",
-      "size_bytes": 29680
+      "sha256": "dbb390be28413abf512fd206be11522afc6b8324c0c9ff3282cdb859ccba9cfa",
+      "size_bytes": 29003
     },
     {
       "path": "apps/market-squawk/src/backtest_service.rs",
