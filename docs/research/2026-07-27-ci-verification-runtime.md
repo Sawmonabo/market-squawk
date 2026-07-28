@@ -7,11 +7,11 @@ approximately one-hour Linux verification feedback loop.
 | --- | --- |
 | Document type | Research and diagnostic decision record |
 | Audience | Maintainers, CI owners, release reviewers |
-| Status | Audited decision input; runtime correction not yet implemented or measured |
+| Status | Audited decision input; pipeline runtime correction not yet implemented or measured; correctness follow-up ongoing |
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `605362c495e6b139ccdbbdda85d86a69de96eb18` |
+| Latest completed correctness candidate | `d02a2f14bd9e999ef1206b528d79528c72263016` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -279,6 +279,35 @@ harness passed 13 of 13 tests in 4.26 seconds. It then reached
 returned the wrong public classification, one repair path could not replace an open destination,
 and one build-input check did not detect a same-length rewrite. These are newly reached
 cross-platform defects rather than ONNX regressions.
+
+Candidate `0039429a756f475e12e21083e7b91570830aba34` ran in
+[run 30359382270](https://github.com/Sawmonabo/market-squawk/actions/runs/30359382270):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| macOS | Passed | Complete job `90275079124` passed in 21m33s |
+| Linux verify | Passed | Complete job `90275079203` passed in 52m52s |
+| Windows | Failed | Job `90275079128` reached the application library, where one of 51 tests exhausted its existing Kraken acknowledgement deadline |
+
+The Linux and macOS jobs provide hosted evidence for the authority-residue, open-destination, and
+build-input corrections. Windows stopped in the earlier Kraken production vertical before reaching
+the platform configuration/security harness, so this candidate did not establish their Windows
+behavior.
+
+Candidate `d02a2f14bd9e999ef1206b528d79528c72263016` ran in
+[run 30363692902](https://github.com/Sawmonabo/market-squawk/actions/runs/30363692902):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| macOS | Passed | Complete job `90289414582` passed in 27m19s |
+| Windows | Passed | Complete job `90289414559` passed in 16m02s, including 51 of 51 application-library tests and 48 of 48 platform configuration/security tests |
+| Linux verify | Failed | Job `90289414652` reached the Kraken production vertical, where paper recovery returned `RecoveryInitialization(Control(Adapter(NotAttemptedBusy)))` |
+
+This candidate supplies the previously missing hosted Windows proof for the platform and ONNX
+corrections. It also demonstrates that matching the Kraken vertical to the shipping multi-thread
+runtime exposed a real paper-recovery sequence handoff race on Linux. The current correction is
+locally verified but is not accepted until a later unchanged candidate passes the complete hosted
+Linux, macOS, and Windows jobs.
 
 ### Linux authority-state lock lifetime
 
@@ -555,8 +584,43 @@ second digest, bounded length, single-link rule, and handle identity must all ag
 read. Rust source-tree inventory applies the same two-read proof to each source and retains the
 root directory handle while checking that the named root still has the same identity at the end.
 This closes both same-length content substitution and path-replacement windows without trusting
-timestamp precision. The local macOS platform harness and strict platform Clippy gate pass; hosted
-Windows evidence remains required before this correction is accepted.
+timestamp precision. Candidate `d02a2f1` subsequently passed all 48 Windows platform
+configuration/security tests, supplying the hosted evidence that candidate `0039429` could not
+reach.
+
+### Tokio runtime topology and paper-recovery sequence handoff
+
+The Kraken production verticals formerly used plain `#[tokio::test]`. Tokio 1.53.1 documents that
+this creates a separate single-threaded current-thread runtime for each test, while
+`flavor = "multi_thread"` uses the same scheduler family as `Builder::new_multi_thread` in the
+shipping application
+([Tokio test runtime](https://docs.rs/tokio/1.53.1/tokio/attr.test.html)).
+Candidate `0039429` exhausted the existing Kraken acknowledgement deadline on Windows under that
+nonrepresentative topology. The correction changed only the two production verticals to a
+two-worker multi-thread runtime. Candidate `d02a2f1` then passed the complete Windows job and both
+verticals without increasing deadlines, adding retries, serializing tests, or relaxing assertions.
+
+The representative scheduler exposed a production race in the paper adapter. A producer held the
+shared event-sequence mutex while placing `InitializeRecovery` on the bounded worker queue. On
+another runtime worker, the receiver could process that command before the producer returned and
+dropped the mutex guard. Recovery used a nonblocking `try_lock`, so a valid in-flight handoff became
+public `NotAttemptedBusy`. The current-thread test runtime had hidden the ordering because the
+receiver could not run until the sender yielded.
+
+The bounded correction uses a Tokio mutex for the shared sequence. Live market and dispatcher
+producers retain nonblocking `try_lock` behavior. Only startup recovery may await the short
+producer critical section, and that wait remains inside the existing control cancellation and
+deadline using a biased `tokio::select!` with cancellation and deadline first. Tokio documents that
+its async mutex yields rather than blocking a runtime thread, that `try_lock` remains nonblocking,
+and that canceling `lock` loses only queue position
+([Tokio mutex](https://docs.rs/tokio/1.53.1/tokio/sync/struct.Mutex.html),
+[`tokio::select!` cancellation behavior](https://docs.rs/tokio/1.53.1/tokio/macro.select.html)).
+On paths that reach this wait, no recovery state is mutated before acquisition, so cancellation or
+deadline expiry remains a no-op at this boundary.
+
+The existing paper-adapter library passed 15 of 15 tests and the complete application library
+passed 56 of 56 tests locally with the correction. This is focused diagnostic evidence, not
+release approval. Hosted Linux proof at the exact committed candidate remains required.
 
 ## Correction design
 
@@ -705,6 +769,9 @@ The platform-contract sources added during the correctness follow-up were review
 - [Exact Rust 1.97.1 Windows error mapping](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/io/error/windows.rs)
 - [Exact Rust 1.97.1 Windows rename implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/fs/windows.rs)
 - [Tokio 1.53.1 oneshot receiver](https://docs.rs/tokio/1.53.1/tokio/sync/oneshot/struct.Receiver.html)
+- [Tokio 1.53.1 test runtime](https://docs.rs/tokio/1.53.1/tokio/attr.test.html)
+- [Tokio 1.53.1 mutex](https://docs.rs/tokio/1.53.1/tokio/sync/struct.Mutex.html)
+- [Tokio 1.53.1 `select!`](https://docs.rs/tokio/1.53.1/tokio/macro.select.html)
 
 ### Operating-system and analytical-storage contracts
 

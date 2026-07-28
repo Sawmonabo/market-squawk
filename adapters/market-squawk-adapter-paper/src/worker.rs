@@ -12,7 +12,7 @@ use market_squawk_execution::{
     PersistenceAcknowledgement, ReconcileOrders, ReconciliationAcknowledgement,
     ReconciliationBatchBinding, RecoverExecutionState,
 };
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{PaperAuditKind, PaperAuditRecord};
@@ -155,7 +155,7 @@ pub(crate) struct PaperWorker {
     cancellation: CancellationToken,
     reconciliation_fence: Option<AccountRiskReconciliationFence>,
     financial_changes: watch::Sender<u64>,
-    event_sequence: Arc<std::sync::Mutex<u64>>,
+    event_sequence: Arc<Mutex<u64>>,
 }
 
 #[derive(Debug)]
@@ -258,7 +258,7 @@ impl PaperWorker {
         cancellation: CancellationToken,
         reconciliation_fence: Option<AccountRiskReconciliationFence>,
         financial_changes: watch::Sender<u64>,
-        event_sequence: Arc<std::sync::Mutex<u64>>,
+        event_sequence: Arc<Mutex<u64>>,
         recovery_input_digest: Option<[u8; 32]>,
     ) -> Self {
         let recovery_pending = checkpoint.is_some();
@@ -361,7 +361,7 @@ impl PaperWorker {
                     } = envelope;
                     match event {
                         WorkerEvent::Command(command) => {
-                            if self.handle_command(sequence, command) {
+                            if self.handle_command(sequence, command).await {
                                 break;
                             }
                         }
@@ -374,7 +374,7 @@ impl PaperWorker {
         }
     }
 
-    fn handle_command(&mut self, event_sequence: u64, command: WorkerCommand) -> bool {
+    async fn handle_command(&mut self, event_sequence: u64, command: WorkerCommand) -> bool {
         match command {
             WorkerCommand::Submit { order, reply } => {
                 let result = if self.state.recovery_pending {
@@ -480,7 +480,7 @@ impl PaperWorker {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
                 } else {
-                    self.initialize_recovery()
+                    self.initialize_recovery(&control).await
                 };
                 let _ = reply.send(result);
                 false
@@ -498,7 +498,10 @@ impl PaperWorker {
         }
     }
 
-    fn initialize_recovery(&mut self) -> Result<PaperRecoveryInitialization, PaperControlError> {
+    async fn initialize_recovery(
+        &mut self,
+        control: &PaperControlContext,
+    ) -> Result<PaperRecoveryInitialization, PaperControlError> {
         self.refresh_audit_health();
         if !self.state.recovery_pending || self.audit_failed.load(AtomicOrdering::Acquire) {
             return Err(PaperControlError::RecoveryInitializationUnavailable);
@@ -533,10 +536,15 @@ impl PaperWorker {
                         PaperControlError::RecoveryInitializationUnavailable
                     }
                 })?;
-        let mut event_sequence = self
-            .event_sequence
-            .try_lock()
-            .map_err(|_| PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy))?;
+        let cancellation = control.cancellation();
+        let mut event_sequence = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(PaperControlError::Cancelled),
+            () = tokio::time::sleep_until(control.deadline()) => {
+                return Err(PaperControlError::DeadlineExceeded);
+            }
+            sequence = self.event_sequence.lock() => sequence,
+        };
         let recovery_permit = permits
             .next()
             .ok_or(PaperControlError::RecoveryInitializationUnavailable)?;

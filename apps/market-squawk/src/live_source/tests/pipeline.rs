@@ -16,6 +16,7 @@ use super::super::{
 #[test]
 fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
 -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
     let json = r#"{
       "endpoint":"wss://ws.kraken.com/v2",
       "channel":"book",
@@ -56,7 +57,10 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
     let config = AppConfig::load(ConfigSources::new(
         None,
         &environment,
-        ConfigOverrides::default(),
+        ConfigOverrides {
+            data_dir: Some(temporary.path().join("data")),
+            ..ConfigOverrides::default()
+        },
     ))?;
     let kraken = config.kraken().ok_or("Kraken source profile missing")?;
     let route = LiveRouteConfig::try_new(LiveRouteConfigInput {

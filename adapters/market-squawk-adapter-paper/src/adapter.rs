@@ -1,7 +1,7 @@
 //! Bounded public adapter, market ingress, audit, and owned worker lifecycle.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::Timestamp;
@@ -13,7 +13,7 @@ use market_squawk_execution::{
     ReconciliationAcknowledgement,
 };
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::PaperCheckpointRepository;
@@ -166,7 +166,7 @@ impl PaperExecutionAdapter {
         )
         .map_err(|error| match error {
             EnqueueError::Busy | EnqueueError::Full => ExecutionAdapterError::NotAttemptedBusy,
-            EnqueueError::Closed | EnqueueError::Poisoned | EnqueueError::SequenceExhausted => {
+            EnqueueError::Closed | EnqueueError::SequenceExhausted => {
                 ExecutionAdapterError::KnownFailure
             }
         })
@@ -345,9 +345,7 @@ impl ExecutionMarketSink for PaperMarketIngress {
         .map_err(|error| match error {
             EnqueueError::Busy | EnqueueError::Full => ExecutionMarketSinkError::Saturated,
             EnqueueError::Closed => ExecutionMarketSinkError::Closed,
-            EnqueueError::Poisoned | EnqueueError::SequenceExhausted => {
-                ExecutionMarketSinkError::RetainedSize
-            }
+            EnqueueError::SequenceExhausted => ExecutionMarketSinkError::RetainedSize,
         })
     }
 
@@ -767,11 +765,7 @@ fn try_send_event(
     slot: OwnedSemaphorePermit,
     retained_bytes: Option<OwnedSemaphorePermit>,
 ) -> Result<(), EnqueueError> {
-    let mut sequence = match sequence.try_lock() {
-        Ok(sequence) => sequence,
-        Err(TryLockError::WouldBlock) => return Err(EnqueueError::Busy),
-        Err(TryLockError::Poisoned(_)) => return Err(EnqueueError::Poisoned),
-    };
+    let mut sequence = sequence.try_lock().map_err(|_| EnqueueError::Busy)?;
     let next = sequence
         .checked_add(1)
         .ok_or(EnqueueError::SequenceExhausted)?;
@@ -849,10 +843,8 @@ fn try_send_control_once(
     slot: &mut Option<OwnedSemaphorePermit>,
     retained_bytes: &mut Option<OwnedSemaphorePermit>,
 ) -> ControlEnqueueOutcome {
-    let mut sequence = match sequence.try_lock() {
-        Ok(sequence) => sequence,
-        Err(TryLockError::WouldBlock) => return ControlEnqueueOutcome::Retry,
-        Err(TryLockError::Poisoned(_)) => return ControlEnqueueOutcome::Closed,
+    let Ok(mut sequence) = sequence.try_lock() else {
+        return ControlEnqueueOutcome::Retry;
     };
     let Some(next) = sequence.checked_add(1) else {
         return ControlEnqueueOutcome::Closed;
@@ -895,7 +887,6 @@ enum EnqueueError {
     Busy,
     Full,
     Closed,
-    Poisoned,
     SequenceExhausted,
 }
 

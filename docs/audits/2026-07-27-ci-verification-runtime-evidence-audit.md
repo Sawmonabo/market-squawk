@@ -11,7 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `605362c495e6b139ccdbbdda85d86a69de96eb18` |
+| Latest completed correctness candidate | `d02a2f14bd9e999ef1206b528d79528c72263016` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -35,7 +35,8 @@ The audit compared the research report with:
 - a two-pass Cargo fingerprint reproduction;
 - the Linux authority-lock, Windows analytical-backup, and manifest-allocation implementations;
 - the unchanged Windows job rerun and file-adapter clock/deadline fixture;
-- the Windows ONNX worker's resource profile and pinned Job Object dependency; and
+- the Windows ONNX worker's resource profile and pinned Job Object dependency;
+- the Kraken vertical runtime topology and paper-recovery sequence handoff; and
 - the relevant Linux, Windows, Rust, and SQLite platform contracts.
 
 ## Findings
@@ -124,6 +125,22 @@ speedup.
   a same-length rewrite. Capability-handle metadata from `cap-fs-ext 4.0.2`, a second no-follow
   open, a second bounded hash, and retained root-directory identity make the Windows boundary
   content- and identity-based rather than timestamp-dependent.
+- Exact candidate `0039429` passed the complete Linux and macOS jobs. Windows stopped in the
+  application library's Kraken vertical before reaching the platform configuration/security
+  harness, so it did not provide Windows acceptance evidence for the platform corrections.
+- Tokio 1.53.1 documents that plain `#[tokio::test]` uses a separate current-thread runtime while
+  the explicit multi-thread flavor is equivalent to a multi-thread runtime builder. Exact
+  candidate `d02a2f1` passed the complete Windows job after the two Kraken production verticals
+  adopted the representative two-worker topology; all 48 platform configuration/security tests
+  also passed.
+- The same `d02a2f1` candidate passed macOS but failed Linux when paper recovery returned
+  `NotAttemptedBusy`. The producer still held the shared event-sequence mutex while enqueueing
+  recovery, and the multi-thread worker could receive the command before that guard dropped. This
+  is a production handoff race, not queue saturation or a deadline failure.
+- The bounded correction keeps live producer acquisition nonblocking while allowing only startup
+  recovery to await the sequence mutex under its existing cancellation and deadline. Tokio's
+  mutex and `select!` contracts support that design. The unchanged paper and application library
+  surfaces pass locally; hosted exact-candidate evidence remains required.
 
 The retained diagnostic log identities were:
 
@@ -144,6 +161,12 @@ The retained diagnostic log identities were:
 | Candidate `605362c` Windows job `90260430186` | `33bf821efd984f0646afe8bde79fb23f34e3d1182bd2c046764ab48ec31886af` |
 | Candidate `605362c` macOS job `90260430125` | `5c44cf3d3c4f4968a0ce3d7221c45261f902f2e0e2570c468f2074cc74c628e3` |
 | Candidate `605362c` Linux job `90260430159` | `93e2345ba46d5d54a368e57b045179891ed6be5d6ee47d1449d38b63c63045cf` |
+| Candidate `0039429` Windows job `90275079128` | `f1c3394edb1ac14b215acbc99b25e01c7fcb23bafd7b524981fb64bbdff0fe8f` |
+| Candidate `0039429` macOS job `90275079124` | `5576172b03fab14bdd48aa86f6269bd14cc4fa7f5e179052b6f0f7af7711109d` |
+| Candidate `0039429` Linux job `90275079203` | `8648a47dd706ce02530ea21f40108be1b472dda8c83e77ce630ad9aad9db3723` |
+| Candidate `d02a2f1` Windows job `90289414559` | `d55d41d1756751d10ecff1432369dca192837ecacaab2a47e1a34997ec62f697` |
+| Candidate `d02a2f1` macOS job `90289414582` | `8ef872ed2fa60f608c2fcf393e5bd62f5eb2fc79a5d587e50064e65fab29a5f4` |
+| Candidate `d02a2f1` Linux job `90289414652` | `7e5f3677549a5b3432592a27d2a5e6cec2d9fe5b14f98cb50b5a0a7da4e13304` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -154,7 +177,7 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 
 | Category | Listed sources | Audit result |
 | --- | ---: | --- |
-| Cargo, Rust, and toolchain documentation, including exact source | 23 | Covered |
+| Cargo, Rust, and toolchain documentation, including exact source | 26 | Covered |
 | Operating-system, storage, and locked-dependency contracts | 20 | Covered |
 | Official GitHub documentation and maintained CI tools | 9 | Covered |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
@@ -187,9 +210,13 @@ numerical forecast.
   cases.
 - Exact candidate `605362c` passed the complete Linux and macOS jobs. Windows passed all 13
   modeling contracts, then exposed four platform authority and build-input cases.
-- The new Windows authority and build-input diagnosis is grounded in the exact locked dependency
-  and Rust 1.97.1 sources plus current Microsoft filesystem contracts. The local correction has
-  focused macOS and strict Clippy evidence but remains pending hosted Windows proof.
+- Exact candidate `0039429` passed Linux and macOS but stopped in the Windows Kraken vertical
+  before reaching the platform corrections.
+- Exact candidate `d02a2f1` passed complete Windows and macOS jobs. Windows established the
+  platform corrections; Linux exposed the paper-recovery sequence handoff under the representative
+  multi-thread runtime.
+- The paper-recovery correction has focused local evidence and a source-backed bounded-wait design,
+  but remains pending hosted exact-candidate proof.
 - The correctness fixes are not release evidence until one unchanged candidate passes Linux,
   macOS, and Windows.
 - The audit verdict approves this report as decision input. It is not release approval and not
