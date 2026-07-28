@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `f7c7712a95654230abc40f6e6d43a297e0dab210` |
+| Correctness follow-up candidate | `605362c495e6b139ccdbbdda85d86a69de96eb18` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -253,13 +253,32 @@ Candidate `f7c7712a95654230abc40f6e6d43a297e0dab210` completed in
 | --- | --- | --- |
 | Linux verify | Passed | Complete job `90241570286` passed in 59m14s |
 | macOS | Passed | Complete job `90241570407` passed in 26m44s |
-| Windows | Failed | Job `90241570389` passed the lock, catalog, data, and MCP corrections, then reached the Windows ONNX worker for the first time |
+| Windows | Failed | Job `90241570389` passed the previously failing boundaries reached before modeling, then reached the Windows ONNX worker for the first time |
 
 The Windows modeling harness ran 13 tests: 10 passed and three helper-backed tests returned
 `WarmUp`. The previous Windows job `90227935382` did not run this harness; its earlier
 13-test entry was the Coinbase unit suite, and the job stopped in the data catalog tests.
 Candidate `f7c7712` is therefore the first retained hosted Windows evidence for this worker
-boundary, not a regression from a prior Windows modeling pass.
+boundary, not a regression from a prior Windows modeling pass. It stopped at modeling before
+Cargo reached the later platform `configuration_security` harness, so it did not establish that
+the platform authority-residue, replacement, or build-input mutation cases passed on Windows.
+
+Candidate `605362c495e6b139ccdbbdda85d86a69de96eb18` ran in
+[run 30354812388](https://github.com/Sawmonabo/market-squawk/actions/runs/30354812388):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| macOS | Passed | Complete job `90260430125` passed in 17m47s |
+| Linux verify | Passed | Complete job `90260430159` passed in 58m22s |
+| Windows | Failed | Job `90260430186` passed all 13 modeling contracts, then exposed four later platform failures |
+
+This candidate confirms unchanged Linux and macOS behavior after the ONNX correction. The Windows
+run is positive hosted evidence for the corrected ONNX committed-memory profile: the modeling
+harness passed 13 of 13 tests in 4.26 seconds. It then reached
+`configuration_security`, where 44 tests passed and four failed. Two authority-residue cases
+returned the wrong public classification, one repair path could not replace an open destination,
+and one build-input check did not detect a same-length rewrite. These are newly reached
+cross-platform defects rather than ONNX regressions.
 
 ### Linux authority-state lock lifetime
 
@@ -479,6 +498,66 @@ Release authority still requires one unchanged candidate to pass the complete Li
 Windows jobs. These corrections remove cross-platform classification and cross-session ownership
 defects; they do not normalize or retry the failures.
 
+### Windows authority residue and open-destination replacement
+
+Two newly reached authority-state cases had one direct classification defect. Windows publication
+uses a rename-based temporary rather than Unix's hard-link installation protocol. An unexpected
+reserved temporary at store-open time therefore has no retained identity proof tying it to a
+completed publication. Returning `RecoveryRequired` treated both a user-created orphan and a
+hard-linked reserved entry as recoverable state. The fail-closed contract is
+`UnsafeFileType`: Windows accepts no open-time publication residue that it cannot prove.
+
+The trailing-byte repair failure had a separate cause. Its destination remained open through a
+handle created with Rust's default Windows share flags, which include read, write, and delete
+sharing
+([Rust Windows `OpenOptionsExt`](https://doc.rust-lang.org/std/os/windows/fs/trait.OpenOptionsExt.html)).
+The pinned `atomicwrites 0.4.4` replacement calls `MoveFileExW` directly, and its upstream tracker
+records the same Windows overwrite failure with access-denied error 5
+([exact `atomicwrites 0.4.4` implementation](https://github.com/untitaker/rust-atomicwrites/blob/0.4.4/src/lib.rs),
+[`atomicwrites` issue 35](https://github.com/untitaker/rust-atomicwrites/issues/35)).
+
+Rust 1.97.1's `std::fs::rename` first calls `MoveFileExW`. On access denied, it reopens the source
+for delete access and attempts `SetFileInformationByHandle(FileRenameInfoEx)` with replace-existing
+and POSIX-semantics flags
+([Rust `rename`](https://doc.rust-lang.org/std/fs/fn.rename.html),
+[exact Rust 1.97.1 Windows implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/fs/windows.rs)).
+Microsoft documents that the POSIX-semantics flag permits replacement while handles to the
+destination remain open; those handles continue to address the replaced file while subsequent
+opens use the new file
+([`FILE_RENAME_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info),
+[`FileRenameInformationEx`](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4217551b-d2c0-42cb-9dc1-69a716cf6d0c)).
+
+The correction retains the existing write-through `atomicwrites` path first. Only its
+`PermissionDenied` replacement failure falls back to the capability-relative directory rename,
+which reaches Rust's modern Windows fallback. The authority root identity is checked before and
+after publication, and the fixed temporary must be absent while the destination must be a safe
+regular file before success is returned. Other errors remain fail-closed as
+`RecoveryRequired`.
+
+### Windows build-input identity and mutation detection
+
+The build-input boundary previously used device, inode, and hard-link identity only on Unix. Its
+non-Unix fallback compared length, modification time, and read-only state and ignored the
+single-link requirement. A same-length Windows rewrite can preserve every one of those observable
+values at filesystem timestamp granularity, so the test mutation was accepted.
+
+The correction opens the final path component without following links, obtains metadata from the
+opened capability handle, and uses `cap-fs-ext 4.0.2` device, file-index, and link-count metadata
+on both Unix and Windows. The library explicitly provides these handle-backed values on Windows
+([`cap-fs-ext` metadata extension](https://github.com/bytecodealliance/cap-std/blob/v4.0.2/cap-fs-ext/src/metadata_ext.rs)).
+Microsoft's underlying handle-information contract exposes the volume serial number, file index,
+and number of links
+([`GetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle),
+[`BY_HANDLE_FILE_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information)).
+
+Every individual input is then reopened without following the final component and rehashed. The
+second digest, bounded length, single-link rule, and handle identity must all agree with the first
+read. Rust source-tree inventory applies the same two-read proof to each source and retains the
+root directory handle while checking that the named root still has the same identity at the end.
+This closes both same-length content substitution and path-replacement windows without trusting
+timestamp precision. The local macOS platform harness and strict platform Clippy gate pass; hosted
+Windows evidence remains required before this correction is accepted.
+
 ## Correction design
 
 ### 1. Repair Git metadata invalidation
@@ -601,7 +680,7 @@ The correction therefore does not require a paid runner under the current public
 
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
 
-### Official Cargo and Rust documentation
+### Cargo, Rust, and toolchain documentation
 
 - [Cargo build scripts and invalidation](https://doc.rust-lang.org/cargo/reference/build-scripts.html)
 - [Cargo rebuild diagnosis](https://doc.rust-lang.org/cargo/faq.html#why-is-cargo-rebuilding-my-code)
@@ -616,12 +695,15 @@ The platform-contract sources added during the correctness follow-up were review
 - [Rust `Vec` capacity and boxed-slice conversion](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)
 - [Rust `File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
 - [Rust `TryLockError`](https://doc.rust-lang.org/std/fs/enum.TryLockError.html)
+- [Rust Windows `OpenOptionsExt` sharing contract](https://doc.rust-lang.org/std/os/windows/fs/trait.OpenOptionsExt.html)
+- [Rust `rename`](https://doc.rust-lang.org/std/fs/fn.rename.html)
 - [Rust parallel test execution](https://doc.rust-lang.org/book/ch11-02-running-tests.html#running-tests-in-parallel-or-consecutively)
 - [Rust `JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html)
 - [Exact Rust 1.97.1 `GenericShunt` implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs)
 - [Exact Rust 1.97.1 generic `Vec` collection](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs)
 - [Exact Rust 1.97.1 Windows allocator](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/alloc/windows.rs)
 - [Exact Rust 1.97.1 Windows error mapping](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/io/error/windows.rs)
+- [Exact Rust 1.97.1 Windows rename implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/fs/windows.rs)
 - [Tokio 1.53.1 oneshot receiver](https://docs.rs/tokio/1.53.1/tokio/sync/oneshot/struct.Receiver.html)
 
 ### Operating-system and analytical-storage contracts
@@ -632,8 +714,17 @@ The platform-contract sources added during the correctness follow-up were review
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [Microsoft Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
 - [Microsoft Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
+- [Microsoft `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
+- [Microsoft `CreateFileW` sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+- [Microsoft `GetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
+- [Microsoft `BY_HANDLE_FILE_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information)
+- [Microsoft `FILE_RENAME_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
+- [Microsoft `FileRenameInformationEx`](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4217551b-d2c0-42cb-9dc1-69a716cf6d0c)
 - [SQLite URI filenames](https://www.sqlite.org/uri.html)
 - [SQLite opening connections and immutable URI parameters](https://sqlite.org/c3ref/open.html)
+- [`atomicwrites 0.4.4` source](https://github.com/untitaker/rust-atomicwrites/blob/0.4.4/src/lib.rs)
+- [`atomicwrites` Windows overwrite issue](https://github.com/untitaker/rust-atomicwrites/issues/35)
+- [`cap-fs-ext 4.0.2` metadata extension](https://github.com/bytecodealliance/cap-std/blob/v4.0.2/cap-fs-ext/src/metadata_ext.rs)
 - [`fs2 0.4.3` Windows locking implementation](https://github.com/danburkert/fs2-rs/blob/e1d4843b7c19e3ce1ecbae92255223de31b36d3b/src/windows.rs#L89-L112)
 - [`win32job 2.0.3` source](https://github.com/ohadravid/win32job-rs/tree/v2.0.3)
 - [`win32job` extended-limit issue](https://github.com/ohadravid/win32job-rs/issues/6)

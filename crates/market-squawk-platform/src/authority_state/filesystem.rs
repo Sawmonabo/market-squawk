@@ -222,7 +222,17 @@ impl StateFiles {
         let source = self.root_path.join(slot.temporary());
         let destination = self.root_path.join(slot.file());
         let publication = if existed {
-            atomicwrites::replace_atomic(&source, &destination)
+            match atomicwrites::replace_atomic(&source, &destination) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
+                    // MoveFileExW cannot always replace a destination that remains open. Rust's
+                    // rename adds the FileRenameInfoEx POSIX-semantics fallback on supported
+                    // Windows filesystems while this capability handle retains the authority root.
+                    self.directory
+                        .rename(slot.temporary(), &self.directory, slot.file())
+                }
+                Err(source) => Err(source),
+            }
         } else {
             atomicwrites::move_atomic(&source, &destination)
         };
@@ -323,7 +333,7 @@ impl StateFiles {
         for slot in [Slot::A, Slot::B] {
             match self.directory.symlink_metadata(slot.temporary()) {
                 Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Ok(_) => return Err(LocalAuthorityStateStoreError::RecoveryRequired),
+                Ok(_) => return Err(LocalAuthorityStateStoreError::UnsafeFileType),
                 Err(source) => return Err(io_error("inspect publication residue", source)),
             }
         }

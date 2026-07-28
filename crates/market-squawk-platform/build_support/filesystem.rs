@@ -1,7 +1,7 @@
 //! Capability-relative, bounded build-input hashing.
 
 use std::error::Error;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -30,33 +30,56 @@ fn hash_file_with_after_read<F>(
 where
     F: FnOnce(),
 {
-    let before_path = fs::symlink_metadata(path)?;
-    if before_path.file_type().is_symlink() || !before_path.is_file() || before_path.len() > maximum
-    {
-        return Err("build input is not a bounded regular file".into());
-    }
-    let mut file = File::open(path)?;
+    let mut file = open_file_without_following(path)?;
     let before = file.metadata()?;
-    if !same_identity(&before_path, &before, require_single_link) {
-        return Err("build input path and descriptor identities differ".into());
+    if !is_bounded_regular(&before, maximum, require_single_link) {
+        return Err("build input is not a bounded regular file".into());
     }
     let (digest, observed, after) = hash_open_descriptor(&mut file, &before, maximum)?;
     after_read();
-    let current = fs::symlink_metadata(path)?;
+
+    let mut current_file = open_file_without_following(path)?;
+    let current_before = current_file.metadata()?;
+    if !is_bounded_regular(&current_before, maximum, require_single_link) {
+        return Err("build input path no longer names a bounded regular file".into());
+    }
+    let (current_digest, current_observed, current_after) =
+        hash_open_descriptor(&mut current_file, &current_before, maximum)?;
     if observed != before.len()
         || !same_identity(&before, &after, require_single_link)
-        || !same_identity(&before, &current, require_single_link)
+        || !same_identity(&before, &current_before, require_single_link)
+        || current_observed != current_before.len()
+        || !same_identity(&current_before, &current_after, require_single_link)
+        || digest != current_digest
     {
         return Err("build input changed during descriptor hashing".into());
     }
     Ok(digest)
 }
 
+fn open_file_without_following(path: &Path) -> Result<cap_std::fs::File, Box<dyn Error>> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_std::ambient_authority;
+    use cap_std::fs::{Dir, OpenOptions};
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or("build input path has no final component")?;
+    let directory = Dir::open_ambient_dir(parent, ambient_authority())?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    Ok(directory.open_with(name, &options)?)
+}
+
 fn hash_open_descriptor(
-    file: &mut File,
-    before: &fs::Metadata,
+    file: &mut cap_std::fs::File,
+    before: &cap_std::fs::Metadata,
     maximum: u64,
-) -> Result<(String, u64, fs::Metadata), Box<dyn Error>> {
+) -> Result<(String, u64, cap_std::fs::Metadata), Box<dyn Error>> {
     if !before.is_file() || before.len() > maximum {
         return Err("build input descriptor is not a bounded regular file".into());
     }
@@ -134,7 +157,6 @@ where
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Err("Rust source root is not a real directory".into());
     }
-    after_root_metadata();
     let parent = root
         .parent()
         .ok_or("Rust source root has no capability parent")?;
@@ -144,10 +166,15 @@ where
     let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
     let root_directory = parent.open_dir_nofollow(name)?;
     let root_descriptor_metadata = root_directory.dir_metadata()?;
-    let root_path_metadata = cap_std::fs::Metadata::from_just_metadata(root_metadata);
-    if !same_directory_identity(&root_path_metadata, &root_descriptor_metadata) {
+    if !root_descriptor_metadata.is_dir() {
         return Err("Rust source root descriptor is not a directory".into());
     }
+    after_root_metadata();
+    let verified_root = parent.open_dir_nofollow(name)?;
+    if !same_directory_identity(&root_descriptor_metadata, &verified_root.dir_metadata()?) {
+        return Err("Rust source root identity changed before traversal".into());
+    }
+    let retained_root = root_directory.try_clone()?;
     let mut files = Vec::new();
     let mut pending = vec![(root_directory, root.to_owned(), 0_usize)];
     let mut observed_entries = 0_usize;
@@ -191,9 +218,9 @@ where
             {
                 let mut options = OpenOptions::new();
                 options.read(true).follow(FollowSymlinks::No);
-                let mut file = entry.open_with(&options)?.into_std();
+                let mut file = entry.open_with(&options)?;
                 let before = file.metadata()?;
-                if before.len() > maximum_file_bytes {
+                if !is_bounded_regular(&before, maximum_file_bytes, true) {
                     return Err("Rust source file exceeds its per-file byte bound".into());
                 }
                 observed_bytes = observed_bytes
@@ -204,10 +231,19 @@ where
                 }
                 let (sha256, observed, after) =
                     hash_open_descriptor(&mut file, &before, maximum_file_bytes)?;
-                let current = entry.open_with(&options)?.into_std().metadata()?;
+                let mut current_file = entry.open_with(&options)?;
+                let current_before = current_file.metadata()?;
+                if !is_bounded_regular(&current_before, maximum_file_bytes, true) {
+                    return Err("Rust source path no longer names a bounded regular file".into());
+                }
+                let (current_sha256, current_observed, current_after) =
+                    hash_open_descriptor(&mut current_file, &current_before, maximum_file_bytes)?;
                 if observed != before.len()
                     || !same_identity(&before, &after, true)
-                    || !same_identity(&before, &current, true)
+                    || !same_identity(&before, &current_before, true)
+                    || current_observed != current_before.len()
+                    || !same_identity(&current_before, &current_after, true)
+                    || sha256 != current_sha256
                 {
                     return Err("Rust source changed during capability hashing".into());
                 }
@@ -216,6 +252,13 @@ where
                 return Err("Rust source inventory contains a special filesystem entry".into());
             }
         }
+    }
+    let current_root = parent.open_dir_nofollow(name)?;
+    if !same_directory_identity(
+        &retained_root.dir_metadata()?,
+        &current_root.dir_metadata()?,
+    ) {
+        return Err("Rust source root identity changed during traversal".into());
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
@@ -267,22 +310,92 @@ where
     )
 }
 
-#[cfg(unix)]
-fn same_identity(left: &fs::Metadata, right: &fs::Metadata, require_single_link: bool) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
+fn is_bounded_regular(
+    metadata: &cap_std::fs::Metadata,
+    maximum: u64,
+    require_single_link: bool,
+) -> bool {
+    metadata.is_file()
+        && metadata.len() <= maximum
+        && single_link_requirement_is_met(metadata, require_single_link)
+}
 
-    left.dev() == right.dev()
+#[cfg(any(unix, windows))]
+fn single_link_requirement_is_met(
+    metadata: &cap_std::fs::Metadata,
+    require_single_link: bool,
+) -> bool {
+    use cap_fs_ext::MetadataExt as _;
+
+    !require_single_link || metadata.nlink() == 1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn single_link_requirement_is_met(
+    _metadata: &cap_std::fs::Metadata,
+    require_single_link: bool,
+) -> bool {
+    !require_single_link
+}
+
+#[cfg(any(unix, windows))]
+fn same_identity(
+    left: &cap_std::fs::Metadata,
+    right: &cap_std::fs::Metadata,
+    require_single_link: bool,
+) -> bool {
+    use cap_fs_ext::MetadataExt as _;
+
+    left.is_file()
+        && right.is_file()
+        && left.dev() == right.dev()
         && left.ino() == right.ino()
         && left.len() == right.len()
         && left.nlink() == right.nlink()
         && (!require_single_link || left.nlink() == 1)
-        && left.mode() == right.mode()
+        && same_platform_file_metadata(left, right)
+}
+
+#[cfg(unix)]
+fn same_platform_file_metadata(
+    left: &cap_std::fs::Metadata,
+    right: &cap_std::fs::Metadata,
+) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    left.mode() == right.mode()
         && left.uid() == right.uid()
         && left.gid() == right.gid()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
         && left.ctime() == right.ctime()
         && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(windows)]
+fn same_platform_file_metadata(
+    left: &cap_std::fs::Metadata,
+    right: &cap_std::fs::Metadata,
+) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_identity(
+    left: &cap_std::fs::Metadata,
+    right: &cap_std::fs::Metadata,
+    _require_single_link: bool,
+) -> bool {
+    left.is_file()
+        && right.is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.permissions().readonly() == right.permissions().readonly()
 }
 
 #[cfg(unix)]
@@ -304,14 +417,22 @@ fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Me
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-#[cfg(not(unix))]
-fn same_identity(left: &fs::Metadata, right: &fs::Metadata, _require_single_link: bool) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.permissions().readonly() == right.permissions().readonly()
+#[cfg(windows)]
+fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
+    use cap_fs_ext::MetadataExt as _;
+    use cap_std::fs::MetadataExt as _;
+
+    left.is_dir()
+        && right.is_dir()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.nlink() == right.nlink()
+        && left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
     left.is_dir()
         && right.is_dir()

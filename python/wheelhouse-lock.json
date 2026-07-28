@@ -3242,8 +3242,8 @@
     },
     {
       "path": "crates/market-squawk-platform/build_support/filesystem.rs",
-      "sha256": "e632cbab52328ce795abf587737f1964a2e0de5f64dcce0efb5753629c5a3590",
-      "size_bytes": 11061
+      "sha256": "09367c47eb6291baf0e7a93ba987a1a68d30fb02fdd7ba7ee9e4abc651a6abc8",
+      "size_bytes": 15159
     },
     {
       "path": "crates/market-squawk-platform/build_support/reader.rs",
@@ -3262,8 +3262,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/authority_state/filesystem.rs",
-      "sha256": "03ce80dcfc372204f4526d1ca48a93ed533e0ffe50f298b6d8755781848119bc",
-      "size_bytes": 20910
+      "sha256": "e7158a3dde17dc03bf34a0e62e2c37d6419be32d6f3f41af3207771387e04f62",
+      "size_bytes": 21517
     },
     {
       "path": "crates/market-squawk-platform/src/authority_state/recovery.rs",

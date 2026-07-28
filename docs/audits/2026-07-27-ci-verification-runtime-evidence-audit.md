@@ -11,7 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `f7c7712a95654230abc40f6e6d43a297e0dab210` |
+| Correctness follow-up candidate | `605362c495e6b139ccdbbdda85d86a69de96eb18` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -27,7 +27,7 @@ follow-up in the maintained research documentation.
 
 The audit compared the research report with:
 
-- the 21-source research inventory;
+- the initial 21-source research inventory and subsequent primary-source correctness follow-ups;
 - four source-category syntheses and four bounded batch reports;
 - the repository workflow, verification scripts, Loom wrapper, and platform build script;
 - GitHub Actions run and job metadata;
@@ -100,8 +100,9 @@ speedup.
   or failure. Exact per-transfer join receipts preserve bounded reaper ownership while making each
   session wait only for its own worker.
 - Exact candidate `f7c7712` passed the complete Linux and macOS jobs. Its Windows job passed the
-  preceding lock, catalog, data, and MCP corrections, then became the first retained Windows run
-  to execute the modeling harness.
+  previously failing boundaries reached before modeling, then became the first retained Windows
+  run to execute the modeling harness. It stopped at modeling before the later platform
+  `configuration_security` harness and therefore did not prove those platform cases.
 - The Windows ONNX worker configured `limit_working_memory(0, 3 GiB)`, which violates Microsoft's
   requirement that a nonzero maximum working set have a nonzero minimum. `win32job 2.0.3` applied
   the invalid profile before process assignment, so each helper exited before protocol
@@ -110,6 +111,19 @@ speedup.
   binds both per-process and job-wide 3 GiB committed-memory limits plus kill-on-close through an
   audited local patch of the exact licensed dependency. The patch source is now included in the
   Python release source closure, and runtime resource evidence advances to version 2.
+- Exact candidate `605362c` passed its complete macOS job. Its Windows modeling harness passed all
+  13 contracts, providing hosted evidence for the committed-memory correction, and then the later
+  platform `configuration_security` harness exposed four previously unreached failures.
+- Windows authority publication uses rename rather than Unix's hard-link installation proof.
+  Open-time reserved temporary state cannot therefore be proven as legitimate on Windows and must
+  be classified fail-closed as `UnsafeFileType`, not recoverable state.
+- The pinned `atomicwrites 0.4.4` Windows replacement path uses `MoveFileExW` only. Rust 1.97.1's
+  rename implementation adds a `FileRenameInfoEx` POSIX-semantics fallback on access denied, which
+  is the supported replacement path when the destination remains open with delete sharing.
+- The old non-Unix build-input identity fallback did not enforce a single hard link and could miss
+  a same-length rewrite. Capability-handle metadata from `cap-fs-ext 4.0.2`, a second no-follow
+  open, a second bounded hash, and retained root-directory identity make the Windows boundary
+  content- and identity-based rather than timestamp-dependent.
 
 The retained diagnostic log identities were:
 
@@ -127,6 +141,9 @@ The retained diagnostic log identities were:
 | Candidate `f7c7712` Linux job `90241570286` | `78bbb617c584f51567afc42ce62392f9b9822f38fd765cbec111f4a0839f3a57` |
 | Candidate `f7c7712` Windows job `90241570389` | `9234b45044e1d2959cba1e54f4be507989631dcb952745127096d982a8317efb` |
 | Candidate `f7c7712` macOS job `90241570407` | `e412fcdee3c80d849e25410f18bd41f4c1d65eec255080dbfc3250cccd52f403` |
+| Candidate `605362c` Windows job `90260430186` | `33bf821efd984f0646afe8bde79fb23f34e3d1182bd2c046764ab48ec31886af` |
+| Candidate `605362c` macOS job `90260430125` | `5c44cf3d3c4f4968a0ce3d7221c45261f902f2e0e2570c468f2074cc74c628e3` |
+| Candidate `605362c` Linux job `90260430159` | `93e2345ba46d5d54a368e57b045179891ed6be5d6ee47d1449d38b63c63045cf` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -135,12 +152,12 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 
 ## Source coverage
 
-| Category | Sources | Audit result |
+| Category | Listed sources | Audit result |
 | --- | ---: | --- |
-| GitHub repositories | 7 | Covered; maintained primary project repositories |
-| Official documentation and exact toolchain source | 28 | Seven runtime sources plus current platform-contract sources |
+| Cargo, Rust, and toolchain documentation, including exact source | 23 | Covered |
+| Operating-system, storage, and locked-dependency contracts | 20 | Covered |
+| Official GitHub documentation and maintained CI tools | 9 | Covered |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
-| Reputable sources | 4 | Covered; first-party documentation or direct Rust expertise |
 
 The report cites sources beside its material claims and distinguishes source-backed facts from
 Market Squawk design inferences. It does not rely on academic evidence for a repository-specific
@@ -166,7 +183,13 @@ numerical forecast.
   coupling.
 - Exact candidate `f7c7712` completed without cancellation: Linux and macOS passed; Windows passed
   the prior corrections and exposed the invalid ONNX Job Object profile in the first retained
-  Windows execution of that harness.
+  Windows execution of that harness. It did not reach the later platform configuration/security
+  cases.
+- Exact candidate `605362c` passed the complete Linux and macOS jobs. Windows passed all 13
+  modeling contracts, then exposed four platform authority and build-input cases.
+- The new Windows authority and build-input diagnosis is grounded in the exact locked dependency
+  and Rust 1.97.1 sources plus current Microsoft filesystem contracts. The local correction has
+  focused macOS and strict Clippy evidence but remains pending hosted Windows proof.
 - The correctness fixes are not release evidence until one unchanged candidate passes Linux,
   macOS, and Windows.
 - The audit verdict approves this report as decision input. It is not release approval and not
