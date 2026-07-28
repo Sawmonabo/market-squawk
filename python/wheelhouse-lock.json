@@ -3507,8 +3507,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/input.rs",
-      "sha256": "a8032b924953cdebf03968ac314a85da19cbc45579848e66861f197925b3dc77",
-      "size_bytes": 39546
+      "sha256": "543b64ddb39b815bd39d0c42857af40fb94fe02671a9d85ac1c3be04e089cb06",
+      "size_bytes": 39554
     },
     {
       "path": "crates/market-squawk-platform/src/input/ownership.rs",

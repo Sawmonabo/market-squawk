@@ -475,11 +475,11 @@ impl VerifiedInputFile {
         mut checkpoint: impl FnMut(InputReadCheckpoint) -> Result<(), E>,
     ) -> Result<BoundedInput, BoundedReadError<E>> {
         checkpoint(InputReadCheckpoint::BeforeRead).map_err(BoundedReadError::Control)?;
-        fs2::FileExt::try_lock_shared(&self.file)
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::WouldBlock {
-                    InputFileError::FileBusy
-                } else {
+        self.file
+            .try_lock_shared()
+            .map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => InputFileError::FileBusy,
+                std::fs::TryLockError::Error(source) => {
                     InputFileError::StabilityLockUnavailable { source }
                 }
             })
