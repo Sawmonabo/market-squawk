@@ -58,7 +58,7 @@ static KRAKEN_VERTICAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 ///
 /// The risk probe is evidence for defense in depth. It is deliberately not represented as a
 /// production hook invocation and cannot create an approval or reach dispatch.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_reject_it() -> TestResult
 {
     let _budget_guard = KRAKEN_VERTICAL_TEST_LOCK.lock().await;
@@ -207,7 +207,7 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> TestResult {
     // The fixture's transport-idle limit is 30 seconds; this leaves scheduling headroom while
     // still proving that acknowledgement expiry, rather than transport idleness, rotates it.
