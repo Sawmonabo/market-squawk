@@ -11,6 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
+| Correctness follow-up candidate | `c7b045fcf09553b934d388a62ca9fe7e0ea36b82` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -217,6 +218,19 @@ completed with:
 | Linux verify | Failed | Platform authority-state test returned `AlreadyLocked` |
 | Windows | Failed | Analytical backup/evidence tests returned indeterminate or invalid evidence |
 
+The follow-up exact candidate
+`c7b045fcf09553b934d388a62ca9fe7e0ea36b82` completed in
+[run 30340497944](https://github.com/Sawmonabo/market-squawk/actions/runs/30340497944):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| macOS | Passed | Complete job `90214783636` passed in 17m35s |
+| Linux verify | Passed | Complete job `90214783685` passed in 58m54s |
+| Windows | Failed | Job `90214783655` repeated four backup and one analytical-evidence failures |
+
+This run confirms the Linux lock-lifetime and file-adapter fixture corrections under the hosted
+gates. It is not release approval because Windows failed.
+
 ### Linux authority-state lock lifetime
 
 The Linux failure was a production lock-lifecycle defect exposed by concurrent process creation.
@@ -234,23 +248,44 @@ post-acquisition error path. Genuine contention remains rejected while the guard
 existing 64-test platform configuration/security harness and focused Clippy gate pass locally with
 this correction.
 
-### Windows canonical backup paths
+### Windows backup paths and retained lease
 
-Four Windows analytical-backup failures shared one production path-conversion defect.
+The initial Windows backup diagnosis identified a genuine path-conversion defect but incorrectly
+treated it as the complete cause of four coarsened `BundleCreationIndeterminate` failures.
 `LocalPaths::prepare` canonicalizes its root, and Rust documents that Windows canonicalization
 returns extended-length syntax such as `\\?\D:\...`
-([`std::fs::canonicalize`](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)). The immutable
-SQLite URI builder rejected every double-backslash prefix as UNC, even though Rust distinguishes a
-local `VerbatimDisk` prefix from `UNC`, `VerbatimUNC`, `DeviceNS`, and generic verbatim forms
+([`std::fs::canonicalize`](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)). The former
+immutable SQLite URI builder rejected every double-backslash prefix as UNC, even though Rust
+distinguishes a local `VerbatimDisk` prefix from `UNC`, `VerbatimUNC`, `DeviceNS`, and generic
+verbatim forms
 ([`std::path::Prefix`](https://doc.rust-lang.org/std/path/enum.Prefix.html)).
 
-The correction classifies parsed Windows path prefixes, accepts only absolute `Disk` and
-`VerbatimDisk` paths, converts them to SQLite's `/D:/...` URI-path form, and continues rejecting
-network, device, generic verbatim, relative, and non-UTF-8 paths. SQLite documents the drive-letter
-URI form and the `immutable=1` read contract
+Candidate `c7b045fcf09553b934d388a62ca9fe7e0ea36b82` corrected that boundary by accepting only absolute
+`Disk` and `VerbatimDisk` paths, emitting SQLite's documented `/D:/...` URI-path form, and
+continuing to reject network, device, generic verbatim, relative, and non-UTF-8 paths
 ([SQLite URI filenames](https://www.sqlite.org/uri.html),
-[SQLite open flags and URI parameters](https://sqlite.org/c3ref/open.html)). The existing
-38-test data library suite and focused Clippy gate pass locally with this correction.
+[SQLite open flags and URI parameters](https://sqlite.org/c3ref/open.html)). However,
+[Windows job 90214783655](https://github.com/Sawmonabo/market-squawk/actions/runs/30340497944/job/90214783655)
+reproduced all four public backup failures after that correction. The hosted evidence therefore
+proved the path correction valid but incomplete.
+
+The remaining deterministic failure was a self-conflicting database lease. Retained verification
+took an exclusive `fs2` whole-file lock on the SQLite database and immediately reopened the same
+database through another handle to hash and verify it. On Windows, `fs2 0.4.3` implements that lock
+with `LockFileEx`. Microsoft documents that a locking process cannot access the locked range
+through a second handle and that an exclusive range lock denies both reads and writes
+([Microsoft `LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)).
+The receipt read therefore failed with a lock violation before immutable SQLite verification, and
+the public backup service coarsened that I/O failure to `BundleCreationIndeterminate`.
+
+The production correction retains exclusivity on the existing private `.catalog.writer.lock`
+sidecar instead of byte-locking the database against its own verifier. The retained catalog file
+still provides exact identity and no-delete protection; receipt hashing and immutable SQLite
+verification remain unchanged. The sidecar acquisition is capability-relative, no-follow,
+open-existing, and noncreating, so read-only verification cannot manufacture missing authority
+state. Its guard explicitly unlocks during drop, matching the Linux logical-owner lifetime
+correction. The existing exact backup test passes locally with this design; cross-platform release
+authority still depends on a new unchanged hosted candidate.
 
 ### Windows clock-fault fixture
 
@@ -276,16 +311,40 @@ passes locally after this fixture correction. The adjacent hostile-clock panic i
 was intentional output from an earlier subcase that the test harness buffered; it was not a second
 causal failure.
 
-### Remaining Windows evidence failure
+### Windows analytical-evidence allocation contract
 
-The fifth original Windows data failure,
-`derived_commit_retains_canonical_multi_object_and_parent_evidence`, is separate from backup-path
-handling. Its path is SQLite queries plus pure semantic validation, and the current error mapping
-coarsens multiple internal evidence causes into `AnalyticalEvidenceInvalid`. The focused local
-data suite passes, but the Windows-only cause is not yet substantiated. The Windows rerun stopped in
-the file-adapter harness before it reached the data crate, so it neither reproduced nor cleared
-this finding. No ordering change, retry, serialization, fixture rewrite, or semantic correction is
-justified without a repeated failure that preserves a bounded exact cause.
+The fifth Windows data failure,
+`derived_commit_retains_canonical_multi_object_and_parent_evidence`, repeated in
+job `90214783655` and is independent of SQLite data semantics. The stored evidence is valid; the
+failure arose while reconstructing its two-object derived manifest.
+
+The locked `rustc 1.97.1` reports source commit
+`8bab26f4f68e0e26f0bb7960be334d5b520ea452`. That toolchain collects `Result<Vec<_>, _>` through
+`GenericShunt`, whose lower size hint is zero
+([exact Rust 1.97.1 `GenericShunt`](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs)).
+The generic `Vec::from_iter` implementation therefore selects its minimum nonzero capacity rather
+than the fixture's exact two-object length
+([exact Rust 1.97.1 `Vec` collection](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs)).
+`ManifestPlan::from_objects` then converted that spare-capacity vector into a boxed slice and
+rejected the plan if the allocation moved. Rust documents that `into_boxed_slice` discards excess
+capacity, while a vector whose length equals capacity can convert without reallocation
+([Rust `Vec` allocation contract](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)).
+
+Rust 1.97.1's Windows allocator performs the shrink with `HeapReAlloc` and flags zero
+([exact Rust 1.97.1 Windows allocator](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/alloc/windows.rs)).
+Microsoft documents that `HeapReAlloc` may move the block unless
+`HEAP_REALLOC_IN_PLACE_ONLY` is requested
+([Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)).
+When Windows moved the allocation, the manifest returned `AllocationContract`; evidence mapping
+coarsened it to `AnalyticalEvidenceInvalid`. The macOS pass reflected allocator behavior, not a
+portable guarantee.
+
+The correction is centralized in `ManifestPlan::from_objects`: any spare-capacity input is moved
+into a fallibly reserved exact-capacity vector, capacity equality is checked before conversion,
+and the post-conversion pointer check remains as defense in depth. This preserves the immutable
+allocation contract for every caller without changing the fixture, SQL ordering, evidence
+semantics, or error acceptance. The existing exact evidence test passes locally; Windows hosted
+evidence remains required.
 
 These corrections have focused local evidence only. Release authority still requires one unchanged
 candidate to pass the complete Linux, macOS, and Windows jobs. The runtime correction must make
@@ -411,6 +470,8 @@ The correction therefore does not require a paid runner under the current public
 
 ## Sources
 
+The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
+
 ### Official Cargo and Rust documentation
 
 - [Cargo build scripts and invalidation](https://doc.rust-lang.org/cargo/reference/build-scripts.html)
@@ -423,10 +484,16 @@ The correction therefore does not require a paid runner under the current public
 - [Rust Performance Book: compile times](https://nnethercote.github.io/perf-book/compile-times.html)
 - [Rust Windows canonicalization](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
 - [Rust Windows path-prefix classification](https://doc.rust-lang.org/std/path/enum.Prefix.html)
+- [Rust `Vec` capacity and boxed-slice conversion](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)
+- [Exact Rust 1.97.1 `GenericShunt` implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs)
+- [Exact Rust 1.97.1 generic `Vec` collection](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs)
+- [Exact Rust 1.97.1 Windows allocator](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/alloc/windows.rs)
 
 ### Operating-system and analytical-storage contracts
 
 - [Linux `flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html)
+- [Microsoft `LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
+- [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [SQLite URI filenames](https://www.sqlite.org/uri.html)
 - [SQLite opening connections and immutable URI parameters](https://sqlite.org/c3ref/open.html)
 

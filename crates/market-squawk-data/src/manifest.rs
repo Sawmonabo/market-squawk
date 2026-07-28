@@ -465,8 +465,25 @@ impl ManifestPlan {
 
     fn from_objects(
         dataset_id: DatasetId,
-        objects: Vec<ManifestObject>,
+        mut objects: Vec<ManifestObject>,
     ) -> Result<Self, ManifestPlanError> {
+        if objects.capacity() != objects.len() {
+            let object_count = objects.len();
+            let mut exact = Vec::new();
+            exact
+                .try_reserve_exact(object_count)
+                .map_err(|_| ManifestPlanError::CountOverflow)?;
+            if exact.capacity() != object_count {
+                return Err(ManifestPlanError::AllocationContract);
+            }
+            for object in objects {
+                exact.push(object);
+            }
+            objects = exact;
+        }
+        if objects.capacity() != objects.len() {
+            return Err(ManifestPlanError::AllocationContract);
+        }
         let allocation = objects.as_ptr();
         let objects = objects.into_boxed_slice();
         if objects.as_ptr() != allocation {

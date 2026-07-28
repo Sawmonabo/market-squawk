@@ -11,6 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
+| Correctness follow-up candidate | `c7b045fcf09553b934d388a62ca9fe7e0ea36b82` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -32,9 +33,9 @@ The audit compared the research report with:
 - GitHub Actions run and job metadata;
 - retained Linux, macOS, and Windows job logs;
 - a two-pass Cargo fingerprint reproduction;
-- the Linux authority-lock and Windows analytical-backup implementations;
+- the Linux authority-lock, Windows analytical-backup, and manifest-allocation implementations;
 - the unchanged Windows job rerun and file-adapter clock/deadline fixture; and
-- the relevant Linux, Rust, and SQLite platform contracts.
+- the relevant Linux, Windows, Rust, and SQLite platform contracts.
 
 ## Findings
 
@@ -66,14 +67,25 @@ speedup.
 - The proposed 28–32 minute cold wall time is explicitly labeled a planning projection. It is not
   presented as measured evidence.
 - The Linux authority failure follows Linux's documented open-file-description `flock` lifetime;
-  the explicit-unlock guard corrects that lifecycle without accepting real contention.
-- Four Windows backup failures follow Rust's documented extended-length canonical path through the
-  former blanket UNC rejection. Prefix classification and SQLite's documented `/D:/...` URI form
-  support the correction.
+  the explicit-unlock guard corrects that lifecycle without accepting real contention. Exact
+  candidate `c7b045f` subsequently passed the complete hosted Linux verify job in 58m54s.
+- The former Windows URI builder incorrectly rejected canonical local `VerbatimDisk` paths. Prefix
+  classification and SQLite's documented `/D:/...` URI form support that correction, but exact
+  candidate `c7b045f` reproduced all four coarsened backup failures and proved the path-only causal
+  conclusion incomplete.
+- The remaining backup failure is a deterministic Windows `LockFileEx` self-conflict: retained
+  verification exclusively byte-locked the database and then read the same range through a second
+  handle. Microsoft's contract directly describes that denied access. An existing, noncreating
+  private writer-sidecar lease preserves exclusivity without blocking receipt and SQLite reads.
 - The unchanged Windows rerun failed earlier in the file-adapter harness because a one-second
   synthetic fixture deadline competed with its intended injected clock failure. Source, runner
   image, toolchain, and test executable were unchanged, and the production deadline result was
   correct.
+- The fifth Windows failure repeated at `c7b045f`. Rust 1.97.1's `Result<Vec<_>, _>` collection
+  produced spare capacity; `into_boxed_slice` then shrank it through Windows `HeapReAlloc`, which
+  may move the block. The manifest's pointer-identity guard consequently rejected valid evidence.
+  Exact-capacity normalization at the central manifest boundary removes that allocator dependency
+  without weakening evidence semantics.
 
 The retained diagnostic log identities were:
 
@@ -84,6 +96,7 @@ The retained diagnostic log identities were:
 | Current Windows job `90189278913` | `eab9f3c4fc4868bf0d1e5eba22ae4d9263a49980a199032a208652078e737bc7` |
 | Current macOS job `90189278954` | `a20deae2bee0c04774b7e450bcaa67f71284f400f9887681d73c73d96237c1c9` |
 | Windows rerun job `90209089614` | `387e6aea41dbe4606d92efb72b104134e62fcd77e962a97410027905c695a8b9` |
+| Candidate `c7b045f` Windows job `90214783655` | `db7140c27c4a0fcfb1eeeeaece9e6b3de5b6d00dea2db7ce943b49a3559fde61` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -95,7 +108,7 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 | Category | Sources | Audit result |
 | --- | ---: | --- |
 | GitHub repositories | 6 | Covered; maintained primary project repositories |
-| Official documentation | 12 | Seven runtime sources plus five platform-contract sources |
+| Official documentation and exact toolchain source | 18 | Seven runtime sources plus current platform-contract sources |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
 | Reputable sources | 4 | Covered; first-party documentation or direct Rust expertise |
 
@@ -109,11 +122,14 @@ numerical forecast.
   population must be a bounded experiment and retained only after demonstrating a net benefit.
 - The complete discovery and batch reports remain temporary working papers because they repeat the
   reviewed report and are not required for day-to-day maintenance.
-- The Linux lock defect, four Windows backup-path failures, and the later Windows file-adapter
-  fixture race now have bounded causal explanations and focused local evidence.
-- The original Windows multi-object analytical-evidence failure remains unresolved. The rerun
-  stopped before the data crate and cannot be used as contrary evidence. Any repeated failure must
-  preserve a bounded internal cause before relational behavior changes.
+- The Linux lock defect, Windows URI boundary, Windows retained-backup lock conflict, Windows
+  manifest-allocation dependency, and file-adapter fixture race now have bounded causal
+  explanations and focused local evidence.
+- The corrected backup and manifest designs use the existing failing tests as focused proof; no
+  retry, sleep, serialization, fixture rewrite, new test target, or weakened evidence rule was
+  introduced.
+- Exact candidate `c7b045f` completed without cancellation: Linux and macOS passed, while Windows
+  repeated the five failures addressed by the next candidate.
 - The correctness fixes are not release evidence until one unchanged candidate passes Linux,
   macOS, and Windows.
 - The audit verdict approves this report as decision input. It is not release approval and not

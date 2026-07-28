@@ -4,10 +4,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 
-use fs2::FileExt as _;
 use market_squawk_platform::{
     CatalogFileGuard, CatalogLocation, CatalogRestoreStage, CatalogRestoreTarget,
-    InstalledCatalogFile, PathError,
+    CatalogWriterGuard, InstalledCatalogFile, PathError,
 };
 
 use super::{
@@ -20,7 +19,7 @@ use crate::catalog::{Catalog, CatalogError, map_catalog_location_error};
 pub(crate) struct VerifiedBackupCatalog {
     location: CatalogLocation,
     guard: CatalogFileGuard,
-    lease: File,
+    _lease: CatalogWriterGuard,
     receipt: BackupReceipt,
 }
 
@@ -43,7 +42,11 @@ impl VerifiedBackupCatalog {
         self.guard
             .validate_identity()
             .map_err(map_catalog_location_error)?;
-        let identity = backup_file_identity(&self.lease)?;
+        let file = self
+            .guard
+            .try_clone_file()
+            .map_err(map_catalog_location_error)?;
+        let identity = backup_file_identity(&file)?;
         verify_named_backup(self.location.path(), &identity, &self.receipt)?;
         self.guard
             .validate_identity()
@@ -93,9 +96,10 @@ impl fmt::Debug for InstalledBackupCatalog {
 impl Catalog {
     /// Retains an exclusive non-mutating lease over one exact immutable backup.
     ///
-    /// Unlike an ordinary catalog writer open, verification neither creates nor acquires the
-    /// catalog writer sidecar. The lease is taken directly on the already-opened backup file and
-    /// retained with the exact file capability.
+    /// Verification acquires the already-published writer sidecar without creating filesystem
+    /// state. The exclusive sidecar lease is retained with the exact readable catalog capability
+    /// so receipt and immutable SQLite verification never conflict with an operating-system byte
+    /// lock on the database itself.
     pub(crate) fn verify_backup_retained(
         location: &CatalogLocation,
         receipt: &BackupReceipt,
@@ -107,18 +111,17 @@ impl Catalog {
         let guard = location
             .open_catalog_file()
             .map_err(map_catalog_location_error)?;
-        let lease = guard.try_clone_file().map_err(map_catalog_location_error)?;
-        lease.try_lock_exclusive().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
+        let lease = location.acquire_existing_writer().map_err(|error| {
+            if matches!(error, PathError::CatalogAlreadyLocked) {
                 CatalogError::BackupLeaseUnavailable
             } else {
-                CatalogError::Io(source)
+                map_catalog_location_error(error)
             }
         })?;
         let retained = VerifiedBackupCatalog {
             location: location.clone(),
             guard,
-            lease,
+            _lease: lease,
             receipt: *receipt,
         };
         retained.revalidate()?;

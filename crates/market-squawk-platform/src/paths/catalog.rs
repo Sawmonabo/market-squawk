@@ -24,7 +24,7 @@ const CATALOG_SHM_FILE: &str = "catalog.sqlite3-shm";
 
 /// Lifetime guard for one private, unique-link, capability-relative catalog writer lock.
 pub struct CatalogWriterGuard {
-    _file: File,
+    file: File,
 }
 
 /// Retained handle proving the fixed catalog path names one private, unique-link file.
@@ -354,6 +354,12 @@ impl fmt::Debug for CatalogWriterGuard {
     }
 }
 
+impl Drop for CatalogWriterGuard {
+    fn drop(&mut self) {
+        let _ignored = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// Prepared placement capability for the local SQLite control-plane catalog.
 #[derive(Clone)]
 pub struct CatalogLocation {
@@ -456,9 +462,26 @@ impl CatalogLocation {
 
     /// Acquires the no-follow cross-process writer lock relative to the prepared root capability.
     pub fn acquire_writer(&self) -> Result<CatalogWriterGuard, PathError> {
+        self.acquire_writer_lock(true)
+    }
+
+    /// Acquires an existing no-follow writer lock without creating filesystem state.
+    ///
+    /// This is the nonmutating lease boundary for an already-published catalog. The fixed writer
+    /// sidecar must already exist as a private, unique-link regular file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::CatalogAlreadyLocked`] when another owner retains the sidecar, or a
+    /// path or I/O error when the existing sidecar cannot be opened and revalidated safely.
+    pub fn acquire_existing_writer(&self) -> Result<CatalogWriterGuard, PathError> {
+        self.acquire_writer_lock(false)
+    }
+
+    fn acquire_writer_lock(&self, create: bool) -> Result<CatalogWriterGuard, PathError> {
         self.validate_for_open()?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
+        options.read(true).write(true).create(create);
         options.follow(FollowSymlinks::No);
         configure_private_lock_creation(&mut options);
         let file = self
@@ -475,7 +498,7 @@ impl CatalogLocation {
             }
         })?;
         validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
-        Ok(CatalogWriterGuard { _file: file })
+        Ok(CatalogWriterGuard { file })
     }
 }
 
