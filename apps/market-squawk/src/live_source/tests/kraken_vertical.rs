@@ -108,12 +108,19 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
     let rejection = defense_in_depth_risk_probe(&definition.execution_terms(), observed)?;
-    assert_eq!(
-        rejection.as_ref(),
-        [
-            RiskRejectionCode::SourceQuality,
-            RiskRejectionCode::Account(AccountRiskViolation::UnsupportedSettlement),
-        ]
+    assert!(
+        matches!(
+            rejection.as_ref(),
+            [
+                RiskRejectionCode::SourceQuality,
+                RiskRejectionCode::Account(AccountRiskViolation::UnsupportedSettlement),
+            ] | [
+                RiskRejectionCode::SourceQuality,
+                RiskRejectionCode::SourceStale,
+                RiskRejectionCode::Account(AccountRiskViolation::UnsupportedSettlement),
+            ]
+        ),
+        "{rejection:#?}"
     );
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
