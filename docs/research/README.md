@@ -55,6 +55,13 @@ decisions can be audited without relying on conversation history.
   — independently audited provider decisions, exact artifact bindings, reconciled probe lineage,
   source links, and the activation/restart authority consequences implemented on 2026-07-23.
 
+## Build and verification decisions
+
+- [CI verification runtime and build-cache diagnosis](2026-07-27-ci-verification-runtime.md) —
+  measured phase timing, the reproduced Cargo invalidation defect, inactive pull-request cache
+  population, repeated Loom construction, fail-closed parallel-job design, acceptance evidence,
+  and primary sources for reducing feedback time without weakening release coverage.
+
 ## Provider decisions
 
 - [Treasury daily rates release authority](providers/2026-07-26-treasury-daily-rates-release-authority.md)
