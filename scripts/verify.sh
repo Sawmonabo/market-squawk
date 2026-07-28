@@ -89,11 +89,10 @@ CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard ./scripts/check_capture_queue_loom.sh
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard \
   cargo build --workspace --all-features --release --locked
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard python3 scripts/check_capture_frame_contracts.py
-CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard cargo build -p market-squawk --all-features --locked
 
 tmp_dir="$(mktemp -d)"
-./target/debug/market-squawk --help >"$tmp_dir/help.txt"
-./target/debug/market-squawk \
+./target/release/market-squawk --help >"$tmp_dir/help.txt"
+./target/release/market-squawk \
   --data-dir "$tmp_dir" mock --events 100 >"$tmp_dir/snapshot.json"
 python3 - "$tmp_dir/snapshot.json" <<'PY'
 import json
@@ -108,4 +107,4 @@ if not isinstance(products, dict) or "TEST-USD" not in products:
     raise SystemExit(f"offline mock product is missing: {snapshot!r}")
 print("offline mock smoke test passed")
 PY
-python3 scripts/smoke_mcp.py ./target/debug/market-squawk
+python3 scripts/smoke_mcp.py ./target/release/market-squawk
