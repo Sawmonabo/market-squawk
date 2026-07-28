@@ -643,21 +643,31 @@ fn publish_immutable(
         remove_stage(root, &stage_path)?;
         return Err(ExperimentError::Io(error));
     }
-    drop(stage);
     match root.hard_link(&stage_path, root, final_path) {
-        Ok(()) => {}
+        Ok(()) =>
+        {
+            #[cfg(windows)]
+            if let Err(error) = stage.sync_all() {
+                drop(stage);
+                remove_stage(root, &stage_path)?;
+                return Err(ExperimentError::Io(error));
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = read_bounded(root, final_path, bytes.len().max(1))?;
             if existing != bytes || policy == ExistingPolicy::Reject {
+                drop(stage);
                 remove_stage(root, &stage_path)?;
                 return Err(ExperimentError::TrialAlreadyExists);
             }
         }
         Err(error) => {
+            drop(stage);
             remove_stage(root, &stage_path)?;
             return Err(ExperimentError::Io(error));
         }
     }
+    drop(stage);
     synchronize_parent(root, final_path)?;
     match root.remove_file(&stage_path) {
         Ok(()) => {}
@@ -840,7 +850,13 @@ fn synchronize_parent(root: &Dir, path: &Path) -> Result<(), ExperimentError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn synchronize_parent(_root: &Dir, _path: &Path) -> Result<(), ExperimentError> {
+    // The writable staged file is re-flushed after its final hard link is published.
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn synchronize_parent(_root: &Dir, _path: &Path) -> Result<(), ExperimentError> {
     Err(ExperimentError::Unavailable)
 }

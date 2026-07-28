@@ -1697,8 +1697,8 @@
     },
     {
       "path": "crates/market-squawk-backtesting/src/experiments/inventory.rs",
-      "sha256": "efa2565e96c2cc5763086224481e167bb14c93e2f9b3a584b836ae6883ec3a60",
-      "size_bytes": 38118
+      "sha256": "e066c83ca645cb65ab0581b186fcbf7302472671f3c225eab4928dfc586c3ef0",
+      "size_bytes": 38634
     },
     {
       "path": "crates/market-squawk-backtesting/src/experiments/model.rs",
