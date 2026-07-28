@@ -12,6 +12,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::*;
+#[cfg(windows)]
+use crate::evidence_store::sync_new_link_metadata;
 use crate::evidence_store::sync_publication_directory;
 #[cfg(test)]
 use crate::evidence_store::{PublicationCommitEvent, PublicationCommitTestProbe};
@@ -218,12 +220,13 @@ pub(super) fn persist_snapshot(
     }
     check_cancelled(cancellation)?;
     match directory.hard_link(&staging_name, directory, &final_name) {
-        Ok(()) =>
-        {
+        Ok(()) => {
             #[cfg(test)]
             if let Some(probe) = publication_probe {
                 probe.final_link_published(cancellation);
             }
+            #[cfg(windows)]
+            sync_new_link_metadata(&staging)?;
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             if read_bounded_regular(directory, &final_name, limits.max_snapshot_bytes)? != bytes {

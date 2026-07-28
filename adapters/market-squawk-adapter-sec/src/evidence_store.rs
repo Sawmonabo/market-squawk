@@ -113,7 +113,11 @@ impl RawEvidenceStore {
             .directory
             .hard_link(&staging_name, &self.directory, &final_name)
         {
-            Ok(()) => self.observe_final_link(cancellation),
+            Ok(()) => {
+                self.observe_final_link(cancellation);
+                #[cfg(windows)]
+                sync_new_link_metadata(&staging)?;
+            }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 let commit_cancellation = CancellationToken::new();
                 if self
@@ -247,9 +251,21 @@ pub(crate) fn sync_publication_directory(directory: &Dir) -> Result<(), std::io:
         .and_then(|opened| opened.sync_all())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn sync_publication_directory(directory: &Dir) -> Result<(), std::io::Error> {
     directory.try_clone()?.into_std_file().sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_publication_directory(_directory: &Dir) -> Result<(), std::io::Error> {
+    // Windows has no safe portable equivalent to fsync for a directory handle.
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_new_link_metadata(file: &std::fs::File) -> Result<(), std::io::Error> {
+    // Re-flush the writable staging handle after publishing its final hard link.
+    file.sync_all()
 }
 
 #[cfg(test)]
