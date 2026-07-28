@@ -73,7 +73,7 @@ All byte ceilings are exact integer byte counts. All timing values are milliseco
 | `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | Command-specific diagnostic override | `false` | Boolean; enables paper behavior only and grants no live execution authority |
 | `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | Internal override only | `1000` | Positive and no greater than `capture_shutdown_ms` |
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | Internal override only | `5000` | Positive, no greater than `60000`, and no less than the flush interval |
-| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `5000` | `1..=60000`; independent source-supervisor shutdown deadline |
+| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000`; bounds the source supervisor and its owned capture cleanup |
 | `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset | When present, must be a nonempty absolute path; model composition verifies that the running application and sibling ONNX worker are the exact signed files installed there |
 | `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | Internal override only | Unset | Redacted locator, 1–512 bytes, no control characters, prefixed by `keyring:` or `encrypted-file:` |
 | `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | Internal typed override only | Unset | Complete closed Coinbase profile; the environment value is JSON at most 128 KiB |
@@ -99,7 +99,7 @@ capture_destination_registry_memory_ceiling_bytes = 1048576
 paper_bot_enabled = false
 capture_flush_interval_ms = 1000
 capture_shutdown_ms = 5000
-source_shutdown_ms = 5000
+source_shutdown_ms = 15000
 training_release_root = "/absolute/path/to/installed-training-release"
 source_secret = "keyring:opaque-local-reference"
 ```

@@ -132,7 +132,7 @@ All durations are integer milliseconds. All memory limits are exact integer byte
 | `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | No general override; diagnostic commands may supply their own flag | `false` | Rust boolean syntax: `true` or `false`; grants no live execution authority |
 | `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | None | `1000` | Positive and no greater than `capture_shutdown_ms` |
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | None | `5000` | Positive, `<=60000`, and no less than the flush interval |
-| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `5000` | `1..=60000` |
+| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000` |
 | `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset | When present, nonempty and absolute; startup verifies that the running application and sibling ONNX worker are the exact signed files installed there |
 | `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | None | Unset | Locator only; `1..=512` bytes, no control characters, prefix `keyring:` or `encrypted-file:` |
 | `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | None | Unset | Complete closed Coinbase profile; environment JSON at most 128 KiB |
@@ -165,7 +165,7 @@ capture_memory_ceiling_bytes = 67108864
 capture_destination_registry_memory_ceiling_bytes = 1048576
 capture_flush_interval_ms = 1000
 capture_shutdown_ms = 5000
-source_shutdown_ms = 5000
+source_shutdown_ms = 15000
 
 paper_bot_enabled = false
 ```
@@ -221,11 +221,11 @@ effective precedence origin.
 To test the precedence of one non-secret value without changing the file:
 
 ```bash
-MARKET_SQUAWK_SOURCE_SHUTDOWN_MS=7000 \
-  "$MSQ" --config "$CONFIG" --source-shutdown-ms 9000 --output json config show
+MARKET_SQUAWK_SOURCE_SHUTDOWN_MS=12000 \
+  "$MSQ" --config "$CONFIG" --source-shutdown-ms 15000 --output json config show
 ```
 
-The effective `sourceShutdownMs` entry must be `{"value":9000,"origin":"cli"}`: the CLI layer wins
+The effective `sourceShutdownMs` entry must be `{"value":15000,"origin":"cli"}`: the CLI layer wins
 over the environment, which wins over the file.
 
 Internally, `AppConfig` records one origin for every setting:
@@ -350,7 +350,7 @@ With the baseline above, `config validate` returns this shape:
       "origin": "local_file"
     },
     "sourceShutdownMs": {
-      "value": 5000,
+      "value": 15000,
       "origin": "safe_default"
     },
     "sourceSecretConfigured": {

@@ -403,14 +403,15 @@ source_secret = "keyring:coinbase"
 }
 
 #[test]
-fn source_shutdown_has_an_independent_safe_default() -> Result<(), Box<dyn std::error::Error>> {
+fn source_shutdown_default_outlives_owned_capture_cleanup() -> Result<(), Box<dyn std::error::Error>>
+{
     let config = AppConfig::load(ConfigSources::new(
         None,
         &BTreeMap::new(),
         ConfigOverrides::default(),
     ))?;
 
-    assert_eq!(config.source_shutdown().as_millis(), 5_000);
+    assert_eq!(config.source_shutdown().as_millis(), 15_000);
     assert_eq!(config.capture_queue_capacity().get(), 16_384);
     assert_eq!(
         config.capture_memory_ceiling_bytes().get(),
@@ -426,8 +427,8 @@ fn source_shutdown_has_an_independent_safe_default() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn source_shutdown_accepts_exact_boundaries_and_rejects_zero_or_excess() {
-    for accepted in [1, 60_000] {
+fn source_shutdown_accepts_safe_boundaries_and_rejects_incomplete_cleanup_budgets() {
+    for accepted in [11_000, 121_000] {
         let config = AppConfig::load(ConfigSources::new(
             None,
             &BTreeMap::new(),
@@ -439,7 +440,7 @@ fn source_shutdown_accepts_exact_boundaries_and_rejects_zero_or_excess() {
         assert!(config.is_ok(), "source shutdown {accepted}ms was rejected");
     }
 
-    for rejected in [0, 60_001] {
+    for rejected in [0, 10_999, 121_001] {
         let error = AppConfig::load(ConfigSources::new(
             None,
             &BTreeMap::new(),

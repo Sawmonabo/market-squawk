@@ -34,14 +34,15 @@ const DEFAULT_CAPTURE_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 1024 * 1024;
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SHUTDOWN_MS: u64 = 5_000;
-const DEFAULT_SOURCE_SHUTDOWN_MS: u64 = 5_000;
+const DEFAULT_SOURCE_SHUTDOWN_MS: u64 = 15_000;
+const SOURCE_SHUTDOWN_COORDINATION_GRACE_MS: u64 = 1_000;
 const MAX_QUEUE_CAPACITY: usize = 1_048_576;
 const MAX_CAPTURE_MEMORY_CEILING_BYTES: usize = 4_294_967_295;
 const MAX_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 const MIN_STALE_AFTER_MS: u64 = 250;
 const MAX_STALE_AFTER_MS: u64 = 600_000;
 const MAX_SHUTDOWN_MS: u64 = 60_000;
-const MAX_SOURCE_SHUTDOWN_MS: u64 = 60_000;
+const MAX_SOURCE_SHUTDOWN_MS: u64 = 121_000;
 const MAX_SECRET_REFERENCE_BYTES: usize = 512;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
@@ -978,7 +979,16 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             .source_shutdown_ms
             .and_then(NonZeroU64::new)
             .ok_or(ConfigError::InvalidSourceShutdownTiming)?;
-        if source_shutdown_ms.get() > MAX_SOURCE_SHUTDOWN_MS {
+        let minimum_source_shutdown_ms = shutdown_ms
+            .get()
+            .checked_mul(2)
+            .and_then(|milliseconds| {
+                milliseconds.checked_add(SOURCE_SHUTDOWN_COORDINATION_GRACE_MS)
+            })
+            .ok_or(ConfigError::InvalidSourceShutdownTiming)?;
+        if !(minimum_source_shutdown_ms..=MAX_SOURCE_SHUTDOWN_MS)
+            .contains(&source_shutdown_ms.get())
+        {
             return Err(ConfigError::InvalidSourceShutdownTiming);
         }
         if values

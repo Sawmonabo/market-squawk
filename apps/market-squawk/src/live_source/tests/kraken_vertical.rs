@@ -118,7 +118,7 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
     cancellation.cancel();
-    let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
+    let shutdown = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown()).await?;
     assert!(shutdown.is_complete(), "{shutdown:#?}");
     let persisted_checkpoint = *shutdown
         .checkpoint()
@@ -186,7 +186,7 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert!(restarted.financial_reconciliation_current());
     restart_cancellation.cancel();
     let restart_shutdown =
-        tokio::time::timeout(Duration::from_secs(10), restarted.shutdown()).await?;
+        tokio::time::timeout(Duration::from_secs(30), restarted.shutdown()).await?;
     assert!(restart_shutdown.is_complete(), "{restart_shutdown:#?}");
     assert_eq!(
         restart_shutdown
@@ -227,7 +227,7 @@ async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> 
 
     let rotation = tokio::time::timeout(ROTATION_BOUND, &mut server).await;
     cancellation.cancel();
-    let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
+    let shutdown = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown()).await?;
     assert!(shutdown.is_complete(), "{shutdown:#?}");
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     match rotation {

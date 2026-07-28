@@ -1056,7 +1056,9 @@ mod tests {
             &BTreeMap::new(),
             ConfigOverrides {
                 data_dir: Some(directory.path().join("data")),
-                source_shutdown_ms: Some(1),
+                capture_flush_interval_ms: Some(10),
+                capture_shutdown_ms: Some(100),
+                source_shutdown_ms: Some(1_200),
                 ..ConfigOverrides::default()
             },
         ))?;
@@ -1066,7 +1068,7 @@ mod tests {
         });
 
         let disposition = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             run_source(config, source, RunMode::ForDuration(0)),
         )
         .await??;

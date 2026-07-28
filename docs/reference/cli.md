@@ -51,7 +51,7 @@ Clap marks the options below as global, so they may appear with any public subco
 | `--log <FILTER>` | Tracing filter | `info`; may use `MARKET_SQUAWK_LOG` | Configures local stderr tracing; it is not part of `AppConfig` |
 | `--json-logs` | Flag | Off | Emits structured tracing to stderr |
 | `--output <human|json>` | Enum | `human` | Selects human plus pretty JSON or compact JSON for supported commands |
-| `--source-shutdown-ms <U64>` | Milliseconds | Configuration value, initially `5000` | Overrides the source-supervisor shutdown deadline; valid range is `1..=60000` |
+| `--source-shutdown-ms <U64>` | Milliseconds | Configuration value, initially `15000` | Overrides the source-supervisor shutdown deadline; it must be at least `2 × capture_shutdown_ms + 1000` and no greater than `121000` |
 | `--training-release-root <PATH>` | Absolute path | None | Selects the installed signed training release; the running application and sibling ONNX worker must be the exact files from that release |
 | `--capture-queue-capacity <USIZE>` | Count | Configuration value, initially `16384` | Overrides the fixed raw-capture queue capacity; valid range is `1..=1048576` |
 | `--capture-memory-ceiling-bytes <USIZE>` | Bytes | Configuration value, initially `67108864` | Overrides the per-channel capture memory ceiling; valid range is `1..=4294967295` |

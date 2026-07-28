@@ -341,6 +341,8 @@ impl ControlledArtifactRepository {
         staging.sync_all().map_err(|_| ArtifactError::Unavailable)?;
         drop(staging);
         context.ensure_live()?;
+        #[cfg(windows)]
+        eprintln!("artifact publication diagnostic: staging synchronized");
 
         publish_staged_artifact(
             &self.root,
@@ -349,9 +351,15 @@ impl ControlledArtifactRepository {
             artifact_path,
             &mut guard,
         )?;
+        #[cfg(windows)]
+        eprintln!("artifact publication diagnostic: staged artifact published");
         synchronize_publication_directories(&directory, artifact_path)?;
+        #[cfg(windows)]
+        eprintln!("artifact publication diagnostic: publication synchronized");
         context.ensure_live()?;
         let persisted = read_bounded_regular(&directory, artifact_path, self.maximum_bytes.get())?;
+        #[cfg(windows)]
+        eprintln!("artifact publication diagnostic: publication reopened");
         if persisted.as_slice() != publication.content()
             || format!("{:x}", Sha256::digest(&persisted)) != publication.sha256_hex()
         {
@@ -680,6 +688,16 @@ fn publish_staged_artifact(
         .map_err(|_| ArtifactError::Unavailable)?;
     let source_exists = windows_regular_entry_exists(directory, staging_path)?;
     let destination_exists = windows_regular_entry_exists(directory, artifact_path)?;
+    eprintln!(
+        "artifact publication diagnostic: move={:?}, raw_os_error={:?}, source_exists={}, destination_exists={}",
+        publication.as_ref().err().map(std::io::Error::kind),
+        publication
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+        source_exists,
+        destination_exists,
+    );
     match publication {
         Ok(()) if !source_exists && destination_exists => {
             guard.disarm();
