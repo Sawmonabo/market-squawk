@@ -11,7 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `05b406f12a62dd4938b0d6ebe7013d9c607132ba` |
+| Correctness follow-up candidate | `f7c7712a95654230abc40f6e6d43a297e0dab210` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -34,7 +34,8 @@ The audit compared the research report with:
 - retained Linux, macOS, and Windows job logs;
 - a two-pass Cargo fingerprint reproduction;
 - the Linux authority-lock, Windows analytical-backup, and manifest-allocation implementations;
-- the unchanged Windows job rerun and file-adapter clock/deadline fixture; and
+- the unchanged Windows job rerun and file-adapter clock/deadline fixture;
+- the Windows ONNX worker's resource profile and pinned Job Object dependency; and
 - the relevant Linux, Windows, Rust, and SQLite platform contracts.
 
 ## Findings
@@ -98,6 +99,17 @@ speedup.
   one process-global reaper and could therefore inherit an unrelated session's pending SDK thread
   or failure. Exact per-transfer join receipts preserve bounded reaper ownership while making each
   session wait only for its own worker.
+- Exact candidate `f7c7712` passed the complete Linux and macOS jobs. Its Windows job passed the
+  preceding lock, catalog, data, and MCP corrections, then became the first retained Windows run
+  to execute the modeling harness.
+- The Windows ONNX worker configured `limit_working_memory(0, 3 GiB)`, which violates Microsoft's
+  requirement that a nonzero maximum working set have a nonzero minimum. `win32job 2.0.3` applied
+  the invalid profile before process assignment, so each helper exited before protocol
+  initialization and the parent consistently mapped EOF to public `WarmUp`.
+- A valid nonzero working-set minimum would not cap committed memory. The correction instead
+  binds both per-process and job-wide 3 GiB committed-memory limits plus kill-on-close through an
+  audited local patch of the exact licensed dependency. The patch source is now included in the
+  Python release source closure, and runtime resource evidence advances to version 2.
 
 The retained diagnostic log identities were:
 
@@ -112,6 +124,9 @@ The retained diagnostic log identities were:
 | Candidate `05b406f` Linux job `90227935404` | `e00fb737ab040a38697db0172cd9456cfd9e461b7f20ac845745419f18769d1a` |
 | Candidate `05b406f` Windows job `90227935382` | `5528931b286af7a140be0f697e6961aacdcb011597534edf9fca2296bab5c2a2` |
 | Candidate `05b406f` macOS job `90227935405` | `b7910509c67325af7e547d219eb480e906a72211bc9994ed196ffa23097ad8da` |
+| Candidate `f7c7712` Linux job `90241570286` | `78bbb617c584f51567afc42ce62392f9b9822f38fd765cbec111f4a0839f3a57` |
+| Candidate `f7c7712` Windows job `90241570389` | `9234b45044e1d2959cba1e54f4be507989631dcb952745127096d982a8317efb` |
+| Candidate `f7c7712` macOS job `90241570407` | `e412fcdee3c80d849e25410f18bd41f4c1d65eec255080dbfc3250cccd52f403` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -123,7 +138,7 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 | Category | Sources | Audit result |
 | --- | ---: | --- |
 | GitHub repositories | 7 | Covered; maintained primary project repositories |
-| Official documentation and exact toolchain source | 25 | Seven runtime sources plus current platform-contract sources |
+| Official documentation and exact toolchain source | 28 | Seven runtime sources plus current platform-contract sources |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
 | Reputable sources | 4 | Covered; first-party documentation or direct Rust expertise |
 
@@ -139,7 +154,8 @@ numerical forecast.
   reviewed report and are not required for day-to-day maintenance.
 - The Linux lock defect, Windows URI boundary, Windows retained-backup lock conflict, Windows
   manifest-allocation dependency, file-adapter fixture race, Windows lock-contention
-  classification, and MCP cross-session reaper dependency now have bounded causal explanations.
+  classification, MCP cross-session reaper dependency, and Windows ONNX Job Object profile now
+  have bounded causal explanations.
 - The corrected backup and manifest designs use the existing failing tests as focused proof; no
   retry, sleep, serialization, fixture rewrite, new test target, or weakened evidence rule was
   introduced.
@@ -148,6 +164,9 @@ numerical forecast.
 - Exact candidate `05b406f` completed without cancellation: macOS passed; Windows passed those five
   corrections and exposed catalog lock classification; Linux exposed MCP session/global-reaper
   coupling.
+- Exact candidate `f7c7712` completed without cancellation: Linux and macOS passed; Windows passed
+  the prior corrections and exposed the invalid ONNX Job Object profile in the first retained
+  Windows execution of that harness.
 - The correctness fixes are not release evidence until one unchanged candidate passes Linux,
   macOS, and Windows.
 - The audit verdict approves this report as decision input. It is not release approval and not

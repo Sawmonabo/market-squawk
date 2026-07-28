@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use super::OnnxWorkerProcessError;
 
 #[cfg(any(windows, all(unix, not(target_vendor = "apple"))))]
-const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const WORKER_MEMORY_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 #[cfg(not(any(windows, all(unix, not(target_vendor = "apple")))))]
-const WORKER_ADDRESS_SPACE_BYTES: u64 = 0;
+const WORKER_MEMORY_LIMIT_BYTES: u64 = 0;
 #[cfg(unix)]
 const WORKER_FILE_DESCRIPTOR_LIMIT: u64 = 64;
 #[cfg(not(unix))]
@@ -26,7 +26,7 @@ pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcess
         maximum: Some(value),
     };
     #[cfg(not(target_vendor = "apple"))]
-    setrlimit(Resource::As, exact(WORKER_ADDRESS_SPACE_BYTES))
+    setrlimit(Resource::As, exact(WORKER_MEMORY_LIMIT_BYTES))
         .map_err(|_| OnnxWorkerProcessError::Resource)?;
     // Darwin does not implement a usable RLIMIT_AS. Static compute admission and the parent-owned
     // per-request wall deadline contain work without imposing a cumulative lifetime CPU ceiling.
@@ -50,21 +50,24 @@ pub(super) fn deny_file_growth() -> Result<(), OnnxWorkerProcessError> {
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub(super) struct ResourceGuard(win32job::Job);
+pub(super) struct ResourceGuard {
+    _job: win32job::Job,
+}
 
 #[cfg(windows)]
 pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcessError> {
-    let maximum = usize::try_from(WORKER_ADDRESS_SPACE_BYTES)
-        .map_err(|_| OnnxWorkerProcessError::Resource)?;
+    let maximum =
+        usize::try_from(WORKER_MEMORY_LIMIT_BYTES).map_err(|_| OnnxWorkerProcessError::Resource)?;
     let mut limits = win32job::ExtendedLimitInfo::new();
     limits
-        .limit_working_memory(0, maximum)
+        .limit_process_memory(maximum)
+        .limit_job_memory(maximum)
         .limit_kill_on_job_close();
     let job = win32job::Job::create_with_limit_info(&limits)
         .map_err(|_| OnnxWorkerProcessError::Resource)?;
     job.assign_current_process()
         .map_err(|_| OnnxWorkerProcessError::Resource)?;
-    Ok(ResourceGuard(job))
+    Ok(ResourceGuard { _job: job })
 }
 
 #[cfg(windows)]
@@ -91,7 +94,7 @@ pub(super) fn semantics_digest() -> [u8; 32] {
     bind_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-resource-profile/v1",
+        b"market-squawk/onnx-worker-resource-profile/v2",
     );
     bind_bytes(&mut digest, b"target-os", std::env::consts::OS.as_bytes());
     bind_bytes(
@@ -102,8 +105,8 @@ pub(super) fn semantics_digest() -> [u8; 32] {
     bind_bytes(&mut digest, b"profile", resource_profile());
     bind_u128(
         &mut digest,
-        b"address-space-or-working-set-bytes",
-        u128::from(WORKER_ADDRESS_SPACE_BYTES),
+        b"memory-limit-bytes",
+        u128::from(WORKER_MEMORY_LIMIT_BYTES),
     );
     bind_u128(
         &mut digest,
@@ -113,8 +116,10 @@ pub(super) fn semantics_digest() -> [u8; 32] {
     for (name, enabled) in [
         (
             b"address-space-limit".as_slice(),
-            cfg!(any(windows, all(unix, not(target_vendor = "apple")))),
+            cfg!(all(unix, not(target_vendor = "apple"))),
         ),
+        (b"process-committed-memory-limit".as_slice(), cfg!(windows)),
+        (b"job-committed-memory-limit".as_slice(), cfg!(windows)),
         (
             b"core-dump-denial".as_slice(),
             cfg!(all(unix, not(target_os = "haiku"))),
@@ -137,7 +142,7 @@ const fn resource_profile() -> &'static [u8] {
     } else if cfg!(unix) {
         b"unix-rlimit-as-nofile-core-fsize/v1"
     } else if cfg!(windows) {
-        b"windows-job-working-set-kill-on-close/v1"
+        b"windows-job-process-and-job-commit-kill-on-close/v2"
     } else {
         b"unsupported-fail-closed/v1"
     }

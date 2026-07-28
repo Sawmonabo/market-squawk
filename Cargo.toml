@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*", "adapters/*"]
+exclude = ["vendor/win32job"]
 default-members = ["apps/market-squawk"]
 
 [workspace.package]
@@ -212,3 +213,9 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# win32job 2.0.3 does not expose the committed-memory limits required by the
+# Windows ONNX worker. Keep the audited upstream source local until
+# https://github.com/ohadravid/win32job-rs/issues/6 is resolved and released.
+[patch.crates-io]
+win32job = { path = "vendor/win32job" }

@@ -82,13 +82,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "c14a8a764631c6e31df00f7b494f3007c91eb75b48fdfcbb160d8913398be32d",
-      "size_bytes": 178482
+      "sha256": "d7f7b2f32d1de6a2c3c99196cf2ee6da87ec52bc0ec5b79e579ad8491e499a72",
+      "size_bytes": 178339
     },
     {
       "path": "Cargo.toml",
-      "sha256": "5e5b49a46efc74f8e537d9feb33af9246f77b760ac51dbf44eb7561373add3c8",
-      "size_bytes": 7013
+      "sha256": "4c2b7d43fc450538c50bf9bcbeda3a116da80a88732e49b5daa77de1a8877e4c",
+      "size_bytes": 7325
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
@@ -3212,8 +3212,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/resources.rs",
-      "sha256": "8da172cc0a7de4c888acbd40f1a90c99eef2764d2f421d91148fd1dbee60f744",
-      "size_bytes": 5055
+      "sha256": "9bd857b4d2499234b3ef4ec2ea7aac7050a56ebff45eab2e4a304665d499b9ce",
+      "size_bytes": 5222
     },
     {
       "path": "crates/market-squawk-modeling/src/registry.rs",
@@ -4342,13 +4342,53 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "600bdb01d509222db47af822c660d2fcbf0ea1abe2aac78063735c56ab2acb2e",
-      "size_bytes": 102340
+      "sha256": "5da82458aca40f68089e9fcaebec6d69ed0c325d1cb344998b5bb33ef5512d6e",
+      "size_bytes": 102724
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
       "sha256": "1d77cc7053c2cc332a0e03fb0e4855d9bab2cb080deb0c200c9972e0d69dde03",
       "size_bytes": 14193
+    },
+    {
+      "path": "vendor/win32job/Cargo.toml",
+      "sha256": "86cf416eee2bf11f35bbc269146636ce8c72aa1c0ea64962c456809148e079c8",
+      "size_bytes": 809
+    },
+    {
+      "path": "vendor/win32job/README.md",
+      "sha256": "ff91fd0572ed1e6f0f92d309a32c6f5929e25641ecc8efc883dd9485bc556698",
+      "size_bytes": 1812
+    },
+    {
+      "path": "vendor/win32job/src/error.rs",
+      "sha256": "685d9d3cee5d9306277c33ad633fe72c8354582e6366f1486196337535876505",
+      "size_bytes": 1120
+    },
+    {
+      "path": "vendor/win32job/src/job.rs",
+      "sha256": "5f4e7119701f33a724d631c7ce9cd68c1713fa3952170ddeed473c643b347e97",
+      "size_bytes": 4438
+    },
+    {
+      "path": "vendor/win32job/src/lib.rs",
+      "sha256": "48fb52c3edc493d2c9df1188c1b2dd206d0f88ce7408711ab7fd41c9e46442a7",
+      "size_bytes": 1873
+    },
+    {
+      "path": "vendor/win32job/src/limits.rs",
+      "sha256": "fd23679a0203d2cde8e2950528782f38f0fd8f877c390b5f2b135cac4e31475e",
+      "size_bytes": 8473
+    },
+    {
+      "path": "vendor/win32job/src/query.rs",
+      "sha256": "67035f0d2bf80451895b3553a655e48203784057ec40ac4377a01b0aa3473643",
+      "size_bytes": 2184
+    },
+    {
+      "path": "vendor/win32job/src/utils.rs",
+      "sha256": "5cf305502d88924bbfab69bbf2bed0fe07577c0acc86c0c306bf9849ebd11ac5",
+      "size_bytes": 2893
     }
   ]
 }

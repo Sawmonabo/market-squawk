@@ -555,6 +555,14 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
         root / "crates/market-squawk-python/Cargo.toml",
         root / "crates/market-squawk-modeling/Cargo.toml",
     ]
+    patches = workspace.get("patch")
+    if isinstance(patches, dict):
+        for registry in patches.values():
+            if not isinstance(registry, dict):
+                continue
+            for patch in registry.values():
+                if isinstance(patch, dict) and isinstance(patch.get("path"), str):
+                    pending.append(root / patch["path"] / "Cargo.toml")
     visited: set[Path] = set()
     while pending:
         manifest = pending.pop().resolve(strict=True)

@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `05b406f12a62dd4938b0d6ebe7013d9c607132ba` |
+| Correctness follow-up candidate | `f7c7712a95654230abc40f6e6d43a297e0dab210` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -246,6 +246,21 @@ allocator-sensitive derived-evidence case, and the earlier file-adapter clock ca
 Windows. The two remaining failures are independent production authority defects described below;
 neither is a regression in the analytical corrections.
 
+Candidate `f7c7712a95654230abc40f6e6d43a297e0dab210` completed in
+[run 30348918829](https://github.com/Sawmonabo/market-squawk/actions/runs/30348918829):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| Linux verify | Passed | Complete job `90241570286` passed in 59m14s |
+| macOS | Passed | Complete job `90241570407` passed in 26m44s |
+| Windows | Failed | Job `90241570389` passed the lock, catalog, data, and MCP corrections, then reached the Windows ONNX worker for the first time |
+
+The Windows modeling harness ran 13 tests: 10 passed and three helper-backed tests returned
+`WarmUp`. The previous Windows job `90227935382` did not run this harness; its earlier
+13-test entry was the Coinbase unit suite, and the job stopped in the data catalog tests.
+Candidate `f7c7712` is therefore the first retained hosted Windows evidence for this worker
+boundary, not a regression from a prior Windows modeling pass.
+
 ### Linux authority-state lock lifetime
 
 The Linux failure was a production lock-lifecycle defect exposed by concurrent process creation.
@@ -389,7 +404,8 @@ The same focused correction covers every remaining production site that performe
 ownership, both analytical-root authority acquisition paths, and durable MCP audit ownership.
 Private RAII guards explicitly unlock at the logical final-owner boundary, including
 post-acquisition error paths. The existing catalog, publication-recovery, data-library, and MCP
-audit tests pass locally; Windows hosted evidence is still required.
+audit tests passed locally, and Windows job `90241570389` carried these corrected boundaries
+through to the later modeling harness.
 
 ### MCP session-specific SDK reaping
 
@@ -421,6 +437,43 @@ historical failure cannot affect the session result
 [Tokio 1.53.1 oneshot receiver](https://docs.rs/tokio/1.53.1/tokio/sync/oneshot/struct.Receiver.html)).
 The receipt wait remains bounded and cancellation-safe. Existing MCP unit, hostile-boundary, and
 lifecycle tests pass locally without retry, sleep, timeout inflation, or test serialization.
+Linux job `90241570286` subsequently passed the complete verification gate with this ownership
+model.
+
+### Windows ONNX committed-memory containment
+
+Windows job `90241570389` exposed a deterministic production defect in the helper's Job Object
+profile. The worker called `limit_working_memory(0, 3 GiB)`. Microsoft requires a nonzero minimum
+when the maximum working-set size is nonzero
+([Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)).
+The pinned `win32job 2.0.3` implementation forwards that pair to `SetInformationJobObject` before
+assigning the process
+([exact `win32job` job construction](https://github.com/ohadravid/win32job-rs/blob/v2.0.3/src/job.rs)).
+Every Windows helper therefore exited during containment setup, before reading initialization or
+emitting a protocol response. The parent observed EOF as `WorkerError::Unavailable`, which the
+public tract backend correctly coarsened to `OnnxBackendError::WarmUp`.
+
+That one causal chain explains all three failures. The valid model never reached warm-up, while
+the oversized-intermediate and compute-heavy models never reached worker-side static admission
+that would have returned `Resource` and then `IntermediateLimit`. The one-nanosecond deadline test
+passed only because it also expects `WarmUp`; it did not prove helper startup.
+
+Changing the minimum to a token nonzero value would make the profile syntactically valid but would
+retain only a working-set ceiling. Working-set limits do not bound committed virtual memory. The
+hardened correction instead applies both per-process and job-wide 3 GiB committed-memory limits
+with kill-on-close. Microsoft documents that `JOB_OBJECT_LIMIT_PROCESS_MEMORY` caps each process's
+committed memory and `JOB_OBJECT_LIMIT_JOB_MEMORY` caps the job-wide sum
+([Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)).
+
+Upstream `win32job 2.0.3` exposes neither committed-memory setter, and its general extended-limit
+request remains open
+([upstream issue 6](https://github.com/ohadravid/win32job-rs/issues/6)). Market Squawk therefore
+patches that exact licensed source locally with only the two safe setters. Cargo resolves the
+patched source through the lockfile, the Python release builder now admits local Cargo patches into
+its complete source closure, and the resource-semantics digest advances to version 2. This retains
+the workspace's `unsafe_code = "forbid"` boundary and makes the stronger containment behavior part
+of runtime evidence. No new test target, retry, sleep, deadline increase, or test serialization is
+required; the existing 13-test Windows modeling harness is the authoritative hosted proof.
 
 Release authority still requires one unchanged candidate to pass the complete Linux, macOS, and
 Windows jobs. These corrections remove cross-platform classification and cross-session ownership
@@ -577,9 +630,13 @@ The platform-contract sources added during the correctness follow-up were review
 - [Microsoft `LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
 - [Microsoft system errors 0–499](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
+- [Microsoft Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
+- [Microsoft Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
 - [SQLite URI filenames](https://www.sqlite.org/uri.html)
 - [SQLite opening connections and immutable URI parameters](https://sqlite.org/c3ref/open.html)
 - [`fs2 0.4.3` Windows locking implementation](https://github.com/danburkert/fs2-rs/blob/e1d4843b7c19e3ce1ecbae92255223de31b36d3b/src/windows.rs#L89-L112)
+- [`win32job 2.0.3` source](https://github.com/ohadravid/win32job-rs/tree/v2.0.3)
+- [`win32job` extended-limit issue](https://github.com/ohadravid/win32job-rs/issues/6)
 
 ### Official GitHub documentation and maintained tools
 
