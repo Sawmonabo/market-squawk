@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 
 use super::PathError;
@@ -356,7 +355,7 @@ impl fmt::Debug for CatalogWriterGuard {
 
 impl Drop for CatalogWriterGuard {
     fn drop(&mut self) {
-        let _ignored = fs2::FileExt::unlock(&self.file);
+        let _ignored = self.file.unlock();
     }
 }
 
@@ -490,15 +489,21 @@ impl CatalogLocation {
             .map_err(|source| PathError::io("failed to open catalog writer lock", source))?;
         let file = file.into_std();
         validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
-        file.try_lock_exclusive().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                PathError::CatalogAlreadyLocked
-            } else {
-                PathError::io("failed to acquire catalog writer lock", source)
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(PathError::CatalogAlreadyLocked);
             }
-        })?;
-        validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
-        Ok(CatalogWriterGuard { file })
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(PathError::io(
+                    "failed to acquire catalog writer lock",
+                    source,
+                ));
+            }
+        }
+        let guard = CatalogWriterGuard { file };
+        validate_private_file_identity(self, WRITER_LOCK_FILE, &guard.file)?;
+        Ok(guard)
     }
 }
 

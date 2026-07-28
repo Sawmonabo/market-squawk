@@ -9,7 +9,6 @@ use std::{
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use fs2::FileExt as _;
 use market_squawk_mcp::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
     AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass, MutationAuditBundle,
@@ -34,13 +33,16 @@ impl DurableAuditSink {
     pub(super) fn try_new(control: Dir) -> Result<Self, LocalAuditError> {
         let file = open_audit_file(&control)?;
         validate_private_file_identity(&control, &file)?;
-        file.try_lock_exclusive().map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                LocalAuditError::AlreadyLocked
-            } else {
-                LocalAuditError::Io(source)
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LocalAuditError::AlreadyLocked);
             }
-        })?;
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(LocalAuditError::Io(source));
+            }
+        }
+        let file = AuditWriterGuard(file);
         validate_private_file_identity(&control, &file)?;
         synchronize_parent_directory(&control, &file)?;
         recover_audit_file(&file)?;
@@ -143,10 +145,38 @@ impl DurableAuditSink {
 
 #[derive(Debug)]
 struct AuditState {
-    file: File,
+    file: AuditWriterGuard,
     records: Box<[Option<AuditEvent>]>,
     next: usize,
     poisoned: bool,
+}
+
+struct AuditWriterGuard(File);
+
+impl std::ops::Deref for AuditWriterGuard {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AuditWriterGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for AuditWriterGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuditWriterGuard([LOCKED AUDIT CAPABILITY])")
+    }
+}
+
+impl Drop for AuditWriterGuard {
+    fn drop(&mut self) {
+        let _ignored = self.0.unlock();
+    }
 }
 
 impl AuditState {

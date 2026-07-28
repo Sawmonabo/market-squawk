@@ -9,7 +9,6 @@ use std::sync::{Mutex, OnceLock};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use fs2::FileExt as _;
 use market_squawk_platform::ArtifactRoot;
 use sha2::{Digest as _, Sha256};
 #[cfg(test)]
@@ -79,6 +78,20 @@ struct RootRegistryGuard {
     path: PathBuf,
 }
 
+struct RootAuthorityLock(File);
+
+impl RootAuthorityLock {
+    const fn file(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for RootAuthorityLock {
+    fn drop(&mut self) {
+        let _ignored = self.0.unlock();
+    }
+}
+
 impl Drop for RootRegistryGuard {
     fn drop(&mut self) {
         if let Ok(mut roots) = OPEN_ARTIFACT_ROOTS
@@ -93,7 +106,7 @@ impl Drop for RootRegistryGuard {
 pub(super) struct RootAuthority {
     pub(super) identity: ArtifactRootIdentity,
     pub(super) publication: PublicationCoordinator,
-    _lock: File,
+    _lock: RootAuthorityLock,
     _registry: RootRegistryGuard,
 }
 
@@ -102,7 +115,7 @@ pub(crate) struct PreparedRootAuthority {
     root: ArtifactRoot,
     directory: Dir,
     endpoint: RootEndpointIdentity,
-    lock: File,
+    lock: RootAuthorityLock,
     registry: RootRegistryGuard,
 }
 
@@ -248,14 +261,15 @@ pub(crate) fn acquire_prepared_root_authority(
         .map_err(crate::parquet_store::map_artifact_root_clone_error)?;
     let registry = acquire_process_registry(root.root())?;
     let lock = open_root_authority_lock(&directory, create_lock)?;
-    match lock.try_lock_exclusive() {
+    match lock.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(ParquetStoreError::RootAuthorityAlreadyOwned);
         }
-        Err(error) => return Err(error.into()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
-    validate_root_control_file(&directory, ROOT_AUTHORITY_LOCK, &lock, 1)?;
+    let lock = RootAuthorityLock(lock);
+    validate_root_control_file(&directory, ROOT_AUTHORITY_LOCK, lock.file(), 1)?;
     let endpoint = root_endpoint_identity(&directory, root.root())?;
     Ok(PreparedRootAuthority {
         root,
@@ -1135,14 +1149,15 @@ pub(super) fn acquire_root_authority(
     let root_path = root.root();
     let registry = acquire_process_registry(root_path)?;
     let lock = open_or_create_root_authority_lock(directory)?;
-    match lock.try_lock_exclusive() {
+    match lock.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(ParquetStoreError::RootAuthorityAlreadyOwned);
         }
-        Err(error) => return Err(error.into()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
-    validate_root_control_file(directory, ROOT_AUTHORITY_LOCK, &lock, 1)?;
+    let lock = RootAuthorityLock(lock);
+    validate_root_control_file(directory, ROOT_AUTHORITY_LOCK, lock.file(), 1)?;
 
     let stable_root = load_or_create_root_marker(
         directory,

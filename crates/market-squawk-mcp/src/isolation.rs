@@ -591,16 +591,38 @@ pub(crate) enum IsolatedSdkOutcome {
     Finished(Result<QuitReason, tokio::task::JoinError>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum SdkThreadShutdown {
     Joined,
-    TransferredToReaper,
+    TransferredToReaper(SdkThreadJoinReceipt),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SdkReaperDrain {
     Complete,
     Pending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SdkThreadJoinOutcome {
+    Joined,
+    Panicked,
+}
+
+#[derive(Debug)]
+pub(crate) struct SdkThreadJoinReceipt {
+    completion: oneshot::Receiver<SdkThreadJoinOutcome>,
+}
+
+impl SdkThreadJoinReceipt {
+    async fn wait(&mut self, timeout: Duration) -> Result<SdkReaperDrain, SdkThreadError> {
+        match tokio::time::timeout(timeout, &mut self.completion).await {
+            Ok(Ok(SdkThreadJoinOutcome::Joined)) => Ok(SdkReaperDrain::Complete),
+            Ok(Ok(SdkThreadJoinOutcome::Panicked)) => Err(SdkThreadError::WorkerPanicked),
+            Ok(Err(_closed)) => Err(SdkThreadError::ReaperUnavailable),
+            Err(_elapsed) => Ok(SdkReaperDrain::Pending),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -613,6 +635,7 @@ pub(crate) enum SdkThreadError {
     WorkerPanicked,
     #[error("MCP SDK reaper is unavailable")]
     ReaperUnavailable,
+    #[cfg(test)]
     #[error("MCP SDK reaper observed a worker panic")]
     ReapedWorkerPanicked,
 }
@@ -620,6 +643,7 @@ pub(crate) enum SdkThreadError {
 #[derive(Debug)]
 struct ReapRequest {
     thread: ThreadJoinHandle<()>,
+    completion: oneshot::Sender<SdkThreadJoinOutcome>,
 }
 
 const MAX_PROCESS_SDK_THREADS: usize = 64;
@@ -728,9 +752,13 @@ fn reap_finished_sdk_threads(
             }
         };
         if let Some(request) = request {
-            if request.thread.join().is_err() {
+            let outcome = if request.thread.join().is_ok() {
+                SdkThreadJoinOutcome::Joined
+            } else {
                 failed.store(true, Ordering::SeqCst);
-            }
+                SdkThreadJoinOutcome::Panicked
+            };
+            let _ignored = request.completion.send(outcome);
             pending.fetch_sub(1, Ordering::SeqCst);
             changed.notify_waiters();
         }
@@ -786,9 +814,13 @@ impl SdkThreadReaper {
                 }
             };
             if let Some(request) = completed {
-                if request.thread.join().is_err() {
+                let outcome = if request.thread.join().is_ok() {
+                    SdkThreadJoinOutcome::Joined
+                } else {
                     self.failed.store(true, Ordering::SeqCst);
-                }
+                    SdkThreadJoinOutcome::Panicked
+                };
+                let _ignored = request.completion.send(outcome);
                 self.pending.fetch_sub(1, Ordering::SeqCst);
                 self.changed.notify_waiters();
                 return Ok(SdkThreadReaperReservation {
@@ -810,10 +842,12 @@ impl SdkThreadReaper {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     pub(crate) async fn drain(&self, timeout: Duration) -> Result<SdkReaperDrain, SdkThreadError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
@@ -858,15 +892,23 @@ struct SdkThreadReaperReservation {
 }
 
 impl SdkThreadReaperReservation {
-    fn retain(mut self, thread: ThreadJoinHandle<()>, reaper: &SdkThreadReaper) {
+    fn retain(
+        mut self,
+        thread: ThreadJoinHandle<()>,
+        reaper: &SdkThreadReaper,
+    ) -> SdkThreadJoinReceipt {
+        let (completion, receipt) = oneshot::channel();
         reaper.pending.fetch_add(1, Ordering::SeqCst);
         let mut state = SDK_THREAD_SLOTS[self.index]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = SdkThreadSlot::Running(ReapRequest { thread });
+        *state = SdkThreadSlot::Running(ReapRequest { thread, completion });
         self.active = false;
         drop(state);
         reaper.worker_finished();
+        SdkThreadJoinReceipt {
+            completion: receipt,
+        }
     }
 }
 
@@ -961,8 +1003,10 @@ where
                 Err(SdkThreadError::WorkerPanicked)
             }
             Err(_elapsed) => {
-                self.transfer_or_join();
-                Ok(SdkThreadShutdown::TransferredToReaper)
+                let receipt = self
+                    .transfer_or_join()
+                    .ok_or(SdkThreadError::ReaperUnavailable)?;
+                Ok(SdkThreadShutdown::TransferredToReaper(receipt))
             }
         }
     }
@@ -976,20 +1020,20 @@ where
         joined
     }
 
-    fn transfer_or_join(&mut self) {
+    fn transfer_or_join(&mut self) -> Option<SdkThreadJoinReceipt> {
         let (Some(thread), Some(reservation)) =
             (self.thread.take(), self.reaper_reservation.take())
         else {
-            return;
+            return None;
         };
-        reservation.retain(thread, &self.reaper);
+        Some(reservation.retain(thread, &self.reaper))
     }
 }
 
 impl<T: Send + 'static> Drop for OwnedSdkThread<T> {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        self.transfer_or_join();
+        let _ignored = self.transfer_or_join();
     }
 }
 
@@ -1035,7 +1079,6 @@ pub(crate) fn run_isolated_sdk(
 pub(crate) struct SessionSupervisor {
     cancellation: CancellationToken,
     sdk_thread: Option<OwnedSdkThread<IsolatedSdkOutcome>>,
-    sdk_reaper: SdkThreadReaper,
     host_tasks: Vec<TokioJoinHandle<()>>,
     writer: WriterSupervisor,
     shutdown_timeout: Duration,
@@ -1046,7 +1089,6 @@ impl std::fmt::Debug for SessionSupervisor {
         formatter
             .debug_struct("SessionSupervisor")
             .field("sdk_thread_owned", &self.sdk_thread.is_some())
-            .field("sdk_reaper", &self.sdk_reaper)
             .field("host_task_count", &self.host_tasks.len())
             .field("writer", &self.writer)
             .field("shutdown_timeout", &self.shutdown_timeout)
@@ -1058,7 +1100,6 @@ impl SessionSupervisor {
     pub(crate) fn new(
         cancellation: CancellationToken,
         sdk_thread: OwnedSdkThread<IsolatedSdkOutcome>,
-        sdk_reaper: SdkThreadReaper,
         host_tasks: Vec<TokioJoinHandle<()>>,
         writer: WriterSupervisor,
         shutdown_timeout: Duration,
@@ -1066,7 +1107,6 @@ impl SessionSupervisor {
         Self {
             cancellation,
             sdk_thread: Some(sdk_thread),
-            sdk_reaper,
             host_tasks,
             writer,
             shutdown_timeout,
@@ -1084,18 +1124,21 @@ impl SessionSupervisor {
         terminal_marker: &'static [u8],
     ) -> Result<(), TransportError> {
         self.cancellation.cancel();
-        let sdk_result = match self.sdk_thread.take() {
-            Some(thread) => thread
-                .shutdown(self.shutdown_timeout)
-                .await
-                .map(|_shutdown| ())
-                .map_err(|_error| TransportError::WriterTask),
-            None => Ok(()),
+        let (sdk_result, mut join_receipt) = match self.sdk_thread.take() {
+            Some(thread) => match thread.shutdown(self.shutdown_timeout).await {
+                Ok(SdkThreadShutdown::Joined) => (Ok(()), None),
+                Ok(SdkThreadShutdown::TransferredToReaper(receipt)) => (Ok(()), Some(receipt)),
+                Err(_error) => (Err(TransportError::WriterTask), None),
+            },
+            None => (Ok(()), None),
         };
-        let reaper_result = match self.sdk_reaper.drain(self.shutdown_timeout).await {
-            Ok(SdkReaperDrain::Complete) => Ok(()),
-            Ok(SdkReaperDrain::Pending) => Err(TransportError::WriteTimedOut),
-            Err(_error) => Err(TransportError::WriterTask),
+        let reaper_result = match &mut join_receipt {
+            Some(receipt) => match receipt.wait(self.shutdown_timeout).await {
+                Ok(SdkReaperDrain::Complete) => Ok(()),
+                Ok(SdkReaperDrain::Pending) => Err(TransportError::WriteTimedOut),
+                Err(_error) => Err(TransportError::WriterTask),
+            },
+            None => Ok(()),
         };
         let mut host_tasks = std::mem::take(&mut self.host_tasks);
         let host_result = match tokio::time::timeout(self.shutdown_timeout, async {
@@ -1182,7 +1225,7 @@ mod thread_reaper_tests {
             }
         });
         entered.recv_timeout(Duration::from_secs(1))?;
-        reservation.retain(worker, &reaper);
+        let _receipt = reservation.retain(worker, &reaper);
         tokio::time::timeout(
             Duration::from_secs(1),
             reaper.wait_for_scan_after(prior_scans),
@@ -1288,10 +1331,10 @@ mod thread_reaper_tests {
             tokio::task::yield_now().await;
         }
 
-        assert_eq!(
-            worker.shutdown(Duration::from_millis(10)).await?,
-            SdkThreadShutdown::TransferredToReaper
-        );
+        let mut receipt = match worker.shutdown(Duration::from_millis(10)).await? {
+            SdkThreadShutdown::TransferredToReaper(receipt) => receipt,
+            SdkThreadShutdown::Joined => return Err("SDK worker unexpectedly joined".into()),
+        };
         tokio::time::timeout(Duration::from_secs(1), async {
             while !cancelled.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -1300,7 +1343,7 @@ mod thread_reaper_tests {
         .await?;
         assert_eq!(reaper.pending_count(), 1);
         assert_eq!(
-            reaper.drain(Duration::from_millis(10)).await?,
+            receipt.wait(Duration::from_millis(10)).await?,
             SdkReaperDrain::Pending
         );
         assert_eq!(reaper.pending_count(), 1);
@@ -1310,6 +1353,10 @@ mod thread_reaper_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         changed.notify_all();
+        assert_eq!(
+            receipt.wait(Duration::from_secs(1)).await?,
+            SdkReaperDrain::Complete
+        );
         assert_eq!(
             reaper.drain(Duration::from_secs(1)).await?,
             SdkReaperDrain::Complete

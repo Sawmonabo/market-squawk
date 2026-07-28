@@ -8,7 +8,6 @@ use std::time::Duration;
 use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use fs2::FileExt;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
     AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics, ProviderBudgetPolicy,
@@ -95,8 +94,16 @@ pub struct SqliteProviderRateStore {
 }
 
 struct ProviderRateOwnerLease {
-    _file: File,
+    _file: ProviderRateOwnerLock,
     run_id: Mutex<Option<ProviderRateRunId>>,
+}
+
+struct ProviderRateOwnerLock(File);
+
+impl Drop for ProviderRateOwnerLock {
+    fn drop(&mut self) {
+        let _ignored = self.0.unlock();
+    }
 }
 
 impl std::fmt::Debug for ProviderRateOwnerLease {
@@ -596,13 +603,16 @@ fn acquire_owner_lease(path: &Path) -> Result<ProviderRateOwnerLease, ProviderRa
         .try_clone()
         .map_err(|_| ProviderRateStoreError::Unavailable)?;
     let file = file.into_std();
-    match FileExt::try_lock_exclusive(&file) {
+    match file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(ProviderRateStoreError::AlreadyOwned);
         }
-        Err(_) => return Err(ProviderRateStoreError::Unavailable),
+        Err(std::fs::TryLockError::Error(_)) => {
+            return Err(ProviderRateStoreError::Unavailable);
+        }
     }
+    let file = ProviderRateOwnerLock(file);
     let locked = identity_file
         .metadata()
         .map_err(|_| ProviderRateStoreError::Unavailable)?;

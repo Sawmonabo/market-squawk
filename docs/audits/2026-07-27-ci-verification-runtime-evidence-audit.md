@@ -11,7 +11,7 @@ follow-up in the maintained research documentation.
 | Evidence cutoff | 2026-07-28 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `c7b045fcf09553b934d388a62ca9fe7e0ea36b82` |
+| Correctness follow-up candidate | `05b406f12a62dd4938b0d6ebe7013d9c607132ba` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -86,6 +86,18 @@ speedup.
   may move the block. The manifest's pointer-identity guard consequently rejected valid evidence.
   Exact-capacity normalization at the central manifest boundary removes that allocator dependency
   without weakening evidence semantics.
+- Exact candidate `05b406f` passed macOS. Its Windows job passed all four corrected backup cases,
+  the allocator-sensitive derived-evidence case, and the file-adapter clock case before exposing a
+  later catalog contention-classification defect.
+- The Windows catalog remained exclusively owned. `fs2 0.4.3` returned raw
+  `ERROR_LOCK_VIOLATION` 33, Rust 1.97.1 classified that general I/O error as `Uncategorized`, and
+  the old `WouldBlock` comparison converted expected contention into public `UnsafePath`. Rust's
+  stable `File::try_lock` API provides the exact typed contention boundary without changing the
+  operating-system locking primitive.
+- The Linux MCP failure is a production session-isolation defect: an individual session drained
+  one process-global reaper and could therefore inherit an unrelated session's pending SDK thread
+  or failure. Exact per-transfer join receipts preserve bounded reaper ownership while making each
+  session wait only for its own worker.
 
 The retained diagnostic log identities were:
 
@@ -97,6 +109,9 @@ The retained diagnostic log identities were:
 | Current macOS job `90189278954` | `a20deae2bee0c04774b7e450bcaa67f71284f400f9887681d73c73d96237c1c9` |
 | Windows rerun job `90209089614` | `387e6aea41dbe4606d92efb72b104134e62fcd77e962a97410027905c695a8b9` |
 | Candidate `c7b045f` Windows job `90214783655` | `db7140c27c4a0fcfb1eeeeaece9e6b3de5b6d00dea2db7ce943b49a3559fde61` |
+| Candidate `05b406f` Linux job `90227935404` | `e00fb737ab040a38697db0172cd9456cfd9e461b7f20ac845745419f18769d1a` |
+| Candidate `05b406f` Windows job `90227935382` | `5528931b286af7a140be0f697e6961aacdcb011597534edf9fca2296bab5c2a2` |
+| Candidate `05b406f` macOS job `90227935405` | `b7910509c67325af7e547d219eb480e906a72211bc9994ed196ffa23097ad8da` |
 | Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
 | Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
 
@@ -107,8 +122,8 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 
 | Category | Sources | Audit result |
 | --- | ---: | --- |
-| GitHub repositories | 6 | Covered; maintained primary project repositories |
-| Official documentation and exact toolchain source | 18 | Seven runtime sources plus current platform-contract sources |
+| GitHub repositories | 7 | Covered; maintained primary project repositories |
+| Official documentation and exact toolchain source | 25 | Seven runtime sources plus current platform-contract sources |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
 | Reputable sources | 4 | Covered; first-party documentation or direct Rust expertise |
 
@@ -123,13 +138,16 @@ numerical forecast.
 - The complete discovery and batch reports remain temporary working papers because they repeat the
   reviewed report and are not required for day-to-day maintenance.
 - The Linux lock defect, Windows URI boundary, Windows retained-backup lock conflict, Windows
-  manifest-allocation dependency, and file-adapter fixture race now have bounded causal
-  explanations and focused local evidence.
+  manifest-allocation dependency, file-adapter fixture race, Windows lock-contention
+  classification, and MCP cross-session reaper dependency now have bounded causal explanations.
 - The corrected backup and manifest designs use the existing failing tests as focused proof; no
   retry, sleep, serialization, fixture rewrite, new test target, or weakened evidence rule was
   introduced.
 - Exact candidate `c7b045f` completed without cancellation: Linux and macOS passed, while Windows
-  repeated the five failures addressed by the next candidate.
+  repeated five failures.
+- Exact candidate `05b406f` completed without cancellation: macOS passed; Windows passed those five
+  corrections and exposed catalog lock classification; Linux exposed MCP session/global-reaper
+  coupling.
 - The correctness fixes are not release evidence until one unchanged candidate passes Linux,
   macOS, and Windows.
 - The audit verdict approves this report as decision input. It is not release approval and not

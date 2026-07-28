@@ -238,7 +238,6 @@ impl<S: ToolServices> McpServer<S> {
         let mut supervisor = SessionSupervisor::new(
             session_cancellation,
             sdk_thread,
-            sdk_reaper,
             host_tasks,
             writer,
             shutdown_timeout,

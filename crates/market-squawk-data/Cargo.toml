@@ -21,7 +21,6 @@ cap-fs-ext = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
 futures-util = { workspace = true }
-fs2 = { workspace = true }
 libc = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }

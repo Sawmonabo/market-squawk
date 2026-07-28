@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-28 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Correctness follow-up candidate | `c7b045fcf09553b934d388a62ca9fe7e0ea36b82` |
+| Correctness follow-up candidate | `05b406f12a62dd4938b0d6ebe7013d9c607132ba` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -231,6 +231,21 @@ The follow-up exact candidate
 This run confirms the Linux lock-lifetime and file-adapter fixture corrections under the hosted
 gates. It is not release approval because Windows failed.
 
+The next exact candidate,
+`05b406f12a62dd4938b0d6ebe7013d9c607132ba`, completed in
+[run 30344656257](https://github.com/Sawmonabo/market-squawk/actions/runs/30344656257):
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| macOS | Passed | Complete job `90227935405` passed in 18m07s |
+| Linux verify | Failed | Job `90227935404` reached MCP tests, where one session inherited another session's process-global reaper state |
+| Windows | Failed | Job `90227935382` passed the five intended backup/evidence corrections, then exposed catalog-lock contention misclassification |
+
+This run is important narrowing evidence. All four analytical-backup cases, the
+allocator-sensitive derived-evidence case, and the earlier file-adapter clock case passed on
+Windows. The two remaining failures are independent production authority defects described below;
+neither is a regression in the analytical corrections.
+
 ### Linux authority-state lock lifetime
 
 The Linux failure was a production lock-lifecycle defect exposed by concurrent process creation.
@@ -284,8 +299,8 @@ still provides exact identity and no-delete protection; receipt hashing and immu
 verification remain unchanged. The sidecar acquisition is capability-relative, no-follow,
 open-existing, and noncreating, so read-only verification cannot manufacture missing authority
 state. Its guard explicitly unlocks during drop, matching the Linux logical-owner lifetime
-correction. The existing exact backup test passes locally with this design; cross-platform release
-authority still depends on a new unchanged hosted candidate.
+correction. The existing exact backup test passed locally, and all four affected backup cases
+passed in Windows job `90227935382`.
 
 ### Windows clock-fault fixture
 
@@ -307,9 +322,9 @@ The correction changes only those injected clock-failure scenarios to use the st
 elapsed ceiling as a noncompeting deadline. It preserves the strict `ClockFailure` assertions and
 does not change production code. The same harness separately retains immediate-expiry,
 one-second saturation, cancellation, and blocking-worker-panic coverage. The exact focused test
-passes locally after this fixture correction. The adjacent hostile-clock panic in the failed log
-was intentional output from an earlier subcase that the test harness buffered; it was not a second
-causal failure.
+passed locally after this fixture correction and the complete Windows file-adapter harness passed
+in job `90227935382`. The adjacent hostile-clock panic in the earlier failed log was intentional
+output from an earlier subcase that the test harness buffered; it was not a second causal failure.
 
 ### Windows analytical-evidence allocation contract
 
@@ -343,12 +358,73 @@ The correction is centralized in `ManifestPlan::from_objects`: any spare-capacit
 into a fallibly reserved exact-capacity vector, capacity equality is checked before conversion,
 and the post-conversion pointer check remains as defense in depth. This preserves the immutable
 allocation contract for every caller without changing the fixture, SQL ordering, evidence
-semantics, or error acceptance. The existing exact evidence test passes locally; Windows hosted
-evidence remains required.
+semantics, or error acceptance. The existing exact evidence test passed locally and in Windows job
+`90227935382`.
 
-These corrections have focused local evidence only. Release authority still requires one unchanged
-candidate to pass the complete Linux, macOS, and Windows jobs. The runtime correction must make
-future failures easier to see; it must not mask them.
+### Windows catalog-lock contention classification
+
+After the intended Windows corrections passed, `tests/catalog.rs` exposed a preexisting typed-error
+defect. The first catalog retained its writer guard correctly. A second open reached `fs2 0.4.3`,
+whose Windows implementation uses `LockFileEx` and returns `ERROR_LOCK_VIOLATION` (raw error 33)
+for the contended whole-file range
+([`fs2 0.4.3` Windows source](https://github.com/danburkert/fs2-rs/blob/e1d4843b7c19e3ce1ecbae92255223de31b36d3b/src/windows.rs#L89-L112),
+[Microsoft system error 33](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)).
+
+Rust 1.97.1 classifies that raw general I/O error as `Uncategorized`; the old catalog code checked
+only `io::ErrorKind::WouldBlock`. Contention consequently became `PathError::Io` and then the public
+`CatalogError::UnsafePath`, rather than the required `WriterAlreadyOpen`
+([exact Rust 1.97.1 Windows error mapping](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/io/error/windows.rs#L16-L90)).
+The new explicit catalog-guard unlock was not involved: the first guard was still live, and the
+second attempt never constructed a guard.
+
+The correction uses Rust's stable standard-library `File::try_lock`, which maps platform
+contention into the dedicated `TryLockError::WouldBlock` variant before returning it. Rust has
+provided this typed API since 1.89, and its documented implementation retains nonblocking
+exclusive `flock` semantics on Unix and `LockFileEx` semantics on Windows
+([`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock),
+[`TryLockError`](https://doc.rust-lang.org/std/fs/enum.TryLockError.html)).
+
+The same focused correction covers every remaining production site that performed the same
+`ErrorKind::WouldBlock` comparison: catalog writer/backup-sidecar authority, provider-rate
+ownership, both analytical-root authority acquisition paths, and durable MCP audit ownership.
+Private RAII guards explicitly unlock at the logical final-owner boundary, including
+post-acquisition error paths. The existing catalog, publication-recovery, data-library, and MCP
+audit tests pass locally; Windows hosted evidence is still required.
+
+### MCP session-specific SDK reaping
+
+The Linux failure was a separate session-isolation defect. Every `McpServer` clones a handle to one
+bounded process-global SDK-thread reaper. One adjacent hostile-boundary test intentionally aborts a
+session whose still-running SDK thread is transferred to that reaper. Rust executes tests within
+one test executable concurrently by default
+([Rust test execution](https://doc.rust-lang.org/book/ch11-02-running-tests.html#running-tests-in-parallel-or-consecutively)).
+
+The failing session had already joined its own SDK thread, but `SessionSupervisor::shutdown`
+unconditionally drained the process-global pending count. It therefore waited on the unrelated
+aborted session's thread. When that unrelated work exceeded the current session's 500ms shutdown
+budget, the clean session produced `TransportError::WriteTimedOut`; the server coarsened that into
+`ServerError::Transport`.
+
+The hosted timeline supports the ownership chain: the adjacent abort test returned at
+09:11:31.332 UTC, the clean session exhausted its shutdown budget and failed at 09:11:32.450 UTC,
+and three neighboring sessions using the default five-second budget completed together at about
+09:11:33.335 UTC. The MCP implementation and dependency lock were unchanged from five earlier
+passing Linux jobs, so runner scheduling exposed an existing ownership defect rather than creating
+a source regression.
+
+The hardened correction keeps the process-global capacity and exact `JoinHandle` ownership, but a
+transfer now returns a one-worker completion receipt. A session waits only for its own receipt;
+when its SDK thread was already joined, it performs no reaper wait. The reaper resolves a receipt
+only after joining that exact thread, so no thread is detached and an unrelated pending worker or
+historical failure cannot affect the session result
+([Rust `JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html),
+[Tokio 1.53.1 oneshot receiver](https://docs.rs/tokio/1.53.1/tokio/sync/oneshot/struct.Receiver.html)).
+The receipt wait remains bounded and cancellation-safe. Existing MCP unit, hostile-boundary, and
+lifecycle tests pass locally without retry, sleep, timeout inflation, or test serialization.
+
+Release authority still requires one unchanged candidate to pass the complete Linux, macOS, and
+Windows jobs. These corrections remove cross-platform classification and cross-session ownership
+defects; they do not normalize or retry the failures.
 
 ## Correction design
 
@@ -485,17 +561,25 @@ The platform-contract sources added during the correctness follow-up were review
 - [Rust Windows canonicalization](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
 - [Rust Windows path-prefix classification](https://doc.rust-lang.org/std/path/enum.Prefix.html)
 - [Rust `Vec` capacity and boxed-slice conversion](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation)
+- [Rust `File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)
+- [Rust `TryLockError`](https://doc.rust-lang.org/std/fs/enum.TryLockError.html)
+- [Rust parallel test execution](https://doc.rust-lang.org/book/ch11-02-running-tests.html#running-tests-in-parallel-or-consecutively)
+- [Rust `JoinHandle`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html)
 - [Exact Rust 1.97.1 `GenericShunt` implementation](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/iter/adapters/mod.rs)
 - [Exact Rust 1.97.1 generic `Vec` collection](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/alloc/src/vec/spec_from_iter_nested.rs)
 - [Exact Rust 1.97.1 Windows allocator](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/alloc/windows.rs)
+- [Exact Rust 1.97.1 Windows error mapping](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/io/error/windows.rs)
+- [Tokio 1.53.1 oneshot receiver](https://docs.rs/tokio/1.53.1/tokio/sync/oneshot/struct.Receiver.html)
 
 ### Operating-system and analytical-storage contracts
 
 - [Linux `flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html)
 - [Microsoft `LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
+- [Microsoft system errors 0–499](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [SQLite URI filenames](https://www.sqlite.org/uri.html)
 - [SQLite opening connections and immutable URI parameters](https://sqlite.org/c3ref/open.html)
+- [`fs2 0.4.3` Windows locking implementation](https://github.com/danburkert/fs2-rs/blob/e1d4843b7c19e3ce1ecbae92255223de31b36d3b/src/windows.rs#L89-L112)
 
 ### Official GitHub documentation and maintained tools
 
