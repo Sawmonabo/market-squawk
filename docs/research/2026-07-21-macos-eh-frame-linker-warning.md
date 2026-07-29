@@ -25,6 +25,7 @@ The clean gate ran on macOS 26.5.1 arm64 with Apple `ld` 1267 and Rust 1.97.1 / 
 | `publication_recovery` | 322,018,376 bytes | 19.68 MiB |
 | `control_plane` | 354,986,784 bytes | 21.96 MiB |
 | Debug `market-squawk` binary | 538,619,984 bytes | 33.63 MiB |
+| Debug `market-squawk-desktop` binary | 551,969,816 bytes | 34.46 MiB |
 | Release `market-squawk` | 8,804,400 bytes | 42,024 bytes |
 
 The `control_plane` measurement was added after its existing consolidated harness gained the real
@@ -35,6 +36,8 @@ The debug application-binary measurement was added after the complete local prod
 linked the analytical and inference dependency graph into the executable built alongside
 integration tests. Its measured `__eh_frame` is 35,259,372 bytes. The allowance is restricted to
 macOS builds with debug assertions, so release builds continue to surface every linker diagnostic.
+The Tauri desktop binary composes the same product graph and measured 36,128,472 bytes of
+`__eh_frame`; it carries the same target- and profile-scoped allowance at its binary root.
 
 The LLVM arm64 Mach-O definition assigns only the low 24 bits of a compact-unwind entry to the
 DWARF FDE offset and defines the mask as `0x00FF_FFFF`, or 16 MiB minus one byte. Each affected
@@ -67,10 +70,11 @@ Add `#![allow(linker_messages)]` only to the currently measured affected roots:
 2. the `ingest_vertical` integration-test root; and
 3. the `market-squawk-data` library only under `cfg(test)`; and
 4. the consolidated application `control_plane` integration-test root; and
-5. the application binary only for macOS debug-assertion builds.
+5. the application binary only for macOS debug-assertion builds; and
+6. the desktop application binary only for macOS debug-assertion builds.
 
 This does not change generated code, unwind behavior, product behavior, or test coverage. It
-classifies five measured diagnostics while every other linker message remains visible.
+classifies six measured diagnostics while every other linker message remains visible.
 
 ## Sources
 

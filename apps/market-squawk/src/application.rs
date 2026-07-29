@@ -285,6 +285,12 @@ impl Application {
             .admit(arguments)
     }
 
+    /// Returns the immutable, code-owned operation registry for bounded presentation discovery.
+    #[must_use]
+    pub fn capabilities(&self) -> ServiceCapabilities {
+        self.capabilities.clone()
+    }
+
     /// Admits and invokes one operation through the same path used by every local transport.
     pub async fn invoke(
         &self,

@@ -252,7 +252,7 @@ run broad all-feature/all-target gates after every small edit; use focused affec
 affected-package gate, and the complete gate once at the actual review/release checkpoint.
 
 On macOS arm64, Rust 1.97 may report that oversized debug/test executables cannot encode some
-compact-unwind entries because their `__eh_frame` offsets exceed the format's 24-bit field. Five
+compact-unwind entries because their `__eh_frame` offsets exceed the format's 24-bit field. Six
 measured crate roots carry narrowly scoped `linker_messages` allowances. The release executable is
 below that measured boundary and release linker diagnostics remain enabled. If another target emits
 the warning, measure its executable and `__eh_frame` before changing any lint; do not add a

@@ -96,6 +96,7 @@ pub struct LocalProduct {
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
+    provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
     provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
     model_runtime: Option<Arc<ProductionModelRuntime>>,
@@ -197,6 +198,8 @@ impl LocalProduct {
             Arc::clone(&provider_activation),
             provider_activation_state.clone(),
         ));
+        let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
+            portal_activation.clone();
 
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
@@ -304,6 +307,7 @@ impl LocalProduct {
             research_ingest,
             provider_onboarding: onboarding,
             provider_activation,
+            provider_portal_activation,
             provider_activation_state,
             portfolio,
             model_runtime,
@@ -344,6 +348,11 @@ impl LocalProduct {
     /// Returns provider onboarding authority for explicit CLI adapter activation boundaries.
     pub fn provider_onboarding(&self) -> Arc<ProviderOnboardingService> {
         Arc::clone(&self.provider_onboarding)
+    }
+
+    /// Returns the shared durable provider activation boundary used by local presentation modes.
+    pub fn provider_portal_activation(&self) -> Arc<dyn crate::ProviderPortalActivationAuthority> {
+        Arc::clone(&self.provider_portal_activation)
     }
 
     pub(in crate::local_product) const fn provider_activation_state(
@@ -407,6 +416,10 @@ impl std::fmt::Debug for LocalProduct {
             .field("research", &"[ANALYTICAL AUTHORITY]")
             .field("provider_onboarding", &"[ONBOARDING AUTHORITY]")
             .field("provider_activation", &"[ADAPTER ACTIVATION AUTHORITY]")
+            .field(
+                "provider_portal_activation",
+                &"[PORTAL ACTIVATION AUTHORITY]",
+            )
             .field("provider_activation_state", &"[DURABLE ACTIVATION RECIPES]")
             .field("portfolio", &"[PORTFOLIO AUTHORITY]")
             .field("model_runtime_configured", &self.model_runtime.is_some())

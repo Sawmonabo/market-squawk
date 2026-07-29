@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img">
+  <title>Market Squawk</title>
+  <rect width="1024" height="1024" rx="224" fill="#155dfc"/>
+  <path
+    d="M176 520h96l36-68 50 158 54-286 62 372 70-412 64 348 52-236 48 124h140"
+    fill="none"
+    stroke="#fff"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="44"
+  />
+</svg>
