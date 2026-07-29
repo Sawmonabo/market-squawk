@@ -19,6 +19,9 @@
       "../../../docs/licenses/tauri-mpl-notice.md": "licenses/tauri-mpl-notice.md",
       "../../../docs/licenses/tract-onnx-notice.md": "licenses/tract-onnx-notice.md",
       "generated-release/": "market-squawk-release/"
+    },
+    "macOS": {
+      "minimumSystemVersion": "12.0"
     }
   }
 }
