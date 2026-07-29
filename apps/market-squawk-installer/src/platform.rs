@@ -127,10 +127,10 @@ impl ProgramName {
             Self::Installer => PathBuf::from(format!("bin/market-squawk-installer{suffix}")),
             Self::Uv => PathBuf::from(format!("tools/uv{suffix}")),
             Self::Python => match target {
-                SupportedTarget::X86_64PcWindowsMsvc => PathBuf::from("python/python.exe"),
+                SupportedTarget::X86_64PcWindowsMsvc => PathBuf::from("python.exe"),
                 SupportedTarget::Aarch64AppleDarwin
                 | SupportedTarget::X86_64AppleDarwin
-                | SupportedTarget::X86_64UnknownLinuxGnu => PathBuf::from("python/bin/python"),
+                | SupportedTarget::X86_64UnknownLinuxGnu => PathBuf::from("bin/python"),
             },
         }
     }

@@ -1,6 +1,15 @@
 {
   "artifacts": [
     {
+      "filename": "iniconfig-2.3.0-py3-none-any.whl",
+      "license": "MIT",
+      "project": "iniconfig",
+      "sha256": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
+      "size_bytes": 7484,
+      "url": "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl",
+      "version": "2.3.0"
+    },
+    {
       "filename": "maturin-1.14.1-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
       "license": "MIT OR Apache-2.0",
       "project": "maturin",
@@ -10,31 +19,22 @@
       "version": "1.14.1"
     },
     {
-      "filename": "pyarrow-25.0.0-cp312-cp312-macosx_12_0_arm64.whl",
-      "license": "Apache-2.0",
-      "project": "pyarrow",
-      "sha256": "149730a3d1f0fb59d663a0b8aa210adfd9c17c27cd94a0d143e60daea8320d4e",
-      "size_bytes": 35850884,
-      "url": "https://files.pythonhosted.org/packages/73/44/fdd3a4377807b7dcabe2d4b5aa99dbbc98e2e5df3f1ca4e7f0aec492d987/pyarrow-25.0.0-cp312-cp312-macosx_12_0_arm64.whl",
-      "version": "25.0.0"
+      "filename": "maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
+      "license": "MIT OR Apache-2.0",
+      "project": "maturin",
+      "sha256": "dfc54ae32e6fcb18302193ab9a30b0b25eefffba994ae13238974805533ef75e",
+      "size_bytes": 10627576,
+      "url": "https://files.pythonhosted.org/packages/1a/bd/9c0d5d6983905ce2c9edaa073a7e89355a9cf7f396988e05d32f1c37785d/maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
+      "version": "1.14.1"
     },
     {
-      "filename": "pyarrow-25.0.0-cp313-cp313-macosx_12_0_arm64.whl",
-      "license": "Apache-2.0",
-      "project": "pyarrow",
-      "sha256": "8831a3ba52fa7cdb78d368d968b1dcd06171e6dff5461e16d90de91d371e47bc",
-      "size_bytes": 35844549,
-      "url": "https://files.pythonhosted.org/packages/6c/c8/098ce17d778fd9d29e40bb8c5f19a40cc90c3f0b46c9057b0d7993f42f54/pyarrow-25.0.0-cp313-cp313-macosx_12_0_arm64.whl",
-      "version": "25.0.0"
-    },
-    {
-      "filename": "pytest-9.1.1-py3-none-any.whl",
-      "license": "MIT",
-      "project": "pytest",
-      "sha256": "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
-      "size_bytes": 386536,
-      "url": "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl",
-      "version": "9.1.1"
+      "filename": "maturin-1.14.1-py3-none-win_amd64.whl",
+      "license": "MIT OR Apache-2.0",
+      "project": "maturin",
+      "sha256": "3c9f94640ecc4895e94abaf834a0684430032c865b2748a36c12461fd9252fdd",
+      "size_bytes": 10314067,
+      "url": "https://files.pythonhosted.org/packages/63/4b/585adeb9167b08d3cdff0032a938b0e72655c92003df4f52c3f696a1bcc2/maturin-1.14.1-py3-none-win_amd64.whl",
+      "version": "1.14.1"
     },
     {
       "filename": "packaging-26.2-py3-none-any.whl",
@@ -55,13 +55,40 @@
       "version": "1.6.0"
     },
     {
-      "filename": "iniconfig-2.3.0-py3-none-any.whl",
-      "license": "MIT",
-      "project": "iniconfig",
-      "sha256": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
-      "size_bytes": 7484,
-      "url": "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl",
-      "version": "2.3.0"
+      "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "license": "Apache-2.0",
+      "project": "pyarrow",
+      "sha256": "72132b9a8a0a1840197794d4dea26080069b6b0981c116bc078762dc9691b21b",
+      "size_bytes": 35878945,
+      "url": "https://files.pythonhosted.org/packages/55/c7/581ccbcdb3d897eb2893328d68db3d52eca373bf2a7e964d0a6276b8e85b/pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "version": "25.0.0"
+    },
+    {
+      "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
+      "license": "Apache-2.0",
+      "project": "pyarrow",
+      "sha256": "e009ef945e498dca2f050ea10d2e9764cb44017254826fc4574fdb8d2530173b",
+      "size_bytes": 37630854,
+      "url": "https://files.pythonhosted.org/packages/64/d1/ccb01db7329ea0411ef4fbd9b62a04d3268b36777d4e758d5e39b91ddeab/pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
+      "version": "25.0.0"
+    },
+    {
+      "filename": "pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+      "license": "Apache-2.0",
+      "project": "pyarrow",
+      "sha256": "447df764beb07c544f0178a5f6b70ef44b9ecf382b3cdfad4c2d7867353c3887",
+      "size_bytes": 50119765,
+      "url": "https://files.pythonhosted.org/packages/6a/29/0ed312ec800fb536f93783215126cee4b8977dcfeccba6f0f44df0cc87d7/pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+      "version": "25.0.0"
+    },
+    {
+      "filename": "pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
+      "license": "Apache-2.0",
+      "project": "pyarrow",
+      "sha256": "2e093efbecb5317372f819228fa4b4e6157eee48d3f0a7b0303705ebf81a7104",
+      "size_bytes": 28613262,
+      "url": "https://files.pythonhosted.org/packages/fa/65/da20806de93ca6ee91e72cb6a9b08b3ac890b46efc8d94a7326c651c4c81/pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
+      "version": "25.0.0"
     },
     {
       "filename": "pygments-2.20.0-py3-none-any.whl",
@@ -71,24 +98,32 @@
       "size_bytes": 1231151,
       "url": "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl",
       "version": "2.20.0"
+    },
+    {
+      "filename": "pytest-9.1.1-py3-none-any.whl",
+      "license": "MIT",
+      "project": "pytest",
+      "sha256": "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
+      "size_bytes": 386536,
+      "url": "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl",
+      "version": "9.1.1"
     }
   ],
-  "platform": "macos-arm64",
   "python": {
-    "maximum_exclusive": "3.14",
-    "minimum": "3.12"
+    "maximum_exclusive": "3.15",
+    "minimum": "3.14"
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "5add6b3c5018079aca252366b3a0545ac32587db3a1090ff8a4ec27da711276b",
-      "size_bytes": 231372
+      "sha256": "b88e466ad7f068efdacb5c9e50fd3999068e7b312011058eb9e047ab1f8125fa",
+      "size_bytes": 231913
     },
     {
       "path": "Cargo.toml",
-      "sha256": "464bd06d6f3b52139e24cb2ce2ed4ce3332dcac90c356be8f2883bf9097ab81c",
-      "size_bytes": 7715
+      "sha256": "a9be89917e984a322b66c352c550b7db5547c77cc2a406ffc24fa6ecc851293b",
+      "size_bytes": 7829
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
@@ -802,7 +837,7 @@
     },
     {
       "path": "apps/market-squawk/Cargo.toml",
-      "sha256": "c5f8d78f1a57085439929cfe2f11122c3de13c0f3eda624e1d78b5fbbe0b2e6f",
+      "sha256": "3d3cfac8b4359080a77f80d30f052d1b04e12c3794c67b9039cf07a895e73934",
       "size_bytes": 3823
     },
     {
@@ -1427,8 +1462,8 @@
     },
     {
       "path": "apps/market-squawk/src/release/close.rs",
-      "sha256": "70c88f0c47bc1975199c9c64849bfa8fcb214d476a75b87a51b50250353d4934",
-      "size_bytes": 24537
+      "sha256": "c3a7a96379fc5a6a3d1ca74fa056bbd45df6497656c1af6690212ef32f062762",
+      "size_bytes": 24156
     },
     {
       "path": "apps/market-squawk/src/release/close_demonstration.rs",
@@ -3057,7 +3092,7 @@
     },
     {
       "path": "crates/market-squawk-mcp/Cargo.toml",
-      "sha256": "eed42da51a79f01fbbf002c95c88ec7ed3cea54299a96caec9c88693bb3dccb9",
+      "sha256": "b1f9707b7115aeeb5b2f223055c6106f147b90f258efdf17492d69e699e60f6e",
       "size_bytes": 724
     },
     {
@@ -3102,8 +3137,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/Cargo.toml",
-      "sha256": "880332c0df8ab520e1e4a4554ed37234052ad35f3fe0cfa6dff0b137b7030837",
-      "size_bytes": 1697
+      "sha256": "9ba1ad222643f955da15c0999a86f769ae8f4dd1968d2222ce81b4aecb9959eb",
+      "size_bytes": 1775
     },
     {
       "path": "crates/market-squawk-modeling/fixtures/onnx/manifest.json",
@@ -3134,6 +3169,11 @@
       "path": "crates/market-squawk-modeling/src/bin/market_squawk_release_signer.rs",
       "sha256": "f6f8025c3638e4466d1bf67fca91772ff2215504875b75fc525e3f506c5b00f4",
       "size_bytes": 1806
+    },
+    {
+      "path": "crates/market-squawk-modeling/src/bin/market_squawk_train.rs",
+      "sha256": "e1730feefc01c010bf2870a000e250255de52d76a03da3abbb7e38a167de00ef",
+      "size_bytes": 2673
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle.rs",
@@ -3222,8 +3262,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/training_environment.rs",
-      "sha256": "efd9be94163aeb97c4b2f4d998690bb3e931a298d854386875db65eb8b15383b",
-      "size_bytes": 44343
+      "sha256": "228f0c1d54763ba75a07d220cbb25a3d0aa2cfe282b9919bf6fc56704249edf3",
+      "size_bytes": 47045
     },
     {
       "path": "crates/market-squawk-platform/Cargo.toml",
@@ -3667,13 +3707,13 @@
     },
     {
       "path": "crates/market-squawk-python/src/lib.rs",
-      "sha256": "660f3a85a9f40dccaff6f1cf91cd2102eeee2198e340c295bdbe7ea57b2d173b",
-      "size_bytes": 6739
+      "sha256": "156c2f142c9db874d0ebf73562679f0f635802ba8d7c086e9a32086fc9f2d86b",
+      "size_bytes": 6757
     },
     {
       "path": "crates/market-squawk-python/src/receipt.rs",
-      "sha256": "dd06e14d9e8b1eb9afb7b2c299fac1f25e7b9bd11aab587ba89dade8fbf981e5",
-      "size_bytes": 4125
+      "sha256": "fddafd67ef097954697b8eea28c5c089309059908835e4255b772b8c80196ad7",
+      "size_bytes": 4212
     },
     {
       "path": "crates/market-squawk-services/Cargo.toml",
@@ -4231,6 +4271,11 @@
       "size_bytes": 12449
     },
     {
+      "path": "distribution/release-components.json",
+      "sha256": "8a58980938a4da3c7bdcbbe85b858c9886ce8f3e818467f64ba723d0a4e7d176",
+      "size_bytes": 6172
+    },
+    {
       "path": "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",
       "sha256": "4b2aafb34991ac31ef296c42b729b94eb1020de6b4006b28e97304f0e15ca50f",
       "size_bytes": 4244
@@ -4262,8 +4307,8 @@
     },
     {
       "path": "python/market_squawk/__init__.py",
-      "sha256": "9743a6c3f76d0ad5789ec21bf3a91c00d937443a1ff52c2c383b33dc4edc94c7",
-      "size_bytes": 735
+      "sha256": "6d98423148773d7d217cd12308be1c087d2e169f34d9ef5b2d2bbc0a27e963eb",
+      "size_bytes": 747
     },
     {
       "path": "python/market_squawk/_data_validation.py",
@@ -4307,13 +4352,13 @@
     },
     {
       "path": "python/pyproject.toml",
-      "sha256": "e6ea8dde2e02ff3988f59c780608e3e72a6d889bc928a996726bd7a2d0bb50c2",
-      "size_bytes": 617
+      "sha256": "b6a740cb0310594d8d28abb1f41e882c127fc1fcd5cda6a677aff75687aafe7d",
+      "size_bytes": 613
     },
     {
       "path": "python/requirements.lock",
-      "sha256": "79c7755e99018b43d3179cb712d89b08b973ebf860ee82ce02d88e43022b48e9",
-      "size_bytes": 659
+      "sha256": "ce37b54024dad5287327f20e6c129f26996b7d1d3f4860b15644d656f634fe53",
+      "size_bytes": 829
     },
     {
       "path": "python/tests/test_data.py",
@@ -4336,19 +4381,39 @@
       "size_bytes": 2579
     },
     {
+      "path": "python/wheelhouse/aarch64-apple-darwin.json",
+      "sha256": "b5150d0fc04b634375379052583dcae228fa65317c3990bb452fc9d1c6d4f13f",
+      "size_bytes": 506
+    },
+    {
+      "path": "python/wheelhouse/x86_64-apple-darwin.json",
+      "sha256": "7feb3b2e1c22893cdacaf6bdc3befa589c6eeae17f2034a069e28ea7f79a4bb6",
+      "size_bytes": 507
+    },
+    {
+      "path": "python/wheelhouse/x86_64-pc-windows-msvc.json",
+      "sha256": "44d5f5eb805dfa3d0b58a7144dc20cfd221f85ff5529e86c82cd09f275e7fbbb",
+      "size_bytes": 447
+    },
+    {
+      "path": "python/wheelhouse/x86_64-unknown-linux-gnu.json",
+      "sha256": "989eaf0a8115dbc693aba138d38fce7694d7b714aedbda2a4cbe0766fd25ff11",
+      "size_bytes": 535
+    },
+    {
       "path": "rust-toolchain.toml",
       "sha256": "279d77167cec5426fa80f457cd066dc74a360fbe4e2816f4f3fa01487a918fdc",
       "size_bytes": 86
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "5da82458aca40f68089e9fcaebec6d69ed0c325d1cb344998b5bb33ef5512d6e",
-      "size_bytes": 102724
+      "sha256": "eee474808b5865138e8503b56508702cdace44084012971295a97662f9b10a1b",
+      "size_bytes": 129932
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "1d77cc7053c2cc332a0e03fb0e4855d9bab2cb080deb0c200c9972e0d69dde03",
-      "size_bytes": 14193
+      "sha256": "9c666f5c781f2b24cd171e30bd2333c5853b805305b7a1263819dd2117fb845d",
+      "size_bytes": 16352
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",

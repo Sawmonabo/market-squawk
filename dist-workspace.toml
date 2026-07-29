@@ -1,0 +1,24 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+allow-dirty = ["ci"]
+packages = ["market-squawk-installer"]
+version = "1.0.0"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+checksum = "sha256"
+source-tarball = true
+installers = []
+ci = ["github"]
+hosting = ["github"]
+github-attestations = true
+pr-run-mode = "plan"
+fail-fast = false
+merge-tasks = false
+cache-builds = false

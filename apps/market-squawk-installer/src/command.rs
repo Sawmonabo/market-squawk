@@ -1,7 +1,8 @@
 //! Stable installer CLI and bounded HTTPS release retrieval.
 
-use std::fs;
-use std::io::Write as _;
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
@@ -11,6 +12,8 @@ use futures_util::StreamExt as _;
 use reqwest::redirect::Policy;
 use semver::Version;
 use serde::Serialize;
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::Url;
@@ -22,13 +25,18 @@ use crate::contracts::{
 use crate::lifecycle::{
     InstallError, install, repair, resolve_program, rollback, status, uninstall, update,
 };
-use crate::manifest::{MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ReleaseManifest};
-use crate::platform::{ProgramName, default_install_root};
+use crate::manifest::{
+    ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_ARCHIVE_ENTRIES,
+    MAXIMUM_ENTRY_BYTES, MAXIMUM_MANIFEST_BYTES, ReleaseManifest,
+};
+use crate::platform::{ProgramName, SupportedTarget, default_install_root};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAXIMUM_REDIRECTS: usize = 10;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MAXIMUM_MANIFEST_TREE_DEPTH: usize = 64;
 
 /// Parses and executes one installer command.
 ///
@@ -76,6 +84,45 @@ enum InstallerCommand {
         #[arg(value_enum)]
         program: ProgramName,
     },
+    /// Build release metadata from one closed native staging tree.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManifestCommand {
+    /// Hash every staged component and write one current-target manifest.
+    Build(ManifestBuildArguments),
+}
+
+#[derive(Debug, Args)]
+struct ManifestBuildArguments {
+    /// Exact product version; must match this installer binary.
+    #[arg(long)]
+    version: String,
+    /// Exact lowercase Git commit object ID.
+    #[arg(long)]
+    commit: String,
+    /// Exact lowercase Git tree object ID.
+    #[arg(long)]
+    tree: String,
+    /// Deterministic RFC 3339 release time.
+    #[arg(long)]
+    generated_at: String,
+    /// Closed staging directory represented by the archive.
+    #[arg(long)]
+    staging_root: PathBuf,
+    /// Complete ZIP archive produced from the staging directory.
+    #[arg(long)]
+    bundle: PathBuf,
+    /// Immutable GitHub Release URL for the complete ZIP archive.
+    #[arg(long)]
+    archive_url: String,
+    /// New manifest file to create.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -120,11 +167,29 @@ struct UninstallArguments {
 }
 
 async fn execute(cli: Cli) -> Result<(), CommandError> {
-    let root = match cli.root {
+    let Cli {
+        root,
+        json,
+        command,
+    } = cli;
+    let command = match command {
+        InstallerCommand::Manifest { command } => {
+            match command {
+                ManifestCommand::Build(arguments) => {
+                    let receipt = build_release_manifest(arguments)?;
+                    output(json, "built release manifest", &receipt)?;
+                }
+            }
+            return Ok(());
+        }
+        command => command,
+    };
+
+    let root = match root {
         Some(root) => root,
         None => default_install_root()?,
     };
-    match cli.command {
+    match command {
         InstallerCommand::Install(arguments) => {
             let receipt = match (arguments.manifest_url, arguments.manifest, arguments.bundle) {
                 (Some(url), None, None) => {
@@ -144,7 +209,7 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 }
                 _ => return Err(CommandError::InstallSource),
             };
-            output(cli.json, "installed", &receipt)?;
+            output(json, "installed", &receipt)?;
         }
         InstallerCommand::Update => {
             let current = status(&root)?;
@@ -156,23 +221,23 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 UpdateRequest::from_local(root, &downloaded.manifest, downloaded.bundle.path())?
                     .with_channel_manifest_url(url)?,
             )?;
-            output(cli.json, "updated", &receipt)?;
+            output(json, "updated", &receipt)?;
         }
         InstallerCommand::Repair => {
             let receipt = repair(RepairRequest::new(root))?;
-            output(cli.json, "verified", &receipt)?;
+            output(json, "verified", &receipt)?;
         }
         InstallerCommand::Rollback => {
             let receipt = rollback(RollbackRequest::new(root))?;
-            output(cli.json, "rolled back", &receipt)?;
+            output(json, "rolled back", &receipt)?;
         }
         InstallerCommand::Uninstall(arguments) => {
             let receipt = uninstall(uninstall_request(root, arguments))?;
-            output(cli.json, "uninstalled", &receipt)?;
+            output(json, "uninstalled", &receipt)?;
         }
         InstallerCommand::Status => {
             let current = status(&root)?;
-            output(cli.json, "status", &current)?;
+            output(json, "status", &current)?;
         }
         InstallerCommand::Launch { program } => {
             let executable = resolve_program(&root, program)?;
@@ -183,8 +248,83 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 return Err(CommandError::ProgramExit(exit.code()));
             }
         }
+        InstallerCommand::Manifest { .. } => return Err(CommandError::ManifestBuild),
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestBuildReceipt {
+    output: PathBuf,
+    target: &'static str,
+    component_count: usize,
+    manifest_sha256: String,
+}
+
+fn build_release_manifest(
+    arguments: ManifestBuildArguments,
+) -> Result<ManifestBuildReceipt, CommandError> {
+    if arguments.version != env!("CARGO_PKG_VERSION") {
+        return Err(CommandError::ManifestBuild);
+    }
+    let target = SupportedTarget::current()?;
+    let root = controlled_staging_root(&arguments.staging_root)?;
+    let bundle = controlled_regular_file(&arguments.bundle, MAXIMUM_ARCHIVE_BYTES)?;
+    let output = new_output_path(&arguments.output, &root)?;
+    let components = staged_components(&root, target)?;
+    let paths_before = components
+        .iter()
+        .map(|component| component.path.clone())
+        .collect::<Vec<_>>();
+    let paths_after = staged_paths(&root)?;
+    if paths_before
+        .iter()
+        .map(|path| path.as_ref())
+        .ne(paths_after.iter().map(String::as_str))
+    {
+        return Err(CommandError::ManifestBuild);
+    }
+
+    let bundle_size = fs::metadata(&bundle).map_err(CommandError::Io)?.len();
+    let bundle_sha256 = stable_sha256_file(&bundle, MAXIMUM_ARCHIVE_BYTES)?;
+    let value = json!({
+        "schema_version": crate::manifest::MANIFEST_SCHEMA_VERSION,
+        "product": "market-squawk",
+        "version": arguments.version,
+        "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "repository": "Sawmonabo/market-squawk",
+        "commit_sha": arguments.commit,
+        "tree_sha": arguments.tree,
+        "generated_at": arguments.generated_at,
+        "targets": [{
+            "target": target,
+            "minimum_system": target.minimum_system(),
+            "archive": {
+                "url": arguments.archive_url,
+                "size": bundle_size,
+                "sha256": bundle_sha256,
+            },
+            "components": components,
+        }],
+    });
+    let mut encoded = serde_json::to_vec_pretty(&value).map_err(CommandError::Json)?;
+    encoded.push(b'\n');
+    ReleaseManifest::admit_current(&encoded)?;
+    let manifest_sha256 = format!("{:x}", Sha256::digest(&encoded));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(CommandError::Io)?;
+    file.write_all(&encoded).map_err(CommandError::Io)?;
+    file.sync_all().map_err(CommandError::Io)?;
+    Ok(ManifestBuildReceipt {
+        output,
+        target: target.as_str(),
+        component_count: paths_before.len(),
+        manifest_sha256,
+    })
 }
 
 fn uninstall_request(root: PathBuf, arguments: UninstallArguments) -> UninstallRequest {
@@ -222,6 +362,224 @@ fn uninstall_request(root: PathBuf, arguments: UninstallArguments) -> UninstallR
         }
     }
     request
+}
+
+fn controlled_staging_root(path: &Path) -> Result<PathBuf, CommandError> {
+    let metadata = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(CommandError::ManifestBuild);
+    }
+    path.canonicalize().map_err(CommandError::Io)
+}
+
+fn controlled_regular_file(path: &Path, maximum: u64) -> Result<PathBuf, CommandError> {
+    let metadata = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
+        return Err(CommandError::ManifestBuild);
+    }
+    path.canonicalize().map_err(CommandError::Io)
+}
+
+fn new_output_path(path: &Path, staging_root: &Path) -> Result<PathBuf, CommandError> {
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(CommandError::ManifestBuild)?;
+    let parent = path.parent().ok_or(CommandError::ManifestBuild)?;
+    let parent = controlled_staging_root(parent)?;
+    let output = parent.join(name);
+    if output.starts_with(staging_root) {
+        return Err(CommandError::ManifestBuild);
+    }
+    match fs::symlink_metadata(&output) {
+        Ok(_) => return Err(CommandError::ManifestBuild),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(CommandError::Io(error)),
+    }
+    Ok(output)
+}
+
+fn staged_components(
+    root: &Path,
+    target: SupportedTarget,
+) -> Result<Vec<ComponentIdentity>, CommandError> {
+    staged_paths(root)?
+        .into_iter()
+        .map(|path| {
+            let role = component_role(&path, target);
+            let file = root.join(Path::new(&path));
+            let metadata = fs::symlink_metadata(&file).map_err(CommandError::Io)?;
+            let size = metadata.len();
+            let sha256 = stable_sha256_file(&file, MAXIMUM_ENTRY_BYTES)?;
+            Ok(ComponentIdentity {
+                path: path.into(),
+                role,
+                size,
+                sha256: sha256.into(),
+                executable: file_is_executable(&metadata, role),
+            })
+        })
+        .collect()
+}
+
+fn staged_paths(root: &Path) -> Result<Vec<String>, CommandError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut cursor = 0_usize;
+    let mut paths = BTreeSet::new();
+    while cursor < directories.len() {
+        let directory = &directories[cursor];
+        for entry in fs::read_dir(directory).map_err(CommandError::Io)? {
+            let entry = entry.map_err(CommandError::Io)?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(CommandError::Io)?;
+            if metadata.file_type().is_symlink() {
+                return Err(CommandError::ManifestBuild);
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| CommandError::ManifestBuild)?;
+            if relative.components().count() > MAXIMUM_MANIFEST_TREE_DEPTH {
+                return Err(CommandError::ManifestBuild);
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !metadata.file_type().is_file()
+                || paths.len() >= MAXIMUM_ARCHIVE_ENTRIES
+                || !paths.insert(portable_relative_path(relative)?)
+            {
+                return Err(CommandError::ManifestBuild);
+            }
+        }
+        cursor = cursor.checked_add(1).ok_or(CommandError::ManifestBuild)?;
+    }
+    if paths.is_empty() {
+        return Err(CommandError::ManifestBuild);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, CommandError> {
+    let components = path
+        .components()
+        .map(|component| {
+            let std::path::Component::Normal(value) = component else {
+                return Err(CommandError::ManifestBuild);
+            };
+            value
+                .to_str()
+                .filter(|value| !value.is_empty())
+                .ok_or(CommandError::ManifestBuild)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(components.join("/"))
+}
+
+fn component_role(path: &str, target: SupportedTarget) -> ComponentRole {
+    let suffix = target.executable_suffix();
+    if path == format!("bin/market-squawk-desktop{suffix}") {
+        ComponentRole::Desktop
+    } else if path == format!("bin/market-squawk{suffix}") {
+        ComponentRole::Cli
+    } else if path == format!("bin/market-squawk-capture-helper{suffix}") {
+        ComponentRole::CaptureHelper
+    } else if path == format!("bin/market-squawk-onnx-worker{suffix}") {
+        ComponentRole::OnnxWorker
+    } else if path == format!("bin/market-squawk-model-validator{suffix}") {
+        ComponentRole::ModelValidator
+    } else if path
+        == match target {
+            SupportedTarget::X86_64PcWindowsMsvc => "Scripts/market-squawk-train.exe",
+            SupportedTarget::Aarch64AppleDarwin
+            | SupportedTarget::X86_64AppleDarwin
+            | SupportedTarget::X86_64UnknownLinuxGnu => "bin/market-squawk-train",
+        }
+    {
+        ComponentRole::TrainingDriver
+    } else if path == format!("bin/market-squawk-installer{suffix}") {
+        ComponentRole::Installer
+    } else if path == format!("tools/uv{suffix}") {
+        ComponentRole::Uv
+    } else if path
+        == match target {
+            SupportedTarget::X86_64PcWindowsMsvc => "python.exe",
+            SupportedTarget::Aarch64AppleDarwin
+            | SupportedTarget::X86_64AppleDarwin
+            | SupportedTarget::X86_64UnknownLinuxGnu => "bin/python",
+        }
+    {
+        ComponentRole::PythonRuntime
+    } else if path.starts_with("desktop/") {
+        ComponentRole::DesktopResource
+    } else if path.starts_with("licenses/") {
+        ComponentRole::License
+    } else if path.starts_with("notices/") {
+        ComponentRole::Notice
+    } else {
+        ComponentRole::PythonEnvironment
+    }
+}
+
+#[cfg(unix)]
+fn file_is_executable(metadata: &fs::Metadata, _role: ComponentRole) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn file_is_executable(_metadata: &fs::Metadata, role: ComponentRole) -> bool {
+    role.requires_executable()
+}
+
+fn stable_sha256_file(path: &Path, maximum: u64) -> Result<String, CommandError> {
+    let named_before = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if !named_before.file_type().is_file()
+        || named_before.file_type().is_symlink()
+        || named_before.len() > maximum
+    {
+        return Err(CommandError::ManifestBuild);
+    }
+    let mut file = File::open(path).map_err(CommandError::Io)?;
+    let opened_before = file.metadata().map_err(CommandError::Io)?;
+    if !same_file_metadata(&named_before, &opened_before) {
+        return Err(CommandError::ManifestBuild);
+    }
+    let mut digest = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(CommandError::Io)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| CommandError::ManifestBuild)?)
+            .filter(|bytes| *bytes <= maximum)
+            .ok_or(CommandError::ManifestBuild)?;
+        digest.update(&buffer[..read]);
+    }
+    let opened_after = file.metadata().map_err(CommandError::Io)?;
+    let named_after = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if observed != named_before.len()
+        || !same_file_metadata(&named_before, &opened_after)
+        || !same_file_metadata(&named_before, &named_after)
+    {
+        return Err(CommandError::ManifestBuild);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn same_file_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 #[derive(Debug)]
@@ -422,6 +780,8 @@ pub enum CommandError {
     DownloadIdentity,
     #[error("the installation root has no usable parent directory")]
     DownloadRoot,
+    #[error("release manifest build input changed, escaped its boundary, or is inconsistent")]
+    ManifestBuild,
     #[error("failed to install the process TLS provider")]
     TlsProvider,
     #[error("release network request failed")]

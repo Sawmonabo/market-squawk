@@ -327,7 +327,7 @@ sealed Python release builder.
 - [ ] **Step 4: Generalize the Rust training verifier**
 
   Accept only Python `3.14.<patch>` with tag `cp314`. Admit the exact platform tag compiled into the
-  release foundation, use `bin/python` on Unix and `Scripts/python.exe` on Windows, and replace the
+  release foundation, use `bin/python` on Unix and `python.exe` on Windows, and replace the
   macOS-only project-wheel schema with a platform-neutral schema version. Preserve closed fields,
   two-pass file identity, permission checks, RECORD verification, and no-action behavior on any
   mismatch.
@@ -393,8 +393,8 @@ sealed Python release builder.
   cargo-dist binary:
 
   ```bash
-  cargo dist manifest --tag v0.2.0
-  cargo dist plan --tag v0.2.0
+  cargo dist manifest --tag v1.0.0
+  cargo dist plan --tag v1.0.0
   ```
 
 - [ ] **Step 2: Build a deterministic closed bundle**
@@ -511,7 +511,7 @@ sealed Python release builder.
 
 **Interfaces:**
 
-- Consumes: one clean annotated `v0.2.0` tag at the approved exact commit plus protected platform
+- Consumes: one clean annotated `v1.0.0` tag at the approved exact commit plus protected platform
   signing credentials.
 - Produces: one immutable GitHub Release whose complete asset set can be verified and downloaded
   without cloning the repository.
@@ -664,11 +664,11 @@ sealed Python release builder.
   Publish the immutable release, then independently verify:
 
   ```bash
-  gh release verify v0.2.0
+  gh release verify v1.0.0
   rm -rf /tmp/market-squawk-release-verify
   mkdir -m 700 /tmp/market-squawk-release-verify
-  gh release download v0.2.0 --pattern install.sh --dir /tmp/market-squawk-release-verify
-  gh release verify-asset v0.2.0 /tmp/market-squawk-release-verify/install.sh
+  gh release download v1.0.0 --pattern install.sh --dir /tmp/market-squawk-release-verify
+  gh release verify-asset v1.0.0 /tmp/market-squawk-release-verify/install.sh
   ```
 
   Run the public `releases/latest/download/install.sh` command from a fresh supported host and

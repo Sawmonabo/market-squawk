@@ -1,0 +1,131 @@
+{
+  "python": {
+    "implementation": "cpython",
+    "license": "Python-2.0",
+    "provider": "astral-sh/python-build-standalone",
+    "provider_license": "MPL-2.0",
+    "release_url": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260728",
+    "variant": "standard-gil",
+    "version": "3.14.6"
+  },
+  "schema_version": 1,
+  "targets": {
+    "aarch64-apple-darwin": {
+      "minimum_system": "macOS 12",
+      "python": {
+        "archive_path": "python",
+        "format": "tar.gz",
+        "sha256": "f4b47659e2da4b97f38cefdf5ad19f0042946099d843cde60de308708e5b1ac5",
+        "size_bytes": 26022203,
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.14.6%2B20260728-aarch64-apple-darwin-install_only_stripped.tar.gz"
+      },
+      "pyarrow": {
+        "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
+        "license": "Apache-2.0",
+        "sha256": "72132b9a8a0a1840197794d4dea26080069b6b0981c116bc078762dc9691b21b",
+        "size_bytes": 35878945,
+        "url": "https://files.pythonhosted.org/packages/55/c7/581ccbcdb3d897eb2893328d68db3d52eca373bf2a7e964d0a6276b8e85b/pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
+        "version": "25.0.0"
+      },
+      "uv": {
+        "binary_path": "uv-aarch64-apple-darwin/uv",
+        "binary_sha256": "f812c287f194e090fe7e34d28b17d86e96d1f475cc4f8ab687c666ac6e540c99",
+        "binary_size_bytes": 39539088,
+        "format": "tar.gz",
+        "sha256": "2b9e582af54f84fa50c115427451a6c13e80f43b52f8282b8af5791077317bbf",
+        "size_bytes": 17387877,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.12.0/uv-aarch64-apple-darwin.tar.gz"
+      },
+      "wheel_platform_tag": "macosx_12_0_arm64"
+    },
+    "x86_64-apple-darwin": {
+      "minimum_system": "macOS 12",
+      "python": {
+        "archive_path": "python",
+        "format": "tar.gz",
+        "sha256": "00a22363402a1a15d4fb1327c8259a91118258d5463d10a97d3e56c1f18195f6",
+        "size_bytes": 25984062,
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.14.6%2B20260728-x86_64-apple-darwin-install_only_stripped.tar.gz"
+      },
+      "pyarrow": {
+        "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
+        "license": "Apache-2.0",
+        "sha256": "e009ef945e498dca2f050ea10d2e9764cb44017254826fc4574fdb8d2530173b",
+        "size_bytes": 37630854,
+        "url": "https://files.pythonhosted.org/packages/64/d1/ccb01db7329ea0411ef4fbd9b62a04d3268b36777d4e758d5e39b91ddeab/pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
+        "version": "25.0.0"
+      },
+      "uv": {
+        "binary_path": "uv-x86_64-apple-darwin/uv",
+        "binary_sha256": "2e82ae0c831847f8ec51274a7c4f41141106fc4349b0cd147e79bac097ec6729",
+        "binary_size_bytes": 47067076,
+        "format": "tar.gz",
+        "sha256": "d41593beaefc54bab7d062af0ef6ca093bfb81d001d58ebbef39e44423f9c496",
+        "size_bytes": 19231401,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.12.0/uv-x86_64-apple-darwin.tar.gz"
+      },
+      "wheel_platform_tag": "macosx_12_0_x86_64"
+    },
+    "x86_64-pc-windows-msvc": {
+      "minimum_system": "Windows 10 1809",
+      "python": {
+        "archive_path": "python",
+        "format": "tar.gz",
+        "sha256": "19ab713e908d476afbf2b662f72cf6d85c5de6ed44a1b28815ecfbea37b20d54",
+        "size_bytes": 22501299,
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.14.6%2B20260728-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+      },
+      "pyarrow": {
+        "filename": "pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
+        "license": "Apache-2.0",
+        "sha256": "2e093efbecb5317372f819228fa4b4e6157eee48d3f0a7b0303705ebf81a7104",
+        "size_bytes": 28613262,
+        "url": "https://files.pythonhosted.org/packages/fa/65/da20806de93ca6ee91e72cb6a9b08b3ac890b46efc8d94a7326c651c4c81/pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
+        "version": "25.0.0"
+      },
+      "uv": {
+        "binary_path": "uv.exe",
+        "binary_sha256": "268cd62b99395eb53825795518e067e4b27ec4b445175df343824689f307c807",
+        "binary_size_bytes": 47514624,
+        "format": "zip",
+        "sha256": "68200e25de594df92387186bbfb9d9df606ec1d87efaa0ae0c7f690970e53db6",
+        "size_bytes": 18813141,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.12.0/uv-x86_64-pc-windows-msvc.zip"
+      },
+      "wheel_platform_tag": "win_amd64"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "minimum_system": "Ubuntu 24.04-compatible",
+      "python": {
+        "archive_path": "python",
+        "format": "tar.gz",
+        "sha256": "d6254462d5fe066810a472d286861f6a18f66400008bfa9688e202a5672e88cb",
+        "size_bytes": 35891118,
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.14.6%2B20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+      },
+      "pyarrow": {
+        "filename": "pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+        "license": "Apache-2.0",
+        "sha256": "447df764beb07c544f0178a5f6b70ef44b9ecf382b3cdfad4c2d7867353c3887",
+        "size_bytes": 50119765,
+        "url": "https://files.pythonhosted.org/packages/6a/29/0ed312ec800fb536f93783215126cee4b8977dcfeccba6f0f44df0cc87d7/pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+        "version": "25.0.0"
+      },
+      "uv": {
+        "binary_path": "uv-x86_64-unknown-linux-gnu/uv",
+        "binary_sha256": "b6e3cb5b4858d920c63e1d88e31a7a4d8f567073ee4e5e4a1889f93984dc28ea",
+        "binary_size_bytes": 55110904,
+        "format": "tar.gz",
+        "sha256": "eaf842262aa1c418d8ecc5605f02ee1ebfd369124fa48548e85f9481a47831a9",
+        "size_bytes": 21373358,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.12.0/uv-x86_64-unknown-linux-gnu.tar.gz"
+      },
+      "wheel_platform_tag": "manylinux_2_28_x86_64"
+    }
+  },
+  "uv": {
+    "license": "Apache-2.0 OR MIT",
+    "release_url": "https://github.com/astral-sh/uv/releases/tag/0.12.0",
+    "version": "0.12.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    "iniconfig-2.3.0-py3-none-any.whl",
+    "maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
+    "packaging-26.2-py3-none-any.whl",
+    "pluggy-1.6.0-py3-none-any.whl",
+    "pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+    "pygments-2.20.0-py3-none-any.whl",
+    "pytest-9.1.1-py3-none-any.whl"
+  ],
+  "minimum_system": "Ubuntu 24.04-compatible",
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "wheel_platform_tag": "manylinux_2_28_x86_64"
+}

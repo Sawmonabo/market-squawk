@@ -2,7 +2,7 @@
 
 ## Supported release
 
-The `0.2.0` release candidate is developed on the historically named
+The `1.0.0` release candidate is developed on the historically named
 `release/market-squawk-v0.1.0` integration branch; that branch name is retained for audit
 continuity and does not define the package version. No complete local release is currently approved
 or tagged. Security corrections are integrated into the active release branch and then into `main`

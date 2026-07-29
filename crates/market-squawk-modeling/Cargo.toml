@@ -65,3 +65,7 @@ path = "src/bin/market_squawk_release_signer.rs"
 name = "market-squawk-onnx-worker"
 path = "src/bin/market_squawk_onnx_worker.rs"
 required-features = ["onnx-tract"]
+
+[[bin]]
+name = "market-squawk-train"
+path = "src/bin/market_squawk_train.rs"

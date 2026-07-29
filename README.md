@@ -4,7 +4,7 @@
 
 [![GitHub Actions](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml/badge.svg)](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml)
 [![Rust 1.97.1](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
-[![Version 0.2.0 candidate](https://img.shields.io/badge/version-0.2.0%20candidate-f59e0b)](Cargo.toml)
+[![Version 1.0.0 candidate](https://img.shields.io/badge/version-1.0.0%20candidate-f59e0b)](Cargo.toml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-2563eb)](#license)
 
 Market Squawk is a self-hosted platform for live market data, investment research, financial
@@ -19,7 +19,7 @@ application services remain available through the complete command-line interfac
 desktop where supported and can open the protected, temporary loopback portal as a fallback.
 
 > [!IMPORTANT]
-> Market Squawk has not published `v1.0.0`. The workspace currently carries the `0.2.0`
+> Market Squawk has not published `v1.0.0`. The workspace currently carries the `1.0.0`
 > development candidate; the existing `v0.1.0` tag is a historical development snapshot. Provider
 > acceptance and the final unchanged-candidate release verification still block the first complete
 > release. See the [delivery ledger](docs/plans/delivery-ledger.md) for current details.

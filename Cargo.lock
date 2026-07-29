@@ -4220,7 +4220,7 @@ checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "market-squawk"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4288,7 +4288,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-bls"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4307,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-coinbase"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4330,7 +4330,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-files"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-fred"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4379,7 +4379,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-kraken"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -4400,7 +4400,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-paper"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "atomicwrites",
  "cap-fs-ext",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-portfolio"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "market-squawk-data",
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-sec"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "cap-fs-ext",
@@ -4473,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-adapter-treasury"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -4494,7 +4494,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-analytics"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "market-squawk-domain",
  "proptest",
@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-backtesting"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "cap-fs-ext",
@@ -4532,7 +4532,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-data"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4564,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-desktop"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "market-squawk",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-domain"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bitcoin",
  "bs58",
@@ -4602,7 +4602,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-execution"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "market-squawk-analytics",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-installer"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "atomicwrites",
  "chrono",
@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-live"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "futures-util",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-mcp"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "market-squawk-services",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-modeling"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "cap-std",
  "csv",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-platform"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-portfolio"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "market-squawk-analytics",
  "market-squawk-data",
@@ -4760,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-python"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "market-squawk-analytics",
  "market-squawk-data",
@@ -4774,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-services"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4789,7 +4789,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-sources"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -4814,7 +4814,7 @@ dependencies = [
 
 [[package]]
 name = "market-squawk-valuation"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "market-squawk-analytics",
  "market-squawk-data",

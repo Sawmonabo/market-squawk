@@ -230,52 +230,48 @@ pub(super) fn verify_python_training_matrix(
     )
     .context("top-level signed Python release manifest is unavailable")?;
     let declared_matrix = declared_python_matrix(&directory)?;
-    let mut selected = None;
-    for (name, expected_tag) in [("release-cp312", "cp312"), ("release-cp313", "cp313")] {
-        let declared = declared_matrix
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Python support matrix omitted {name}"))?;
-        if declared.python_tag != expected_tag {
-            bail!("Python support matrix maps a release directory to the wrong interpreter");
-        }
-        let root = directory.join(name);
-        let metadata = fs::symlink_metadata(&root)
-            .with_context(|| format!("signed Python training root {name} is unavailable"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("signed Python training root is not a real directory");
-        }
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("signed Python training root {name} is unavailable"))?;
-        if root.parent() != Some(directory.as_path()) {
-            bail!("signed Python training root escaped its evidence directory");
-        }
-        let verified = verify_application_training_environment(
-            &root,
-            application.canonical_path(),
-            onnx_worker.canonical_path(),
-        )
-        .with_context(|| format!("signed Python training root {name} failed admission"))?;
-        if hex_digest(verified.release_manifest_sha256()) != release_manifest.sha256 {
-            bail!("signed Python training root does not bind the top-level release manifest");
-        }
-        if verified.python_tag() != expected_tag
-            || verified.python_tag() != declared.python_tag
-            || verified.python_version() != declared.python_version
-            || hex_digest(verified.receipt_sha256()) != declared.receipt_sha256
-        {
-            bail!("signed Python training root does not bind its declared support-matrix entry");
-        }
-        if selected.is_none() {
-            selected = Some(root);
-        }
+    let name = "release-cp314";
+    let expected_tag = "cp314";
+    let declared = declared_matrix
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Python support matrix omitted {name}"))?;
+    if declared.python_tag != expected_tag {
+        bail!("Python support matrix maps a release directory to the wrong interpreter");
+    }
+    let root = directory.join(name);
+    let metadata = fs::symlink_metadata(&root)
+        .with_context(|| format!("signed Python training root {name} is unavailable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("signed Python training root is not a real directory");
+    }
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("signed Python training root {name} is unavailable"))?;
+    if root.parent() != Some(directory.as_path()) {
+        bail!("signed Python training root escaped its evidence directory");
+    }
+    let verified = verify_application_training_environment(
+        &root,
+        application.canonical_path(),
+        onnx_worker.canonical_path(),
+    )
+    .with_context(|| format!("signed Python training root {name} failed admission"))?;
+    if hex_digest(verified.release_manifest_sha256()) != release_manifest.sha256 {
+        bail!("signed Python training root does not bind the top-level release manifest");
+    }
+    if verified.python_tag() != expected_tag
+        || verified.python_tag() != declared.python_tag
+        || verified.python_version() != declared.python_version
+        || hex_digest(verified.receipt_sha256()) != declared.receipt_sha256
+    {
+        bail!("signed Python training root does not bind its declared support-matrix entry");
     }
     if hash_stable_file(selected_application, MAXIMUM_BINARY_BYTES)? != application
         || hash_stable_file(&onnx_worker_path, MAXIMUM_ONNX_WORKER_BYTES)? != onnx_worker
     {
         bail!("selected application or ONNX worker changed during Python matrix admission");
     }
-    selected.context("signed Python training matrix is empty")
+    Ok(root)
 }
 
 fn declared_python_matrix(directory: &Path) -> Result<BTreeMap<String, DeclaredPythonRuntime>> {
@@ -286,25 +282,27 @@ fn declared_python_matrix(directory: &Path) -> Result<BTreeMap<String, DeclaredP
     .context("top-level Python release evidence is unavailable")?;
     let evidence: Value =
         serde_json::from_slice(&bytes).context("top-level Python release evidence is invalid")?;
-    if evidence.pointer("/schema_version").and_then(Value::as_u64) != Some(5) {
+    if evidence.pointer("/schema_version").and_then(Value::as_u64) != Some(6) {
         bail!("top-level Python release evidence schema is invalid");
     }
     let entries = evidence
         .pointer("/support_matrix")
         .and_then(Value::as_array)
-        .filter(|entries| entries.len() == 2)
-        .ok_or_else(|| anyhow::anyhow!("Python support matrix is not the exact required pair"))?;
+        .filter(|entries| entries.len() == 1)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Python support matrix is not the exact CPython 3.14 entry")
+        })?;
     let mut matrix = BTreeMap::new();
     for entry in entries {
         let directory = entry
             .get("release_directory")
             .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "release-cp312" | "release-cp313"))
+            .filter(|value| *value == "release-cp314")
             .ok_or_else(|| anyhow::anyhow!("Python support-matrix directory is invalid"))?;
         let python_tag = entry
             .get("python_tag")
             .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "cp312" | "cp313"))
+            .filter(|value| *value == "cp314")
             .ok_or_else(|| anyhow::anyhow!("Python support-matrix tag is invalid"))?;
         let python_version = entry
             .get("python")
@@ -331,7 +329,7 @@ fn declared_python_matrix(directory: &Path) -> Result<BTreeMap<String, DeclaredP
             bail!("Python support matrix repeats a release directory");
         }
     }
-    if !matrix.contains_key("release-cp312") || !matrix.contains_key("release-cp313") {
+    if !matrix.contains_key("release-cp314") {
         bail!("Python support matrix omitted a required release directory");
     }
     Ok(matrix)
@@ -469,12 +467,12 @@ pub(super) fn validate_python_evidence(
         .context("Python release evidence is invalid JSON")?;
     let release: Value = serde_json::from_slice(&release_bytes)
         .context("Python release manifest is invalid JSON")?;
-    if evidence.pointer("/schema_version").and_then(Value::as_u64) != Some(5)
-        || release.pointer("/schema_version").and_then(Value::as_u64) != Some(2)
+    if evidence.pointer("/schema_version").and_then(Value::as_u64) != Some(6)
+        || release.pointer("/schema_version").and_then(Value::as_u64) != Some(3)
         || release
             .pointer("/payload/schema_version")
             .and_then(Value::as_u64)
-            != Some(2)
+            != Some(3)
     {
         bail!("Python release evidence schema is invalid");
     }

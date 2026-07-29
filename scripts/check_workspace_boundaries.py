@@ -13,7 +13,7 @@ from typing import Any
 
 
 EXPECTED_PACKAGE_FIELDS = {
-    "version": "0.2.0",
+    "version": "1.0.0",
     "edition": "2024",
     "rust_version": "1.97.1",
     "license": "Apache-2.0 OR MIT",
@@ -21,6 +21,7 @@ EXPECTED_PACKAGE_FIELDS = {
 EXPECTED_MANIFESTS = {
     "market-squawk": "apps/market-squawk/Cargo.toml",
     "market-squawk-desktop": "apps/market-squawk-desktop/src-tauri/Cargo.toml",
+    "market-squawk-installer": "apps/market-squawk-installer/Cargo.toml",
     "market-squawk-domain": "crates/market-squawk-domain/Cargo.toml",
     "market-squawk-platform": "crates/market-squawk-platform/Cargo.toml",
     "market-squawk-sources": "crates/market-squawk-sources/Cargo.toml",
@@ -368,6 +369,7 @@ def main() -> int:
     expected_member_patterns = [
         "apps/market-squawk",
         "apps/market-squawk-desktop/src-tauri",
+        "apps/market-squawk-installer",
         "crates/*",
     ]
     if any((root / "adapters").glob("*/Cargo.toml")):

@@ -77,7 +77,7 @@ market-squawk-adapter-portfolio = { workspace = true }
 market-squawk-adapter-sec = { workspace = true }
 market-squawk-adapter-treasury = { workspace = true }
 market-squawk-analytics = { workspace = true }
-market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", version = "=0.2.0" }
+market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", version = "=1.0.0" }
 market-squawk-data = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }

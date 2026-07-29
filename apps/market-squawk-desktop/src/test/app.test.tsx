@@ -10,7 +10,7 @@ import type { ProductTransport } from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
   contractVersion: "market-squawk-desktop-v1",
-  applicationVersion: "0.2.0",
+  applicationVersion: "1.0.0",
   buildProfile: "development",
   platform: "macos",
   dataRoot: ".market-squawk",

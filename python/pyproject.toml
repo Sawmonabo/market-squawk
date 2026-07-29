@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "market-squawk"
-version = "0.2.0"
+version = "1.0.0"
 description = "Local point-in-time financial research and deterministic model training"
-requires-python = ">=3.12,<3.14"
+requires-python = "==3.14.*"
 license = "Apache-2.0 OR MIT"
 dependencies = ["pyarrow==25.0.0"]
 

@@ -242,11 +242,10 @@ pub(crate) struct ComponentIdentity {
 impl ComponentIdentity {
     fn validate(&self) -> Result<(), ManifestError> {
         validate_portable_path(&self.path)?;
-        if self.size == 0
-            || self.size > MAXIMUM_ENTRY_BYTES
+        if self.size > MAXIMUM_ENTRY_BYTES
+            || (self.size == 0 && self.role.requires_executable())
             || !is_lower_sha256(&self.sha256)
             || (self.role.requires_executable() && !self.executable)
-            || (self.role == ComponentRole::TrainingDriver && self.executable)
         {
             return Err(ManifestError::ComponentIdentity {
                 path: self.path.clone(),
@@ -289,7 +288,7 @@ impl ComponentRole {
         Self::PythonEnvironment,
     ];
 
-    const fn requires_executable(self) -> bool {
+    pub(crate) const fn requires_executable(self) -> bool {
         matches!(
             self,
             Self::Desktop
@@ -297,6 +296,7 @@ impl ComponentRole {
                 | Self::CaptureHelper
                 | Self::OnnxWorker
                 | Self::ModelValidator
+                | Self::TrainingDriver
                 | Self::Installer
                 | Self::Uv
                 | Self::PythonRuntime

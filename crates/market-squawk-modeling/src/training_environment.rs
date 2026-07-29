@@ -20,12 +20,11 @@ const MAX_DISTRIBUTION_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_APPLICATION_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_ONNX_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TRAINING_LAUNCHER_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILES: usize = 8_192;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
 const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
-const TRAINING_DRIVER_RECORD_PATH: &str = "../../../bin/market-squawk-train";
-const TRAINING_DRIVER_RELATIVE_PATH: &str = "bin/market-squawk-train";
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
 const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
@@ -123,6 +122,7 @@ struct FoundationWire {
     build_python_version: String,
     cargo_lock_sha256: String,
     requirements_lock_sha256: String,
+    release_components_sha256: String,
     release_public_key: String,
     release_signer_sha256: String,
     runtime_distributions: Vec<RuntimeRequirementWire>,
@@ -149,6 +149,7 @@ struct ReleaseManifestWire {
     onnx_worker: FileDigestWire,
     project_wheel: ProjectWheelWire,
     schema_version: u32,
+    training_driver: FileDigestWire,
     validator: FileDigestWire,
 }
 
@@ -157,11 +158,12 @@ struct ReleaseManifestWire {
 struct ProjectWheelWire {
     abi_tag: String,
     filename: String,
-    macos_deployment_target: String,
+    minimum_system: String,
     platform_tag: String,
     python_tag: String,
     sha256: String,
     size_bytes: u64,
+    target: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -290,7 +292,10 @@ pub fn verify_validator_training_environment(
     validator: &Path,
 ) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
     let verified = verify_installed_files(root)?;
-    let expected = verified.root.join("bin/market-squawk-model-validator");
+    let expected = verified.root.join(format!(
+        "bin/market-squawk-model-validator{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     if canonical(validator)? != canonical(&expected)? {
         return Err(TrainingEnvironmentError::RuntimeWitness);
     }
@@ -374,7 +379,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::ReleaseManifest,
     )?;
     if signed_environment.schema_version != 1
-        || signed_manifest.schema_version != 2
+        || signed_manifest.schema_version != 3
         || !verify_signature(
             &foundation.release_public_key,
             ENVIRONMENT_RECEIPT_DOMAIN,
@@ -393,7 +398,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let environment = signed_environment.payload;
     let manifest = signed_manifest.payload;
 
-    if manifest.schema_version != 2
+    if manifest.schema_version != 3
         || parse_hex(&environment.foundation_sha256)? != foundation_sha256
         || parse_hex(&manifest.foundation_sha256)? != foundation_sha256
         || parse_hex(&environment.release_manifest_sha256)? != manifest_file.sha256
@@ -403,6 +408,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         || !valid_project_wheel(&manifest.project_wheel)
         || manifest.application.size_bytes == 0
         || manifest.onnx_worker.size_bytes == 0
+        || manifest.training_driver.size_bytes == 0
         || manifest.validator.size_bytes == 0
     {
         return Err(TrainingEnvironmentError::EnvironmentReceipt);
@@ -423,7 +429,10 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
 
     let validator = read_controlled(
         &canonical_root,
-        Path::new("bin/market-squawk-model-validator"),
+        Path::new(&format!(
+            "bin/market-squawk-model-validator{}",
+            std::env::consts::EXE_SUFFIX
+        )),
         MAX_VALIDATOR_EXECUTABLE_BYTES,
         false,
     )?;
@@ -436,7 +445,10 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
 
     let application = read_controlled(
         &canonical_root,
-        Path::new("bin/market-squawk"),
+        Path::new(&format!(
+            "bin/market-squawk{}",
+            std::env::consts::EXE_SUFFIX
+        )),
         MAX_APPLICATION_EXECUTABLE_BYTES,
         false,
     )?;
@@ -449,7 +461,10 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
 
     let onnx_worker = read_controlled(
         &canonical_root,
-        Path::new("bin/market-squawk-onnx-worker"),
+        Path::new(&format!(
+            "bin/market-squawk-onnx-worker{}",
+            std::env::consts::EXE_SUFFIX
+        )),
         MAX_ONNX_WORKER_EXECUTABLE_BYTES,
         false,
     )?;
@@ -457,6 +472,19 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         &onnx_worker,
         &manifest.onnx_worker.sha256,
         manifest.onnx_worker.size_bytes,
+        TrainingEnvironmentError::RuntimeWitness,
+    )?;
+
+    let training_driver = read_controlled(
+        &canonical_root,
+        Path::new(training_driver_relative_path()),
+        MAX_TRAINING_LAUNCHER_BYTES,
+        false,
+    )?;
+    exact_file(
+        &training_driver,
+        &manifest.training_driver.sha256,
+        manifest.training_driver.size_bytes,
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 
@@ -568,6 +596,7 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
     let digests = [
         &wire.build_python_sha256,
         &wire.cargo_lock_sha256,
+        &wire.release_components_sha256,
         &wire.requirements_lock_sha256,
         &wire.release_signer_sha256,
         &wire.source_closure_sha256,
@@ -598,7 +627,7 @@ fn verify_distributions(
     foundation: &FoundationWire,
 ) -> Result<(), TrainingEnvironmentError> {
     if environment.project_distribution.name != "market-squawk"
-        || environment.project_distribution.version != "0.2.0"
+        || environment.project_distribution.version != env!("CARGO_PKG_VERSION")
         || environment.runtime_distributions.len() != foundation.runtime_distributions.len()
     {
         return Err(TrainingEnvironmentError::InstalledDistribution);
@@ -684,7 +713,8 @@ fn verify_distribution(
     let mut entries = BTreeMap::new();
     let mut saw_record = false;
     let require_training_driver =
-        distribution.name == "market-squawk" && distribution.version == "0.2.0";
+        distribution.name == "market-squawk" && distribution.version == env!("CARGO_PKG_VERSION");
+    let training_driver_record_path = training_driver_record_path();
     let mut saw_training_driver = false;
     let mut total_bytes = 0_u64;
     for row in reader.records() {
@@ -708,7 +738,7 @@ fn verify_distribution(
             saw_record = true;
             continue;
         }
-        let is_training_driver = require_training_driver && name == TRAINING_DRIVER_RECORD_PATH;
+        let is_training_driver = require_training_driver && name == training_driver_record_path;
         let file = if is_training_driver {
             if saw_training_driver || digest.is_empty() || size.is_empty() {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
@@ -716,7 +746,7 @@ fn verify_distribution(
             saw_training_driver = true;
             read_controlled(
                 root,
-                Path::new(TRAINING_DRIVER_RELATIVE_PATH),
+                Path::new(training_driver_relative_path()),
                 MAX_DISTRIBUTION_FILE_BYTES,
                 false,
             )?
@@ -771,7 +801,7 @@ fn verify_distribution(
     }
     let mut expected_paths = entries
         .keys()
-        .filter(|name| name.as_str() != TRAINING_DRIVER_RECORD_PATH)
+        .filter(|name| name.as_str() != training_driver_record_path)
         .cloned()
         .collect::<BTreeSet<_>>();
     expected_paths.insert(record_entry);
@@ -790,7 +820,27 @@ fn expected_site_packages(root: &Path, version: &str) -> Result<PathBuf, Trainin
     let [major, minor, _patch] = parts.as_slice() else {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     };
-    Ok(root.join(format!("lib/python{major}.{minor}/site-packages")))
+    if cfg!(windows) {
+        Ok(root.join("Lib/site-packages"))
+    } else {
+        Ok(root.join(format!("lib/python{major}.{minor}/site-packages")))
+    }
+}
+
+const fn training_driver_relative_path() -> &'static str {
+    if cfg!(windows) {
+        "Scripts/market-squawk-train.exe"
+    } else {
+        "bin/market-squawk-train"
+    }
+}
+
+const fn training_driver_record_path() -> &'static str {
+    if cfg!(windows) {
+        "../../../Scripts/market-squawk-train.exe"
+    } else {
+        "../../../bin/market-squawk-train"
+    }
 }
 
 fn scan_distribution_paths(
@@ -1031,28 +1081,71 @@ fn relative_path(value: &str) -> Result<&Path, TrainingEnvironmentError> {
 
 fn valid_interpreter(value: &InterpreterWire) -> bool {
     let expected_tag = match value.version.split('.').collect::<Vec<_>>().as_slice() {
-        ["3", "12", patch] if patch.bytes().all(|byte| byte.is_ascii_digit()) => "cp312",
-        ["3", "13", patch] if patch.bytes().all(|byte| byte.is_ascii_digit()) => "cp313",
+        ["3", "14", "6"] => "cp314",
         _ => return false,
     };
     value.implementation == "cpython"
         && value.python_tag == expected_tag
-        && value.executable_relative_path == "bin/python"
+        && value.executable_relative_path == expected_interpreter_path()
         && value.size_bytes > 0
         && valid_hex(&value.sha256)
 }
 
 fn valid_project_wheel(value: &ProjectWheelWire) -> bool {
+    let (target, platform_tag, minimum_system) = current_platform_contract();
     !value.filename.is_empty()
         && value.filename.len() <= 255
         && !value.filename.contains(['/', '\\'])
         && value.filename.ends_with(".whl")
         && value.python_tag == "cp310"
         && value.abi_tag == "abi3"
-        && value.platform_tag == "macosx_12_0_arm64"
-        && value.macos_deployment_target == "12.0"
+        && value.platform_tag == platform_tag
+        && value.minimum_system == minimum_system
+        && value.target == target
         && value.size_bytes > 0
         && valid_hex(&value.sha256)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const fn current_platform_contract() -> (&'static str, &'static str, &'static str) {
+    ("aarch64-apple-darwin", "macosx_12_0_arm64", "macOS 12")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const fn current_platform_contract() -> (&'static str, &'static str, &'static str) {
+    ("x86_64-apple-darwin", "macosx_12_0_x86_64", "macOS 12")
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const fn current_platform_contract() -> (&'static str, &'static str, &'static str) {
+    ("x86_64-pc-windows-msvc", "win_amd64", "Windows 10 1809")
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn current_platform_contract() -> (&'static str, &'static str, &'static str) {
+    (
+        "x86_64-unknown-linux-gnu",
+        "manylinux_2_28_x86_64",
+        "Ubuntu 24.04-compatible",
+    )
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+)))]
+const fn current_platform_contract() -> (&'static str, &'static str, &'static str) {
+    ("unsupported", "unsupported", "unsupported")
+}
+
+const fn expected_interpreter_path() -> &'static str {
+    if cfg!(windows) {
+        "python.exe"
+    } else {
+        "bin/python"
+    }
 }
 
 fn valid_runtime_requirements(values: &[RuntimeRequirementWire]) -> bool {

@@ -72,6 +72,8 @@ fn verify_training_environment(
     native_extension: &Path,
 ) -> PyResult<TrainingEnvironmentReceipt> {
     let sys = py.import("sys").map_err(|_| invalid_receipt())?;
+    sys.setattr("dont_write_bytecode", true)
+        .map_err(|_| invalid_receipt())?;
     let root: String = sys
         .getattr("prefix")
         .and_then(|value| value.extract())

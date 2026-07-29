@@ -38,20 +38,17 @@ MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
 MAX_APPLICATION_EXECUTABLE_BYTES = 768 * 1024 * 1024
 MAX_ONNX_WORKER_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_VALIDATOR_EXECUTABLE_BYTES = 256 * 1024 * 1024
+MAX_TRAINING_LAUNCHER_BYTES = 32 * 1024 * 1024
 MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
-TRAINING_DRIVER_RECORD_PATH = "../../../bin/market-squawk-train"
-TRAINING_DRIVER_RELEASE_PATH = Path("bin/market-squawk-train")
 RUST_TOOLCHAIN = "1.97.1"
-RUST_TOOLCHAIN_FULL = "1.97.1-aarch64-apple-darwin"
 MACOS_DEPLOYMENT_TARGET = "12.0"
 SOURCE_DATE_EPOCH = "946684800"
-PROJECT_WHEEL_PLATFORM_TAG = (
-    f"macosx_{MACOS_DEPLOYMENT_TARGET.replace('.', '_')}_arm64"
-)
 RELEASE_MANIFEST_DOMAIN = b"market-squawk-release-manifest-v1\0"
 ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v1\0"
-SUPPORTED_PYTHONS = ((3, 12), (3, 13))
+SUPPORTED_PYTHONS = ((3, 14),)
+REQUIRED_PYTHON = (3, 14, 6)
+CANONICAL_RELEASE = "release-cp314"
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
 ROOT_PURPOSE = "market-squawk-python-release-artifacts"
@@ -84,6 +81,87 @@ class ReleaseBuildError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PlatformProfile:
+    target: str
+    system: str
+    machines: tuple[str, ...]
+    executable_suffix: str
+    interpreter_relative_path: str
+    wheel_platform_tag: str
+    minimum_system: str
+    native_extension_suffix: str
+    maturin_compatibility: str | None = None
+
+
+PLATFORM_PROFILES = {
+    profile.target: profile
+    for profile in (
+        PlatformProfile(
+            "aarch64-apple-darwin",
+            "Darwin",
+            ("arm64", "aarch64"),
+            "",
+            "bin/python",
+            "macosx_12_0_arm64",
+            "macOS 12",
+            "abi3.so",
+        ),
+        PlatformProfile(
+            "x86_64-apple-darwin",
+            "Darwin",
+            ("x86_64",),
+            "",
+            "bin/python",
+            "macosx_12_0_x86_64",
+            "macOS 12",
+            "abi3.so",
+        ),
+        PlatformProfile(
+            "x86_64-pc-windows-msvc",
+            "Windows",
+            ("AMD64", "x86_64"),
+            ".exe",
+            "python.exe",
+            "win_amd64",
+            "Windows 10 1809",
+            "pyd",
+        ),
+        PlatformProfile(
+            "x86_64-unknown-linux-gnu",
+            "Linux",
+            ("x86_64", "AMD64"),
+            "",
+            "bin/python",
+            "manylinux_2_28_x86_64",
+            "Ubuntu 24.04-compatible",
+            "abi3.so",
+            "manylinux_2_28",
+        ),
+    )
+}
+
+
+def platform_profile(target: str) -> PlatformProfile:
+    try:
+        return PLATFORM_PROFILES[target]
+    except KeyError as error:
+        raise ReleaseBuildError("release target is unsupported") from error
+
+
+def host_profile() -> PlatformProfile:
+    system = platform.system()
+    machine = platform.machine()
+    matches = [
+        profile
+        for profile in PLATFORM_PROFILES.values()
+        if profile.system == system and machine in profile.machines
+    ]
+    if len(matches) != 1:
+        raise ReleaseBuildError("host is not one exact supported release target")
+    return matches[0]
+
+
+@dataclass(frozen=True)
 class Artifact:
     project: str
     version: str
@@ -105,16 +183,16 @@ class Source:
 class ReleaseLock:
     minimum: tuple[int, int]
     maximum_exclusive: tuple[int, int]
-    platform: str
+    target: str
     artifacts: tuple[Artifact, ...]
     sources: tuple[Source, ...]
 
     @classmethod
     def for_test(cls, *, filename: str, sha256: str, size_bytes: int) -> "ReleaseLock":
         return cls(
-            (3, 12),
             (3, 14),
-            "macos-arm64",
+            (3, 15),
+            "aarch64-apple-darwin",
             (
                 Artifact(
                     "fixture",
@@ -172,6 +250,7 @@ class InstalledDistribution:
 class NativeReleaseExecutables:
     application: Path
     onnx_worker: Path
+    training_driver: Path
     validator: Path
 
 
@@ -260,7 +339,7 @@ class ReleaseSigner:
         return completed.stdout
 
 
-def load_lock(path: Path) -> ReleaseLock:
+def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
     try:
         if path.is_symlink():
             raise ReleaseBuildError("Python release lock must not be a symbolic link")
@@ -273,20 +352,19 @@ def load_lock(path: Path) -> ReleaseLock:
     if not isinstance(value, dict) or set(value) != {
         "schema_version",
         "python",
-        "platform",
         "artifacts",
         "sources",
     }:
         raise ReleaseBuildError("Python release lock shape is invalid")
-    if value["schema_version"] != 1 or value["platform"] != "macos-arm64":
-        raise ReleaseBuildError("Python release lock version or platform is unsupported")
+    if value["schema_version"] != 2:
+        raise ReleaseBuildError("Python release lock version is unsupported")
     python = value["python"]
     if not isinstance(python, dict) or set(python) != {"minimum", "maximum_exclusive"}:
         raise ReleaseBuildError("Python interpreter matrix is invalid")
     minimum = _version(python["minimum"])
     maximum = _version(python["maximum_exclusive"])
-    if minimum != (3, 12) or maximum != (3, 14):
-        raise ReleaseBuildError("Python lock must claim only the verified CPython 3.12-3.13 matrix")
+    if minimum != (3, 14) or maximum != (3, 15):
+        raise ReleaseBuildError("Python lock must claim only the verified CPython 3.14 product")
     artifacts_value = value["artifacts"]
     if (
         not isinstance(artifacts_value, list)
@@ -326,6 +404,16 @@ def load_lock(path: Path) -> ReleaseLock:
         _wheel_tags(item["filename"])
         artifacts.append(Artifact(**item))
         names.add(item["filename"])
+    profile = platform_profile(target or host_profile().target)
+    profile_path = path.parent / "wheelhouse" / f"{profile.target}.json"
+    profile_artifacts = _load_platform_wheel_lock(profile_path, profile)
+    selected = {
+        artifact.filename: artifact
+        for artifact in artifacts
+        if artifact.filename in profile_artifacts
+    }
+    if set(selected) != profile_artifacts:
+        raise ReleaseBuildError("platform wheel set is absent from the common release lock")
     sources_value = value["sources"]
     if not isinstance(sources_value, list) or len(sources_value) > MAX_SOURCES:
         raise ReleaseBuildError("Python source lock is invalid")
@@ -346,7 +434,205 @@ def load_lock(path: Path) -> ReleaseLock:
             raise ReleaseBuildError("Python source hash or size is invalid")
         sources.append(Source(**item))
         source_paths.add(item["path"])
-    return ReleaseLock(minimum, maximum, value["platform"], tuple(artifacts), tuple(sources))
+    return ReleaseLock(
+        minimum,
+        maximum,
+        profile.target,
+        tuple(selected[name] for name in sorted(selected)),
+        tuple(sources),
+    )
+
+
+def _load_platform_wheel_lock(
+    path: Path, profile: PlatformProfile
+) -> set[str]:
+    try:
+        if path.is_symlink():
+            raise ReleaseBuildError("platform wheel lock must not be a symbolic link")
+        raw = path.read_bytes()
+        if not raw or len(raw) > 64 * 1024:
+            raise ReleaseBuildError("platform wheel lock exceeds its byte bound")
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("platform wheel lock is unreadable") from error
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "target",
+        "minimum_system",
+        "wheel_platform_tag",
+        "artifacts",
+    }:
+        raise ReleaseBuildError("platform wheel lock shape is invalid")
+    artifacts = value["artifacts"]
+    if (
+        value["schema_version"] != 1
+        or value["target"] != profile.target
+        or value["minimum_system"] != profile.minimum_system
+        or value["wheel_platform_tag"] != profile.wheel_platform_tag
+        or not isinstance(artifacts, list)
+        or len(artifacts) != len(set(artifacts))
+        or artifacts != sorted(artifacts)
+        or any(
+            not isinstance(name, str)
+            or not name.endswith(".whl")
+            or "/" in name
+            or "\\" in name
+            for name in artifacts
+        )
+    ):
+        raise ReleaseBuildError("platform wheel lock identity is invalid")
+    return set(artifacts)
+
+
+def admit_release_components(
+    path: Path,
+    profile: PlatformProfile,
+    uv_executable: Path,
+    root: Path,
+) -> str:
+    """Admit the exact uv, CPython, and PyArrow release-component matrix."""
+
+    try:
+        if path.is_symlink():
+            raise ReleaseBuildError("release component lock must not be a symbolic link")
+        raw = path.read_bytes()
+        if not raw or len(raw) > 256 * 1024:
+            raise ReleaseBuildError("release component lock exceeds its byte bound")
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("release component lock is unreadable") from error
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "uv",
+        "python",
+        "targets",
+    }:
+        raise ReleaseBuildError("release component lock shape is invalid")
+    uv = value["uv"]
+    python = value["python"]
+    targets = value["targets"]
+    if (
+        value["schema_version"] != 1
+        or not isinstance(uv, dict)
+        or set(uv) != {"version", "license", "release_url"}
+        or uv["version"] != "0.12.0"
+        or uv["license"] != "Apache-2.0 OR MIT"
+        or uv["release_url"] != "https://github.com/astral-sh/uv/releases/tag/0.12.0"
+        or not isinstance(python, dict)
+        or set(python)
+        != {
+            "implementation",
+            "version",
+            "variant",
+            "provider",
+            "license",
+            "provider_license",
+            "release_url",
+        }
+        or python["implementation"] != "cpython"
+        or python["version"] != "3.14.6"
+        or python["variant"] != "standard-gil"
+        or python["provider"] != "astral-sh/python-build-standalone"
+        or python["license"] != "Python-2.0"
+        or python["provider_license"] != "MPL-2.0"
+        or python["release_url"]
+        != "https://github.com/astral-sh/python-build-standalone/releases/tag/20260728"
+        or not isinstance(targets, dict)
+        or set(targets) != set(PLATFORM_PROFILES)
+    ):
+        raise ReleaseBuildError("release component matrix identity is invalid")
+    for target, target_value in targets.items():
+        target_profile = platform_profile(target)
+        if not isinstance(target_value, dict) or set(target_value) != {
+            "minimum_system",
+            "wheel_platform_tag",
+            "uv",
+            "python",
+            "pyarrow",
+        }:
+            raise ReleaseBuildError("target release-component shape is invalid")
+        if (
+            target_value["minimum_system"] != target_profile.minimum_system
+            or target_value["wheel_platform_tag"]
+            != target_profile.wheel_platform_tag
+        ):
+            raise ReleaseBuildError("target release-component contract is invalid")
+        _admit_download_identity(target_value["uv"], "github.com", uv_binary=True)
+        _admit_download_identity(target_value["python"], "github.com")
+        _admit_download_identity(target_value["pyarrow"], "files.pythonhosted.org")
+
+    selected = targets[profile.target]["uv"]
+    try:
+        executable = uv_executable.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ReleaseBuildError("locked uv executable is unavailable") from error
+    if (
+        executable.is_symlink()
+        or not executable.is_file()
+        or _file_digest(executable)
+        != (selected["binary_size_bytes"], selected["binary_sha256"])
+    ):
+        raise ReleaseBuildError("locked uv executable identity differs")
+    version = _run_output([str(executable), "--version"], root)
+    if not version.startswith("uv 0.12.0 "):
+        raise ReleaseBuildError("locked uv executable reports the wrong version")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _admit_download_identity(
+    value: object,
+    host: str,
+    *,
+    uv_binary: bool = False,
+) -> None:
+    required = {"url", "size_bytes", "sha256"}
+    if uv_binary:
+        required.update(
+            {
+                "format",
+                "binary_path",
+                "binary_size_bytes",
+                "binary_sha256",
+            }
+        )
+    elif host == "files.pythonhosted.org":
+        required.update({"filename", "version", "license"})
+    else:
+        required.update({"format", "archive_path"})
+    if not isinstance(value, dict) or set(value) != required:
+        raise ReleaseBuildError("release download identity shape is invalid")
+    parsed = urllib.parse.urlparse(value["url"])
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not isinstance(value["size_bytes"], int)
+        or value["size_bytes"] <= 0
+    ):
+        raise ReleaseBuildError("release download URL or size is invalid")
+    _sha256(value["sha256"])
+    if uv_binary:
+        if (
+            value["format"] not in {"tar.gz", "zip"}
+            or not isinstance(value["binary_path"], str)
+            or not value["binary_path"]
+            or not isinstance(value["binary_size_bytes"], int)
+            or value["binary_size_bytes"] <= 0
+        ):
+            raise ReleaseBuildError("uv archive member identity is invalid")
+        _sha256(value["binary_sha256"])
+    elif host == "files.pythonhosted.org":
+        if (
+            value["version"] != "25.0.0"
+            or value["license"] != "Apache-2.0"
+            or Path(parsed.path).name != value["filename"]
+        ):
+            raise ReleaseBuildError("PyArrow release identity is invalid")
+    elif value["format"] != "tar.gz" or value["archive_path"] != "python":
+        raise ReleaseBuildError("managed Python archive identity is invalid")
 
 
 def admit_artifact_root(path: Path, repository_root: Path) -> ArtifactLayout:
@@ -400,8 +686,11 @@ def admit_wheelhouse(
     version: tuple[int, int],
 ) -> tuple[Path, ...]:
     _admit_owned_child(wheelhouse, wheelhouse.parent, "wheelhouse")
+    profile = platform_profile(lock.target)
     selected = tuple(
-        artifact for artifact in lock.artifacts if _compatible(artifact.filename, version)
+        artifact
+        for artifact in lock.artifacts
+        if _compatible(artifact.filename, version, profile)
     )
     projects = {artifact.project.lower() for artifact in selected}
     if not REQUIRED_PROJECTS <= projects:
@@ -444,12 +733,13 @@ def locked_runtime_requirements(
         if name in names:
             raise ReleaseBuildError("Python runtime dependency is duplicated")
         for python_version in SUPPORTED_PYTHONS:
+            profile = platform_profile(lock.target)
             candidates = [
                 artifact
                 for artifact in lock.artifacts
                 if _normalize_project_name(artifact.project) == name
                 and artifact.version == version
-                and _compatible(artifact.filename, python_version)
+                and _compatible(artifact.filename, python_version, profile)
             ]
             if len(candidates) != 1:
                 raise ReleaseBuildError(
@@ -471,7 +761,14 @@ def prepare_wheelhouse(
     selected = {
         artifact.filename: artifact
         for artifact in lock.artifacts
-        if any(_compatible(artifact.filename, version) for version in SUPPORTED_PYTHONS)
+        if any(
+            _compatible(
+                artifact.filename,
+                version,
+                platform_profile(lock.target),
+            )
+            for version in SUPPORTED_PYTHONS
+        )
     }
     for artifact in selected.values():
         destination = wheelhouse / artifact.filename
@@ -542,8 +839,13 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
         paths.update(_regular_files(root, root / relative))
     paths.update(
         {
+            "distribution/release-components.json",
             "python/pyproject.toml",
             "python/requirements.lock",
+            "python/wheelhouse/aarch64-apple-darwin.json",
+            "python/wheelhouse/x86_64-apple-darwin.json",
+            "python/wheelhouse/x86_64-pc-windows-msvc.json",
+            "python/wheelhouse/x86_64-unknown-linux-gnu.json",
             "scripts/build_python_release.py",
             "scripts/tests/test_build_python_release.py",
         }
@@ -863,9 +1165,14 @@ def admit_sources(lock: ReleaseLock, root: Path) -> None:
             raise ReleaseBuildError("Python release source identity mismatch")
 
 
-def admit_toolchain(root: Path) -> dict[str, object]:
-    """Bind direct Rust/Xcode executables, stdlib, SDK, and target policy."""
+def admit_toolchain(
+    root: Path, profile: PlatformProfile | None = None
+) -> dict[str, object]:
+    """Bind direct Rust and native host tools for one exact release target."""
 
+    profile = profile or host_profile()
+    if host_profile() != profile:
+        raise ReleaseBuildError("release target does not match the native build host")
     configured = _toml(root / "rust-toolchain.toml")["toolchain"]["channel"]
     rust_version = _toml(root / "Cargo.toml")["workspace"]["package"]["rust-version"]
     if configured != RUST_TOOLCHAIN or rust_version != RUST_TOOLCHAIN:
@@ -875,13 +1182,50 @@ def admit_toolchain(root: Path) -> dict[str, object]:
     if rustup_discovered is None:
         raise ReleaseBuildError("rustup is required to resolve direct pinned Rust tools")
     rustup = Path(rustup_discovered).resolve(strict=True)
-    cargo_path = _direct_rust_tool(rustup, "cargo", root, evidence_environment)
-    rustc_path = _direct_rust_tool(rustup, "rustc", root, evidence_environment)
+    cargo_path = _direct_rust_tool(
+        rustup, "cargo", profile, root, evidence_environment
+    )
+    rustc_path = _direct_rust_tool(
+        rustup, "rustc", profile, root, evidence_environment
+    )
     cargo_version = _run_output([str(cargo_path), "-vV"], root, evidence_environment)
     rustc_version = _run_output([str(rustc_path), "-vV"], root, evidence_environment)
     _require_tool_release(cargo_version, "cargo", RUST_TOOLCHAIN)
     _require_tool_release(rustc_version, "rustc", RUST_TOOLCHAIN)
 
+    sysroot = Path(
+        _run_output(
+            [str(rustc_path), "--print", "sysroot"], root, evidence_environment
+        )
+    ).resolve(strict=True)
+    if sysroot != rustc_path.parent.parent:
+        raise ReleaseBuildError("direct rustc and reported sysroot identities differ")
+    toolchain = {
+        "schema_version": 2,
+        "target": profile.target,
+        "minimum_system": profile.minimum_system,
+        "cargo": _tool_binding(cargo_path, cargo_version),
+        "rustc": _tool_binding(rustc_path, rustc_version),
+        "rust_stdlib": _tree_binding(sysroot / "lib/rustlib" / profile.target / "lib"),
+        "rustup": _tool_binding(
+            rustup,
+            _run_output([str(rustup), "--version"], root, evidence_environment),
+        ),
+    }
+    if profile.system == "Darwin":
+        toolchain.update(_admit_macos_toolchain(root, evidence_environment))
+    elif profile.system == "Linux":
+        toolchain.update(_admit_linux_toolchain(root, evidence_environment))
+    elif profile.system == "Windows":
+        toolchain.update(_admit_windows_toolchain())
+    else:
+        raise ReleaseBuildError("native release toolchain is unsupported")
+    return toolchain
+
+
+def _admit_macos_toolchain(
+    root: Path, evidence_environment: dict[str, str]
+) -> dict[str, object]:
     xcrun = Path("/usr/bin/xcrun").resolve(strict=True)
     clang = _xcode_tool(xcrun, "clang", root, evidence_environment)
     clangxx = _xcode_tool(xcrun, "clang++", root, evidence_environment)
@@ -911,13 +1255,6 @@ def admit_toolchain(root: Path) -> dict[str, object]:
     )
     if developer_dir is None:
         raise ReleaseBuildError("macOS SDK is outside a recognized Xcode developer directory")
-    sysroot = Path(
-        _run_output(
-            [str(rustc_path), "--print", "sysroot"], root, evidence_environment
-        )
-    ).resolve(strict=True)
-    if sysroot != rustc_path.parent.parent:
-        raise ReleaseBuildError("direct rustc and reported sysroot identities differ")
     sdk_settings = tuple(
         _file_binding(path)
         for path in (
@@ -927,16 +1264,7 @@ def admit_toolchain(root: Path) -> dict[str, object]:
         )
     )
     return {
-        "schema_version": 1,
-        "target": "aarch64-apple-darwin",
         "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
-        "cargo": _tool_binding(cargo_path, cargo_version),
-        "rustc": _tool_binding(rustc_path, rustc_version),
-        "rust_stdlib": _tree_binding(sysroot / "lib/rustlib/aarch64-apple-darwin/lib"),
-        "rustup": _tool_binding(
-            rustup,
-            _run_output([str(rustup), "--version"], root, evidence_environment),
-        ),
         "xcrun": _tool_binding(
             xcrun,
             _run_output([str(xcrun), "--version"], root, evidence_environment),
@@ -966,9 +1294,51 @@ def admit_toolchain(root: Path) -> dict[str, object]:
     }
 
 
+def _admit_linux_toolchain(
+    root: Path, evidence_environment: dict[str, str]
+) -> dict[str, object]:
+    cc = _system_tool("cc")
+    cxx = _system_tool("c++")
+    archiver = _system_tool("ar")
+    ranlib = _system_tool("ranlib")
+    return {
+        "cc": _tool_binding(
+            cc, _run_output([str(cc), "--version"], root, evidence_environment)
+        ),
+        "cxx": _tool_binding(
+            cxx, _run_output([str(cxx), "--version"], root, evidence_environment)
+        ),
+        "linker": _tool_binding(cc),
+        "archiver": _tool_binding(archiver),
+        "ranlib": _tool_binding(ranlib),
+    }
+
+
+def _admit_windows_toolchain() -> dict[str, object]:
+    compiler = _system_tool("cl.exe")
+    linker = _system_tool("link.exe")
+    archiver = _system_tool("lib.exe")
+    return {
+        "compiler": _tool_binding(compiler),
+        "linker": _tool_binding(linker),
+        "archiver": _tool_binding(archiver),
+    }
+
+
+def _system_tool(name: str) -> Path:
+    discovered = shutil.which(name)
+    if discovered is None:
+        raise ReleaseBuildError(f"required native tool is unavailable: {name}")
+    path = Path(discovered).resolve(strict=True)
+    if not path.is_file():
+        raise ReleaseBuildError(f"required native tool is invalid: {name}")
+    return path
+
+
 def _direct_rust_tool(
     rustup: Path,
     name: str,
+    profile: PlatformProfile,
     root: Path,
     environment: dict[str, str],
 ) -> Path:
@@ -978,7 +1348,7 @@ def _direct_rust_tool(
                 str(rustup),
                 "which",
                 "--toolchain",
-                RUST_TOOLCHAIN_FULL,
+                f"{RUST_TOOLCHAIN}-{profile.target}",
                 name,
             ],
             root,
@@ -1055,7 +1425,10 @@ def _tree_binding(root: Path) -> dict[str, object]:
 
 def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRuntime, ...]:
     if len(paths) != len(SUPPORTED_PYTHONS):
-        raise ReleaseBuildError("one interpreter is required for each supported Python minor")
+        raise ReleaseBuildError("exactly one CPython 3.14.6 interpreter is required")
+    profile = platform_profile(lock.target)
+    if host_profile() != profile:
+        raise ReleaseBuildError("release target does not match the native build host")
     admitted: dict[tuple[int, int], PythonRuntime] = {}
     canonical_paths: set[Path] = set()
     for path in paths:
@@ -1069,9 +1442,10 @@ def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRu
         minor = version[:2]
         if (
             evidence.get("implementation") != "cpython"
-            or evidence.get("system") != "Darwin"
-            or evidence.get("machine") != "arm64"
+            or evidence.get("system") != profile.system
+            or evidence.get("machine") not in profile.machines
             or len(version) != 3
+            or version != REQUIRED_PYTHON
             or not lock.minimum <= minor < lock.maximum_exclusive
             or minor not in SUPPORTED_PYTHONS
             or minor in admitted
@@ -1080,7 +1454,7 @@ def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRu
         canonical_paths.add(executable)
         admitted[minor] = PythonRuntime(executable, version)
     if tuple(sorted(admitted)) != SUPPORTED_PYTHONS:
-        raise ReleaseBuildError("Python 3.12 and 3.13 must both be independently admitted")
+        raise ReleaseBuildError("CPython 3.14.6 was not independently admitted")
     return tuple(admitted[minor] for minor in SUPPORTED_PYTHONS)
 
 
@@ -1091,9 +1465,21 @@ def build_release(
     layout: ArtifactLayout,
     runtimes: tuple[PythonRuntime, ...],
     toolchain: dict[str, object],
+    release_components_sha256: str,
+    uv_executable: Path,
 ) -> None:
     with ExitStack() as cleanup:
-        _build_release(root, lock_path, lock, layout, runtimes, toolchain, cleanup)
+        _build_release(
+            root,
+            lock_path,
+            lock,
+            layout,
+            runtimes,
+            toolchain,
+            release_components_sha256,
+            uv_executable,
+            cleanup,
+        )
 
 
 def _build_release(
@@ -1103,6 +1489,8 @@ def _build_release(
     layout: ArtifactLayout,
     runtimes: tuple[PythonRuntime, ...],
     toolchain: dict[str, object],
+    release_components_sha256: str,
+    uv_executable: Path,
     cleanup: ExitStack,
 ) -> None:
     admit_sources(lock, root)
@@ -1134,7 +1522,10 @@ def _build_release(
         root,
         bootstrap_environment,
     )
-    signer_helper = root / "target/release/market-squawk-release-signer"
+    profile = platform_profile(lock.target)
+    signer_helper = _cargo_release_dir(root, profile) / (
+        f"market-squawk-release-signer{profile.executable_suffix}"
+    )
     if not signer_helper.is_file():
         raise ReleaseBuildError("Rust release signing helper was not produced")
     signer_helper_sha256 = _file_digest(signer_helper)[1]
@@ -1154,6 +1545,7 @@ def _build_release(
         root / "python/requirements.lock",
         lock_path,
         lock,
+        release_components_sha256,
         build_runtime,
         toolchain,
         runtime_requirements,
@@ -1183,11 +1575,14 @@ def _build_release(
     maturin = next(path for path in build_wheels if path.name.startswith("maturin-"))
     _run(
         [
-            build_python,
-            "-I",
-            "-m",
+            str(uv_executable),
             "pip",
             "install",
+            "--python",
+            build_python,
+            "--no-config",
+            "--offline",
+            "--no-cache",
             "--no-index",
             "--no-deps",
             str(maturin),
@@ -1198,22 +1593,24 @@ def _build_release(
     environment = dict(bootstrap_environment)
     environment["PYO3_PYTHON"] = build_python
     environment["MARKET_SQUAWK_MODEL_VALIDATOR_SHA256"] = validator_sha256
-    _run(
-        [
-            build_python,
-            "-I",
-            "-m",
-            "maturin",
-            "build",
-            "--release",
-            "--locked",
-            "--out",
-            str(layout.distribution),
-        ],
-        root / "python",
-        environment,
+    maturin_command = [
+        build_python,
+        "-I",
+        "-m",
+        "maturin",
+        "build",
+        "--release",
+        "--locked",
+        "--out",
+        str(layout.distribution),
+    ]
+    if profile.maturin_compatibility is not None:
+        maturin_command.extend(["--compatibility", profile.maturin_compatibility])
+    _run(maturin_command, root / "python", environment)
+    project_version = _project_version(root)
+    project_wheels = list(
+        layout.distribution.glob(f"market_squawk-{project_version}-*.whl")
     )
-    project_wheels = list(layout.distribution.glob("market_squawk-0.2.0-*.whl"))
     if len(project_wheels) != 1:
         raise ReleaseBuildError("maturin did not create exactly one project wheel")
     project_wheel = project_wheels[0]
@@ -1222,17 +1619,17 @@ def _build_release(
     if (
         python_tag != "cp310"
         or abi_tag != "abi3"
-        or platform_tag != PROJECT_WHEEL_PLATFORM_TAG
+        or platform_tag != profile.wheel_platform_tag
     ):
         raise ReleaseBuildError(
-            "project wheel does not carry the exact pinned cp310-abi3 macOS platform tag"
+            "project wheel does not carry the exact pinned cp310-abi3 platform tag"
         )
     prepared_releases = []
     for runtime, (minor, release_venv) in zip(runtimes, layout.releases, strict=True):
         if runtime.version[:2] != minor:
             raise ReleaseBuildError("release environment and interpreter identity differ")
         _reset_owned_child(release_venv, layout.root, f"release-cp{minor[0]}{minor[1]}")
-        release_python = _create_venv(
+        release_python = _copy_runtime_release(
             runtime,
             release_venv,
             root,
@@ -1252,11 +1649,11 @@ def _build_release(
             )
         )
     if (
-        not prepared_releases
-        or prepared_releases[0][1] != (3, 12)
-        or prepared_releases[0][2] != layout.root / "release-cp312"
+        len(prepared_releases) != 1
+        or prepared_releases[0][1] != (3, 14)
+        or prepared_releases[0][2] != layout.root / CANONICAL_RELEASE
     ):
-        raise ReleaseBuildError("canonical CPython 3.12 release is unavailable")
+        raise ReleaseBuildError("canonical CPython 3.14 release is unavailable")
     canonical_executables = prepared_releases[0][4]
     application_size, application_sha256 = _file_digest(
         canonical_executables.application
@@ -1266,6 +1663,9 @@ def _build_release(
     )
     canonical_validator_size, canonical_validator_sha256 = _file_digest(
         canonical_executables.validator
+    )
+    training_driver_size, training_driver_sha256 = _file_digest(
+        canonical_executables.training_driver
     )
     if (
         (canonical_validator_size, canonical_validator_sha256)
@@ -1279,6 +1679,7 @@ def _build_release(
         abi_tag,
         platform_tag,
         prepared_releases[0][2],
+        profile,
         signer,
     )
     (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
@@ -1287,11 +1688,16 @@ def _build_release(
         runtime_environment = dict(bootstrap_environment)
         _run(
             [
-                release_python,
-                "-I",
-                "-m",
+                str(uv_executable),
                 "pip",
                 "install",
+                "--python",
+                release_python,
+                "--prefix",
+                str(release_venv),
+                "--no-config",
+                "--offline",
+                "--no-cache",
                 "--no-index",
                 "--find-links",
                 str(layout.wheelhouse),
@@ -1306,11 +1712,16 @@ def _build_release(
         )
         _run(
             [
-                release_python,
-                "-I",
-                "-m",
+                str(uv_executable),
                 "pip",
                 "install",
+                "--python",
+                release_python,
+                "--prefix",
+                str(release_venv),
+                "--no-config",
+                "--offline",
+                "--no-cache",
                 "--no-index",
                 "--no-deps",
                 str(project_wheel),
@@ -1318,11 +1729,19 @@ def _build_release(
             root,
             runtime_environment,
         )
+        install_native_training_driver(
+            release_venv,
+            runtime,
+            built_executables.training_driver,
+            project_version,
+        )
         if (
             _file_digest(installed_executables.application)
             != (application_size, application_sha256)
             or _file_digest(installed_executables.onnx_worker)
             != (onnx_worker_size, onnx_worker_sha256)
+            or _file_digest(installed_executables.training_driver)
+            != (training_driver_size, training_driver_sha256)
             or _file_digest(installed_executables.validator)
             != (canonical_validator_size, canonical_validator_sha256)
         ):
@@ -1330,7 +1749,7 @@ def _build_release(
         distribution = inspect_installed_distribution(
             release_venv,
             runtime,
-            RuntimeRequirement("market-squawk", "0.2.0"),
+            RuntimeRequirement("market-squawk", project_version),
             native_prefix="market_squawk/__init__.",
             require_training_driver=True,
         )
@@ -1357,6 +1776,7 @@ def _build_release(
             [
                 release_python,
                 "-I",
+                "-B",
                 "-c",
                 "import market_squawk as native;"
                 "raise SystemExit(0 if getattr(native, "
@@ -1369,6 +1789,7 @@ def _build_release(
             [
                 release_python,
                 "-I",
+                "-B",
                 "-m",
                 "pytest",
                 *(str(root / path) for path in FOCUSED_TESTS),
@@ -1403,10 +1824,11 @@ def _build_release(
                 "validator_sha256": validator_sha256,
                 "application_sha256": application_sha256,
                 "onnx_worker_sha256": onnx_worker_sha256,
+                "training_driver_sha256": training_driver_sha256,
             }
         )
     evidence = {
-        "schema_version": 5,
+        "schema_version": 6,
         "support_matrix": matrix_evidence,
         "toolchain": toolchain,
         "build_environment": {
@@ -1431,11 +1853,13 @@ def _build_release(
             "python_tag": python_tag,
             "abi_tag": abi_tag,
             "platform_tag": platform_tag,
-            "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
+            "minimum_system": profile.minimum_system,
+            "target": profile.target,
         },
         "native_executables": {
             "application_sha256": application_sha256,
             "onnx_worker_sha256": onnx_worker_sha256,
+            "training_driver_sha256": training_driver_sha256,
             "validator_sha256": validator_sha256,
         },
     }
@@ -1452,6 +1876,7 @@ def _build_native_release_executables(
     toolchain: dict[str, object],
     environment: dict[str, str],
 ) -> NativeReleaseExecutables:
+    profile = platform_profile(str(toolchain.get("target")))
     _run(
         [
             str(_bound_tool(toolchain, "cargo")),
@@ -1466,6 +1891,8 @@ def _build_native_release_executables(
             "market-squawk-model-validator",
             "--bin",
             "market-squawk-onnx-worker",
+            "--bin",
+            "market-squawk-train",
             "--no-default-features",
             "--features",
             "market-squawk/release-evidence",
@@ -1475,17 +1902,20 @@ def _build_native_release_executables(
         root,
         environment,
     )
-    release = root / "target/release"
+    release = _cargo_release_dir(root, profile)
+    suffix = profile.executable_suffix
     executables = NativeReleaseExecutables(
-        application=release / "market-squawk",
-        onnx_worker=release / "market-squawk-onnx-worker",
-        validator=release / "market-squawk-model-validator",
+        application=release / f"market-squawk{suffix}",
+        onnx_worker=release / f"market-squawk-onnx-worker{suffix}",
+        training_driver=release / f"market-squawk-train{suffix}",
+        validator=release / f"market-squawk-model-validator{suffix}",
     )
     if any(
         path.is_symlink() or not path.is_file()
         for path in (
             executables.application,
             executables.onnx_worker,
+            executables.training_driver,
             executables.validator,
         )
     ):
@@ -1493,21 +1923,33 @@ def _build_native_release_executables(
     return executables
 
 
+def _cargo_release_dir(root: Path, profile: PlatformProfile) -> Path:
+    return root / "target" / profile.target / "release"
+
+
 def _copy_native_release_executables(
     executables: NativeReleaseExecutables,
     release_root: Path,
 ) -> NativeReleaseExecutables:
+    profile = host_profile()
+    suffix = profile.executable_suffix
     native_bin = release_root / "bin"
-    if native_bin.is_symlink() or not native_bin.is_dir():
+    if native_bin.is_symlink() or (
+        native_bin.exists() and not native_bin.is_dir()
+    ):
         raise ReleaseBuildError("release executable directory is invalid")
+    native_bin.mkdir(exist_ok=True)
     installed = NativeReleaseExecutables(
-        application=native_bin / "market-squawk",
-        onnx_worker=native_bin / "market-squawk-onnx-worker",
-        validator=native_bin / "market-squawk-model-validator",
+        application=native_bin / f"market-squawk{suffix}",
+        onnx_worker=native_bin / f"market-squawk-onnx-worker{suffix}",
+        training_driver=release_root / _training_driver_path(profile),
+        validator=native_bin / f"market-squawk-model-validator{suffix}",
     )
+    installed.training_driver.parent.mkdir(exist_ok=True)
     for source, destination in (
         (executables.application, installed.application),
         (executables.onnx_worker, installed.onnx_worker),
+        (executables.training_driver, installed.training_driver),
         (executables.validator, installed.validator),
     ):
         if (
@@ -1523,6 +1965,79 @@ def _copy_native_release_executables(
         if _file_digest(destination) != expected_identity:
             raise ReleaseBuildError("installed native release identity changed")
     return installed
+
+
+def install_native_training_driver(
+    release_root: Path,
+    runtime: PythonRuntime,
+    source: Path,
+    project_version: str,
+) -> None:
+    """Replace the path-bound wheel script with the signed relocatable launcher."""
+
+    profile = host_profile()
+    destination = release_root / _training_driver_path(profile)
+    site_packages = _site_packages_path(release_root, runtime, profile)
+    record_candidates = tuple(
+        site_packages.glob(f"market_squawk-{project_version}.dist-info/RECORD")
+    )
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or source.stat().st_size == 0
+        or source.stat().st_size > MAX_TRAINING_LAUNCHER_BYTES
+        or destination.is_symlink()
+        or not destination.is_file()
+        or len(record_candidates) != 1
+    ):
+        raise ReleaseBuildError("installed training launcher identity is invalid")
+    record = record_candidates[0]
+    if record.is_symlink() or not record.is_file() or record.stat().st_size > MAX_RECORD_BYTES:
+        raise ReleaseBuildError("installed project RECORD is invalid")
+
+    training_record_path = os.path.relpath(destination, site_packages).replace(os.sep, "/")
+    replacement = destination.with_name(f".{destination.name}.native")
+    if replacement.exists() or replacement.is_symlink():
+        raise ReleaseBuildError("training launcher replacement path already exists")
+    expected_size, expected_sha256 = _file_digest(source)
+    try:
+        shutil.copyfile(source, replacement)
+        replacement.chmod(0o555)
+        if _file_digest(replacement) != (expected_size, expected_sha256):
+            raise ReleaseBuildError("training launcher changed during installation")
+        os.replace(replacement, destination)
+
+        rows = []
+        matched = 0
+        with record.open("r", encoding="utf-8", newline="") as stream:
+            for row in csv.reader(stream):
+                if len(row) != 3:
+                    raise ReleaseBuildError("installed project RECORD is malformed")
+                if row[0] == training_record_path:
+                    matched += 1
+                    encoded = base64.urlsafe_b64encode(
+                        bytes.fromhex(expected_sha256)
+                    ).rstrip(b"=").decode("ascii")
+                    row = [training_record_path, f"sha256={encoded}", str(expected_size)]
+                rows.append(row)
+        if matched != 1:
+            raise ReleaseBuildError("installed project RECORD omits the training launcher")
+
+        temporary_record = record.with_name(".RECORD.native")
+        if temporary_record.exists() or temporary_record.is_symlink():
+            raise ReleaseBuildError("project RECORD replacement path already exists")
+        try:
+            with temporary_record.open("x", encoding="utf-8", newline="") as stream:
+                csv.writer(stream, lineterminator="\n").writerows(rows)
+            if temporary_record.stat().st_size > MAX_RECORD_BYTES:
+                raise ReleaseBuildError("installed project RECORD exceeds its bound")
+            os.replace(temporary_record, record)
+        finally:
+            temporary_record.unlink(missing_ok=True)
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise ReleaseBuildError("native training launcher installation failed") from error
+    finally:
+        replacement.unlink(missing_ok=True)
 
 
 def _marker_content(path: Path, purpose: str) -> str:
@@ -1551,7 +2066,7 @@ def _admit_owned_child(path: Path, root: Path, purpose: str) -> None:
 
 def _reset_owned_child(path: Path, root: Path, purpose: str) -> None:
     _admit_owned_child(path, root, purpose)
-    if purpose in {"release-cp312", "release-cp313"}:
+    if purpose == CANONICAL_RELEASE:
         _unseal_owned_release_authority(path)
     shutil.rmtree(path)
     path.mkdir()
@@ -1635,6 +2150,32 @@ def _toml(path: Path) -> dict[str, object]:
     return value
 
 
+def _project_version(root: Path) -> str:
+    workspace = _toml(root / "Cargo.toml")
+    workspace_table = workspace.get("workspace")
+    workspace_package = (
+        workspace_table.get("package") if isinstance(workspace_table, dict) else None
+    )
+    rust_version = (
+        workspace_package.get("version")
+        if isinstance(workspace_package, dict)
+        else None
+    )
+    python = _toml(root / "python/pyproject.toml")
+    python_project = python.get("project")
+    python_version = (
+        python_project.get("version") if isinstance(python_project, dict) else None
+    )
+    if (
+        not isinstance(rust_version, str)
+        or not isinstance(python_version, str)
+        or rust_version != python_version
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", rust_version) is None
+    ):
+        raise ReleaseBuildError("Rust and Python release versions are inconsistent")
+    return rust_version
+
+
 def _require_tool_release(output: str, tool: str, expected: str) -> None:
     first = output.splitlines()[0].split()
     release = first[1] if len(first) >= 2 and first[0] == tool else None
@@ -1656,6 +2197,57 @@ def _create_venv(
     return str(executable)
 
 
+def _copy_runtime_release(
+    runtime: PythonRuntime,
+    release_root: Path,
+    root: Path,
+    environment: dict[str, str] | None = None,
+) -> str:
+    """Copy one admitted self-contained CPython distribution into the release root."""
+
+    profile = host_profile()
+    source_root = (
+        runtime.executable.parent
+        if profile.system == "Windows"
+        else runtime.executable.parent.parent
+    )
+    expected_source = source_root / profile.interpreter_relative_path
+    if expected_source.resolve(strict=True) != runtime.executable:
+        raise ReleaseBuildError("managed Python runtime layout is not canonical")
+    observed_files = 0
+    observed_bytes = 0
+    for source in source_root.rglob("*"):
+        metadata = source.lstat()
+        if source.is_symlink():
+            resolved = source.resolve(strict=True)
+            if not resolved.is_file() or not resolved.is_relative_to(source_root):
+                raise ReleaseBuildError("managed Python runtime contains an unsafe link")
+            size = resolved.stat().st_size
+        elif source.is_file():
+            size = metadata.st_size
+        elif source.is_dir():
+            continue
+        else:
+            raise ReleaseBuildError("managed Python runtime contains a special file")
+        observed_files += 1
+        observed_bytes += size
+        if observed_files > 32_768 or observed_bytes > 2 * 1024 * 1024 * 1024:
+            raise ReleaseBuildError("managed Python runtime exceeds its copy bounds")
+    shutil.copytree(
+        source_root,
+        release_root,
+        dirs_exist_ok=True,
+        symlinks=False,
+        copy_function=shutil.copy2,
+    )
+    for copied in release_root.rglob("*"):
+        if copied.is_symlink():
+            raise ReleaseBuildError("copied Python runtime retained a symbolic link")
+    executable = release_root / profile.interpreter_relative_path
+    _admit_created_runtime(executable, runtime.version, root, environment)
+    return str(executable)
+
+
 def _admit_created_runtime(
     executable: Path,
     expected: tuple[int, int, int],
@@ -1663,10 +2255,11 @@ def _admit_created_runtime(
     environment: dict[str, str] | None = None,
 ) -> None:
     evidence, version = _interpreter_evidence(executable, root, environment)
+    profile = host_profile()
     if (
         evidence.get("implementation") != "cpython"
-        or evidence.get("system") != "Darwin"
-        or evidence.get("machine") != "arm64"
+        or evidence.get("system") != profile.system
+        or evidence.get("machine") not in profile.machines
         or version != expected
     ):
         raise ReleaseBuildError("created venv does not use its exact admitted interpreter")
@@ -1714,60 +2307,128 @@ def _cargo_environment(
     _reject_cargo_configuration((root, root / "python"), cargo_home)
     cargo = _bound_tool(toolchain, "cargo")
     rustc = _bound_tool(toolchain, "rustc")
-    clang = _bound_tool(toolchain, "clang")
-    clangxx = _bound_tool(toolchain, "clangxx")
-    archiver = _bound_tool(toolchain, "archiver")
-    ranlib = _bound_tool(toolchain, "ranlib")
-    sdk = toolchain.get("sdk")
-    if (
-        not isinstance(sdk, dict)
-        or not isinstance(sdk.get("path"), str)
-        or toolchain.get("target") != "aarch64-apple-darwin"
-        or toolchain.get("macos_deployment_target") != MACOS_DEPLOYMENT_TARGET
-        or not isinstance(toolchain.get("developer_dir"), str)
-    ):
-        raise ReleaseBuildError("bound macOS build policy is invalid")
-    path = os.pathsep.join(
-        dict.fromkeys(
-            [
-                str(cargo.parent),
-                str(rustc.parent),
-                str(clang.parent),
-                "/usr/bin",
-                "/bin",
-            ]
-        )
-    )
+    target = toolchain.get("target")
+    if not isinstance(target, str):
+        raise ReleaseBuildError("bound native build target is invalid")
+    profile = platform_profile(target)
+    if host_profile() != profile:
+        raise ReleaseBuildError("bound native build target differs from the host")
     temporary = build_home / "tmp"
     if not temporary.is_dir():
         temporary = Path("/tmp")
     environment = {
-        "AR": str(archiver),
         "CARGO_HOME": str(cargo_home),
+        "CARGO_BUILD_TARGET": profile.target,
         "CARGO_INCREMENTAL": "0",
         "CARGO_NET_OFFLINE": "true" if offline else "false",
-        "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER": str(clang),
         "CARGO_TERM_COLOR": "never",
-        "CC": str(clang),
-        "CXX": str(clangxx),
-        "DEVELOPER_DIR": str(toolchain["developer_dir"]),
         "HOME": str(build_home),
         "LANG": "C",
         "LC_ALL": "C",
-        "MACOSX_DEPLOYMENT_TARGET": MACOS_DEPLOYMENT_TARGET,
-        "PATH": path,
         "PIP_CONFIG_FILE": os.devnull,
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PIP_NO_INDEX": "1" if offline else "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",
-        "RANLIB": str(ranlib),
         "RUSTC": str(rustc),
-        "SDKROOT": sdk["path"],
         "SOURCE_DATE_EPOCH": SOURCE_DATE_EPOCH,
         "TMPDIR": str(temporary),
         "TZ": "UTC",
+        "UV_LINK_MODE": "copy",
+        "UV_NO_CONFIG": "1",
+        "UV_NO_PROGRESS": "1",
+        "UV_OFFLINE": "true" if offline else "false",
+        "UV_PYTHON_DOWNLOADS": "never",
     }
+    target_key = profile.target.upper().replace("-", "_")
+    if profile.system == "Darwin":
+        clang = _bound_tool(toolchain, "clang")
+        clangxx = _bound_tool(toolchain, "clangxx")
+        archiver = _bound_tool(toolchain, "archiver")
+        ranlib = _bound_tool(toolchain, "ranlib")
+        sdk = toolchain.get("sdk")
+        if (
+            not isinstance(sdk, dict)
+            or not isinstance(sdk.get("path"), str)
+            or toolchain.get("macos_deployment_target") != MACOS_DEPLOYMENT_TARGET
+            or not isinstance(toolchain.get("developer_dir"), str)
+        ):
+            raise ReleaseBuildError("bound macOS build policy is invalid")
+        environment.update(
+            {
+                "AR": str(archiver),
+                "CC": str(clang),
+                "CXX": str(clangxx),
+                "DEVELOPER_DIR": str(toolchain["developer_dir"]),
+                f"CARGO_TARGET_{target_key}_LINKER": str(clang),
+                "MACOSX_DEPLOYMENT_TARGET": MACOS_DEPLOYMENT_TARGET,
+                "PATH": os.pathsep.join(
+                    dict.fromkeys(
+                        [
+                            str(cargo.parent),
+                            str(rustc.parent),
+                            str(clang.parent),
+                            "/usr/bin",
+                            "/bin",
+                        ]
+                    )
+                ),
+                "RANLIB": str(ranlib),
+                "SDKROOT": sdk["path"],
+            }
+        )
+    elif profile.system == "Linux":
+        cc = _bound_tool(toolchain, "cc")
+        cxx = _bound_tool(toolchain, "cxx")
+        archiver = _bound_tool(toolchain, "archiver")
+        ranlib = _bound_tool(toolchain, "ranlib")
+        environment.update(
+            {
+                "AR": str(archiver),
+                "CC": str(cc),
+                "CXX": str(cxx),
+                f"CARGO_TARGET_{target_key}_LINKER": str(cc),
+                "PATH": os.pathsep.join(
+                    dict.fromkeys(
+                        [
+                            str(cargo.parent),
+                            str(rustc.parent),
+                            str(cc.parent),
+                            "/usr/bin",
+                            "/bin",
+                        ]
+                    )
+                ),
+                "RANLIB": str(ranlib),
+            }
+        )
+    elif profile.system == "Windows":
+        compiler = _bound_tool(toolchain, "compiler")
+        linker = _bound_tool(toolchain, "linker")
+        archiver = _bound_tool(toolchain, "archiver")
+        required = ("INCLUDE", "LIB", "PATH", "PATHEXT", "SystemRoot")
+        if any(not os.environ.get(name) for name in required):
+            raise ReleaseBuildError("MSVC developer environment is incomplete")
+        environment.update({name: os.environ[name] for name in required})
+        environment["PATH"] = os.pathsep.join(
+            dict.fromkeys(
+                [
+                    str(cargo.parent),
+                    str(rustc.parent),
+                    str(compiler.parent),
+                    str(linker.parent),
+                    str(archiver.parent),
+                    environment["PATH"],
+                ]
+            )
+        )
+        environment["TEMP"] = str(temporary)
+        environment["TMP"] = str(temporary)
+        if os.environ.get("LIBPATH"):
+            environment["LIBPATH"] = os.environ["LIBPATH"]
+    else:
+        raise ReleaseBuildError("bound native build target is unsupported")
     _mapping_sha256(environment)
     return environment
 
@@ -1818,6 +2479,7 @@ def build_training_foundation_receipt(
     requirements_lock: Path,
     wheelhouse_lock: Path,
     lock: ReleaseLock,
+    release_components_sha256: str,
     runtime: PythonRuntime,
     toolchain: dict[str, object],
     runtime_requirements: tuple[RuntimeRequirement, ...],
@@ -1828,6 +2490,7 @@ def build_training_foundation_receipt(
 
     _sha256(release_public_key)
     _sha256(release_signer_sha256)
+    _sha256(release_components_sha256)
     if (
         not runtime_requirements
         or len(runtime_requirements) > MAX_RUNTIME_DISTRIBUTIONS
@@ -1848,6 +2511,7 @@ def build_training_foundation_receipt(
         "cargo_lock_sha256": _file_digest(root / "Cargo.lock")[1],
         "requirements_lock_sha256": _file_digest(requirements_lock)[1],
         "release_public_key": release_public_key,
+        "release_components_sha256": release_components_sha256,
         "release_signer_sha256": release_signer_sha256,
         "runtime_distributions": [
             {"name": value.name, "version": value.version}
@@ -1876,23 +2540,28 @@ def build_release_manifest(
     abi_tag: str,
     platform_tag: str,
     canonical_release: Path,
+    profile: PlatformProfile,
     signer: ReleaseSigner,
 ) -> tuple[bytes, str]:
-    """Bind the exact wheel and canonical CPython 3.12 native product."""
+    """Bind the exact wheel and canonical CPython 3.14 native product."""
 
     _sha256(foundation_sha256)
     wheel_size, wheel_sha256 = _file_digest(project_wheel)
-    if canonical_release.name != "release-cp312":
+    if canonical_release.name != CANONICAL_RELEASE:
         raise ReleaseBuildError("native release executable identity is not canonical")
-    _admit_owned_child(canonical_release, canonical_release.parent, "release-cp312")
+    _admit_owned_child(canonical_release, canonical_release.parent, CANONICAL_RELEASE)
+    suffix = profile.executable_suffix
     expected_names = {
-        "application": "market-squawk",
-        "onnx_worker": "market-squawk-onnx-worker",
-        "validator": "market-squawk-model-validator",
+        "application": f"market-squawk{suffix}",
+        "onnx_worker": f"market-squawk-onnx-worker{suffix}",
+        "training_driver": f"market-squawk-train{suffix}",
+        "validator": f"market-squawk-model-validator{suffix}",
     }
     native_files = {
-        name: canonical_release / "bin" / executable
-        for name, executable in expected_names.items()
+        "application": canonical_release / "bin" / expected_names["application"],
+        "onnx_worker": canonical_release / "bin" / expected_names["onnx_worker"],
+        "training_driver": canonical_release / _training_driver_path(profile),
+        "validator": canonical_release / "bin" / expected_names["validator"],
     }
     if any(
         path.name != expected_names[name] or path.is_symlink() or not path.is_file()
@@ -1902,6 +2571,7 @@ def build_release_manifest(
     native_limits = {
         "application": MAX_APPLICATION_EXECUTABLE_BYTES,
         "onnx_worker": MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+        "training_driver": MAX_TRAINING_LAUNCHER_BYTES,
         "validator": MAX_VALIDATOR_EXECUTABLE_BYTES,
     }
     try:
@@ -1934,13 +2604,18 @@ def build_release_manifest(
         "project_wheel": {
             "abi_tag": abi_tag,
             "filename": project_wheel.name,
-            "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
+            "minimum_system": profile.minimum_system,
             "platform_tag": platform_tag,
             "python_tag": python_tag,
             "sha256": wheel_sha256,
             "size_bytes": wheel_size,
+            "target": profile.target,
         },
-        "schema_version": 2,
+        "schema_version": 3,
+        "training_driver": {
+            "sha256": native_identities["training_driver"][1],
+            "size_bytes": native_identities["training_driver"][0],
+        },
         "validator": {
             "sha256": native_identities["validator"][1],
             "size_bytes": native_identities["validator"][0],
@@ -1955,7 +2630,7 @@ def build_release_manifest(
     ).encode("ascii")
     manifest = {
         "payload": payload,
-        "schema_version": 2,
+        "schema_version": 3,
         "signature": signer.sign(RELEASE_MANIFEST_DOMAIN, payload_bytes),
     }
     encoded = json.dumps(
@@ -1971,6 +2646,7 @@ def build_release_manifest(
 def harden_project_wheel(project_wheel: Path) -> None:
     """Replace Maturin's Python bootstrap with the independently loaded native initializer."""
 
+    profile = host_profile()
     if (
         project_wheel.is_symlink()
         or not project_wheel.is_file()
@@ -2001,7 +2677,7 @@ def harden_project_wheel(project_wheel: Path) -> None:
                 member
                 for member in members
                 if member.filename.startswith(nested_native_prefix)
-                and member.filename.endswith(".so")
+                and member.filename.endswith(profile.native_extension_suffix)
             ]
             if (
                 mutable_bootstrap not in names
@@ -2015,7 +2691,7 @@ def harden_project_wheel(project_wheel: Path) -> None:
             ):
                 raise ReleaseBuildError("project wheel bootstrap layout is invalid")
             native_suffix = nested_native[0].filename.removeprefix(nested_native_prefix)
-            if native_suffix != "abi3.so":
+            if native_suffix != profile.native_extension_suffix:
                 raise ReleaseBuildError("project wheel native initializer ABI is invalid")
             native_initializer = f"market_squawk/__init__.{native_suffix}"
             if native_initializer in names:
@@ -2110,12 +2786,12 @@ def inspect_installed_distribution(
 ) -> InstalledDistribution:
     """Verify one installed distribution and its complete owned file roots."""
 
-    site_packages = (
-        release_root
-        / "lib"
-        / f"python{runtime.version[0]}.{runtime.version[1]}"
-        / "site-packages"
-    )
+    profile = host_profile()
+    site_packages = _site_packages_path(release_root, runtime, profile)
+    training_driver = _training_driver_path(profile)
+    training_driver_record = os.path.relpath(
+        release_root / training_driver, site_packages
+    ).replace(os.sep, "/")
     if site_packages.is_symlink() or not site_packages.is_dir():
         raise ReleaseBuildError("installed distribution root is invalid")
     candidates = []
@@ -2163,19 +2839,19 @@ def inspect_installed_distribution(
                     saw_record = True
                     continue
                 is_training_driver = (
-                    require_training_driver and name == TRAINING_DRIVER_RECORD_PATH
+                    require_training_driver and name == training_driver_record
                 )
                 if is_training_driver:
                     if saw_training_driver or not encoded_digest or not encoded_size:
                         raise ReleaseBuildError(
                             "installed training driver RECORD entry is invalid"
                         )
-                    path = release_root / TRAINING_DRIVER_RELEASE_PATH
+                    path = release_root / training_driver
                     observed_record_path = os.path.relpath(path, site_packages).replace(
                         os.sep, "/"
                     )
                     if (
-                        observed_record_path != TRAINING_DRIVER_RECORD_PATH
+                        observed_record_path != training_driver_record
                         or path.parent.is_symlink()
                     ):
                         raise ReleaseBuildError(
@@ -2252,7 +2928,7 @@ def inspect_installed_distribution(
     ):
         raise ReleaseBuildError("installed distribution RECORD is incomplete")
     internal_entries = {
-        name for name in entries if name != TRAINING_DRIVER_RECORD_PATH
+        name for name in entries if name != training_driver_record
     }
     roots = tuple(
         sorted(
@@ -2273,7 +2949,8 @@ def inspect_installed_distribution(
         native_entries = [
             name
             for name in entries
-            if name.startswith(native_prefix) and name.endswith(".so")
+            if name.startswith(native_prefix)
+            and name.endswith(profile.native_extension_suffix)
         ]
         if len(native_entries) != 1:
             raise ReleaseBuildError("installed project has no unique native extension")
@@ -2373,7 +3050,8 @@ def install_training_environment(
         interpreter_relative = interpreter.relative_to(release_root).as_posix()
     except ValueError as error:
         raise ReleaseBuildError("release interpreter escapes its environment") from error
-    if interpreter_relative != "bin/python":
+    profile = host_profile()
+    if interpreter_relative != profile.interpreter_relative_path:
         raise ReleaseBuildError("release interpreter path is not canonical")
     if (
         distribution.native_extension is None
@@ -2400,7 +3078,7 @@ def install_training_environment(
     payload = {
         "foundation_sha256": foundation_sha256,
         "interpreter": {
-            "executable_relative_path": "bin/python",
+            "executable_relative_path": profile.interpreter_relative_path,
             "implementation": "cpython",
             "python_tag": f"cp{runtime.version[0]}{runtime.version[1]}",
             "sha256": interpreter_sha256,
@@ -2572,15 +3250,26 @@ def _normalize_project_name(value: str) -> str:
     return normalized
 
 
-def _compatible(filename: str, version: tuple[int, int]) -> bool:
+def _compatible(
+    filename: str,
+    version: tuple[int, int],
+    profile: PlatformProfile,
+) -> bool:
     python_tag, _abi, platform_tag = _wheel_tags(filename)
     current = f"cp{version[0]}{version[1]}"
     python_ok = python_tag == "py3" or current in python_tag.split(".")
-    platform_ok = platform_tag == "any" or (
-        platform.system() == "Darwin"
-        and platform.machine() == "arm64"
-        and "arm64" in platform_tag
-    )
+    platform_ok = platform_tag == "any"
+    if profile.target == "aarch64-apple-darwin":
+        platform_ok = platform_ok or "arm64" in platform_tag or "universal2" in platform_tag
+    elif profile.target == "x86_64-apple-darwin":
+        platform_ok = platform_ok or "x86_64" in platform_tag or "universal2" in platform_tag
+    elif profile.target == "x86_64-pc-windows-msvc":
+        platform_ok = platform_ok or platform_tag == "win_amd64"
+    elif profile.target == "x86_64-unknown-linux-gnu":
+        platform_ok = platform_ok or (
+            "x86_64" in platform_tag
+            and ("manylinux" in platform_tag or "linux" in platform_tag)
+        )
     return python_ok and platform_ok
 
 
@@ -2636,6 +3325,20 @@ def _file_digest(path: Path) -> tuple[int, str]:
     return len(content), hashlib.sha256(content).hexdigest()
 
 
+def _site_packages_path(
+    root: Path, runtime: PythonRuntime, profile: PlatformProfile
+) -> Path:
+    if profile.system == "Windows":
+        return root / "Lib" / "site-packages"
+    return root / "lib" / f"python{runtime.version[0]}.{runtime.version[1]}" / "site-packages"
+
+
+def _training_driver_path(profile: PlatformProfile) -> Path:
+    if profile.system == "Windows":
+        return Path("Scripts/market-squawk-train.exe")
+    return Path("bin/market-squawk-train")
+
+
 def _venv_python(root: Path) -> str:
     return str(root / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
 
@@ -2674,8 +3377,14 @@ def _run_output(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", required=True, type=Path)
+    parser.add_argument(
+        "--target",
+        required=True,
+        choices=tuple(PLATFORM_PROFILES),
+    )
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--python", required=True, action="append", type=Path)
+    parser.add_argument("--uv", required=True, type=Path)
     parser.add_argument("--source-cache", type=Path)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--prepare-cache-only", action="store_true")
@@ -2688,8 +3397,18 @@ def main() -> int:
             if options.source_cache is not None
             else None
         )
-        lock = load_lock(lock_path)
-        toolchain = admit_toolchain(root)
+        profile = platform_profile(options.target)
+        if host_profile() != profile:
+            raise ReleaseBuildError("release target does not match the native build host")
+        lock = load_lock(lock_path, profile.target)
+        components_sha256 = admit_release_components(
+            root / "distribution/release-components.json",
+            profile,
+            options.uv,
+            root,
+        )
+        uv_executable = options.uv.expanduser().resolve(strict=True)
+        toolchain = admit_toolchain(root, profile)
         runtimes = admit_runtimes(tuple(options.python), lock)
         admit_sources(lock, root)
         layout = admit_artifact_root(options.artifact_root, root)
@@ -2703,7 +3422,16 @@ def main() -> int:
         else:
             if not options.offline:
                 raise ReleaseBuildError("release build requires --offline")
-            build_release(root, lock_path, lock, layout, runtimes, toolchain)
+            build_release(
+                root,
+                lock_path,
+                lock,
+                layout,
+                runtimes,
+                toolchain,
+                components_sha256,
+                uv_executable,
+            )
     except (OSError, ReleaseBuildError) as error:
         print(f"python release rejected: {error}", file=sys.stderr)
         return 2

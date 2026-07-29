@@ -13,7 +13,7 @@ default-members = ["apps/market-squawk"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.97.1"
-version = "0.2.0"
+version = "1.0.0"
 license = "Apache-2.0 OR MIT"
 
 [workspace.dependencies]
@@ -66,28 +66,28 @@ hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio
 hmac = "=0.12.1"
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
-market-squawk = { path = "apps/market-squawk", version = "=0.2.0" }
-market-squawk-adapter-bls = { path = "adapters/market-squawk-adapter-bls", version = "=0.2.0" }
-market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=0.2.0" }
-market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", version = "=0.2.0" }
-market-squawk-adapter-fred = { path = "adapters/market-squawk-adapter-fred", version = "=0.2.0" }
-market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=0.2.0" }
-market-squawk-adapter-paper = { path = "adapters/market-squawk-adapter-paper", version = "=0.2.0" }
-market-squawk-adapter-portfolio = { path = "adapters/market-squawk-adapter-portfolio", version = "=0.2.0" }
-market-squawk-adapter-sec = { path = "adapters/market-squawk-adapter-sec", version = "=0.2.0" }
-market-squawk-adapter-treasury = { path = "adapters/market-squawk-adapter-treasury", version = "=0.2.0" }
-market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "=0.2.0" }
-market-squawk-data = { path = "crates/market-squawk-data", version = "=0.2.0" }
-market-squawk-domain = { path = "crates/market-squawk-domain", version = "=0.2.0" }
-market-squawk-execution = { path = "crates/market-squawk-execution", version = "=0.2.0" }
-market-squawk-live = { path = "crates/market-squawk-live", version = "=0.2.0" }
-market-squawk-mcp = { path = "crates/market-squawk-mcp", version = "=0.2.0" }
-market-squawk-modeling = { path = "crates/market-squawk-modeling", version = "=0.2.0" }
-market-squawk-platform = { path = "crates/market-squawk-platform", version = "=0.2.0" }
-market-squawk-portfolio = { path = "crates/market-squawk-portfolio", version = "=0.2.0" }
-market-squawk-services = { path = "crates/market-squawk-services", version = "=0.2.0" }
-market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.2.0" }
-market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=0.2.0" }
+market-squawk = { path = "apps/market-squawk", version = "=1.0.0" }
+market-squawk-adapter-bls = { path = "adapters/market-squawk-adapter-bls", version = "=1.0.0" }
+market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=1.0.0" }
+market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", version = "=1.0.0" }
+market-squawk-adapter-fred = { path = "adapters/market-squawk-adapter-fred", version = "=1.0.0" }
+market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=1.0.0" }
+market-squawk-adapter-paper = { path = "adapters/market-squawk-adapter-paper", version = "=1.0.0" }
+market-squawk-adapter-portfolio = { path = "adapters/market-squawk-adapter-portfolio", version = "=1.0.0" }
+market-squawk-adapter-sec = { path = "adapters/market-squawk-adapter-sec", version = "=1.0.0" }
+market-squawk-adapter-treasury = { path = "adapters/market-squawk-adapter-treasury", version = "=1.0.0" }
+market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "=1.0.0" }
+market-squawk-data = { path = "crates/market-squawk-data", version = "=1.0.0" }
+market-squawk-domain = { path = "crates/market-squawk-domain", version = "=1.0.0" }
+market-squawk-execution = { path = "crates/market-squawk-execution", version = "=1.0.0" }
+market-squawk-live = { path = "crates/market-squawk-live", version = "=1.0.0" }
+market-squawk-mcp = { path = "crates/market-squawk-mcp", version = "=1.0.0" }
+market-squawk-modeling = { path = "crates/market-squawk-modeling", version = "=1.0.0" }
+market-squawk-platform = { path = "crates/market-squawk-platform", version = "=1.0.0" }
+market-squawk-portfolio = { path = "crates/market-squawk-portfolio", version = "=1.0.0" }
+market-squawk-services = { path = "crates/market-squawk-services", version = "=1.0.0" }
+market-squawk-sources = { path = "crates/market-squawk-sources", version = "=1.0.0" }
+market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=1.0.0" }
 memory-stats = "=1.2.0"
 num-bigint = "0.4"
 parking_lot = "0.12"
