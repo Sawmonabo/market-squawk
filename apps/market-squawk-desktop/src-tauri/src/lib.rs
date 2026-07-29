@@ -37,8 +37,6 @@ struct DesktopArgs {
 
 #[derive(Debug, Error)]
 enum DesktopStartupError {
-    #[error("desktop arguments are invalid")]
-    Arguments(#[source] clap::Error),
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
     #[error("local product initialization failed")]
@@ -49,7 +47,8 @@ enum DesktopStartupError {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let code = match try_run() {
+    let args = DesktopArgs::try_parse().unwrap_or_else(|error| error.exit());
+    let code = match try_run(args) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
@@ -59,8 +58,7 @@ pub fn run() {
     std::process::exit(code);
 }
 
-fn try_run() -> Result<i32, DesktopStartupError> {
-    let args = DesktopArgs::try_parse().map_err(DesktopStartupError::Arguments)?;
+fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));

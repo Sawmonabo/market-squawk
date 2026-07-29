@@ -1,25 +1,25 @@
 # Local control plane
 
 Market Squawk's local control plane composes product authorities once and exposes them through the
-CLI and local stdio MCP. `LocalProduct` owns the local capabilities; `Application` is the
-transport-neutral operation boundary shared by both transports. Source admission, dataset
-authority, model admission, central risk, and execution lifecycle remain product-owned regardless
-of transport.
+Obsidian Signal desktop, CLI, and local stdio MCP. `LocalProduct` owns the local capabilities;
+`Application` is the transport-neutral operation boundary shared by all three presentations.
+Source admission, dataset authority, model admission, central risk, and execution lifecycle remain
+product-owned regardless of presentation.
 
 | Metadata | Value |
 | --- | --- |
 | Document type | Architecture |
-| Audience | Maintainers, CLI and MCP authors, operators, security reviewers |
+| Audience | Maintainers, desktop/CLI/MCP authors, operators, security reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
 - [Scope](#scope)
 - [Composition](#composition)
 - [Application contract](#application-contract)
-- [CLI and MCP request paths](#cli-and-mcp-request-paths)
+- [Presentation request paths](#presentation-request-paths)
 - [Local state and artifact authority](#local-state-and-artifact-authority)
 - [Central risk and execution authority](#central-risk-and-execution-authority)
 - [Cancellation and lifecycle](#cancellation-and-lifecycle)
@@ -34,6 +34,7 @@ The control plane owns:
 
 - construction and lifecycle of local product services and their capabilities;
 - the closed, typed application operation registry;
+- the desktop bootstrap, read-only application view, and provider-setup presentation boundary;
 - CLI request admission and local operator workflows;
 - MCP initialization, tool discovery/calls, framing, cancellation, result rendering, and shutdown;
 - SQLite catalog/control state, source activation state, secrets, and controlled artifacts;
@@ -41,25 +42,28 @@ The control plane owns:
 - cancellation, deadlines, result limits, and reverse-order shutdown;
 - central risk and the sole dispatch route into paper execution.
 
-It does not process a market event inside SQLite, MCP, or the CLI. It also does not turn transport
-access into financial authority: a well-formed command still has to satisfy the product-domain
-contract and all applicable confirmation, rights, evidence, risk, and lifecycle gates.
+It does not process a market event inside SQLite, a desktop WebView, MCP, or the CLI. It also does
+not turn presentation access into financial authority: a well-formed command still has to satisfy
+the product-domain contract and all applicable confirmation, rights, evidence, risk, and lifecycle
+gates.
 
 ## Composition
 
 `LocalProduct::try_new` opens the hardened local paths and builds the source, research, portfolio,
 analysis/backtest, model, fair-value, and paper authorities. It then composes exactly one
-`Application` from all required domain services. The CLI borrows this product composition. The MCP
-composition receives an `Arc<Application>` plus the same controlled path capabilities for its
-audit and large-result repository.
+`Application` from all required domain services. The desktop and CLI borrow this product
+composition. The MCP composition receives an `Arc<Application>` plus the same controlled path
+capabilities for its audit and large-result repository.
 
 ```mermaid
 flowchart TD
     Operator["Local operator"]
+    DesktopUser["Desktop user"]
     Client["Local MCP client"]
     Config["Validated AppConfig and LocalPaths"]
     Product["LocalProduct lifecycle owner"]
     CLI["market-squawk CLI transport"]
+    Desktop["Tauri WebView and closed bridge"]
     MCP["Hardened stdio MCP transport"]
     App["Application descriptor and dispatch authority"]
     Domains["11 required domain services"]
@@ -86,7 +90,10 @@ flowchart TD
     Product --> FairValue
     Product --> Paper
     Operator --> CLI
+    DesktopUser --> Desktop
     Client --> MCP
+    Desktop --> App
+    Desktop --> Source
     CLI --> App
     MCP --> App
     CLI --> SQL
@@ -116,6 +123,8 @@ local capabilities: provider activation, controlled file ingestion, point-in-tim
 publication, model admission, portfolio import, and governed backtest registration. These
 workflows still call the same owned domain authorities; they are not duplicate service
 implementations. General read-only DataFusion SQL is likewise an explicit CLI-only operator path.
+The desktop bridge invokes only read-only application descriptors through its generic path and
+delegates confirmed provider setup to the existing source/onboarding authorities.
 
 ## Application contract
 
@@ -146,19 +155,28 @@ All 62 application descriptors are mapped into MCP tools with their complete `in
 `outputSchema`, effect annotations, task prohibition, and bounded contract metadata; the server does
 not maintain a separate handwritten tool catalog. The pure MCP capability check performs that exact
 conversion and proves the complete `tools/list` response fits the configured frame before a server
-can be published. CLI commands representing application operations call
+can be published. CLI commands and desktop read views representing application operations call
 `Application::invoke` with the same descriptor admission. This prevents schema and authorization
-drift between transports while allowing the explicit local producer workflows described above to
-retain their stronger path, file, signing, or publication capabilities.
+drift between presentations while allowing the explicit local producer and provider-setup
+workflows described above to retain their stronger capabilities.
 
-## CLI and MCP request paths
+## Presentation request paths
 
 ### Shared application request
 
-Both transports construct a `RequestContext` with a request identity, cancellation token, absolute
-deadline, and result limits. The application validates the operation and arguments before a domain
-service sees them. Domain services return transport-neutral typed results rather than writing
-directly to a terminal or protocol stream.
+Each application request constructs a `RequestContext` with a request identity, cancellation token,
+absolute deadline, and result limits. The application validates the operation and arguments before
+a domain service sees them. Domain services return transport-neutral typed results rather than
+writing directly to a presentation.
+
+### Desktop request
+
+The desktop WebView validates bootstrap and result payloads at its Zod boundary. Its Rust bridge
+then admits only read-only operations through the generic application path, applies fixed request
+and result ceilings plus a 15-second deadline, and returns redacted typed failures. Provider setup
+uses a separate tagged command with explicit confirmation, a 30-second operation deadline, and the
+existing durable onboarding and activation authorities. The system browser receives only an exact
+code-owned official provider URL or the validated loopback portal URL returned by `Source.Setup`.
 
 ### MCP request
 
@@ -298,7 +316,7 @@ work.
 
 | Failure | Immediate consequence | Recovery |
 | --- | --- | --- |
-| Mandatory domain missing, duplicated, or misplaced | `Application` composition fails before CLI/MCP service publication | Correct composition; all 11 domains are mandatory |
+| Mandatory domain missing, duplicated, or misplaced | `Application` composition fails before desktop/CLI/MCP publication | Correct composition; all 11 domains are mandatory |
 | Unknown operation or invalid closed-schema argument | Request is rejected before domain dispatch | Correct the command/tool input |
 | Domain service rejects an actionable tool call | MCP returns a bounded `isError: true` tool result and audits `service_rejected` | Correct the request or restore the named domain authority, then retry with a new request identity |
 | Request cancelled or deadline elapsed | Domain sees cancellation; late output is not admitted as a successful result | Issue a new request with a new identity |
@@ -327,8 +345,8 @@ work.
   identity, size, content, confirmation, and, where applicable, signatures/evidence before
   publication.
 - Read-only DataFusion SQL is confined to the CLI and one immutable dataset relation.
-- Neither CLI nor MCP is present in the live event-to-action path; execution-related operations
-  retain central risk and dispatcher-owned adapter authority.
+- The desktop, CLI, and MCP remain outside the live event-to-action path; execution-related
+  operations retain central risk and dispatcher-owned adapter authority.
 
 ## Related documentation and code
 
@@ -346,6 +364,9 @@ Architecture:
 
 Current implementation anchors:
 
+- [Desktop composition root](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
+- [Desktop main-window capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
 - [Local product composition](../../apps/market-squawk/src/local_product/mod.rs)
 - [Transport-neutral application](../../apps/market-squawk/src/application.rs)
 - [Closed operation descriptors](../../apps/market-squawk/src/application/contracts.rs)
@@ -383,3 +404,4 @@ Market Squawk behavior.
 | [MCP 2025-11-25 schema](https://modelcontextprotocol.io/specification/2025-11-25/schema) | Exact `Tool.outputSchema`, `CallToolResult.structuredContent`, and `CallToolResult.isError` wire contracts | 2026-07-26 |
 | [MCP 2025-11-25 cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation) | Request-identity cancellation and late-cancellation race semantics | 2026-07-23 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction boundaries and single-writer behavior for local catalog state | 2026-07-23 |
+| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Window-scoped permission composition for the desktop presentation bridge | 2026-07-28 |

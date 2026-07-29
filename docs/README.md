@@ -9,16 +9,16 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Document type | Documentation portal index |
 | Audience | Operators, users, integrators, maintainers, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed product commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Start by intent
 
 | I want to… | Start here |
 | --- | --- |
 | Understand the system and its boundaries | [Architecture](architecture/README.md) |
-| Install, configure, ingest, query, model, or operate it | [Operations](operations/README.md) |
-| Look up an exact command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
+| Launch the desktop, install, configure, ingest, query, model, or operate it | [Operations](operations/README.md) |
+| Look up an exact desktop/CLI command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
 | Follow the approved implementation sequence | [Implementation plan](plans/implementation-plan.md) |
@@ -68,9 +68,10 @@ runnable remain in the delivery ledger rather than receiving fictional instructi
 
 ### Reference
 
-The [reference portal](reference/README.md) is the factual contract for CLI, configuration, MCP,
-source coverage, data quality, and time/provenance semantics. Reference pages state defaults,
-bounds, exact names, schemas, classifications, and failure behavior without becoming tutorials.
+The [reference portal](reference/README.md) is the factual contract for desktop and CLI launchers,
+configuration, MCP, source coverage, data quality, and time/provenance semantics. Reference pages
+state defaults, bounds, exact names, schemas, classifications, and failure behavior without
+becoming tutorials.
 
 ### Delivery authority
 

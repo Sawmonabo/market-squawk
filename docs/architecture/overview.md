@@ -9,8 +9,8 @@ runtime containers before the reader descends into crate or protocol detail.
 | Document type | Architecture overview |
 | Audience | Operators, maintainers, integrators, security reviewers, and research users |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
@@ -107,11 +107,11 @@ flowchart LR
         LocalState["Controlled local state and artifacts"]
     end
 
-    Operator -->|"CLI commands and local configuration"| MarketSquawk
+    Operator -->|"Tauri desktop or CLI and local configuration"| MarketSquawk
     McpClient -->|"stdio MCP requests"| MarketSquawk
     MarketSquawk -->|"bounded results and artifact references"| Operator
     MarketSquawk -->|"typed MCP results"| McpClient
-    Browser <-->|"ephemeral loopback onboarding portal"| MarketSquawk
+    Browser <-->|"official handoff or ephemeral loopback onboarding"| MarketSquawk
     Files -->|"capability-confined reads"| MarketSquawk
     Providers <-->|"allowlisted HTTPS or WebSocket protocols"| MarketSquawk
     Python <-->|"admitted datasets and finalized model candidates"| MarketSquawk
@@ -139,7 +139,8 @@ The runtime-container view answers: which local runtimes and stores own the majo
 
 ```mermaid
 flowchart TB
-    subgraph ApplicationProcess["market-squawk process"]
+    subgraph ApplicationProcess["One Market Squawk application process"]
+        Desktop["Tauri desktop and closed presentation bridge"]
         Cli["CLI transport"]
         Mcp["Local stdio MCP transport"]
         Portal["Bounded loopback onboarding portal"]
@@ -173,6 +174,7 @@ flowchart TB
         Secrets["OS keyring"]
     end
 
+    Desktop --> App
     Cli --> App
     Mcp --> App
     Portal --> App
@@ -196,9 +198,11 @@ flowchart TB
     ResearchConsumers -->|"bounded admitted inference"| OnnxHelper
 ```
 
-CLI and MCP are transports over the same immutable set of 11 application-domain services. They do
-not call adapters or storage engines directly. The application composition fails before either
-transport is published if a required domain implementation is missing or duplicated.
+Desktop, CLI, and MCP are presentations over the same immutable set of 11 application-domain
+services. They do not call adapters or storage engines directly. A desktop process and a CLI/MCP
+process each compose the same `LocalProduct`; they are alternative owners of a single-writer data
+root, not concurrent frontends over one root. Composition fails before a presentation is published
+if a required domain implementation is missing or duplicated.
 
 The live runtime starts its shards and initial immutable snapshots before feed ingress escapes.
 Each source generation obtains current registry and capture authority, binds its routes before the
@@ -286,6 +290,8 @@ Architecture:
 Primary implementation anchors:
 
 - [Workspace manifest](../../Cargo.toml)
+- [Desktop composition root](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Shared domain contracts](../../crates/market-squawk-domain/src/lib.rs)
 - [Local product composition](../../apps/market-squawk/src/local_product/mod.rs)
 - [Transport-neutral application services](../../apps/market-squawk/src/application.rs)
@@ -303,3 +309,4 @@ Primary implementation anchors:
 | [GitHub: creating diagrams](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams) | GitHub renders the stable Mermaid flowcharts used on this page. | 2026-07-23 |
 | [Tokio runtime documentation](https://docs.rs/tokio/latest/tokio/) | The local asynchronous runtime owns tasks, cancellation, channels, and blocking boundaries. | 2026-07-23 |
 | [Apache DataFusion introduction](https://datafusion.apache.org/user-guide/introduction.html) | DataFusion is an embeddable Arrow-based analytical query engine rather than an external database service. | 2026-07-23 |
+| [Tauri 2 architecture](https://v2.tauri.app/concept/architecture/) | Defines the system-WebView and Rust-core composition used by the desktop presentation. | 2026-07-28 |

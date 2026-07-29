@@ -1,21 +1,21 @@
 # Reference
 
-These pages define the exact public commands, configuration, local MCP surface, source coverage,
-quality semantics, and time/provenance contract at the reviewed product commit.
+These pages define the exact desktop and CLI launchers, configuration, local MCP surface, source
+coverage, quality semantics, and time/provenance contract at the reviewed implementation base.
 
 | Field | Value |
 | --- | --- |
 | Document type | Reference index |
 | Audience | Operators, integration authors, maintainers, and reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed product commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## References
 
 | Reference | Contract |
 | --- | --- |
-| [Command-line interface](cli.md) | Command hierarchy, global options, confirmations, limits, output, and authority mapping |
+| [CLI and desktop launcher](cli.md) | Desktop options, CLI hierarchy, confirmations, limits, output, and authority mapping |
 | [Configuration and secrets](configuration.md) | Precedence, keys, defaults, environment, provider profiles, secret locators, and reporting |
 | [Model Context Protocol](mcp.md) | Stdio lifecycle, exact 63-tool registry, schemas, annotations, limits, artifacts, audits, and cancellation |
 | [Source coverage](source-coverage.md) | Supported adapters, current coverage/quality ceilings, rights, credentials, and health semantics |
@@ -27,6 +27,7 @@ quality semantics, and time/provenance contract at the reviewed product commit.
 ```mermaid
 flowchart LR
     CLI["CLI command"]
+    Desktop["Desktop presentation command"]
     MCP["MCP tool"]
     Config["Validated configuration"]
     Source["Source coverage and rights"]
@@ -37,6 +38,7 @@ flowchart LR
 
     Config --> Service
     CLI --> Service
+    Desktop --> Service
     MCP --> Service
     Source --> Service
     Time --> Service
@@ -44,10 +46,10 @@ flowchart LR
     Service --> Result
 ```
 
-CLI and MCP are transports over the same application-domain services except for explicitly
-documented CLI-owned operations such as local initialization, confined input admission, and bounded
-read-only DataFusion SQL. Neither transport creates financial authority merely by admitting a
-well-formed request.
+Desktop, CLI, and MCP use the same application-domain services except for explicitly documented
+presentation or CLI-owned operations such as provider setup, local initialization, confined input
+admission, and bounded read-only DataFusion SQL. A well-formed presentation request does not create
+financial authority.
 
 ## Reference conventions
 

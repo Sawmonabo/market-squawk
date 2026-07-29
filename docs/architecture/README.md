@@ -9,8 +9,8 @@ cross-cutting semantics, trust, deployment, quality, and accepted decisions.
 | Document type | Architecture index |
 | Audience | Operators, maintainers, integrators, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Reading path
 
@@ -41,7 +41,7 @@ implementation, not release-status journals or operator runbooks.
 | [Building blocks](building-blocks.md) | Which crate or adapter owns each responsibility, dependency, and authority boundary? |
 | [Live execution plane](live-execution-plane.md) | How do current provider frames become qualified instrument state and risk-evaluated paper actions? |
 | [Research data plane](research-data-plane.md) | How do source objects become immutable, queryable, point-in-time analytical generations? |
-| [Local control plane](control-plane.md) | How do CLI and stdio MCP share typed application services, lifecycle, audit, and local capabilities? |
+| [Local control plane](control-plane.md) | How do desktop, CLI, and stdio MCP share typed application services, lifecycle, audit, and local capabilities? |
 | [Data, time, and provenance](data-time-and-provenance.md) | How are identity, knowledge time, source precision, revisions, and lineage preserved? |
 | [Security and trust boundaries](security-and-trust-boundaries.md) | Where do requests, bytes, credentials, evidence, and financial authority change trust level? |
 | [Local deployment](deployment.md) | Which processes, endpoints, directories, startup stages, and recovery surfaces exist on one host? |
@@ -59,8 +59,8 @@ implementation, not release-status journals or operator runbooks.
   point-in-time aware.
 - Strategies and models emit intents; central risk owns approval; the dispatcher owns the sole
   adapter submission boundary.
-- CLI and MCP invoke the same typed application operations, while CLI-only producer and analytical
-  workflows retain their narrower local capabilities.
+- Desktop, CLI, and MCP invoke the same typed application operations, while dedicated presentation
+  and producer workflows retain their narrower local capabilities.
 - Current authority is process-local, generation-bound, deadline-bound, revocable, and not
   recreated by archived evidence.
 
@@ -77,6 +77,7 @@ implementation, not release-status journals or operator runbooks.
 ## Implementation anchors
 
 - [Workspace manifest](../../Cargo.toml)
+- [Desktop composition](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
 - [Application composition](../../apps/market-squawk/src/local_product/mod.rs)
 - [Canonical domain](../../crates/market-squawk-domain/src/lib.rs)
 - [Live runtime](../../crates/market-squawk-live/src/lib.rs)

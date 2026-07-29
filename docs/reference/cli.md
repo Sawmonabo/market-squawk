@@ -1,20 +1,22 @@
 # Command-line interface reference
 
-This page is the factual reference for the shipping `market-squawk` command hierarchy, its
-arguments, local authority boundaries, result envelopes, and exit behavior.
+This page is the factual reference for the shipping `market-squawk` command hierarchy and the
+`market-squawk-desktop` launcher, including their arguments, local authority boundaries, result
+envelopes, and exit behavior.
 
 | Field | Value |
 | --- | --- |
 | Document type | Reference |
 | Audience | Operators, integrators, automation authors, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Implementation review base | `50912c18271a0389fb5ac8817555230930dd0506` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
 - [Scope](#scope)
 - [Invocation and global options](#invocation-and-global-options)
+- [Desktop launcher](#desktop-launcher)
 - [Command hierarchy](#command-hierarchy)
 - [Release evidence](#release-evidence)
 - [Confirmation and input admission](#confirmation-and-input-admission)
@@ -61,6 +63,50 @@ Clap marks the options below as global, so they may appear with any public subco
 
 Configuration precedence, every environment mapping, and the provider-profile contracts are in
 [Configuration reference](configuration.md).
+
+## Desktop launcher
+
+```text
+market-squawk-desktop [OPTIONS]
+```
+
+The desktop launcher opens the Obsidian Signal Tauri application and composes the same
+`LocalProduct` and closed `Application` operation registry used by the CLI and local MCP server.
+It is an interactive presentation mode, not a second implementation of provider, research, model,
+portfolio, risk, execution, or persistence authority.
+
+| Option | Value | Default | Effect |
+| --- | --- | --- | --- |
+| `--config <PATH>` | Local TOML file | None | Loads one explicit configuration file |
+| `--data-dir <PATH>` | Local path | `.market-squawk` through configuration | Highest-precedence local data-root override |
+| `--training-release-root <PATH>` | Absolute path | None | Selects the verified local Python training release and sibling model worker |
+| `--paper-mode` | Flag | Off | Enables paper-only bot behavior for this desktop process |
+| `-h`, `--help` | Flag | — | Prints desktop launcher help and exits successfully |
+| `-V`, `--version` | Flag | — | Prints the desktop package version and exits successfully |
+
+The desktop uses safe defaults, the explicit file, normal `MARKET_SQUAWK_*` configuration
+variables, and these launcher overrides. It deliberately removes
+`MARKET_SQUAWK_LOG`, `MARKET_SQUAWK_EXTERNAL_NETWORK`, and
+`MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED` from the configuration environment because those values
+belong to CLI logging or foreground release-evidence workflows, not ambient desktop authority.
+The desktop does not accept the CLI's output, log-rendering, capture-memory, or release-evidence
+options.
+
+The WebView receives five closed commands: bootstrap facts, read-only bounded application
+invocation, confirmed provider onboarding, exact official-provider page opening, and protected
+provider-setup opening. Every business and operating capability remains with its owning Rust
+service. Provider pages and the validated loopback setup URL open only in the system browser.
+
+When launching from the source checkout, pass application arguments after Tauri's runner
+separator:
+
+```bash
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
+  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+```
+
+The CLI remains the complete interface for automation, servers, release evidence, supported
+headless use, and local stdio MCP. It does not require Node.js, pnpm, Tauri, or a system WebView.
 
 ## Command hierarchy
 
@@ -429,6 +475,8 @@ publication, and order dispatch remain with their dedicated application services
 - [Configuration reference](configuration.md)
 - [MCP reference](mcp.md)
 - [Installation and bootstrap](../operations/installation-and-bootstrap.md)
+- [Desktop launcher contract](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [CLI contract](../../apps/market-squawk/src/cli.rs)
 - [Process dispatch and output](../../apps/market-squawk/src/main.rs)
 - [Shared CLI transport](../../apps/market-squawk/src/local_product/cli_transport.rs)

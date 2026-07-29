@@ -10,8 +10,8 @@ unmeasured target into a performance claim.
 | Document type | Quality-attribute architecture |
 | Audience | Maintainers, release reviewers, operators, security reviewers, and performance engineers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
@@ -78,7 +78,8 @@ current evidence disposition.
 | QA-MODEL-01 | A bundle, runtime, graph, tensor, worker, warm-up, deadline, or output violates its admitted contract. | Reject or quarantine the model generation and produce typed no-action evidence. | Zero order intents from failed inference; `infer` uses only its admitted in-memory or prewarmed worker capability. | Implemented and accepted for native and tract ONNX paths; optional external runtime remains policy-gated. |
 | QA-PORT-01 | Portfolio import, corporate-action evidence, valuation set, or aggregate work is incomplete or exceeds a limit. | Reject publication/result or mark the financial measure explicitly incomplete; never synthesize an exact zero or overflow allocation. | Published revision identity binds reporting currency, schema, source, policy, and evidence; work/results stay under admitted limits. | Implemented and accepted in Quarter 3 portfolio remediation. |
 | QA-FV-01 | Delayed, adjusted, proxy, modeled, similar-instrument, stale, or inaccessible-market evidence is evaluated for Level 1. | Fail the Level 1 conjunction and retain Level 2, Level 3, or `Unclassified` as supported by evidence; never alter execution quality. | No Level 1 result without every code-owned predicate; no override can promote Level 1 or cure `Unclassified`. | Implemented and accepted in the fair-value closeout. |
-| QA-CTRL-01 | CLI or MCP submits unknown fields, excessive structure/results, an expired deadline, cancellation, or an unauthorized mutation. | Apply the same code-owned descriptor and application service; reject before domain mutation or publish a controlled artifact reference. | Exact schema/bounds are identical across transports; cancellation/deadline stops owned work; mutation has durable audit. | Implemented; complete 11-domain application composition and focused MCP/control-plane evidence exist. |
+| QA-CTRL-01 | Desktop, CLI, or MCP submits unknown fields, excessive structure/results, an expired deadline, cancellation, or an unauthorized mutation. | Apply the same code-owned descriptor and application service with presentation-specific stricter limits; reject before domain mutation or publish a controlled artifact reference where supported. | Shared descriptors and domain authority remain unchanged; cancellation/deadline stops owned work; governed mutation has durable audit. | Implemented; complete 11-domain application composition and focused desktop/MCP/control-plane evidence exist. |
+| QA-DESKTOP-01 | A new operator launches the interactive product on a supported host. | Open the permanent Obsidian Signal shell, derive readiness from Rust authorities, preserve protected browser and CLI recovery, and retain keyboard/reflow/reduced-motion behavior. | Bundled assets only; five closed commands; three critical frontend behaviors pass; native package installs and launches on the supported matrix. | Source application and focused checks are implemented; hosted package, signing, install, and exact-head acceptance remain pending. |
 | QA-REC-01 | Shutdown deadline, child/helper failure, or ambiguous persistence outcome occurs. | Stop admission, invalidate authority, preserve a terminal owner, and return incomplete/unavailable until reconciliation proves state. | No detached authority-bearing work; restart either resumes exact durable state or reports a typed recovery requirement. | Implemented across live, capture, execution, provider activation, model, portfolio, backtest, paper, and valuation lifecycles. |
 | QA-PRIV-01 | The product runs locally with normal logging and configured provider access. | Keep structured logs local, redact secret values/references, use stdio MCP, and publish artifacts under controlled roots. | Network inventory matches declared provider/onboarding traffic; logs/results contain no secret material; paths and SQL stay within their typed capabilities. | Implemented contracts and security gates exist; final exact-head credential/network audit remains pending. |
 | QA-BUILD-01 | Repeated development and verification builds produce generated Cargo state. | Use one worktree-local target, nonincremental approval gates, bounded debug profiles, and a hard disk ceiling. | Verification refuses a target over 20 GiB; source and release artifact size are reported separately from generated cache. | Enforced; accepted hardening gate peaked below 20 GiB and cleaned generated output afterward. |
@@ -132,8 +133,9 @@ exists or a status string changed.
 
 ### Security
 
-- Untrusted JSON, CSV, XML, Excel, OFX, Parquet, WebSocket, HTTP, MCP, model, and local-state inputs
-  cross size, depth, count, type, schema, cancellation, and time bounds before authority changes.
+- Untrusted desktop, JSON, CSV, XML, Excel, OFX, Parquet, WebSocket, HTTP, MCP, model, and
+  local-state inputs cross size, depth, count, type, schema, cancellation, and time bounds before
+  authority changes.
 - Endpoint, redirect, TLS, response-size, budget, and retry policy is source-owned.
 - Secret values are zeroized/redacted and stored through an opaque backend reference.
 - Local paths are capability-confined; publications use stable identity and no-clobber/no-follow
@@ -170,6 +172,11 @@ The product uses stable Rust 1.97.1, Edition 2024, resolver 3, a committed lockf
 dependencies. Platform code contains explicit Unix and Windows path/process/security branches,
 while the sealed Python v0.1 target is CPython 3.12/3.13 on macOS arm64.
 
+The desktop package matrix covers Ubuntu 24.04 x86-64, macOS 15 on Apple Silicon and Intel, and
+Windows Server 2025 x86-64. The system WebView and native package format remain platform-owned;
+successful bundle creation without a developer-identity signature is not signing or installation
+acceptance.
+
 The accepted full-gate host recorded in project memory is Apple M1 Pro, macOS 26.5.1, 16 GiB RAM.
 This is evidence for that host, not proof of every conditional platform implementation. A release
 claim for another operating system requires the same locked functional/security gate and any
@@ -197,7 +204,7 @@ service that shares the live runtime.
 | Model containment | [Modeling crate](../../crates/market-squawk-modeling/src/lib.rs), [modeling contracts](../../crates/market-squawk-modeling/tests/modeling_contracts.rs) |
 | Portfolio | [Portfolio crate](../../crates/market-squawk-portfolio/src/lib.rs), [portfolio service tests](../../crates/market-squawk-portfolio/tests/service.rs) |
 | Fair value | [Valuation crate](../../crates/market-squawk-valuation/src/lib.rs), [fair-value integration](../../crates/market-squawk-valuation/tests/fair_value.rs) |
-| CLI/MCP services | [Application contracts](../../apps/market-squawk/src/application/contracts.rs), [production MCP composition](../../apps/market-squawk/tests/production_mcp_composition.rs), [control-plane harness](../../apps/market-squawk/tests/harnesses/control_plane.rs) |
+| Desktop/CLI/MCP services | [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs), [three critical frontend behaviors](../../apps/market-squawk-desktop/src/test/app.test.tsx), [application contracts](../../apps/market-squawk/src/application/contracts.rs), [production MCP composition](../../apps/market-squawk/tests/production_mcp_composition.rs), [control-plane harness](../../apps/market-squawk/tests/harnesses/control_plane.rs) |
 | Provider activation | [Evidence validation](../research/2026-07-23-provider-activation-evidence-validation.md), [local provider activation](../../apps/market-squawk/src/local_product/cli_provider.rs) |
 | Exact-head and disk evidence | [Project memory](../project-memory.md), [delivery ledger](../plans/delivery-ledger.md) |
 

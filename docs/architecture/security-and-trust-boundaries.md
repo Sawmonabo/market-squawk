@@ -1,8 +1,8 @@
 # Security and Trust Boundaries
 
 Market Squawk is self-hosted, but local does not mean trusted. Provider responses, imported files,
-model artifacts, CLI/MCP requests, browser-originated onboarding requests, persisted state, and
-execution intent all cross explicit validation or authority boundaries before they can affect
+model artifacts, desktop/CLI/MCP requests, browser-originated onboarding requests, persisted state,
+and execution intent all cross explicit validation or authority boundaries before they can affect
 durable state or an order adapter.
 
 | Field | Value |
@@ -10,8 +10,8 @@ durable state or an order adapter.
 | Document type | Security architecture explanation |
 | Audience | Maintainers, security reviewers, operators, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
@@ -23,7 +23,7 @@ durable state or an order adapter.
 - [Source and parser authority](#source-and-parser-authority)
 - [Model, portfolio, and fair-value authority](#model-portfolio-and-fair-value-authority)
 - [Mandatory risk and execution authority](#mandatory-risk-and-execution-authority)
-- [CLI, MCP, artifacts, and audit](#cli-mcp-artifacts-and-audit)
+- [Desktop, CLI, MCP, artifacts, and audit](#desktop-cli-mcp-artifacts-and-audit)
 - [Failure and recovery](#failure-and-recovery)
 - [Security invariants](#security-invariants)
 - [Related documentation and code](#related-documentation-and-code)
@@ -33,7 +33,7 @@ durable state or an order adapter.
 
 This page describes the current process and data trust boundaries for credentials, source bytes,
 normalization, source authority, model admission and inference, portfolio and fair-value evidence,
-central risk, local CLI/MCP transports, controlled artifacts, audit, and local stores.
+central risk, local desktop/CLI/MCP presentations, controlled artifacts, audit, and local stores.
 
 It does not claim:
 
@@ -61,9 +61,9 @@ Authority is narrow and non-transitive:
 - A strategy may produce a bounded `OrderIntent`, but it cannot construct an `ApprovedOrder`.
 - Risk may approve after consuming live authority and reserving account/portfolio state, but only
   the dispatcher can construct the adapter-facing `DispatchOrder`.
-- MCP and CLI may invoke registered application services; secret storage, capability-confined file
-  access, catalog publication, risk approval, and adapter submission remain with their dedicated
-  services.
+- Desktop, MCP, and CLI may invoke registered application services; the owning product services
+  retain secret storage, controlled file access, catalog publication, risk approval, and adapter
+  submission.
 
 Serializable evidence explains what happened. Process-local capabilities authorize what may happen
 now. Serialization, replay, restart, copying, or a matching enum value cannot reconstruct a
@@ -78,6 +78,7 @@ Market Squawk authorities?
 flowchart LR
     subgraph Outside["Outside the application process"]
         Operator["Operator"]
+        DesktopUser["Desktop user"]
         Client["Local MCP client"]
         Providers["Provider and venue endpoints"]
         Files["User-selected files and model artifacts"]
@@ -85,6 +86,7 @@ flowchart LR
     end
 
     subgraph Entry["Bounded entry surfaces"]
+        Desktop["Bundled WebView and closed Tauri bridge"]
         CLI["CLI transport"]
         MCP["MCP stdio transport<br/>peer identity recorded as unverified"]
         Portal["Ephemeral IPv4 loopback onboarding portal"]
@@ -117,12 +119,16 @@ flowchart LR
     end
 
     Operator -->|typed arguments| CLI
+    DesktopUser -->|local interaction| Desktop
     Client -->|bounded JSON-RPC frames| MCP
     Operator -->|host, origin, session, CSRF, bounded body| Portal
     Providers -->|untrusted bounded bytes| Parser
     Files -->|untrusted bounded bytes| Parser
     Files -->|untrusted bundle/runtime bytes| ModelAdmission
     CLI -->|admitted operation| App
+    Desktop -->|read-only bounded operation| App
+    Desktop -->|confirmed provider workflow| Onboarding
+    Desktop -->|confirmed provider workflow| Activation
     MCP -->|admitted operation| App
     Portal -->|session and credential request| Onboarding
     Portal -->|verified activation request| Activation
@@ -173,7 +179,7 @@ restricted to capability-confined catalog, dataset, artifact, authority-state, a
 | Portfolio | Source records and calculated accounting state | Preserve raw record, reconcile, publish immutable revision and content identity | Import or publication rejected; risk cannot bind the account |
 | Fair value | Live/research/analytics/portfolio producer evidence | Producer-specific receipt, time/evidence verification, code-owned ruleset, approval/revocation | `Unclassified` or rejected approval; never promotes execution quality |
 | Risk and dispatch | Intent, current live capability, market state, portfolio/account state | Mandatory audit admission, policy checks, reservation, expiry/revocation rechecks, one-use dispatch | Rejection, released reservation, or reconciliation-required state; no unchecked adapter call |
-| CLI/MCP | Local arguments or JSON-RPC bytes | Closed descriptor, structural/result bounds, cancellation/deadline, domain service, audit | Typed error or controlled session exit |
+| Desktop/CLI/MCP | Local interaction, arguments, or JSON-RPC bytes | Closed presentation command or descriptor, structural/result bounds, cancellation/deadline, domain service, audit | Typed error or controlled presentation exit |
 | Artifact/audit/store | Result bytes or state transition | Capability-relative no-follow path, immutable/content-addressed publication, durable reservation/transaction | No overwrite or partial authority; recovery is exact and bounded |
 
 ## Credential boundary
@@ -283,15 +289,20 @@ The execution boundary is enforced by type construction and ownership:
    failure, and uncertain outcome are separate states; uncertain attempts require reconciliation.
 
 Central risk is a logical process-local authority, not a claim that risk is a separate network
-service. Strategies, models, adapters, CLI, MCP, replay, and persisted records have no alternate
-constructor or direct submission path.
+service. Strategies, models, adapters, desktop, CLI, MCP, replay, and persisted records have no
+alternate constructor or direct submission path.
 
-## CLI, MCP, artifacts, and audit
+## Desktop, CLI, MCP, artifacts, and audit
 
-CLI and MCP share the same lifecycle-owned `Application` and its complete set of eleven domain
-services. Each operation is defined by a closed descriptor and admitted before dispatch to a domain
-service. Services own their financial, persistence, and authority invariants; transports own only
-framing and presentation.
+Desktop, CLI, and MCP share the same lifecycle-owned `Application` and its complete set of eleven
+domain services. Each generic operation is defined by a closed descriptor and admitted before
+dispatch to a domain service. Services own their financial, persistence, and authority invariants;
+presentations own rendering, framing, and their stricter local limits.
+
+The desktop loads bundled assets under a strict CSP. Its window capability grants five closed
+commands: bootstrap, read-only application invocation, confirmed provider onboarding, exact
+official-provider page opening, and validated protected-setup opening. Credential fields remain
+write-only presentation state and are cleared after submission.
 
 The production MCP server:
 
@@ -339,8 +350,8 @@ publication contexts are process-local and must be newly admitted.
   LLM, persistence, and control-plane I/O stay outside that path.
 - All execution-critical queues are count- and byte-bounded; saturation has an explicit
   invalidation or rejection consequence.
-- Credentials are accessed only through exact secret-store operations and never returned by CLI,
-  MCP, audit, or artifacts.
+- Credentials are accessed only through exact secret-store operations and never returned by
+  desktop, CLI, MCP, audit, or artifacts.
 - Source metadata, rights, coverage, session, capture, and stream evidence are code-validated before
   executable quality is possible.
 - Model admission and inference failure produces no automated action.
@@ -369,6 +380,8 @@ publication contexts are process-local and must be newly admitted.
 - [Fair-value evidence](../../crates/market-squawk-valuation/src/evidence.rs)
 - [Risk service](../../crates/market-squawk-execution/src/risk.rs)
 - [Execution adapter boundary](../../crates/market-squawk-execution/src/adapter.rs)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
+- [Desktop window capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
 - [MCP server and limits](../../crates/market-squawk-mcp/src/server.rs)
 - [Production MCP audit sink](../../apps/market-squawk/src/mcp/audit.rs)
 - [Provider activation evidence validation](../research/2026-07-23-provider-activation-evidence-validation.md)
@@ -384,5 +397,7 @@ defines Market Squawk's current controls.
 | [OWASP threat-modeling guidance](https://owasp.org/www-project-security-culture/stable/6-Threat_Modelling/) | Uses data-flow diagrams and trust boundaries to identify where data changes trust level | 2026-07-23 |
 | [Model Context Protocol transports specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) | Defines stdio transport responsibilities and process-bound message exchange | 2026-07-23 |
 | [Model Context Protocol security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices) | Documents MCP-specific request, credential, and trust threats | 2026-07-23 |
+| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped command permissions for the desktop presentation boundary | 2026-07-28 |
+| [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the bundled WebView content policy used to restrict desktop content loading | 2026-07-28 |
 | [FASB ASU 2011-04, Fair Value Measurement (Topic 820)](https://fasb.org/page/document?pdf=ASU2011-04.pdf&title=UPDATE+NO.+2011-04%E2%80%94FAIR+VALUE+MEASUREMENT+%28TOPIC+820%29%3A+AMENDMENTS+TO+ACHIEVE+COMMON+FAIR+VALUE+MEASUREMENT+AND+DISCLOSURE+REQUIREMENTS+IN+U.S.+GAAP+AND+IFRSS) | Establishes the accounting fair-value framework that remains separate from market-data execution authority | 2026-07-23 |
 | [IFRS 13 Fair Value Measurement](https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/) | Defines fair value and the input hierarchy independently of delivery quality and execution eligibility | 2026-07-23 |

@@ -9,14 +9,15 @@ order, and recovery surfaces at the reviewed commit.
 | Document type | Deployment architecture |
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
 - [Scope](#scope)
 - [Supported topology](#supported-topology)
 - [Process and network view](#process-and-network-view)
+- [Desktop distribution boundary](#desktop-distribution-boundary)
 - [On-disk layout](#on-disk-layout)
 - [Startup and shutdown](#startup-and-shutdown)
 - [Failure and recovery](#failure-and-recovery)
@@ -40,6 +41,9 @@ operate and why.
 
 The baseline topology is one operator-owned machine:
 
+- `market-squawk-desktop` is the Tauri 2 interactive application. Its bundled React WebView owns
+  presentation only; a five-command bridge composes the existing `LocalProduct` and `Application`
+  services in the same process;
 - `market-squawk` is the CLI and local MCP application process;
 - Tokio tasks inside that process own source supervision, live shards, research services,
   application requests, risk, paper execution, and lifecycle;
@@ -57,10 +61,11 @@ keeps the same `LocalProduct` and `Application` alive for the stdio session. Pro
 capture or paper-bot commands own their source/runtime workers until cancellation and bounded
 shutdown complete.
 
-The provider onboarding command may start an ephemeral HTTP server on an operating-system-selected
-IPv4 loopback port and open the local browser. The listener has a bounded lifetime, request count,
-connection count, per-request deadline, body size, session token, Host/Origin enforcement, and
-CSRF token. It never binds a non-loopback address.
+The desktop loads only bundled application assets and opens official provider pages in the system
+browser. Providers whose supported workflow uses the protected browser fallback start the same
+ephemeral HTTP server used by the CLI on an operating-system-selected IPv4 loopback port. The
+listener has a bounded lifetime, request count, connection count, per-request deadline, body size,
+session token, Host/Origin enforcement, and CSRF token. It never binds a non-loopback address.
 
 ## Process and network view
 
@@ -69,16 +74,23 @@ runtime?
 
 ```mermaid
 flowchart LR
+    DesktopUser["Desktop user"]
     Operator["Operator shell"]
     McpClient["Local MCP client"]
-    Browser["Local browser"]
+    Browser["System browser"]
     Python["Optional sealed CPython"]
 
     subgraph Host["Operator-controlled machine"]
-        subgraph MainProcess["market-squawk process"]
-            Main["Application runtime"]
-            Loopback["Ephemeral loopback portal task"]
+        subgraph DesktopProcess["market-squawk-desktop process"]
+            WebView["Bundled React WebView"]
+            Bridge["Closed Tauri presentation bridge"]
+            DesktopMain["LocalProduct and Application runtime"]
+            WebView --> Bridge --> DesktopMain
         end
+        subgraph CliProcess["market-squawk process"]
+            CliMain["CLI or stdio MCP runtime"]
+        end
+        Loopback["Ephemeral loopback portal task"]
         Capture["capture helper process"]
         Onnx["ONNX worker process"]
         Keyring["Operating-system keyring"]
@@ -97,35 +109,72 @@ flowchart LR
     Official["SEC, FRED/ALFRED, BLS, and Treasury interfaces"]
     Inputs["User-authorized files"]
 
-    Operator -->|"CLI"| Main
-    McpClient <-->|"stdio"| Main
+    DesktopUser --> WebView
+    Operator -->|"CLI"| CliMain
+    McpClient <-->|"stdio"| CliMain
     Browser <-->|"HTTP on 127.0.0.1 only"| Loopback
-    Loopback -->|"typed application request"| Main
+    DesktopMain -->|"bounded setup owner"| Loopback
+    CliMain -->|"bounded setup owner"| Loopback
+    DesktopMain -->|"exact official URL"| Browser
     Python <-->|"admitted exports and candidates"| Artifacts
-    Main <-->|"allowlisted WSS"| Coinbase
-    Main <-->|"allowlisted WSS"| Kraken
-    Main <-->|"allowlisted HTTPS"| Official
-    Inputs -->|"capability-confined reads"| Main
-    Main <-->|"opaque secret references"| Keyring
-    Main -->|"bounded capture protocol"| Capture
+    DesktopMain <-->|"configured WSS"| Coinbase
+    DesktopMain <-->|"configured WSS"| Kraken
+    DesktopMain <-->|"configured HTTPS"| Official
+    CliMain <-->|"configured provider interfaces"| Coinbase
+    CliMain <-->|"configured provider interfaces"| Kraken
+    CliMain <-->|"configured provider interfaces"| Official
+    Inputs -->|"controlled reads"| DesktopMain
+    Inputs -->|"controlled reads"| CliMain
+    DesktopMain <-->|"opaque secret references"| Keyring
+    CliMain <-->|"opaque secret references"| Keyring
+    DesktopMain -->|"bounded capture protocol"| Capture
+    CliMain -->|"bounded capture protocol"| Capture
     Capture --> Journal
-    Main -->|"bounded model protocol"| Onnx
-    Main <--> Catalog
-    Main <--> Control
-    Main <--> Authority
-    Main <--> Artifacts
+    DesktopMain -->|"bounded model protocol"| Onnx
+    CliMain -->|"bounded model protocol"| Onnx
+    DesktopMain <--> Catalog
+    DesktopMain <--> Control
+    DesktopMain <--> Authority
+    DesktopMain <--> Artifacts
+    CliMain <--> Catalog
+    CliMain <--> Control
+    CliMain <--> Authority
+    CliMain <--> Artifacts
 ```
 
-MCP uses stdio, helper IPC is private to the parent process, and the sole HTTP listener is the
-loopback-scoped onboarding task. Source endpoints are selected through immutable adapter metadata
-and configuration allowlists. Local structured logs and explicit provider operations account for
-the product's operational output and network activity.
+The desktop and CLI are alternative process owners and must not concurrently claim the same
+single-writer data root. MCP uses stdio, Tauri uses window-scoped IPC, helper IPC is private to the
+parent process, and the sole HTTP listener is the loopback-scoped onboarding task. Source endpoints
+are selected through immutable adapter metadata and validated configuration. Local structured logs
+and explicit provider operations account for the product's operational output and network
+activity.
 
 The ONNX worker is not a generic executable hook. When a signed training release is selected,
 startup verifies that the running application and bounded regular sibling worker are the canonical
 installed paths and match the signed release-manifest digests. Model admission then fixes
 graph/operator/tensor/resource policy before publication. The capture helper is likewise a
 validated sibling and receives one confined journal destination.
+
+## Desktop distribution boundary
+
+The tracked Tauri configuration produces one resizable desktop window whose HTML, JavaScript,
+styles, fonts, and icons are bundled with the application. Node.js, pnpm, Vite, and the Rust
+toolchain are build-time inputs only. At runtime the desktop uses the operating system's WebView:
+WebKit on macOS, WebView2 on Windows, and WebKitGTK 4.1 on Linux.
+
+The supported package-build matrix is:
+
+| Host | Native output |
+| --- | --- |
+| Ubuntu 24.04 x86-64 | Debian package and AppImage |
+| macOS 15 Apple Silicon | Application bundle and DMG |
+| macOS 15 Intel | Application bundle and DMG |
+| Windows Server 2025 x86-64 | NSIS and MSI installers |
+
+Each package includes the project licenses and required third-party notices. The current workflow
+uses no developer-identity signature; a macOS linker-created ad-hoc Mach-O signature is not
+distribution signing. Developer signing, notarization, installation, launch, and exact-head
+acceptance remain separate release evidence and are not inferred from bundle creation.
 
 ## On-disk layout
 
@@ -202,6 +251,22 @@ For a production product command or MCP session, startup proceeds in authority o
 Partial composition is not published. Corrupt or unverifiable durable state produces a typed
 startup failure or quarantines only the affected provider where that isolation is safe.
 
+### Desktop startup
+
+The desktop follows the same composition order with a presentation boundary around it:
+
+1. parse the four desktop options and load the normal validated configuration precedence;
+2. remove CLI logging and release-evidence environment controls from ambient desktop
+   configuration;
+3. construct `LocalProduct` before creating the Tauri window;
+4. register the five closed commands and the main-window capability;
+5. load the bundled React application under the configured content-security policy; and
+6. publish bootstrap facts only after the owning Rust authorities return them.
+
+If argument parsing, configuration, path preparation, authority recovery, or application
+composition fails, no ready desktop state is shown. Closing the window first cancels new desktop
+work and then completes the existing bounded application shutdown.
+
 ### Live startup
 
 Production live startup adds a stricter sequence:
@@ -259,6 +324,8 @@ manifest/object state is not a valid application backup procedure.
   only opaque references and non-secret evidence.
 - Loopback does not remove web risks. The portal verifies peer address, Host, Origin, session,
   expiry, CSRF, request count, connection count, timeout, and body limits.
+- The desktop WebView loads bundled assets under a strict CSP and receives only the five
+  window-scoped presentation commands; business authority remains in the Rust application.
 - Helper executables and model artifacts are admitted by exact identity before use.
 - Provider access uses explicit endpoints, TLS policy, timeouts, response-size limits, shared
   budgets, and health transitions.
@@ -294,6 +361,10 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Configuration and secrets](../operations/configuration-and-secrets.md)
 - [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
 - [Configuration composition](../../crates/market-squawk-platform/src/config.rs)
+- [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
+- [Desktop capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
+- [Desktop composition root](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Local product startup](../../apps/market-squawk/src/local_product/mod.rs)
 - [Application lifecycle](../../apps/market-squawk/src/application.rs)
 - [Production source supervisor](../../apps/market-squawk/src/live_source/supervisor.rs)
@@ -310,3 +381,7 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Apache Parquet documentation](https://parquet.apache.org/docs/) | Parquet is the local durable analytical file format beneath manifest authority. | 2026-07-23 |
 | [Apache DataFusion introduction](https://datafusion.apache.org/user-guide/introduction.html) | DataFusion is embedded in the local process and operates over Arrow and admitted local data. | 2026-07-23 |
 | [Tokio runtime documentation](https://docs.rs/tokio/latest/tokio/) | Defines asynchronous tasks, timers, cancellation-related primitives, and blocking-work separation used by the process topology. | 2026-07-23 |
+| [Tauri architecture](https://v2.tauri.app/concept/architecture/) | Defines the Rust core, system WebView, and IPC boundaries used by the desktop process. | 2026-07-28 |
+| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-07-28 |
+| [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the CSP control applied to bundled desktop content. | 2026-07-28 |
+| [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-28 |

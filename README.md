@@ -13,9 +13,10 @@ keeps its catalog, analytical datasets, models, artifacts, and audit records on 
 machine and requires no paid software, paid API, cloud service, hosted database, container runtime,
 or telemetry service.
 
-The application is operated through a complete command-line interface and a local stdio
-[Model Context Protocol (MCP)](docs/reference/mcp.md) server. Provider setup uses a guided,
-temporary browser portal bound to the local machine.
+The Obsidian Signal desktop application is the primary interactive experience. The same Rust
+application services remain available through the complete command-line interface and local stdio
+[Model Context Protocol (MCP)](docs/reference/mcp.md) server. Provider setup runs inside the
+desktop where supported and can open the protected, temporary loopback portal as a fallback.
 
 > [!IMPORTANT]
 > Market Squawk has not published `v1.0.0`. The workspace currently carries the `0.2.0`
@@ -46,7 +47,7 @@ temporary browser portal bound to the local machine.
 | Portfolios | Holdings and transaction imports, cost basis, gains, income, performance, exposure, attribution, scenarios, and portfolio risk |
 | Risk and execution | Typed order intents, mandatory central risk checks, realistic local paper execution, fees, latency, slippage, partial fills, cancellation, reconciliation, and recovery |
 | Fair value | Evidence-backed ASC 820 and IFRS 13 measurements with separate Level 1, Level 2, Level 3, and unclassified outcomes |
-| Local interfaces | A cohesive CLI and a typed local stdio MCP server spanning source, market, research, fundamental, macro, portfolio, analysis, model, fair-value, bot, execution, and risk operations |
+| Local interfaces | The Obsidian Signal Tauri desktop, a cohesive CLI, and a typed local stdio MCP server over the same Rust application services |
 
 Provider coverage, authentication needs, data quality, and current limitations are documented in
 [Source coverage](docs/reference/source-coverage.md). Only observations that satisfy the complete
@@ -66,7 +67,7 @@ flowchart TB
     ResearchSources["Files, filings, macro, portfolios, and historical providers"]
 
     subgraph Local["Market Squawk on the local machine"]
-        Control["CLI and local stdio MCP"]
+        Control["Tauri desktop · CLI · local stdio MCP"]
         Services["Shared application services"]
         Domain["Shared domain contracts<br/>identity · time · money · quality · provenance"]
 
@@ -123,7 +124,24 @@ rustup show active-toolchain
 The repository pins Rust `1.97.1` with `rustfmt` and Clippy in
 [`rust-toolchain.toml`](rust-toolchain.toml).
 
-### 2. Build the local executable bundle
+### 2. Launch the desktop application
+
+Building the desktop from source also requires Node.js `24.18.0`, pnpm `10.31.0`, and the
+[Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/) for the current operating
+system. These are build tools; an installed desktop package does not require Node.js, pnpm, or
+Rust.
+
+```bash
+pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
+  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+```
+
+This opens the permanent Obsidian Signal shell with guided setup, source onboarding, and bounded
+views over the local application services. The final `--` separates Tauri runner arguments from
+Market Squawk desktop arguments.
+
+### 3. Build the local headless bundle
 
 ```bash
 CARGO_INCREMENTAL=0 cargo build --locked --release \
@@ -140,7 +158,7 @@ CARGO_INCREMENTAL=0 cargo build --locked --release \
 The three executables are written to `target/release/`. The application, capture helper, and ONNX
 worker should remain sibling files when installed.
 
-### 3. Initialize a local instance
+### 4. Initialize a local instance
 
 ```bash
 MSQ="$PWD/target/release/market-squawk"
@@ -154,7 +172,7 @@ DATA_ROOT="$PWD/.market-squawk"
 The default local state is stored under `.market-squawk/`, which is ignored by Git. Use an absolute,
 operator-owned `--data-dir` for a durable installation.
 
-### 4. Open the guided provider setup
+### 5. Open guided provider setup from the CLI
 
 Treasury Fiscal Data is a practical first source because it requires no provider account or API
 key:
@@ -285,6 +303,7 @@ lockfile. Crates are grouped by product responsibility:
 | Path | Responsibility |
 | --- | --- |
 | `apps/market-squawk/` | CLI, application composition, local portal, and process lifecycle |
+| `apps/market-squawk-desktop/` | Tauri 2 desktop shell, bounded presentation bridge, and React interface |
 | `crates/` | Shared domain, live, storage, analytics, modeling, portfolio, execution, valuation, services, and MCP |
 | `adapters/` | Provider, file, portfolio, and paper-execution boundaries |
 | `python/` | Optional point-in-time research, finance, visualization, and deterministic training |

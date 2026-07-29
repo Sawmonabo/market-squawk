@@ -1212,3 +1212,36 @@ shell and complete guided setup are first-release requirements. Implementation b
 the specification's accepted-head refresh gate confirms current platform support, maintained
 dependency versions and licenses, least-privilege Tauri capabilities, typed state ownership,
 desktop/browser/CLI service reuse, accessibility, and thin release-relevant verification.
+
+## 2026-07-28 Obsidian Signal implementation checkpoint
+
+The approved desktop is implemented in the single cohesive
+`feature/obsidian-signal-desktop` lane. Pushed checkpoints `940c9a4`, `9f6a4e2`, and `85cdf07`
+contain the Tauri 2/React product shell, its closed Rust presentation bridge, native and protected
+browser provider setup, and affected-path/native-package CI. The CLI, local stdio MCP, protected
+browser portal, and desktop remain presentations over the same application services and durable
+authorities.
+
+The implementation remains bound to these operating decisions:
+
+- the frontend has exactly one behavioral test file with the three approved critical cases; do not
+  add visual, prose, snapshot, generator, or routine component tests;
+- the WebView owns rendering and transient form state only; displayed readiness and mutation
+  outcomes come from the Rust authorities;
+- five closed Tauri commands are the complete desktop capability surface;
+- Node.js, pnpm, Vite, and Rust are desktop build inputs, not installed CLI/headless runtime
+  requirements;
+- desktop CI is configured to build Debian, AppImage, macOS application/DMG, NSIS, and MSI
+  artifacts without a developer-identity signature on the supported hosted runners while signing
+  remains separate release evidence;
+- documentation-only changes skip compiler/frontend jobs but continue through policy and security
+  checks; and
+- the lane keeps its own Cargo target, uses `CARGO_INCREMENTAL=0`, and stops at the 20 GiB
+  worktree-local ceiling. The post-package measurement is 13 GiB.
+
+Issue `#36` and its Project 5 item remain the live delivery record. The focused Apple Silicon
+application/DMG build, integrity check, fresh-root launch, and bounded shutdown passed in this lane.
+The lane must still obtain hosted native-package evidence on all four matrix entries, signed
+installation evidence, the one clean unchanged exact-head gate, and grouped Quarter 4 review before
+integration. After integration, close the issue/project item, remove the clean worktree, prune
+metadata, delete the merged local and origin feature branch, and recheck generated storage.

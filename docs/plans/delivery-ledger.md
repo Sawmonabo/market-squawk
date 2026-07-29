@@ -964,3 +964,52 @@ package/type/build checks run within the lane; the broad unchanged-head workspac
 gates run once at the grouped Quarter 4 checkpoint. Issue `#36` remains the implementation and
 release-blocker tracker until native packaging, browser/CLI continuity, and exact-head evidence are
 complete.
+
+### Implemented lane checkpoint
+
+The pushed feature history currently consists of:
+
+- `940c9a4` — the nested Tauri 2 application, locked React presentation, permanent Obsidian Signal
+  shell, guided provider setup, protected browser fallback styling, and three critical frontend
+  behaviors;
+- `9f6a4e2` — the closed, bounded presentation authority over `LocalProduct`, the read-only
+  application registry, and the existing confirmed provider-onboarding services; and
+- `85cdf07` — affected-path CI classification, desktop package jobs, release-gate frontend
+  verification, exact third-party notice handling, and the locally patched upstream GLib
+  soundness fix with provenance.
+
+The implemented desktop uses five window-scoped Tauri commands, bundled fonts and assets, a strict
+content-security policy, normal local configuration precedence, application-owned readiness, and
+bounded shutdown. It preserves the complete CLI and local stdio MCP as first-class headless
+interfaces. Coinbase public, Coinbase Exchange direct, and Kraken setup use the native guided
+flow; research-provider setup reuses the protected loopback browser workflow.
+
+Focused evidence at `85cdf07` includes a frozen pnpm install, all three frontend behaviors,
+TypeScript compilation, Vite production output, Rust formatting, strict desktop/application
+Clippy, locked offline desktop compilation, workspace-boundary and generated-artifact policy,
+dependency/license/advisory review, credential scans, and the refreshed 958-source Python release
+closure. The desktop worktree target measured 9.1 GiB, below the 20 GiB ceiling.
+
+This checkpoint does not accept a desktop release. Its remaining barriers included one inspected
+local Apple Silicon application/DMG build, successful hosted package jobs for Linux, both macOS
+architectures, and Windows, signed installation evidence, the clean unchanged exact-head release
+gate, and the grouped Quarter 4 review. Issue `#36` and its Project 5 item remain open until the
+current predicates close and the integrated lane is cleaned up.
+
+The current lane candidate subsequently completed the focused Apple Silicon package check:
+
+| Evidence | Result |
+| --- | --- |
+| Release build | Completed in 9m05s with `CARGO_INCREMENTAL=0` and one worktree-local target |
+| Application bundle | 88 MiB, arm64, identifier `com.marketsquawk.desktop`, version `0.2.0` |
+| Application executable SHA-256 | `5aead5b6b1773e89441c0fd406bfcd38d99aeea6af99d8388d1febcd57fcbc04` |
+| DMG | 34 MiB; `hdiutil verify` passed |
+| DMG SHA-256 | `4763907e7dd0a38428c118c13ed2515d2c5fc40994a52d52f10de14a16aeeb5c` |
+| Bundled resources | Project Apache-2.0/MIT licenses plus Tauri/GTK and tract notices |
+| Launch evidence | Opened from the application bundle against a fresh temporary root, created the local catalog/control layout, and completed bounded shutdown |
+| Signing state | No developer-identity signature or notarization; the linker-created ad-hoc Mach-O signature is not distribution signing |
+| Generated storage | 13 GiB after packaging, below the 20 GiB ceiling |
+
+This is focused working-tree package evidence, not unchanged-commit or cross-platform release
+acceptance. The local Apple Silicon build barrier is closed; hosted package jobs, signed
+installation evidence, the exact-head gate, and grouped Quarter 4 review remain.

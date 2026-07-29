@@ -9,14 +9,14 @@ recovery behavior.
 | Document type | Operations index |
 | Audience | Local operators, analysts, integrators, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed product commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Runbooks
 
 | Runbook | Use it to… |
 | --- | --- |
-| [Installation and bootstrap](installation-and-bootstrap.md) | Build/install the local binaries, prepare a data root, and prove the product composes |
+| [Installation and bootstrap](installation-and-bootstrap.md) | Launch/package the desktop, build/install the headless bundle, prepare a data root, and prove the product composes |
 | [Configuration and secrets](configuration-and-secrets.md) | Compose validated configuration, inspect precedence, and understand the currently composed secret-store boundary |
 | [Source operations](source-operations.md) | Register, set up, activate, inspect, and recover supported live and research sources |
 | [Research ingestion](research-ingestion.md) | Admit local/provider research objects and publish provenance-bound observations |
@@ -68,13 +68,13 @@ checkout as the complete first local release.
 
 ## Current operational ceiling
 
-The current CLI and complete local stdio MCP are runnable across the documented product domains.
-Public Coinbase and Kraken remain `DirectUnverified`. The separate authenticated Coinbase Direct
-path can derive `DirectVerified` authority from an exact active onboarding generation and drive the
-shipping fee-aware strategy through central risk and realistic paper execution. The runbooks do not
-claim release acceptance until the authorized unchanged-head external trace is complete. Provider
-onboarding completion and the remaining release acceptance work are tracked in the
-[delivery ledger](../plans/delivery-ledger.md).
+The Obsidian Signal desktop is runnable from source, and the current CLI and complete local stdio
+MCP are runnable across the documented product domains. Native package signing and exact-head
+platform acceptance remain release evidence. Public Coinbase and Kraken remain
+`DirectUnverified`. The separate authenticated Coinbase Direct path can derive `DirectVerified`
+authority from an exact active onboarding generation and drive the shipping fee-aware strategy
+through central risk and realistic paper execution. Provider onboarding completion and remaining
+release acceptance work are tracked in the [delivery ledger](../plans/delivery-ledger.md).
 
 ## Reference while operating
 

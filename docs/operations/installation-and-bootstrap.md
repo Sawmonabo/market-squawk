@@ -1,17 +1,18 @@
 # Installation and local bootstrap
 
-This runbook builds the reviewed Market Squawk source, installs the complete local executable
-bundle into an operator-owned versioned directory, and initializes a new local data root. The
-shipping core is a local Rust application. It does not require a container runtime, cloud account,
-paid provider, Python interpreter, or external ONNX Runtime library.
+This runbook builds the reviewed Market Squawk source, launches or packages the Obsidian Signal
+desktop application, installs the complete headless executable bundle into an operator-owned
+versioned directory, and initializes a new local data root. The shipping core is a local Rust
+application. It does not require a container runtime, cloud account, paid provider, Python
+interpreter, or external ONNX Runtime library.
 
 | Field | Value |
 | --- | --- |
 | Document type | Operations runbook |
 | Audience | Local operators, release installers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
@@ -19,6 +20,8 @@ paid provider, Python interpreter, or external ONNX Runtime library.
 - [Preconditions](#preconditions)
 - [Safety and authority](#safety-and-authority)
 - [Build the locked executable bundle](#build-the-locked-executable-bundle)
+- [Build the desktop package](#build-the-desktop-package)
+- [Launch the desktop application](#launch-the-desktop-application)
 - [Install the bundle](#install-the-bundle)
 - [Bootstrap a new data root](#bootstrap-a-new-data-root)
 - [Expected success evidence](#expected-success-evidence)
@@ -34,6 +37,7 @@ paid provider, Python interpreter, or external ONNX Runtime library.
 Use this procedure for a source-based local installation at the reviewed product head. It covers:
 
 - the exact Rust toolchain and locked Cargo dependency graph;
+- the locked desktop frontend and Tauri package;
 - all three executables needed by the installed application;
 - an operator-owned, versioned installation directory;
 - configuration validation, stateful `init`, and the bounded query-only `doctor` check;
@@ -41,8 +45,8 @@ Use this procedure for a source-based local installation at the reviewed product
 
 This runbook does not:
 
-- claim that a local build is an accepted release candidate or reproduce the exact-head full
-  release gate;
+- claim that a local or hosted unsigned package is a signed, notarized, or accepted release
+  candidate, or reproduce the exact-head full release gate;
 - install a container image, system service, hosted component, or external provider account;
 - onboard a data provider, start a bot, or grant source, model, risk, or execution authority;
 - install the optional Python product or optional external ONNX Runtime acceleration library.
@@ -71,6 +75,20 @@ The tracked CI workflow declares Linux, macOS, and Windows jobs. A configured ma
 successful execution evidence; cross-platform acceptance requires completed exact-head jobs and is
 recorded only in the delivery ledger. This runbook's shell examples use a POSIX shell; binary names
 end in `.exe` on Windows.
+
+### Desktop source-build toolchain
+
+The desktop source build additionally requires:
+
+- Node.js `24.18.0` LTS;
+- pnpm `10.31.0`, pinned by `apps/market-squawk-desktop/package.json`; and
+- the current official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the
+  host: Xcode Command Line Tools on macOS, MSVC plus WebView2 development support on Windows, or
+  WebKitGTK 4.1 and the listed GTK/native packages on Linux.
+
+Node.js, pnpm, and Rust are source-build dependencies. They are not runtime dependencies of an
+installed native desktop package, the installed CLI, or headless MCP operation. Linux desktop
+packages still use the distribution's WebKitGTK runtime.
 
 ### Optional Python product
 
@@ -117,6 +135,10 @@ selectable installation path.
    `mcp serve` reserves stdout for protocol frames.
 8. A successful build or `doctor` call is local evidence only. It does not grant provider rights,
    data quality, automated-action eligibility, or release approval.
+9. The current native-package workflow intentionally uses `--no-sign`. Treat its output as a
+   development package with no developer-identity signature or notarization until exact signed
+   installation evidence is recorded. A linker-created ad-hoc Mach-O signature is not distribution
+   signing.
 
 ## Build the locked executable bundle
 
@@ -189,6 +211,70 @@ On Windows, use the corresponding paths ending in `.exe`.
 These focused commands produce the shipping bundle without claiming the broader all-workspace,
 all-feature release gate. The accepted gate uses the repository's controlled verification
 workflow and is recorded only in the delivery ledger.
+
+## Build the desktop package
+
+Install the exact frontend graph and run its three critical behavioral checks:
+
+```bash
+pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+pnpm --dir apps/market-squawk-desktop typecheck
+pnpm --dir apps/market-squawk-desktop test --run
+```
+
+Then build only the package types supported by the current host. For Apple Silicon macOS:
+
+```bash
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
+  tauri build --ci --no-sign --bundles app,dmg
+```
+
+The hosted package workflow uses the same locked source and produces:
+
+| Host | Package types |
+| --- | --- |
+| Ubuntu 24.04 x86-64 | Debian package and AppImage |
+| macOS 15 Apple Silicon | Application bundle and DMG |
+| macOS 15 Intel | Application bundle and DMG |
+| Windows Server 2025 x86-64 | NSIS and MSI installers |
+
+Generated packages are under `target/release/bundle/`. They include the Market Squawk
+Apache-2.0/MIT licenses and the required Tauri/GTK and tract notices. Current package jobs use
+`--no-sign`; successful compilation and bundling do not establish a developer-identity signature,
+notarization, installation, launch, or release acceptance.
+
+## Launch the desktop application
+
+For development from the source checkout:
+
+```bash
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
+  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+```
+
+The first separator passes runner arguments through pnpm and Tauri; the second passes the remaining
+arguments to `market-squawk-desktop`. The desktop launcher accepts:
+
+```text
+--config <PATH>
+--data-dir <PATH>
+--training-release-root <PATH>
+--paper-mode
+```
+
+On macOS, launch a locally built application bundle with explicit application arguments using:
+
+```bash
+open "target/release/bundle/macos/Market Squawk.app" --args \
+  --data-dir "$PWD/.market-squawk" \
+  --paper-mode
+```
+
+The desktop loads only bundled interface assets and opens the same `LocalProduct` and `Application`
+composition used by the CLI and MCP. Setup state is read from the owning Rust services. Coinbase
+public, Coinbase Exchange direct, and Kraken setup can run directly in the desktop; supported
+research providers use the existing protected loopback portal in the system browser. Closing the
+window begins the existing bounded application shutdown.
 
 ## Install the bundle
 
@@ -303,6 +389,9 @@ There is no implicit configuration-file discovery.
 - The three expected release executables exist.
 - The installed executables are regular sibling files in the same versioned `bin` directory.
 - `market-squawk --version` prints `market-squawk 0.2.0`.
+- The desktop type check and three critical frontend checks pass.
+- A requested native package appears under `target/release/bundle/` with the bundled license
+  notices. For the current no-developer-identity workflow, this is package-build evidence only.
 
 ### Configuration and initialization
 
@@ -454,6 +543,9 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | --- | --- | --- |
 | rustup selects a compiler other than `1.97.1` | Pinned toolchain is unavailable or locally overridden | Stop and install/select the repository-pinned toolchain |
 | Cargo reports that the lockfile must change | Source and `Cargo.lock` do not match, or the command omitted `--locked` | Restore a clean reviewed checkout; do not regenerate the lockfile for this installation |
+| pnpm reports an out-of-date lockfile | The desktop manifest and committed `pnpm-lock.yaml` do not match | Restore the reviewed files; do not install without `--frozen-lockfile` |
+| Tauri cannot compile or bundle | A host prerequisite is missing or an unsupported bundle type was requested | Install the official prerequisite for that host and request only the package types in the matrix above |
+| Desktop exits before opening a window | Desktop arguments, effective configuration, local paths, or `LocalProduct` startup failed | Run `market-squawk-desktop --help`, inspect the redacted stderr error, and correct the named local input; do not bypass initialization |
 | Application starts but capture helper admission fails | Helper missing, not an exact sibling, symlinked, non-executable, differently owned, or group/other writable | Quiesce the process and reinstall the whole bundle as regular sibling files |
 | ONNX worker is unavailable | Worker omitted, moved, symlinked, changed during admission, or built without the required target | Reinstall the exact worker beside the application |
 | `config validate` fails before state exists | Invalid file, environment, CLI override, or closed-schema value | Follow the configuration runbook; initialization is not a remedy for invalid configuration |
@@ -468,6 +560,7 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | Location or stream | Contents |
 | --- | --- |
 | `<source>/target/release/` | Local Cargo build outputs; generated, replaceable, and not runtime authority |
+| `<source>/target/release/bundle/` | Generated native application packages and installers |
 | `<install-root>/bin/` | The three installed executable files and operator-recorded inventory |
 | `<data-root>/catalog.sqlite3` | Durable catalog after `init`; SQLite `-wal` and `-shm` sidecars may exist while active |
 | `<data-root>/journal/` | Immutable diagnostic/capture journal state |
@@ -489,6 +582,9 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 - [Pinned Rust toolchain](../../rust-toolchain.toml)
 - [Workspace and release profile](../../Cargo.toml)
 - [Application executable targets](../../apps/market-squawk/Cargo.toml)
+- [Desktop frontend manifest](../../apps/market-squawk-desktop/package.json)
+- [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
+- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Modeling worker target](../../crates/market-squawk-modeling/Cargo.toml)
 - [Executable sibling admission](../../apps/market-squawk/src/local_product/executable.rs)
 - [Capture-helper admission](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)
@@ -497,7 +593,7 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 
 ## Official sources
 
-These upstream sources were reviewed directly on 2026-07-23. They describe prerequisite tools and
+These upstream sources were reviewed directly through 2026-07-28. They describe prerequisite tools and
 formats; the reviewed Market Squawk commit remains authoritative for the exact build, bundle, and
 bootstrap procedure.
 
@@ -506,3 +602,6 @@ bootstrap procedure.
 | [Install Rust](https://rust-lang.org/tools/install/) | rustup is the supported Rust toolchain installer; Windows Rust installation requires the corresponding Visual Studio prerequisites | 2026-07-23 |
 | [Cargo build command](https://doc.rust-lang.org/cargo/commands/cargo-build.html) | `--release` selects the release profile and `--locked` rejects dependency resolution that would change the lockfile | 2026-07-23 |
 | [Python virtual environments](https://docs.python.org/3/library/venv.html) | Upstream isolation mechanism used only as an input to the separate sealed Python release workflow | 2026-07-23 |
+| [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | Defines the supported host build tools, WebView, and Linux native packages required to compile a Tauri 2 application | 2026-07-28 |
+| [Tauri distribution](https://v2.tauri.app/distribute/) | Defines native platform packaging and signing as separate distribution concerns | 2026-07-28 |
+| [Node.js releases](https://nodejs.org/en/about/previous-releases) | Node.js 24 is the active LTS line used by the locked desktop build | 2026-07-28 |

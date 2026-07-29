@@ -9,8 +9,8 @@ event-to-decision path.
 | Document type | Building-block architecture |
 | Audience | Maintainers, reviewers, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Contents
 
@@ -32,9 +32,10 @@ responsibilities. It does not reproduce public API inventories, protocol sequenc
 procedures. The root [workspace manifest](../../Cargo.toml) is the exact dependency source of
 truth; this page explains that graph at the reviewed commit.
 
-Crates are not deployment units. Most run inside the `market-squawk` process, while restricted
-capture and ONNX binaries provide specific helper-process boundaries. Adapters are concrete
-provider/file/execution integrations, not independent services.
+Crates are not deployment units. Most run inside either the `market-squawk` CLI/MCP process or the
+`market-squawk-desktop` process, while restricted capture and ONNX binaries provide specific
+helper-process boundaries. Adapters are concrete provider/file/execution integrations, not
+independent services.
 
 ## Workspace structure
 
@@ -75,6 +76,7 @@ flowchart TB
 
     Adapters["provider, file, portfolio and paper adapters"]
     App["market-squawk application and CLI composition"]
+    Desktop["market-squawk-desktop Tauri presentation"]
 
     Domain --> Platform
     Domain --> Sources
@@ -118,6 +120,7 @@ flowchart TB
     Backtesting --> App
     Valuation --> App
     Execution --> App
+    App --> Desktop
 ```
 
 Arrows point from a dependency toward its consumer. The diagram intentionally summarizes
@@ -157,7 +160,9 @@ authority separate from execution.
 
 `market-squawk-mcp` depends only on `market-squawk-services` for business-facing contracts. The
 application supplies concrete domain services and composes the protocol transport. CLI routes
-through the same `Application` and `LocalProduct`; neither transport is a second composition root.
+through the same `Application` and `LocalProduct`. The desktop crate depends on that application
+crate and adds only Tauri lifecycle plus a closed presentation bridge; it does not reimplement the
+product graph.
 
 The stable-ABI Python crate consumes analytical, data, domain, and modeling contracts. It has no
 edge into live or execution. Concrete adapters depend inward on source/platform/domain or
@@ -186,7 +191,8 @@ production call authority.
 | [`market-squawk-python`](../../crates/market-squawk-python/src/lib.rs) | Stable-ABI Python access to admitted point-in-time datasets and bounded Rust analytical/training contracts, outside the live path. |
 | [`market-squawk-services`](../../crates/market-squawk-services/src/lib.rs) | Transport-neutral typed operation descriptors, JSON admission, deadlines, cancellation, authorization, artifact policy, bounds, progress, and result metadata. |
 | [`market-squawk-mcp`](../../crates/market-squawk-mcp/src/lib.rs) | Bounded local stdio MCP framing, protocol lifecycle, output backpressure, audit, and opaque artifact references over `ToolServices`. |
-| [`market-squawk`](../../apps/market-squawk/src/lib.rs) | Shipping binaries and sole product composition: application domains, CLI/MCP, live source/runtime ownership, research, portfolio, model, fair value, backtest, and paper execution. |
+| [`market-squawk`](../../apps/market-squawk/src/lib.rs) | Shared product composition and CLI/MCP binaries: application domains, live source/runtime ownership, research, portfolio, model, fair value, backtest, and paper execution. |
+| [`market-squawk-desktop`](../../apps/market-squawk-desktop/src-tauri/src/lib.rs) | Tauri 2 composition root, window lifecycle, and five-command presentation bridge over `LocalProduct`; the React WebView owns rendering and transient form state only. |
 
 ## Adapter responsibilities
 
@@ -258,7 +264,7 @@ handoffs are also bounded, nonblocking boundaries with explicit failure disposit
 | Extraction batch | Extraction adapter under request permit | Research ingest authority | Rights, revision, source, count, bytes, and cancellation are checked before publication. |
 | Dataset generation | Data publication coordinator | Query/Python/backtest consumers | Catalog authority and immutable manifest identify complete objects. |
 | Producer evidence | Live/research/analytics/portfolio services | Fair-value service | Producer receipt proves origin; classification never changes data quality. |
-| Typed tool request | CLI or MCP descriptor admission | Application domain service | Same schema, authorization, deadline, cancellation, and result bounds apply to both transports. |
+| Typed application request | Desktop, CLI, or MCP descriptor admission | Application domain service | The shared descriptor applies the same schema and domain authority; each presentation may impose stricter limits or read-only access. |
 
 ## Failure consequences
 
@@ -273,7 +279,8 @@ Boundary failure is part of the contract:
 - risk rejection returns no approval; dispatch saturation returns no adapter call;
 - extraction, catalog, object-store, or query failure cannot alter current live state;
 - incomplete dataset publication leaves no current manifest generation;
-- invalid portfolio, model, backtest, or valuation evidence cannot be reconstructed by CLI/MCP;
+- invalid portfolio, model, backtest, or valuation evidence cannot be reconstructed by a
+  presentation;
   and
 - transport failure cancels or bounds the request but does not gain business-domain ownership.
 
