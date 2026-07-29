@@ -15,10 +15,11 @@ use thiserror::Error;
 
 mod bridge;
 mod contracts;
+mod installation;
 
 use bridge::{
-    DesktopState, application_invoke, desktop_bootstrap, open_official_provider_page,
-    open_protected_provider_setup, provider_onboarding,
+    DesktopState, application_invoke, desktop_bootstrap, installation_control,
+    open_official_provider_page, open_protected_provider_setup, provider_onboarding,
 };
 
 #[cfg(target_os = "linux")]
@@ -66,6 +67,8 @@ enum DesktopStartupError {
     },
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
+    #[error("complete product installation failed")]
+    Installation(#[from] installation::InstallationStartupError),
     #[error("local product initialization failed")]
     Product(#[from] LocalProductError),
     #[error("desktop runtime initialization failed")]
@@ -149,11 +152,13 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .invoke_handler(tauri::generate_handler![
             application_invoke,
             desktop_bootstrap,
+            installation_control,
             open_official_provider_page,
             open_protected_provider_setup,
             provider_onboarding
         ])
         .build(tauri::generate_context!())?;
+    let installation = installation::prepare(app.handle())?;
     let desktop_data_directory = app.path().app_local_data_dir()?;
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
@@ -171,7 +176,9 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             &environment,
             ConfigOverrides {
                 data_dir: args.data_dir,
-                training_release_root: args.training_release_root,
+                training_release_root: args
+                    .training_release_root
+                    .or(installation.active_release_root),
                 ..ConfigOverrides::default()
             },
         )
@@ -180,7 +187,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let product_config = config.clone();
     let product =
         tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(product, config, config_path);
+    let state = DesktopState::new(product, config, config_path, installation.root);
     if !app.manage(state) {
         return Err(DesktopStartupError::DuplicateState);
     }

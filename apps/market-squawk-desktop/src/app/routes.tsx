@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom"
 
 import { DomainPage } from "@/components/domain-page"
+import { InstallationPage } from "@/components/installation-page"
 import { OverviewPage } from "@/components/overview-page"
 
 const domainRoutes = [
@@ -77,18 +78,6 @@ const operatingRoutes = [
       "Inspect the bounded local stdio tool surface and client setup without placing MCP in the live path.",
   },
   {
-    path: "/updates",
-    title: "Updates",
-    description:
-      "Review signed release availability and installation status. No update is installed without explicit authority.",
-  },
-  {
-    path: "/backup-recovery",
-    title: "Backup & Recovery",
-    description:
-      "Protect local catalogs, manifests, datasets, artifacts, and configuration with controlled recovery procedures.",
-  },
-  {
     path: "/logs",
     title: "Logs",
     description:
@@ -119,6 +108,11 @@ export function AppRoutes() {
           }
         />
       ))}
+      <Route path="/updates" element={<InstallationPage />} />
+      <Route
+        path="/backup-recovery"
+        element={<InstallationPage recovery />}
+      />
       {operatingRoutes.map((route) => (
         <Route
           key={route.path}
@@ -132,4 +126,3 @@ export function AppRoutes() {
     </Routes>
   )
 }
-

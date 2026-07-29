@@ -114,6 +114,38 @@ export const desktopBootstrapSchema = z.object({
   operations: z.array(operationSummarySchema),
 })
 
+export const installationStatusSchema = z.object({
+  installed: z.boolean(),
+  active_version: z.string().nullable(),
+  previous_version: z.string().nullable(),
+  target: z.string().nullable(),
+  manifest_sha256: z.string().nullable(),
+  channel_manifest_url: z.string().nullable(),
+  healthy: z.boolean(),
+})
+
+const installationReceiptSchema = z.object({
+  version: z.string(),
+  previous_version: z.string().nullable(),
+  manifest_sha256: z.string(),
+  target: z.string(),
+  repaired: z.boolean(),
+})
+
+const uninstallReceiptSchema = z.object({
+  removed_program: z.boolean(),
+  deleted_data_classes: z.array(z.string()),
+})
+
+export const installationControlResultSchema = z.object({
+  action: z.enum(["status", "update", "repair", "rollback", "uninstall"]),
+  status: installationStatusSchema,
+  receipt: z
+    .union([installationReceiptSchema, uninstallReceiptSchema])
+    .nullable(),
+  restartRequired: z.boolean(),
+})
+
 export const applicationResultSchema = z.object({
   data: z.unknown(),
   metadata: z.object({
@@ -136,6 +168,10 @@ export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
 export type EncryptedFileFallback = z.infer<
   typeof encryptedFileFallbackSchema
 >
+export type InstallationControlResult = z.infer<
+  typeof installationControlResultSchema
+>
+export type InstallationStatus = z.infer<typeof installationStatusSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>

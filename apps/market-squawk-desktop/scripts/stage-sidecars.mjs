@@ -4,8 +4,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
+  realpathSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -64,14 +67,25 @@ const targetTriple = execFileSync("rustc", ["--print", "host-tuple"], {
   encoding: "utf8",
 }).trim()
 const executableSuffix = process.platform === "win32" ? ".exe" : ""
-const releaseDirectory = join(metadata.target_directory, "release")
+const releaseDirectory = join(metadata.target_directory, targetTriple, "release")
 const stagingDirectory = join(applicationRoot, "src-tauri", "binaries")
+const generatedReleaseDirectory = join(
+  applicationRoot,
+  "src-tauri",
+  "generated-release",
+)
+const packageVersion = metadata.packages.find(
+  (candidate) => candidate.name === "market-squawk-desktop",
+)?.version
 const programs = [
   "market-squawk",
   "market-squawk-capture-helper",
   "market-squawk-onnx-worker",
 ]
 
+if (packageVersion === undefined) {
+  throw new Error("The desktop package version is unavailable.")
+}
 mkdirSync(stagingDirectory, { recursive: true })
 for (const program of programs) {
   const source = join(releaseDirectory, `${program}${executableSuffix}`)
@@ -89,8 +103,139 @@ for (const program of programs) {
   }
 }
 
+stageCompleteRelease()
+
 if (process.platform === "linux") {
   await prepareLinuxBundlerTools(metadata.target_directory)
+}
+
+function stageCompleteRelease() {
+  const configuredOutput = process.env.MARKET_SQUAWK_RELEASE_OUTPUT
+  if (!configuredOutput) {
+    throw new Error(
+      "MARKET_SQUAWK_RELEASE_OUTPUT must identify the verified current-target release output.",
+    )
+  }
+  const releaseOutput = realpathSync(resolve(configuredOutput))
+  const outputMetadata = lstatSync(releaseOutput)
+  if (
+    outputMetadata.isSymbolicLink() ||
+    !outputMetadata.isDirectory() ||
+    (process.platform !== "win32" && outputMetadata.uid !== process.getuid())
+  ) {
+    throw new Error("The complete release output is not a controlled directory.")
+  }
+
+  const bundleName = `market-squawk-${packageVersion}-${targetTriple}.zip`
+  const bootstrapName =
+    `market-squawk-bootstrap-${targetTriple}${executableSuffix}`
+  const manifestName = "market-squawk-release.json"
+  const checksumName = "SHA256SUMS"
+  const expected = [bootstrapName, bundleName, checksumName, manifestName].sort()
+  const observed = readdirSync(releaseOutput).sort()
+  if (
+    observed.length !== expected.length ||
+    observed.some((name, index) => name !== expected[index])
+  ) {
+    throw new Error("The complete release output has an unexpected file set.")
+  }
+
+  const artifacts = [bootstrapName, bundleName, manifestName]
+  const checksums = parseChecksums(
+    readFileSync(join(releaseOutput, checksumName), "utf8"),
+  )
+  if (
+    checksums.size !== artifacts.length ||
+    artifacts.some((name) => checksums.get(name) !== fileSha256(join(releaseOutput, name)))
+  ) {
+    throw new Error("The complete release checksums are incomplete or invalid.")
+  }
+  const manifestBytes = readFileSync(join(releaseOutput, manifestName))
+  if (manifestBytes.byteLength === 0 || manifestBytes.byteLength > 1024 * 1024) {
+    throw new Error("The complete release manifest exceeds its fixed byte bound.")
+  }
+  const manifest = JSON.parse(manifestBytes.toString("utf8"))
+  const target = manifest?.targets?.[0]
+  const bundleMetadata = controlledReleaseFile(
+    join(releaseOutput, bundleName),
+    2 * 1024 * 1024 * 1024,
+  )
+  if (
+    manifest?.schema_version !== 1 ||
+    manifest?.product !== "market-squawk" ||
+    manifest?.repository !== "Sawmonabo/market-squawk" ||
+    manifest?.version !== packageVersion ||
+    manifest?.tag !== `v${packageVersion}` ||
+    !Array.isArray(manifest.targets) ||
+    manifest.targets.length !== 1 ||
+    target?.target !== targetTriple ||
+    target?.archive?.size !== bundleMetadata.size ||
+    target?.archive?.sha256 !== checksums.get(bundleName) ||
+    typeof target?.archive?.url !== "string" ||
+    !target.archive.url.endsWith(`/${bundleName}`)
+  ) {
+    throw new Error("The complete release manifest does not match this native package.")
+  }
+  controlledReleaseFile(join(releaseOutput, bootstrapName), 256 * 1024 * 1024)
+  controlledReleaseFile(join(releaseOutput, manifestName), 1024 * 1024)
+  controlledReleaseFile(join(releaseOutput, checksumName), 64 * 1024)
+
+  const temporary = `${generatedReleaseDirectory}.new-${process.pid}`
+  if (existsSync(temporary)) {
+    rmSync(temporary, { recursive: true })
+  }
+  mkdirSync(temporary, { recursive: false, mode: 0o700 })
+  try {
+    for (const name of expected) {
+      const destination = join(temporary, name)
+      copyFileSync(join(releaseOutput, name), destination)
+      if (process.platform !== "win32") {
+        chmodSync(destination, name === bootstrapName ? 0o755 : 0o644)
+      }
+    }
+    if (existsSync(generatedReleaseDirectory)) {
+      const previous = lstatSync(generatedReleaseDirectory)
+      if (previous.isSymbolicLink() || !previous.isDirectory()) {
+        throw new Error("The generated release resource path is unsafe.")
+      }
+      rmSync(generatedReleaseDirectory, { recursive: true })
+    }
+    renameSync(temporary, generatedReleaseDirectory)
+  } finally {
+    if (existsSync(temporary)) {
+      rmSync(temporary, { recursive: true })
+    }
+  }
+}
+
+function parseChecksums(value) {
+  const parsed = new Map()
+  const lines = value.split("\n").filter((line) => line.length > 0)
+  for (const line of lines) {
+    const match = /^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(line)
+    if (!match || parsed.has(match[2])) {
+      throw new Error("The complete release checksum file is malformed.")
+    }
+    parsed.set(match[2], match[1])
+  }
+  return parsed
+}
+
+function controlledReleaseFile(path, maximumBytes) {
+  const metadata = lstatSync(path)
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isFile() ||
+    metadata.size === 0 ||
+    metadata.size > maximumBytes
+  ) {
+    throw new Error("A complete release file violates its fixed identity bounds.")
+  }
+  return metadata
+}
+
+function fileSha256(path) {
+  return sha256(readFileSync(path))
 }
 
 async function prepareLinuxBundlerTools(targetDirectory) {

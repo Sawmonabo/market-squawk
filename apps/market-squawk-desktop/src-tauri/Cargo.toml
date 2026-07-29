@@ -18,10 +18,12 @@ tauri-build = { workspace = true }
 clap = { workspace = true }
 market-squawk = { workspace = true }
 market-squawk-data = { workspace = true }
+market-squawk-installer = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-services = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 thiserror = { workspace = true }

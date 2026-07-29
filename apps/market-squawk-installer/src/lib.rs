@@ -9,12 +9,14 @@ mod platform;
 mod store;
 
 pub use self::archive::ArchiveError;
-pub use self::command::{CommandError, run_cli};
+pub use self::command::{CommandError, run_cli, update_from_channel};
 pub use self::contracts::{
     InstallReceipt, InstallRequest, InstallStatus, MutableDataClass, RepairRequest,
     RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
-pub use self::lifecycle::{InstallError, install, repair, rollback, status, uninstall, update};
+pub use self::lifecycle::{
+    InstallError, active_release_root, install, repair, rollback, status, uninstall, update,
+};
 pub use self::manifest::{AdmittedRelease, ComponentRole, ManifestError, ReleaseManifest};
 pub use self::platform::{PlatformError, ProgramName, SupportedTarget, default_install_root};
 pub use self::store::StoreError;

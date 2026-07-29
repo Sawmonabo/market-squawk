@@ -109,6 +109,7 @@ tmp/
 
 # Rust build artifacts — Plan-024 sidecar crate (per cargo workspace at repo root)
 target/
+apps/market-squawk-desktop/src-tauri/generated-release/
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/coverage/

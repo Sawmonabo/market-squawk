@@ -81,7 +81,8 @@ impl SupportedTarget {
         }
     }
 
-    pub(crate) const fn executable_suffix(self) -> &'static str {
+    /// Returns the native executable suffix for this release target.
+    pub const fn executable_suffix(self) -> &'static str {
         match self {
             Self::X86_64PcWindowsMsvc => ".exe",
             Self::Aarch64AppleDarwin | Self::X86_64AppleDarwin | Self::X86_64UnknownLinuxGnu => "",

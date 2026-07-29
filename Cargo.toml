@@ -67,6 +67,7 @@ hmac = "=0.12.1"
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
 market-squawk = { path = "apps/market-squawk", version = "=1.0.0" }
+market-squawk-installer = { path = "apps/market-squawk-installer", version = "=1.0.0" }
 market-squawk-adapter-bls = { path = "adapters/market-squawk-adapter-bls", version = "=1.0.0" }
 market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=1.0.0" }
 market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", version = "=1.0.0" }

@@ -230,6 +230,22 @@ pub(crate) struct ApplicationInvocation {
     pub(crate) arguments: Map<String, Value>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum InstallationControlCommand {
+    Status,
+    Update,
+    Repair,
+    Rollback,
+    Uninstall,
+}
+
+impl InstallationControlCommand {
+    pub(crate) const fn requires_confirmation(self) -> bool {
+        !matches!(self, Self::Status)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum ProviderOnboardingCommand {

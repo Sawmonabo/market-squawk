@@ -158,6 +158,23 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
     })
 }
 
+/// Returns the revalidated active immutable release root.
+///
+/// # Errors
+///
+/// Fails when no release is installed, the selector targets another platform, or any active
+/// component differs from its retained receipt.
+pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
+    let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+    let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+    if state.active.target != crate::platform::SupportedTarget::current()? {
+        return Err(InstallError::CorruptInstallation);
+    }
+    let active = store.version_path(&state.active);
+    verify_installed_tree(&active, &state.active.components)?;
+    Ok(active)
+}
+
 pub(crate) fn resolve_program(
     root: &Path,
     program: crate::platform::ProgramName,

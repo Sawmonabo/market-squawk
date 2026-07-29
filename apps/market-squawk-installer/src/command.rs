@@ -19,8 +19,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::contracts::{
-    InstallRequest, MutableDataClass, RepairRequest, RollbackRequest, UninstallRequest,
-    UpdateRequest,
+    InstallReceipt, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest,
+    UninstallRequest, UpdateRequest,
 };
 use crate::lifecycle::{
     InstallError, install, repair, resolve_program, rollback, status, uninstall, update,
@@ -46,6 +46,29 @@ const MAXIMUM_MANIFEST_TREE_DEPTH: usize = 64;
 /// fixed-program launch failure.
 pub async fn run_cli() -> Result<(), CommandError> {
     execute(Cli::parse()).await
+}
+
+/// Downloads and activates the next complete release from the retained update channel.
+///
+/// # Errors
+///
+/// Returns [`CommandError`] when no channel is retained or the remote manifest, bundle, or
+/// installation lifecycle fails admission.
+pub async fn update_from_channel(root: &Path) -> Result<InstallReceipt, CommandError> {
+    let current = status(root)?;
+    let url = current
+        .channel_manifest_url()
+        .ok_or(CommandError::UpdateChannel)?
+        .to_owned();
+    let downloaded = download_release(&url, root).await?;
+    Ok(update(
+        UpdateRequest::from_local(
+            root.to_path_buf(),
+            &downloaded.manifest,
+            downloaded.bundle.path(),
+        )?
+        .with_channel_manifest_url(&url)?,
+    )?)
 }
 
 #[derive(Debug, Parser)]
@@ -212,15 +235,7 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
             output(json, "installed", &receipt)?;
         }
         InstallerCommand::Update => {
-            let current = status(&root)?;
-            let url = current
-                .channel_manifest_url()
-                .ok_or(CommandError::UpdateChannel)?;
-            let downloaded = download_release(url, &root).await?;
-            let receipt = update(
-                UpdateRequest::from_local(root, &downloaded.manifest, downloaded.bundle.path())?
-                    .with_channel_manifest_url(url)?,
-            )?;
+            let receipt = update_from_channel(&root).await?;
             output(json, "updated", &receipt)?;
         }
         InstallerCommand::Repair => {

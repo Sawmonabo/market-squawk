@@ -2,6 +2,7 @@ import type {
   ApplicationResult,
   DesktopBootstrap,
   EncryptedFileFallback,
+  InstallationControlResult,
   ProviderActivation,
   ProviderBootstrap,
   ProviderSession,
@@ -11,6 +12,13 @@ export interface ApplicationRequest {
   operation: string
   arguments?: Record<string, unknown>
 }
+
+export type InstallationControlRequest =
+  | { action: "status" }
+  | { action: "update" }
+  | { action: "repair" }
+  | { action: "rollback" }
+  | { action: "uninstall" }
 
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }
@@ -45,6 +53,9 @@ export type ProviderOnboardingResult<
 
 export interface ProductTransport {
   bootstrap(): Promise<DesktopBootstrap>
+  installation(
+    request: InstallationControlRequest,
+  ): Promise<InstallationControlResult>
   invoke(request: ApplicationRequest): Promise<ApplicationResult>
   onboard<Request extends ProviderOnboardingRequest>(
     request: Request,

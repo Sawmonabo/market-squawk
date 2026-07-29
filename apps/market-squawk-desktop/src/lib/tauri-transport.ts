@@ -4,12 +4,14 @@ import {
   applicationResultSchema,
   desktopBootstrapSchema,
   encryptedFileFallbackSchema,
+  installationControlResultSchema,
   providerActivationSchema,
   providerBootstrapSchema,
   providerSessionSchema,
 } from "@/lib/schemas"
 import type {
   ApplicationRequest,
+  InstallationControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
@@ -26,6 +28,14 @@ class TauriTransport implements ProductTransport {
   async bootstrap() {
     const value = await invoke("desktop_bootstrap")
     return desktopBootstrapSchema.parse(value)
+  }
+
+  async installation(request: InstallationControlRequest) {
+    const value = await invoke("installation_control", {
+      request,
+      confirmed: request.action !== "status",
+    })
+    return installationControlResultSchema.parse(value)
   }
 
   async invoke(request: ApplicationRequest) {
@@ -82,6 +92,10 @@ class UnavailableBrowserTransport implements ProductTransport {
         "Open this interface through the Market Squawk desktop application. Use the protected provider portal for browser fallback.",
       ),
     )
+  }
+
+  installation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
   }
 
   invoke(): Promise<never> {

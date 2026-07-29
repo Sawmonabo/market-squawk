@@ -12,6 +12,10 @@ use market_squawk::{
     ProviderPortalActivationAuthority, ProviderPortalActivationError, StartOnboardingRequest,
 };
 use market_squawk_data::CatalogLimit;
+use market_squawk_installer::{
+    RepairRequest, RollbackRequest, UninstallRequest, repair, rollback,
+    status as installation_status, uninstall, update_from_channel,
+};
 use market_squawk_platform::SecretValue;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -25,9 +29,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::contracts::{
-    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, McpClientInstruction,
-    OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState, SetupStep,
-    SetupStepAction, SetupStepState,
+    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, InstallationControlCommand,
+    McpClientInstruction, OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState,
+    SetupStep, SetupStepAction, SetupStepState,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -79,6 +83,7 @@ pub(crate) struct DesktopState {
     product: LocalProduct,
     config: AppConfig,
     config_path: Option<PathBuf>,
+    installation_root: PathBuf,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     cancellation: CancellationToken,
 }
@@ -88,12 +93,14 @@ impl DesktopState {
         product: LocalProduct,
         config: AppConfig,
         config_path: Option<PathBuf>,
+        installation_root: PathBuf,
     ) -> Self {
         let portal_activation = product.provider_portal_activation();
         Self {
             product,
             config,
             config_path,
+            installation_root,
             portal_activation,
             cancellation: CancellationToken::new(),
         }
@@ -175,6 +182,27 @@ impl DesktopState {
                 "A complete local MCP client instruction could not be generated from verified installed state.",
             )
         };
+        let installation = installation_status(&self.installation_root)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let installation = if installation.is_installed() && installation.is_healthy() {
+            Readiness::new(
+                ReadinessState::Ready,
+                "Verified",
+                "The complete installed release and every retained component passed verification.",
+            )
+        } else if installation.is_installed() {
+            Readiness::new(
+                ReadinessState::Unverified,
+                "Repair required",
+                "The installed release failed component verification and cannot be treated as ready.",
+            )
+        } else {
+            Readiness::new(
+                ReadinessState::NotConfigured,
+                "Not installed",
+                "No complete versioned Market Squawk release is active for this user.",
+            )
+        };
         Ok(DesktopBootstrap::new(
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
@@ -188,11 +216,7 @@ impl DesktopState {
                 "Ready",
                 "The controlled local workspace and catalogs opened successfully.",
             ),
-            Readiness::new(
-                ReadinessState::Unverified,
-                "Not verified",
-                "No signed installation receipt was admitted for this running build.",
-            ),
+            installation,
             model_runtime,
             mcp,
             mcp_client,
@@ -427,6 +451,100 @@ pub(crate) fn desktop_bootstrap(
     state: State<'_, DesktopState>,
 ) -> Result<DesktopBootstrap, DesktopCommandError> {
     state.bootstrap()
+}
+
+#[tauri::command]
+pub(crate) async fn installation_control(
+    request: InstallationControlCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    if request.requires_confirmation() && !confirmed {
+        return Err(DesktopCommandError::new(
+            "confirmation_required",
+            "Confirm the installation change before continuing.",
+        ));
+    }
+    let root = state.installation_root.clone();
+    match request {
+        InstallationControlCommand::Status => {
+            let current = blocking_installation(move || installation_status(&root)).await?;
+            Ok(json!({
+                "action": "status",
+                "status": current,
+                "receipt": null,
+                "restartRequired": false,
+            }))
+        }
+        InstallationControlCommand::Update => {
+            let receipt = update_from_channel(&root)
+                .await
+                .map_err(map_installation_error)?;
+            let current = blocking_installation(move || installation_status(&root)).await?;
+            Ok(json!({
+                "action": "update",
+                "status": current,
+                "receipt": receipt,
+                "restartRequired": true,
+            }))
+        }
+        InstallationControlCommand::Repair => {
+            let operation_root = root.clone();
+            let receipt =
+                blocking_installation(move || repair(RepairRequest::new(operation_root))).await?;
+            let current = blocking_installation(move || installation_status(&root)).await?;
+            Ok(json!({
+                "action": "repair",
+                "status": current,
+                "receipt": receipt,
+                "restartRequired": false,
+            }))
+        }
+        InstallationControlCommand::Rollback => {
+            let operation_root = root.clone();
+            let receipt =
+                blocking_installation(move || rollback(RollbackRequest::new(operation_root)))
+                    .await?;
+            let current = blocking_installation(move || installation_status(&root)).await?;
+            Ok(json!({
+                "action": "rollback",
+                "status": current,
+                "receipt": receipt,
+                "restartRequired": true,
+            }))
+        }
+        InstallationControlCommand::Uninstall => {
+            let receipt =
+                blocking_installation(move || uninstall(UninstallRequest::preserving_data(root)))
+                    .await?;
+            Ok(json!({
+                "action": "uninstall",
+                "status": {
+                    "installed": false,
+                    "active_version": null,
+                    "previous_version": null,
+                    "target": null,
+                    "manifest_sha256": null,
+                    "channel_manifest_url": null,
+                    "healthy": false
+                },
+                "receipt": receipt,
+                "restartRequired": true,
+            }))
+        }
+    }
+}
+
+async fn blocking_installation<T>(
+    operation: impl FnOnce() -> Result<T, market_squawk_installer::InstallError> + Send + 'static,
+) -> Result<T, DesktopCommandError>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_error| DesktopCommandError::internal())?
+        .map_err(map_installation_error)
 }
 
 #[tauri::command]
@@ -795,4 +913,8 @@ fn map_activation_error(error: ProviderPortalActivationError) -> DesktopCommandE
         },
         error.to_string(),
     )
+}
+
+fn map_installation_error(error: impl std::fmt::Display) -> DesktopCommandError {
+    DesktopCommandError::new("installation_failed", error.to_string())
 }

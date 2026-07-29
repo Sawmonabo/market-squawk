@@ -142,6 +142,20 @@ function transport(
 ): ProductTransport {
   return {
     bootstrap: async () => bootstrap,
+    installation: async () => ({
+      action: "status",
+      status: {
+        installed: false,
+        active_version: null,
+        previous_version: null,
+        target: null,
+        manifest_sha256: null,
+        channel_manifest_url: null,
+        healthy: false,
+      },
+      receipt: null,
+      restartRequired: false,
+    }),
     invoke: async () => ({
       data: null,
       metadata: {
