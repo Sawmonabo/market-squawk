@@ -170,6 +170,29 @@ def _machine_matches(profile: PlatformProfile, machine: object) -> bool:
     }
 
 
+def _interpreter_platform_matches(
+    profile: PlatformProfile,
+    evidence: dict[str, object],
+) -> bool:
+    machine = evidence.get("machine")
+    if isinstance(machine, str) and machine:
+        return _machine_matches(profile, machine)
+
+    configured = evidence.get("configured_platform")
+    if not isinstance(configured, str):
+        return False
+    normalized = configured.casefold().replace("_", "-")
+    if profile.target == "x86_64-pc-windows-msvc":
+        return normalized == "win-amd64"
+    if profile.target == "x86_64-unknown-linux-gnu":
+        return normalized == "linux-x86-64"
+    if profile.target == "aarch64-apple-darwin":
+        return normalized.startswith("macosx-") and normalized.endswith("-arm64")
+    if profile.target == "x86_64-apple-darwin":
+        return normalized.startswith("macosx-") and normalized.endswith("-x86-64")
+    return False
+
+
 @dataclass(frozen=True)
 class Artifact:
     project: str
@@ -244,6 +267,7 @@ class ArtifactLayout:
 class AcquiredReleaseComponents:
     python: Path
     uv: Path
+    zig: Path | None
 
 
 @dataclass(frozen=True)
@@ -519,9 +543,10 @@ def admit_release_components(
     path: Path,
     profile: PlatformProfile,
     uv_executable: Path,
+    zig_executable: Path | None,
     root: Path,
 ) -> str:
-    """Admit the exact uv, CPython, and PyArrow release-component matrix."""
+    """Admit the exact uv, CPython, PyArrow, and Linux linker component matrix."""
 
     raw, target = load_release_components(path, profile)
     selected = target["uv"]
@@ -539,6 +564,24 @@ def admit_release_components(
     version = _run_output([str(executable), "--version"], root)
     if not version.startswith("uv 0.12.0 "):
         raise ReleaseBuildError("locked uv executable reports the wrong version")
+    selected_zig = target.get("zig")
+    if profile.system == "Linux":
+        if not isinstance(selected_zig, dict) or zig_executable is None:
+            raise ReleaseBuildError("locked Zig executable is unavailable")
+        try:
+            zig = zig_executable.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise ReleaseBuildError("locked Zig executable is unavailable") from error
+        if (
+            zig.is_symlink()
+            or not zig.is_file()
+            or _file_digest(zig)
+            != (selected_zig["binary_size_bytes"], selected_zig["binary_sha256"])
+            or _run_output([str(zig), "version"], root) != "0.16.0"
+        ):
+            raise ReleaseBuildError("locked Zig executable identity differs")
+    elif selected_zig is not None or zig_executable is not None:
+        raise ReleaseBuildError("Zig is permitted only for the Linux release target")
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -560,11 +603,13 @@ def load_release_components(
     if not isinstance(value, dict) or set(value) != {
         "schema_version",
         "uv",
+        "zig",
         "python",
         "targets",
     }:
         raise ReleaseBuildError("release component lock shape is invalid")
     uv = value["uv"]
+    zig = value["zig"]
     python = value["python"]
     targets = value["targets"]
     if (
@@ -574,6 +619,11 @@ def load_release_components(
         or uv["version"] != "0.12.0"
         or uv["license"] != "Apache-2.0 OR MIT"
         or uv["release_url"] != "https://github.com/astral-sh/uv/releases/tag/0.12.0"
+        or not isinstance(zig, dict)
+        or set(zig) != {"version", "license", "release_url"}
+        or zig["version"] != "0.16.0"
+        or zig["license"] != "MIT"
+        or zig["release_url"] != "https://ziglang.org/download/0.16.0/"
         or not isinstance(python, dict)
         or set(python)
         != {
@@ -599,13 +649,16 @@ def load_release_components(
         raise ReleaseBuildError("release component matrix identity is invalid")
     for target, target_value in targets.items():
         target_profile = platform_profile(target)
-        if not isinstance(target_value, dict) or set(target_value) != {
+        expected_fields = {
             "minimum_system",
             "wheel_platform_tag",
             "uv",
             "python",
             "pyarrow",
-        }:
+        }
+        if target_profile.system == "Linux":
+            expected_fields.add("zig")
+        if not isinstance(target_value, dict) or set(target_value) != expected_fields:
             raise ReleaseBuildError("target release-component shape is invalid")
         if (
             target_value["minimum_system"] != target_profile.minimum_system
@@ -613,9 +666,19 @@ def load_release_components(
             != target_profile.wheel_platform_tag
         ):
             raise ReleaseBuildError("target release-component contract is invalid")
-        _admit_download_identity(target_value["uv"], "github.com", uv_binary=True)
+        _admit_download_identity(
+            target_value["uv"],
+            "github.com",
+            binary_archive="uv",
+        )
         _admit_download_identity(target_value["python"], "github.com")
         _admit_download_identity(target_value["pyarrow"], "files.pythonhosted.org")
+        if target_profile.system == "Linux":
+            _admit_download_identity(
+                target_value["zig"],
+                "ziglang.org",
+                binary_archive="Zig",
+            )
 
     selected = targets[profile.target]
     if not isinstance(selected, dict):
@@ -627,10 +690,10 @@ def _admit_download_identity(
     value: object,
     host: str,
     *,
-    uv_binary: bool = False,
+    binary_archive: str | None = None,
 ) -> None:
     required = {"url", "size_bytes", "sha256"}
-    if uv_binary:
+    if binary_archive is not None:
         required.update(
             {
                 "format",
@@ -658,15 +721,15 @@ def _admit_download_identity(
     ):
         raise ReleaseBuildError("release download URL or size is invalid")
     _sha256(value["sha256"])
-    if uv_binary:
+    if binary_archive is not None:
         if (
-            value["format"] not in {"tar.gz", "zip"}
+            value["format"] not in {"tar.gz", "tar.xz", "zip"}
             or not isinstance(value["binary_path"], str)
             or not value["binary_path"]
             or not isinstance(value["binary_size_bytes"], int)
             or value["binary_size_bytes"] <= 0
         ):
-            raise ReleaseBuildError("uv archive member identity is invalid")
+            raise ReleaseBuildError(f"{binary_archive} archive member identity is invalid")
         _sha256(value["binary_sha256"])
     elif host == "files.pythonhosted.org":
         if (
@@ -687,7 +750,7 @@ def acquire_release_components(
     *,
     allow_network: bool,
 ) -> AcquiredReleaseComponents:
-    """Acquire and safely expand the exact uv and CPython archives for one native build."""
+    """Acquire and safely expand the exact uv, CPython, and Linux Zig archives."""
 
     _raw, target = load_release_components(path, profile)
     root = _admit_component_root(component_root, repository_root, profile)
@@ -728,14 +791,42 @@ def acquire_release_components(
         / str(python["archive_path"])
         / profile.interpreter_relative_path
     ).resolve(strict=True)
+    zig_executable = None
+    zig = target.get("zig")
+    if profile.system == "Linux":
+        if not isinstance(zig, dict):
+            raise ReleaseBuildError("selected Zig release component is invalid")
+        zig_archive = _acquire_locked_download(
+            downloads / "zig.archive",
+            zig,
+            allow_network=allow_network,
+        )
+        zig_root = _replace_extracted_archive(
+            zig_archive,
+            expanded / "zig",
+            str(zig["format"]),
+        )
+        zig_executable = (zig_root / str(zig["binary_path"])).resolve(strict=True)
     if (
         not uv_executable.is_file()
         or _file_digest(uv_executable)
         != (uv["binary_size_bytes"], uv["binary_sha256"])
         or not python_executable.is_file()
+        or (
+            zig_executable is not None
+            and (
+                not zig_executable.is_file()
+                or _file_digest(zig_executable)
+                != (zig["binary_size_bytes"], zig["binary_sha256"])
+            )
+        )
     ):
         raise ReleaseBuildError("expanded release component identity is invalid")
-    return AcquiredReleaseComponents(python=python_executable, uv=uv_executable)
+    return AcquiredReleaseComponents(
+        python=python_executable,
+        uv=uv_executable,
+        zig=zig_executable,
+    )
 
 
 def _admit_component_root(
@@ -818,6 +909,7 @@ def _acquire_locked_download(
                     "github.com",
                     "objects.githubusercontent.com",
                     "release-assets.githubusercontent.com",
+                    "ziglang.org",
                 }
             ):
                 raise ReleaseBuildError("release component redirected outside its allowed hosts")
@@ -855,8 +947,8 @@ def _replace_extracted_archive(archive: Path, destination: Path, archive_format:
         shutil.rmtree(temporary)
     temporary.mkdir(mode=0o700)
     try:
-        if archive_format == "tar.gz":
-            _extract_tar_archive(archive, temporary)
+        if archive_format in {"tar.gz", "tar.xz"}:
+            _extract_tar_archive(archive, temporary, archive_format)
         elif archive_format == "zip":
             _extract_zip_archive(archive, temporary)
         else:
@@ -873,8 +965,13 @@ def _replace_extracted_archive(archive: Path, destination: Path, archive_format:
     return destination.resolve(strict=True)
 
 
-def _extract_tar_archive(archive: Path, destination: Path) -> None:
-    with tarfile.open(archive, mode="r:gz") as source:
+def _extract_tar_archive(
+    archive: Path,
+    destination: Path,
+    archive_format: str,
+) -> None:
+    mode = "r:gz" if archive_format == "tar.gz" else "r:xz"
+    with tarfile.open(archive, mode=mode) as source:
         members = source.getmembers()
         total = 0
         if not members or len(members) > 32_768:
@@ -1483,7 +1580,9 @@ def admit_sources(lock: ReleaseLock, root: Path) -> None:
 
 
 def admit_toolchain(
-    root: Path, profile: PlatformProfile | None = None
+    root: Path,
+    profile: PlatformProfile | None = None,
+    zig_executable: Path | None = None,
 ) -> dict[str, object]:
     """Bind direct Rust and native host tools for one exact release target."""
 
@@ -1539,7 +1638,13 @@ def admit_toolchain(
     if profile.system == "Darwin":
         toolchain.update(_admit_macos_toolchain(root, evidence_environment))
     elif profile.system == "Linux":
-        toolchain.update(_admit_linux_toolchain(root, evidence_environment))
+        toolchain.update(
+            _admit_linux_toolchain(
+                root,
+                evidence_environment,
+                zig_executable,
+            )
+        )
     elif profile.system == "Windows":
         toolchain.update(_admit_windows_toolchain())
     else:
@@ -1619,8 +1724,13 @@ def _admit_macos_toolchain(
 
 
 def _admit_linux_toolchain(
-    root: Path, evidence_environment: dict[str, str]
+    root: Path,
+    evidence_environment: dict[str, str],
+    zig_executable: Path | None,
 ) -> dict[str, object]:
+    if zig_executable is None:
+        raise ReleaseBuildError("the locked Linux Zig linker is unavailable")
+    zig = zig_executable.expanduser().resolve(strict=True)
     cc = _system_tool("cc")
     cxx = _system_tool("c++")
     archiver = _system_tool("ar")
@@ -1635,6 +1745,10 @@ def _admit_linux_toolchain(
         "linker": _tool_binding(cc),
         "archiver": _tool_binding(archiver),
         "ranlib": _tool_binding(ranlib),
+        "zig": _tool_binding(
+            zig,
+            _run_output([str(zig), "version"], root, evidence_environment),
+        ),
     }
 
 
@@ -1768,7 +1882,7 @@ def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRu
         if (
             evidence.get("implementation") != "cpython"
             or evidence.get("system") != profile.system
-            or not _machine_matches(profile, evidence.get("machine"))
+            or not _interpreter_platform_matches(profile, evidence)
             or len(version) != 3
             or version != REQUIRED_PYTHON
             or not lock.minimum <= minor < lock.maximum_exclusive
@@ -1779,7 +1893,9 @@ def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRu
                 "Python interpreter is outside the exact support matrix "
                 f"(implementation={evidence.get('implementation')!r}, "
                 f"system={evidence.get('system')!r}, "
-                f"machine={evidence.get('machine')!r}, version={version!r})"
+                f"machine={evidence.get('machine')!r}, "
+                f"configured_platform={evidence.get('configured_platform')!r}, "
+                f"version={version!r})"
             )
         canonical_paths.add(executable)
         admitted[minor] = PythonRuntime(executable, version)
@@ -1940,6 +2056,7 @@ def _build_release(
     ]
     if profile.maturin_compatibility is not None:
         maturin_command.extend(["--compatibility", profile.maturin_compatibility])
+        maturin_command.append("--zig")
     _run(maturin_command, root / "python", environment)
     project_version = _project_version(root)
     project_wheels = list(
@@ -2835,7 +2952,7 @@ def _admit_created_runtime(
     if (
         evidence.get("implementation") != "cpython"
         or evidence.get("system") != profile.system
-        or not _machine_matches(profile, evidence.get("machine"))
+        or not _interpreter_platform_matches(profile, evidence)
         or version != expected
     ):
         raise ReleaseBuildError("created venv does not use its exact admitted interpreter")
@@ -2852,10 +2969,11 @@ def _interpreter_evidence(
             "-I",
             "-c",
             (
-                "import json,platform,sys;"
+                "import json,platform,sys,sysconfig;"
                 "print(json.dumps({'implementation':sys.implementation.name,"
                 "'version':list(sys.version_info[:3]),'system':platform.system(),"
-                "'machine':platform.machine()},sort_keys=True))"
+                "'machine':platform.machine(),"
+                "'configured_platform':sysconfig.get_platform()},sort_keys=True))"
             ),
         ],
         root,
@@ -2959,18 +3077,20 @@ def _cargo_environment(
         cxx = _bound_tool(toolchain, "cxx")
         archiver = _bound_tool(toolchain, "archiver")
         ranlib = _bound_tool(toolchain, "ranlib")
+        zig = _bound_tool(toolchain, "zig")
         environment.update(
             {
                 "AR": str(archiver),
+                "CARGO_ZIGBUILD_ZIG_PATH": str(zig),
                 "CC": str(cc),
                 "CXX": str(cxx),
-                f"CARGO_TARGET_{target_key}_LINKER": str(cc),
                 "PATH": os.pathsep.join(
                     dict.fromkeys(
                         [
                             str(cargo.parent),
                             str(rustc.parent),
                             str(cc.parent),
+                            str(zig.parent),
                             "/usr/bin",
                             "/bin",
                         ]
@@ -3968,10 +4088,11 @@ def main() -> int:
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--python", action="append", type=Path)
     parser.add_argument("--uv", type=Path)
+    parser.add_argument("--zig", type=Path)
     parser.add_argument(
         "--component-root",
         type=Path,
-        help="Builder-owned cache for the exact locked uv and CPython archives.",
+        help="Builder-owned cache for the exact locked uv, CPython, and Linux Zig archives.",
     )
     parser.add_argument("--source-cache", type=Path)
     parser.add_argument("--offline", action="store_true")
@@ -3994,9 +4115,13 @@ def main() -> int:
         if host_profile() != profile:
             raise ReleaseBuildError("release target does not match the native build host")
         if options.component_root is not None:
-            if options.python is not None or options.uv is not None:
+            if (
+                options.python is not None
+                or options.uv is not None
+                or options.zig is not None
+            ):
                 raise ReleaseBuildError(
-                    "component-root cannot be combined with explicit Python or uv paths"
+                    "component-root cannot be combined with explicit component paths"
                 )
             acquired = acquire_release_components(
                 root / "distribution/release-components.json",
@@ -4008,6 +4133,7 @@ def main() -> int:
             )
             python_paths = (acquired.python,)
             uv_path = acquired.uv
+            zig_path = acquired.zig
         else:
             if options.python is None or options.uv is None:
                 raise ReleaseBuildError(
@@ -4015,11 +4141,13 @@ def main() -> int:
                 )
             python_paths = tuple(options.python)
             uv_path = options.uv
+            zig_path = options.zig
         lock = load_lock(lock_path, profile.target)
         components_sha256 = admit_release_components(
             root / "distribution/release-components.json",
             profile,
             uv_path,
+            zig_path,
             root,
         )
         native_code_signing = admit_native_code_signing(
@@ -4027,7 +4155,7 @@ def main() -> int:
             options.sign_native,
         )
         uv_executable = uv_path.expanduser().resolve(strict=True)
-        toolchain = admit_toolchain(root, profile)
+        toolchain = admit_toolchain(root, profile, zig_path)
         runtimes = admit_runtimes(python_paths, lock)
         admit_sources(lock, root)
         layout = admit_artifact_root(options.artifact_root, root)

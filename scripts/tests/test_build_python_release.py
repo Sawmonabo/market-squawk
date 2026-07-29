@@ -50,6 +50,18 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                     ),
                     contract,
                 )
+        self.assertTrue(
+            builder._interpreter_platform_matches(
+                builder.platform_profile("x86_64-pc-windows-msvc"),
+                {"machine": "", "configured_platform": "win-amd64"},
+            )
+        )
+        _raw, linux = builder.load_release_components(
+            ROOT / "distribution" / "release-components.json",
+            builder.platform_profile("x86_64-unknown-linux-gnu"),
+        )
+        self.assertEqual(linux["zig"]["format"], "tar.xz")
+        self.assertEqual(linux["zig"]["binary_path"], "zig-x86_64-linux-0.16.0/zig")
 
     def test_release_signing_seed_is_zeroed_when_the_build_fails(self) -> None:
         signer = builder.ReleaseSigner.__new__(builder.ReleaseSigner)

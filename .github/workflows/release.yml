@@ -297,12 +297,13 @@ jobs:
             echo "CARGO_BUILD_TARGET=$TARGET"
             echo "CARGO_HOME=$artifact_root/cargo-home"
             echo "CARGO_NET_OFFLINE=true"
-            echo "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT<<MARKET_SQUAWK_FOUNDATION"
-            cat "$artifact_root/training-foundation.json"
-            echo "MARKET_SQUAWK_FOUNDATION"
             echo "MARKET_SQUAWK_PYTHON_PRODUCT=$artifact_root/release-cp314"
             echo "MARKET_SQUAWK_COMPONENT_ROOT=$component_root"
           } >> "$GITHUB_ENV"
+          foundation="$(cat "$artifact_root/training-foundation.json")"
+          [[ -n "$foundation" && "$foundation" != *$'\n'* && "$foundation" != *$'\r'* ]]
+          printf 'MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT=%s\n' "$foundation" \
+            >> "$GITHUB_ENV"
       - name: Build and stage complete native inputs
         shell: bash
         env:
@@ -664,11 +665,487 @@ jobs:
             gh attestation verify "$path" --repo "$GITHUB_REPOSITORY"
           done
 
+  candidate-smoke:
+    name: Install draft package (${{ matrix.name }})
+    needs:
+      - freeze
+      - draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon DMG
+            os: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ""
+            native_suffix: .dmg
+            package_kind: dmg
+            timeout: 45
+          - name: macOS Intel DMG
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ""
+            native_suffix: .dmg
+            package_kind: dmg
+            timeout: 45
+          - name: Windows NSIS
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            native_suffix: -setup.exe
+            package_kind: nsis
+            timeout: 45
+          - name: Windows MSI
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            native_suffix: .msi
+            package_kind: msi
+            timeout: 45
+          - name: Linux AppImage
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            native_suffix: .AppImage
+            package_kind: appimage
+            timeout: 45
+          - name: Linux DEB
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            native_suffix: .deb
+            package_kind: deb
+            timeout: 45
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.freeze.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download and verify the exact draft package
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_SUFFIX: ${{ matrix.native_suffix }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          candidate="$RUNNER_TEMP/release-candidate"
+          mkdir -m 700 "$candidate"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --pattern market-squawk-release.json \
+            --pattern "market-squawk-release-$TARGET.json" \
+            --pattern "market-squawk-$VERSION-$TARGET.zip" \
+            --pattern "market-squawk-bootstrap-$TARGET$EXE" \
+            --pattern "market-squawk-$VERSION-$TARGET$NATIVE_SUFFIX" \
+            --dir "$candidate"
+
+          expected=(
+            SHA256SUMS
+            market-squawk-release.json
+            "market-squawk-release-$TARGET.json"
+            "market-squawk-$VERSION-$TARGET.zip"
+            "market-squawk-bootstrap-$TARGET$EXE"
+            "market-squawk-$VERSION-$TARGET$NATIVE_SUFFIX"
+          )
+          for name in "${expected[@]}"
+          do
+            [[ -f "$candidate/$name" && ! -L "$candidate/$name" ]]
+          done
+          observed="$(find "$candidate" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          [[ "$observed" == "${#expected[@]}" ]]
+
+          for name in "${expected[@]}"
+          do
+            if [[ "$name" != "SHA256SUMS" ]]; then
+              expected_digest="$(
+                awk -v name="$name" '$2 == name { print $1 }' \
+                  "$candidate/SHA256SUMS"
+              )"
+              [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+              if command -v sha256sum >/dev/null 2>&1; then
+                actual_digest="$(sha256sum "$candidate/$name" | awk '{ print $1 }')"
+              else
+                actual_digest="$(shasum -a 256 "$candidate/$name" | awk '{ print $1 }')"
+              fi
+              [[ "$actual_digest" == "$expected_digest" ]]
+            fi
+            gh attestation verify "$candidate/$name" --repo "$GITHUB_REPOSITORY"
+          done
+          echo "MARKET_SQUAWK_CANDIDATE=$candidate" >> "$GITHUB_ENV"
+      - name: Install and launch the DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          dmg="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.dmg"
+          hdiutil verify "$dmg"
+          mount="$RUNNER_TEMP/market-squawk-dmg"
+          application="$RUNNER_TEMP/Applications/Market Squawk.app"
+          mkdir -m 700 "$mount"
+          mkdir -m 700 "$RUNNER_TEMP/Applications"
+          cleanup() {
+            if mount | grep -F -q "on $mount "; then
+              hdiutil detach "$mount"
+            fi
+          }
+          trap cleanup EXIT
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
+          packaged="$mount/Market Squawk.app"
+          [[ -d "$packaged" && ! -L "$packaged" ]]
+          codesign --verify --deep --strict --verbose=2 "$packaged"
+          spctl --assess --type execute --verbose=4 "$packaged"
+          xcrun stapler validate "$packaged"
+          ditto "$packaged" "$application"
+          hdiutil detach "$mount"
+
+          home="$RUNNER_TEMP/native-home"
+          data="$RUNNER_TEMP/native-data"
+          log="$RUNNER_TEMP/native-desktop.log"
+          mkdir -m 700 "$home" "$data"
+          HOME="$home" "$application/Contents/MacOS/market-squawk-desktop" \
+            --data-dir "$data" >"$log" 2>&1 &
+          desktop_pid=$!
+          state=""
+          for _attempt in {1..120}
+          do
+            state="$(
+              find "$home" -type f -path '*/program/installation.json' \
+                -print -quit
+            )"
+            if [[ -n "$state" ]]; then
+              break
+            fi
+            if ! kill -0 "$desktop_pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          [[ -n "$state" ]]
+          sleep 3
+          kill -0 "$desktop_pid"
+          kill "$desktop_pid"
+          wait "$desktop_pid" || true
+
+          root="$(dirname "$state")"
+          installer="$(
+            find "$root/versions" -type f \
+              -path '*/bin/market-squawk-installer' -print
+          )"
+          application_cli="$(
+            find "$root/versions" -type f -path '*/bin/market-squawk' -print
+          )"
+          runtime="$(
+            find "$root/versions" -type f -path '*/bin/python' -print
+          )"
+          [[ -n "$installer" && "$installer" != *$'\n'* ]]
+          [[ -n "$application_cli" && "$application_cli" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          "$installer" --root "$root" status --json
+          "$installer" --root "$root" repair
+          "$application_cli" doctor \
+            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --output json
+          "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          python3 scripts/smoke_mcp.py "$application_cli"
+          "$installer" --root "$root" uninstall
+          [[ ! -e "$state" ]]
+      - name: Install and launch the Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PACKAGE_KIND: ${{ matrix.package_kind }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $suffix = if ($env:PACKAGE_KIND -eq "nsis") {
+            "-setup.exe"
+          } else {
+            ".msi"
+          }
+          $package = Join-Path `
+            $env:MARKET_SQUAWK_CANDIDATE `
+            "market-squawk-$env:VERSION-$env:TARGET$suffix"
+          $signature = Get-AuthenticodeSignature $package
+          if ($signature.Status -ne "Valid") {
+            throw "The downloaded Windows package signature is invalid."
+          }
+
+          if ($env:PACKAGE_KIND -eq "nsis") {
+            $install = Start-Process `
+              -FilePath $package `
+              -ArgumentList "/S" `
+              -Wait `
+              -PassThru
+          } else {
+            $install = Start-Process `
+              -FilePath msiexec.exe `
+              -ArgumentList @("/i", "`"$package`"", "/quiet", "/norestart") `
+              -Wait `
+              -PassThru
+          }
+          if ($install.ExitCode -ne 0) {
+            throw "The Windows package installation failed."
+          }
+
+          $desktopNames = @("market-squawk-desktop.exe", "Market Squawk.exe")
+          $desktops = @(
+            Get-ChildItem `
+              -Path $env:LOCALAPPDATA, $env:ProgramFiles `
+              -File `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in $desktopNames }
+          )
+          $desktops = @($desktops | Sort-Object FullName -Unique)
+          if ($desktops.Count -ne 1) {
+            throw "The Windows package did not install one desktop executable."
+          }
+          $desktop = $desktops[0]
+          $stdout = Join-Path $env:RUNNER_TEMP "native-desktop.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "native-desktop.stderr.log"
+          $process = Start-Process `
+            -FilePath $desktop.FullName `
+            -ArgumentList @("--data-dir", (Join-Path $env:RUNNER_TEMP "native-data")) `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+          try {
+            $state = $null
+            foreach ($attempt in 1..120) {
+              $state = @(
+                Get-ChildItem `
+                  -Path $env:LOCALAPPDATA `
+                  -Filter installation.json `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DirectoryName -like "*Market*Squawk*program" }
+              )
+              if ($state.Count -eq 1) {
+                break
+              }
+              if ($process.HasExited) {
+                Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+                throw "The installed Windows desktop exited before startup completed."
+              }
+              Start-Sleep -Seconds 1
+            }
+            if ($state.Count -ne 1) {
+              throw "The installed Windows desktop did not activate its complete release."
+            }
+            Start-Sleep -Seconds 3
+            if ($process.HasExited) {
+              throw "The installed Windows desktop did not remain operational."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              $process.WaitForExit()
+            }
+          }
+
+          $root = $state[0].DirectoryName
+          $installer = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk-installer.exe `
+              -File `
+              -Recurse
+          )
+          $application = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk.exe `
+              -File `
+              -Recurse
+          )
+          $runtime = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter python.exe `
+              -File `
+              -Recurse
+          )
+          if (
+            $installer.Count -ne 1 -or
+            $application.Count -ne 1 -or
+            $runtime.Count -ne 1
+          ) {
+            throw "The installed Windows product component set is incomplete."
+          }
+          & $installer[0].FullName --root $root status --json
+          if ($LASTEXITCODE -ne 0) { throw "Installed-product status failed." }
+          & $installer[0].FullName --root $root repair
+          if ($LASTEXITCODE -ne 0) { throw "Installed-product repair failed." }
+          & $application[0].FullName doctor `
+            --data-dir (Join-Path $env:RUNNER_TEMP "doctor-data") `
+            --output json
+          if ($LASTEXITCODE -ne 0) { throw "Installed CLI doctor failed." }
+          & $runtime[0].FullName -I -B -c `
+            "import market_squawk, pyarrow; print(pyarrow.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Managed Python admission failed." }
+          python scripts/smoke_mcp.py $application[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "Installed MCP smoke failed." }
+          & $installer[0].FullName --root $root uninstall
+          if ($LASTEXITCODE -ne 0 -or (Test-Path $state[0].FullName)) {
+            throw "Default installed-product uninstall failed."
+          }
+
+          if ($env:PACKAGE_KIND -eq "nsis") {
+            $uninstallers = @(
+              Get-ChildItem `
+                -Path $desktop.DirectoryName `
+                -Filter "*uninstall*.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+            )
+            if ($uninstallers.Count -ne 1) {
+              throw "The NSIS package uninstaller is unavailable."
+            }
+            $remove = Start-Process `
+              -FilePath $uninstallers[0].FullName `
+              -ArgumentList "/S" `
+              -Wait `
+              -PassThru
+          } else {
+            $remove = Start-Process `
+              -FilePath msiexec.exe `
+              -ArgumentList @("/x", "`"$package`"", "/quiet", "/norestart") `
+              -Wait `
+              -PassThru
+          }
+          if ($remove.ExitCode -ne 0) {
+            throw "The Windows package uninstall failed."
+          }
+      - name: Install and launch the Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PACKAGE_KIND: ${{ matrix.package_kind }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            dbus-x11 \
+            libayatana-appindicator3-1 \
+            librsvg2-2 \
+            libwebkit2gtk-4.1-0 \
+            libxdo3 \
+            xvfb
+
+          package_name=""
+          if [[ "$PACKAGE_KIND" == "appimage" ]]; then
+            desktop="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.AppImage"
+            chmod u+x "$desktop"
+          else
+            package="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.deb"
+            package_name="$(dpkg-deb --field "$package" Package)"
+            [[ "$package_name" =~ ^[a-z0-9][a-z0-9+.-]+$ ]]
+            sudo apt-get install --yes "$package"
+            desktop="$(
+              dpkg-query --listfiles "$package_name" |
+                grep -E '/market-squawk-desktop$'
+            )"
+            [[ -n "$desktop" && "$desktop" != *$'\n'* && -x "$desktop" ]]
+          fi
+
+          home="$RUNNER_TEMP/native-home"
+          data="$RUNNER_TEMP/native-data"
+          xdg="$RUNNER_TEMP/native-xdg"
+          log="$RUNNER_TEMP/native-desktop.log"
+          mkdir -m 700 "$home" "$data" "$xdg"
+          if [[ "$PACKAGE_KIND" == "appimage" ]]; then
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+              HOME="$home" \
+              XDG_DATA_HOME="$xdg" \
+              xvfb-run -a "$desktop" --data-dir "$data" >"$log" 2>&1 &
+          else
+            HOME="$home" \
+              XDG_DATA_HOME="$xdg" \
+              xvfb-run -a "$desktop" --data-dir "$data" >"$log" 2>&1 &
+          fi
+          desktop_pid=$!
+          state=""
+          for _attempt in {1..120}
+          do
+            state="$(
+              find "$xdg" "$home" -type f \
+                -path '*/program/installation.json' -print -quit
+            )"
+            if [[ -n "$state" ]]; then
+              break
+            fi
+            if ! kill -0 "$desktop_pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          [[ -n "$state" ]]
+          sleep 3
+          kill -0 "$desktop_pid"
+          pkill -TERM -P "$desktop_pid" 2>/dev/null || true
+          kill "$desktop_pid" 2>/dev/null || true
+          wait "$desktop_pid" || true
+
+          root="$(dirname "$state")"
+          installer="$(
+            find "$root/versions" -type f \
+              -path '*/bin/market-squawk-installer' -print
+          )"
+          application="$(
+            find "$root/versions" -type f -path '*/bin/market-squawk' -print
+          )"
+          runtime="$(
+            find "$root/versions" -type f -path '*/bin/python' -print
+          )"
+          [[ -n "$installer" && "$installer" != *$'\n'* ]]
+          [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          "$installer" --root "$root" status --json
+          "$installer" --root "$root" repair
+          "$application" doctor \
+            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --output json
+          "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          python3 scripts/smoke_mcp.py "$application"
+          "$installer" --root "$root" uninstall
+          [[ ! -e "$state" ]]
+          if [[ -n "$package_name" ]]; then
+            sudo apt-get remove --yes "$package_name"
+          fi
+
   publish:
     name: Publish the immutable stable release
     needs:
       - freeze
       - draft
+      - candidate-smoke
     runs-on: ubuntu-24.04
     environment: stable-release
     permissions:

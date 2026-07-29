@@ -120,12 +120,26 @@
         "size_bytes": 21373358,
         "url": "https://github.com/astral-sh/uv/releases/download/0.12.0/uv-x86_64-unknown-linux-gnu.tar.gz"
       },
-      "wheel_platform_tag": "manylinux_2_28_x86_64"
+      "wheel_platform_tag": "manylinux_2_28_x86_64",
+      "zig": {
+        "binary_path": "zig-x86_64-linux-0.16.0/zig",
+        "binary_sha256": "2317bbb91798556d9d0f38aabdac23db83f0979b25f767259ae474546724087c",
+        "binary_size_bytes": 172641672,
+        "format": "tar.xz",
+        "sha256": "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+        "size_bytes": 55478392,
+        "url": "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+      }
     }
   },
   "uv": {
     "license": "Apache-2.0 OR MIT",
     "release_url": "https://github.com/astral-sh/uv/releases/tag/0.12.0",
     "version": "0.12.0"
+  },
+  "zig": {
+    "license": "MIT",
+    "release_url": "https://ziglang.org/download/0.16.0/",
+    "version": "0.16.0"
   }
 }

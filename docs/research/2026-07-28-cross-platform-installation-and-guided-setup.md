@@ -307,6 +307,24 @@ Current sealed Python product evidence is narrower than the desired OS matrix. T
 claim complete cross-platform installation until every supported pair has a complete built,
 installed, and exercised Python artifact set.
 
+### Linux wheel compatibility
+
+Passing a `manylinux_2_28` label to a wheel builder does not make a binary compatible with that
+baseline. A build on Ubuntu 24.04 can still link newer glibc symbols, which the wheel audit correctly
+rejects. Market Squawk therefore uses the release-locked Zig 0.16.0 linker through Maturin for its
+Linux wheel build. The build downloads the exact archive recorded in the release-component lock,
+checks the archive and executable digests, records the tool in release evidence, and then performs
+the normal offline release build. Zig is a build tool only; it is not installed with the product.
+The locked Maturin 1.14.1 release uses cargo-zigbuild 0.23.0, whose maintained release line tests
+Zig 0.16.0.
+
+This follows Maturin's supported Zig path for portable Linux wheels and preserves the actual
+`manylinux_2_28_x86_64` compatibility contract instead of relabeling a host-native binary
+([Maturin distribution guidance](https://www.maturin.rs/distribution.html),
+[cargo-zigbuild 0.23.0](https://github.com/rust-cross/cargo-zigbuild/releases/tag/v0.23.0),
+[PyPA platform compatibility tags](https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/),
+[Zig 0.16.0 release index](https://ziglang.org/download/index.json)).
+
 ## Security and release trust
 
 HTTPS and checksums do not establish complete release authority. The installer must verify:
@@ -439,6 +457,10 @@ measured improvement remain separate work.
 - [uv locking and syncing](https://docs.astral.sh/uv/concepts/projects/sync/)
 - [uv Python support](https://docs.astral.sh/uv/reference/policies/python/)
 - [Python 3.14.6](https://www.python.org/downloads/release/python-3146/)
+- [Maturin distribution guidance](https://www.maturin.rs/distribution.html)
+- [cargo-zigbuild 0.23.0](https://github.com/rust-cross/cargo-zigbuild/releases/tag/v0.23.0)
+- [PyPA platform compatibility tags](https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/)
+- [Zig release index](https://ziglang.org/download/index.json)
 
 ### Platform and security
 

@@ -4272,8 +4272,8 @@
     },
     {
       "path": "distribution/release-components.json",
-      "sha256": "8a58980938a4da3c7bdcbbe85b858c9886ce8f3e818467f64ba723d0a4e7d176",
-      "size_bytes": 6172
+      "sha256": "5d5d6fe36f7a615290a9ae4e8339faeac9901413b6af5da748cea578bc7d3d92",
+      "size_bytes": 6734
     },
     {
       "path": "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",
@@ -4407,13 +4407,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "68ce8f412a85d10407e5906972e7adb72fce59f54997c4850c37c6aaaf307281",
-      "size_bytes": 153911
+      "sha256": "097ed28e1352c599c2225d273f44e2278fa643ece2fe17672feaedb32fe4d214",
+      "size_bytes": 158573
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "9c666f5c781f2b24cd171e30bd2333c5853b805305b7a1263819dd2117fb845d",
-      "size_bytes": 16352
+      "sha256": "23d1d065c6a0c5171021f26642242f1533b68def7a92d09f8d2f164742be81c3",
+      "size_bytes": 16927
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",

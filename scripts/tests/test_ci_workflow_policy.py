@@ -68,6 +68,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         )
             self.assertGreater(checkout_steps, 0)
 
+    def test_stable_publication_waits_for_draft_package_installation(self) -> None:
+        release = WORKFLOWS[1].read_text()
+        self.assertRegex(
+            release,
+            re.compile(
+                r"^  candidate-smoke:\n"
+                r"(?:.*\n)*?"
+                r"^  publish:\n"
+                r"(?:.*\n)*?"
+                r"^      - candidate-smoke$",
+                re.MULTILINE,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -386,12 +386,13 @@ jobs:
             echo "CARGO_BUILD_TARGET=$TARGET"
             echo "CARGO_HOME=$artifact_root/cargo-home"
             echo "CARGO_NET_OFFLINE=true"
-            echo "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT<<MARKET_SQUAWK_FOUNDATION"
-            cat "$artifact_root/training-foundation.json"
-            echo "MARKET_SQUAWK_FOUNDATION"
             echo "MARKET_SQUAWK_PYTHON_PRODUCT=$artifact_root/release-cp314"
             echo "MARKET_SQUAWK_COMPONENT_ROOT=$component_root"
           } >> "$GITHUB_ENV"
+          foundation="$(cat "$artifact_root/training-foundation.json")"
+          [[ -n "$foundation" && "$foundation" != *$'\n'* && "$foundation" != *$'\r'* ]]
+          printf 'MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT=%s\n' "$foundation" \
+            >> "$GITHUB_ENV"
       - name: Build complete native inputs
         shell: bash
         env:
