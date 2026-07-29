@@ -1492,12 +1492,19 @@ def admit_toolchain(
     rustup_discovered = shutil.which("rustup")
     if rustup_discovered is None:
         raise ReleaseBuildError("rustup is required to resolve direct pinned Rust tools")
-    rustup = Path(rustup_discovered).resolve(strict=True)
+    rustup_launcher = Path(rustup_discovered).absolute()
+    expected_rustup_name = "rustup.exe" if profile.system == "Windows" else "rustup"
+    rustup = rustup_launcher.resolve(strict=True)
+    if (
+        rustup_launcher.name.casefold() != expected_rustup_name.casefold()
+        or not rustup.is_file()
+    ):
+        raise ReleaseBuildError("rustup launcher identity is invalid")
     cargo_path = _direct_rust_tool(
-        rustup, "cargo", profile, root, evidence_environment
+        rustup_launcher, "cargo", profile, root, evidence_environment
     )
     rustc_path = _direct_rust_tool(
-        rustup, "rustc", profile, root, evidence_environment
+        rustup_launcher, "rustc", profile, root, evidence_environment
     )
     cargo_version = _run_output([str(cargo_path), "-vV"], root, evidence_environment)
     rustc_version = _run_output([str(rustc_path), "-vV"], root, evidence_environment)
@@ -1520,7 +1527,7 @@ def admit_toolchain(
         "rust_stdlib": _tree_binding(sysroot / "lib/rustlib" / profile.target / "lib"),
         "rustup": _tool_binding(
             rustup,
-            _run_output([str(rustup), "--version"], root, evidence_environment),
+            _run_output([str(rustup_launcher), "--version"], root, evidence_environment),
         ),
     }
     if profile.system == "Darwin":
