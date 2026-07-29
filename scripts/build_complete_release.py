@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -75,6 +76,18 @@ TARGETS = {
         TargetProfile("x86_64-unknown-linux-gnu", ""),
     )
 }
+MINIMUM_SYSTEMS = {
+    "aarch64-apple-darwin": "macOS 12",
+    "x86_64-apple-darwin": "macOS 12",
+    "x86_64-pc-windows-msvc": "Windows 10 1809",
+    "x86_64-unknown-linux-gnu": "Ubuntu 24.04-compatible",
+}
+NATIVE_PACKAGE_SUFFIXES = {
+    "aarch64-apple-darwin": (".dmg",),
+    "x86_64-apple-darwin": (".dmg",),
+    "x86_64-pc-windows-msvc": (".msi", "-setup.exe"),
+    "x86_64-unknown-linux-gnu": (".AppImage", ".deb"),
+}
 
 
 @dataclass(frozen=True)
@@ -88,8 +101,30 @@ class Options:
     output: Path
 
 
+@dataclass(frozen=True)
+class AggregateOptions:
+    inputs: tuple[Path, ...]
+    install_template: Path
+    output: Path
+
+
+@dataclass(frozen=True)
+class CollectOptions:
+    target: TargetProfile
+    version: str
+    release_output: Path
+    native_bundle: Path
+    output: Path
+
+
 def main() -> int:
     try:
+        if sys.argv[1:2] == ["aggregate"]:
+            aggregate_release(parse_aggregate_options(sys.argv[2:]))
+            return 0
+        if sys.argv[1:2] == ["collect"]:
+            collect_native_packages(parse_collect_options(sys.argv[2:]))
+            return 0
         options = parse_options()
         root = Path(__file__).resolve().parents[1]
         validate_repository_identity(root, options)
@@ -120,6 +155,415 @@ def main() -> int:
         print(f"complete release rejected: {error}", file=sys.stderr)
         return 2
     return 0
+
+
+def parse_aggregate_options(arguments: list[str]) -> AggregateOptions:
+    parser = argparse.ArgumentParser(
+        description="Assemble the complete cross-platform GitHub Release asset set."
+    )
+    parser.add_argument("--input", required=True, action="append", type=Path)
+    parser.add_argument("--install-template", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    values = parser.parse_args(arguments)
+    return AggregateOptions(
+        inputs=tuple(path.expanduser().absolute() for path in values.input),
+        install_template=values.install_template.expanduser().absolute(),
+        output=values.output.expanduser().absolute(),
+    )
+
+
+def parse_collect_options(arguments: list[str]) -> CollectOptions:
+    parser = argparse.ArgumentParser(
+        description="Collect one platform's complete bundle and native packages."
+    )
+    parser.add_argument("--target", required=True, choices=tuple(TARGETS))
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--release-output", required=True, type=Path)
+    parser.add_argument("--native-bundle", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    values = parser.parse_args(arguments)
+    if VERSION_PATTERN.fullmatch(values.version) is None:
+        raise ReleaseBuildError("native package version is malformed")
+    return CollectOptions(
+        target=TARGETS[values.target],
+        version=values.version,
+        release_output=values.release_output.expanduser().absolute(),
+        native_bundle=values.native_bundle.expanduser().absolute(),
+        output=values.output.expanduser().absolute(),
+    )
+
+
+def collect_native_packages(options: CollectOptions) -> None:
+    root = Path(__file__).resolve().parents[1]
+    release_output = controlled_directory(options.release_output, "platform release output")
+    native_bundle = controlled_directory(options.native_bundle, "native package output")
+    output = claim_output(options.output, root)
+    target = options.target.target
+    suffix = options.target.executable_suffix
+    base_names = {
+        "SHA256SUMS",
+        "market-squawk-release.json",
+        f"market-squawk-{options.version}-{target}.zip",
+        f"market-squawk-bootstrap-{target}{suffix}",
+    }
+    if set(list_regular_paths(release_output)) != base_names:
+        raise ReleaseBuildError("platform release output set is incomplete")
+    for name in sorted(base_names):
+        copy_stable(
+            release_output / name,
+            output / name,
+            executable=name.startswith("market-squawk-bootstrap-"),
+        )
+
+    expected_suffixes = NATIVE_PACKAGE_SUFFIXES[target]
+    selected: dict[str, Path] = {}
+    for package_suffix in expected_suffixes:
+        matches = [
+            path
+            for path in native_bundle.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and path.name.endswith(package_suffix)
+        ]
+        if len(matches) != 1:
+            raise ReleaseBuildError("native package output has no unique expected artifact")
+        selected[package_suffix] = matches[0]
+    for package_suffix, source in sorted(selected.items()):
+        destination = (
+            output
+            / f"market-squawk-{options.version}-{target}{package_suffix}"
+        )
+        copy_stable(
+            source,
+            destination,
+            executable=package_suffix == ".AppImage",
+        )
+    expected = base_names | {
+        f"market-squawk-{options.version}-{target}{package_suffix}"
+        for package_suffix in expected_suffixes
+    }
+    if {path.name for path in output.iterdir()} != expected:
+        raise ReleaseBuildError("platform publish output set is not closed")
+
+
+def aggregate_release(options: AggregateOptions) -> None:
+    root = Path(__file__).resolve().parents[1]
+    if len(options.inputs) != len(TARGETS):
+        raise ReleaseBuildError("release aggregation requires exactly four platform inputs")
+    template = options.install_template.resolve(strict=True)
+    if template != root / "distribution/install.sh" or template.is_symlink():
+        raise ReleaseBuildError("release installer template is not the repository authority")
+    output = claim_output(options.output, root)
+
+    releases = [_admit_platform_publish_input(path) for path in options.inputs]
+    shared_fields = (
+        "schema_version",
+        "product",
+        "version",
+        "tag",
+        "repository",
+        "commit_sha",
+        "tree_sha",
+        "generated_at",
+    )
+    reference = releases[0]["manifest"]
+    if any(
+        tuple(release["manifest"][field] for field in shared_fields)
+        != tuple(reference[field] for field in shared_fields)
+        for release in releases[1:]
+    ):
+        raise ReleaseBuildError("platform release manifests do not share one exact revision")
+
+    targets = [release["target"]["target"] for release in releases]
+    if sorted(targets) != sorted(TARGETS) or len(set(targets)) != len(TARGETS):
+        raise ReleaseBuildError("platform release input set is incomplete or duplicated")
+
+    index_targets = []
+    expected_outputs: set[str] = set()
+    bootstrap_digests: dict[str, str] = {}
+    for release in sorted(releases, key=lambda value: value["target"]["target"]):
+        target = release["target"]["target"]
+        source = release["root"]
+        manifest_name = f"market-squawk-release-{target}.json"
+        copied = []
+        for name in sorted(release["asset_names"]):
+            destination_name = manifest_name if name == "market-squawk-release.json" else name
+            destination = output / destination_name
+            copy_stable(
+                source / name,
+                destination,
+                executable=name.startswith("market-squawk-bootstrap-")
+                or name.endswith(".AppImage"),
+            )
+            expected_outputs.add(destination_name)
+            copied.append(destination_name)
+
+        manifest_artifact = _release_artifact(reference["tag"], output / manifest_name)
+        package_names = sorted(
+            name for name in copied if name in release["package_names"]
+        )
+        index_targets.append(
+            {
+                "archive": release["target"]["archive"],
+                "manifest": manifest_artifact,
+                "minimum_system": release["target"]["minimum_system"],
+                "native_packages": [
+                    _release_artifact(reference["tag"], output / name)
+                    for name in package_names
+                ],
+                "target": target,
+            }
+        )
+        bootstrap_name = release["bootstrap_name"]
+        bootstrap_digests[target] = file_sha256(output / bootstrap_name)
+
+    index = {
+        "commit_sha": reference["commit_sha"],
+        "generated_at": reference["generated_at"],
+        "kind": "market-squawk-release-index",
+        "product": reference["product"],
+        "repository": reference["repository"],
+        "schema_version": 1,
+        "tag": reference["tag"],
+        "targets": index_targets,
+        "tree_sha": reference["tree_sha"],
+        "version": reference["version"],
+    }
+    index_path = output / "market-squawk-release.json"
+    _write_json(index_path, index)
+    expected_outputs.add(index_path.name)
+
+    install_path = output / "install.sh"
+    _render_install_template(
+        template,
+        install_path,
+        reference["tag"],
+        bootstrap_digests,
+    )
+    expected_outputs.add(install_path.name)
+
+    artifacts = tuple(
+        path for path in sorted(output.iterdir()) if path.name != "SHA256SUMS"
+    )
+    write_checksums(output, artifacts)
+    expected_outputs.add("SHA256SUMS")
+    observed = {path.name for path in output.iterdir()}
+    if observed != expected_outputs or any(
+        path.is_symlink() or not path.is_file() for path in output.iterdir()
+    ):
+        raise ReleaseBuildError("aggregated GitHub Release asset set is not closed")
+
+
+def _admit_platform_publish_input(path: Path) -> dict[str, object]:
+    root = controlled_directory(path, "platform release input")
+    manifest_path = root / "market-squawk-release.json"
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_path.stat().st_size == 0
+        or manifest_path.stat().st_size > 1024 * 1024
+    ):
+        raise ReleaseBuildError("platform release manifest exceeds its fixed bound")
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("platform release manifest is malformed") from error
+    expected_manifest_fields = {
+        "commit_sha",
+        "generated_at",
+        "product",
+        "repository",
+        "schema_version",
+        "tag",
+        "targets",
+        "tree_sha",
+        "version",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != expected_manifest_fields
+        or manifest["schema_version"] != 1
+        or manifest["product"] != "market-squawk"
+        or manifest["repository"] != "Sawmonabo/market-squawk"
+        or VERSION_PATTERN.fullmatch(str(manifest["version"])) is None
+        or manifest["tag"] != f"v{manifest['version']}"
+        or OBJECT_PATTERN.fullmatch(str(manifest["commit_sha"])) is None
+        or OBJECT_PATTERN.fullmatch(str(manifest["tree_sha"])) is None
+        or not isinstance(manifest["targets"], list)
+        or len(manifest["targets"]) != 1
+    ):
+        raise ReleaseBuildError("platform release manifest identity is invalid")
+    target_release = manifest["targets"][0]
+    if (
+        not isinstance(target_release, dict)
+        or set(target_release) != {"archive", "components", "minimum_system", "target"}
+        or target_release["target"] not in TARGETS
+        or target_release["minimum_system"]
+        != MINIMUM_SYSTEMS[target_release["target"]]
+    ):
+        raise ReleaseBuildError("platform release target identity is invalid")
+    target = target_release["target"]
+    version = manifest["version"]
+    suffix = TARGETS[target].executable_suffix
+    bundle_name = f"market-squawk-{version}-{target}.zip"
+    bootstrap_name = f"market-squawk-bootstrap-{target}{suffix}"
+    package_names = {
+        f"market-squawk-{version}-{target}{package_suffix}"
+        for package_suffix in NATIVE_PACKAGE_SUFFIXES[target]
+    }
+    expected_names = {
+        "SHA256SUMS",
+        "market-squawk-release.json",
+        bundle_name,
+        bootstrap_name,
+        *package_names,
+    }
+    observed = {child.name for child in root.iterdir()}
+    if observed != expected_names or any(
+        child.is_symlink() or not child.is_file() for child in root.iterdir()
+    ):
+        raise ReleaseBuildError("platform release publish input set is not closed")
+    _admit_manifest_target(root, manifest["tag"], target_release, bundle_name)
+    _admit_platform_checksums(root, bundle_name, bootstrap_name)
+    return {
+        "asset_names": expected_names - {"SHA256SUMS"},
+        "bootstrap_name": bootstrap_name,
+        "manifest": manifest,
+        "package_names": package_names,
+        "root": root,
+        "target": target_release,
+    }
+
+
+def _admit_manifest_target(
+    root: Path,
+    tag: str,
+    target: dict[str, object],
+    bundle_name: str,
+) -> None:
+    archive = target["archive"]
+    components = target["components"]
+    if (
+        not isinstance(archive, dict)
+        or set(archive) != {"sha256", "size", "url"}
+        or archive["url"]
+        != (
+            "https://github.com/Sawmonabo/market-squawk/releases/download/"
+            f"{tag}/{bundle_name}"
+        )
+        or archive["size"] != (root / bundle_name).stat().st_size
+        or archive["sha256"] != file_sha256(root / bundle_name)
+        or not isinstance(components, list)
+        or not components
+        or len(components) > MAXIMUM_FILES
+    ):
+        raise ReleaseBuildError("platform release archive identity is invalid")
+    previous = None
+    expanded = 0
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {
+            "executable",
+            "path",
+            "role",
+            "sha256",
+            "size",
+        }:
+            raise ReleaseBuildError("platform release component identity is invalid")
+        path = component["path"]
+        if not isinstance(path, str):
+            raise ReleaseBuildError("platform release component path is invalid")
+        validate_portable_path(path)
+        if (
+            previous is not None
+            and previous >= path
+            or not isinstance(component["size"], int)
+            or component["size"] < 0
+            or component["size"] > MAXIMUM_FILE_BYTES
+            or re.fullmatch(r"[0-9a-f]{64}", str(component["sha256"])) is None
+            or not isinstance(component["executable"], bool)
+        ):
+            raise ReleaseBuildError("platform release component identity is invalid")
+        expanded += component["size"]
+        if expanded > MAXIMUM_EXPANDED_BYTES:
+            raise ReleaseBuildError("platform release component set is oversized")
+        previous = path
+
+
+def _admit_platform_checksums(root: Path, bundle_name: str, bootstrap_name: str) -> None:
+    checksum = root / "SHA256SUMS"
+    expected_names = {bundle_name, bootstrap_name, "market-squawk-release.json"}
+    observed: dict[str, str] = {}
+    for line in checksum.read_text(encoding="ascii").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        if match is None or match.group(2) in observed:
+            raise ReleaseBuildError("platform release checksum file is malformed")
+        observed[match.group(2)] = match.group(1)
+    if set(observed) != expected_names or any(
+        observed[name] != file_sha256(root / name) for name in expected_names
+    ):
+        raise ReleaseBuildError("platform release checksum file is incomplete")
+
+
+def _release_artifact(tag: str, path: Path) -> dict[str, object]:
+    return {
+        "sha256": file_sha256(path),
+        "size": path.stat().st_size,
+        "url": (
+            "https://github.com/Sawmonabo/market-squawk/releases/download/"
+            f"{tag}/{path.name}"
+        ),
+    }
+
+
+def _write_json(path: Path, value: dict[str, object]) -> None:
+    encoded = (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    if len(encoded) > 1024 * 1024:
+        raise ReleaseBuildError("release index exceeds its fixed byte bound")
+    with path.open("xb") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _render_install_template(
+    template: Path,
+    output: Path,
+    tag: str,
+    bootstrap_digests: dict[str, str],
+) -> None:
+    replacements = {
+        "__MARKET_SQUAWK_TAG__": tag,
+        "__MARKET_SQUAWK_BOOTSTRAP_AARCH64_APPLE_DARWIN_SHA256__": bootstrap_digests[
+            "aarch64-apple-darwin"
+        ],
+        "__MARKET_SQUAWK_BOOTSTRAP_X86_64_APPLE_DARWIN_SHA256__": bootstrap_digests[
+            "x86_64-apple-darwin"
+        ],
+        "__MARKET_SQUAWK_BOOTSTRAP_X86_64_UNKNOWN_LINUX_GNU_SHA256__": bootstrap_digests[
+            "x86_64-unknown-linux-gnu"
+        ],
+    }
+    rendered = template.read_text(encoding="ascii")
+    for token, value in replacements.items():
+        if rendered.count(token) != 1:
+            raise ReleaseBuildError("release installer template token count is invalid")
+        rendered = rendered.replace(token, value)
+    if "__MARKET_SQUAWK_" in rendered:
+        raise ReleaseBuildError("release installer template is not fully rendered")
+    with output.open("x", encoding="ascii", newline="\n") as stream:
+        stream.write(rendered)
+        stream.flush()
+        os.fsync(stream.fileno())
+    output.chmod(0o755)
 
 
 def parse_options() -> Options:

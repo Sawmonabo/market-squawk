@@ -6,9 +6,9 @@ This page defines the sole terminal gate for the first complete local Market Squ
 | --- | --- |
 | Document type | Release gate and evidence contract |
 | Audience | Release owner, reviewers, maintainers, and auditors |
-| Status | Gate authority implemented; terminal execution blocked |
-| Last substantive review | 2026-07-26 |
-| Implementation review base | `d738500e8ad4d7b1ad4f19410ba3f64b573206db` plus the release-evidence authority change |
+| Status | Gate and publication authority implemented; terminal execution blocked |
+| Last substantive review | 2026-07-28 |
+| Implementation review base | Installer candidate `a0e4f01989a6ce91a8589b1a22b204860dee4d54`; refresh against the frozen release head before approval |
 
 ## Contents
 
@@ -26,11 +26,12 @@ This page defines the sole terminal gate for the first complete local Market Squ
 `usable_complete_local_release = true` is permitted only when one clean, unchanged candidate:
 
 1. satisfies all provider and durable-use predicates;
-2. produces signed Python 3.12 and 3.13 releases;
-3. passes the offline complete-product demonstration;
+2. produces the signed, complete CPython 3.14 product for every supported target;
+3. passes the offline complete-product and native-package demonstrations;
 4. passes fuzz, performance, security, dependency, license, credential, build, and test gates;
 5. receives a grouped Quarter 4 review with no unresolved release-blocking finding; and
-6. is sealed by `release evidence close` without changing Git or any evidence input.
+6. is sealed by `release evidence close` without changing Git or any evidence input; and
+7. publishes the exact closed assets through the protected immutable-release transaction.
 
 No individual lane, test suite, documentation update, provider fixture, or provisional report can
 make that decision.
@@ -40,10 +41,15 @@ make that decision.
 - The release branch and origin point to the reviewed candidate.
 - `git status --porcelain` is empty.
 - `HEAD` and `HEAD^{tree}` are recorded once and remain unchanged.
-- The release binary and sibling ONNX worker are built with the locked dependency graph.
+- The desktop, CLI, helpers, models, Python, uv, and installer are built with the locked dependency
+  graph and component matrix.
 - The operator has explicitly authorized external provider collection and configured required
   contacts, credentials, queries, and rights evidence.
-- CPython 3.12 and 3.13 interpreters and the sealed wheelhouse are available.
+- The locked standard CPython 3.14.6, uv 0.12.0, PyArrow 25.0.0, and sealed wheelhouse inputs are
+  available for the native target.
+- Protected Apple Developer ID/notarization and Windows Authenticode credentials are available.
+- GitHub immutable releases are enabled and the `stable-release` environment has approved the
+  exact annotated tag.
 - One worktree-local Cargo target is below the 20 GiB release ceiling; `CARGO_INCREMENTAL=0`.
 - Hosted CI and dependency-update pull requests have been reconciled, or an external service
   blocker is recorded without being mistaken for a code failure.
@@ -53,11 +59,13 @@ make that decision.
 ```mermaid
 flowchart TD
     Freeze["Freeze clean candidate HEAD/tree"]
-    Build["Signed Python release build and selected executable"]
+    Build["Signed CPython 3.14 complete-product build"]
     Fuzz["fuzz.json"]
     Perf["performance.json"]
     Providers["providers/provider-evidence.json"]
-    Python["python signed releases"]
+    Python["signed release-cp314 product"]
+    Native["signed native packages for four targets"]
+    Attest["GitHub artifact attestations"]
     Demo["demo.json"]
     Gate["Supervised full gate"]
     GateLog["full-gate.log"]
@@ -71,6 +79,7 @@ flowchart TD
     Build --> Perf
     Build --> Providers
     Build --> Python
+    Build --> Native
     Providers --> Demo
     Python --> Demo
     Build --> Gate
@@ -83,7 +92,9 @@ flowchart TD
     Demo --> Close
     GateReceipt --> Close
     Close --> Review
-    Review --> Publish
+    Native --> Attest
+    Review --> Attest
+    Attest --> Publish
 ```
 
 Any remediation returns the flow to `Freeze` with a new commit and invalidates all prior
@@ -105,9 +116,9 @@ TREE_SHA="$(git rev-parse HEAD^{tree})"
 EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
 mkdir -p "$EVIDENCE_DIR"
 
-# Build both signed Python releases first. Use the immutable CPython 3.12
-# application copy as SELECTED_BINARY for every Rust evidence producer.
-SELECTED_BINARY="$EVIDENCE_DIR/python/release-cp312/bin/market-squawk"
+# Build the signed CPython 3.14 product first. Use its immutable application
+# copy as SELECTED_BINARY for every Rust evidence producer.
+SELECTED_BINARY="$EVIDENCE_DIR/python/release-cp314/bin/market-squawk"
 
 "$SELECTED_BINARY" \
   release demonstrate --offline \
@@ -158,8 +169,7 @@ Before writing `manifest.json`, the closer requires exactly:
 └── python/
     ├── market-squawk-release.json
     ├── market-squawk-release-evidence.json
-    ├── release-cp312/
-    └── release-cp313/
+    └── release-cp314/
 ```
 
 It validates:
@@ -173,7 +183,7 @@ It validates:
 - mandatory provider surfaces, restart recovery, Coinbase Direct action authority, public-source
   non-promotion, and admitted FRED/ALFRED persistence/training rights;
 - exact provider and demonstration binding to the release executable;
-- signed Python environments plus exact Python-manifest binding to the selected application
+- the signed CPython 3.14 environment plus exact Python-manifest binding to the selected application
   executable;
 - production live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/doctor,
   and MCP predicates;
@@ -206,11 +216,10 @@ The terminal gate has not run. The current release remains blocked by:
 
 - authorized unchanged-head Coinbase Direct provider acceptance;
 - required external SEC, BLS, Treasury, and provider-recovery evidence;
-- FRED/ALFRED durable persistence and model-training rights under the currently enforced release
-  predicate;
 - exact-head fuzz, performance, Python, demonstration, full security/build, and closure evidence;
-  and
-- the grouped Quarter 4 review and final publication.
+- protected Apple and Windows signing credentials;
+- signed package evidence from Linux, Windows, Intel macOS, and Apple Silicon macOS; and
+- the grouped Quarter 4 review, immutable-release setting, and final publication.
 
 The release-demonstration implementation can be integrated while those externally coordinated
 inputs remain unresolved. It does not change their status.
@@ -219,6 +228,9 @@ inputs remain unresolved. It does not change their status.
 
 - [Strict evidence closer](../../apps/market-squawk/src/release/close.rs)
 - [Release command dispatch](../../apps/market-squawk/src/release/mod.rs)
+- [Stable GitHub release transaction](../../.github/workflows/release.yml)
+- [Complete release assembler](../../scripts/build_complete_release.py)
+- [Verified installation bootstrap](../../distribution/install.sh)
 - [Demonstration methodology](usable-release-demonstration.md)
 - [Performance methodology](usable-release-performance.md)
 - [Release review record](../reports/usable-release-review.md)
@@ -228,3 +240,7 @@ inputs remain unresolved. It does not change their status.
 - [cargo-deny](https://embarkstudios.github.io/cargo-deny/)
 - [RustSec cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit)
 - [Gitleaks](https://github.com/gitleaks/gitleaks)
+- [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+- [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
+- [Tauri macOS signing and notarization](https://v2.tauri.app/distribute/sign/macos/)
+- [Tauri Windows signing](https://v2.tauri.app/distribute/sign/windows/)

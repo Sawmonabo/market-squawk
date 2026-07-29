@@ -233,6 +233,7 @@ def allowed_local_dependencies(package_name: str) -> set[str]:
         return {
             "market-squawk",
             "market-squawk-data",
+            "market-squawk-installer",
             "market-squawk-platform",
             "market-squawk-services",
         }

@@ -1,0 +1,763 @@
+name: Stable Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated stable tag to publish
+        required: true
+        default: v1.0.0
+        type: string
+
+concurrency:
+  group: stable-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  freeze:
+    name: Freeze annotated release revision
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      tree: ${{ steps.identity.outputs.tree }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
+        with:
+          tool: cargo-dist@0.32.0
+      - id: identity
+        name: Admit one clean annotated release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$RELEASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          [[ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" == "tag" ]]
+          commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          tree="$(git rev-parse "$commit^{tree}")"
+          version="${RELEASE_TAG#v}"
+          [[ "$(git rev-parse HEAD)" == "$commit" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          grep -F -x "version = \"$version\"" Cargo.toml
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$commit" origin/main
+          cargo dist plan --tag "$RELEASE_TAG"
+          {
+            echo "commit=$commit"
+            echo "tree=$tree"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  credentials:
+    name: Require protected native-signing authority
+    needs: freeze
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject an incomplete stable signing configuration
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            WINDOWS_CERTIFICATE \
+            WINDOWS_CERTIFICATE_PASSWORD
+          do
+            [[ -n "${!name}" ]]
+          done
+
+  platform:
+    name: Signed platform release (${{ matrix.name }})
+    needs:
+      - freeze
+      - credentials
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            uv_relative: uv-x86_64-unknown-linux-gnu/uv
+            bundles: deb,appimage
+            timeout: 180
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-aarch64-apple-darwin/uv
+            bundles: app,dmg
+            timeout: 240
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-x86_64-apple-darwin/uv
+            bundles: app,dmg
+            timeout: 270
+          - name: Windows x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            uv_relative: uv.exe
+            bundles: nsis,msi
+            timeout: 270
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.freeze.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Tauri system prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          package_json_file: apps/market-squawk-desktop/package.json
+      # actions/setup-node v7.0.0, verified release commit (2026-07-21).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
+      # actions/setup-python v7.0.0, verified release commit (2026-07-13).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: 3.14.6
+      # ilammy/msvc-dev-cmd v1.13.0, verified release commit (2024-04-07).
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: "false"
+      - name: Import Apple Developer ID authority
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          certificate="$RUNNER_TEMP/market-squawk.p12"
+          keychain="$RUNNER_TEMP/market-squawk.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          python3 - "$certificate" <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          import sys
+
+          Path(sys.argv[1]).write_bytes(
+              base64.b64decode(os.environ["APPLE_CERTIFICATE"], validate=True)
+          )
+          PY
+          security create-keychain -p "$keychain_password" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          identities="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*\"\\(Developer ID Application:.*\\)\"/\\1/p')"
+          [[ -n "$identities" && "$identities" != *$'\n'* ]]
+          echo "APPLE_SIGNING_IDENTITY=$identities" >> "$GITHUB_ENV"
+          echo "MARKET_SQUAWK_APPLE_SIGNING_IDENTITY=$identities" >> "$GITHUB_ENV"
+      - name: Import Windows publisher authority
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $certificate = Join-Path $env:RUNNER_TEMP "market-squawk.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificate,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString `
+            -String $env:WINDOWS_CERTIFICATE_PASSWORD `
+            -Force `
+            -AsPlainText
+          $imported = Import-PfxCertificate `
+            -FilePath $certificate `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          if ($null -eq $imported -or $imported.Count -ne 1) {
+            throw "The Windows publisher certificate was not imported exactly once."
+          }
+          $thumbprint = $imported.Thumbprint.ToUpperInvariant()
+          if ($thumbprint -notmatch "^[0-9A-F]{40}$") {
+            throw "The Windows publisher thumbprint is malformed."
+          }
+          "MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT=$thumbprint" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build the signed sealed Python 3.14 product
+        shell: bash
+        env:
+          MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK: "1"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          artifact_root="$RUNNER_TEMP/python-product"
+          component_root="$RUNNER_TEMP/release-components"
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --prepare-cache-only
+          unset MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK
+          signing=()
+          if [[ "$RUNNER_OS" != "Linux" ]]; then
+            signing+=(--sign-native)
+          fi
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --offline \
+            "${signing[@]}"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            jq -e '.native_code_signing.status == "not-requested"' \
+              "$artifact_root/market-squawk-release-evidence.json"
+          else
+            jq -e \
+              '.native_code_signing.status == "signed"
+               and .native_code_signing.timestamped == true
+               and .signed_runtime_file_count > 0' \
+              "$artifact_root/market-squawk-release-evidence.json"
+          fi
+          {
+            echo "CARGO_BUILD_TARGET=$TARGET"
+            echo "CARGO_HOME=$artifact_root/cargo-home"
+            echo "CARGO_NET_OFFLINE=true"
+            echo "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT<<MARKET_SQUAWK_FOUNDATION"
+            cat "$artifact_root/training-foundation.json"
+            echo "MARKET_SQUAWK_FOUNDATION"
+            echo "MARKET_SQUAWK_PYTHON_PRODUCT=$artifact_root/release-cp314"
+            echo "MARKET_SQUAWK_COMPONENT_ROOT=$component_root"
+          } >> "$GITHUB_ENV"
+      - name: Build and stage complete native inputs
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+          UV_RELATIVE: ${{ matrix.uv_relative }}
+        run: |
+          set -euo pipefail
+
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-desktop
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk --bin market-squawk-capture-helper
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-installer
+          native="$RUNNER_TEMP/native-input"
+          mkdir -m 700 "$native"
+          cp "target/$TARGET/release/market-squawk-desktop$EXE" \
+            "$native/market-squawk-desktop$EXE"
+          cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \
+            "$native/market-squawk-capture-helper$EXE"
+          cp "target/$TARGET/release/market-squawk-installer$EXE" \
+            "$native/market-squawk-installer$EXE"
+          cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
+            "$native/uv$EXE"
+      - name: Sign and verify complete macOS inputs
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for path in "$RUNNER_TEMP/native-input/"*
+          do
+            codesign \
+              --force \
+              --options runtime \
+              --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              "$path"
+            codesign --verify --strict --verbose=2 "$path"
+          done
+      - name: Sign and verify complete Windows inputs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = Get-ChildItem -File (Join-Path $env:RUNNER_TEMP "native-input")
+          if ($files.Count -ne 4) {
+            throw "The complete native input set is not closed."
+          }
+          foreach ($file in $files) {
+            & signtool sign `
+              /fd SHA256 `
+              /sha1 $env:MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signing failed."
+            }
+            & signtool verify /pa /v $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode verification failed."
+            }
+          }
+      - name: Assemble the complete immutable bundle
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          python3 scripts/build_complete_release.py \
+            --target "$TARGET" \
+            --version "${{ needs.freeze.outputs.version }}" \
+            --commit "${{ needs.freeze.outputs.commit }}" \
+            --tree "${{ needs.freeze.outputs.tree }}" \
+            --python-release "$MARKET_SQUAWK_PYTHON_PRODUCT" \
+            --native-bundle "$RUNNER_TEMP/native-input" \
+            --output "$RUNNER_TEMP/complete-release"
+          echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release" \
+            >> "$GITHUB_ENV"
+      - name: Install desktop dependencies and signing overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+          printf '{}\n' > "$RUNNER_TEMP/tauri-signing.json"
+      - name: Configure Windows package signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $configuration = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = `
+                  $env:MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          }
+          $configuration |
+            ConvertTo-Json -Depth 4 |
+            Set-Content `
+              -Path (Join-Path $env:RUNNER_TEMP "tauri-signing.json") `
+              -Encoding utf8NoBOM
+      - name: Typecheck the desktop
+        run: pnpm --dir apps/market-squawk-desktop typecheck
+      - name: Run the three critical desktop tests
+        run: pnpm --dir apps/market-squawk-desktop test --run
+      # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        if: runner.os == 'Linux'
+        with:
+          projectPath: apps/market-squawk-desktop
+          args: >-
+            --config src-tauri/tauri.bundle.conf.json
+            --config ${{ runner.temp }}/tauri-signing.json
+            --target ${{ matrix.target }}
+            --ci
+            --bundles ${{ matrix.bundles }}
+      # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/market-squawk-desktop
+          args: >-
+            --config src-tauri/tauri.bundle.conf.json
+            --config ${{ runner.temp }}/tauri-signing.json
+            --target ${{ matrix.target }}
+            --ci
+            --bundles ${{ matrix.bundles }}
+      # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        if: runner.os == 'Windows'
+        with:
+          projectPath: apps/market-squawk-desktop
+          args: >-
+            --config src-tauri/tauri.bundle.conf.json
+            --config ${{ runner.temp }}/tauri-signing.json
+            --target ${{ matrix.target }}
+            --ci
+            --bundles ${{ matrix.bundles }}
+      - name: Verify the installed complete product
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
+          bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-${{ needs.freeze.outputs.version }}-$TARGET.zip"
+          manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
+          install_root="$RUNNER_TEMP/installed-product"
+          "$bootstrap" --root "$install_root" install \
+            --manifest "$manifest" \
+            --bundle "$bundle"
+          "$bootstrap" --root "$install_root" status --json
+          "$bootstrap" --root "$install_root" repair
+          application="$(find "$install_root/versions" -type f \
+            -name "market-squawk$EXE" -print)"
+          runtime="$(find "$install_root/versions" -type f \
+            \( -path '*/bin/python' -o -path '*/python.exe' \) -print)"
+          [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          "$application" doctor \
+            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --output json
+          "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          python3 scripts/smoke_mcp.py "$application"
+          "$bootstrap" --root "$install_root" uninstall
+      - name: Verify signed macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" \
+            -maxdepth 1 -type f -name '*.dmg' -print)"
+          [[ -n "$dmg" && "$dmg" != *$'\n'* ]]
+          hdiutil verify "$dmg"
+          mount="$RUNNER_TEMP/mounted-dmg"
+          mkdir -m 700 "$mount"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
+          app="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print)"
+          [[ -n "$app" && "$app" != *$'\n'* ]]
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+          hdiutil detach "$mount"
+      - name: Verify signed Windows packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = Join-Path `
+            (Get-Location) `
+            "target/${{ matrix.target }}/release/bundle"
+          $packages = @(
+            Get-ChildItem -Recurse -File $bundle |
+              Where-Object {
+                $_.Extension -eq ".msi" -or $_.Name.EndsWith("-setup.exe")
+              }
+          )
+          if ($packages.Count -ne 2) {
+            throw "The signed Windows package set is incomplete."
+          }
+          foreach ($package in $packages) {
+            $signature = Get-AuthenticodeSignature $package.FullName
+            if (
+              $signature.Status -ne "Valid" -or
+              $signature.SignerCertificate.Thumbprint -ne
+                $env:MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
+            ) {
+              throw "A Windows package has no valid expected publisher signature."
+            }
+          }
+      - name: Verify Linux AppImage MCP dispatch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          appimage="$(find "target/${{ matrix.target }}/release/bundle/appimage" \
+            -maxdepth 1 -type f -name '*.AppImage' -print)"
+          [[ -n "$appimage" && "$appimage" != *$'\n'* ]]
+          chmod u+x "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            python3 scripts/smoke_mcp.py --desktop-appimage "$appimage"
+          deb="$(find "target/${{ matrix.target }}/release/bundle/deb" \
+            -maxdepth 1 -type f -name '*.deb' -print)"
+          [[ -n "$deb" && "$deb" != *$'\n'* ]]
+          dpkg-deb --info "$deb" >/dev/null
+      - name: Collect the closed platform release
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          python3 scripts/build_complete_release.py collect \
+            --target "$TARGET" \
+            --version "${{ needs.freeze.outputs.version }}" \
+            --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
+            --native-bundle "target/$TARGET/release/bundle" \
+            --output "$RUNNER_TEMP/platform-publish"
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: platform-${{ matrix.target }}
+          path: ${{ runner.temp }}/platform-publish/*
+          if-no-files-found: error
+          retention-days: 1
+
+  draft:
+    name: Attest and create the closed draft
+    needs:
+      - freeze
+      - platform
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.freeze.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      # actions/download-artifact v8.0.1, verified release commit (2026-07-23).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: platform-*
+          path: ${{ runner.temp }}/platform
+      - name: Assemble and verify the exact release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' inputs \
+            < <(find "$RUNNER_TEMP/platform" -mindepth 1 -maxdepth 1 \
+              -type d -name 'platform-*' -print0 | sort -z)
+          [[ "${#inputs[@]}" -eq 4 ]]
+          arguments=()
+          for input in "${inputs[@]}"
+          do
+            arguments+=(--input "$input")
+          done
+          python3 scripts/build_complete_release.py aggregate \
+            "${arguments[@]}" \
+            --install-template distribution/install.sh \
+            --output "$RUNNER_TEMP/release"
+          (
+            cd "$RUNNER_TEMP/release"
+            sha256sum --check --strict SHA256SUMS
+          )
+          jq -e \
+            --arg commit "${{ needs.freeze.outputs.commit }}" \
+            --arg tree "${{ needs.freeze.outputs.tree }}" \
+            --arg tag "$RELEASE_TAG" \
+            '.commit_sha == $commit
+             and .tree_sha == $tree
+             and .tag == $tag
+             and (.targets | length) == 4' \
+            "$RUNNER_TEMP/release/market-squawk-release.json"
+      # actions/attest v4.2.0, verified release commit (2026-07-20).
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: ${{ runner.temp }}/release/*
+      - id: draft
+        name: Create the all-or-nothing draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release already exists for $RELEASE_TAG." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --target "${{ needs.freeze.outputs.commit }}" \
+            --title "Market Squawk ${{ needs.freeze.outputs.version }}" \
+            --notes "Complete signed self-hosted Market Squawk release." \
+            "$RUNNER_TEMP/release/"*
+          release_id="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              --jq .id
+          )"
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          mapfile -t local_names \
+            < <(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -exec basename {} \; | sort)
+          mapfile -t remote_names \
+            < <(
+              gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+                --paginate \
+                --jq '.[].name' |
+                sort
+            )
+          [[ "${local_names[*]}" == "${remote_names[*]}" ]]
+          for path in "$RUNNER_TEMP/release/"*
+          do
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY"
+          done
+
+  publish:
+    name: Publish the immutable stable release
+    needs:
+      - freeze
+      - draft
+    runs-on: ubuntu-24.04
+    environment: stable-release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the already closed draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          draft="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .draft
+          )"
+          target="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .target_commitish
+          )"
+          [[ "$draft" == "true" ]]
+          [[ "$target" == "${{ needs.freeze.outputs.commit }}" ]]
+          gh api \
+            --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=false >/dev/null
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName,targetCommitish \
+            --jq \
+              '.isDraft == false
+               and .isPrerelease == false
+               and .tagName == env.RELEASE_TAG
+               and .targetCommitish == "${{ needs.freeze.outputs.commit }}"' |
+            grep -F -x true
+
+  public-smoke:
+    name: Verify public install-to-use
+    needs:
+      - freeze
+      - publish
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - name: Install through the public stable endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --proto '=https' \
+            --tlsv1.2 \
+            --retry 6 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh |
+            sh
+      - name: Verify immutable release assets and attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          verified=false
+          for _attempt in {1..12}
+          do
+            if gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"; then
+              verified=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$verified" == "true" ]]
+          mkdir -m 700 "$RUNNER_TEMP/release-verify"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern install.sh \
+            --pattern market-squawk-release.json \
+            --dir "$RUNNER_TEMP/release-verify"
+          gh release verify-asset \
+            "$RELEASE_TAG" \
+            "$RUNNER_TEMP/release-verify/install.sh" \
+            --repo "$GITHUB_REPOSITORY"
+          for path in "$RUNNER_TEMP/release-verify/"*
+          do
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY"
+          done

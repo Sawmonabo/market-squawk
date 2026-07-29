@@ -15,10 +15,12 @@ targets = [
 checksum = "sha256"
 source-tarball = true
 installers = []
-ci = ["github"]
+# The custom stable-release transaction composes cargo-dist planning with the sealed Python,
+# complete-bundle, Tauri signing, and native smoke gates that generated cargo-dist CI cannot own.
+ci = []
 hosting = ["github"]
-github-attestations = true
-pr-run-mode = "plan"
+# `.github/workflows/release.yml` attests the final cross-platform asset closure in one operation.
+github-attestations = false
 fail-fast = false
 merge-tasks = false
 cache-builds = false

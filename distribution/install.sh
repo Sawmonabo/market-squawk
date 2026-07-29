@@ -5,7 +5,6 @@ umask 077
 
 tag='__MARKET_SQUAWK_TAG__'
 release_base="https://github.com/Sawmonabo/market-squawk/releases/download/$tag"
-manifest_url="$release_base/market-squawk-release.json"
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64 | Darwin:aarch64)
@@ -26,6 +25,8 @@ case "$(uname -s):$(uname -m)" in
     exit 2
     ;;
 esac
+
+manifest_url="$release_base/market-squawk-release-$target.json"
 
 case "$tag:$expected_sha256" in
   *'__MARKET_SQUAWK_'*)

@@ -24,8 +24,8 @@ jobs:
       code: ${{ steps.changes.outputs.code }}
       desktop: ${{ steps.changes.outputs.desktop }}
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
@@ -69,8 +69,12 @@ jobs:
 
               case "$path" in
                 apps/market-squawk-desktop/*|\
+                apps/market-squawk-installer/*|\
                 apps/market-squawk/assets/provider-onboarding/*|\
                 apps/market-squawk/src/local_product/*|\
+                distribution/*|\
+                python/wheelhouse-lock.json|\
+                python/wheelhouse/*|\
                 LICENSE-APACHE|LICENSE-MIT|\
                 docs/licenses/geist-ofl-license.txt|\
                 docs/licenses/geist-mono-ofl-license.txt|\
@@ -78,7 +82,12 @@ jobs:
                 docs/licenses/tract-onnx-notice.md|\
                 vendor/glib-0.18.5/*|\
                 Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
-                scripts/smoke_mcp.py|scripts/verify.sh|.github/workflows/ci.yml)
+                dist-workspace.toml|\
+                scripts/build_complete_release.py|\
+                scripts/build_python_release.py|\
+                scripts/check_workspace_boundaries.py|\
+                scripts/smoke_mcp.py|scripts/verify.sh|\
+                .github/workflows/ci.yml|.github/workflows/release.yml)
                   desktop=true
                   ;;
               esac
@@ -100,18 +109,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
-      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
-      # taiki-e/install-action v2.83.4, verified release commit (2026-07-17).
-      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b
+      # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: Install pinned Gitleaks CLI
@@ -136,8 +145,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
@@ -153,18 +162,18 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev
-      # pnpm/action-setup v6.0.8, verified release commit (2026-05-12).
-      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093
+      # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
         with:
           package_json_file: apps/market-squawk-desktop/package.json
-      # actions/setup-node v6.4.0, verified release commit (2026-04-20).
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      # actions/setup-node v7.0.0, verified release commit (2026-07-21).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
-      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
@@ -177,8 +186,8 @@ jobs:
           cache-all-crates: "false"
           cache-workspace-crates: "false"
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      # taiki-e/install-action v2.83.4, verified release commit (2026-07-17).
-      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b
+      # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: Install pinned Gitleaks CLI
@@ -205,13 +214,13 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
-      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
@@ -234,13 +243,13 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
-      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
@@ -268,25 +277,37 @@ jobs:
         include:
           - name: Linux x64
             os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            uv_relative: uv-x86_64-unknown-linux-gnu/uv
             bundles: deb,appimage
-            timeout: 90
+            timeout: 180
           - name: macOS Apple Silicon
             os: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-aarch64-apple-darwin/uv
             bundles: app,dmg
-            timeout: 120
+            timeout: 210
           - name: macOS Intel
             os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-x86_64-apple-darwin/uv
             bundles: app,dmg
-            timeout: 150
+            timeout: 240
           - name: Windows x64
             os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            uv_relative: uv.exe
             bundles: nsis,msi
-            timeout: 150
+            timeout: 240
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
-      # actions/checkout v6.0.2, verified release commit (2026-01-09).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
@@ -302,18 +323,25 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev
-      # pnpm/action-setup v6.0.8, verified release commit (2026-05-12).
-      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093
+      # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
         with:
           package_json_file: apps/market-squawk-desktop/package.json
-      # actions/setup-node v6.4.0, verified release commit (2026-04-20).
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      # actions/setup-node v7.0.0, verified release commit (2026-07-21).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
-      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
-      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+      # actions/setup-python v7.0.0, verified release commit (2026-07-13).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: 3.14.6
+      # ilammy/msvc-dev-cmd v1.13.0, verified release commit (2024-04-07).
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
@@ -328,18 +356,134 @@ jobs:
             ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
                 (github.event_name == 'pull_request' &&
                  github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Build the sealed Python 3.14 product
+        shell: bash
+        env:
+          MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK: "1"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          artifact_root="$RUNNER_TEMP/python-product"
+          component_root="$RUNNER_TEMP/release-components"
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --prepare-cache-only
+          unset MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --offline
+
+          {
+            echo "CARGO_BUILD_TARGET=$TARGET"
+            echo "CARGO_HOME=$artifact_root/cargo-home"
+            echo "CARGO_NET_OFFLINE=true"
+            echo "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT<<MARKET_SQUAWK_FOUNDATION"
+            cat "$artifact_root/training-foundation.json"
+            echo "MARKET_SQUAWK_FOUNDATION"
+            echo "MARKET_SQUAWK_PYTHON_PRODUCT=$artifact_root/release-cp314"
+            echo "MARKET_SQUAWK_COMPONENT_ROOT=$component_root"
+          } >> "$GITHUB_ENV"
+      - name: Build complete native inputs
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+          UV_RELATIVE: ${{ matrix.uv_relative }}
+        run: |
+          set -euo pipefail
+
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-desktop
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk --bin market-squawk-capture-helper
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-installer
+
+          native="$RUNNER_TEMP/native-input"
+          mkdir -m 700 "$native"
+          cp "target/$TARGET/release/market-squawk-desktop$EXE" \
+            "$native/market-squawk-desktop$EXE"
+          cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \
+            "$native/market-squawk-capture-helper$EXE"
+          cp "target/$TARGET/release/market-squawk-installer$EXE" \
+            "$native/market-squawk-installer$EXE"
+          cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
+            "$native/uv$EXE"
+
+          python3 scripts/build_complete_release.py \
+            --target "$TARGET" \
+            --version 1.0.0 \
+            --commit "$CANDIDATE_SHA" \
+            --tree "$(git rev-parse 'HEAD^{tree}')" \
+            --python-release "$MARKET_SQUAWK_PYTHON_PRODUCT" \
+            --native-bundle "$native" \
+            --output "$RUNNER_TEMP/complete-release"
+          echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release" \
+            >> "$GITHUB_ENV"
       - run: pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
       - run: pnpm --dir apps/market-squawk-desktop typecheck
       - run: pnpm --dir apps/market-squawk-desktop test --run
-      # tauri-apps/tauri-action v0.6.2, official release commit (2026-03-14).
-      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+      # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           projectPath: apps/market-squawk-desktop
           args: >-
             --config src-tauri/tauri.bundle.conf.json
+            --target ${{ matrix.target }}
             --ci
             --no-sign
             --bundles ${{ matrix.bundles }}
+      - name: Verify the installed complete product
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
+          bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-1.0.0-$TARGET.zip"
+          manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
+          install_root="$RUNNER_TEMP/installed-product"
+          "$bootstrap" --root "$install_root" install \
+            --manifest "$manifest" \
+            --bundle "$bundle"
+          "$bootstrap" --root "$install_root" status --json
+          "$bootstrap" --root "$install_root" repair
+
+          application="$(find "$install_root/versions" -type f \
+            -name "market-squawk$EXE" -print)"
+          runtime="$(find "$install_root/versions" -type f \
+            \( -path '*/bin/python' -o -path '*/python.exe' \) -print)"
+          [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          "$application" doctor \
+            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --output json
+          "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          python3 scripts/smoke_mcp.py "$application"
+          "$bootstrap" --root "$install_root" uninstall
+      - name: Collect the closed platform artifact set
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          python3 scripts/build_complete_release.py collect \
+            --target "$TARGET" \
+            --version 1.0.0 \
+            --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
+            --native-bundle "target/$TARGET/release/bundle" \
+            --output "$RUNNER_TEMP/platform-publish"
       - name: Verify Linux AppImage MCP dispatch
         if: runner.os == 'Linux'
         shell: bash
@@ -347,7 +491,7 @@ jobs:
           set -euo pipefail
 
           mapfile -d '' appimages \
-            < <(find target/release/bundle/appimage -maxdepth 1 \
+            < <(find "target/${{ matrix.target }}/release/bundle/appimage" -maxdepth 1 \
               -type f -name '*.AppImage' -print0)
           [[ "${#appimages[@]}" -eq 1 ]]
           appimage="${appimages[0]}"
@@ -361,7 +505,7 @@ jobs:
 
           stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
           stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
-          if target/release/market-squawk-desktop \
+          if "target/${{ matrix.target }}/release/market-squawk-desktop" \
             --stdio-mcp \
             --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
             >"$stdout" 2>"$stderr"; then
@@ -376,8 +520,8 @@ jobs:
       # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: market-squawk-${{ matrix.name }}-${{ env.CANDIDATE_SHA }}
-          path: target/release/bundle/**
+          name: market-squawk-${{ matrix.target }}-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/platform-publish/*
           if-no-files-found: error
           retention-days: 7
 

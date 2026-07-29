@@ -14,13 +14,14 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tomllib
 import urllib.error
 import urllib.parse
@@ -52,6 +53,8 @@ CANONICAL_RELEASE = "release-cp314"
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
 ROOT_PURPOSE = "market-squawk-python-release-artifacts"
+COMPONENT_ROOT_MARKER = ".market-squawk-release-components-v1"
+COMPONENT_ROOT_PURPOSE = "market-squawk-locked-release-components"
 ALLOWED_LICENSES = {
     "Apache-2.0",
     "MIT",
@@ -232,6 +235,12 @@ class ArtifactLayout:
 
 
 @dataclass(frozen=True)
+class AcquiredReleaseComponents:
+    python: Path
+    uv: Path
+
+
+@dataclass(frozen=True)
 class InstalledDistribution:
     name: str
     version: str
@@ -252,6 +261,22 @@ class NativeReleaseExecutables:
     onnx_worker: Path
     training_driver: Path
     validator: Path
+
+
+@dataclass(frozen=True)
+class NativeCodeSigning:
+    system: str
+    identity: str
+    tool: Path
+
+    def evidence(self) -> dict[str, object]:
+        return {
+            "identity": self.identity,
+            "status": "signed",
+            "system": self.system,
+            "tool_sha256": _file_digest(self.tool)[1],
+            "timestamped": True,
+        }
 
 
 class ReleaseSigner:
@@ -492,6 +517,31 @@ def admit_release_components(
 ) -> str:
     """Admit the exact uv, CPython, and PyArrow release-component matrix."""
 
+    raw, target = load_release_components(path, profile)
+    selected = target["uv"]
+    try:
+        executable = uv_executable.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ReleaseBuildError("locked uv executable is unavailable") from error
+    if (
+        executable.is_symlink()
+        or not executable.is_file()
+        or _file_digest(executable)
+        != (selected["binary_size_bytes"], selected["binary_sha256"])
+    ):
+        raise ReleaseBuildError("locked uv executable identity differs")
+    version = _run_output([str(executable), "--version"], root)
+    if not version.startswith("uv 0.12.0 "):
+        raise ReleaseBuildError("locked uv executable reports the wrong version")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def load_release_components(
+    path: Path,
+    profile: PlatformProfile,
+) -> tuple[bytes, dict[str, object]]:
+    """Load the closed component matrix and select one already-validated target."""
+
     try:
         if path.is_symlink():
             raise ReleaseBuildError("release component lock must not be a symbolic link")
@@ -561,22 +611,10 @@ def admit_release_components(
         _admit_download_identity(target_value["python"], "github.com")
         _admit_download_identity(target_value["pyarrow"], "files.pythonhosted.org")
 
-    selected = targets[profile.target]["uv"]
-    try:
-        executable = uv_executable.expanduser().resolve(strict=True)
-    except OSError as error:
-        raise ReleaseBuildError("locked uv executable is unavailable") from error
-    if (
-        executable.is_symlink()
-        or not executable.is_file()
-        or _file_digest(executable)
-        != (selected["binary_size_bytes"], selected["binary_sha256"])
-    ):
-        raise ReleaseBuildError("locked uv executable identity differs")
-    version = _run_output([str(executable), "--version"], root)
-    if not version.startswith("uv 0.12.0 "):
-        raise ReleaseBuildError("locked uv executable reports the wrong version")
-    return hashlib.sha256(raw).hexdigest()
+    selected = targets[profile.target]
+    if not isinstance(selected, dict):
+        raise ReleaseBuildError("selected release-component target is invalid")
+    return raw, selected
 
 
 def _admit_download_identity(
@@ -633,6 +671,279 @@ def _admit_download_identity(
             raise ReleaseBuildError("PyArrow release identity is invalid")
     elif value["format"] != "tar.gz" or value["archive_path"] != "python":
         raise ReleaseBuildError("managed Python archive identity is invalid")
+
+
+def acquire_release_components(
+    path: Path,
+    profile: PlatformProfile,
+    component_root: Path,
+    repository_root: Path,
+    *,
+    allow_network: bool,
+) -> AcquiredReleaseComponents:
+    """Acquire and safely expand the exact uv and CPython archives for one native build."""
+
+    _raw, target = load_release_components(path, profile)
+    root = _admit_component_root(component_root, repository_root, profile)
+    downloads = root / "downloads"
+    expanded = root / "expanded"
+    for directory in (downloads, expanded):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ReleaseBuildError("release component directory is unsafe")
+        directory.mkdir(exist_ok=True)
+
+    uv = target["uv"]
+    python = target["python"]
+    if not isinstance(uv, dict) or not isinstance(python, dict):
+        raise ReleaseBuildError("selected release-component inputs are invalid")
+    uv_archive = _acquire_locked_download(
+        downloads / "uv.archive",
+        uv,
+        allow_network=allow_network,
+    )
+    python_archive = _acquire_locked_download(
+        downloads / "python.archive",
+        python,
+        allow_network=allow_network,
+    )
+    uv_root = _replace_extracted_archive(
+        uv_archive,
+        expanded / "uv",
+        str(uv["format"]),
+    )
+    python_root = _replace_extracted_archive(
+        python_archive,
+        expanded / "python",
+        str(python["format"]),
+    )
+    uv_executable = (uv_root / str(uv["binary_path"])).resolve(strict=True)
+    python_executable = (
+        python_root
+        / str(python["archive_path"])
+        / profile.interpreter_relative_path
+    ).resolve(strict=True)
+    if (
+        not uv_executable.is_file()
+        or _file_digest(uv_executable)
+        != (uv["binary_size_bytes"], uv["binary_sha256"])
+        or not python_executable.is_file()
+    ):
+        raise ReleaseBuildError("expanded release component identity is invalid")
+    return AcquiredReleaseComponents(python=python_executable, uv=uv_executable)
+
+
+def _admit_component_root(
+    path: Path,
+    repository_root: Path,
+    profile: PlatformProfile,
+) -> Path:
+    repository_root = repository_root.resolve(strict=True)
+    home = Path.home().resolve(strict=True)
+    candidate = path.expanduser().absolute()
+    if candidate.is_symlink():
+        raise ReleaseBuildError("release component root must not be a symbolic link")
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise ReleaseBuildError("release component root must be a directory")
+        canonical = candidate.resolve(strict=True)
+    else:
+        canonical = candidate.parent.resolve(strict=True) / candidate.name
+    if (
+        canonical in {Path("/"), home, repository_root}
+        or canonical.is_relative_to(repository_root)
+    ):
+        raise ReleaseBuildError("release component root resolves to a protected location")
+    purpose = f"{COMPONENT_ROOT_PURPOSE}:{profile.target}"
+    expected = _marker_content(canonical, purpose)
+    marker = canonical / COMPONENT_ROOT_MARKER
+    if canonical.exists():
+        entries = tuple(canonical.iterdir())
+        if marker not in entries:
+            if entries:
+                raise ReleaseBuildError("release component root is not builder-owned")
+            marker.write_text(expected, encoding="utf-8")
+        elif marker.is_symlink() or not marker.is_file() or marker.read_text() != expected:
+            raise ReleaseBuildError("release component root ownership marker is invalid")
+    else:
+        canonical.mkdir(mode=0o700)
+        marker.write_text(expected, encoding="utf-8")
+    if os.name != "nt":
+        canonical.chmod(0o700)
+    return canonical
+
+
+def _acquire_locked_download(
+    destination: Path,
+    identity: dict[str, object],
+    *,
+    allow_network: bool,
+) -> Path:
+    expected = (identity["size_bytes"], identity["sha256"])
+    if destination.is_file() and not destination.is_symlink():
+        if _file_digest(destination) == expected:
+            return destination
+        if not allow_network:
+            raise ReleaseBuildError("cached release component identity differs")
+        destination.unlink()
+    elif destination.exists() or destination.is_symlink():
+        raise ReleaseBuildError("release component download path is unsafe")
+    if not allow_network:
+        raise ReleaseBuildError("locked release component is absent from the offline cache")
+
+    temporary = destination.with_suffix(".part")
+    temporary.unlink(missing_ok=True)
+    expected_size = int(identity["size_bytes"])
+    digest = hashlib.sha256()
+    observed = 0
+    request = urllib.request.Request(
+        str(identity["url"]),
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "market-squawk-release-builder",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("xb") as output:
+            final = urllib.parse.urlparse(response.geturl())
+            if (
+                final.scheme != "https"
+                or final.hostname
+                not in {
+                    "github.com",
+                    "objects.githubusercontent.com",
+                    "release-assets.githubusercontent.com",
+                }
+            ):
+                raise ReleaseBuildError("release component redirected outside its allowed hosts")
+            declared = response.headers.get("Content-Length")
+            if declared is not None and int(declared) != expected_size:
+                raise ReleaseBuildError("release component response length differs")
+            while chunk := response.read(1024 * 1024):
+                observed += len(chunk)
+                if observed > expected_size:
+                    raise ReleaseBuildError("release component exceeded its locked byte size")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, ValueError, urllib.error.URLError, ReleaseBuildError):
+        temporary.unlink(missing_ok=True)
+        raise
+    if observed != expected_size or digest.hexdigest() != identity["sha256"]:
+        temporary.unlink(missing_ok=True)
+        raise ReleaseBuildError("release component download identity differs")
+    if os.name != "nt":
+        temporary.chmod(0o600)
+    os.replace(temporary, destination)
+    return destination
+
+
+def _replace_extracted_archive(archive: Path, destination: Path, archive_format: str) -> Path:
+    parent = destination.parent.resolve(strict=True)
+    if destination.parent != parent or destination.is_symlink():
+        raise ReleaseBuildError("release component extraction path is unsafe")
+    temporary = parent / f".{destination.name}.extracting"
+    if temporary.exists() or temporary.is_symlink():
+        if not temporary.is_dir() or temporary.is_symlink():
+            raise ReleaseBuildError("release component temporary path is unsafe")
+        shutil.rmtree(temporary)
+    temporary.mkdir(mode=0o700)
+    try:
+        if archive_format == "tar.gz":
+            _extract_tar_archive(archive, temporary)
+        elif archive_format == "zip":
+            _extract_zip_archive(archive, temporary)
+        else:
+            raise ReleaseBuildError("release component archive format is unsupported")
+        _admit_extracted_tree(temporary)
+        if destination.exists():
+            if not destination.is_dir() or destination.is_symlink():
+                raise ReleaseBuildError("release component destination is unsafe")
+            shutil.rmtree(destination)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return destination.resolve(strict=True)
+
+
+def _extract_tar_archive(archive: Path, destination: Path) -> None:
+    with tarfile.open(archive, mode="r:gz") as source:
+        members = source.getmembers()
+        total = 0
+        if not members or len(members) > 32_768:
+            raise ReleaseBuildError("release component archive entry count is invalid")
+        for member in members:
+            _validate_archive_path(member.name)
+            if not (member.isdir() or member.isreg() or member.issym() or member.islnk()):
+                raise ReleaseBuildError("release component archive contains a special entry")
+            if member.size < 0 or member.size > MAX_DISTRIBUTION_FILE_BYTES:
+                raise ReleaseBuildError("release component archive entry is oversized")
+            total += member.size
+            if total > MAX_DISTRIBUTION_BYTES:
+                raise ReleaseBuildError("release component archive is oversized")
+        source.extractall(destination, members=members, filter="data")
+
+
+def _extract_zip_archive(archive: Path, destination: Path) -> None:
+    with zipfile.ZipFile(archive, mode="r") as source:
+        members = source.infolist()
+        total = 0
+        if not members or len(members) > 32_768:
+            raise ReleaseBuildError("release component archive entry count is invalid")
+        for member in members:
+            _validate_archive_path(member.filename)
+            mode = member.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            if (
+                member.flag_bits & 0x1
+                or member.file_size < 0
+                or member.file_size > MAX_DISTRIBUTION_FILE_BYTES
+                or file_type not in (0, stat.S_IFREG, stat.S_IFDIR)
+            ):
+                raise ReleaseBuildError("release component archive contains an invalid entry")
+            total += member.file_size
+            if total > MAX_DISTRIBUTION_BYTES:
+                raise ReleaseBuildError("release component archive is oversized")
+            output = destination.joinpath(*PurePosixPath(member.filename).parts)
+            if member.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with source.open(member) as reader, output.open("xb") as writer:
+                shutil.copyfileobj(reader, writer, 1024 * 1024)
+
+
+def _validate_archive_path(value: str) -> None:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or value.startswith(("/", "\\"))
+        or "\\" in value
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ReleaseBuildError("release component archive contains an unsafe path")
+
+
+def _admit_extracted_tree(root: Path) -> None:
+    files = 0
+    total = 0
+    for path in root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink():
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                raise ReleaseBuildError("release component archive contains an unsafe link")
+            continue
+        if path.is_dir():
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseBuildError("release component archive contains a special file")
+        files += 1
+        total += metadata.st_size
+        if files > 32_768 or total > MAX_DISTRIBUTION_BYTES:
+            raise ReleaseBuildError("release component extraction exceeds its fixed bounds")
 
 
 def admit_artifact_root(path: Path, repository_root: Path) -> ArtifactLayout:
@@ -1467,6 +1778,7 @@ def build_release(
     toolchain: dict[str, object],
     release_components_sha256: str,
     uv_executable: Path,
+    native_code_signing: NativeCodeSigning | None,
 ) -> None:
     with ExitStack() as cleanup:
         _build_release(
@@ -1478,6 +1790,7 @@ def build_release(
             toolchain,
             release_components_sha256,
             uv_executable,
+            native_code_signing,
             cleanup,
         )
 
@@ -1491,6 +1804,7 @@ def _build_release(
     toolchain: dict[str, object],
     release_components_sha256: str,
     uv_executable: Path,
+    native_code_signing: NativeCodeSigning | None,
     cleanup: ExitStack,
 ) -> None:
     admit_sources(lock, root)
@@ -1563,6 +1877,7 @@ def _build_release(
         root,
         toolchain,
         bootstrap_environment,
+        native_code_signing,
     )
     validator_size, validator_sha256 = _file_digest(built_executables.validator)
     build_python = _create_venv(
@@ -1684,6 +1999,7 @@ def _build_release(
     )
     (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
     matrix_evidence = []
+    signed_runtime_paths: list[Path] = []
     for runtime, minor, release_venv, release_python, installed_executables in prepared_releases:
         runtime_environment = dict(bootstrap_environment)
         _run(
@@ -1734,6 +2050,14 @@ def _build_release(
             runtime,
             built_executables.training_driver,
             project_version,
+        )
+        signed_runtime_paths.extend(
+            sign_release_tree(
+                release_venv,
+                runtime,
+                native_code_signing,
+                installed_executables,
+            )
         )
         if (
             _file_digest(installed_executables.application)
@@ -1862,6 +2186,16 @@ def _build_release(
             "training_driver_sha256": training_driver_sha256,
             "validator_sha256": validator_sha256,
         },
+        "native_code_signing": (
+            native_code_signing.evidence()
+            if native_code_signing is not None
+            else {
+                "status": "not-requested",
+                "system": profile.system,
+                "timestamped": False,
+            }
+        ),
+        "signed_runtime_file_count": len(signed_runtime_paths),
     }
     (layout.root / "market-squawk-release-evidence.json").write_text(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
@@ -1875,6 +2209,7 @@ def _build_native_release_executables(
     root: Path,
     toolchain: dict[str, object],
     environment: dict[str, str],
+    native_code_signing: NativeCodeSigning | None = None,
 ) -> NativeReleaseExecutables:
     profile = platform_profile(str(toolchain.get("target")))
     _run(
@@ -1920,6 +2255,15 @@ def _build_native_release_executables(
         )
     ):
         raise ReleaseBuildError("bound Rust release executables were not produced")
+    sign_native_files(
+        (
+            executables.application,
+            executables.onnx_worker,
+            executables.training_driver,
+            executables.validator,
+        ),
+        native_code_signing,
+    )
     return executables
 
 
@@ -2038,6 +2382,219 @@ def install_native_training_driver(
         raise ReleaseBuildError("native training launcher installation failed") from error
     finally:
         replacement.unlink(missing_ok=True)
+
+
+def admit_native_code_signing(
+    profile: PlatformProfile,
+    requested: bool,
+) -> NativeCodeSigning | None:
+    if not requested:
+        return None
+    if profile.system == "Darwin":
+        identity = os.environ.get("MARKET_SQUAWK_APPLE_SIGNING_IDENTITY", "")
+        tool = Path("/usr/bin/codesign")
+        if (
+            not identity
+            or len(identity) > 256
+            or any(character in identity for character in "\r\n\0")
+            or tool.is_symlink()
+            or not tool.is_file()
+        ):
+            raise ReleaseBuildError("Apple native signing authority is unavailable")
+        return NativeCodeSigning(profile.system, identity, tool)
+    if profile.system == "Windows":
+        identity = os.environ.get(
+            "MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT",
+            "",
+        ).upper()
+        discovered = shutil.which("signtool.exe") or shutil.which("signtool")
+        if re.fullmatch(r"[0-9A-F]{40}", identity) is None or discovered is None:
+            raise ReleaseBuildError("Windows native signing authority is unavailable")
+        tool = Path(discovered).resolve(strict=True)
+        if tool.is_symlink() or not tool.is_file():
+            raise ReleaseBuildError("Windows native signing tool is unavailable")
+        return NativeCodeSigning(profile.system, identity, tool)
+    raise ReleaseBuildError("native code signing is unavailable for this release target")
+
+
+def sign_native_files(
+    paths: tuple[Path, ...],
+    signing: NativeCodeSigning | None,
+) -> tuple[Path, ...]:
+    if signing is None:
+        return ()
+    signed = []
+    for path in paths:
+        if path.is_symlink() or not path.is_file() or not _is_native_code(path, signing.system):
+            raise ReleaseBuildError("native signing input is not an admitted executable")
+        if signing.system == "Darwin":
+            command = [
+                str(signing.tool),
+                "--force",
+                "--options",
+                "runtime",
+                "--timestamp",
+                "--sign",
+                signing.identity,
+                str(path),
+            ]
+            verify = [
+                str(signing.tool),
+                "--verify",
+                "--strict",
+                "--verbose=2",
+                str(path),
+            ]
+        else:
+            command = [
+                str(signing.tool),
+                "sign",
+                "/fd",
+                "SHA256",
+                "/sha1",
+                signing.identity,
+                "/tr",
+                "http://timestamp.digicert.com",
+                "/td",
+                "SHA256",
+                str(path),
+            ]
+            verify = [
+                str(signing.tool),
+                "verify",
+                "/pa",
+                "/v",
+                str(path),
+            ]
+        _run_native_signing(command)
+        _run_native_signing(verify)
+        signed.append(path.resolve(strict=True))
+    return tuple(signed)
+
+
+def sign_release_tree(
+    release_root: Path,
+    runtime: PythonRuntime,
+    signing: NativeCodeSigning | None,
+    installed_executables: NativeReleaseExecutables,
+) -> tuple[Path, ...]:
+    if signing is None:
+        return ()
+    excluded = {
+        path.resolve(strict=True)
+        for path in (
+            installed_executables.application,
+            installed_executables.onnx_worker,
+            installed_executables.training_driver,
+            installed_executables.validator,
+        )
+    }
+    candidates = tuple(
+        path
+        for path in sorted(release_root.rglob("*"))
+        if path.is_file()
+        and not path.is_symlink()
+        and path.resolve(strict=True) not in excluded
+        and _is_native_code(path, signing.system)
+    )
+    signed = sign_native_files(candidates, signing)
+    rewrite_signed_record_entries(release_root, runtime, signed)
+    return signed
+
+
+def rewrite_signed_record_entries(
+    release_root: Path,
+    runtime: PythonRuntime,
+    signed_paths: tuple[Path, ...],
+) -> None:
+    if not signed_paths:
+        return
+    profile = host_profile()
+    site_packages = _site_packages_path(release_root, runtime, profile).resolve(strict=True)
+    pending = {
+        path.resolve(strict=True)
+        for path in signed_paths
+        if path.resolve(strict=True).is_relative_to(site_packages)
+    }
+    for record in sorted(site_packages.glob("*.dist-info/RECORD")):
+        if record.is_symlink() or not record.is_file() or record.stat().st_size > MAX_RECORD_BYTES:
+            raise ReleaseBuildError("installed distribution RECORD is invalid")
+        rows = []
+        changed = False
+        try:
+            with record.open("r", encoding="utf-8", newline="") as stream:
+                for row in csv.reader(stream):
+                    if len(row) != 3:
+                        raise ReleaseBuildError("installed distribution RECORD is malformed")
+                    candidate = (
+                        site_packages.joinpath(*PurePosixPath(row[0]).parts)
+                        .resolve(strict=True)
+                    )
+                    if not candidate.is_relative_to(release_root):
+                        raise ReleaseBuildError("installed distribution RECORD escapes its release")
+                    if candidate in pending:
+                        size, digest = _file_digest(candidate)
+                        encoded = (
+                            base64.urlsafe_b64encode(bytes.fromhex(digest))
+                            .rstrip(b"=")
+                            .decode("ascii")
+                        )
+                        row = [row[0], f"sha256={encoded}", str(size)]
+                        pending.remove(candidate)
+                        changed = True
+                    rows.append(row)
+        except (OSError, UnicodeError, csv.Error) as error:
+            raise ReleaseBuildError("installed distribution RECORD is unreadable") from error
+        if not changed:
+            continue
+        temporary = record.with_name(f".{record.name}.signed")
+        if temporary.exists() or temporary.is_symlink():
+            raise ReleaseBuildError("signed RECORD replacement path already exists")
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as stream:
+                csv.writer(stream, lineterminator="\n").writerows(rows)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if temporary.stat().st_size > MAX_RECORD_BYTES:
+                raise ReleaseBuildError("signed distribution RECORD exceeds its bound")
+            os.replace(temporary, record)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if pending:
+        raise ReleaseBuildError("signed installed distribution file is absent from RECORD")
+
+
+def _is_native_code(path: Path, system: str) -> bool:
+    with path.open("rb") as stream:
+        prefix = stream.read(4)
+    if system == "Windows":
+        return path.suffix.lower() in {".dll", ".exe", ".pyd"} and prefix[:2] == b"MZ"
+    return prefix in {
+        b"\xbe\xba\xfe\xca",
+        b"\xbf\xba\xfe\xca",
+        b"\xca\xfe\xba\xbe",
+        b"\xca\xfe\xba\xbf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+    }
+
+
+def _run_native_signing(command: list[str]) -> None:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseBuildError("native signing tool could not complete") from error
+    if completed.returncode != 0 or len(completed.stdout) > 64 * 1024:
+        raise ReleaseBuildError("native signing or verification failed")
 
 
 def _marker_content(path: Path, purpose: str) -> str:
@@ -3383,11 +3940,21 @@ def main() -> int:
         choices=tuple(PLATFORM_PROFILES),
     )
     parser.add_argument("--artifact-root", required=True, type=Path)
-    parser.add_argument("--python", required=True, action="append", type=Path)
-    parser.add_argument("--uv", required=True, type=Path)
+    parser.add_argument("--python", action="append", type=Path)
+    parser.add_argument("--uv", type=Path)
+    parser.add_argument(
+        "--component-root",
+        type=Path,
+        help="Builder-owned cache for the exact locked uv and CPython archives.",
+    )
     parser.add_argument("--source-cache", type=Path)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--prepare-cache-only", action="store_true")
+    parser.add_argument(
+        "--sign-native",
+        action="store_true",
+        help="Timestamp and platform-sign every native release component.",
+    )
     options = parser.parse_args()
     try:
         root = Path(__file__).resolve().parents[1]
@@ -3400,16 +3967,42 @@ def main() -> int:
         profile = platform_profile(options.target)
         if host_profile() != profile:
             raise ReleaseBuildError("release target does not match the native build host")
+        if options.component_root is not None:
+            if options.python is not None or options.uv is not None:
+                raise ReleaseBuildError(
+                    "component-root cannot be combined with explicit Python or uv paths"
+                )
+            acquired = acquire_release_components(
+                root / "distribution/release-components.json",
+                profile,
+                options.component_root,
+                root,
+                allow_network=options.prepare_cache_only
+                and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1",
+            )
+            python_paths = (acquired.python,)
+            uv_path = acquired.uv
+        else:
+            if options.python is None or options.uv is None:
+                raise ReleaseBuildError(
+                    "explicit Python and uv paths or one component-root are required"
+                )
+            python_paths = tuple(options.python)
+            uv_path = options.uv
         lock = load_lock(lock_path, profile.target)
         components_sha256 = admit_release_components(
             root / "distribution/release-components.json",
             profile,
-            options.uv,
+            uv_path,
             root,
         )
-        uv_executable = options.uv.expanduser().resolve(strict=True)
+        native_code_signing = admit_native_code_signing(
+            profile,
+            options.sign_native,
+        )
+        uv_executable = uv_path.expanduser().resolve(strict=True)
         toolchain = admit_toolchain(root, profile)
-        runtimes = admit_runtimes(tuple(options.python), lock)
+        runtimes = admit_runtimes(python_paths, lock)
         admit_sources(lock, root)
         layout = admit_artifact_root(options.artifact_root, root)
         if options.prepare_cache_only:
@@ -3431,6 +4024,7 @@ def main() -> int:
                 toolchain,
                 components_sha256,
                 uv_executable,
+                native_code_signing,
             )
     except (OSError, ReleaseBuildError) as error:
         print(f"python release rejected: {error}", file=sys.stderr)

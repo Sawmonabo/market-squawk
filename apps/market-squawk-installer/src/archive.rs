@@ -454,22 +454,28 @@ fn verify_component(path: &Path, receipt: &ComponentReceipt) -> Result<(), Archi
 
 pub(crate) fn sync_directory(path: &Path) -> Result<(), ArchiveError> {
     #[cfg(unix)]
-    let directory = File::open(path)
-        .map_err(|source| ArchiveError::io("open directory for synchronization", source))?;
+    {
+        let directory = File::open(path)
+            .map_err(|source| ArchiveError::io("open directory for synchronization", source))?;
+        directory
+            .sync_all()
+            .map_err(|source| ArchiveError::io("synchronize directory", source))
+    }
     #[cfg(windows)]
-    let directory = {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(|source| ArchiveError::io("open directory for synchronization", source))?
-    };
-    directory
-        .sync_all()
-        .map_err(|source| ArchiveError::io("synchronize directory", source))
+    {
+        // Windows permits directory handles but does not support flushing one through
+        // `FlushFileBuffers`: that call requires file write access, which directory handles
+        // cannot request. Component files are flushed before same-volume activation, and the
+        // retained archive remains the recovery authority if selector publication is interrupted.
+        let metadata = fs::symlink_metadata(path).map_err(|source| {
+            ArchiveError::io("inspect directory after synchronization", source)
+        })?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            Ok(())
+        } else {
+            Err(ArchiveError::UnsafeDestination)
+        }
+    }
 }
 
 /// Release archive or installed-tree validation failure.

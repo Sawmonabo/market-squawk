@@ -5,8 +5,13 @@ import re
 import unittest
 
 
-WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+WORKFLOWS = tuple(
+    Path(__file__).resolve().parents[2] / ".github" / "workflows" / name
+    for name in ("ci.yml", "release.yml")
+)
 ACTION_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+
+
 def workflow_step_blocks(workflow: str) -> list[str]:
     lines = workflow.splitlines()
     blocks: list[str] = []
@@ -34,25 +39,35 @@ def workflow_step_blocks(workflow: str) -> list[str]:
 
 class CiWorkflowPolicyTests(unittest.TestCase):
     def test_external_actions_are_immutable_and_checkout_never_persists_credentials(self) -> None:
-        workflow = WORKFLOW.read_text()
-        action_steps = [
-            block for block in workflow_step_blocks(workflow) if "- uses:" in block
-        ]
-        self.assertTrue(action_steps)
-        checkout_steps = 0
-        for step in action_steps:
-            reference_match = re.search(r"^- uses: (\S+)$", step.lstrip(), re.MULTILINE)
-            self.assertIsNotNone(reference_match, step)
-            reference = reference_match.group(1) if reference_match else ""
-            with self.subTest(reference=reference):
-                self.assertRegex(reference, ACTION_PIN)
-                if reference.startswith("actions/checkout@"):
-                    checkout_steps += 1
-                    self.assertRegex(
-                        step,
-                        re.compile(r"^\s+persist-credentials: false$", re.MULTILINE),
-                    )
-        self.assertGreater(checkout_steps, 0)
+        for workflow_path in WORKFLOWS:
+            action_steps = [
+                block
+                for block in workflow_step_blocks(workflow_path.read_text())
+                if "- uses:" in block
+            ]
+            self.assertTrue(action_steps)
+            checkout_steps = 0
+            for step in action_steps:
+                reference_match = re.search(
+                    r"^- uses: (\S+)$",
+                    step.lstrip(),
+                    re.MULTILINE,
+                )
+                self.assertIsNotNone(reference_match, step)
+                reference = reference_match.group(1) if reference_match else ""
+                with self.subTest(workflow=workflow_path.name, reference=reference):
+                    self.assertRegex(reference, ACTION_PIN)
+                    if reference.startswith("actions/checkout@"):
+                        checkout_steps += 1
+                        self.assertRegex(
+                            step,
+                            re.compile(
+                                r"^\s+persist-credentials: false$",
+                                re.MULTILINE,
+                            ),
+                        )
+            self.assertGreater(checkout_steps, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
