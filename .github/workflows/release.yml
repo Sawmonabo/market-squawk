@@ -69,6 +69,7 @@ jobs:
     name: Require protected native-signing authority
     needs: freeze
     runs-on: ubuntu-24.04
+    environment: stable-release
     steps:
       - name: Reject an incomplete stable signing configuration
         shell: bash
@@ -134,6 +135,7 @@ jobs:
             timeout: 270
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
+    environment: stable-release
     steps:
       # actions/checkout v7.0.1, verified release commit (2026-07-22).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
