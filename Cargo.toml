@@ -227,4 +227,5 @@ strip = "symbols"
 # Windows ONNX worker. Keep the audited upstream source local until
 # https://github.com/ohadravid/win32job-rs/issues/6 is resolved and released.
 [patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }
 win32job = { path = "vendor/win32job" }

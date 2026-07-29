@@ -11,8 +11,29 @@ import sys
 
 MAX_REPOSITORY_FILE_BYTES = 5 * 1024 * 1024
 
-# Binary protocol fixtures must be individually reviewed and listed by exact repository path.
-ALLOWED_BINARY_FILES: frozenset[str] = frozenset()
+# Binary protocol fixtures and shipping visual assets must be individually reviewed and listed by
+# exact repository path.
+ALLOWED_BINARY_FILES: frozenset[str] = frozenset(
+    {
+        "apps/market-squawk-desktop/src-tauri/icons/128x128.png",
+        "apps/market-squawk-desktop/src-tauri/icons/128x128@2x.png",
+        "apps/market-squawk-desktop/src-tauri/icons/32x32.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square107x107Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square142x142Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square150x150Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square284x284Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square30x30Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square310x310Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square44x44Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square71x71Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/Square89x89Logo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/StoreLogo.png",
+        "apps/market-squawk-desktop/src-tauri/icons/icon.icns",
+        "apps/market-squawk-desktop/src-tauri/icons/icon.ico",
+        "apps/market-squawk-desktop/src-tauri/icons/icon.png",
+        "docs/superpowers/specs/assets/2026-07-28-market-squawk-obsidian-signal.png",
+    }
+)
 
 BLOCKED_DIRECTORY_COMPONENTS = frozenset(
     {

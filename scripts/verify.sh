@@ -2,6 +2,20 @@
 set -euo pipefail
 
 readonly TARGET_CEILING_KIB=$((20 * 1024 * 1024))
+readonly DESKTOP_APP="apps/market-squawk-desktop"
+
+policy_only=false
+case "${1:-}" in
+  "")
+    ;;
+  --policy-only)
+    policy_only=true
+    ;;
+  *)
+    printf 'usage: %s [--policy-only]\n' "$0" >&2
+    exit 2
+    ;;
+esac
 
 reject_cargo_directory_overrides() {
   local variable
@@ -60,14 +74,45 @@ reject_ambient_capture_benchmark_variables
 export CARGO_INCREMENTAL=0
 enforce_target_ceiling pre-verification
 
-python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 python3 scripts/check_workspace_boundaries.py
 python3 scripts/check_generated_artifacts.py
 cargo deny check
-# The exact exception and upstream refresh gate are documented in deny.toml.
-cargo audit --deny warnings --ignore RUSTSEC-2024-0436
+# The exact exceptions, upstream constraints, and refresh gates are documented in deny.toml.
+cargo audit --deny warnings \
+  --ignore RUSTSEC-2024-0370 \
+  --ignore RUSTSEC-2024-0411 \
+  --ignore RUSTSEC-2024-0412 \
+  --ignore RUSTSEC-2024-0413 \
+  --ignore RUSTSEC-2024-0415 \
+  --ignore RUSTSEC-2024-0416 \
+  --ignore RUSTSEC-2024-0418 \
+  --ignore RUSTSEC-2024-0419 \
+  --ignore RUSTSEC-2024-0420 \
+  --ignore RUSTSEC-2024-0436 \
+  --ignore RUSTSEC-2025-0075 \
+  --ignore RUSTSEC-2025-0080 \
+  --ignore RUSTSEC-2025-0081 \
+  --ignore RUSTSEC-2025-0098 \
+  --ignore RUSTSEC-2025-0100
 gitleaks dir --redact --no-banner .
 gitleaks git --redact --no-banner
+
+if "$policy_only"; then
+  exit 0
+fi
+
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  printf 'full verification requires the pnpm version pinned by %s/package.json\n' \
+    "$DESKTOP_APP" >&2
+  exit 2
+fi
+
+pnpm --dir "$DESKTOP_APP" install --frozen-lockfile
+pnpm --dir "$DESKTOP_APP" typecheck
+pnpm --dir "$DESKTOP_APP" test --run
+pnpm --dir "$DESKTOP_APP" build
 cargo fmt --all -- --check
 RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS="-Dwarnings" \
   CAPTURE_BENCH_DEVELOPMENT_BACKEND=candidate \

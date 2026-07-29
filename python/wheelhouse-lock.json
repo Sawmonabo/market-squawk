@@ -82,13 +82,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "d7f7b2f32d1de6a2c3c99196cf2ee6da87ec52bc0ec5b79e579ad8491e499a72",
-      "size_bytes": 178339
+      "sha256": "5add6b3c5018079aca252366b3a0545ac32587db3a1090ff8a4ec27da711276b",
+      "size_bytes": 231372
     },
     {
       "path": "Cargo.toml",
-      "sha256": "4c2b7d43fc450538c50bf9bcbeda3a116da80a88732e49b5daa77de1a8877e4c",
-      "size_bytes": 7325
+      "sha256": "464bd06d6f3b52139e24cb2ce2ed4ce3332dcac90c356be8f2883bf9097ab81c",
+      "size_bytes": 7715
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
@@ -807,13 +807,13 @@
     },
     {
       "path": "apps/market-squawk/assets/provider-onboarding/index.html",
-      "sha256": "92187bd3987d278410d780e29d081d097dac8e3245ee51482134d8fcc71192ae",
+      "sha256": "c10e5f229c2b2256bd22e3a9cf3b67562f7c5cc11ceb2789ea33a6e2283d5c16",
       "size_bytes": 1001
     },
     {
       "path": "apps/market-squawk/assets/provider-onboarding/portal.css",
-      "sha256": "0384c0027067645712cfffa94dc4f929a46e58f5c91717dc6d2fc867558258a5",
-      "size_bytes": 20535
+      "sha256": "d05b30ac86716f8e2f95b3c8c65a1a9e587d9eea1e123cd0d05ac840ba180a29",
+      "size_bytes": 19990
     },
     {
       "path": "apps/market-squawk/assets/provider-onboarding/portal.js",
@@ -822,8 +822,8 @@
     },
     {
       "path": "apps/market-squawk/src/application.rs",
-      "sha256": "13634387dcca8e0397b3dfa3a1a97b453e27725d6e55f8c12de857793315da56",
-      "size_bytes": 23732
+      "sha256": "1d314d7b942148020303a697e75dfd1b045153fa55146712eb97603b2a24314a",
+      "size_bytes": 23942
     },
     {
       "path": "apps/market-squawk/src/application/analysis.rs",
@@ -1242,8 +1242,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/mod.rs",
-      "sha256": "d3ab53a83b7eba0f4706bc4418a855db5de485cc870c1d70848c36acd710547a",
-      "size_bytes": 27269
+      "sha256": "19f9d946d605d3f1527be0412c347cb0deb96aa154e722cee707a1b0b1a85f4c",
+      "size_bytes": 27911
     },
     {
       "path": "apps/market-squawk/src/local_product/provider_activation_state.rs",
@@ -4349,6 +4349,486 @@
       "path": "scripts/tests/test_build_python_release.py",
       "sha256": "1d77cc7053c2cc332a0e03fb0e4855d9bab2cb080deb0c200c9972e0d69dde03",
       "size_bytes": 14193
+    },
+    {
+      "path": "vendor/glib-0.18.5/Cargo.toml",
+      "sha256": "bcd52d812b4c111864ae8e88ba6c0a8311eb0cf781b5e81634950b4619592132",
+      "size_bytes": 3127
+    },
+    {
+      "path": "vendor/glib-0.18.5/README.md",
+      "sha256": "31d662868efe1db14c1ae19dc99c0352266dd6f6b2db31d4079cbb162268a819",
+      "size_bytes": 3720
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/alias.rs",
+      "sha256": "55c23867766bc1f570c9d51dd165eb0f96ba606eae6ee4c15d9f3c7a8ccd19e5",
+      "size_bytes": 332
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/checksum.rs",
+      "sha256": "2c7f7d139aff5a28ba1672f633e0f76a79e4527e5abed0d9d588d823a3002646",
+      "size_bytes": 1368
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/constants.rs",
+      "sha256": "c2fa5757279dcc2a357daa56cef643c622b2c387ddc48f88024f67bb72a4cd00",
+      "size_bytes": 6264
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/date_time.rs",
+      "sha256": "fc05d7c90e522d5ef1cb7cef6d41de49b8357a8349c48745dff3f769b42d0fda",
+      "size_bytes": 16318
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/enums.rs",
+      "sha256": "70685084d7462df9cf4f9a1a5254b298f0de8ea587cbd7f8ff28e468c306386a",
+      "size_bytes": 102752
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/flags.rs",
+      "sha256": "c2f77a0bdeeea8af3d0a39d7afeb2b75affae58905522b5fa65922d460052d4e",
+      "size_bytes": 19925
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/functions.rs",
+      "sha256": "e9b0cd6ddde7a2fcb157221e712d9f33f419aeae1aa3d206987ebce526152e7e",
+      "size_bytes": 26604
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/key_file.rs",
+      "sha256": "263c41a0df370671ef65dbf77f4a1311c349ebbb2a7b6d0a4a19525d57788e9d",
+      "size_bytes": 15314
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/main_context.rs",
+      "sha256": "6c8d3b897b821e73e1653aeff2ddfcffcfd7dd3805bb1d850656c1b8100cab84",
+      "size_bytes": 4947
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/main_loop.rs",
+      "sha256": "79d3273a2e8357b7d1cf2e3d53ed98e85f3260ae9780a7a559234c0d2d797b57",
+      "size_bytes": 1557
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/markup_parse_context.rs",
+      "sha256": "979a1e49c8cd5cbca751d40cb37defe20c2f0a72dd9e4b65838c527d0ae0d291",
+      "size_bytes": 3567
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/mod.rs",
+      "sha256": "74aa2e241ebca146a4843974b2c83087bc93fb71e70d86d2011172cbc5616ce4",
+      "size_bytes": 4239
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/source.rs",
+      "sha256": "b2360784363f49c9a2e63e2e7873bc478d93eb09dda22f0018ee69b84a5f92b8",
+      "size_bytes": 4434
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/time_zone.rs",
+      "sha256": "62a86aac66665ec0843bb0ad0d202d72b03224b4b072895034c7daf1f09aba81",
+      "size_bytes": 3092
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/uri.rs",
+      "sha256": "dd30e5981df044c95a3900c983da28c06fd8fa399b03c76acb45ec2f6c59fcae",
+      "size_bytes": 16960
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/auto/versions.txt",
+      "sha256": "035a7287797d47bfbc9811abee3a8bbae5f5e6ec7dab72ec394a123ddb88c4c2",
+      "size_bytes": 132
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/boxed.rs",
+      "sha256": "1bb1a003c82fc5903b398aef6f07d8f828446eff0a793e4aa94abbadff79f3fa",
+      "size_bytes": 24430
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/boxed_any_object.rs",
+      "sha256": "bd11c46e03dea925ae9b15ba6c2c70f38e207aa70530f30c4a1e7b7322f19404",
+      "size_bytes": 6519
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/boxed_inline.rs",
+      "sha256": "9dd644d5be6a11e8a56dbb16f70c1570affdeceaaf2622f88d661fa5769b487d",
+      "size_bytes": 29709
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/bridged_logging.rs",
+      "sha256": "a74ff5afc558ac072d083703d234bb79d77362d56c6a2b50934c49a7abfe0eb1",
+      "size_bytes": 13937
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/byte_array.rs",
+      "sha256": "b859699a50b69878cbf4d7d83c25a3e34402147bc7febe481e92c6d01e31898c",
+      "size_bytes": 3991
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/bytes.rs",
+      "sha256": "2c4d37050af422a475380fdc05dda58a5179b7a54ac67d14e8ab1131833f5619",
+      "size_bytes": 7205
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/char.rs",
+      "sha256": "edb208444ce0760c6b52a86e90db0fe2b18472c2436f75b2d241acfaeb89c3f6",
+      "size_bytes": 5624
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/checksum.rs",
+      "sha256": "fc98c34788d878d2461a394b442a4d8797602b3d380d96260c71160c552faa6f",
+      "size_bytes": 1987
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/clone.rs",
+      "sha256": "87ff5bf8fca591fb8236d61c8b1bee0db54c645b0af1c1f97dd36298c4f0f79b",
+      "size_bytes": 2073
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/closure.rs",
+      "sha256": "2008243add8ac242fad14e79626ba4fcf3eac2eed72666ae9f9936bad163714a",
+      "size_bytes": 14750
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/list.rs",
+      "sha256": "53887e634a8dc22fd79ad7d38f9e914d06a013061831f5e4bd2ba9095c668220",
+      "size_bytes": 27224
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/mod.rs",
+      "sha256": "0a6967d4d9f22bcfa6dcc35b2ce4f26ce1cc82f83111812ab0815f4b33e2c81f",
+      "size_bytes": 275
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/ptr_slice.rs",
+      "sha256": "6fcb10ac7d9b4ba58cdbed9dc0ad40a4f4d4f608a3572403f8a7c77fc99c2221",
+      "size_bytes": 41267
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/slice.rs",
+      "sha256": "64d450ea2799db681a2d8d505bcac94c9f3a9ab0e52deb8c7ad0eada7d9b15a8",
+      "size_bytes": 27475
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/slist.rs",
+      "sha256": "15b7ae76a09001e2df9c43feed8f28e06385d6032d53010358e58eb4a693e54b",
+      "size_bytes": 27177
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/collections/strv.rs",
+      "sha256": "e519528d5006592cf682be0ddca09a7eb2b5997115df28184b19e81881c03f03",
+      "size_bytes": 44165
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/control_flow.rs",
+      "sha256": "9610f16228f2f57a426fbb0c8a9513cb22631d0dc52fa65dfdc5f5372757a40e",
+      "size_bytes": 2480
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/convert.rs",
+      "sha256": "78fb8fa4fcc6d4c42be9eacb782f456daa35fdab20698dbcc1b67c11e66cb05a",
+      "size_bytes": 13755
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/date.rs",
+      "sha256": "bed49f44abb204d94c062f137f7a39e3ad722adf90b11b833aaae12733871650",
+      "size_bytes": 13749
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/date_time.rs",
+      "sha256": "99cff4cd4e19d57bf81187bc6e74fe7f6936cbb6575728027bfe16595ec478d4",
+      "size_bytes": 366
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/enums.rs",
+      "sha256": "a436d253d4f03bffacb488a890784304f231297607460c49ceab64bef21e5338",
+      "size_bytes": 30879
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/error.rs",
+      "sha256": "7350aca6f26e415d3fe653c6ec94e1e6b735d3f2cefbdae7131cb1342762b29a",
+      "size_bytes": 9227
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/exit_code.rs",
+      "sha256": "a3de4048a143860c2d38dd1067b91bc52da9c3994491d5f8ca5187100739ff48",
+      "size_bytes": 680
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/future_with_timeout.rs",
+      "sha256": "59c508f47dd247b680ed4a31f05124ae753845a5416c8fec0e31f6218849972c",
+      "size_bytes": 2950
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/auto/binding.rs",
+      "sha256": "9fcf34d5a4e30234890ecf00af8c7b73362597d12007483d630c6fa94099106b",
+      "size_bytes": 1579
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/auto/binding_group.rs",
+      "sha256": "fa4186b216f273ad2d7d531018d60a4b2a68243e1c1526f20d11bc10dc45b662",
+      "size_bytes": 2647
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/auto/flags.rs",
+      "sha256": "9a900bdfccfa61f6b222df9cc2bd1859438f72fc17cbe807a268a17079599af3",
+      "size_bytes": 4598
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/auto/mod.rs",
+      "sha256": "71208f4ba80a250bd47ea5216e17da250b344f6e5c8cbd2fc154771bab0f1124",
+      "size_bytes": 687
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/auto/signal_group.rs",
+      "sha256": "5ccbc1ee15564464d8107baf2631daa5dd426f8649d9710679f49f1407797a2b",
+      "size_bytes": 2045
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/binding.rs",
+      "sha256": "ff7537c94681056aba4cdb603653e1d781ae2d2c6728d55fc5b8b9786b13758a",
+      "size_bytes": 9508
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/binding_group.rs",
+      "sha256": "79705410a96508115ab8a601e13251a27a62507e93b1c88f9c90c590ed6f302b",
+      "size_bytes": 16670
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/flags.rs",
+      "sha256": "6c2bb2afff339f54225ebbe9d4ab7ef06e8f783612e1e079bc18a3be6ef0ba1d",
+      "size_bytes": 1909
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/mod.rs",
+      "sha256": "ad5a8530e2bb7e3a4e49d9d78f66451b0aa8c5b16b88e7185c4a8759d5aa3329",
+      "size_bytes": 573
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gobject/signal_group.rs",
+      "sha256": "17eb4995d8f13d37d25d3a0465ca135d69fc4e548db712c2bd80c5419d8812e6",
+      "size_bytes": 8181
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gstring.rs",
+      "sha256": "f3fe8d70bd1e58b070d4ed9d34cdd3e39f511f341424a632b9d8acdf2aec8741",
+      "size_bytes": 73945
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/gstring_builder.rs",
+      "sha256": "bfb1b131433531af2efa8765853ef35bbe02dc86120a04b55e6ec97e60cc8fac",
+      "size_bytes": 9407
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/key_file.rs",
+      "sha256": "018b398bc1bd50fd0f9925408d6898d2974c7f510d79575cb655dad7e17243de",
+      "size_bytes": 9335
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/lib.rs",
+      "sha256": "70abc92bf0d02f3c4989034501065cdf64d70901e511f6720d8cd65fcbb662e1",
+      "size_bytes": 6621
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/log.rs",
+      "sha256": "d5458fa20083efdd1f46bc1464d46fcd32fb1af926f3151881f0c0ec37e330e1",
+      "size_bytes": 34213
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/main_context.rs",
+      "sha256": "a1dc45489f318659f0c4a94d3143807270e6cce6a8d127afa25944838ce66b25",
+      "size_bytes": 9513
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/main_context_channel.rs",
+      "sha256": "e619173fc993bb1ffa350ef692b50b3b268ed5b294208caede8271ae742d80e8",
+      "size_bytes": 30419
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/main_context_futures.rs",
+      "sha256": "49a56a433d4f57929d7ced0d438b8dcdbe05b78d097e28d27ead09821cb802be",
+      "size_bytes": 26537
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/manual_functions.rs",
+      "sha256": "8e9bea0686535b5a464c82fe8b0356734e82c6aafe8bec9c717d208a6fb76059",
+      "size_bytes": 9914
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/object.rs",
+      "sha256": "61304201fc2dd2ec7d0e8db7343bc62db6e9c81be07b2b16ad3f530a8972f017",
+      "size_bytes": 160705
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/param_spec.rs",
+      "sha256": "3ffc0efc67226b180ae4f625d6579749c1d74e58fc8790d4ad837697a65ea3ff",
+      "size_bytes": 69707
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/prelude.rs",
+      "sha256": "75479bc1c16d719f472d44f08450b6972af5b4b18a77bcba381fa34428b0a567",
+      "size_bytes": 374
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/property.rs",
+      "sha256": "c35ba9d518b0866f4bd07de5b2433fd70ef0ed38a1fb68839d2e481ab77bd887",
+      "size_bytes": 8863
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/quark.rs",
+      "sha256": "edfba293a1a4fcce1d057f961a182fd6aa5bfe142ecf03a692593d6951a1af5c",
+      "size_bytes": 2514
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/shared.rs",
+      "sha256": "24678285b9553298767c5a866aa9005dd84e0b3dae4760fcbbc6d3bf32adab8a",
+      "size_bytes": 23665
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/signal.rs",
+      "sha256": "09af50bf7e406b7c36f0fcbcfdb2855d6db259ca14fd4922c25c13b62db45b1d",
+      "size_bytes": 5933
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/source.rs",
+      "sha256": "2b5ed41c030a532be71b8525f73e6097d43380899e352dc2b1db07e4ff2d4cc5",
+      "size_bytes": 40158
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/source_futures.rs",
+      "sha256": "7d2fde280f9830916e3392eb7cdb69e1dd731084089699a2ad1bc0ddcb7dbcd6",
+      "size_bytes": 15661
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/basic.rs",
+      "sha256": "e671bd06f057c34b0b0b1dbb8c2b49c1d088b8697a0143d592969162744601ae",
+      "size_bytes": 2092
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/boxed.rs",
+      "sha256": "77825d5f8f7c6a2c78e10a696bbcd379984c1174ab9e3ce5a67d0942c38c4d16",
+      "size_bytes": 3346
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/interface.rs",
+      "sha256": "7ce87736717fdba007b649501e6cd4121c69e18a6cf0bcaf79a5512b4864ca53",
+      "size_bytes": 7121
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/mod.rs",
+      "sha256": "c3b6cb807d4e5ba7bd88153fedff76de11bcd53797905fc94d1dfadc51caa3c9",
+      "size_bytes": 9355
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/object.rs",
+      "sha256": "77da557b5e346ae3cde5ddfe525eeba22054b5beeb8335ae4a54a95cafab8701",
+      "size_bytes": 24414
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/object_impl_ref.rs",
+      "sha256": "7395e7e9bd5f8e6221883daaf2918758171bd75a002c5ec45b3099449a088c5d",
+      "size_bytes": 4279
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/shared.rs",
+      "sha256": "d60b0164b5d71412d9e7ef7a405cf730eecc3825dea2889810512124f50aae80",
+      "size_bytes": 9284
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/signal.rs",
+      "sha256": "006c9ad5a763fa2922b933f18b19b253d771f4a89e3115acca9c445c26c361b2",
+      "size_bytes": 21430
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/subclass/types.rs",
+      "sha256": "a2ad0aa5a551d95e73eb31d0339007bc615ebcbdf72953a92ddcc66ba09f4e4e",
+      "size_bytes": 38914
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/thread_guard.rs",
+      "sha256": "33995f6ba5bb78698ce049be3129579b9d7cc7d101b64bc8252e2d46150369a8",
+      "size_bytes": 3336
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/thread_pool.rs",
+      "sha256": "82766026df3d2f06fc4917eab56c4c205d95eaebd46b06f3c53ec4b406b2b050",
+      "size_bytes": 7750
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/time_span.rs",
+      "sha256": "7c0ca119e080a460d2e2f4d92d0e4b2909e215b52126351a74d2c4f2a0d94857",
+      "size_bytes": 2734
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/time_zone.rs",
+      "sha256": "8f54373db83b228a3459d71c18b3229fe37646fe3deeba23ad5592f6f5aad9d9",
+      "size_bytes": 460
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/translate.rs",
+      "sha256": "f7b8c4b8a778e02d9ab18a1e018c27504e79e77b78353805bce156c694a0e85f",
+      "size_bytes": 94681
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/types.rs",
+      "sha256": "37137fe328dd321ceb4c9bfb439b40c630204711d4b24cc78c31800f539be4af",
+      "size_bytes": 18400
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/unichar.rs",
+      "sha256": "b489b849e3d7fbfd6563f43526d07647c5344e25f3a0a27803294f2695b7b9ce",
+      "size_bytes": 7864
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/unicollate.rs",
+      "sha256": "0bf8fe3d5aca3dc7f9ebba97984b775f0bcbf3b158cdfac03fc71c5b2a11f77d",
+      "size_bytes": 2752
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/utils.rs",
+      "sha256": "3c05a182c7e19409198d560e04de9136d3dbbb6beba166def08a76c181be75df",
+      "size_bytes": 8574
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/value.rs",
+      "sha256": "37eb2396c22f6eec372da9561d2c1651e4a9aff1f5fc634ac6db78f885f8be80",
+      "size_bytes": 45287
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/value_array.rs",
+      "sha256": "61b40654fe0771b5fafde9b54f2fba8db9c81cb27f114376024b66b775a785e7",
+      "size_bytes": 7064
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/variant.rs",
+      "sha256": "b48295eca732e862b2c5347ee431c2f800c7b0c6b30f6a0f0879cd16fe13eb9b",
+      "size_bytes": 77401
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/variant_dict.rs",
+      "sha256": "7b22eeb2804a2ec07d32612b712374559f23ed1e2cc59f0d05b7f28e168d706b",
+      "size_bytes": 10269
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/variant_iter.rs",
+      "sha256": "a0f5ee8acb8faa089bcdfbc9a57372609fce7654026ccef7d9a224d05a654ccc",
+      "size_bytes": 9882
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/variant_type.rs",
+      "sha256": "3e0ed2dd6119876bac19599b3aa729d5252d5449fe7f40329fb702c8f224c6b8",
+      "size_bytes": 33192
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/win32.rs",
+      "sha256": "a221643d9be5f9cee911fad60890d3727fdd700f70da6dcf947b2631be2fcee6",
+      "size_bytes": 3385
+    },
+    {
+      "path": "vendor/glib-0.18.5/src/wrapper.rs",
+      "sha256": "1356b5423ac469b1778a6f06d3855251f5f8f5246bbbe05812502deeadadca54",
+      "size_bytes": 14934
     },
     {
       "path": "vendor/win32job/Cargo.toml",

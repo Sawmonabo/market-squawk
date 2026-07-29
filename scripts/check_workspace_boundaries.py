@@ -20,6 +20,7 @@ EXPECTED_PACKAGE_FIELDS = {
 }
 EXPECTED_MANIFESTS = {
     "market-squawk": "apps/market-squawk/Cargo.toml",
+    "market-squawk-desktop": "apps/market-squawk-desktop/src-tauri/Cargo.toml",
     "market-squawk-domain": "crates/market-squawk-domain/Cargo.toml",
     "market-squawk-platform": "crates/market-squawk-platform/Cargo.toml",
     "market-squawk-sources": "crates/market-squawk-sources/Cargo.toml",
@@ -52,6 +53,7 @@ EXPECTED_MANIFESTS = {
 }
 REQUIRED_MEMBERS = {
     "apps/market-squawk/Cargo.toml",
+    "apps/market-squawk-desktop/src-tauri/Cargo.toml",
     "crates/market-squawk-domain/Cargo.toml",
 }
 EXPECTED_DEFAULT_MEMBERS = {"apps/market-squawk/Cargo.toml"}
@@ -226,6 +228,13 @@ def inherits_workspace_value(package: dict[str, Any], field: str) -> bool:
 def allowed_local_dependencies(package_name: str) -> set[str]:
     if package_name == "market-squawk":
         return set(EXPECTED_MANIFESTS) - {package_name}
+    if package_name == "market-squawk-desktop":
+        return {
+            "market-squawk",
+            "market-squawk-data",
+            "market-squawk-platform",
+            "market-squawk-services",
+        }
     if package_name in PROVIDER_ADAPTERS:
         return PROVIDER_DEPENDENCIES
     if package_name == "market-squawk-adapter-paper":
@@ -356,7 +365,11 @@ def main() -> int:
     if workspace.get("resolver") != "3":
         diagnostics.add("Cargo.toml: workspace resolver must be 3")
 
-    expected_member_patterns = ["apps/*", "crates/*"]
+    expected_member_patterns = [
+        "apps/market-squawk",
+        "apps/market-squawk-desktop/src-tauri",
+        "crates/*",
+    ]
     if any((root / "adapters").glob("*/Cargo.toml")):
         expected_member_patterns.append("adapters/*")
     if workspace.get("members") != expected_member_patterns:
@@ -403,8 +416,13 @@ def main() -> int:
 
     existing_manifests = {
         manifest.relative_to(root).as_posix()
-        for parent in ("apps", "crates", "adapters")
-        for manifest in (root / parent).glob("*/Cargo.toml")
+        for pattern in (
+            "apps/*/Cargo.toml",
+            "apps/*/src-tauri/Cargo.toml",
+            "crates/*/Cargo.toml",
+            "adapters/*/Cargo.toml",
+        )
+        for manifest in root.glob(pattern)
     }
     for unregistered_manifest in sorted(existing_manifests - member_manifests.keys()):
         diagnostics.add(

@@ -17,12 +17,30 @@ unsound = "all"
 yanked = "deny"
 maximum-db-staleness = "P7D"
 unused-ignored-advisory = "deny"
-# Parquet 58.3.0 unconditionally depends on paste 1.0.15. RUSTSEC-2024-0436 is an
-# informational unmaintained advisory with no patched paste release. Reevaluate this exact
-# exception when DataFusion supports Arrow/Parquet 59 or a maintained upstream patch exists.
-# Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436.html
-# Upstream manifest: https://github.com/apache/arrow-rs/blob/58.3.0/parquet/Cargo.toml
-ignore = ["RUSTSEC-2024-0436"]
+# Parquet 58.3.0 unconditionally depends on unmaintained paste 1.0.15. Current Tauri 2's supported
+# Linux WebKitGTK backend unconditionally resolves the archived gtk-rs 0.18 bindings, the old macro
+# helper, and urlpattern's unmaintained rust-unic 0.9 parser graph. Tauri 2 has no stable GTK4
+# backend. RUSTSEC-2024-0429 is separately corrected by the exact reviewed local glib backport in
+# vendor/glib-0.18.5 and therefore is not ignored here. These are informational maintenance
+# findings, not undisclosed vulnerability findings. Refresh this exact list on every Tauri upgrade
+# and remove entries as soon as the stable upstream graph permits it.
+ignore = [
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0411",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+]
 
 [licenses]
 confidence-threshold = 0.93
@@ -44,6 +62,14 @@ exceptions = [
     # Keep the weak-copyleft admission exact; distribution obligations and source are recorded in
     # docs/licenses/tract-onnx-notice.md.
     { allow = ["MPL-2.0"], crate = "dyn-eq@0.1.3" },
+    # Current Tauri 2 HTML parsing and native-directory discovery graph. Versions, package
+    # checksums, source links, and distribution obligations are recorded in
+    # docs/licenses/tauri-mpl-notice.md.
+    { allow = ["MPL-2.0"], crate = "cssparser@0.36.0" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros@0.6.1" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short@0.3.5" },
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+    { allow = ["MPL-2.0"], crate = "selectors@0.36.1" },
     # Exact transitive DataFusion 54 dependency versions; keep Zlib scoped to these crates.
     { allow = ["Zlib"], crate = "foldhash@0.1.5" },
     { allow = ["Zlib"], crate = "foldhash@0.2.0" },
