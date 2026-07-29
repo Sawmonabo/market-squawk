@@ -1666,7 +1666,8 @@ def _direct_rust_tool(
             environment,
         )
     ).resolve(strict=True)
-    if path.name != name or not path.is_file():
+    expected_name = f"{name}.exe" if profile.system == "Windows" else name
+    if path.name.casefold() != expected_name.casefold() or not path.is_file():
         raise ReleaseBuildError("rustup returned an invalid direct Rust tool")
     return path
 
@@ -3926,8 +3927,15 @@ def _run_output(
         )
     except OSError as error:
         raise ReleaseBuildError("release tool evidence command could not start") from error
-    if completed.returncode != 0 or not completed.stdout or len(completed.stdout) > 16_384:
-        raise ReleaseBuildError("release tool evidence command failed")
+    label = " ".join((Path(command[0]).name, *command[1:]))
+    if completed.returncode != 0:
+        raise ReleaseBuildError(
+            f"release tool evidence command failed ({label}; exit {completed.returncode})"
+        )
+    if not completed.stdout:
+        raise ReleaseBuildError(f"release tool evidence command returned no output ({label})")
+    if len(completed.stdout) > 16_384:
+        raise ReleaseBuildError(f"release tool evidence output exceeded its bound ({label})")
     return completed.stdout.strip()
 
 
