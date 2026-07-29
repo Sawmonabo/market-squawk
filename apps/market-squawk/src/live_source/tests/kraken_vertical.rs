@@ -438,7 +438,13 @@ async fn serve_resynchronizing_kraken_sessions(
     first
         .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
         .await?;
-    drop(first);
+    while let Some(message) = first.next().await {
+        match message {
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Ping(payload)) => first.send(Message::Pong(payload)).await?,
+            Ok(_) => {}
+        }
+    }
 
     let mut socket = accept_kraken_subscription(&listener).await?;
     socket.send(Message::Text(acknowledgement.into())).await?;

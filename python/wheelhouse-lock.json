@@ -1187,8 +1187,8 @@
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/kraken_vertical.rs",
-      "sha256": "aa9da58cd6f756a3364277f8e535fb090e7d8e98762c93277c2744267da4fc37",
-      "size_bytes": 23436
+      "sha256": "782f758c1b6b4f752a5be1276b06ff26e19dfd8d06c13fe8cb8269ed11f821e5",
+      "size_bytes": 23672
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/mod.rs",
