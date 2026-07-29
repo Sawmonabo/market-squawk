@@ -3,6 +3,7 @@ fn main() {
         "application_invoke",
         "desktop_bootstrap",
         "open_official_provider_page",
+        "open_protected_provider_setup",
         "provider_onboarding",
     ]);
     if let Err(error) =

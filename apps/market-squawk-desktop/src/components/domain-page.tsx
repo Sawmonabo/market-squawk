@@ -40,9 +40,12 @@ export function DomainPage({
     : []
   const automatic = operations.find((operation) => {
     const required = operation.inputSchema.required
+    const userRequired = Array.isArray(required)
+      ? required.filter((field) => field !== "resultLimits")
+      : []
     return (
       operation.readOnly &&
-      (!Array.isArray(required) || required.length === 0)
+      userRequired.length === 0
     )
   })
 
@@ -170,4 +173,3 @@ function PageFrame({
     </div>
   )
 }
-

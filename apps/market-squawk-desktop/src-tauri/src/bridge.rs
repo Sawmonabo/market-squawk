@@ -16,9 +16,10 @@ use market_squawk_services::{
     validate_json_contract,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tauri::State;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use uuid::Uuid;
 
 use crate::contracts::{
@@ -27,10 +28,19 @@ use crate::contracts::{
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAXIMUM_DESKTOP_RESULT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_DESKTOP_RESULT_ITEMS: u64 = 1_000;
 const MAXIMUM_OPERATION_BYTES: usize = 128;
 const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
+
+#[derive(Clone, Copy, Debug)]
+enum InvocationAuthority {
+    ReadOnly,
+    ExactConfirmed(&'static str),
+}
 
 pub(crate) struct DesktopState {
     product: LocalProduct,
@@ -157,6 +167,14 @@ pub(crate) async fn application_invoke(
     request: ApplicationInvocation,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    invoke_application(request, &state, InvocationAuthority::ReadOnly).await
+}
+
+async fn invoke_application(
+    mut request: ApplicationInvocation,
+    state: &DesktopState,
+    authority: InvocationAuthority,
+) -> Result<Value, DesktopCommandError> {
     if request.operation.is_empty()
         || request.operation.len() > MAXIMUM_OPERATION_BYTES
         || request.operation.chars().any(char::is_control)
@@ -165,6 +183,25 @@ pub(crate) async fn application_invoke(
             "The selected Market Squawk operation is invalid.",
         ));
     }
+    let application = state.product.application();
+    let capabilities = application.capabilities();
+    let descriptor = capabilities
+        .find(&request.operation)
+        .ok_or_else(|| map_service_error(ServiceError::NotFound))?;
+    let authorized = match authority {
+        InvocationAuthority::ReadOnly => descriptor.effects().read_only(),
+        InvocationAuthority::ExactConfirmed(operation) => request.operation == operation,
+    };
+    if !authorized {
+        return Err(map_service_error(ServiceError::Unauthorized));
+    }
+    request.arguments.insert(
+        "resultLimits".to_owned(),
+        json!({
+            "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
+            "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
+        }),
+    );
     let input = Value::Object(request.arguments.clone());
     let input_structure = JsonStructureLimits::try_new(24, 64 * 1024, 4_096, 1_024)
         .map_err(|_error| DesktopCommandError::internal())?;
@@ -193,7 +230,6 @@ pub(crate) async fn application_invoke(
     let request_id = RequestId::try_string(format!("desktop-{}", Uuid::new_v4()))
         .map_err(|_error| DesktopCommandError::internal())?;
     let context = RequestContext::new(request_id, cancellation.clone(), deadline, limits);
-    let application = state.product.application();
     let operation = request.operation;
     let arguments = request.arguments;
     tokio::select! {
@@ -217,8 +253,15 @@ pub(crate) async fn application_invoke(
 #[tauri::command]
 pub(crate) async fn provider_onboarding(
     request: ProviderOnboardingCommand,
+    confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
+    if request.requires_confirmation() && !confirmed {
+        return Err(DesktopCommandError::new(
+            "confirmation_required",
+            "Confirm the provider change before continuing.",
+        ));
+    }
     let cancellation = state.cancellation.child_token();
     let operation_cancellation = cancellation.clone();
     let onboarding = state.product.provider_onboarding();
@@ -345,6 +388,58 @@ pub(crate) fn open_official_provider_page(
         DesktopCommandError::new(
             "open_failed",
             "The official provider page could not be opened in the system browser.",
+        )
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn open_protected_provider_setup(
+    provider_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<(), DesktopCommandError> {
+    let supported = state
+        .product
+        .provider_onboarding()
+        .profiles()
+        .into_iter()
+        .any(|profile| profile.id() == provider_id);
+    if !supported {
+        return Err(DesktopCommandError::invalid_request(
+            "The selected provider is not supported.",
+        ));
+    }
+    let mut arguments = Map::new();
+    arguments.insert("provider".to_owned(), Value::String(provider_id));
+    arguments.insert("confirm".to_owned(), Value::Bool(true));
+    let result = invoke_application(
+        ApplicationInvocation {
+            operation: SOURCE_SETUP_OPERATION.to_owned(),
+            arguments,
+        },
+        &state,
+        InvocationAuthority::ExactConfirmed(SOURCE_SETUP_OPERATION),
+    )
+    .await?;
+    let portal_url = result
+        .pointer("/data/portal/url")
+        .and_then(Value::as_str)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let parsed = Url::parse(portal_url).map_err(|_error| DesktopCommandError::internal())?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(DesktopCommandError::internal());
+    }
+    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|_error| {
+        DesktopCommandError::new(
+            "open_failed",
+            "The protected provider setup could not be opened in the system browser.",
         )
     })
 }

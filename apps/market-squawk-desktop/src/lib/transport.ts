@@ -40,5 +40,5 @@ export interface ProductTransport {
     signal?: AbortSignal,
   ): Promise<unknown>
   openOfficialProviderPage(providerId: string): Promise<void>
+  openProtectedProviderSetup(providerId: string): Promise<void>
 }
-

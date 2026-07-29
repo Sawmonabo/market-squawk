@@ -37,11 +37,19 @@ class TauriTransport implements ProductTransport {
   }
 
   onboard(request: ProviderOnboardingRequest, signal?: AbortSignal) {
-    return abortable(invoke("provider_onboarding", { request }), signal)
+    const confirmed = !["bootstrap", "resume"].includes(request.action)
+    return abortable(
+      invoke("provider_onboarding", { request, confirmed }),
+      signal,
+    )
   }
 
   async openOfficialProviderPage(providerId: string) {
     await invoke("open_official_provider_page", { providerId })
+  }
+
+  async openProtectedProviderSetup(providerId: string) {
+    await invoke("open_protected_provider_setup", { providerId })
   }
 }
 
@@ -65,6 +73,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   openOfficialProviderPage(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
+
+  openProtectedProviderSetup(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
 }
 
 function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -85,4 +97,3 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
     }),
   ])
 }
-

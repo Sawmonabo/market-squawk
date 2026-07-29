@@ -64,6 +64,7 @@ function transport(
     }),
     onboard,
     openOfficialProviderPage: async () => undefined,
+    openProtectedProviderSetup: async () => undefined,
   }
 }
 

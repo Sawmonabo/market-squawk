@@ -13,7 +13,7 @@ mod contracts;
 
 use bridge::{
     DesktopState, application_invoke, desktop_bootstrap, open_official_provider_page,
-    provider_onboarding,
+    open_protected_provider_setup, provider_onboarding,
 };
 
 #[derive(Debug, Parser)]
@@ -85,6 +85,7 @@ fn try_run() -> Result<i32, DesktopStartupError> {
             application_invoke,
             desktop_bootstrap,
             open_official_provider_page,
+            open_protected_provider_setup,
             provider_onboarding
         ])
         .build(tauri::generate_context!())?;

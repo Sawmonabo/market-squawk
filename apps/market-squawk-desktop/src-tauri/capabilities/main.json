@@ -8,6 +8,7 @@
     "allow-application-invoke",
     "allow-desktop-bootstrap",
     "allow-open-official-provider-page",
+    "allow-open-protected-provider-setup",
     "allow-provider-onboarding"
   ]
 }

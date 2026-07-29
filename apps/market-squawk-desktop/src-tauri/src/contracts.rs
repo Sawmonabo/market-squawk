@@ -177,6 +177,12 @@ pub(crate) enum ProviderOnboardingCommand {
     },
 }
 
+impl ProviderOnboardingCommand {
+    pub(crate) const fn requires_confirmation(&self) -> bool {
+        !matches!(self, Self::Bootstrap | Self::Resume { .. })
+    }
+}
+
 impl fmt::Debug for ProviderOnboardingCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let action = match self {
