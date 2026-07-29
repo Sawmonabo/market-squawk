@@ -166,17 +166,22 @@ describe("Market Squawk desktop boundary", () => {
       </MemoryRouter>,
     )
 
-    expect(
-      await screen.findByRole("heading", { name: "Welcome to Market Squawk" }),
-    ).toBeTruthy()
-    const navigation = screen.getByRole("navigation", {
-      name: "Market Squawk",
-    })
+    const welcome = await screen.findByText("Welcome to Market Squawk")
+    expect(welcome.closest("h1,h2,h3,h4,h5,h6")).toBeTruthy()
+    const navigation = document.querySelector(
+      'nav[aria-label="Market Squawk"]',
+    )
+    expect(navigation).toBeTruthy()
+    if (!navigation) {
+      throw new Error("Market Squawk navigation is absent")
+    }
     expect(navigation.querySelectorAll("a,button")).toHaveLength(15)
-    expect(
-      screen.getByRole("button", { name: /Paper Execution/ }),
-    ).toBeTruthy()
-    expect(screen.getByRole("link", { name: "Backup & Recovery" })).toBeTruthy()
+    const paperExecution = Array.from(
+      navigation.querySelectorAll("button"),
+    ).find((button) => button.textContent?.includes("Paper Execution"))
+    expect(paperExecution?.getAttribute("aria-disabled")).toBe("true")
+    const backup = navigation.querySelector('a[href="/backup-recovery"]')
+    expect(backup?.textContent).toContain("Backup & Recovery")
   })
 
   it("never promotes an unverified backend state to installation readiness", async () => {
