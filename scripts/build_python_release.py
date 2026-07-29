@@ -1756,10 +1756,23 @@ def _admit_windows_toolchain() -> dict[str, object]:
     compiler = _system_tool("cl.exe")
     linker = _system_tool("link.exe")
     archiver = _system_tool("lib.exe")
+    assembler = _system_tool("ml64.exe")
+    developer_directory_value = os.environ.get("VCINSTALLDIR")
+    if not developer_directory_value:
+        raise ReleaseBuildError("MSVC developer environment is incomplete")
+    developer_directory = Path(developer_directory_value).resolve(strict=True)
+    if not developer_directory.is_dir():
+        raise ReleaseBuildError("MSVC developer directory is invalid")
+    target_architecture = os.environ.get("VSCMD_ARG_TGT_ARCH")
+    if target_architecture != "x64":
+        raise ReleaseBuildError("MSVC target architecture is not x64")
     return {
         "compiler": _tool_binding(compiler),
         "linker": _tool_binding(linker),
         "archiver": _tool_binding(archiver),
+        "assembler": _tool_binding(assembler),
+        "developer_directory": str(developer_directory),
+        "target_architecture": target_architecture,
     }
 
 
@@ -3103,10 +3116,21 @@ def _cargo_environment(
         compiler = _bound_tool(toolchain, "compiler")
         linker = _bound_tool(toolchain, "linker")
         archiver = _bound_tool(toolchain, "archiver")
+        assembler = _bound_tool(toolchain, "assembler")
+        developer_directory = toolchain.get("developer_directory")
+        target_architecture = toolchain.get("target_architecture")
+        if (
+            not isinstance(developer_directory, str)
+            or not Path(developer_directory).resolve(strict=True).is_dir()
+            or target_architecture != "x64"
+        ):
+            raise ReleaseBuildError("bound MSVC developer environment is invalid")
         required = ("INCLUDE", "LIB", "PATH", "PATHEXT", "SystemRoot")
         if any(not os.environ.get(name) for name in required):
             raise ReleaseBuildError("MSVC developer environment is incomplete")
         environment.update({name: os.environ[name] for name in required})
+        environment["VCINSTALLDIR"] = developer_directory
+        environment["VSCMD_ARG_TGT_ARCH"] = target_architecture
         environment["PATH"] = os.pathsep.join(
             dict.fromkeys(
                 [
@@ -3115,6 +3139,7 @@ def _cargo_environment(
                     str(compiler.parent),
                     str(linker.parent),
                     str(archiver.parent),
+                    str(assembler.parent),
                     environment["PATH"],
                 ]
             )

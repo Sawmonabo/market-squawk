@@ -206,14 +206,23 @@ def _safe_executable(
 
 def _validate_executable_directory_chain(path: Path, owner: int) -> None:
     current = path.parent
+    current_groups = {os.getgid(), *os.getgroups()}
     while True:
         metadata = os.lstat(current)
         expected_owner = 0 if owner == 0 else os.getuid()
+        mode = stat.S_IMODE(metadata.st_mode)
+        group_writable_by_current_process = (
+            owner == 0
+            and bool(mode & stat.S_IWGRP)
+            and metadata.st_gid in current_groups
+        )
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != expected_owner
-            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or bool(mode & stat.S_IWOTH)
+            or (owner != 0 and bool(mode & stat.S_IWGRP))
+            or group_writable_by_current_process
             or Path(os.path.realpath(current)) != current
         ):
             raise GateError("observation tool directory authority is unsafe")

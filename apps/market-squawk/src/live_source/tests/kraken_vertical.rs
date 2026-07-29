@@ -45,6 +45,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 const PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
+const FIRST_GENERATION_READY: &[u8] = b"kraken-generation-one-ready";
 const LOCAL_SUBSCRIPTION_BOUND: Duration = Duration::from_secs(10);
 const LOCAL_SNAPSHOT_BOUND: Duration = Duration::from_secs(20);
 static KRAKEN_VERTICAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -435,6 +436,29 @@ async fn serve_resynchronizing_kraken_sessions(
     first
         .send(Message::Text(acknowledgement.clone().into()))
         .await?;
+    first
+        .send(Message::Ping(FIRST_GENERATION_READY.into()))
+        .await?;
+    tokio::time::timeout(LOCAL_SUBSCRIPTION_BOUND, async {
+        loop {
+            match first.next().await {
+                Some(Ok(Message::Pong(payload))) if payload.as_ref() == FIRST_GENERATION_READY => {
+                    return TestResult::Ok(());
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    first.send(Message::Pong(payload)).await?;
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                    return Err(
+                        "Kraken source closed before the first-generation acknowledgement barrier"
+                            .into(),
+                    );
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await??;
     first
         .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
         .await?;
