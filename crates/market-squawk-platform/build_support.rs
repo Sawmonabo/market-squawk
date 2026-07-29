@@ -29,12 +29,14 @@ const PROCESS_GROUP_TERM_GRACE_MILLIS: u64 = 100;
 const PROCESS_GROUP_KILL_GRACE_MILLIS: u64 = 500;
 const LEADER_REAP_GRACE_MILLIS: u64 = 500;
 const PIPE_READER_GRACE_MILLIS: u64 = 500;
+#[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(PROCESS_GROUP_TERM_GRACE_MILLIS);
+#[cfg(unix)]
 const PROCESS_GROUP_KILL_GRACE: Duration = Duration::from_millis(PROCESS_GROUP_KILL_GRACE_MILLIS);
 const LEADER_REAP_GRACE: Duration = Duration::from_millis(LEADER_REAP_GRACE_MILLIS);
 const PIPE_READER_GRACE: Duration = Duration::from_millis(PIPE_READER_GRACE_MILLIS);
 const OWNED_PROCESS_GROUP_SUPERVISION_SUPPORTED: bool =
-    cfg!(any(target_os = "linux", target_os = "macos"));
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
 /// Additive TERM + KILL + leader reap + concurrent pipe-finish grace after execution enforcement.
 const MAXIMUM_CLEANUP_GRACE_MILLIS: u64 = PROCESS_GROUP_TERM_GRACE_MILLIS
     + PROCESS_GROUP_KILL_GRACE_MILLIS
@@ -230,14 +232,21 @@ pub(crate) fn authoritative_command_policy(
         return Err("authoritative outer process-group identity is invalid".into());
     }
     #[cfg(unix)]
-    if rustix::process::getpgrp().as_raw_pid() != expected {
-        return Err("authoritative build helper is outside its bound outer process group".into());
+    {
+        if rustix::process::getpgrp().as_raw_pid() != expected {
+            return Err(
+                "authoritative build helper is outside its bound outer process group".into(),
+            );
+        }
+        Ok(CommandPolicy::AuthoritativeInheritOuter {
+            expected_process_group: expected,
+        })
     }
     #[cfg(not(unix))]
-    return Err("authoritative inherited process-group policy is unsupported".into());
-    Ok(CommandPolicy::AuthoritativeInheritOuter {
-        expected_process_group: expected,
-    })
+    {
+        let _ = expected;
+        Err("authoritative inherited process-group policy is unsupported".into())
+    }
 }
 
 impl CommandPolicy {
@@ -251,7 +260,10 @@ impl CommandPolicy {
                 return Err("authoritative process group changed before inner spawn".into());
             }
             #[cfg(not(unix))]
-            return Err("authoritative inherited process-group policy is unsupported".into());
+            {
+                let _ = expected_process_group;
+                return Err("authoritative inherited process-group policy is unsupported".into());
+            }
         }
         Ok(())
     }
@@ -375,7 +387,7 @@ fn run_command_with_charged_post_spawn_deadline_inner(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    let mut execution = BoundedExecution::new(command.spawn()?, spec.policy);
+    let mut execution = BoundedExecution::new(command.spawn()?, spec.policy)?;
     let setup_result = execution.start_readers(
         spec.maximum_stdout,
         spec.maximum_stderr,
@@ -445,6 +457,8 @@ struct BoundedExecution {
     policy: CommandPolicy,
     #[cfg(unix)]
     process_group_id: Option<rustix::process::Pid>,
+    #[cfg(windows)]
+    process_job: Option<win32job::Job>,
     stdout_reader: Option<BoundedReader>,
     stderr_reader: Option<BoundedReader>,
     status: Option<ExitStatus>,
@@ -452,7 +466,9 @@ struct BoundedExecution {
 }
 
 impl BoundedExecution {
-    fn new(child: Child, policy: CommandPolicy) -> Self {
+    fn new(child: Child, policy: CommandPolicy) -> Result<Self, Box<dyn Error>> {
+        #[cfg(windows)]
+        let mut child = child;
         #[cfg(unix)]
         let process_group_id = policy
             .owns_process_group()
@@ -460,16 +476,34 @@ impl BoundedExecution {
             .transpose()
             .ok()
             .flatten();
-        Self {
+        #[cfg(windows)]
+        let process_job = if policy.owns_process_group() {
+            match create_windows_process_job(&child) {
+                Ok(job) => Some(job),
+                Err(error) => {
+                    let _kill_result = child.kill();
+                    let _reap_result = wait_for_child_exit(&mut child, LEADER_REAP_GRACE);
+                    return Err(format!(
+                        "failed to establish Windows bounded-command containment: {error}"
+                    )
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
             child,
             policy,
             #[cfg(unix)]
             process_group_id,
+            #[cfg(windows)]
+            process_job,
             stdout_reader: None,
             stderr_reader: None,
             status: None,
             cleaned: false,
-        }
+        })
     }
 
     fn start_readers(
@@ -542,7 +576,15 @@ impl BoundedExecution {
                     .map(|status| status.is_some())
                     .map_err(Into::into);
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(windows)]
+            {
+                if let Some(status) = self.child.try_wait()? {
+                    self.status = Some(status);
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             return Err("bounded command requires supported process-group control".into());
         }
 
@@ -581,7 +623,21 @@ impl BoundedExecution {
             // owns final whole-group extinction, including grandchildren that retained pipe FDs.
             Ok(())
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let group_result = if self.policy.owns_process_group() {
+            self.process_job.take().map_or_else(
+                || Err("bounded child Windows job object is absent".to_owned()),
+                |job| {
+                    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes the kernel terminate the entire
+                    // contained process tree when this final handle is closed.
+                    drop(job);
+                    Ok(())
+                },
+            )
+        } else {
+            Ok(())
+        };
+        #[cfg(not(any(unix, windows)))]
         let group_result = Err("bounded execution has no supported process containment".to_owned());
         if self.status.is_none() {
             let _kill_result = self.child.kill();
@@ -624,6 +680,17 @@ impl Drop for BoundedExecution {
             let _cleanup = self.cleanup();
         }
     }
+}
+
+#[cfg(windows)]
+fn create_windows_process_job(child: &Child) -> Result<win32job::Job, Box<dyn Error>> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let mut limits = win32job::ExtendedLimitInfo::new();
+    limits.limit_kill_on_job_close();
+    let job = win32job::Job::create_with_limit_info(&limits)?;
+    job.assign_process(child.as_raw_handle() as isize)?;
+    Ok(job)
 }
 
 fn ensure_before_execution_deadline(deadline: Instant, phase: &str) -> Result<(), Box<dyn Error>> {
