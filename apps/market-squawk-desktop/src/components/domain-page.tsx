@@ -1,5 +1,10 @@
 import * as React from "react"
-import { CircleAlert, DatabaseZap, ListTree } from "lucide-react"
+import {
+  CircleAlert,
+  DatabaseZap,
+  ListTree,
+  Play,
+} from "lucide-react"
 import { useLocation } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
@@ -17,7 +22,7 @@ export function DomainPage({
   description,
 }: {
   title: string
-  domain?: string
+  domain?: string | readonly string[]
   description: string
 }) {
   const product = useProduct()
@@ -25,6 +30,8 @@ export function DomainPage({
   const [result, setResult] = React.useState<ApplicationResult | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(false)
+  const [selectedOperation, setSelectedOperation] = React.useState("")
+  const [argumentsText, setArgumentsText] = React.useState("")
 
   if (product.status !== "ready") {
     return (
@@ -57,9 +64,13 @@ export function DomainPage({
 
   const operations = domain
     ? product.bootstrap.operations.filter(
-        (operation) => operation.domain === domain,
+        (operation) =>
+          typeof domain === "string"
+            ? operation.domain === domain
+            : domain.includes(operation.domain),
       )
     : []
+  const readableOperations = operations.filter((operation) => operation.readOnly)
   const automatic = operations.find((operation) => {
     const required = operation.inputSchema.required
     const userRequired = Array.isArray(required)
@@ -70,16 +81,45 @@ export function DomainPage({
       userRequired.length === 0
     )
   })
+  const selected =
+    readableOperations.find(
+      (operation) => operation.name === selectedOperation,
+    ) ??
+    automatic ??
+    readableOperations[0]
 
   const load = async () => {
-    if (!automatic) {
+    if (!selected) {
+      return
+    }
+    setResult(null)
+    setError(null)
+    let argumentsValue: Record<string, unknown>
+    try {
+      const parsed: unknown = argumentsText.trim()
+        ? JSON.parse(argumentsText)
+        : {}
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error("Arguments must be a JSON object.")
+      }
+      argumentsValue = parsed as Record<string, unknown>
+    } catch (parseError) {
+      setError(
+        parseError instanceof Error
+          ? parseError.message
+          : "Arguments must be valid JSON.",
+      )
       return
     }
     setLoading(true)
-    setError(null)
     try {
       const response = await product.transport.invoke({
-        operation: automatic.name,
+        operation: selected.name,
+        arguments: argumentsValue,
       })
       setResult(response)
     } catch (requestError) {
@@ -108,19 +148,80 @@ export function DomainPage({
                 Values appear only after their owning Rust service returns them.
               </p>
             </div>
-            {automatic ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="ml-auto"
-                onClick={load}
-                disabled={loading}
-              >
-                {loading ? "Reading…" : "Read current state"}
-              </Button>
-            ) : null}
           </div>
+          {selected ? (
+            <div className="mt-5 grid gap-4 border-t border-border pt-5">
+              <label className="grid gap-2 text-xs font-medium" htmlFor="domain-operation">
+                Read-only operation
+                <select
+                  id="domain-operation"
+                  className="h-10 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  value={selected.name}
+                  disabled={loading}
+                  onChange={(event) => {
+                    setSelectedOperation(event.currentTarget.value)
+                    setArgumentsText("")
+                    setResult(null)
+                    setError(null)
+                  }}
+                >
+                  {readableOperations.map((operation) => (
+                    <option key={operation.name} value={operation.name}>
+                      {operation.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="grid gap-2 text-xs font-medium" htmlFor="domain-arguments">
+                Operation arguments
+                <textarea
+                  id="domain-arguments"
+                  className="min-h-24 resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                  value={argumentsText}
+                  disabled={loading}
+                  onChange={(event) =>
+                    setArgumentsText(event.currentTarget.value)
+                  }
+                  placeholder={argumentPlaceholder(selected.inputSchema)}
+                  spellCheck={false}
+                />
+              </label>
+              <details className="rounded-md border border-border bg-background px-3 py-2">
+                <summary className="cursor-pointer text-xs font-medium text-foreground">
+                  Input contract
+                </summary>
+                <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-border pt-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {JSON.stringify(selected.inputSchema, null, 2)}
+                </pre>
+              </details>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={load}
+                  disabled={loading}
+                >
+                  <Play aria-hidden="true" />
+                  {loading ? "Reading…" : "Run read-only operation"}
+                </Button>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  The desktop accepts only registry-declared read operations.
+                  Result count and bytes are bounded by the Rust service.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <Alert className="mt-5">
+              <CircleAlert aria-hidden="true" />
+              <AlertTitle>Desktop exploration unavailable</AlertTitle>
+              <AlertDescription>
+                No typed read-only application operation is mapped to this
+                route. Use the documented CLI or MCP surface until a bounded
+                desktop read is added.
+              </AlertDescription>
+            </Alert>
+          )}
           {error ? (
             <p role="alert" className="mt-4 text-sm text-red-400">
               {error}
@@ -142,6 +243,16 @@ export function DomainPage({
                   value={result.metadata.availableItems}
                 />
               </dl>
+              <div className="mb-4 grid gap-4 border-b border-border pb-4 lg:grid-cols-2">
+                <ResultEvidence
+                  label="Source coverage"
+                  value={result.metadata.sourceCoverage}
+                />
+                <ResultEvidence
+                  label="Data quality"
+                  value={result.metadata.dataQuality}
+                />
+              </div>
               <ReadableValue value={result.data} />
             </div>
           ) : (
@@ -153,15 +264,17 @@ export function DomainPage({
                 />
                 <p className="mt-2 text-xs text-muted-foreground">
                   {automatic
-                    ? "Read the bounded local service when you need current data."
-                    : "Complete the required setup fields before this domain can be queried."}
+                    ? "Run the bounded local read when you need current data."
+                    : selected
+                      ? "Choose a read-only operation and provide its required arguments."
+                      : "No desktop read is available for this route."}
                 </p>
               </div>
             </div>
           )}
         </section>
         <section className="rounded-xl border border-border bg-card/35 p-5">
-          <h2 className="text-sm font-semibold">Available operations</h2>
+          <h2 className="text-sm font-semibold">Application contracts</h2>
           <ul className="mt-3 space-y-3">
             {operations.length ? (
               operations.map((operation) => (
@@ -171,6 +284,11 @@ export function DomainPage({
                   </p>
                   <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
                     {operation.description}
+                  </p>
+                  <p className="mt-1 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+                    {operation.readOnly
+                      ? "Read available above"
+                      : `${operation.authorization.replaceAll("_", " ")} · protected mutation not exposed by desktop`}
                   </p>
                 </li>
               ))
@@ -185,6 +303,38 @@ export function DomainPage({
       </div>
     </PageFrame>
   )
+}
+
+function ResultEvidence({
+  label,
+  value,
+}: {
+  label: string
+  value: unknown
+}) {
+  return (
+    <section>
+      <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </h3>
+      <div className="mt-2 rounded-md border border-border/70 px-3 py-2">
+        <ReadableValue value={value} />
+      </div>
+    </section>
+  )
+}
+
+function argumentPlaceholder(inputSchema: Record<string, unknown>): string {
+  const required = Array.isArray(inputSchema.required)
+    ? inputSchema.required.filter(
+        (field): field is string =>
+          typeof field === "string" && field !== "resultLimits",
+      )
+    : []
+  if (required.length === 0) {
+    return "{}"
+  }
+  return `{ ${required.map((field) => `"${field}": …`).join(", ")} }`
 }
 
 function ResultFact({

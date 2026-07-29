@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom"
 
 import { DomainPage } from "@/components/domain-page"
 import { InstallationPage } from "@/components/installation-page"
+import { McpPage } from "@/components/mcp-page"
 import { OverviewPage } from "@/components/overview-page"
 
 const domainRoutes = [
@@ -22,9 +23,9 @@ const domainRoutes = [
   {
     path: "/research",
     title: "Research",
-    domain: "research",
+    domain: ["research", "fundamental", "macro"],
     description:
-      "Work with versioned local datasets, manifests, point-in-time history, and alternative data.",
+      "Work with versioned local datasets, point-in-time history, alternative data, company fundamentals, and macroeconomic revisions.",
   },
   {
     path: "/portfolios",
@@ -72,12 +73,6 @@ const domainRoutes = [
 
 const operatingRoutes = [
   {
-    path: "/mcp",
-    title: "MCP",
-    description:
-      "Inspect the bounded local stdio tool surface and client setup without placing MCP in the live path.",
-  },
-  {
     path: "/logs",
     title: "Logs",
     description:
@@ -109,6 +104,7 @@ export function AppRoutes() {
         />
       ))}
       <Route path="/updates" element={<InstallationPage />} />
+      <Route path="/mcp" element={<McpPage />} />
       <Route
         path="/backup-recovery"
         element={<InstallationPage recovery />}

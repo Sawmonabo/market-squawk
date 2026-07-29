@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -139,6 +139,16 @@ function transport(
   onboard: ProductTransport["onboard"] = async () => {
     throw new Error("Provider onboarding is not configured for this test.")
   },
+  invoke: ProductTransport["invoke"] = async () => ({
+    data: null,
+    metadata: {
+      completeness: "complete",
+      returnedItems: 0,
+      availableItems: 0,
+      sourceCoverage: { status: "not_applicable" },
+      dataQuality: { status: "not_applicable" },
+    },
+  }),
 ): ProductTransport {
   return {
     bootstrap: async () => bootstrap,
@@ -156,32 +166,104 @@ function transport(
       receipt: null,
       restartRequired: false,
     }),
-    invoke: async () => ({
-      data: null,
-      metadata: {
-        completeness: "complete",
-        returnedItems: 0,
-        availableItems: 0,
-        sourceCoverage: { status: "not_applicable" },
-        dataQuality: { status: "not_applicable" },
-      },
-    }),
+    invoke,
     onboard,
     openOfficialProviderPage: async () => undefined,
     openProtectedProviderSetup: async () => undefined,
   }
 }
 
+function datasetRead(
+  name: string,
+  domain: string,
+  description: string,
+): DesktopBootstrap["operations"][number] {
+  return {
+    name,
+    description,
+    domain,
+    authorization: "read_only",
+    readOnly: true,
+    destructive: false,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        dataset: { type: "string" },
+        resultLimits: { type: "object" },
+      },
+      required: ["dataset", "resultLimits"],
+    },
+  }
+}
+
 describe("Market Squawk desktop boundary", () => {
-  it("exposes the permanent product navigation with accessible labels", async () => {
-    render(
-      <MemoryRouter initialEntries={["/overview"]}>
-        <App transport={transport()} />
+  it("uses accessible product navigation to explore real research and MCP state", async () => {
+    const requests: Parameters<ProductTransport["invoke"]>[0][] = []
+    const readyBootstrap: DesktopBootstrap = {
+      ...blockedBootstrap,
+      setupSteps: blockedBootstrap.setupSteps.map((step) =>
+        step.id === "research"
+          ? {
+              ...step,
+              state: "complete",
+              complete: true,
+              blockingReason: null,
+              recovery: null,
+            }
+          : step,
+      ),
+      operations: [
+        datasetRead(
+          "Research.GetManifest",
+          "research",
+          "Return one immutable analytical dataset manifest.",
+        ),
+        datasetRead(
+          "Fundamental.GetFacts",
+          "fundamental",
+          "Return bounded reported fundamental facts.",
+        ),
+        datasetRead(
+          "Macro.GetRevisions",
+          "macro",
+          "Return bounded macroeconomic revision history.",
+        ),
+      ],
+    }
+    const user = userEvent.setup()
+    const rendered = render(
+      <MemoryRouter initialEntries={["/research"]}>
+        <App
+          transport={transport(
+            readyBootstrap,
+            undefined,
+            async (request) => {
+              requests.push(request)
+              if (requests.length > 1) {
+                throw new Error("dataset not found")
+              }
+              return {
+                data: {
+                  datasetId: "research-prices-v3",
+                  generation: 7,
+                },
+                metadata: {
+                  completeness: "complete",
+                  returnedItems: 1,
+                  availableItems: 1,
+                  sourceCoverage: { status: "not_applicable" },
+                  dataQuality: { status: "not_applicable" },
+                },
+              }
+            },
+          )}
+        />
       </MemoryRouter>,
     )
 
-    const welcome = await screen.findByText("Welcome to Market Squawk")
-    expect(welcome.closest("h1,h2,h3,h4,h5,h6")).toBeTruthy()
+    const heading = await screen.findByRole("heading", { name: "Research" })
+    expect(heading.tagName).toBe("H1")
     const navigation = document.querySelector(
       'nav[aria-label="Market Squawk"]',
     )
@@ -196,6 +278,59 @@ describe("Market Squawk desktop boundary", () => {
     expect(paperExecution?.getAttribute("aria-disabled")).toBe("true")
     const backup = navigation.querySelector('a[href="/backup-recovery"]')
     expect(backup?.textContent).toContain("Backup & Recovery")
+    expect(screen.getByText("Input contract")).toBeTruthy()
+    expect(
+      screen.getByRole("option", { name: "Fundamental.GetFacts" }),
+    ).toBeTruthy()
+    expect(
+      screen.getByRole("option", { name: "Macro.GetRevisions" }),
+    ).toBeTruthy()
+
+    fireEvent.change(
+      screen.getByLabelText("Operation arguments"),
+      { target: { value: '{"dataset":"research-prices"}' } },
+    )
+    await user.click(
+      screen.getByRole("button", { name: "Run read-only operation" }),
+    )
+
+    expect(
+      await screen.findByText("research-prices-v3"),
+    ).toBeTruthy()
+    expect(screen.getByText("Source coverage")).toBeTruthy()
+    expect(screen.getByText("Data quality")).toBeTruthy()
+    expect(requests).toEqual([
+      {
+        operation: "Research.GetManifest",
+        arguments: { dataset: "research-prices" },
+      },
+    ])
+
+    fireEvent.change(
+      screen.getByLabelText("Operation arguments"),
+      { target: { value: '{"dataset":"missing"}' } },
+    )
+    await user.click(
+      screen.getByRole("button", { name: "Run read-only operation" }),
+    )
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "dataset not found",
+    )
+    expect(screen.queryByText("research-prices-v3")).toBeNull()
+
+    rendered.unmount()
+    render(
+      <MemoryRouter initialEntries={["/mcp"]}>
+        <App transport={transport(readyBootstrap)} />
+      </MemoryRouter>,
+    )
+    expect(
+      await screen.findByText(
+        "/Applications/Market Squawk.app/Contents/MacOS/market-squawk",
+      ),
+    ).toBeTruthy()
+    expect(screen.getByText("Desktop exit required")).toBeTruthy()
+    expect(screen.getByText("Research.GetManifest")).toBeTruthy()
   })
 
   it("never promotes an unverified backend state to installation readiness", async () => {
