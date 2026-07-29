@@ -939,3 +939,28 @@ The desktop shell and complete guided setup remain release-blocking product work
 changes, the implementation owner must pass the specification's accepted-head refresh gate and
 record the resulting dependency/ownership lane without moving or weakening the existing provider
 and terminal-release predicates.
+
+## 2026-07-28 Obsidian Signal implementation lane
+
+The approved desktop-interface refresh gate passed against accepted integration head
+`dbc909eeb1ca334ae114947158a875fdda3d27d8`. Tauri 2 and the selected maintained frontend
+foundations remain compatible with the supported platform/toolchain baseline. Current composition
+confirms that the desktop can reuse `LocalProduct`, the closed `Application` operation registry,
+and the existing durable provider-onboarding and activation authorities without introducing a
+second backend.
+
+Implementation is owned by one serialized product lane,
+`feature/obsidian-signal-desktop`, with one worktree at
+`.worktrees/obsidian-signal-desktop`. Its complete dependency-ordered plan is
+[`2026-07-28-obsidian-signal-desktop.md`](../superpowers/plans/2026-07-28-obsidian-signal-desktop.md).
+The lane owns the nested Tauri app, React presentation, root manifests and lockfiles, the narrow
+presentation bridge, browser-fallback visual reconciliation, affected-path CI, maintained
+documentation, and release-gate integration. It must not split these shared hotspots across
+parallel branches.
+
+Verification is intentionally thin during implementation: one frontend test file may protect only
+accessible navigation, authority-derived readiness, and fail-closed mutation behavior. Focused
+package/type/build checks run within the lane; the broad unchanged-head workspace and platform
+gates run once at the grouped Quarter 4 checkpoint. Issue `#36` remains the implementation and
+release-blocker tracker until native packaging, browser/CLI continuity, and exact-head evidence are
+complete.
