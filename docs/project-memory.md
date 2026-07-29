@@ -1187,3 +1187,28 @@ contains this entry, does not inherit `f8c2569` exact-head status; the final rel
 repeat every applicable clean exact-head gate and grouped review. Current generated state is
 6.5 GiB under the 20 GiB ceiling, `.worktrees` is empty, incremental compilation remains disabled,
 and 153 GiB is free.
+
+## 2026-07-28 approved Obsidian Signal product interface
+
+The approved Market Squawk interactive product experience is a Tauri 2 desktop shell with a
+protected loopback browser fallback and first-class CLI/headless operation. Setup is a route inside
+the permanent product shell, not a disposable browser wizard. All three presentation modes must
+call shared Rust application services and retain the established provider, credential, model,
+catalog, risk, execution, artifact, and audit authorities.
+
+The binding visual and interaction specification is
+[`docs/superpowers/specs/2026-07-28-market-squawk-obsidian-signal-interface-design.md`](superpowers/specs/2026-07-28-market-squawk-obsidian-signal-interface-design.md).
+Its tracked PNG is the canonical visual acceptance baseline. The approved **Obsidian Signal**
+direction uses shadcn/ui `new-york-v4/sidebar-07` as its structural foundation, the permanent
+navigation recorded in that specification, near-black and graphite surfaces, restrained cobalt
+interaction color, semantic operational colors, Geist typography, Lucide icons, and the sparse
+Squawk Signal identity. Teal or purple branding, gradients, glass effects, glowing card grids,
+oversized marketing presentation, excessive pills, ambient animation, remote UI assets, hard-coded
+readiness, and a visually unrelated post-setup application are outside the approved direction.
+
+This checkpoint records an approved design at audit base
+`cfb902b007f66b49b366b3e7f5d03a640e11f9aa`; it does not claim implementation. The interactive
+shell and complete guided setup are first-release requirements. Implementation begins only after
+the specification's accepted-head refresh gate confirms current platform support, maintained
+dependency versions and licenses, least-privilege Tauri capabilities, typed state ownership,
+desktop/browser/CLI service reuse, accessibility, and thin release-relevant verification.

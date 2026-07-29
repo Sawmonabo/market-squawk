@@ -919,3 +919,23 @@ disabled, and 153 GiB is free. PR `#26` remains the sole open pull request. Issu
 `#31` remain open until their actual provider and terminal-release predicates close. This
 cross-platform correctness checkpoint does not close those predicates, does not implement the
 proposed CI sharding/cache redesign, and does not transfer exact-head evidence to a later commit.
+
+## 2026-07-28 approved desktop-interface baseline
+
+The Obsidian Signal desktop-shell and guided-setup design is approved at audit base
+`cfb902b007f66b49b366b3e7f5d03a640e11f9aa`. The canonical specification is
+[`2026-07-28-market-squawk-obsidian-signal-interface-design.md`](../superpowers/specs/2026-07-28-market-squawk-obsidian-signal-interface-design.md);
+its digest-bound tracked PNG preserves the exact accepted visual baseline.
+
+The required implementation outcome is one permanent Tauri 2 product shell, protected loopback
+browser fallback, and first-class CLI/headless route over shared Rust application services. The
+approved shell uses shadcn/ui `new-york-v4/sidebar-07` structure, the recorded permanent
+navigation, the Obsidian Signal visual tokens, accessible responsive behavior, bundled local
+assets, and least-privilege typed commands. Setup must guide a non-specialist through the complete
+supported product without hard-coded readiness or duplicated business authority.
+
+This is independently persisted approved design evidence, not implementation or release approval.
+The desktop shell and complete guided setup remain release-blocking product work. Before code
+changes, the implementation owner must pass the specification's accepted-head refresh gate and
+record the resulting dependency/ownership lane without moving or weakening the existing provider
+and terminal-release predicates.
