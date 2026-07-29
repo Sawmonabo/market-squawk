@@ -117,13 +117,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "b88e466ad7f068efdacb5c9e50fd3999068e7b312011058eb9e047ab1f8125fa",
-      "size_bytes": 231913
+      "sha256": "97a35cef5f6042df1279ae4f816f76d3ebe1224b2bf21b83e5cb4ecfe30acf29",
+      "size_bytes": 231952
     },
     {
       "path": "Cargo.toml",
-      "sha256": "a9be89917e984a322b66c352c550b7db5547c77cc2a406ffc24fa6ecc851293b",
-      "size_bytes": 7829
+      "sha256": "0f8e7d531756109ab3fd797286e287f63d03f1720a60581d23e35f7242d12414",
+      "size_bytes": 7917
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
