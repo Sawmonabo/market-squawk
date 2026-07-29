@@ -9,8 +9,8 @@ supporting the choice.
 | Document type | ADR index |
 | Audience | Maintainers, reviewers, architects, and contributors |
 | Status | Current |
-| Last substantive review | 2026-07-23 |
-| Reviewed commit | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Last substantive review | 2026-07-29 |
+| Reviewed commit | `e6f77d564b00a6e6911c30be60d441f0576e9e08` |
 
 ## Accepted decisions
 
@@ -21,6 +21,7 @@ supporting the choice.
 | [0003](0003-single-writer-live-state.md) | Use deterministic single-writer live state | One shard actor orders mutation for each venue/instrument route under bounded admission |
 | [0004](0004-local-analytical-storage-stack.md) | Use a local analytical storage stack | SQLite, Arrow, Parquet, and DataFusion each own a distinct control, exchange, storage, or query role |
 | [0005](0005-central-risk-and-execution-authority.md) | Centralize risk and execution authority | Strategies produce intents, risk alone approves, and the bounded dispatcher alone reaches an adapter |
+| [0006](0006-complete-versioned-release-bundles.md) | Install complete versioned release bundles | Native packages and the curl path share one verified immutable product, lifecycle authority, and rollback boundary |
 
 ## ADR lifecycle
 

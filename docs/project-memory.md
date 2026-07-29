@@ -1349,3 +1349,39 @@ approval still requires the same clean pushed exact head and terminal hosted evi
 guided native bootstrap, uv/managed-Python installation, signed installation evidence, and the
 unchanged release predicates remain mandatory blockers. Issue `#36`, draft PR `#37`, and their
 Project 5 state must stay open until those predicates actually close.
+
+## 2026-07-29 complete installation and public release contract
+
+The first public release must provide both a stable one-command POSIX installation and clickable
+native packages from the repository's GitHub Releases page. Source-build commands remain developer
+instructions and are not an acceptable ordinary-user installation path. Issue `#38` and
+[`2026-07-29-complete-installation-and-public-release.md`](superpowers/plans/2026-07-29-complete-installation-and-public-release.md)
+track the implementation to completion.
+
+Every default installation carries the same complete product: the Obsidian Signal desktop,
+`market-squawk`, the capture helper, ONNX worker, model validator and training driver, the Rust
+installer, uv 0.12.0, standard managed CPython 3.14.6, and the exact locked Python analytics and
+training environment. Users must not need Rust, Node.js, pnpm, Python, uv, containers, cloud
+services, database services, or paid subscriptions preinstalled.
+
+The accepted release targets and floors are Ubuntu 24.04-compatible x64 Linux, Windows 10 version
+1809 or newer on x64, and macOS 12 or newer on Intel and Apple Silicon. GitHub Releases must expose
+DMG/application, NSIS/MSI, AppImage/DEB, complete headless bundles, manifests, checksums, and
+attestations as applicable. The stable `install.sh` performs supported-target detection and
+verified bootstrap acquisition only; one Rust lifecycle authority performs bounded extraction,
+closed-manifest verification, atomic activation, status, update, repair, rollback, and
+data-preserving uninstall.
+
+Program versions are immutable. Installation retains the active version and one previous
+known-good version, changes one atomic active selector only after full verification, and never
+updates an active version in place. Ordinary uninstall preserves configuration, credentials,
+catalogs, portfolios, datasets, models, logs, and artifacts. Stable publication requires the
+platform's native signing or notarization evidence and exact installed-product verification on all
+four targets; unsigned pull-request artifacts remain test evidence only.
+
+This contract was frozen against audit base
+`e6f77d564b00a6e6911c30be60d441f0576e9e08`, tree
+`4c27aa5c06ab43e93b7a5cc270e8ccfaae26b9e4`. That identity is a planning locator, not Quarter 4
+approval. Implementation must refresh onto the accepted desktop head before release assembly, and
+the final unchanged candidate must pass the existing release predicates and grouped Quarter 4
+review.

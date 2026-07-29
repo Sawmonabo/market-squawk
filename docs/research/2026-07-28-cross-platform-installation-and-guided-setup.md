@@ -7,11 +7,11 @@ beginner-friendly Market Squawk installation on Windows, macOS, and Linux.
 | --- | --- |
 | Document type | Research and architectural decision input |
 | Audience | Product owners, maintainers, release engineers, security reviewers |
-| Status | Research complete; design decision pending; no implementation authority |
-| Research date | 2026-07-28 |
-| Repository audit anchor | `f9b8b4e5cfb84b30a0a682fd7952e766a14b4ba1` |
+| Status | Approved implementation basis |
+| Research date | 2026-07-28; decision refresh 2026-07-29 |
+| Repository audit anchor | `e6f77d564b00a6e6911c30be60d441f0576e9e08` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-28-cross-platform-installation-evidence-audit.md) |
-| Refresh gate | Refresh repository state, tool versions, platform signing rules, and Python artifact coverage before implementation planning if the audit anchor or external requirements materially change |
+| Refresh gate | Revalidate tool versions, platform signing rules, and native installed-product evidence at the frozen release candidate |
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ beginner-friendly Market Squawk installation on Windows, macOS, and Linux.
 - [Python environment](#python-environment)
 - [Security and release trust](#security-and-release-trust)
 - [CI and release-evidence boundary](#ci-and-release-evidence-boundary)
-- [Decisions still required](#decisions-still-required)
+- [Accepted implementation decisions](#accepted-implementation-decisions)
 - [Rejected shortcuts](#rejected-shortcuts)
 - [Primary sources](#primary-sources)
 - [Related documentation](#related-documentation)
@@ -45,8 +45,11 @@ This research answers:
 It compares cargo-dist 0.32, Qt Installer Framework 4.11, Tauri 2, cargo-packager 0.11.8, Zero
 Install, uv, platform-native packaging, and the existing Market Squawk secure local portal.
 
-This report does not approve an implementation, freeze a platform/architecture matrix, authorize a
-signing expense, or claim that current Python artifacts cover all three operating systems.
+The original 2026-07-28 report did not authorize implementation. The product owner subsequently
+approved the hybrid design, adopted Tauri for the permanent product shell, required a complete
+default installation, selected uv and Python 3.14, and required both a one-line curl entrypoint and
+clickable native packages. The 2026-07-29 refresh below freezes the remaining release decisions
+without claiming that the required native evidence already exists.
 
 ## Executive finding
 
@@ -117,7 +120,7 @@ departure from the complete default.
 | --- | --- | --- | --- |
 | cargo-dist 0.32 | Rust workspace releases, platform archives, shell/PowerShell installers, MSI, GitHub Releases, checksums, auditable metadata, optional attestations | Generated installers do not own sealed Python, provider/data setup, whole-bundle activation, rollback, or data-safe uninstall | Use as release foundation |
 | Qt Installer Framework 4.11 | One customizable GUI/CLI framework on Windows, macOS, and Linux; online/offline components; add/update/remove maintenance tool | Adds Qt/QJSEngine installer behavior and a second product-lifecycle implementation; duplicates the current portal; does not remove signing or product-specific security work | Strong fallback, not recommended |
-| Tauri 2 | Modern Rust-backed web UI; MSI/NSIS, DMG/app, AppImage and native Linux packages; signed updater | Adds WebView, IPC, Windows WebView2 choices, and Linux WebKitGTK surface solely to display setup; duplicates the current portal | Use only if Market Squawk intentionally becomes a desktop application |
+| Tauri 2 | Modern Rust-backed web UI; MSI/NSIS, DMG/app, AppImage and native Linux packages; signed updater | Does not replace complete-bundle verification, Python sealing, rollback, or data-safe uninstall | Use for the approved permanent desktop and native packages, not as the lifecycle authority |
 | cargo-packager 0.11.8 | Rust-native platform packaging and external-binary support | Packaging tool rather than complete setup, repair, upgrade, and rollback authority | Consider only for a proven cargo-dist format gap |
 | Zero Install | Open-source cross-platform, per-user execution, signed feeds, dependencies, updates | Requires another package manager and does not provide Market Squawk onboarding | Architecture reference or secondary channel |
 | Existing local portal + Rust service | Reuses current dark beginner-facing UX; one product-owned state machine; browser, terminal, and automation parity | Requires native bootstrap and release engineering | Guided-setup authority |
@@ -163,9 +166,10 @@ offline and fixed-runtime options
 compatibility depends on the build baseline and WebKitGTK requirements
 ([AppImage](https://v2.tauri.app/distribute/appimage/)).
 
-Tauri is appropriate if the product adopts a desktop shell for broader reasons. Adding it only for
-installation would introduce runtime and security surface without removing any of the hard
-installation responsibilities.
+Market Squawk subsequently adopted the Obsidian Signal Tauri desktop as its permanent interactive
+product for broader reasons. Tauri therefore owns the desktop and native package shell. It still
+does not own complete-bundle verification, Python sealing, update, repair, rollback, or
+data-preserving uninstall.
 
 ## Recommended architecture
 
@@ -259,17 +263,16 @@ Uninstall must offer separate operations:
 
 ## Platform entrypoints
 
-The design direction is:
+The accepted V1 matrix is:
 
-- **Windows:** signed per-user setup executable for beginners; MSI and WinGet as additional
-  supported channels.
-- **macOS:** signed and notarized package/app distribution for beginners; Homebrew and a verified
-  archive as additional channels.
-- **Linux:** verified portable bundle plus selected native packages; use the local wizard where a
-  browser is available and the same setup service through the terminal when headless.
+- **Windows:** Windows 10 version 1809 or newer on x64, with signed per-user NSIS and MSI packages.
+- **macOS:** macOS 12 or newer on Apple Silicon and Intel, with signed and notarized app/DMG
+  packages.
+- **Linux:** Ubuntu 24.04-compatible x64, with verified AppImage and DEB packages.
+- **Headless Unix:** the same supported Linux and macOS targets through the verified curl
+  bootstrap and complete bundle.
 
-This is not the final support matrix. Cross-platform source does not replace native build,
-installation, signing, and smoke evidence.
+Cross-platform source does not replace native build, installation, signing, and smoke evidence.
 
 Apple direct distribution normally requires Developer ID signing and notarization. Windows
 publisher trust also requires a signing/channel decision. Framework selection does not remove those
@@ -281,11 +284,14 @@ requirements
 
 uv supports Windows, macOS, and Linux without requiring a preinstalled Rust or Python toolchain. It
 can install managed CPython, require managed Python, and perform exact locked synchronization.
-CPython 3.12 and 3.13 are Tier 1 supported
+uv 0.12.0 lists CPython 3.14 as Tier 1; Market Squawk freezes standard CPython 3.14.6 for this
+release
 ([uv](https://docs.astral.sh/uv/),
 [managed Python](https://docs.astral.sh/uv/guides/install-python/),
 [locking and syncing](https://docs.astral.sh/uv/concepts/projects/sync/),
-[support policy](https://docs.astral.sh/uv/reference/policies/python/)).
+[support policy](https://docs.astral.sh/uv/reference/policies/python/),
+[uv 0.12.0](https://github.com/astral-sh/uv/releases/tag/0.12.0), and
+[Python 3.14.6](https://www.python.org/downloads/release/python-3146/)).
 
 Market Squawk should:
 
@@ -369,24 +375,25 @@ This is consistent with the maintained
 [CI verification runtime research](2026-07-27-ci-verification-runtime.md); implementation and
 measured improvement remain separate work.
 
-## Decisions still required
+## Accepted implementation decisions
 
-1. **Signing policy:** does the zero-mandatory-cost rule prohibit maintainer-funded Apple and
-   Windows publisher signing, or only fees imposed on the user/runtime?
-2. **Support matrix:** which exact Windows, macOS, and Linux versions and architectures must V1
-   support?
-3. **Primary channel:** should double-click native installers and package-manager channels receive
-   equal support, or is one primary?
-4. **Rollback retention:** how many previous immutable versions should remain installed?
-5. **Offline budget:** what maximum complete bundle size is acceptable per platform?
-6. **Linux baseline:** which minimum glibc/distribution baseline and native package formats are
-   supported?
-7. **Schema recovery:** which local catalog and dataset changes can roll back safely?
-8. **Provider readiness:** how should the wizard distinguish installed capability from a provider
-   still awaiting user authorization or third-party approval?
-
-The first two decisions materially shape the release matrix and must be settled before the
-implementation plan.
+1. **Signing:** the zero-mandatory-cost rule applies to users and runtime operation. Stable macOS
+   and Windows packages require maintainer-supplied platform signing and notarization. Missing
+   credentials block publication; unsigned pull-request artifacts are never presented as stable.
+2. **Support matrix:** Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon use the floors
+   listed above.
+3. **Primary channels:** the one-line curl route and native GitHub Release packages are both
+   first-class. Package-manager channels may mirror the same immutable release after V1.
+4. **Rollback:** retain the active immutable version and one previous known-good version.
+5. **Bundle limits:** reject more than 2 GiB compressed, 4 GiB expanded, 32,768 entries, 1 GiB per
+   entry, or a 1 MiB manifest.
+6. **Python:** ship uv 0.12.0, standard CPython 3.14.6, and a complete offline locked environment
+   on every target.
+7. **Recovery:** program rollback never rewinds local catalog or dataset schemas. Compatibility is
+   admitted before activation; destructive data migration has no automatic rollback.
+8. **Readiness:** installed capability and provider activation are distinct authority facts. The
+   wizard may report the software installed while a provider remains blocked or awaiting a
+   user-controlled step.
 
 ## Rejected shortcuts
 
@@ -408,6 +415,7 @@ implementation plan.
 ### Release and packaging
 
 - [cargo-dist documentation](https://axodotdev.github.io/cargo-dist/)
+- [cargo-dist 0.32.0 immutable release](https://github.com/axodotdev/cargo-dist/releases/tag/v0.32.0)
 - [cargo-dist configuration](https://axodotdev.github.io/cargo-dist/book/reference/config.html)
 - [cargo-dist supply-chain security](https://axodotdev.github.io/cargo-dist/book/supplychain-security/index.html)
 - [cargo-dist MSI installer](https://axodotdev.github.io/cargo-dist/book/installers/msi.html)
@@ -426,13 +434,16 @@ implementation plan.
 ### Python
 
 - [uv documentation](https://docs.astral.sh/uv/)
+- [uv 0.12.0 immutable release](https://github.com/astral-sh/uv/releases/tag/0.12.0)
 - [uv managed Python](https://docs.astral.sh/uv/guides/install-python/)
 - [uv locking and syncing](https://docs.astral.sh/uv/concepts/projects/sync/)
 - [uv Python support](https://docs.astral.sh/uv/reference/policies/python/)
+- [Python 3.14.6](https://www.python.org/downloads/release/python-3146/)
 
 ### Platform and security
 
 - [GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
+- [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
 - [Apple notarization](https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution)
 - [SLSA Build Provenance v1.2](https://slsa.dev/spec/v1.2/build-provenance)
 - [TUF specification](https://theupdateframework.github.io/specification/latest/)

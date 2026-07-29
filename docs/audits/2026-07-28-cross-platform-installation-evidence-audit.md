@@ -4,9 +4,9 @@
 | --- | --- |
 | Document type | Research evidence audit |
 | Audience | Product owners, maintainers, release engineers, security reviewers |
-| Verdict | `PASS_WITH_NOTES` |
-| Audit date | 2026-07-28 |
-| Repository audit anchor | `f9b8b4e5cfb84b30a0a682fd7952e766a14b4ba1` |
+| Verdict | `PASS_WITH_NOTES`; implementation decisions resolved 2026-07-29 |
+| Audit date | 2026-07-28; decision refresh 2026-07-29 |
+| Repository audit anchor | `e6f77d564b00a6e6911c30be60d441f0576e9e08` |
 | Audited report | [Cross-platform installation and guided setup](../research/2026-07-28-cross-platform-installation-and-guided-setup.md) |
 
 ## Table of Contents
@@ -15,7 +15,7 @@
 - [Evidence coverage](#evidence-coverage)
 - [Citation and source quality](#citation-and-source-quality)
 - [Supported conclusions](#supported-conclusions)
-- [Notes and unresolved decisions](#notes-and-unresolved-decisions)
+- [Notes and resolved decisions](#notes-and-resolved-decisions)
 - [Refresh gate](#refresh-gate)
 
 ## Verdict
@@ -27,8 +27,11 @@ architecture as the recommended design direction. It also supports the conclusio
 Framework is the strongest all-in-one fallback and that Tauri should not be introduced solely for
 installation.
 
-The notes concern product-policy and support-matrix decisions. They are not research defects and do
-not authorize implementation.
+The original notes concerned product-policy and support-matrix decisions. The product owner
+subsequently approved the complete default, the curl and native-package channels, uv, Python 3.14,
+and the permanent Tauri desktop. The 2026-07-29 refresh freezes the remaining decisions in the
+audited report and ADR 0006. Native installed-product evidence remains a release gate rather than a
+research defect.
 
 ## Evidence coverage
 
@@ -76,21 +79,21 @@ The evidence supports:
 8. building and smoke-testing installation on each supported operating system;
 9. keeping affected-change CI as scheduling evidence rather than exact-head release approval.
 
-## Notes and unresolved decisions
+## Notes and resolved decisions
 
-Before implementation planning:
+The maintained report now records:
 
-1. Decide whether the zero-mandatory-cost rule permits maintainer-funded platform signing while the
-   product remains free to users.
-2. Freeze the supported operating-system and architecture matrix.
-3. Reconcile exact bundle contents against the then-current Rust workspace and Python release
-   matrix.
-4. Decide primary distribution channels, rollback retention, offline size budgets, and the Linux
-   compatibility baseline.
+1. stable native packages require maintainer-supplied platform signing while installation and
+   runtime remain free to users;
+2. Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon are the V1 targets;
+3. every route carries the complete Rust, desktop, uv, CPython 3.14.6, and locked Python product;
+4. native packages and the one-line curl route are first-class;
+5. one prior known-good version is retained; and
+6. bundle, entry, and manifest size ceilings are fixed.
 
-Current sealed Python evidence is insufficient for a complete Windows/macOS/Linux installation
-claim. That coverage gap must remain explicit until native artifacts pass the installed-product
-workflow.
+Current sealed Python evidence is still insufficient for a complete Windows/macOS/Linux
+installation claim. That coverage gap remains explicit until native artifacts pass the
+installed-product workflow.
 
 ## Refresh gate
 
