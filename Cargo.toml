@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "apps/market-squawk",
     "apps/market-squawk-desktop/src-tauri",
+    "apps/market-squawk-installer",
     "crates/*",
     "adapters/*",
 ]
@@ -53,6 +54,7 @@ datafusion = { version = "=54.0.0", default-features = false, features = [
     "recursive_protection",
     "sql",
 ] }
+directories = "=6.0.0"
 fs2 = "0.4"
 futures-util = "0.3"
 getrandom = "=0.3.4"
@@ -124,6 +126,7 @@ schemars = { version = "=1.2.1", default-features = false, features = [
     "derive",
     "std",
 ] }
+semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha2 = "0.10"
