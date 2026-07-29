@@ -1062,3 +1062,12 @@ is one remediation commit and push. The same Quarter 4 reviewer then closes the 
 a clean unchanged exact-head hosted gate follows once. Issue `#36`, draft PR `#37`, and the
 Project 5 item remain open and in progress until those outcomes and the separate
 signed-installation predicate are actually complete.
+
+Pushed remediation `be8619bfe693eb12ccdcc6477c0b92ae46248250` started exact-head hosted run
+[`30423427243`](https://github.com/Sawmonabo/market-squawk/actions/runs/30423427243). Classification
+and policy passed, but Linux release verification correctly rejected two stale content identities
+in the complete Python release source closure: the changed application executable-admission module
+and platform configuration module. The expected path set remained complete and all 956 other
+source records matched. Remediation updates only those two `sources` size/SHA-256 records, as
+required by the existing source-closure invariant; dependency artifacts, interpreter coverage, and
+platform policy remain unchanged. The previously failing focused admission contract now passes.
