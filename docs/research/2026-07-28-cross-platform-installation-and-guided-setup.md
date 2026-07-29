@@ -265,20 +265,24 @@ Uninstall must offer separate operations:
 
 The accepted V1 matrix is:
 
-- **Windows:** Windows 10 version 1809 or newer on x64, with signed per-user NSIS and MSI packages.
-- **macOS:** macOS 12 or newer on Apple Silicon and Intel, with signed and notarized app/DMG
-  packages.
+- **Windows:** Windows 10 version 1809 or newer on x64, with complete per-user NSIS and MSI
+  packages whose exact native-trust mode is recorded.
+- **macOS:** macOS 12 or newer on Apple Silicon and Intel, with complete app/DMG packages whose
+  exact native-trust mode is recorded.
 - **Linux:** Ubuntu 24.04-compatible x64, with verified AppImage and DEB packages.
 - **Headless Unix:** the same supported Linux and macOS targets through the verified curl
   bootstrap and complete bundle.
 
-Cross-platform source does not replace native build, installation, signing, and smoke evidence.
+Cross-platform source does not replace native build, installation, package-integrity, and smoke
+evidence.
 
 Apple direct distribution normally requires Developer ID signing and notarization. Windows
-publisher trust also requires a signing/channel decision. Framework selection does not remove those
-requirements
+publisher trust also requires a signing or Store authority. Those native trust signals are distinct
+from artifact integrity and build provenance, and neither can be claimed unless the exact authority
+is present
 ([Apple notarization](https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution),
-[Microsoft Authenticode inspection](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature)).
+[Microsoft Authenticode inspection](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature),
+[zero-cost desktop distribution](2026-07-29-zero-cost-desktop-distribution.md)).
 
 ## Python environment
 
@@ -395,16 +399,19 @@ measured improvement remain separate work.
 
 ## Accepted implementation decisions
 
-1. **Signing:** the zero-mandatory-cost rule applies to users and runtime operation. Stable macOS
-   and Windows packages require maintainer-supplied platform signing and notarization. Missing
-   credentials block publication; unsigned pull-request artifacts are never presented as stable.
+1. **Release trust:** paid Apple or Windows credentials are not prerequisites for the core stable
+   release. Every artifact records and proves its actual trust mode. Apple Developer ID and
+   notarization, Microsoft Store MSIX signing, and SignPath Authenticode are admitted only when
+   their real external authority exists; provenance-only packages are never mislabeled as having a
+   verified native publisher.
 2. **Support matrix:** Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon use the floors
    listed above.
 3. **Primary channels:** the one-line curl route and native GitHub Release packages are both
    first-class. Package-manager channels may mirror the same immutable release after V1.
 4. **Rollback:** retain the active immutable version and one previous known-good version.
 5. **Bundle limits:** reject more than 2 GiB compressed, 4 GiB expanded, 32,768 entries, 1 GiB per
-   entry, or a 1 MiB manifest.
+   entry, or an 8 MiB per-platform manifest. The bound remains fixed while admitting the measured
+   1.62 MiB complete Python product inventory.
 6. **Python:** ship uv 0.12.0, standard CPython 3.14.6, and a complete offline locked environment
    on every target.
 7. **Recovery:** program rollback never rewinds local catalog or dataset schemas. Compatibility is
@@ -483,4 +490,5 @@ measured improvement remain separate work.
 - [Provider onboarding research](2026-07-22-zero-fee-provider-onboarding/final-report.md)
 - [Python product dependency admission](2026-07-22-python-product-dependency-admission.md)
 - [CI verification runtime and build-cache diagnosis](2026-07-27-ci-verification-runtime.md)
+- [Zero-cost macOS and Windows desktop distribution](2026-07-29-zero-cost-desktop-distribution.md)
 - [Delivery ledger](../plans/delivery-ledger.md)

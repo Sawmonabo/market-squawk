@@ -2454,7 +2454,8 @@ def _copy_native_release_executables(
             raise ReleaseBuildError("native release executable identity is invalid")
         expected_identity = _file_digest(source)
         shutil.copyfile(source, destination)
-        destination.chmod(0o555)
+        if os.name != "nt":
+            destination.chmod(0o555)
         if _file_digest(destination) != expected_identity:
             raise ReleaseBuildError("installed native release identity changed")
     return installed
@@ -2495,7 +2496,8 @@ def install_native_training_driver(
     expected_size, expected_sha256 = _file_digest(source)
     try:
         shutil.copyfile(source, replacement)
-        replacement.chmod(0o555)
+        if os.name != "nt":
+            replacement.chmod(0o555)
         if _file_digest(replacement) != (expected_size, expected_sha256):
             raise ReleaseBuildError("training launcher changed during installation")
         os.replace(replacement, destination)
@@ -2774,12 +2776,15 @@ def _reset_owned_child(path: Path, root: Path, purpose: str) -> None:
     _admit_owned_child(path, root, purpose)
     if purpose == CANONICAL_RELEASE:
         _unseal_owned_release_authority(path)
-    shutil.rmtree(path)
+    _remove_owned_tree(path)
     path.mkdir()
     (path / CHILD_MARKER).write_text(_marker_content(path, purpose), encoding="utf-8")
 
 
 def _unseal_owned_release_authority(path: Path) -> None:
+    if os.name == "nt":
+        _admit_windows_release_authority(path)
+        return
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -2802,9 +2807,41 @@ def _unseal_owned_release_authority(path: Path) -> None:
             os.close(descriptor)
 
 
+def _admit_windows_release_authority(path: Path) -> None:
+    current = path
+    for component in (None, "share", "market-squawk"):
+        if component is not None:
+            current = current / component
+        try:
+            status = current.lstat()
+        except FileNotFoundError:
+            return
+        attributes = getattr(status, "st_file_attributes", 0)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise ReleaseBuildError("sealed release authority is invalid")
+
+
+def _remove_windows_readonly(function: object, path: str, error: BaseException) -> None:
+    if not isinstance(error, PermissionError) or not callable(function):
+        raise error
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE, follow_symlinks=False)
+    function(path)
+
+
+def _remove_owned_tree(path: Path) -> None:
+    if os.name == "nt":
+        shutil.rmtree(path, onexc=_remove_windows_readonly)
+    else:
+        shutil.rmtree(path)
+
+
 def _remove_owned_child(path: Path, root: Path, purpose: str) -> None:
     _admit_owned_child(path, root, purpose)
-    shutil.rmtree(path)
+    _remove_owned_tree(path)
 
 
 def _regular_files(root: Path, directory: Path) -> set[str]:
@@ -3478,7 +3515,8 @@ def harden_project_wheel(project_wheel: Path) -> None:
                     raise ReleaseBuildError("project wheel RECORD exceeds its bound")
                 record_info = copy.copy(records[0])
                 destination.writestr(record_info, record_bytes)
-        temporary.chmod(wheel_mode)
+        if os.name != "nt":
+            temporary.chmod(wheel_mode)
         os.replace(temporary, project_wheel)
     except ReleaseBuildError:
         raise
@@ -3840,9 +3878,10 @@ def install_training_environment(
     ).encode("ascii")
     receipt_path = authority / "training-environment.json"
     receipt_path.write_bytes(encoded)
-    for path in (wheel_destination, manifest_path, receipt_path):
-        path.chmod(0o444)
-    authority.chmod(0o555)
+    if os.name != "nt":
+        for path in (wheel_destination, manifest_path, receipt_path):
+            path.chmod(0o444)
+        authority.chmod(0o555)
     return hashlib.sha256(encoded).hexdigest()
 
 

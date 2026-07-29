@@ -17,7 +17,9 @@ pub use self::contracts::{
 pub use self::lifecycle::{
     InstallError, active_release_root, install, repair, rollback, status, uninstall, update,
 };
-pub use self::manifest::{AdmittedRelease, ComponentRole, ManifestError, ReleaseManifest};
+pub use self::manifest::{
+    AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
+};
 pub use self::platform::{PlatformError, ProgramName, SupportedTarget, default_install_root};
 pub use self::store::StoreError;
 

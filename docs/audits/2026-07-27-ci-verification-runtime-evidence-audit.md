@@ -8,10 +8,11 @@ follow-up in the maintained research documentation.
 | Document type | Evidence audit |
 | Audience | Maintainers, CI owners, release reviewers |
 | Verdict | `PASS_WITH_NOTES` |
-| Evidence cutoff | 2026-07-28 |
-| Last substantive review | 2026-07-28 |
+| Evidence cutoff | 2026-07-29 |
+| Last substantive review | 2026-07-29 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
+| Current release-packaging measurement | Rejected candidate `775e21da52a8eb08d812bee01e172f55ad93e7ef` |
 | Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
 
 ## Table of Contents
@@ -36,7 +37,9 @@ The audit compared the research report with:
 - the Linux authority-lock, Windows analytical-backup, and manifest-allocation implementations;
 - the unchanged Windows job rerun and file-adapter clock/deadline fixture;
 - the Windows ONNX worker's resource profile and pinned Job Object dependency;
-- the Kraken vertical runtime topology and paper-recovery sequence handoff; and
+- the Kraken vertical runtime topology and paper-recovery sequence handoff;
+- complete-product candidate `775e21d`, including every job duration, completed step duration,
+  failure annotation, and retained failure log;
 - the relevant Linux, Windows, Rust, and SQLite platform contracts.
 
 ## Findings
@@ -148,6 +151,20 @@ speedup.
   gate passed the corrected paper adapter and application surfaces. This is the required hosted
   cross-platform correctness evidence for the sequence handoff; it is not terminal release
   approval or post-redesign runtime evidence.
+- Exact candidate `775e21d` completed in
+  [run 30487393236](https://github.com/Sawmonabo/market-squawk/actions/runs/30487393236).
+  Windows and macOS workspace proof passed in 17m11s and 25m35s, while the serial Linux release
+  verification passed in 69m10s. Complete packaging then exposed three late deterministic
+  boundary failures after 61–97 minutes and one Intel macOS runner-communication failure after
+  81m07s. The jobs began within seconds of classification, so queueing did not cause the observed
+  duration.
+- The 2026 CircleCI benchmark is based on 28,738,317 workflows and reports a 2.2-minute median and
+  9.9-minute mean. DORA places the ordinary test-feedback upper limit at about ten minutes and
+  recommends separating longer work. These values are ecosystem context, not Market Squawk
+  release-package performance claims.
+- The earlier 28–32 minute cold projection was not achieved. The maintained report now labels it
+  historical planning evidence and records separate proposed targets for ordinary pull-request
+  feedback, platform proof, and complete frozen-release packaging.
 
 The retained diagnostic log identities were:
 
@@ -190,7 +207,8 @@ tracked project artifacts; the report retains the durable GitHub run links and r
 | --- | ---: | --- |
 | Cargo, Rust, and toolchain documentation, including exact source | 26 | Covered |
 | Operating-system, storage, and locked-dependency contracts | 20 | Covered |
-| Official GitHub documentation and maintained CI tools | 9 | Covered |
+| Official GitHub documentation and maintained CI tools | 10 | Covered |
+| Delivery-performance benchmarks | 2 | Covered; not treated as repository-specific performance proof |
 | Academic papers | 4 | Covered; repository-transfer limits are explicit |
 
 The report cites sources beside its material claims and distinguishes source-backed facts from
@@ -229,6 +247,9 @@ numerical forecast.
 - Exact candidate `f8c2569` passed Linux, macOS, and Windows unchanged. The paper-recovery
   correction and the preceding cross-platform correctness fixes are therefore accepted at that
   exact code head.
+- Exact candidate `775e21d` completed without cancellation. It establishes the current
+  complete-product runtime baseline and all four package-lane outcomes; it is rejected as release
+  evidence because no package lane passed.
 - The audit verdict approves this report as decision input. It is not release approval and not
   post-change performance evidence.
 
@@ -237,5 +258,6 @@ numerical forecast.
 The report is fit to preserve as a date-anchored diagnostic and implementation-decision input. Its
 two repository-specific runtime root causes are directly reproduced, its workflow-shape diagnosis
 is supported by run evidence and official documentation, its cross-platform correctness follow-up
-passed unchanged, and its expected redesigned runtime remains appropriately qualified pending
+passed unchanged, and its 2026-07-29 complete-product measurement disproves the earlier runtime
+projection without weakening any gate. The redesigned runtime remains pending implementation and
 post-change measurement.

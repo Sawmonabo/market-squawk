@@ -8,15 +8,15 @@ use std::{
 };
 
 use market_squawk_installer::{
-    InstallError, InstallRequest, ManifestError, PlatformError, ReleaseManifest, SupportedTarget,
-    UpdateRequest, active_release_root, default_install_root, install, repair, status, update,
+    InstallError, InstallRequest, MAXIMUM_MANIFEST_BYTES, ManifestError, PlatformError,
+    ReleaseManifest, SupportedTarget, UpdateRequest, active_release_root, default_install_root,
+    install, repair, status, update,
 };
 use semver::Version;
 use tauri::Manager as _;
 use thiserror::Error;
 
 const LATEST_MANIFEST_URL: &str = "https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-release.json";
-const MAXIMUM_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAXIMUM_BOOTSTRAP_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -122,7 +122,7 @@ fn packaged_release(
     }
 
     let manifest_path = directory.join("market-squawk-release.json");
-    let manifest = read_bounded(&manifest_path, MAXIMUM_MANIFEST_BYTES)?;
+    let manifest = read_bounded(&manifest_path, MAXIMUM_MANIFEST_BYTES as u64)?;
     let admitted = ReleaseManifest::admit_current(&manifest)?;
     if admitted.version() != version.to_string() {
         return Err(InstallationStartupError::InvalidPackagedRelease);

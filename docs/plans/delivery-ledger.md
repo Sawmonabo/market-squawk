@@ -1110,3 +1110,43 @@ pushed, clean, unchanged, and re-identified by the reviewer. The next barrier is
 closure plus the hosted native-package and release results. Complete guided native bootstrap,
 uv/managed-Python installation, and signed installation evidence remain mandatory release blockers.
 Issue `#36`, draft PR `#37`, and the Project 5 item therefore remain open and In Progress.
+
+## 2026-07-29 complete installation hosted checkpoint
+
+Draft PR `#39` and issue `#38` now own the complete-installation and public-release lane, stacked on
+the accepted desktop candidate in PR `#37`. Candidate
+`775e21da52a8eb08d812bee01e172f55ad93e7ef` includes the immutable Rust installer lifecycle, sealed
+CPython 3.14/PyArrow product, complete platform bundles, Tauri embedding, four-platform package
+matrix, stable-release transaction, and real dashboard data/MCP exploration.
+
+[Hosted run 30487393236](https://github.com/Sawmonabo/market-squawk/actions/runs/30487393236)
+completed without cancellation. Windows and macOS workspace jobs passed in 17m11s and 25m35s, and
+the complete Linux release verification passed in 69m10s. The four package jobs did not provide
+release approval:
+
+- Windows exposed a Unix-only release-cleanup call after 61m34s.
+- Linux rejected the measured 1.62 MiB complete manifest against an obsolete 1 MiB ceiling after
+  73m26s.
+- Apple Silicon installed and repaired the complete product, then correctly rejected build-only
+  environment variables leaked into the runtime smoke after 97m09s.
+- Intel macOS lost hosted-runner communication after 81m07s without reporting a product failure.
+
+The next frozen candidate corrects the three deterministic boundaries without weakening product
+admission: Windows uses its supported no-follow/reparse-point and read-only cleanup contracts, the
+per-platform manifest ceiling is consistently 8 MiB across every producer and consumer, and
+installed-product smoke removes only the four explicit build-only environment keys. Focused
+installer tests, desktop Rust compilation, frontend type checking, the existing Python release
+contracts, workflow policy, YAML parsing, formatting, source-lock identity, workspace boundaries,
+and generated-artifact checks pass locally.
+
+The maintained CI runtime report now records both the exact repository timings and current
+industry context. Ordinary pull-request feedback is targeted at 10–20 minutes, platform proof at
+30 minutes, and the complete frozen-release build is a separate measured workflow rather than an
+ordinary change loop. The independently audited zero-cost distribution policy also removes paid
+signing credentials as a prerequisite for the core release and requires truthful per-artifact
+trust evidence.
+
+Issue `#38`, PR `#39`, and the Project item remain In Progress. The next barrier is one unchanged
+hosted run of the corrected exact head, followed by implementation of the accepted no-cost
+release-trust policy, publication of real assets, installed public-endpoint verification, grouped
+Quarter 4 acceptance, merge, and branch/worktree/cache closeout.

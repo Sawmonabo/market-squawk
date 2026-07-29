@@ -22,6 +22,7 @@ MAXIMUM_FILES = 32_768
 MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024
 MAXIMUM_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+MAXIMUM_PLATFORM_MANIFEST_BYTES = 8 * 1024 * 1024
 COPY_BUFFER_BYTES = 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
@@ -361,7 +362,7 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
         manifest_path.is_symlink()
         or not manifest_path.is_file()
         or manifest_path.stat().st_size == 0
-        or manifest_path.stat().st_size > 1024 * 1024
+        or manifest_path.stat().st_size > MAXIMUM_PLATFORM_MANIFEST_BYTES
     ):
         raise ReleaseBuildError("platform release manifest exceeds its fixed bound")
     try:

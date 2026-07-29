@@ -14,7 +14,8 @@ use crate::platform::{PlatformError, SupportedTarget};
 pub(crate) const MAXIMUM_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAXIMUM_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAXIMUM_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub(crate) const MAXIMUM_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Maximum encoded byte length of one per-platform release manifest.
+pub const MAXIMUM_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAXIMUM_ARCHIVE_ENTRIES: usize = 32_768;
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const PRODUCT_IDENTITY: &str = "market-squawk";

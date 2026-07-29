@@ -466,6 +466,11 @@ jobs:
           bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-${{ needs.freeze.outputs.version }}-$TARGET.zip"
           manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
           install_root="$RUNNER_TEMP/installed-product"
+          unset \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
           "$bootstrap" --root "$install_root" install \
             --manifest "$manifest" \
             --bundle "$bundle"

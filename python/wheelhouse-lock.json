@@ -4407,8 +4407,8 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "8f5e5a3b7b87dda7d384d8acb8ec2ada2fc32b73cc46dd6316b44a01f064f77f",
-      "size_bytes": 159943
+      "sha256": "40cb6832ec58b7354868c8afd2098f6147be010f5e50c445ee9c250482ad41e8",
+      "size_bytes": 161254
     },
     {
       "path": "scripts/tests/test_build_python_release.py",

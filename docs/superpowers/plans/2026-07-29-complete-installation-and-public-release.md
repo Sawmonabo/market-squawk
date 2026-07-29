@@ -35,14 +35,15 @@ sealed Python release builder.
   standard CPython 3.14.6, and the exact locked Python environment.
 - No installed path may require Rust, Node.js, pnpm, Python, uv, a container runtime, a database
   service, a cloud service, or a paid subscription to be preinstalled.
-- The public stable release must be immutable, carry GitHub release attestations, and pass native
-  signature verification where the platform supplies that trust surface. Unsigned pull-request
-  packages are test artifacts and cannot be published as the stable release.
+- The public stable release must be immutable, carry GitHub release attestations, record the exact
+  native-trust mode of every artifact, and pass native-signature verification wherever that
+  authority is actually present. Pull-request packages are test artifacts and cannot be published
+  as the stable release.
 - Retain the active immutable version and one previous known-good version. Activation changes one
   atomic selector; it never modifies an active version in place.
-- Reject bundles above 2 GiB compressed, 4 GiB expanded, 32,768 entries, 1 GiB per entry, or 1 MiB
-  for the release manifest. Reject duplicate, absolute, parent-traversal, symlink, device, and
-  unlisted paths before activation.
+- Reject bundles above 2 GiB compressed, 4 GiB expanded, 32,768 entries, 1 GiB per entry, or 8 MiB
+  for the per-platform release manifest. Reject duplicate, absolute, parent-traversal, symlink,
+  device, and unlisted paths before activation.
 - Ordinary uninstall removes programs and launchers but preserves configuration, credentials,
   catalogs, portfolios, datasets, models, logs, and artifacts. Each mutable-data class requires a
   separate explicit deletion choice.
@@ -511,8 +512,8 @@ sealed Python release builder.
 
 **Interfaces:**
 
-- Consumes: one clean annotated `v1.0.0` tag at the approved exact commit plus protected platform
-  signing credentials.
+- Consumes: one clean annotated `v1.0.0` tag at the approved exact commit plus any independently
+  admitted native-trust authority that is actually available.
 - Produces: one immutable GitHub Release whose complete asset set can be verified and downloaded
   without cloning the repository.
 
@@ -522,19 +523,21 @@ sealed Python release builder.
   toolchains, builds the sealed CPython 3.14 product and complete bundle, builds native Tauri
   packages, performs installed-product smoke, and uploads only closed expected artifacts.
 
-- [ ] **Step 2: Add native signing gates**
+- [ ] **Step 2: Add truthful per-artifact trust gates**
 
-  macOS jobs import the protected Developer ID identity, sign the app and every executable,
-  notarize, staple, and verify with `codesign`, `spctl`, and `stapler`. Windows jobs sign the
-  bootstrap, executables, NSIS installer, and MSI, then verify publisher identity and timestamp.
-  Missing credentials fail the stable workflow before publication.
+  Core publication must not require paid Apple or Windows credentials. Each package records whether
+  it is provenance-only, Developer ID signed and notarized, Microsoft Store signed, or
+  Authenticode signed. When an optional authority exists, the workflow verifies its publisher,
+  timestamp, and platform-admission evidence against the exact final bytes. Missing optional
+  authority leaves the artifact in its accurately labelled provenance-only mode rather than
+  blocking the core release.
 
 - [ ] **Step 3: Assemble one draft release transaction**
 
   The release job creates a draft, downloads the four exact artifact sets, rejects duplicate or
   missing filenames, builds the closed cross-platform manifest and `install.sh`, verifies every
-  digest and native signature again, generates GitHub artifact attestations, uploads all assets,
-  and runs clean virtual-machine install-to-use jobs against the draft assets.
+  digest and each artifact's declared trust mode again, generates GitHub artifact attestations,
+  uploads all assets, and runs clean virtual-machine install-to-use jobs against the draft assets.
 
 - [ ] **Step 4: Publish only after every predicate passes**
 

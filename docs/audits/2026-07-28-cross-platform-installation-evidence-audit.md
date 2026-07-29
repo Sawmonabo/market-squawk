@@ -4,10 +4,11 @@
 | --- | --- |
 | Document type | Research evidence audit |
 | Audience | Product owners, maintainers, release engineers, security reviewers |
-| Verdict | `PASS_WITH_NOTES`; implementation decisions resolved 2026-07-29 |
+| Verdict | `PASS_WITH_NOTES`; release-trust and manifest decisions refreshed 2026-07-29 |
 | Audit date | 2026-07-28; decision refresh 2026-07-29 |
 | Repository audit anchor | `e6f77d564b00a6e6911c30be60d441f0576e9e08` |
 | Audited report | [Cross-platform installation and guided setup](../research/2026-07-28-cross-platform-installation-and-guided-setup.md) |
+| Supplemental trust audit | [PASS](2026-07-29-zero-cost-desktop-distribution-evidence-audit.md) |
 
 ## Table of Contents
 
@@ -30,8 +31,9 @@ installation.
 The original notes concerned product-policy and support-matrix decisions. The product owner
 subsequently approved the complete default, the curl and native-package channels, uv, Python 3.14,
 and the permanent Tauri desktop. The 2026-07-29 refresh freezes the remaining decisions in the
-audited report and ADR 0006. Native installed-product evidence remains a release gate rather than a
-research defect.
+audited report and ADR 0006. The independently audited zero-cost distribution report supersedes
+the earlier assumption that paid signing credentials must block the core release. Native
+installed-product evidence remains a release gate rather than a research defect.
 
 ## Evidence coverage
 
@@ -77,19 +79,23 @@ The evidence supports:
 6. verifying the complete bundle before atomic activation;
 7. retaining a last-known-good version and preserving user data by default;
 8. building and smoke-testing installation on each supported operating system;
-9. keeping affected-change CI as scheduling evidence rather than exact-head release approval.
+9. keeping affected-change CI as scheduling evidence rather than exact-head release approval; and
+10. representing artifact integrity, provenance, publisher identity, and platform admission as
+    separate trust properties.
 
 ## Notes and resolved decisions
 
 The maintained report now records:
 
-1. stable native packages require maintainer-supplied platform signing while installation and
-   runtime remain free to users;
+1. the core stable release does not require paid signing credentials; every artifact must prove
+   its actual trust mode, and optional native signing or Store authority is admitted only when
+   present;
 2. Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon are the V1 targets;
 3. every route carries the complete Rust, desktop, uv, CPython 3.14.6, and locked Python product;
 4. native packages and the one-line curl route are first-class;
 5. one prior known-good version is retained; and
-6. bundle, entry, and manifest size ceilings are fixed.
+6. bundle and entry ceilings remain fixed, while the per-platform manifest ceiling is 8 MiB so the
+   measured 1.62 MiB complete inventory remains admissible.
 
 Current sealed Python evidence is still insufficient for a complete Windows/macOS/Linux
 installation claim. That coverage gap remains explicit until native artifacts pass the

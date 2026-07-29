@@ -57,6 +57,9 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Zero-cost macOS and Windows desktop distribution](2026-07-29-zero-cost-desktop-distribution.md)
+  — independently audited Apple, Microsoft Store/MSIX, SignPath, native-trust, provenance, and
+  repository-integration findings for a release with no mandatory paid credentials.
 - [CI verification runtime and build-cache diagnosis](2026-07-27-ci-verification-runtime.md) —
   measured phase timing, the reproduced Cargo invalidation defect, inactive pull-request cache
   population, repeated Loom construction, the accepted cross-platform correctness follow-up,

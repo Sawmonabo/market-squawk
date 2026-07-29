@@ -18,6 +18,7 @@ import { createHash } from "node:crypto"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
+const MAXIMUM_RELEASE_MANIFEST_BYTES = 8 * 1024 * 1024
 const LINUX_BUNDLER_TOOL_LOCK = Object.freeze([
   {
     name: "AppRun-x86_64",
@@ -151,7 +152,10 @@ function stageCompleteRelease() {
     throw new Error("The complete release checksums are incomplete or invalid.")
   }
   const manifestBytes = readFileSync(join(releaseOutput, manifestName))
-  if (manifestBytes.byteLength === 0 || manifestBytes.byteLength > 1024 * 1024) {
+  if (
+    manifestBytes.byteLength === 0 ||
+    manifestBytes.byteLength > MAXIMUM_RELEASE_MANIFEST_BYTES
+  ) {
     throw new Error("The complete release manifest exceeds its fixed byte bound.")
   }
   const manifest = JSON.parse(manifestBytes.toString("utf8"))
@@ -177,7 +181,10 @@ function stageCompleteRelease() {
     throw new Error("The complete release manifest does not match this native package.")
   }
   controlledReleaseFile(join(releaseOutput, bootstrapName), 256 * 1024 * 1024)
-  controlledReleaseFile(join(releaseOutput, manifestName), 1024 * 1024)
+  controlledReleaseFile(
+    join(releaseOutput, manifestName),
+    MAXIMUM_RELEASE_MANIFEST_BYTES,
+  )
   controlledReleaseFile(join(releaseOutput, checksumName), 64 * 1024)
 
   const temporary = `${generatedReleaseDirectory}.new-${process.pid}`

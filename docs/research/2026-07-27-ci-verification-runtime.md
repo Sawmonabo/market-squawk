@@ -7,9 +7,9 @@ approximately one-hour Linux verification feedback loop.
 | --- | --- |
 | Document type | Research and diagnostic decision record |
 | Audience | Maintainers, CI owners, release reviewers |
-| Status | Audited decision input; cross-platform correctness follow-up accepted; pipeline runtime correction not yet implemented or measured |
+| Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-28 |
+| Last substantive review | 2026-07-29 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
@@ -19,6 +19,7 @@ approximately one-hour Linux verification feedback loop.
 - [Scope](#scope)
 - [Executive finding](#executive-finding)
 - [Measured runtime](#measured-runtime)
+- [2026-07-29 complete-product measurement](#2026-07-29-complete-product-measurement)
 - [Root causes](#root-causes)
 - [Current candidate correctness follow-up](#current-candidate-correctness-follow-up)
 - [Correction design](#correction-design)
@@ -117,6 +118,79 @@ At the audit date, the most recent 20 release-branch CI runs consisted of 13 fai
 cancellations. Their summed run duration was 8.236 hours. This is not proof that every minute was
 wasted; it demonstrates the operational cost of repeatedly learning one late failure and then
 submitting another cold candidate.
+
+## 2026-07-29 complete-product measurement
+
+Exact candidate `775e21da52a8eb08d812bee01e172f55ad93e7ef` ran in
+[run 30487393236](https://github.com/Sawmonabo/market-squawk/actions/runs/30487393236).
+The completed run produced:
+
+| Job | Result | Wall time | Material evidence |
+| --- | --- | ---: | --- |
+| Classify changes | Passed | 6s | Change classification is not a bottleneck |
+| Policy and security | Passed | 34s | The inexpensive fail-fast lane is healthy |
+| Windows workspace | Passed | 17m11s | Acceptable as platform proof, not as the primary feedback loop |
+| macOS workspace | Passed | 25m35s | Acceptable as platform proof, not as the primary feedback loop |
+| Linux release verification | Passed | 69m10s | `scripts/verify.sh` remained one 68-minute serial step |
+| Windows desktop package | Failed | 61m34s | A Windows-incompatible cleanup call failed after 59m46s of sealed-product construction |
+| Linux desktop package | Failed | 73m26s | A 1 MiB manifest bound rejected the 1.62 MiB complete manifest after 40m45s of Python construction and 31m39s of native construction |
+| Apple Silicon desktop package | Failed | 97m09s | The installed product correctly rejected leaked build-only configuration after 42m55s of Python, 35m52s of native, and 17m14s of Tauri construction |
+| Intel macOS desktop package | Infrastructure failure | 81m07s | The hosted runner lost server communication after spending 76m56s in sealed-product construction; no product failure was reported |
+
+The three product failures were inexpensive compatibility, input-admission, and environment
+isolation defects discovered only after the expensive work. None was runner queueing: all
+scheduled jobs started within seconds of classification. The package workflow also builds release
+Rust code while constructing the sealed Python product, builds the native products again, and then
+invokes the Tauri build. That repeated construction, rather than one unusually large shipping
+executable, is the dominant cost.
+
+The Intel macOS result is not attributed to product code. GitHub's only retained annotation says
+the hosted runner lost communication and identifies runner termination, CPU or memory starvation,
+or blocked networking as possible classes of cause. No build error or complete log was retained.
+The next unchanged hosted execution must determine whether that incident reproduces; reducing the
+job's duration and repeated construction also reduces its exposure to this failure class.
+
+The previous unchanged green desktop candidate,
+[run 30444404418](https://github.com/Sawmonabo/market-squawk/actions/runs/30444404418),
+finished its package jobs in 32m06s on Linux, 36m11s on Apple Silicon, 60m26s on Windows, and
+93m43s on Intel macOS. That is a useful repository baseline but not an equal workload: those jobs
+ran Tauri packaging without the new sealed Python product and complete native release assembly.
+The comparison confirms that Intel packaging was already the platform outlier and that the current
+complete-product workflow added substantial construction work.
+
+There is no universal GitHub Actions duration target. GitHub recommends monitoring each
+repository's job runtime, queue time, and failure rate
+([GitHub Actions metrics](https://docs.github.com/en/actions/concepts/metrics)). The standard
+public runners used here are modest machines: Linux and Windows provide four CPUs and 16 GB RAM,
+the Intel macOS runner provides four CPUs and 14 GB RAM, and the Apple Silicon runner provides
+three M1 CPUs and 7 GB RAM
+([GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+
+Two broader reference points establish that one-hour feedback is not a healthy ordinary CI loop:
+
+- DORA recommends tests complete within a few minutes, with about ten minutes as the upper limit;
+  longer work should be parallelized or moved to a separate delivery-pipeline stage
+  ([DORA continuous integration](https://dora.dev/capabilities/continuous-integration/)).
+- CircleCI's 2026 report measured 28,738,317 workflows and found a 2.2-minute median and 9.9-minute
+  mean duration
+  ([2026 State of Software Delivery](https://circleci.com/landing-pages/assets/2026-state-of-software-delivery-report.pdf)).
+
+Those ecosystem values are context, not a claim that every complete Market Squawk package can
+finish in ten minutes. They support separate operating targets:
+
+- ordinary pull-request feedback: median at or below 10 minutes and p95 at or below 20 minutes;
+- hosted platform proof: at or below 30 minutes; and
+- complete cross-platform packaging: a separately authorized frozen-release workflow, initially
+  allowed 60–90 minutes per platform while its duplicate construction is removed and measured.
+
+The complete packaging workflow must not remain part of every ordinary pull-request feedback loop.
+Cheap deterministic admission checks must run before expensive construction, and each platform
+must build each product input once and reuse that exact output downstream.
+
+The earlier 28–32 minute cold projection was not achieved. Change classification, a separate
+policy lane, trusted package-cache writes, and a final gate now exist, but the Linux verification
+body is still serial and the complete-package matrix adds a second, larger critical path. The
+projection remains historical planning evidence only and must not be cited as measured performance.
 
 ## Root causes
 
@@ -761,6 +835,7 @@ The correction therefore does not require a paid runner under the current public
 ## Sources
 
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
+The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 
 ### Cargo, Rust, and toolchain documentation
 
@@ -816,6 +891,7 @@ The platform-contract sources added during the correctness follow-up were review
 
 ### Official GitHub documentation and maintained tools
 
+- [GitHub Actions metrics](https://docs.github.com/en/actions/concepts/metrics)
 - [GitHub Actions dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 - [GitHub Actions workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
 - [GitHub Actions job variations](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)
@@ -825,6 +901,11 @@ The platform-contract sources added during the correctness follow-up were review
 - [actions/cache](https://github.com/actions/cache)
 - [Mozilla sccache](https://github.com/mozilla/sccache)
 - [cargo-nextest](https://github.com/nextest-rs/nextest)
+
+### Delivery-performance benchmarks
+
+- [DORA continuous integration capability](https://dora.dev/capabilities/continuous-integration/)
+- [CircleCI 2026 State of Software Delivery](https://circleci.com/landing-pages/assets/2026-state-of-software-delivery-report.pdf)
 
 ### Academic evidence
 
