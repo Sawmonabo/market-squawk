@@ -10,7 +10,7 @@ order, and recovery surfaces at the reviewed commit.
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
 | Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Implementation review base | Quarter 4 remediation audited from `03783250a1020d79cdd7f8bda424da62568dd3d5` |
 
 ## Contents
 
@@ -43,7 +43,8 @@ The baseline topology is one operator-owned machine:
 
 - `market-squawk-desktop` is the Tauri 2 interactive application. Its bundled React WebView owns
   presentation only; a five-command bridge composes the existing `LocalProduct` and `Application`
-  services in the same process;
+  services in the same process. Native packages also install the exact CLI, capture helper, and
+  ONNX worker as sibling executables;
 - `market-squawk` is the CLI and local MCP application process;
 - Tokio tasks inside that process own source supervision, live shards, research services,
   application requests, risk, paper execution, and lifecycle;
@@ -150,10 +151,12 @@ and explicit provider operations account for the product's operational output an
 activity.
 
 The ONNX worker is not a generic executable hook. When a signed training release is selected,
-startup verifies that the running application and bounded regular sibling worker are the canonical
-installed paths and match the signed release-manifest digests. Model admission then fixes
-graph/operator/tensor/resource policy before publication. The capture helper is likewise a
-validated sibling and receives one confined journal destination.
+startup verifies that the installed `market-squawk` application identity and bounded regular
+sibling worker are the canonical installed paths and match the signed release-manifest digests.
+When the desktop owns the runtime, it selects that packaged CLI sibling rather than substituting
+the desktop executable's digest. Model admission then fixes graph/operator/tensor/resource policy
+before publication. The capture helper is likewise a validated sibling and receives one confined
+journal destination.
 
 ## Desktop distribution boundary
 
@@ -161,6 +164,13 @@ The tracked Tauri configuration produces one resizable desktop window whose HTML
 styles, fonts, and icons are bundled with the application. Node.js, pnpm, Vite, and the Rust
 toolchain are build-time inputs only. At runtime the desktop uses the operating system's WebView:
 WebKit on macOS, WebView2 on Windows, and WebKitGTK 4.1 on Linux.
+
+Ordinary Cargo and Tauri development use the base `tauri.conf.json`, where native bundling is
+inactive. The supported package command adds `tauri.bundle.conf.json` as an official Tauri
+configuration overlay. Its pre-build step compiles the exact CLI, capture helper, and tract-enabled
+ONNX worker, then stages the host-triple filenames required by `externalBin`. This separation keeps
+package-only generated files out of source control and allows direct workspace Cargo checks to run
+without fake sidecar placeholders.
 
 The supported package-build matrix is:
 
@@ -171,15 +181,19 @@ The supported package-build matrix is:
 | macOS 15 Intel | Application bundle and DMG |
 | Windows Server 2025 x86-64 | NSIS and MSI installers |
 
-Each package includes the project licenses and required third-party notices. The current workflow
+Each package includes the desktop executable, exact sibling CLI, capture helper, ONNX worker,
+project licenses, Geist OFL notice, and required Tauri/GTK and tract notices. The current workflow
 uses no developer-identity signature; a macOS linker-created ad-hoc Mach-O signature is not
 distribution signing. Developer signing, notarization, installation, launch, and exact-head
 acceptance remain separate release evidence and are not inferred from bundle creation.
 
 ## On-disk layout
 
-The default data root is `.market-squawk`, overridden through the documented configuration
-precedence. `LocalPaths::prepare` canonicalizes and opens the root, creates its controlled
+The CLI's safe default data root is `.market-squawk`. An installed desktop launch instead supplies
+Tauri's operating-system application-local data directory as its safe-default value, so a
+double-click launch never depends on a launcher-selected working directory. The optional local
+file, `MARKET_SQUAWK_DATA_DIR`, and `--data-dir` layers retain their documented precedence and
+origin. `LocalPaths::prepare` canonicalizes and opens the effective root, creates its controlled
 subdirectories, and retains directory capabilities.
 
 ```text
@@ -255,13 +269,17 @@ startup failure or quarantines only the affected provider where that isolation i
 
 The desktop follows the same composition order with a presentation boundary around it:
 
-1. parse the four desktop options and load the normal validated configuration precedence;
-2. remove CLI logging and release-evidence environment controls from ambient desktop
+1. parse the four desktop options and construct the Tauri application runtime without publishing
+   its window;
+2. resolve the operating-system application-local data directory and load normal validated
+   configuration precedence with that value only as the desktop safe default;
+3. remove CLI logging and release-evidence environment controls from ambient desktop
    configuration;
-3. construct `LocalProduct` before creating the Tauri window;
-4. register the five closed commands and the main-window capability;
-5. load the bundled React application under the configured content-security policy; and
-6. publish bootstrap facts only after the owning Rust authorities return them.
+4. construct `LocalProduct` and install its state before the Tauri event loop begins;
+5. register the five closed commands and the main-window capability;
+6. load the bundled React application under the configured content-security policy; and
+7. publish setup, navigation, and bootstrap facts only after the owning Rust authorities return
+   them.
 
 If argument parsing, configuration, path preparation, authority recovery, or application
 composition fails, no ready desktop state is shown. Closing the window first cancels new desktop
@@ -362,6 +380,8 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
 - [Configuration composition](../../crates/market-squawk-platform/src/config.rs)
 - [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
+- [Desktop package overlay](../../apps/market-squawk-desktop/src-tauri/tauri.bundle.conf.json)
+- [Desktop external-program staging](../../apps/market-squawk-desktop/scripts/stage-sidecars.mjs)
 - [Desktop capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
 - [Desktop composition root](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
 - [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
@@ -371,6 +391,7 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Capture helper configuration](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)
 - [Provider onboarding portal](../../apps/market-squawk/src/provider_onboarding/portal.rs)
 - [ONNX helper admission](../../apps/market-squawk/src/local_product/executable.rs)
+- [Tauri packaging research](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md)
 
 ## External sources
 
@@ -385,3 +406,6 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-07-28 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the CSP control applied to bundled desktop content. | 2026-07-28 |
 | [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-28 |
+| [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program staging and native-bundle placement. | 2026-07-28 |
+| [Tauri CLI](https://v2.tauri.app/reference/cli/) | Defines ordered configuration overlays used to isolate package-only settings. | 2026-07-28 |
+| [Tauri path API](https://docs.rs/tauri/2.11.5/tauri/path/struct.PathResolver.html#method.app_local_data_dir) | Defines the native application-local data resolver used as the installed desktop default. | 2026-07-28 |

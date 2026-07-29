@@ -2,6 +2,7 @@ import * as React from "react"
 import { Search } from "lucide-react"
 import { useLocation, useNavigate } from "react-router-dom"
 
+import { useProduct } from "@/app/product-context"
 import {
   CommandDialog,
   CommandEmpty,
@@ -13,11 +14,16 @@ import {
 } from "@/components/ui/command"
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
-import { allNavigation, navigationForPath } from "@/lib/navigation"
+import {
+  allNavigation,
+  navigationAdmission,
+  navigationForPath,
+} from "@/lib/navigation"
 
 export function AppHeader() {
   const location = useLocation()
   const navigate = useNavigate()
+  const product = useProduct()
   const current = navigationForPath(location.pathname)
   const [open, setOpen] = React.useState(false)
 
@@ -36,6 +42,10 @@ export function AppHeader() {
     navigate(path)
     setOpen(false)
   }
+  const shortcut =
+    product.status === "ready" && product.bootstrap.platform === "macos"
+      ? "⌘K"
+      : "Ctrl+K"
 
   return (
     <>
@@ -67,7 +77,7 @@ export function AppHeader() {
           <Search className="size-3.5" aria-hidden="true" />
           <span>Search or run a command</span>
           <kbd className="ml-auto rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[9px]">
-            ⌘K
+            {shortcut}
           </kbd>
         </button>
       </header>
@@ -82,21 +92,47 @@ export function AppHeader() {
         <CommandList>
           <CommandEmpty>No matching route.</CommandEmpty>
           <CommandGroup heading="Product">
-            {allNavigation.map((item) => (
-              <CommandItem
-                key={item.path}
-                value={item.label}
-                onSelect={() => choose(item.path)}
-              >
-                <item.icon aria-hidden="true" />
-                <span>{item.label}</span>
-                <CommandShortcut>Go</CommandShortcut>
-              </CommandItem>
-            ))}
+            {allNavigation.map((item) => {
+              const admission =
+                product.status === "ready"
+                  ? navigationAdmission(item, product.bootstrap)
+                  : {
+                      admitted: item.path === "/overview",
+                      reason:
+                        item.path === "/overview"
+                          ? null
+                          : "Local application is still starting.",
+                    }
+              return (
+                <CommandItem
+                  key={item.path}
+                  value={`${item.label} ${admission.reason ?? ""}`}
+                  onSelect={() => {
+                    if (admission.admitted) {
+                      choose(item.path)
+                    }
+                  }}
+                  aria-disabled={!admission.admitted}
+                  className={
+                    admission.admitted
+                      ? undefined
+                      : "cursor-not-allowed opacity-55"
+                  }
+                >
+                  <item.icon aria-hidden="true" />
+                  <span>{item.label}</span>
+                  <CommandShortcut>
+                    {admission.admitted ? "Go" : "Blocked"}
+                  </CommandShortcut>
+                  {!admission.admitted ? (
+                    <span className="sr-only">{admission.reason}</span>
+                  ) : null}
+                </CommandItem>
+              )
+            })}
           </CommandGroup>
         </CommandList>
       </CommandDialog>
     </>
   )
 }
-

@@ -1,9 +1,14 @@
 import * as React from "react"
 import { CircleAlert, DatabaseZap, ListTree } from "lucide-react"
+import { useLocation } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import {
+  navigationAdmission,
+  navigationForPath,
+} from "@/lib/navigation"
 import type { ApplicationResult } from "@/lib/schemas"
 
 export function DomainPage({
@@ -16,6 +21,7 @@ export function DomainPage({
   description: string
 }) {
   const product = useProduct()
+  const location = useLocation()
   const [result, setResult] = React.useState<ApplicationResult | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(false)
@@ -29,6 +35,21 @@ export function DomainPage({
           <AlertDescription>
             Return to Overview and restore the local application connection.
           </AlertDescription>
+        </Alert>
+      </PageFrame>
+    )
+  }
+  const admission = navigationAdmission(
+    navigationForPath(location.pathname),
+    product.bootstrap,
+  )
+  if (!admission.admitted) {
+    return (
+      <PageFrame title={title} description={description}>
+        <Alert>
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>{title} is not ready</AlertTitle>
+          <AlertDescription>{admission.reason}</AlertDescription>
         </Alert>
       </PageFrame>
     )

@@ -27,13 +27,17 @@ export function OverviewPage() {
     )
   }
   const bootstrap = product.bootstrap
+  const firstIncomplete = bootstrap.setupSteps.findIndex(
+    (step) => !step.complete,
+  )
+  const currentStep = firstIncomplete < 0 ? bootstrap.setupSteps.length : firstIncomplete + 1
 
   return (
     <div className="mx-auto w-full max-w-[1120px] space-y-4 p-5 lg:p-7">
       <section className="grid items-start gap-6 lg:grid-cols-[1fr_340px]">
         <div className="pt-1">
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Setup · Step 1 of 8
+            Setup · Step {currentStep} of {bootstrap.setupSteps.length}
           </p>
           <h1 className="mt-3 text-3xl font-bold tracking-[-0.04em] text-white sm:text-4xl">
             Welcome to Market Squawk

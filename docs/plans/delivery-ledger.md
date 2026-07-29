@@ -1013,3 +1013,52 @@ The current lane candidate subsequently completed the focused Apple Silicon pack
 This is focused working-tree package evidence, not unchanged-commit or cross-platform release
 acceptance. The local Apple Silicon build barrier is closed; hosted package jobs, signed
 installation evidence, the exact-head gate, and grouped Quarter 4 review remain.
+
+### Quarter 4 desktop review and remediation
+
+The first grouped Quarter 4 review audited pushed candidate
+`03783250a1020d79cdd7f8bda424da62568dd3d5` against release base
+`95d6792e5cae38b5ec829061451a95886e4b2ad2` and rejected release approval. Its substantiated
+findings require:
+
+- an operating-system native installed data default rather than a relative launch directory;
+- authority-derived setup completion, recovery, navigation admission, and durable resume;
+- complete native packages containing the exact CLI, capture helper, and ONNX worker siblings;
+- action-specific validation for provider responses and awaited credential continuations;
+- exact pull-request-head checkout and artifact identity in CI;
+- affected-path classification for direct package license/vendor inputs;
+- the exact Geist OFL notice; and
+- platform-correct command-palette shortcut text.
+
+Hosted run
+[`30418056063`](https://github.com/Sawmonabo/market-squawk/actions/runs/30418056063)
+completed every scheduled lane successfully but checked a synthetic pull-request merge commit. It
+is cross-platform defect-detection evidence only, even where its source tree matches the candidate,
+and cannot approve the exact feature head.
+
+The active remediation keeps the five-command authority boundary and the one-file/three-test
+frontend limit. It uses Tauri's application-local data resolver, a package-only configuration
+overlay, target-triple external-program staging, the existing Rust onboarding/model/capture
+authorities, and one shared navigation-admission function. Current upstream decisions and caveats
+are preserved in
+[`2026-07-28-tauri-packaging-and-runtime-boundaries.md`](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md).
+
+Focused remediation evidence from the dirty feature worktree is:
+
+| Evidence | Result |
+| --- | --- |
+| Frontend | Production build passed; the single test file passed all three critical cases |
+| Rust | `cargo fmt --all --check` and focused strict Clippy passed for platform, application, and desktop packages |
+| Application bundle | 195 MiB allocated; desktop, CLI, capture helper, and ONNX worker are ARM64 regular executables |
+| Sibling identity | Every bundled sidecar matched its staged release binary byte-for-byte by SHA-256 |
+| Notices | Project licenses, exact Geist OFL notice, Tauri/GTK notice, and tract notice are present |
+| DMG | Mounted read-only; the application and all four executable hashes matched the inspected bundle |
+| Native default | A launch from `/private/tmp` with an isolated home created state only under `Library/Application Support/com.marketsquawk.desktop` |
+| Signing state | The package was built with `--no-sign`; no signing, notarization, or installed-release approval is claimed |
+| Generated storage | 16 GiB after release packaging and focused Clippy, below the 20 GiB ceiling |
+
+This evidence establishes the corrected local package shape and runtime path only. The next barrier
+is one remediation commit and push. The same Quarter 4 reviewer then closes the existing findings;
+a clean unchanged exact-head hosted gate follows once. Issue `#36`, draft PR `#37`, and the
+Project 5 item remain open and in progress until those outcomes and the separate
+signed-installation predicate are actually complete.

@@ -12,7 +12,7 @@ interpreter, or external ONNX Runtime library.
 | Audience | Local operators, release installers, and maintainers |
 | Status | Current |
 | Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Implementation review base | Quarter 4 remediation audited from `03783250a1020d79cdd7f8bda424da62568dd3d5` |
 
 ## Contents
 
@@ -225,9 +225,17 @@ pnpm --dir apps/market-squawk-desktop test --run
 Then build only the package types supported by the current host. For Apple Silicon macOS:
 
 ```bash
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri build --ci --no-sign --bundles app,dmg
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop exec tauri build \
+  --config src-tauri/tauri.bundle.conf.json \
+  --ci \
+  --no-sign \
+  --bundles app,dmg
 ```
+
+The package overlay is mandatory. It activates native bundling, compiles the exact
+`market-squawk`, capture-helper, and tract-enabled ONNX-worker release targets, then stages the
+target-triple filenames expected by Tauri. Direct `cargo check` and `tauri dev` intentionally use
+the base configuration without package-only generated programs.
 
 The hosted package workflow uses the same locked source and produces:
 
@@ -238,10 +246,11 @@ The hosted package workflow uses the same locked source and produces:
 | macOS 15 Intel | Application bundle and DMG |
 | Windows Server 2025 x86-64 | NSIS and MSI installers |
 
-Generated packages are under `target/release/bundle/`. They include the Market Squawk
-Apache-2.0/MIT licenses and the required Tauri/GTK and tract notices. Current package jobs use
-`--no-sign`; successful compilation and bundling do not establish a developer-identity signature,
-notarization, installation, launch, or release acceptance.
+Generated packages are under `target/release/bundle/`. They include the desktop executable,
+`market-squawk`, `market-squawk-capture-helper`, `market-squawk-onnx-worker`, the Market Squawk
+Apache-2.0/MIT licenses, the Geist OFL notice, and the required Tauri/GTK and tract notices. Current
+package jobs use `--no-sign`; successful compilation and bundling do not establish a
+developer-identity signature, notarization, installation, launch, or release acceptance.
 
 ## Launch the desktop application
 
@@ -261,6 +270,11 @@ arguments to `market-squawk-desktop`. The desktop launcher accepts:
 --training-release-root <PATH>
 --paper-mode
 ```
+
+Without an explicit data-directory layer, an installed desktop uses the operating system's
+application-local data directory. Development commands above remain explicit so their disposable
+state is visible in the checkout. A local configuration file, `MARKET_SQUAWK_DATA_DIR`, and
+`--data-dir` retain their normal precedence over the desktop default.
 
 On macOS, launch a locally built application bundle with explicit application arguments using:
 
@@ -390,8 +404,9 @@ There is no implicit configuration-file discovery.
 - The installed executables are regular sibling files in the same versioned `bin` directory.
 - `market-squawk --version` prints `market-squawk 0.2.0`.
 - The desktop type check and three critical frontend checks pass.
-- A requested native package appears under `target/release/bundle/` with the bundled license
-  notices. For the current no-developer-identity workflow, this is package-build evidence only.
+- A requested native package appears under `target/release/bundle/` with the desktop executable,
+  all three exact sibling Rust programs, and every bundled license notice. For the current
+  no-developer-identity workflow, this is package-build evidence only.
 
 ### Configuration and initialization
 
@@ -545,6 +560,8 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 | Cargo reports that the lockfile must change | Source and `Cargo.lock` do not match, or the command omitted `--locked` | Restore a clean reviewed checkout; do not regenerate the lockfile for this installation |
 | pnpm reports an out-of-date lockfile | The desktop manifest and committed `pnpm-lock.yaml` do not match | Restore the reviewed files; do not install without `--frozen-lockfile` |
 | Tauri cannot compile or bundle | A host prerequisite is missing or an unsupported bundle type was requested | Install the official prerequisite for that host and request only the package types in the matrix above |
+| Tauri reports that an `externalBin` file is missing | The package overlay was invoked without completing `bundle:prepare`, or a required release target failed | Use the supported package command, preserve the first compile error, and do not add or commit a placeholder executable |
+| A rebuilt Windows installer retains an older sibling program | Same-version NSIS replacement or retained Tauri output reused stale bytes | Stop the installed programs, build an immutable new release version, inspect installed hashes, and do not approve the release until every sibling changed as expected |
 | Desktop exits before opening a window | Desktop arguments, effective configuration, local paths, or `LocalProduct` startup failed | Run `market-squawk-desktop --help`, inspect the redacted stderr error, and correct the named local input; do not bypass initialization |
 | Application starts but capture helper admission fails | Helper missing, not an exact sibling, symlinked, non-executable, differently owned, or group/other writable | Quiesce the process and reinstall the whole bundle as regular sibling files |
 | ONNX worker is unavailable | Worker omitted, moved, symlinked, changed during admission, or built without the required target | Reinstall the exact worker beside the application |
@@ -584,12 +601,15 @@ Never overwrite the active version in place. Do not use a symlinked helper as a 
 - [Application executable targets](../../apps/market-squawk/Cargo.toml)
 - [Desktop frontend manifest](../../apps/market-squawk-desktop/package.json)
 - [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
+- [Desktop package overlay](../../apps/market-squawk-desktop/src-tauri/tauri.bundle.conf.json)
+- [Desktop external-program staging](../../apps/market-squawk-desktop/scripts/stage-sidecars.mjs)
 - [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Modeling worker target](../../crates/market-squawk-modeling/Cargo.toml)
 - [Executable sibling admission](../../apps/market-squawk/src/local_product/executable.rs)
 - [Capture-helper admission](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)
 - [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
 - [Full verification workflow](../../scripts/verify.sh)
+- [Tauri packaging research](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md)
 
 ## Official sources
 
@@ -604,4 +624,6 @@ bootstrap procedure.
 | [Python virtual environments](https://docs.python.org/3/library/venv.html) | Upstream isolation mechanism used only as an input to the separate sealed Python release workflow | 2026-07-23 |
 | [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | Defines the supported host build tools, WebView, and Linux native packages required to compile a Tauri 2 application | 2026-07-28 |
 | [Tauri distribution](https://v2.tauri.app/distribute/) | Defines native platform packaging and signing as separate distribution concerns | 2026-07-28 |
+| [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program naming and native-package placement | 2026-07-28 |
+| [Tauri CLI](https://v2.tauri.app/reference/cli/) | Defines the package-only `--config` overlay used by this runbook | 2026-07-28 |
 | [Node.js releases](https://nodejs.org/en/about/previous-releases) | Node.js 24 is the active LTS line used by the locked desktop build | 2026-07-28 |

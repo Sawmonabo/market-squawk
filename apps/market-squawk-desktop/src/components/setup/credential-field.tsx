@@ -5,6 +5,7 @@ import { messageFrom } from "@/app/product-context"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import type { ProviderSession } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 export function CredentialField({
@@ -18,7 +19,7 @@ export function CredentialField({
   credentialKind?: "api-key" | "coinbase-exchange"
   sessionId: string
   transport: ProductTransport
-  onAccepted: (result: unknown) => void
+  onAccepted: (result: ProviderSession) => Promise<void>
 }) {
   const fields =
     credentialKind === "coinbase-exchange"
@@ -58,7 +59,7 @@ export function CredentialField({
         sessionId,
         secret,
       })
-      onAccepted(result)
+      await onAccepted(result)
     } catch (requestError) {
       setError(messageFrom(requestError))
     } finally {

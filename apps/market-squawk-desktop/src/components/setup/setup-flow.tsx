@@ -4,31 +4,38 @@ import {
   ArrowRight,
   Check,
   Circle,
+  CircleAlert,
   Database,
   FileCheck2,
   KeyRound,
   Network,
+  RefreshCw,
   ShieldCheck,
   Sparkles,
+  type LucideIcon,
   WalletCards,
 } from "lucide-react"
 
+import { messageFrom } from "@/app/product-context"
+import { ProviderStep } from "@/components/setup/provider-step"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
-import { ProviderStep } from "@/components/setup/provider-step"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type {
+  DesktopBootstrap,
+  SetupStep,
+} from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-const steps = [
-  { label: "System", icon: FileCheck2 },
-  { label: "Storage", icon: Database },
-  { label: "Sources", icon: KeyRound },
-  { label: "Research", icon: Sparkles },
-  { label: "Portfolio", icon: WalletCards },
-  { label: "Paper", icon: ShieldCheck },
-  { label: "MCP", icon: Network },
-  { label: "Review", icon: Check },
-]
+const stepIcons: Record<SetupStep["id"], LucideIcon> = {
+  system: FileCheck2,
+  storage: Database,
+  sources: KeyRound,
+  research: Sparkles,
+  portfolio: WalletCards,
+  paper: ShieldCheck,
+  mcp: Network,
+  review: Check,
+}
 
 export function SetupFlow({
   bootstrap,
@@ -41,11 +48,16 @@ export function SetupFlow({
   onClose: () => void
   onRefresh: () => void
 }) {
-  const [step, setStep] = React.useState(0)
-  const current = steps[step]
+  const steps = bootstrap.setupSteps
+  const [stepIndex, setStepIndex] = React.useState(() => {
+    const firstIncomplete = steps.findIndex((step) => !step.complete)
+    return firstIncomplete < 0 ? steps.length - 1 : firstIncomplete
+  })
+  const current = steps[stepIndex]
   if (!current) {
     return null
   }
+  const completed = steps.filter((step) => step.complete).length
 
   return (
     <section className="rounded-xl border border-border bg-card/55 p-5">
@@ -57,100 +69,111 @@ export function SetupFlow({
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-3 text-xs">
             <span className="font-mono uppercase tracking-wider text-muted-foreground">
-              Step {step + 1} of {steps.length}
+              {completed} of {steps.length} ready
             </span>
-            <span className="font-medium">{current.label}</span>
+            <span className="font-medium">
+              Step {stepIndex + 1}: {current.label}
+            </span>
           </div>
           <Progress
-            value={((step + 1) / steps.length) * 100}
+            value={(completed / steps.length) * 100}
             className="mt-2 h-1"
           />
         </div>
       </div>
 
-      <ol className="mb-6 grid grid-cols-4 gap-2 lg:grid-cols-8" aria-label="Setup steps">
-        {steps.map((item, index) => (
-          <li
-            key={item.label}
-            className={
-              index === step
-                ? "flex items-center gap-1.5 text-[10px] font-medium text-foreground"
-                : index < step
-                  ? "flex items-center gap-1.5 text-[10px] text-emerald-400"
-                  : "flex items-center gap-1.5 text-[10px] text-muted-foreground"
-            }
-          >
-            {index < step ? (
-              <Check className="size-3" aria-hidden="true" />
-            ) : index === step ? (
-              <item.icon className="size-3" aria-hidden="true" />
-            ) : (
-              <Circle className="size-3" aria-hidden="true" />
-            )}
-            <span>{item.label}</span>
-          </li>
-        ))}
+      <ol
+        className="mb-6 grid grid-cols-4 gap-2 lg:grid-cols-8"
+        aria-label="Setup steps"
+      >
+        {steps.map((item, index) => {
+          const Icon = stepIcons[item.id]
+          const selected = index === stepIndex
+          return (
+            <li key={item.id}>
+              <button
+                type="button"
+                onClick={() => setStepIndex(index)}
+                aria-current={selected ? "step" : undefined}
+                className={
+                  selected
+                    ? "flex w-full items-center gap-1.5 text-left text-[10px] font-medium text-foreground"
+                    : item.complete
+                      ? "flex w-full items-center gap-1.5 text-left text-[10px] text-emerald-400"
+                      : "flex w-full items-center gap-1.5 text-left text-[10px] text-muted-foreground hover:text-foreground"
+                }
+              >
+                {item.complete ? (
+                  <Check className="size-3" aria-hidden="true" />
+                ) : selected ? (
+                  <Icon className="size-3" aria-hidden="true" />
+                ) : (
+                  <Circle className="size-3" aria-hidden="true" />
+                )}
+                <span>{item.label}</span>
+              </button>
+            </li>
+          )
+        })}
       </ol>
 
-      <div className="min-h-52">
-        {step === 0 ? (
-          <PlainStep
-            title="Confirm this local application"
-            description={`${bootstrap.storage.detail} The release status is ${bootstrap.installation.label.toLowerCase()}; Market Squawk will not treat it as signed until installation evidence is admitted.`}
-          />
-        ) : null}
-        {step === 1 ? (
-          <PlainStep
-            title="Keep data on this computer"
-            description={`Market Squawk will use ${bootstrap.dataRoot}. Provider credentials remain in the operating-system credential service or the explicitly unlocked encrypted fallback.`}
-          />
-        ) : null}
-        {step === 2 ? (
-          <ProviderStep
-            profiles={bootstrap.providerProfiles}
-            sessions={bootstrap.providerSessions}
+      <div className="min-h-64">
+        {current.id === "sources" ? (
+          <div className="space-y-5">
+            <StepStatus step={current} />
+            <ProviderStep
+              profiles={bootstrap.providerProfiles}
+              sessions={bootstrap.providerSessions}
+              transport={transport}
+              onChanged={onRefresh}
+            />
+          </div>
+        ) : current.id === "research" ? (
+          <LocalAuthorityStep
+            step={current}
+            profileId="local.files"
+            bootstrap={bootstrap}
             transport={transport}
-            onChanged={onRefresh}
+            onRefresh={onRefresh}
           />
-        ) : null}
-        {step === 3 ? (
+        ) : current.id === "portfolio" ? (
+          <LocalAuthorityStep
+            step={current}
+            profileId="local.portfolio-imports"
+            bootstrap={bootstrap}
+            transport={transport}
+            onRefresh={onRefresh}
+          />
+        ) : current.id === "paper" ? (
+          <LocalAuthorityStep
+            step={current}
+            profileId="local.paper-execution"
+            bootstrap={bootstrap}
+            transport={transport}
+            onRefresh={onRefresh}
+          />
+        ) : current.id === "review" ? (
+          <ReviewStep steps={steps} onRefresh={onRefresh} />
+        ) : (
           <PlainStep
-            title="Prepare research and modeling"
-            description={bootstrap.modelRuntime.detail}
+            step={current}
+            supplemental={
+              current.id === "storage"
+                ? `Effective data directory: ${bootstrap.dataRoot}`
+                : current.id === "mcp"
+                  ? "Start when needed with: market-squawk mcp serve"
+                  : bootstrap.installation.detail
+            }
           />
-        ) : null}
-        {step === 4 ? (
-          <PlainStep
-            title="Create a portfolio workspace"
-            description="Import holdings and transactions when you are ready. Market Squawk preserves the source records and reconciles calculated totals before reporting performance."
-          />
-        ) : null}
-        {step === 5 ? (
-          <PlainStep
-            title="Keep execution in paper mode"
-            description="Paper execution uses the central risk checks, realistic fees, latency, slippage, partial fills, balances, and positions. It cannot place a live order."
-          />
-        ) : null}
-        {step === 6 ? (
-          <PlainStep
-            title="Make local tools available"
-            description={bootstrap.mcp.detail}
-          />
-        ) : null}
-        {step === 7 ? (
-          <PlainStep
-            title="Review before activation"
-            description="Review every source and safety choice. Market Squawk activates only the capabilities whose owning Rust authority reports complete."
-          />
-        ) : null}
+        )}
       </div>
 
       <div className="mt-6 flex items-center justify-between border-t border-border pt-4">
         <Button
           type="button"
           variant="ghost"
-          onClick={() => setStep((value) => Math.max(0, value - 1))}
-          disabled={step === 0}
+          onClick={() => setStepIndex((value) => Math.max(0, value - 1))}
+          disabled={stepIndex === 0}
         >
           <ArrowLeft aria-hidden="true" />
           Back
@@ -158,13 +181,17 @@ export function SetupFlow({
         <Button
           type="button"
           onClick={() =>
-            step === steps.length - 1
+            stepIndex === steps.length - 1
               ? onClose()
-              : setStep((value) => Math.min(steps.length - 1, value + 1))
+              : setStepIndex((value) => Math.min(steps.length - 1, value + 1))
           }
         >
-          {step === steps.length - 1 ? "Finish review" : "Continue"}
-          {step === steps.length - 1 ? (
+          {stepIndex === steps.length - 1
+            ? current.complete
+              ? "Finish setup"
+              : "Close review"
+            : "Continue"}
+          {stepIndex === steps.length - 1 ? (
             <Check aria-hidden="true" />
           ) : (
             <ArrowRight aria-hidden="true" />
@@ -176,17 +203,173 @@ export function SetupFlow({
 }
 
 function PlainStep({
-  title,
-  description,
+  step,
+  supplemental,
 }: {
-  title: string
-  description: string
+  step: SetupStep
+  supplemental: string
 }) {
   return (
-    <div className="mx-auto max-w-2xl py-8 text-center">
-      <h2 className="text-xl font-semibold">{title}</h2>
-      <p className="mt-3 text-sm leading-6 text-muted-foreground">{description}</p>
+    <div className="mx-auto max-w-2xl space-y-5 py-6">
+      <StepStatus step={step} />
+      <p className="rounded-lg border border-border bg-background/35 p-4 font-mono text-xs text-foreground/80">
+        {supplemental}
+      </p>
     </div>
   )
 }
 
+function StepStatus({ step }: { step: SetupStep }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <span
+          className={
+            step.complete
+              ? "size-2 rounded-full bg-emerald-400"
+              : step.state === "blocked"
+                ? "size-2 rounded-full bg-amber-400"
+                : "size-2 rounded-full bg-primary"
+          }
+          aria-hidden="true"
+        />
+        <h2 className="text-lg font-semibold">{step.label}</h2>
+      </div>
+      <p className="mt-2 text-sm leading-6 text-muted-foreground">
+        {step.detail}
+      </p>
+      {step.blockingReason ? (
+        <div className="mt-4 flex gap-3 rounded-lg border border-amber-400/25 bg-amber-400/5 p-4">
+          <CircleAlert
+            className="mt-0.5 size-4 shrink-0 text-amber-300"
+            aria-hidden="true"
+          />
+          <div>
+            <p className="text-xs font-medium text-foreground">
+              {step.blockingReason}
+            </p>
+            {step.recovery ? (
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                {step.recovery}
+              </p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function LocalAuthorityStep({
+  step,
+  profileId,
+  bootstrap,
+  transport,
+  onRefresh,
+}: {
+  step: SetupStep
+  profileId: string
+  bootstrap: DesktopBootstrap
+  transport: ProductTransport
+  onRefresh: () => void
+}) {
+  const [pending, setPending] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const profile = bootstrap.providerProfiles.find(
+    (candidate) => candidate.id === profileId,
+  )
+  const session = bootstrap.providerSessions.find(
+    (candidate) => candidate.surface_id === profileId,
+  )
+
+  const openSetup = async () => {
+    setPending(true)
+    setError(null)
+    try {
+      await transport.openProtectedProviderSetup(profileId)
+    } catch (requestError) {
+      setError(messageFrom(requestError))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-5 py-4">
+      <StepStatus step={step} />
+      <section className="rounded-lg border border-border bg-background/35 p-4">
+        <h3 className="text-sm font-semibold">
+          {profile?.display_name ?? step.label}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          {profile?.coverage ?? "This local capability is not installed."}
+        </p>
+        <p className="mt-3 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+          Authority: {session?.next_action === "active" ? "active" : "not active"}
+        </p>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button
+            type="button"
+            size="sm"
+            onClick={openSetup}
+            disabled={pending || !profile}
+          >
+            Open guided setup
+          </Button>
+          <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
+            <RefreshCw aria-hidden="true" />
+            Refresh status
+          </Button>
+        </div>
+      </section>
+      {error ? (
+        <p role="alert" className="text-sm text-red-400">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function ReviewStep({
+  steps,
+  onRefresh,
+}: {
+  steps: SetupStep[]
+  onRefresh: () => void
+}) {
+  return (
+    <div className="mx-auto max-w-2xl space-y-5 py-4">
+      <StepStatus step={steps[steps.length - 1]!} />
+      <ul className="divide-y divide-border rounded-lg border border-border bg-background/35">
+        {steps.slice(0, -1).map((step) => (
+          <li key={step.id} className="flex items-start gap-3 px-4 py-3">
+            {step.complete ? (
+              <Check
+                className="mt-0.5 size-4 shrink-0 text-emerald-400"
+                aria-hidden="true"
+              />
+            ) : (
+              <CircleAlert
+                className="mt-0.5 size-4 shrink-0 text-amber-300"
+                aria-hidden="true"
+              />
+            )}
+            <div>
+              <p className="text-xs font-medium">{step.label}</p>
+              <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                {step.complete
+                  ? step.detail
+                  : (step.blockingReason ?? step.detail)}
+              </p>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
+        <RefreshCw aria-hidden="true" />
+        Refresh all status
+      </Button>
+    </div>
+  )
+}

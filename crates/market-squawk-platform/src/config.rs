@@ -488,6 +488,7 @@ pub struct ConfigSources<'a> {
     config_file: Option<&'a Path>,
     environment: &'a BTreeMap<OsString, OsString>,
     cli: ConfigOverrides,
+    data_directory_default: Option<PathBuf>,
 }
 
 impl fmt::Debug for ConfigSources<'_> {
@@ -497,6 +498,7 @@ impl fmt::Debug for ConfigSources<'_> {
             .field("config_file", &self.config_file)
             .field("environment", &"[ENVIRONMENT OMITTED]")
             .field("cli", &self.cli)
+            .field("data_directory_default", &self.data_directory_default)
             .finish()
     }
 }
@@ -512,7 +514,18 @@ impl<'a> ConfigSources<'a> {
             config_file,
             environment,
             cli,
+            data_directory_default: None,
         }
+    }
+
+    /// Replaces only the built-in data-directory default for one application surface.
+    ///
+    /// Local configuration, `MARKET_SQUAWK_DATA_DIR`, and a CLI override retain their normal
+    /// precedence. The effective origin remains [`ConfigOrigin::SafeDefault`].
+    #[must_use]
+    pub fn with_data_directory_default(mut self, data_directory: PathBuf) -> Self {
+        self.data_directory_default = Some(data_directory);
+        self
     }
 
     /// Captures process environment once at the application boundary.
@@ -636,6 +649,9 @@ impl AppConfig {
     /// Loads and validates defaults, file, supplied environment, then CLI overrides.
     pub fn load(sources: ConfigSources<'_>) -> Result<Self, ConfigError> {
         let mut values = ConfigOverrides::from(Self::default());
+        if let Some(data_directory) = sources.data_directory_default {
+            values.data_dir = Some(data_directory);
+        }
         let mut provenance = ConfigProvenance::default();
         if let Some(path) = sources.config_file {
             let file =

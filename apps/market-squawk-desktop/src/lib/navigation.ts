@@ -17,6 +17,8 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
+import type { DesktopBootstrap } from "@/lib/schemas"
+
 export interface NavigationItem {
   label: string
   path: string
@@ -90,4 +92,65 @@ export function navigationForPath(pathname: string) {
     allNavigation.find((item) => item.path === pathname) ??
     overviewNavigation
   )
+}
+
+export interface NavigationAdmission {
+  admitted: boolean
+  reason: string | null
+}
+
+export function navigationAdmission(
+  item: NavigationItem,
+  bootstrap: DesktopBootstrap,
+): NavigationAdmission {
+  const stepReady = (id: DesktopBootstrap["setupSteps"][number]["id"]) =>
+    bootstrap.setupSteps.some((step) => step.id === id && step.complete)
+  const operationReady =
+    !item.domain ||
+    bootstrap.operations.some((operation) => operation.domain === item.domain)
+
+  const prerequisite = (() => {
+    switch (item.path) {
+      case "/markets":
+        return {
+          ready: stepReady("sources"),
+          reason: "Connect and verify a market-data source first.",
+        }
+      case "/research":
+      case "/backtests":
+        return {
+          ready: stepReady("research"),
+          reason: "Complete local research and model-runtime setup first.",
+        }
+      case "/portfolios":
+        return {
+          ready: stepReady("portfolio"),
+          reason: "Activate the portfolio-import authority first.",
+        }
+      case "/models":
+        return {
+          ready: bootstrap.modelRuntime.state === "ready",
+          reason: "Configure and admit a verified local training release first.",
+        }
+      case "/paper-execution":
+      case "/risk":
+        return {
+          ready: stepReady("paper"),
+          reason: "Activate local paper execution and enable paper mode first.",
+        }
+      default:
+        return { ready: true, reason: null }
+    }
+  })()
+
+  if (!prerequisite.ready) {
+    return { admitted: false, reason: prerequisite.reason }
+  }
+  if (!operationReady) {
+    return {
+      admitted: false,
+      reason: `The installed application does not expose the ${item.label} service.`,
+    }
+  }
+  return { admitted: true, reason: null }
 }

@@ -1,6 +1,10 @@
 import type {
   ApplicationResult,
   DesktopBootstrap,
+  EncryptedFileFallback,
+  ProviderActivation,
+  ProviderBootstrap,
+  ProviderSession,
 } from "@/lib/schemas"
 
 export interface ApplicationRequest {
@@ -29,16 +33,22 @@ export type ProviderOnboardingRequest =
   | { action: "cleanup"; sessionId: string }
   | { action: "cancel"; sessionId: string }
 
+export type ProviderOnboardingResult<
+  Request extends ProviderOnboardingRequest,
+> = Request extends { action: "bootstrap" }
+  ? ProviderBootstrap
+  : Request extends { action: "unlockFallback" | "lockFallback" }
+    ? EncryptedFileFallback
+    : Request extends { action: "activate" }
+      ? ProviderActivation
+      : ProviderSession
+
 export interface ProductTransport {
-  bootstrap(signal?: AbortSignal): Promise<DesktopBootstrap>
-  invoke(
-    request: ApplicationRequest,
-    signal?: AbortSignal,
-  ): Promise<ApplicationResult>
-  onboard(
-    request: ProviderOnboardingRequest,
-    signal?: AbortSignal,
-  ): Promise<unknown>
+  bootstrap(): Promise<DesktopBootstrap>
+  invoke(request: ApplicationRequest): Promise<ApplicationResult>
+  onboard<Request extends ProviderOnboardingRequest>(
+    request: Request,
+  ): Promise<ProviderOnboardingResult<Request>>
   openOfficialProviderPage(providerId: string): Promise<void>
   openProtectedProviderSetup(providerId: string): Promise<void>
 }

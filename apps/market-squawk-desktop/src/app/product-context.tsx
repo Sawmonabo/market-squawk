@@ -30,21 +30,21 @@ export function ProductProvider({
   })
 
   React.useEffect(() => {
-    const cancellation = new AbortController()
+    let active = true
     setState((current) =>
       current.status === "ready"
         ? current
         : { status: "loading", bootstrap: null, error: null },
     )
     transport
-      .bootstrap(cancellation.signal)
+      .bootstrap()
       .then((bootstrap) => {
-        if (!cancellation.signal.aborted) {
+        if (active) {
           setState({ status: "ready", bootstrap, error: null })
         }
       })
       .catch((error: unknown) => {
-        if (!cancellation.signal.aborted) {
+        if (active) {
           setState({
             status: "error",
             bootstrap: null,
@@ -52,7 +52,9 @@ export function ProductProvider({
           })
         }
       })
-    return () => cancellation.abort()
+    return () => {
+      active = false
+    }
   }, [revision, transport])
 
   const value = React.useMemo<ProductContextValue>(

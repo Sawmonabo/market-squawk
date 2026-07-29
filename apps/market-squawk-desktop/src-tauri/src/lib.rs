@@ -43,6 +43,8 @@ enum DesktopStartupError {
     Product(#[from] LocalProductError),
     #[error("desktop runtime initialization failed")]
     Tauri(#[from] tauri::Error),
+    #[error("desktop state was already installed")]
+    DuplicateState,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -59,26 +61,7 @@ pub fn run() {
 }
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
-    let mut environment = ConfigSources::process_environment();
-    environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
-    let config = AppConfig::load(ConfigSources::new(
-        args.config.as_deref(),
-        &environment,
-        ConfigOverrides {
-            data_dir: args.data_dir,
-            paper_bot_enabled: args.paper_mode.then_some(true),
-            training_release_root: args.training_release_root,
-            ..ConfigOverrides::default()
-        },
-    ))?;
-    let product_config = config.clone();
-    let product =
-        tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(product, config);
     let app = tauri::Builder::default()
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             application_invoke,
             desktop_bootstrap,
@@ -87,6 +70,31 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             provider_onboarding
         ])
         .build(tauri::generate_context!())?;
+    let desktop_data_directory = app.path().app_local_data_dir()?;
+    let mut environment = ConfigSources::process_environment();
+    environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
+    environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
+    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
+    let config = AppConfig::load(
+        ConfigSources::new(
+            args.config.as_deref(),
+            &environment,
+            ConfigOverrides {
+                data_dir: args.data_dir,
+                paper_bot_enabled: args.paper_mode.then_some(true),
+                training_release_root: args.training_release_root,
+                ..ConfigOverrides::default()
+            },
+        )
+        .with_data_directory_default(desktop_data_directory),
+    )?;
+    let product_config = config.clone();
+    let product =
+        tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
+    let state = DesktopState::new(product, config);
+    if !app.manage(state) {
+        return Err(DesktopStartupError::DuplicateState);
+    }
     let exit_code = app.run_return(|handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
             handle.state::<DesktopState>().begin_shutdown();

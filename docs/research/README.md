@@ -66,6 +66,10 @@ decisions can be audited without relying on conversation history.
   — current cargo-dist, Qt Installer Framework, Tauri, uv, native packaging, secure activation,
   rollback, offline, headless, complete-default, and change-aware CI evidence; records the
   recommended hybrid direction while the signing and platform-matrix decisions remain pending.
+- [Tauri packaging and installed-runtime boundaries](2026-07-28-tauri-packaging-and-runtime-boundaries.md)
+  — current application-data paths, external-program staging, package-only configuration overlays,
+  exact-head checkout, font licensing, and upstream signing/reinstall caveats applied to the
+  desktop remediation.
 
 ## Provider decisions
 

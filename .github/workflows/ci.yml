@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: "0"
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   classify:
@@ -26,6 +27,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - id: changes
@@ -33,7 +35,7 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_SHA: ${{ env.CANDIDATE_SHA }}
         run: |
           set -euo pipefail
 
@@ -50,6 +52,13 @@ jobs:
           if "$resolved"; then
             while IFS= read -r -d '' path; do
               case "$path" in
+                LICENSE-APACHE|LICENSE-MIT|\
+                docs/licenses/geist-ofl-license.txt|\
+                docs/licenses/tauri-mpl-notice.md|\
+                docs/licenses/tract-onnx-notice.md)
+                  code=true
+                  desktop=true
+                  ;;
                 docs/*|*.md)
                   ;;
                 *)
@@ -61,6 +70,11 @@ jobs:
                 apps/market-squawk-desktop/*|\
                 apps/market-squawk/assets/provider-onboarding/*|\
                 apps/market-squawk/src/local_product/*|\
+                LICENSE-APACHE|LICENSE-MIT|\
+                docs/licenses/geist-ofl-license.txt|\
+                docs/licenses/tauri-mpl-notice.md|\
+                docs/licenses/tract-onnx-notice.md|\
+                vendor/glib-0.18.5/*|\
                 Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 scripts/verify.sh|.github/workflows/ci.yml)
                   desktop=true
@@ -87,6 +101,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
@@ -122,6 +137,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install Tauri system prerequisites
@@ -190,6 +206,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
       # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
@@ -218,6 +235,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
       # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
@@ -264,6 +282,7 @@ jobs:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
       - name: Install Tauri system prerequisites
         if: runner.os == 'Linux'
@@ -310,11 +329,15 @@ jobs:
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         with:
           projectPath: apps/market-squawk-desktop
-          args: --ci --no-sign --bundles ${{ matrix.bundles }}
+          args: >-
+            --config src-tauri/tauri.bundle.conf.json
+            --ci
+            --no-sign
+            --bundles ${{ matrix.bundles }}
       # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: market-squawk-${{ matrix.name }}-${{ github.sha }}
+          name: market-squawk-${{ matrix.name }}-${{ env.CANDIDATE_SHA }}
           path: target/release/bundle/**
           if-no-files-found: error
           retention-days: 7

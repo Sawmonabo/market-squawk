@@ -10,7 +10,6 @@ import { messageFrom } from "@/app/product-context"
 import { CredentialField } from "@/components/setup/credential-field"
 import { Button } from "@/components/ui/button"
 import {
-  providerSessionSchema,
   type ProviderProfile,
   type ProviderSession,
 } from "@/lib/schemas"
@@ -89,12 +88,10 @@ export function ProviderStep({
     setPending(profile.id)
     setError(null)
     try {
-      const session = providerSessionSchema.parse(
-        await transport.onboard({
-          action: "start",
-          surfaceId: profile.id,
-        }),
-      )
+      const session = await transport.onboard({
+        action: "start",
+        surfaceId: profile.id,
+      })
       remember(session)
       if (ACTIVATION_ACTIONS.has(session.next_action)) {
         await activateSource(profile, session)
@@ -108,9 +105,8 @@ export function ProviderStep({
 
   const continueAfterCredential = async (
     profile: ProviderProfile,
-    result: unknown,
+    session: ProviderSession,
   ) => {
-    const session = providerSessionSchema.parse(result)
     remember(session)
     await activateSource(profile, session)
   }

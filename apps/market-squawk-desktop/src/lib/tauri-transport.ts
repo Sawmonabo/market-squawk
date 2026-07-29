@@ -3,11 +3,16 @@ import { invoke, isTauri } from "@tauri-apps/api/core"
 import {
   applicationResultSchema,
   desktopBootstrapSchema,
+  encryptedFileFallbackSchema,
+  providerActivationSchema,
+  providerBootstrapSchema,
+  providerSessionSchema,
 } from "@/lib/schemas"
 import type {
   ApplicationRequest,
   ProductTransport,
   ProviderOnboardingRequest,
+  ProviderOnboardingResult,
 } from "@/lib/transport"
 
 export function createProductTransport(): ProductTransport {
@@ -18,30 +23,27 @@ export function createProductTransport(): ProductTransport {
 }
 
 class TauriTransport implements ProductTransport {
-  async bootstrap(signal?: AbortSignal) {
-    const value = await abortable(invoke("desktop_bootstrap"), signal)
+  async bootstrap() {
+    const value = await invoke("desktop_bootstrap")
     return desktopBootstrapSchema.parse(value)
   }
 
-  async invoke(request: ApplicationRequest, signal?: AbortSignal) {
-    const value = await abortable(
-      invoke("application_invoke", {
-        request: {
-          operation: request.operation,
-          arguments: request.arguments ?? {},
-        },
-      }),
-      signal,
-    )
+  async invoke(request: ApplicationRequest) {
+    const value = await invoke("application_invoke", {
+      request: {
+        operation: request.operation,
+        arguments: request.arguments ?? {},
+      },
+    })
     return applicationResultSchema.parse(value)
   }
 
-  onboard(request: ProviderOnboardingRequest, signal?: AbortSignal) {
+  async onboard<Request extends ProviderOnboardingRequest>(
+    request: Request,
+  ): Promise<ProviderOnboardingResult<Request>> {
     const confirmed = !["bootstrap", "resume"].includes(request.action)
-    return abortable(
-      invoke("provider_onboarding", { request, confirmed }),
-      signal,
-    )
+    const value = await invoke("provider_onboarding", { request, confirmed })
+    return parseProviderResult(request, value)
   }
 
   async openOfficialProviderPage(providerId: string) {
@@ -51,6 +53,26 @@ class TauriTransport implements ProductTransport {
   async openProtectedProviderSetup(providerId: string) {
     await invoke("open_protected_provider_setup", { providerId })
   }
+}
+
+function parseProviderResult<Request extends ProviderOnboardingRequest>(
+  request: Request,
+  value: unknown,
+): ProviderOnboardingResult<Request> {
+  const parsed = (() => {
+    switch (request.action) {
+      case "bootstrap":
+        return providerBootstrapSchema.parse(value)
+      case "unlockFallback":
+      case "lockFallback":
+        return encryptedFileFallbackSchema.parse(value)
+      case "activate":
+        return providerActivationSchema.parse(value)
+      default:
+        return providerSessionSchema.parse(value)
+    }
+  })()
+  return parsed as ProviderOnboardingResult<Request>
 }
 
 class UnavailableBrowserTransport implements ProductTransport {
@@ -66,7 +88,9 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  onboard(): Promise<never> {
+  onboard<Request extends ProviderOnboardingRequest>(
+    _request: Request,
+  ): Promise<ProviderOnboardingResult<Request>> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
@@ -77,23 +101,4 @@ class UnavailableBrowserTransport implements ProductTransport {
   openProtectedProviderSetup(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
-}
-
-function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) {
-    return promise
-  }
-  if (signal.aborted) {
-    return Promise.reject(new DOMException("Request cancelled", "AbortError"))
-  }
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) => {
-      signal.addEventListener(
-        "abort",
-        () => reject(new DOMException("Request cancelled", "AbortError")),
-        { once: true },
-      )
-    }),
-  ])
 }

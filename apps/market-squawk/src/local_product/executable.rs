@@ -11,6 +11,8 @@ use thiserror::Error;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 const MAXIMUM_APPLICATION_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_ONNX_WORKER_BYTES: u64 = 256 * 1024 * 1024;
+const APPLICATION_BASENAME: &str = "market-squawk";
+const DESKTOP_APPLICATION_BASENAME: &str = "market-squawk-desktop";
 const ONNX_WORKER_BASENAME: &str = "market-squawk-onnx-worker";
 
 /// Returns the two-pass SHA-256 identity of the exact executable opened at startup.
@@ -20,18 +22,33 @@ pub(super) fn current_executable_sha256() -> Result<[u8; 32], ExecutableIdentity
     hash_stable_regular_file(&executable, MAXIMUM_APPLICATION_BYTES)
 }
 
-/// Returns the current application and its fixed sibling ONNX worker path.
+/// Returns the signed application identity and its fixed sibling ONNX worker path.
+///
+/// The CLI is its own signed application identity. The desktop bundle carries the same exact CLI
+/// and worker as sibling executables, so model admission remains bound to the release manifest
+/// produced by the existing training pipeline.
 pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), ExecutableIdentityError> {
     let executable = std::env::current_exe()
         .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
     let directory = executable
         .parent()
-        .ok_or(ExecutableIdentityError::InvalidExecutablePath)?;
-    let candidate = directory.join(format!(
+        .ok_or(ExecutableIdentityError::InvalidExecutablePath)?
+        .to_path_buf();
+    let application = if executable.file_stem().and_then(|name| name.to_str())
+        == Some(DESKTOP_APPLICATION_BASENAME)
+    {
+        directory.join(format!(
+            "{APPLICATION_BASENAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ))
+    } else {
+        executable
+    };
+    let worker = directory.join(format!(
         "{ONNX_WORKER_BASENAME}{}",
         std::env::consts::EXE_SUFFIX
     ));
-    Ok((executable, candidate))
+    Ok((application, worker))
 }
 
 /// Admits the exact sibling ONNX worker against its signed release-manifest digest.

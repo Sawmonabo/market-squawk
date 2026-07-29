@@ -6,8 +6,8 @@ use std::{
 };
 
 use market_squawk::{
-    AppConfig, LocalProduct, ProviderOnboardingError, ProviderPortalActivationAuthority,
-    ProviderPortalActivationError, StartOnboardingRequest,
+    AppConfig, LocalProduct, OnboardingNextAction, OnboardingSessionView, ProviderOnboardingError,
+    ProviderPortalActivationAuthority, ProviderPortalActivationError, StartOnboardingRequest,
 };
 use market_squawk_data::CatalogLimit;
 use market_squawk_platform::SecretValue;
@@ -24,7 +24,8 @@ use uuid::Uuid;
 
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, OperationSummary,
-    ProviderOnboardingCommand, Readiness, ReadinessState,
+    ProviderOnboardingCommand, Readiness, ReadinessState, SetupStep, SetupStepAction,
+    SetupStepState,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -65,11 +66,10 @@ impl DesktopState {
         let session_limit = CatalogLimit::new(MAXIMUM_PROVIDER_SESSIONS)
             .map_err(|_error| DesktopCommandError::internal())?;
         let profiles = serialize(onboarding.profiles())?;
-        let sessions = serialize(
-            onboarding
-                .current_sessions(session_limit)
-                .map_err(map_onboarding_error)?,
-        )?;
+        let session_views = onboarding
+            .current_sessions(session_limit)
+            .map_err(map_onboarding_error)?;
+        let sessions = serialize(&session_views)?;
         let fallback = serialize(
             onboarding
                 .encrypted_file_fallback_status()
@@ -108,6 +108,15 @@ impl DesktopState {
                 "No verified local training release is configured for this workspace.",
             )
         };
+        let paper_mode_enabled = self.config.paper_bot_enabled();
+        let installation_verified = false;
+        let model_runtime_ready = self.product.model_runtime().is_some();
+        let setup_steps = setup_steps(
+            &session_views,
+            installation_verified,
+            model_runtime_ready,
+            paper_mode_enabled,
+        );
         Ok(DesktopBootstrap::new(
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
@@ -132,10 +141,11 @@ impl DesktopState {
                 "Available",
                 "The bounded local stdio MCP service is available when explicitly started.",
             ),
-            self.config.paper_bot_enabled(),
+            paper_mode_enabled,
             fallback,
             profiles,
             sessions,
+            setup_steps,
             operations,
         ))
     }
@@ -153,6 +163,150 @@ impl DesktopState {
         };
         let _report = application.shutdown(deadline).await;
     }
+}
+
+fn setup_steps(
+    sessions: &[OnboardingSessionView],
+    installation_verified: bool,
+    model_runtime_ready: bool,
+    paper_mode_enabled: bool,
+) -> Vec<SetupStep> {
+    let sources_ready = sessions.iter().any(|session| {
+        !session.surface_id().starts_with("local.")
+            && session.next_action() == OnboardingNextAction::Active
+    });
+    let files_ready = has_active_session(sessions, "local.files");
+    let portfolio_ready = has_active_session(sessions, "local.portfolio-imports");
+    let paper_profile_ready = has_active_session(sessions, "local.paper-execution");
+    let research_ready = files_ready && model_runtime_ready;
+    let paper_ready = paper_profile_ready && paper_mode_enabled;
+    let review_ready =
+        installation_verified && sources_ready && research_ready && portfolio_ready && paper_ready;
+
+    vec![
+        SetupStep::new(
+            "system",
+            "System",
+            if installation_verified {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::Blocked
+            },
+            installation_verified,
+            "Verify the exact installed Market Squawk release before relying on its identity.",
+            (!installation_verified).then_some("This running build has no admitted installation receipt."),
+            (!installation_verified).then_some(
+                "Install an approved signed package, then reopen Market Squawk from that installation.",
+            ),
+            Some(SetupStepAction::ReviewInstallation),
+        ),
+        SetupStep::new(
+            "storage",
+            "Storage",
+            SetupStepState::Complete,
+            true,
+            "The controlled workspace and catalog are open in the effective data directory.",
+            None,
+            None,
+            None,
+        ),
+        SetupStep::new(
+            "sources",
+            "Sources",
+            if sources_ready {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::ActionRequired
+            },
+            sources_ready,
+            "Activate at least one supported external market or research source.",
+            (!sources_ready).then_some("No external provider session currently holds active authority."),
+            (!sources_ready).then_some(
+                "Connect a supported zero-fee source and complete its provider-specific verification.",
+            ),
+            Some(SetupStepAction::ConfigureSources),
+        ),
+        SetupStep::new(
+            "research",
+            "Research",
+            if research_ready {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::ActionRequired
+            },
+            research_ready,
+            "Research readiness requires the local-file authority and an admitted local model runtime.",
+            (!research_ready)
+                .then_some("The local-file authority or verified training release is not ready."),
+            (!research_ready).then_some(
+                "Activate Local files and configure an approved absolute training-release root.",
+            ),
+            Some(SetupStepAction::ConfigureResearch),
+        ),
+        SetupStep::new(
+            "portfolio",
+            "Portfolio",
+            if portfolio_ready {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::ActionRequired
+            },
+            portfolio_ready,
+            "Portfolio imports become available only after their local authority is active.",
+            (!portfolio_ready).then_some("The portfolio-import authority is not active."),
+            (!portfolio_ready)
+                .then_some("Activate Portfolio holdings and transactions imports."),
+            Some(SetupStepAction::ConfigurePortfolio),
+        ),
+        SetupStep::new(
+            "paper",
+            "Paper",
+            if paper_ready {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::ActionRequired
+            },
+            paper_ready,
+            "Paper execution requires its local provider authority and explicit paper-mode configuration.",
+            (!paper_ready)
+                .then_some("Paper authority is inactive or paper mode is not enabled."),
+            (!paper_ready).then_some(
+                "Activate Local paper execution and restart with paper mode enabled in validated configuration.",
+            ),
+            Some(SetupStepAction::ConfigurePaper),
+        ),
+        SetupStep::new(
+            "mcp",
+            "MCP",
+            SetupStepState::Available,
+            true,
+            "The bounded local stdio MCP server is installed and starts only on explicit request.",
+            None,
+            None,
+            Some(SetupStepAction::ReviewMcp),
+        ),
+        SetupStep::new(
+            "review",
+            "Review",
+            if review_ready {
+                SetupStepState::Complete
+            } else {
+                SetupStepState::Blocked
+            },
+            review_ready,
+            "Final readiness is derived from every required owning authority above.",
+            (!review_ready).then_some("One or more required setup authorities remain incomplete."),
+            (!review_ready)
+                .then_some("Resolve each named blocker, refresh status, and review again."),
+            Some(SetupStepAction::ReviewStatus),
+        ),
+    ]
+}
+
+fn has_active_session(sessions: &[OnboardingSessionView], surface_id: &str) -> bool {
+    sessions.iter().any(|session| {
+        session.surface_id() == surface_id && session.next_action() == OnboardingNextAction::Active
+    })
 }
 
 #[tauri::command]

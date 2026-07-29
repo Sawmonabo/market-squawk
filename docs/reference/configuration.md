@@ -8,8 +8,8 @@ profiles, provenance, and local secret-storage boundary implemented by Market Sq
 | Document type | Reference |
 | Audience | Operators, integrators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-07-28 |
+| Reviewed base | Quarter 4 remediation audited from `03783250a1020d79cdd7f8bda424da62568dd3d5` |
 
 ## Contents
 
@@ -54,6 +54,11 @@ no home-directory, current-directory, XDG, or platform-default configuration-fil
 Process environment is captured once at the application boundary. A higher layer replaces only the
 settings it supplies; the final merged object is then validated as one unit.
 
+An installed desktop replaces only the built-in `data_dir` value with Tauri's
+operating-system application-local data directory. That value remains a `safe_default`; it does
+not impersonate a file, environment, or CLI origin. Every higher-precedence layer below works
+unchanged. The CLI and headless MCP retain `.market-squawk` as their safe default.
+
 The `--log` option and `MARKET_SQUAWK_LOG` configure tracing through Clap. They are consumed before
 the environment is passed to `AppConfig`, so `MARKET_SQUAWK_LOG` is not an `AppConfig` setting and
 does not trigger the unknown-key failure described below.
@@ -64,7 +69,7 @@ All byte ceilings are exact integer byte counts. All timing values are milliseco
 
 | TOML key | Environment key | CLI override | Safe default | Validation and semantics |
 | --- | --- | --- | --- | --- |
-| `data_dir` | `MARKET_SQUAWK_DATA_DIR` | `--data-dir` | `.market-squawk` | Nonempty local path; it need not already exist when configuration is loaded |
+| `data_dir` | `MARKET_SQUAWK_DATA_DIR` | `--data-dir` | `.market-squawk` for CLI/MCP; OS application-local data directory for the installed desktop | Nonempty local path; it need not already exist when configuration is loaded; the surface-specific value retains `safe_default` provenance |
 | `products` | `MARKET_SQUAWK_PRODUCTS` | Command-specific product override | `["BTC-USD"]` | Nonempty, unique list; at most 128 entries; each is 1–128 bytes and contains only ASCII alphanumeric characters or `-`, `.`, `_`, `/` |
 | `stale_after_ms` | `MARKET_SQUAWK_STALE_AFTER_MS` | Internal override only | `5000` | `250..=600000`; market-price freshness, not connection-heartbeat health |
 | `capture_queue_capacity` | `MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY` | `--capture-queue-capacity` | `16384` | `1..=1048576`; fixed raw-capture queue capacity |
@@ -74,7 +79,7 @@ All byte ceilings are exact integer byte counts. All timing values are milliseco
 | `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | Internal override only | `1000` | Positive and no greater than `capture_shutdown_ms` |
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | Internal override only | `5000` | Positive, no greater than `60000`, and no less than the flush interval |
 | `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000`; bounds the source supervisor and its owned capture cleanup |
-| `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset | When present, must be a nonempty absolute path; model composition verifies that the running application and sibling ONNX worker are the exact signed files installed there |
+| `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset | When present, must be a nonempty absolute path; model composition verifies that the installed `market-squawk` application identity and sibling ONNX worker are the exact signed files bound there |
 | `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | Internal override only | Unset | Redacted locator, 1–512 bytes, no control characters, prefixed by `keyring:` or `encrypted-file:` |
 | `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | Internal typed override only | Unset | Complete closed Coinbase profile; the environment value is JSON at most 128 KiB |
 | `kraken` | `MARKET_SQUAWK_KRAKEN_JSON` | Internal typed override only | Unset | Complete closed Kraken profile; the environment value is JSON at most 128 KiB |
@@ -254,6 +259,7 @@ must still pass their own admission and recovery boundaries.
 | [Apple Keychain Services](https://developer.apple.com/documentation/security/keychain-services) | Platform credential-store boundary used by the macOS backend | 2026-07-23 |
 | [Windows Credentials Management](https://learn.microsoft.com/en-us/windows/win32/secauthn/credentials-management) | Platform credential-store boundary used by the Windows backend | 2026-07-23 |
 | [Secret Service API specification](https://specifications.freedesktop.org/secret-service-spec/latest/) | Desktop secret-service contract used by the Linux/Unix backend | 2026-07-23 |
+| [Tauri application-local data resolver](https://docs.rs/tauri/2.11.5/tauri/path/struct.PathResolver.html#method.app_local_data_dir) | Native per-application data directory used only as the installed desktop safe default | 2026-07-28 |
 
 External sources define upstream formats and platform facilities. The reviewed Market Squawk code
 head remains the authority for precedence, accepted keys, exact bounds, routing, and failure

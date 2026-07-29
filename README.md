@@ -139,7 +139,20 @@ CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
 
 This opens the permanent Obsidian Signal shell with guided setup, source onboarding, and bounded
 views over the local application services. The final `--` separates Tauri runner arguments from
-Market Squawk desktop arguments.
+Market Squawk desktop arguments. An installed desktop uses the operating system's
+application-local data directory when no configuration layer supplies another path, so a
+double-click launch does not depend on its working directory.
+
+Native packages use the package-only Tauri overlay, which compiles and installs the CLI, capture
+helper, and ONNX worker beside the desktop executable:
+
+```bash
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop exec tauri build \
+  --config src-tauri/tauri.bundle.conf.json
+```
+
+Choose host-specific package types and the current unsigned-package safety options from the
+[installation runbook](docs/operations/installation-and-bootstrap.md#build-the-desktop-package).
 
 ### 3. Build the local headless bundle
 
@@ -169,8 +182,9 @@ DATA_ROOT="$PWD/.market-squawk"
 "$MSQ" --data-dir "$DATA_ROOT" doctor
 ```
 
-The default local state is stored under `.market-squawk/`, which is ignored by Git. Use an absolute,
-operator-owned `--data-dir` for a durable installation.
+The CLI safe default is `.market-squawk/`, which is ignored by Git; the commands above select that
+path explicitly. Use an absolute, operator-owned `--data-dir` for a durable headless installation.
+The installed desktop's separate native default is described above.
 
 ### 5. Open guided provider setup from the CLI
 

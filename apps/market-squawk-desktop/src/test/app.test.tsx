@@ -6,10 +6,7 @@ import { describe, expect, it } from "vitest"
 import { App } from "@/app/app"
 import { CredentialField } from "@/components/setup/credential-field"
 import type { DesktopBootstrap } from "@/lib/schemas"
-import type {
-  ProductTransport,
-  ProviderOnboardingRequest,
-} from "@/lib/transport"
+import type { ProductTransport } from "@/lib/transport"
 
 const blockedBootstrap: DesktopBootstrap = {
   contractVersion: "market-squawk-desktop-v1",
@@ -42,13 +39,96 @@ const blockedBootstrap: DesktopBootstrap = {
   encryptedFileFallback: "locked",
   providerProfiles: [],
   providerSessions: [],
+  setupSteps: [
+    {
+      id: "system",
+      label: "System",
+      state: "blocked",
+      complete: false,
+      detail: "Verify the installed release.",
+      blockingReason: "No signed installation receipt was admitted.",
+      recovery: "Install a verified package.",
+      action: "review_installation",
+    },
+    {
+      id: "storage",
+      label: "Storage",
+      state: "complete",
+      complete: true,
+      detail: "The local workspace is ready.",
+      blockingReason: null,
+      recovery: null,
+      action: null,
+    },
+    {
+      id: "sources",
+      label: "Sources",
+      state: "action_required",
+      complete: false,
+      detail: "Connect a source.",
+      blockingReason: "No source is active.",
+      recovery: "Connect a source.",
+      action: "configure_sources",
+    },
+    {
+      id: "research",
+      label: "Research",
+      state: "action_required",
+      complete: false,
+      detail: "Configure research.",
+      blockingReason: "Research is not ready.",
+      recovery: "Configure research.",
+      action: "configure_research",
+    },
+    {
+      id: "portfolio",
+      label: "Portfolio",
+      state: "action_required",
+      complete: false,
+      detail: "Configure portfolio imports.",
+      blockingReason: "Portfolio imports are not active.",
+      recovery: "Configure portfolio imports.",
+      action: "configure_portfolio",
+    },
+    {
+      id: "paper",
+      label: "Paper",
+      state: "action_required",
+      complete: false,
+      detail: "Configure paper execution.",
+      blockingReason: "Paper mode is not active.",
+      recovery: "Enable paper mode.",
+      action: "configure_paper",
+    },
+    {
+      id: "mcp",
+      label: "MCP",
+      state: "available",
+      complete: true,
+      detail: "The local MCP service is available.",
+      blockingReason: null,
+      recovery: null,
+      action: "review_mcp",
+    },
+    {
+      id: "review",
+      label: "Review",
+      state: "blocked",
+      complete: false,
+      detail: "Review setup.",
+      blockingReason: "Required setup remains.",
+      recovery: "Resolve blockers.",
+      action: "review_status",
+    },
+  ],
   operations: [],
 }
 
 function transport(
   bootstrap = blockedBootstrap,
-  onboard: (request: ProviderOnboardingRequest) => Promise<unknown> = async () =>
-    ({}),
+  onboard: ProductTransport["onboard"] = async () => {
+    throw new Error("Provider onboarding is not configured for this test.")
+  },
 ): ProductTransport {
   return {
     bootstrap: async () => bootstrap,
@@ -82,8 +162,10 @@ describe("Market Squawk desktop boundary", () => {
     const navigation = screen.getByRole("navigation", {
       name: "Market Squawk",
     })
-    expect(navigation.querySelectorAll("a")).toHaveLength(15)
-    expect(screen.getByRole("link", { name: "Paper Execution" })).toBeTruthy()
+    expect(navigation.querySelectorAll("a,button")).toHaveLength(15)
+    expect(
+      screen.getByRole("button", { name: /Paper Execution/ }),
+    ).toBeTruthy()
     expect(screen.getByRole("link", { name: "Backup & Recovery" })).toBeTruthy()
   })
 
@@ -109,7 +191,7 @@ describe("Market Squawk desktop boundary", () => {
         transport={transport(blockedBootstrap, async () => {
           throw new Error("credential rejected")
         })}
-        onAccepted={() => {
+        onAccepted={async () => {
           accepted = true
         }}
       />,

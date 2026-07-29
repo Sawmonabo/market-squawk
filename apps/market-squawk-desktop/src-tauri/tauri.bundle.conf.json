@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "pnpm bundle:prepare"
+  },
+  "bundle": {
+    "active": true,
+    "externalBin": [
+      "binaries/market-squawk",
+      "binaries/market-squawk-capture-helper",
+      "binaries/market-squawk-onnx-worker"
+    ]
+  }
+}

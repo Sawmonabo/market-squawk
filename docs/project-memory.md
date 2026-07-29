@@ -35,6 +35,29 @@ No release, benchmark, checkpoint, or approval evidence may be produced with 1.9
 toolchain change requires current primary-source research, a recorded decision, exact CI/toolchain
 pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verification run.
 
+## Current upstream research before unfamiliar fixes
+
+When an unfamiliar platform, packaging, compiler, linker, dependency, CI, operating-system, or
+provider failure appears, do not guess or immediately invent a repository-owned workaround.
+Systematically establish the local cause, then search current information as of the working date:
+
+1. official product or standards documentation;
+2. the maintained upstream repository, release notes, and directly relevant issue or discussion;
+3. credible primary technical material when the official source is incomplete; and
+4. only then secondary commentary needed to explain observed behavior.
+
+Prefer the current maintained upstream mechanism when it preserves Market Squawk's authority,
+security, portability, and release invariants. Verify the selected mechanism against the exact
+locked versions in this repository. A copied snippet, stale issue comment, or popular workaround is
+not sufficient by itself.
+
+Persist research only when it creates durable design, operations, dependency, or failure-recovery
+knowledge. Put that evidence in the relevant maintained architecture, operations, reference, or
+date-anchored research page with direct links and review dates. Leave exploratory dead ends in
+temporary scratch and remove them before closeout. Research does not authorize extra framework,
+test, script, or documentation churn; implementation remains the smallest complete production
+change that resolves the established cause.
+
 A4 capture-performance approval uses a bounded measurement trust model, not a hostile same-UID or
 byte-reproducible build-supply-chain claim. Pre-change standard-channel results and the current
 preparer/host bundle are diagnostic until regenerated at one clean exact integrated candidate. Final
@@ -1245,3 +1268,28 @@ The lane must still obtain hosted native-package evidence on all four matrix ent
 installation evidence, the one clean unchanged exact-head gate, and grouped Quarter 4 review before
 integration. After integration, close the issue/project item, remove the clean worktree, prune
 metadata, delete the merged local and origin feature branch, and recheck generated storage.
+
+## 2026-07-28 Quarter 4 desktop remediation decisions
+
+The grouped Quarter 4 review at pushed head
+`03783250a1020d79cdd7f8bda424da62568dd3d5` rejected release approval until the desktop:
+
+- selects Tauri's operating-system application-local data directory as its lowest-precedence
+  installed default while preserving Market Squawk configuration origins;
+- derives all eight setup-step states, blockers, recovery guidance, and route admission from Rust
+  authority facts rather than frontend progress;
+- validates every provider-onboarding response by action and awaits credential continuations;
+- installs the CLI, capture helper, and ONNX worker as exact sibling programs in every native
+  package so existing capture and model identity checks remain intact;
+- uses a package-only Tauri configuration overlay, not committed placeholder binaries, so ordinary
+  workspace Cargo checks remain valid;
+- carries the exact Geist OFL notice;
+- checks out and labels the exact pull-request head in every CI job; and
+- treats the original synthetic-merge hosted run only as cross-platform defect detection.
+
+The supporting current upstream research is
+[`2026-07-28-tauri-packaging-and-runtime-boundaries.md`](research/2026-07-28-tauri-packaging-and-runtime-boundaries.md).
+Tauri's reported Windows same-version sidecar replacement and macOS external-program signing
+caveats remain explicit native-installation acceptance concerns. The feature does not receive a new
+quarter checkpoint after remediation; the same Quarter 4 review closes its substantiated findings,
+then one clean unchanged exact-head gate determines integration eligibility.

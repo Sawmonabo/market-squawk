@@ -45,6 +45,50 @@ export const providerSessionSchema = z
   })
   .loose()
 
+export const providerActivationSchema = z
+  .object({
+    profile: z.string(),
+    session_id: z.string().uuid(),
+    capability_revision: z.number().int().nonnegative(),
+  })
+  .loose()
+
+export const encryptedFileFallbackSchema = z.enum([
+  "disabled",
+  "locked",
+  "ready",
+])
+
+export const setupStepSchema = z.object({
+  id: z.enum([
+    "system",
+    "storage",
+    "sources",
+    "research",
+    "portfolio",
+    "paper",
+    "mcp",
+    "review",
+  ]),
+  label: z.string(),
+  state: z.enum(["complete", "action_required", "blocked", "available"]),
+  complete: z.boolean(),
+  detail: z.string(),
+  blockingReason: z.string().nullable(),
+  recovery: z.string().nullable(),
+  action: z
+    .enum([
+      "review_installation",
+      "configure_sources",
+      "configure_research",
+      "configure_portfolio",
+      "configure_paper",
+      "review_mcp",
+      "review_status",
+    ])
+    .nullable(),
+})
+
 export const desktopBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
   applicationVersion: z.string(),
@@ -57,9 +101,10 @@ export const desktopBootstrapSchema = z.object({
   mcp: readinessSchema,
   paperModeEnabled: z.boolean(),
   telemetryEnabled: z.boolean(),
-  encryptedFileFallback: z.enum(["disabled", "locked", "ready"]),
+  encryptedFileFallback: encryptedFileFallbackSchema,
   providerProfiles: z.array(providerProfileSchema),
   providerSessions: z.array(providerSessionSchema),
+  setupSteps: z.array(setupStepSchema).length(8),
   operations: z.array(operationSummarySchema),
 })
 
@@ -77,11 +122,16 @@ export const applicationResultSchema = z.object({
 export const providerBootstrapSchema = z.object({
   profiles: z.array(providerProfileSchema),
   sessions: z.array(providerSessionSchema),
-  encryptedFileFallback: z.enum(["disabled", "locked", "ready"]),
+  encryptedFileFallback: encryptedFileFallbackSchema,
 })
 
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
+export type EncryptedFileFallback = z.infer<
+  typeof encryptedFileFallbackSchema
+>
+export type ProviderActivation = z.infer<typeof providerActivationSchema>
+export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>
 export type ProviderSession = z.infer<typeof providerSessionSchema>
-
+export type SetupStep = z.infer<typeof setupStepSchema>

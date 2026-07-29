@@ -2,7 +2,6 @@ import * as React from "react"
 import {
   ArrowRight,
   Check,
-  Clock3,
   Database,
   FileChartColumn,
   Network,
@@ -45,46 +44,41 @@ export function SetupOverview({
     )
   }
 
+  const stepFor = (id: DesktopBootstrap["setupSteps"][number]["id"]) =>
+    bootstrap.setupSteps.find((step) => step.id === id)
   const capabilities = [
     {
       title: "Local storage",
-      detail: "Use native private directories and controlled artifacts.",
+      step: stepFor("storage"),
       icon: Database,
-      ready: bootstrap.storage.state === "ready",
     },
     {
       title: "Free data sources",
-      detail: `${bootstrap.providerProfiles.length} supported provider setup paths available.`,
+      step: stepFor("sources"),
       icon: FileChartColumn,
-      ready: bootstrap.providerSessions.some(
-        (session) => session.next_action === "active",
-      ),
     },
     {
       title: "Research and modeling",
-      detail: bootstrap.modelRuntime.detail,
+      step: stepFor("research"),
       icon: Settings2,
-      ready: bootstrap.modelRuntime.state === "ready",
     },
     {
       title: "Portfolio workspace",
-      detail: "Prepare private imports, reconciliation, and analytics.",
+      step: stepFor("portfolio"),
       icon: WalletCards,
-      ready: false,
     },
     {
       title: "Paper execution",
-      detail: "Start with central risk limits and no live-order authority.",
+      step: stepFor("paper"),
       icon: ShieldCheck,
-      ready: bootstrap.paperModeEnabled,
     },
     {
       title: "Local MCP",
-      detail: bootstrap.mcp.detail,
+      step: stepFor("mcp"),
       icon: Network,
-      ready: bootstrap.mcp.state === "ready",
     },
   ]
+  const firstIncomplete = bootstrap.setupSteps.find((step) => !step.complete)
 
   return (
     <section className="rounded-xl border border-border bg-card/55 p-5">
@@ -100,7 +94,7 @@ export function SetupOverview({
             className="flex gap-3 border-b border-border px-0 py-3 last:border-b-0 sm:odd:border-r sm:odd:pr-5 sm:even:pl-5 sm:[&:nth-last-child(-n+2)]:border-b-0"
           >
             <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded border border-border bg-background">
-              {capability.ready ? (
+              {capability.step?.complete ? (
                 <Check className="size-2.5 text-emerald-400" aria-hidden="true" />
               ) : (
                 <capability.icon
@@ -112,7 +106,7 @@ export function SetupOverview({
             <div>
               <h3 className="text-xs font-semibold">{capability.title}</h3>
               <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-                {capability.detail}
+                {capability.step?.detail ?? "Status is unavailable."}
               </p>
             </div>
           </div>
@@ -120,7 +114,9 @@ export function SetupOverview({
       </div>
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <Button type="button" onClick={() => setOpen(true)}>
-          Continue with recommended setup
+          {firstIncomplete
+            ? `Continue with ${firstIncomplete.label.toLowerCase()}`
+            : "Review completed setup"}
           <ArrowRight aria-hidden="true" />
         </Button>
         <Dialog>
@@ -152,12 +148,10 @@ export function SetupOverview({
             </dl>
           </DialogContent>
         </Dialog>
-        <span className="ml-auto flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-          <Clock3 className="size-3" aria-hidden="true" />
-          About 4 min
+        <span className="ml-auto font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+          Saved authority resumes automatically
         </span>
       </div>
     </section>
   )
 }
-

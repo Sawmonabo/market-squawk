@@ -19,6 +19,68 @@ pub(crate) enum ReadinessState {
     Unverified,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SetupStepState {
+    Complete,
+    ActionRequired,
+    Blocked,
+    Available,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SetupStepAction {
+    ReviewInstallation,
+    ConfigureSources,
+    ConfigureResearch,
+    ConfigurePortfolio,
+    ConfigurePaper,
+    ReviewMcp,
+    ReviewStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetupStep {
+    id: &'static str,
+    label: &'static str,
+    state: SetupStepState,
+    complete: bool,
+    detail: &'static str,
+    blocking_reason: Option<&'static str>,
+    recovery: Option<&'static str>,
+    action: Option<SetupStepAction>,
+}
+
+impl SetupStep {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the presentation contract keeps every authority-derived setup fact explicit"
+    )]
+    pub(crate) const fn new(
+        id: &'static str,
+        label: &'static str,
+        state: SetupStepState,
+        complete: bool,
+        detail: &'static str,
+        blocking_reason: Option<&'static str>,
+        recovery: Option<&'static str>,
+        action: Option<SetupStepAction>,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            state,
+            complete,
+            detail,
+            blocking_reason,
+            recovery,
+            action,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Readiness {
@@ -92,6 +154,7 @@ pub(crate) struct DesktopBootstrap {
     encrypted_file_fallback: Value,
     provider_profiles: Value,
     provider_sessions: Value,
+    setup_steps: Vec<SetupStep>,
     operations: Vec<OperationSummary>,
 }
 
@@ -112,6 +175,7 @@ impl DesktopBootstrap {
         encrypted_file_fallback: Value,
         provider_profiles: Value,
         provider_sessions: Value,
+        setup_steps: Vec<SetupStep>,
         operations: Vec<OperationSummary>,
     ) -> Self {
         Self {
@@ -129,6 +193,7 @@ impl DesktopBootstrap {
             encrypted_file_fallback,
             provider_profiles,
             provider_sessions,
+            setup_steps,
             operations,
         }
     }

@@ -17,9 +17,12 @@ import {
   SidebarSeparator,
 } from "@/components/ui/sidebar"
 import {
+  type NavigationItem,
+  navigationAdmission,
   operationsNavigation,
   workspaceNavigation,
 } from "@/lib/navigation"
+import type { DesktopBootstrap } from "@/lib/schemas"
 
 export function AppSidebar() {
   const location = useLocation()
@@ -73,19 +76,14 @@ export function AppSidebar() {
             <SidebarGroupContent>
               <SidebarMenu>
                 {workspaceNavigation.map((item) => (
-                  <SidebarMenuItem key={item.path}>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === item.path}
-                      tooltip={item.label}
-                      className="relative h-9 gap-3 px-2.5 text-[13px] data-[active=true]:before:absolute data-[active=true]:before:inset-y-1 data-[active=true]:before:-left-2 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
-                    >
-                      <Link to={item.path}>
-                        <item.icon aria-hidden="true" />
-                        <span>{item.label}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
+                  <ProductNavigationItem
+                    key={item.path}
+                    item={item}
+                    bootstrap={
+                      product.status === "ready" ? product.bootstrap : null
+                    }
+                    active={location.pathname === item.path}
+                  />
                 ))}
               </SidebarMenu>
             </SidebarGroupContent>
@@ -98,19 +96,14 @@ export function AppSidebar() {
             <SidebarGroupContent>
               <SidebarMenu>
                 {operationsNavigation.map((item) => (
-                  <SidebarMenuItem key={item.path}>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === item.path}
-                      tooltip={item.label}
-                      className="relative h-9 gap-3 px-2.5 text-[13px] data-[active=true]:before:absolute data-[active=true]:before:inset-y-1 data-[active=true]:before:-left-2 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
-                    >
-                      <Link to={item.path}>
-                        <item.icon aria-hidden="true" />
-                        <span>{item.label}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
+                  <ProductNavigationItem
+                    key={item.path}
+                    item={item}
+                    bootstrap={
+                      product.status === "ready" ? product.bootstrap : null
+                    }
+                    active={location.pathname === item.path}
+                  />
                 ))}
               </SidebarMenu>
             </SidebarGroupContent>
@@ -146,5 +139,58 @@ export function AppSidebar() {
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+function ProductNavigationItem({
+  item,
+  bootstrap,
+  active,
+}: {
+  item: NavigationItem
+  bootstrap: DesktopBootstrap | null
+  active: boolean
+}) {
+  const admission = bootstrap
+    ? navigationAdmission(item, bootstrap)
+    : {
+        admitted: item.path === "/overview",
+        reason:
+          item.path === "/overview"
+            ? null
+            : "Wait for the local application to finish starting.",
+      }
+  const className =
+    "relative h-9 gap-3 px-2.5 text-[13px] data-[active=true]:before:absolute data-[active=true]:before:inset-y-1 data-[active=true]:before:-left-2 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
+
+  return (
+    <SidebarMenuItem>
+      {admission.admitted ? (
+        <SidebarMenuButton
+          asChild
+          isActive={active}
+          tooltip={item.label}
+          className={className}
+        >
+          <Link to={item.path}>
+            <item.icon aria-hidden="true" />
+            <span>{item.label}</span>
+          </Link>
+        </SidebarMenuButton>
+      ) : (
+        <SidebarMenuButton
+          type="button"
+          aria-disabled="true"
+          title={admission.reason ?? undefined}
+          tooltip={`${item.label} — ${admission.reason}`}
+          className={`${className} cursor-not-allowed opacity-55`}
+        >
+          <item.icon aria-hidden="true" />
+          <span>{item.label}</span>
+          <LockKeyhole className="ml-auto size-3" aria-hidden="true" />
+          <span className="sr-only">Unavailable: {admission.reason}</span>
+        </SidebarMenuButton>
+      )}
+    </SidebarMenuItem>
   )
 }
