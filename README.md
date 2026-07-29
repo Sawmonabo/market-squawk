@@ -134,14 +134,16 @@ Rust.
 ```bash
 pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
 CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+  tauri dev -- -- --data-dir "$PWD/.market-squawk"
 ```
 
 This opens the permanent Obsidian Signal shell with guided setup, source onboarding, and bounded
 views over the local application services. The final `--` separates Tauri runner arguments from
 Market Squawk desktop arguments. An installed desktop uses the operating system's
 application-local data directory when no configuration layer supplies another path, so a
-double-click launch does not depend on its working directory.
+double-click launch does not depend on its working directory. The production paper service is
+available through the typed Bot and Execution operations, starts stopped, remains paper-only, and
+cannot bypass central risk.
 
 Native packages use the package-only Tauri overlay, which compiles and installs the CLI, capture
 helper, and ONNX worker beside the desktop executable:
@@ -153,6 +155,10 @@ CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop exec tauri build \
 
 Choose host-specific package types and the current unsigned-package safety options from the
 [installation runbook](docs/operations/installation-and-bootstrap.md#build-the-desktop-package).
+The desktop reports local MCP as available only after verifying the packaged CLI sibling and the
+bounded MCP tool contract. Guided setup then renders client JSON with a durable installed launcher,
+and the required workspace identity paths. Close the desktop before an MCP client starts it because
+the two processes must not own the same workspace concurrently.
 
 ### 3. Build the local headless bundle
 
@@ -284,8 +290,11 @@ Generic MCP client configuration:
 ```
 
 The server communicates over local stdio. Protocol responses use stdout and operational logs use
-stderr. See the [MCP reference](docs/reference/mcp.md) for tool domains, schemas, limits, audit
-behavior, controlled artifacts, and client integration.
+stderr. The desktop's guided setup generates the corresponding client JSON from installed,
+required workspace identity state; it does not start the server or configure a client. Advanced
+policy supplied only through environment variables must also be supplied to the MCP client. See the
+[MCP reference](docs/reference/mcp.md) for tool domains, schemas, limits, audit behavior, controlled
+artifacts, and client integration.
 
 ## Documentation
 

@@ -1072,8 +1072,8 @@
     },
     {
       "path": "apps/market-squawk/src/lib.rs",
-      "sha256": "8120ce8f19a560e3dc00a4ab6342262e8941a9f1ef30c3b8dc3f9de161b958df",
-      "size_bytes": 4031
+      "sha256": "6347a377901e1aeeaaecf3aededb2a4aaaa994cc9d740216b49597571f9dd06a",
+      "size_bytes": 4097
     },
     {
       "path": "apps/market-squawk/src/live_runtime.rs",
@@ -1232,8 +1232,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/executable.rs",
-      "sha256": "a695fea1c7485eb158340b51b94b579af230e830e5edceb7b37d333ece51c4d5",
-      "size_bytes": 7677
+      "sha256": "c4431e6452b013acab4c634a5da6f862b15a26a72d3e36ad71da663426b4e37f",
+      "size_bytes": 9197
     },
     {
       "path": "apps/market-squawk/src/local_product/fair_value_producer.rs",
@@ -1242,8 +1242,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/mod.rs",
-      "sha256": "19f9d946d605d3f1527be0412c347cb0deb96aa154e722cee707a1b0b1a85f4c",
-      "size_bytes": 27911
+      "sha256": "56c254dc5ac6d758539f63080cab5932ca29bb2bd53d59971c901baf8cd03fe3",
+      "size_bytes": 30226
     },
     {
       "path": "apps/market-squawk/src/local_product/provider_activation_state.rs",

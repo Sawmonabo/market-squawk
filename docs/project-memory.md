@@ -1293,3 +1293,59 @@ Tauri's reported Windows same-version sidecar replacement and macOS external-pro
 caveats remain explicit native-installation acceptance concerns. The feature does not receive a new
 quarter checkpoint after remediation; the same Quarter 4 review closes its substantiated findings,
 then one clean unchanged exact-head gate determines integration eligibility.
+
+## 2026-07-28 Quarter 4 desktop package-remediation checkpoint
+
+The Obsidian Signal remediation preserves one Rust application authority and removes presentation
+shortcuts that could overstate readiness:
+
+- Markets setup admits only an active exact Coinbase public, Coinbase Exchange direct, or Kraken
+  live-market surface. An active filing or macro session cannot admit the Markets route.
+- Research and Portfolio setup require their complete application operation contracts. A prior
+  local import is separately informational and never substitutes for those contracts.
+- Paper setup requires the exact eight-operation production contract across `Bot`, `Execution`,
+  and `Risk`. The controller starts stopped, stays paper-only, and cannot bypass central risk. The
+  legacy `paper_bot_enabled` setting remains diagnostic capture/replay configuration and grants no
+  production Paper authority.
+- Local MCP setup requires both the safely installed CLI sibling and the complete bounded MCP tool
+  contract. Installed packages emit durable client instructions; a Linux AppImage uses its outer
+  image path and a hidden, typed pre-Tauri `exec` dispatch. Setup starts no server, configures no
+  client, and claims no connected peer.
+- The System step reflects successful configuration, path, catalog, and application-service
+  startup. Model admission and developer signing remain separate visible facts.
+
+Linux AppImage packaging now enables Tauri's target-local tools directory and admits exactly five
+reviewed x86-64 tool identities. Every cached or reacquired input is checked for owner, regular-file
+status, exact length, and SHA-256 before execution. The linuxdeploy AppImage's reviewed header
+transform is applied deterministically and its derived executable digest is verified. Unsupported
+architectures and any missing or changed identity stop packaging. The durable upstream analysis
+and direct sources are recorded in
+[`2026-07-28-tauri-packaging-and-runtime-boundaries.md`](research/2026-07-28-tauri-packaging-and-runtime-boundaries.md).
+
+The final local Apple Silicon package candidate was built with incremental compilation disabled.
+The application bundle contains exactly the desktop, CLI, capture helper, and ONNX worker as ARM64
+executables, plus the exact Geist and Geist Mono license notices. The read-only mounted DMG matched
+all four inspected executables and both notices byte-for-byte. Exact identities are:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Desktop executable | 91,988,880 | `ce228e88c5c39fc30f1cd1256295416923fee8b5dcd60e6377ac6d0bf39cd254` |
+| CLI sibling | 96,717,264 | `8761d9b9a2cd89c98a228d77ddeee476dd6d9c39bba7dcb42f37371d58e66318` |
+| Capture-helper sibling | 561,536 | `831022cbd45bf593e2d73b09d239c52eeb227c6d2b4bdf10cd0fdb95e0bb2072` |
+| ONNX-worker sibling | 15,298,816 | `3276f191c4d6e375a086a1202f5d6f884ef95b3e65b5eecddbb3752876e88c05` |
+| Apple Silicon DMG | 78,943,301 | `54fc42be4a4389ac6ab163e71718899c4c2ca526876cfbd7caf881d4ddd0a86f` |
+
+`hdiutil verify` accepted the DMG. A fresh isolated launch created the controlled catalog,
+artifacts, journal, provider-rate authority, and source/portfolio control layout with no stdout or
+stderr output before bounded termination. Ordinary help exposes only the three supported launcher
+options; the package-only MCP transport remains hidden and fails closed outside Linux AppImage
+context. The worktree target is 17 GiB, below its 20 GiB ceiling, with 132 GiB free.
+
+This package was intentionally built with `--no-sign`. Its linker-created ad-hoc Mach-O signature
+is not developer signing, notarization, or installed-release evidence, and strict deep signature
+verification is therefore not an acceptance result. The independent Quarter 4 semantic re-scan
+reported no remaining substantiated Critical, Important, or Minor finding on the working tree, but
+approval still requires the same clean pushed exact head and terminal hosted evidence. Complete
+guided native bootstrap, uv/managed-Python installation, signed installation evidence, and the
+unchanged release predicates remain mandatory blockers. Issue `#36`, draft PR `#37`, and their
+Project 5 state must stay open until those predicates actually close.

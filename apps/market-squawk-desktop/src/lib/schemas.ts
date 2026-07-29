@@ -78,7 +78,6 @@ export const setupStepSchema = z.object({
   recovery: z.string().nullable(),
   action: z
     .enum([
-      "review_installation",
       "configure_sources",
       "configure_research",
       "configure_portfolio",
@@ -87,6 +86,13 @@ export const setupStepSchema = z.object({
       "review_status",
     ])
     .nullable(),
+})
+
+export const mcpClientInstructionSchema = z.object({
+  program: z.string().min(1),
+  arguments: z.array(z.string()),
+  environment: z.record(z.string(), z.string()),
+  requiresDesktopExit: z.literal(true),
 })
 
 export const desktopBootstrapSchema = z.object({
@@ -99,7 +105,7 @@ export const desktopBootstrapSchema = z.object({
   installation: readinessSchema,
   modelRuntime: readinessSchema,
   mcp: readinessSchema,
-  paperModeEnabled: z.boolean(),
+  mcpClient: mcpClientInstructionSchema.nullable(),
   telemetryEnabled: z.boolean(),
   encryptedFileFallback: encryptedFileFallbackSchema,
   providerProfiles: z.array(providerProfileSchema),

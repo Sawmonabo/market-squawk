@@ -35,6 +35,7 @@
       "../../../LICENSE-APACHE": "licenses/LICENSE-APACHE",
       "../../../LICENSE-MIT": "licenses/LICENSE-MIT",
       "../../../docs/licenses/geist-ofl-license.txt": "licenses/geist-ofl-license.txt",
+      "../../../docs/licenses/geist-mono-ofl-license.txt": "licenses/geist-mono-ofl-license.txt",
       "../../../docs/licenses/tauri-mpl-notice.md": "licenses/tauri-mpl-notice.md",
       "../../../docs/licenses/tract-onnx-notice.md": "licenses/tract-onnx-notice.md"
     },

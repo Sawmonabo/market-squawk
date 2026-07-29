@@ -78,20 +78,30 @@ def finish_process(process: subprocess.Popen[str]) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) > 2:
-        print("usage: smoke_mcp.py [/path/to/market-squawk]", file=sys.stderr)
+    arguments = sys.argv[1:]
+    desktop_appimage = bool(arguments and arguments[0] == "--desktop-appimage")
+    if desktop_appimage:
+        arguments = arguments[1:]
+    if len(arguments) > 1:
+        print(
+            "usage: smoke_mcp.py [--desktop-appimage] [/path/to/executable]",
+            file=sys.stderr,
+        )
         return 2
 
     binary = pathlib.Path(
-        sys.argv[1] if len(sys.argv) == 2 else "target/debug/market-squawk"
+        arguments[0] if arguments else "target/debug/market-squawk"
     ).resolve()
     require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
     with (
         tempfile.TemporaryDirectory() as data_dir,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
     ):
+        command = [str(binary), "--data-dir", data_dir, "mcp", "serve"]
+        if desktop_appimage:
+            command = [str(binary), "--stdio-mcp", "--data-dir", data_dir]
         process = subprocess.Popen(
-            [str(binary), "--data-dir", data_dir, "mcp", "serve"],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_log,

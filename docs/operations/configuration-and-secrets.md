@@ -117,6 +117,11 @@ The environment layer accepts only the fourteen keys in the next table. An unkno
 JSON rejects startup. `MARKET_SQUAWK_LOG` is the one separate tracing variable: the CLI consumes it
 before `AppConfig` validation.
 
+The installed desktop changes one value only within the lowest-precedence safe-default layer: its
+data root is the operating system's application-local data directory. The explicit file,
+environment, and CLI layers keep their documented precedence. The production Paper application
+service is independent of the diagnostic-capture `paper_bot_enabled` setting.
+
 ## Exact settings and bounds
 
 All durations are integer milliseconds. All memory limits are exact integer bytes.
@@ -129,7 +134,7 @@ All durations are integer milliseconds. All memory limits are exact integer byte
 | `capture_queue_capacity` | `MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY` | `--capture-queue-capacity` | `16384` | `1..=1048576` |
 | `capture_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES` | `--capture-memory-ceiling-bytes` | `67108864` | `1..=4294967295` |
 | `capture_destination_registry_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES` | `--capture-destination-registry-memory-ceiling-bytes` | `1048576` | `1..=67108864` |
-| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | No general override; diagnostic commands may supply their own flag | `false` | Rust boolean syntax: `true` or `false`; grants no live execution authority |
+| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | No general override; diagnostic commands may supply their own flag | `false` | Rust boolean syntax: `true` or `false`; applies to diagnostic capture/replay and grants no live-execution or production Paper authority |
 | `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | None | `1000` | Positive and no greater than `capture_shutdown_ms` |
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | None | `5000` | Positive, `<=60000`, and no less than the flush interval |
 | `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000` |

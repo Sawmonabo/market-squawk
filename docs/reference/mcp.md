@@ -60,6 +60,13 @@ installed before product composition: Unix `SIGINT`/`SIGTERM` and the correspond
 termination events cancel the session and then await the same bounded server shutdown, application
 shutdown, and audit flush as a normal end of input.
 
+The desktop setup flow can generate client JSON from its verified packaged CLI, durable package
+launcher, and required workspace identity paths. That is configuration guidance only: the desktop
+does not start MCP, configure a client, claim a connected peer, or infer production Paper authority
+from the diagnostic-capture setting. Advanced policy supplied only through environment variables
+must also be supplied to the client. Close the desktop before a client starts the generated command
+because the desktop and MCP process must not concurrently own the same workspace.
+
 The transport accepts one JSON-RPC message per line. The newline delimiter is not part of the
 frame-size count. Whitespace-only lines are ignored. Production framing admits at most 1 MiB for
 both the outer frame and the parsed JSON body. A frame larger than the outer limit ends the session

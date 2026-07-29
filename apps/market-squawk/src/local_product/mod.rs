@@ -11,6 +11,7 @@ mod fair_value_producer;
 mod provider_activation_state;
 
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use market_squawk_analytics::{
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
 use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
+use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
 use market_squawk_services::{ArtifactError, ArtifactRepository};
@@ -37,7 +39,7 @@ pub use self::cli_provider::CliProviderActivationError;
 pub use self::cli_transport::{CliProductError, CliProductResult, execute_cli_command};
 use self::executable::{
     ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
-    installed_release_programs,
+    installed_application_program, installed_release_programs,
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::provider_activation_state::DurableProviderActivationState;
@@ -86,6 +88,19 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const MODEL_EVALUATION_RECORDS: usize = 4_096;
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Returns the installed CLI path after stable-file and permission verification.
+///
+/// This narrow native-launch boundary does not initialize the application, validate the MCP tool
+/// contract, or start a process.
+///
+/// # Errors
+///
+/// Returns [`LocalMcpAvailabilityError::InstalledCli`] when the packaged CLI sibling is absent,
+/// unsafe, unreadable, or changes during inspection.
+pub fn verified_installed_cli_program() -> Result<PathBuf, LocalMcpAvailabilityError> {
+    installed_application_program().map_err(|_error| LocalMcpAvailabilityError::InstalledCli)
+}
 
 /// Lifecycle owner for every production local authority required by the product surface.
 pub struct LocalProduct {
@@ -320,6 +335,25 @@ impl LocalProduct {
         Arc::clone(&self.application)
     }
 
+    /// Returns the installed CLI path after verifying the CLI and bounded MCP tool contract.
+    ///
+    /// This inspection does not start a protocol session or claim peer identity. Desktop packages
+    /// use it to distinguish an installed, validated on-demand MCP capability from a static UI
+    /// claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the installed CLI is not a stable regular file, the code-owned
+    /// MCP limits are invalid, or the complete tool advertisement exceeds those limits.
+    pub fn verified_local_mcp_program(&self) -> Result<PathBuf, LocalMcpAvailabilityError> {
+        let program = verified_installed_cli_program()?;
+        let limits = McpLimits::try_from(McpLimitSpec::default())
+            .map_err(|_error| LocalMcpAvailabilityError::Limits)?;
+        validate_service_capabilities(&self.application.capabilities(), limits)
+            .map_err(|_error| LocalMcpAvailabilityError::ToolContract)?;
+        Ok(program)
+    }
+
     /// Returns the controlled local paths used by MCP and CLI artifact boundaries.
     pub const fn paths(&self) -> &LocalPaths {
         &self.paths
@@ -536,6 +570,20 @@ fn open_model_domain(
         evaluation_records,
     )?);
     Ok((runtime, model))
+}
+
+/// Installed local MCP availability could not be established.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LocalMcpAvailabilityError {
+    /// The packaged CLI sibling was absent, unsafe, unreadable, or changed during inspection.
+    #[error("installed Market Squawk CLI is unavailable")]
+    InstalledCli,
+    /// Code-owned MCP resource limits were invalid.
+    #[error("local MCP resource limits are invalid")]
+    Limits,
+    /// The complete application tool contract could not fit the bounded MCP advertisement.
+    #[error("local MCP tool contract is invalid")]
+    ToolContract,
 }
 
 /// Production local composition failed before any transport was published.

@@ -16,7 +16,6 @@ import {
   WalletCards,
 } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { ProviderStep } from "@/components/setup/provider-step"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
@@ -129,29 +128,27 @@ export function SetupFlow({
             />
           </div>
         ) : current.id === "research" ? (
-          <LocalAuthorityStep
+          <LocalCapabilityStep
             step={current}
             profileId="local.files"
             bootstrap={bootstrap}
-            transport={transport}
             onRefresh={onRefresh}
           />
         ) : current.id === "portfolio" ? (
-          <LocalAuthorityStep
+          <LocalCapabilityStep
             step={current}
             profileId="local.portfolio-imports"
             bootstrap={bootstrap}
-            transport={transport}
             onRefresh={onRefresh}
           />
         ) : current.id === "paper" ? (
-          <LocalAuthorityStep
+          <PaperStep
             step={current}
-            profileId="local.paper-execution"
             bootstrap={bootstrap}
-            transport={transport}
             onRefresh={onRefresh}
           />
+        ) : current.id === "mcp" ? (
+          <McpStep step={current} instruction={bootstrap.mcpClient} />
         ) : current.id === "review" ? (
           <ReviewStep steps={steps} onRefresh={onRefresh} />
         ) : (
@@ -160,9 +157,7 @@ export function SetupFlow({
             supplemental={
               current.id === "storage"
                 ? `Effective data directory: ${bootstrap.dataRoot}`
-                : current.id === "mcp"
-                  ? "Start when needed with: market-squawk mcp serve"
-                  : bootstrap.installation.detail
+                : bootstrap.installation.detail
             }
           />
         )}
@@ -199,6 +194,63 @@ export function SetupFlow({
         </Button>
       </div>
     </section>
+  )
+}
+
+function McpStep({
+  step,
+  instruction,
+}: {
+  step: SetupStep
+  instruction: DesktopBootstrap["mcpClient"]
+}) {
+  const clientConfiguration = instruction
+    ? {
+        mcpServers: {
+          "market-squawk": {
+            command: instruction.program,
+            args: instruction.arguments,
+            env: instruction.environment,
+          },
+        },
+      }
+    : null
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-5 py-4">
+      <StepStatus step={step} />
+      {clientConfiguration ? (
+        <section className="space-y-4 rounded-lg border border-border bg-background/35 p-4">
+          <div>
+            <h3 className="text-sm font-semibold">
+              Generated local client configuration
+            </h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              The installed capability is verified, but the service is stopped
+              and no MCP client has been configured automatically.
+            </p>
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              Advanced policy supplied only through environment variables must
+              also be added to your MCP client.
+            </p>
+          </div>
+          <pre className="max-h-64 overflow-auto rounded-md border border-border bg-black/35 p-3 font-mono text-[11px] leading-relaxed text-foreground/85">
+            {JSON.stringify(clientConfiguration, null, 2)}
+          </pre>
+          <div className="flex gap-3 rounded-md border border-amber-400/25 bg-amber-400/5 p-3">
+            <CircleAlert
+              className="mt-0.5 size-4 shrink-0 text-amber-300"
+              aria-hidden="true"
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              Close Market Squawk before your MCP client starts this service.
+              The desktop and MCP process use the same local workspace and must
+              not own it at the same time.
+            </p>
+          </div>
+        </section>
+      ) : null}
+    </div>
   )
 }
 
@@ -260,39 +312,23 @@ function StepStatus({ step }: { step: SetupStep }) {
   )
 }
 
-function LocalAuthorityStep({
+function LocalCapabilityStep({
   step,
   profileId,
   bootstrap,
-  transport,
   onRefresh,
 }: {
   step: SetupStep
   profileId: string
   bootstrap: DesktopBootstrap
-  transport: ProductTransport
   onRefresh: () => void
 }) {
-  const [pending, setPending] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
   const profile = bootstrap.providerProfiles.find(
     (candidate) => candidate.id === profileId,
   )
   const session = bootstrap.providerSessions.find(
     (candidate) => candidate.surface_id === profileId,
   )
-
-  const openSetup = async () => {
-    setPending(true)
-    setError(null)
-    try {
-      await transport.openProtectedProviderSetup(profileId)
-    } catch (requestError) {
-      setError(messageFrom(requestError))
-    } finally {
-      setPending(false)
-    }
-  }
 
   return (
     <div className="mx-auto max-w-2xl space-y-5 py-4">
@@ -305,28 +341,71 @@ function LocalAuthorityStep({
           {profile?.coverage ?? "This local capability is not installed."}
         </p>
         <p className="mt-3 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-          Authority: {session?.next_action === "active" ? "active" : "not active"}
+          Private import history:{" "}
+          {session?.next_action === "active" ? "recorded" : "none recorded"}
         </p>
+        <div className="mt-4 rounded-md border border-border bg-black/25 p-3">
+          <p className="text-xs text-muted-foreground">
+            Private data imports are optional. Import history is reported
+            separately and never controls whether the installed capability is
+            ready.
+          </p>
+        </div>
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button
-            type="button"
-            size="sm"
-            onClick={openSetup}
-            disabled={pending || !profile}
-          >
-            Open guided setup
-          </Button>
           <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
             <RefreshCw aria-hidden="true" />
             Refresh status
           </Button>
         </div>
       </section>
-      {error ? (
-        <p role="alert" className="text-sm text-red-400">
-          {error}
+    </div>
+  )
+}
+
+function PaperStep({
+  step,
+  bootstrap,
+  onRefresh,
+}: {
+  step: SetupStep
+  bootstrap: DesktopBootstrap
+  onRefresh: () => void
+}) {
+  const profile = bootstrap.providerProfiles.find(
+    (candidate) => candidate.id === "local.paper-execution",
+  )
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-5 py-4">
+      <StepStatus step={step} />
+      <section className="rounded-lg border border-border bg-background/35 p-4">
+        <h3 className="text-sm font-semibold">
+          {profile?.display_name ?? step.label}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          {profile?.coverage ?? "This local capability is not installed."}
         </p>
-      ) : null}
+        <p className="mt-3 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+          Paper services: {step.complete ? "available" : "unavailable"}
+        </p>
+        <div className="mt-4 rounded-md border border-border bg-black/25 p-3">
+          <p className="text-xs text-muted-foreground">
+            Paper execution starts stopped. Every start, order, cancellation,
+            reconciliation, and kill-switch action remains typed, paper-only,
+            and subject to central risk authority.
+          </p>
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="mt-4"
+          onClick={onRefresh}
+        >
+          <RefreshCw aria-hidden="true" />
+          Refresh status
+        </Button>
+      </section>
     </div>
   )
 }

@@ -75,7 +75,7 @@ All byte ceilings are exact integer byte counts. All timing values are milliseco
 | `capture_queue_capacity` | `MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY` | `--capture-queue-capacity` | `16384` | `1..=1048576`; fixed raw-capture queue capacity |
 | `capture_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES` | `--capture-memory-ceiling-bytes` | `67108864` | `1..=4294967295`; per-channel fixed, resident-generation, and queued-record ceiling |
 | `capture_destination_registry_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES` | `--capture-destination-registry-memory-ceiling-bytes` | `1048576` | `1..=67108864`; process-wide capture-destination registry ceiling |
-| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | Command-specific diagnostic override | `false` | Boolean; enables paper behavior only and grants no live execution authority |
+| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | Command-specific diagnostic override | `false` | Boolean; applies to diagnostic capture/replay and grants no live-execution or production Paper authority |
 | `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | Internal override only | `1000` | Positive and no greater than `capture_shutdown_ms` |
 | `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | Internal override only | `5000` | Positive, no greater than `60000`, and no less than the flush interval |
 | `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000`; bounds the source supervisor and its owned capture cleanup |

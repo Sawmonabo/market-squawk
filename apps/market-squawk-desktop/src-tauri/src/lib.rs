@@ -1,8 +1,13 @@
 //! Market Squawk's Tauri 2 composition root.
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
+#[cfg(target_os = "linux")]
+use market_squawk::verified_installed_cli_program;
 use market_squawk::{LocalProduct, LocalProductError};
 use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
 use tauri::Manager;
@@ -15,6 +20,15 @@ use bridge::{
     DesktopState, application_invoke, desktop_bootstrap, open_official_provider_page,
     open_protected_provider_setup, provider_onboarding,
 };
+
+#[cfg(target_os = "linux")]
+const MAXIMUM_APPIMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const APPIMAGE_HEADER_BYTES: usize = 11;
+#[cfg(target_os = "linux")]
+const DESKTOP_EXECUTABLE_BASENAME: &str = "market-squawk-desktop";
+#[cfg(target_os = "linux")]
+const CLI_EXECUTABLE_BASENAME: &str = "market-squawk";
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk-desktop")]
@@ -30,13 +44,26 @@ struct DesktopArgs {
     /// Absolute verified Python training-release root.
     #[arg(long)]
     training_release_root: Option<PathBuf>,
-    /// Enable paper-only bot behavior.
-    #[arg(long)]
-    paper_mode: bool,
+    /// Dispatch the packaged stdio MCP process from a portable Linux image.
+    #[arg(long, hide = true)]
+    stdio_mcp: bool,
 }
 
 #[derive(Debug, Error)]
 enum DesktopStartupError {
+    #[error("installed MCP transport is unavailable")]
+    McpTransportUnavailable,
+    #[cfg(target_os = "linux")]
+    #[error("installed MCP transport could not start")]
+    McpTransportStart {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("desktop configuration path is invalid")]
+    ConfigurationPath {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
     #[error("local product initialization failed")]
@@ -50,7 +77,12 @@ enum DesktopStartupError {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args = DesktopArgs::try_parse().unwrap_or_else(|error| error.exit());
-    let code = match try_run(args) {
+    let result = if args.stdio_mcp {
+        run_stdio_mcp(args)
+    } else {
+        try_run(args)
+    };
+    let code = match result {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
@@ -58,6 +90,58 @@ pub fn run() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(target_os = "linux")]
+fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
+    use std::os::unix::process::CommandExt as _;
+
+    let cli = verified_installed_cli_program()
+        .map_err(|_error| DesktopStartupError::McpTransportUnavailable)?;
+    let launcher = appimage_mcp_launcher(&cli)
+        .map_err(|_error| DesktopStartupError::McpTransportUnavailable)?
+        .ok_or(DesktopStartupError::McpTransportUnavailable)?;
+    let data_directory = args
+        .data_dir
+        .filter(|path| path.is_absolute())
+        .ok_or(DesktopStartupError::McpTransportUnavailable)?;
+    let config_path = args
+        .config
+        .map(|path| {
+            if !path.is_absolute() {
+                return Err(DesktopStartupError::McpTransportUnavailable);
+            }
+            std::fs::canonicalize(path)
+                .map_err(|_source| DesktopStartupError::McpTransportUnavailable)
+        })
+        .transpose()?;
+    let training_release_root = args
+        .training_release_root
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(DesktopStartupError::McpTransportUnavailable)
+            }
+        })
+        .transpose()?;
+
+    let mut command = std::process::Command::new(launcher.cli_program);
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command.arg("--data-dir").arg(data_directory);
+    if let Some(path) = training_release_root {
+        command.arg("--training-release-root").arg(path);
+    }
+    command.arg("mcp").arg("serve");
+    let source = command.exec();
+    Err(DesktopStartupError::McpTransportStart { source })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
+    Err(DesktopStartupError::McpTransportUnavailable)
 }
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
@@ -75,13 +159,18 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
     environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
+    let config_path = args
+        .config
+        .as_deref()
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|source| DesktopStartupError::ConfigurationPath { source })?;
     let config = AppConfig::load(
         ConfigSources::new(
-            args.config.as_deref(),
+            config_path.as_deref(),
             &environment,
             ConfigOverrides {
                 data_dir: args.data_dir,
-                paper_bot_enabled: args.paper_mode.then_some(true),
                 training_release_root: args.training_release_root,
                 ..ConfigOverrides::default()
             },
@@ -91,7 +180,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let product_config = config.clone();
     let product =
         tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(product, config);
+    let state = DesktopState::new(product, config, config_path);
     if !app.manage(state) {
         return Err(DesktopStartupError::DuplicateState);
     }
@@ -106,4 +195,88 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         _ => {}
     });
     Ok(exit_code)
+}
+
+#[derive(Debug)]
+pub(crate) struct AppImageMcpLauncher {
+    pub(crate) program: PathBuf,
+    #[cfg(target_os = "linux")]
+    cli_program: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AppImageMcpLauncherError;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn appimage_mcp_launcher(
+    cli_program: &Path,
+) -> Result<Option<AppImageMcpLauncher>, AppImageMcpLauncherError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let (appimage, app_dir) = match (std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR")) {
+        (None, None) => return Ok(None),
+        (Some(appimage), Some(app_dir)) => (appimage, app_dir),
+        _ => return Err(AppImageMcpLauncherError),
+    };
+    let appimage = PathBuf::from(appimage);
+    let app_dir = PathBuf::from(app_dir);
+    if !appimage.is_absolute() || !app_dir.is_absolute() {
+        return Err(AppImageMcpLauncherError);
+    }
+    let named = std::fs::symlink_metadata(&appimage).map_err(|_source| AppImageMcpLauncherError)?;
+    let mode = named.permissions().mode();
+    let process_owner = std::fs::metadata("/proc/self")
+        .map_err(|_source| AppImageMcpLauncherError)?
+        .uid();
+    let owner = named.uid();
+    if named.file_type().is_symlink()
+        || !named.is_file()
+        || named.len() == 0
+        || named.len() > MAXIMUM_APPIMAGE_BYTES
+        || mode & 0o111 == 0
+        || mode & 0o022 != 0
+        || (owner != 0 && owner != process_owner)
+    {
+        return Err(AppImageMcpLauncherError);
+    }
+    let mut header = [0_u8; APPIMAGE_HEADER_BYTES];
+    std::fs::File::open(&appimage)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|_source| AppImageMcpLauncherError)?;
+    if header[8..] != [b'A', b'I', 2] {
+        return Err(AppImageMcpLauncherError);
+    }
+    let program = std::fs::canonicalize(appimage).map_err(|_source| AppImageMcpLauncherError)?;
+    let app_dir = std::fs::canonicalize(app_dir).map_err(|_source| AppImageMcpLauncherError)?;
+    if !std::fs::metadata(&app_dir)
+        .map_err(|_source| AppImageMcpLauncherError)?
+        .is_dir()
+    {
+        return Err(AppImageMcpLauncherError);
+    }
+    let current = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_source| AppImageMcpLauncherError)?;
+    let expected_current =
+        std::fs::canonicalize(app_dir.join("usr/bin").join(DESKTOP_EXECUTABLE_BASENAME))
+            .map_err(|_source| AppImageMcpLauncherError)?;
+    let expected_cli = std::fs::canonicalize(app_dir.join("usr/bin").join(CLI_EXECUTABLE_BASENAME))
+        .map_err(|_source| AppImageMcpLauncherError)?;
+    let cli_program =
+        std::fs::canonicalize(cli_program).map_err(|_source| AppImageMcpLauncherError)?;
+    if current != expected_current || cli_program != expected_cli || current == program {
+        return Err(AppImageMcpLauncherError);
+    }
+    Ok(Some(AppImageMcpLauncher {
+        program,
+        cli_program,
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) const fn appimage_mcp_launcher(
+    _cli_program: &Path,
+) -> Result<Option<AppImageMcpLauncher>, AppImageMcpLauncherError> {
+    Ok(None)
 }

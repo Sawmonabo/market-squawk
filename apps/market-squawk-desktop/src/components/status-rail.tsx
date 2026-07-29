@@ -3,6 +3,7 @@ import { useProduct } from "@/app/product-context"
 export function StatusRail() {
   const product = useProduct()
   const bootstrap = product.status === "ready" ? product.bootstrap : null
+  const paper = bootstrap?.setupSteps.find((step) => step.id === "paper")
 
   return (
     <section
@@ -27,7 +28,8 @@ export function StatusRail() {
       />
       <StatusFact
         label="Mode"
-        value={bootstrap?.paperModeEnabled ? "Paper" : "Safe idle"}
+        value={paper?.complete ? "Paper only" : "Unavailable"}
+        ready={paper?.complete}
       />
       <StatusFact
         label="Telemetry"

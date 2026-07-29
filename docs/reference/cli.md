@@ -80,9 +80,13 @@ portfolio, risk, execution, or persistence authority.
 | `--config <PATH>` | Local TOML file | None | Loads one explicit configuration file |
 | `--data-dir <PATH>` | Local path | `.market-squawk` through configuration | Highest-precedence local data-root override |
 | `--training-release-root <PATH>` | Absolute path | None | Selects the verified local Python training release and sibling model worker |
-| `--paper-mode` | Flag | Off | Enables paper-only bot behavior for this desktop process |
 | `-h`, `--help` | Flag | — | Prints desktop launcher help and exits successfully |
 | `-V`, `--version` | Flag | — | Prints the desktop package version and exits successfully |
+
+The Linux AppImage has one hidden stdio-MCP package transport so a generated client command can
+re-enter the portable image after the desktop closes. It is not a user-facing option, is absent
+from help, rejects non-AppImage contexts and arbitrary commands, and dispatches before Tauri or
+local product state opens.
 
 The desktop uses safe defaults, the explicit file, normal `MARKET_SQUAWK_*` configuration
 variables, and these launcher overrides. It deliberately removes
@@ -90,7 +94,9 @@ variables, and these launcher overrides. It deliberately removes
 `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED` from the configuration environment because those values
 belong to CLI logging or foreground release-evidence workflows, not ambient desktop authority.
 The desktop does not accept the CLI's output, log-rendering, capture-memory, or release-evidence
-options.
+options. The production Paper service is independent of the diagnostic-capture
+`paper_bot_enabled` setting; it starts stopped and remains behind typed Bot, Execution, and central
+risk operations.
 
 The WebView receives five closed commands: bootstrap facts, read-only bounded application
 invocation, confirmed provider onboarding, exact official-provider page opening, and protected
@@ -102,7 +108,7 @@ separator:
 
 ```bash
 CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+  tauri dev -- -- --data-dir "$PWD/.market-squawk"
 ```
 
 The CLI remains the complete interface for automation, servers, release evidence, supported

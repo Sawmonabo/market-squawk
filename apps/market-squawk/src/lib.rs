@@ -57,7 +57,9 @@ pub use live_source::{
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
-pub use local_product::{LocalProduct, LocalProductError};
+pub use local_product::{
+    LocalMcpAvailabilityError, LocalProduct, LocalProductError, verified_installed_cli_program,
+};
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };

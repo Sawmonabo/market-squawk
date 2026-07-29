@@ -27,6 +27,7 @@ export function OverviewPage() {
     )
   }
   const bootstrap = product.bootstrap
+  const paper = bootstrap.setupSteps.find((step) => step.id === "paper")
   const firstIncomplete = bootstrap.setupSteps.findIndex(
     (step) => !step.complete,
   )
@@ -65,10 +66,11 @@ export function OverviewPage() {
           label="Release"
           value={`v${bootstrap.applicationVersion} · ${bootstrap.installation.label}`}
         />
-        <Fact label="Python" value={bootstrap.modelRuntime.label} />
+        <Fact label="Model runtime" value={bootstrap.modelRuntime.label} />
         <Fact
-          label="Default safety"
-          value={bootstrap.paperModeEnabled ? "Paper mode" : "Safe idle"}
+          label="Execution safety"
+          value={paper?.complete ? "Central risk required" : "Unavailable"}
+          ready={paper?.complete}
         />
       </section>
 

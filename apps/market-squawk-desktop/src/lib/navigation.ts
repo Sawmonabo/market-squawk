@@ -120,12 +120,12 @@ export function navigationAdmission(
       case "/backtests":
         return {
           ready: stepReady("research"),
-          reason: "Complete local research and model-runtime setup first.",
+          reason: "Restore the complete Research services first.",
         }
       case "/portfolios":
         return {
           ready: stepReady("portfolio"),
-          reason: "Activate the portfolio-import authority first.",
+          reason: "Restore the complete Portfolio services first.",
         }
       case "/models":
         return {
@@ -136,7 +136,7 @@ export function navigationAdmission(
       case "/risk":
         return {
           ready: stepReady("paper"),
-          reason: "Activate local paper execution and enable paper mode first.",
+          reason: "Restore the complete risk-controlled paper services first.",
         }
       default:
         return { ready: true, reason: null }

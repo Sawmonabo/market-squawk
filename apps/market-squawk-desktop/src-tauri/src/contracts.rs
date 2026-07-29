@@ -1,6 +1,6 @@
 //! Bounded, secret-free presentation contracts for the desktop WebView.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use market_squawk::ProviderPortalActivationRequest;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,6 @@ pub(crate) enum SetupStepState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SetupStepAction {
-    ReviewInstallation,
     ConfigureSources,
     ConfigureResearch,
     ConfigurePortfolio,
@@ -103,6 +102,30 @@ impl Readiness {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct McpClientInstruction {
+    program: String,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    requires_desktop_exit: bool,
+}
+
+impl McpClientInstruction {
+    pub(crate) const fn new(
+        program: String,
+        arguments: Vec<String>,
+        environment: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            program,
+            arguments,
+            environment,
+            requires_desktop_exit: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OperationSummary {
@@ -149,7 +172,7 @@ pub(crate) struct DesktopBootstrap {
     installation: Readiness,
     model_runtime: Readiness,
     mcp: Readiness,
-    paper_mode_enabled: bool,
+    mcp_client: Option<McpClientInstruction>,
     telemetry_enabled: bool,
     encrypted_file_fallback: Value,
     provider_profiles: Value,
@@ -171,7 +194,7 @@ impl DesktopBootstrap {
         installation: Readiness,
         model_runtime: Readiness,
         mcp: Readiness,
-        paper_mode_enabled: bool,
+        mcp_client: Option<McpClientInstruction>,
         encrypted_file_fallback: Value,
         provider_profiles: Value,
         provider_sessions: Value,
@@ -188,7 +211,7 @@ impl DesktopBootstrap {
             installation,
             model_runtime,
             mcp,
-            paper_mode_enabled,
+            mcp_client,
             telemetry_enabled: false,
             encrypted_file_fallback,
             provider_profiles,

@@ -150,6 +150,16 @@ are selected through immutable adapter metadata and validated configuration. Loc
 and explicit provider operations account for the product's operational output and network
 activity.
 
+The desktop exposes local MCP only after validating the installed CLI and bounded tool contract.
+Installed formats generate client JSON with the absolute CLI path. A portable Linux AppImage uses
+its durable outer image path and a hidden typed dispatch that `exec`-replaces the payload with the
+fixed CLI before Tauri or local state opens; it never persists the temporary AppImage mount path.
+Both forms include the canonical workspace, optional explicit configuration and training-release
+paths. Generation starts no server, establishes no client identity, and does not infer Paper
+runtime authority from the legacy diagnostic-capture setting. The operator must close the desktop
+before the client starts MCP against that workspace. Other policy supplied only through environment
+variables is not serialized and must be supplied to the client separately.
+
 The ONNX worker is not a generic executable hook. When a signed training release is selected,
 startup verifies that the installed `market-squawk` application identity and bounded regular
 sibling worker are the canonical installed paths and match the signed release-manifest digests.
@@ -182,10 +192,16 @@ The supported package-build matrix is:
 | Windows Server 2025 x86-64 | NSIS and MSI installers |
 
 Each package includes the desktop executable, exact sibling CLI, capture helper, ONNX worker,
-project licenses, Geist OFL notice, and required Tauri/GTK and tract notices. The current workflow
-uses no developer-identity signature; a macOS linker-created ad-hoc Mach-O signature is not
+project licenses, exact Geist and Geist Mono OFL notices, and required Tauri/GTK and tract notices.
+The current workflow uses no developer-identity signature; a macOS linker-created ad-hoc Mach-O
+signature is not
 distribution signing. Developer signing, notarization, installation, launch, and exact-head
 acceptance remain separate release evidence and are not inferred from bundle creation.
+
+Linux AppImage construction uses Tauri's target-local tools directory. Before the bundler runs,
+Market Squawk verifies or reacquires all five external AppImage tools against reviewed immutable
+asset/commit identities, exact byte lengths, and SHA-256 digests. A cache restore is never trusted
+without revalidation, and a missing architecture lock or changed upstream byte stops packaging.
 
 ## On-disk layout
 
@@ -194,7 +210,9 @@ Tauri's operating-system application-local data directory as its safe-default va
 double-click launch never depends on a launcher-selected working directory. The optional local
 file, `MARKET_SQUAWK_DATA_DIR`, and `--data-dir` layers retain their documented precedence and
 origin. `LocalPaths::prepare` canonicalizes and opens the effective root, creates its controlled
-subdirectories, and retains directory capabilities.
+subdirectories, and retains directory capabilities. The production Paper controller is a separate
+application authority: it starts stopped, exposes only paper Bot and Execution operations, and
+remains subject to central risk.
 
 ```text
 <data-root>/
@@ -267,10 +285,16 @@ startup failure or quarantines only the affected provider where that isolation i
 
 ### Desktop startup
 
+Before this sequence, the hidden Linux AppImage `--stdio-mcp` transport either rejects a
+non-AppImage context or validates the canonical image/mount/current-program relationship and
+`exec`-replaces the unopened desktop payload with its exact CLI sibling. It accepts no arbitrary
+command or trailing arguments, does not initialize Tauri or `LocalProduct`, and is absent from
+ordinary help. It is a package transport, not a user configuration option or WebView command.
+
 The desktop follows the same composition order with a presentation boundary around it:
 
-1. parse the four desktop options and construct the Tauri application runtime without publishing
-   its window;
+1. parse the three user-facing desktop options and construct the Tauri application runtime without
+   publishing its window;
 2. resolve the operating-system application-local data directory and load normal validated
    configuration precedence with that value only as the desktop safe default;
 3. remove CLI logging and release-evidence environment controls from ambient desktop

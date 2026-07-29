@@ -1071,3 +1071,42 @@ and platform configuration module. The expected path set remained complete and a
 source records matched. Remediation updates only those two `sources` size/SHA-256 records, as
 required by the existing source-closure invariant; dependency artifacts, interpreter coverage, and
 platform policy remain unchanged. The previously failing focused admission contract now passes.
+
+The resulting desktop candidate also closes the remaining semantic and package findings without
+expanding the five-command WebView boundary or the one-file/three-test frontend limit:
+
+- Markets readiness requires an active exact Coinbase public, Coinbase Exchange direct, or Kraken
+  live-market surface.
+- Research and Portfolio readiness require their complete application operation contracts; import
+  history is optional information rather than authority.
+- Paper readiness requires the exact eight-operation production `Bot`/`Execution`/`Risk` contract,
+  starts stopped, remains paper-only, and is independent of the diagnostic-capture
+  `paper_bot_enabled` setting.
+- MCP readiness requires the installed CLI sibling and complete bounded tool contract. Installed
+  packages emit durable client instructions, and Linux AppImage uses a hidden typed pre-Tauri
+  `exec` dispatch through the durable outer image.
+- Linux package preparation verifies five immutable AppImage-tool identities by owner, type,
+  length, and SHA-256 before Tauri can execute them. Both locked font families carry their exact
+  license notices.
+
+The final focused Apple Silicon package evidence is:
+
+| Evidence | Result |
+| --- | --- |
+| Application bundle | 195 MiB allocated; identifier `com.marketsquawk.desktop`; version `0.2.0` |
+| Desktop executable | 91,988,880 bytes; SHA-256 `ce228e88c5c39fc30f1cd1256295416923fee8b5dcd60e6377ac6d0bf39cd254` |
+| CLI sibling | 96,717,264 bytes; SHA-256 `8761d9b9a2cd89c98a228d77ddeee476dd6d9c39bba7dcb42f37371d58e66318` |
+| Capture helper | 561,536 bytes; SHA-256 `831022cbd45bf593e2d73b09d239c52eeb227c6d2b4bdf10cd0fdb95e0bb2072` |
+| ONNX worker | 15,298,816 bytes; SHA-256 `3276f191c4d6e375a086a1202f5d6f884ef95b3e65b5eecddbb3752876e88c05` |
+| DMG | 78,943,301 bytes; SHA-256 `54fc42be4a4389ac6ab163e71718899c4c2ca526876cfbd7caf881d4ddd0a86f`; `hdiutil verify` passed |
+| Mounted image | All four executables and both exact Geist notices matched the inspected application byte-for-byte |
+| Fresh launch | Created the controlled catalog, artifacts, journal, provider-rate, source, and portfolio layout before bounded termination; stdout/stderr remained empty |
+| Signing | Built with `--no-sign`; the linker ad-hoc signature is not signing or notarization evidence |
+| Generated storage | 17 GiB, below the lane's 20 GiB ceiling; 132 GiB free |
+
+The independent Quarter 4 reviewer found no remaining substantiated Critical, Important, or Minor
+semantic finding on the current tree. That is not exact-head approval until the tree is committed,
+pushed, clean, unchanged, and re-identified by the reviewer. The next barrier is that exact-head
+closure plus the hosted native-package and release results. Complete guided native bootstrap,
+uv/managed-Python installation, and signed installation evidence remain mandatory release blockers.
+Issue `#36`, draft PR `#37`, and the Project 5 item therefore remain open and In Progress.

@@ -58,7 +58,7 @@ export function SetupOverview({
       icon: FileChartColumn,
     },
     {
-      title: "Research and modeling",
+      title: "Research workspace",
       step: stepFor("research"),
       icon: Settings2,
     },

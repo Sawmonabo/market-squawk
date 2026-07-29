@@ -1,6 +1,8 @@
 //! Least-privilege Tauri bridge over the existing local application authorities.
 
 use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,9 +25,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::contracts::{
-    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, OperationSummary,
-    ProviderOnboardingCommand, Readiness, ReadinessState, SetupStep, SetupStepAction,
-    SetupStepState,
+    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, McpClientInstruction,
+    OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState, SetupStep,
+    SetupStepAction, SetupStepState,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -36,6 +38,36 @@ const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
+const LIVE_MARKET_SETUP_SURFACES: [&str; 3] = [
+    "coinbase.public-market-data",
+    "coinbase.exchange-direct-market-data",
+    "kraken.spot-public-market-data",
+];
+const RESEARCH_SETUP_OPERATIONS: [&str; 5] = [
+    "Research.ListDatasets",
+    "Research.GetManifest",
+    "Research.GetHistory",
+    "Research.GetAlternativeData",
+    "Research.IngestSource",
+];
+const PORTFOLIO_SETUP_OPERATIONS: [&str; 6] = [
+    "Portfolio.Import",
+    "Portfolio.GetHoldings",
+    "Portfolio.GetTransactions",
+    "Portfolio.GetPerformance",
+    "Portfolio.GetExposure",
+    "Portfolio.GetRisk",
+];
+const PAPER_SETUP_OPERATIONS: [&str; 8] = [
+    "Bot.GetStatus",
+    "Bot.Start",
+    "Bot.Stop",
+    "Execution.GetOrders",
+    "Execution.GetFills",
+    "Execution.Cancel",
+    "Execution.Reconcile",
+    "Risk.TriggerKillSwitch",
+];
 
 #[derive(Clone, Copy, Debug)]
 enum InvocationAuthority {
@@ -46,16 +78,22 @@ enum InvocationAuthority {
 pub(crate) struct DesktopState {
     product: LocalProduct,
     config: AppConfig,
+    config_path: Option<PathBuf>,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     cancellation: CancellationToken,
 }
 
 impl DesktopState {
-    pub(crate) fn new(product: LocalProduct, config: AppConfig) -> Self {
+    pub(crate) fn new(
+        product: LocalProduct,
+        config: AppConfig,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         let portal_activation = product.provider_portal_activation();
         Self {
             product,
             config,
+            config_path,
             portal_activation,
             cancellation: CancellationToken::new(),
         }
@@ -75,10 +113,17 @@ impl DesktopState {
                 .encrypted_file_fallback_status()
                 .map_err(map_onboarding_error)?,
         )?;
-        let operations = self
-            .product
-            .application()
-            .capabilities()
+        let capabilities = self.product.application().capabilities();
+        let research_service_available = RESEARCH_SETUP_OPERATIONS
+            .iter()
+            .all(|operation| capabilities.find(operation).is_some());
+        let portfolio_service_available = PORTFOLIO_SETUP_OPERATIONS
+            .iter()
+            .all(|operation| capabilities.find(operation).is_some());
+        let paper_service_available = PAPER_SETUP_OPERATIONS
+            .iter()
+            .all(|operation| capabilities.find(operation).is_some());
+        let operations = capabilities
             .tools()
             .iter()
             .map(|tool| {
@@ -108,15 +153,28 @@ impl DesktopState {
                 "No verified local training release is configured for this workspace.",
             )
         };
-        let paper_mode_enabled = self.config.paper_bot_enabled();
-        let installation_verified = false;
-        let model_runtime_ready = self.product.model_runtime().is_some();
+        let mcp_client = self.mcp_client_instruction();
+        let mcp_available = mcp_client.is_some();
         let setup_steps = setup_steps(
             &session_views,
-            installation_verified,
-            model_runtime_ready,
-            paper_mode_enabled,
+            research_service_available,
+            portfolio_service_available,
+            paper_service_available,
+            mcp_available,
         );
+        let mcp = if mcp_available {
+            Readiness::new(
+                ReadinessState::Available,
+                "Available",
+                "The packaged CLI path and bounded local stdio MCP tool contract were verified. The service is not running.",
+            )
+        } else {
+            Readiness::new(
+                ReadinessState::Unverified,
+                "Unavailable",
+                "A complete local MCP client instruction could not be generated from verified installed state.",
+            )
+        };
         Ok(DesktopBootstrap::new(
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
@@ -136,17 +194,46 @@ impl DesktopState {
                 "No signed installation receipt was admitted for this running build.",
             ),
             model_runtime,
-            Readiness::new(
-                ReadinessState::Available,
-                "Available",
-                "The bounded local stdio MCP service is available when explicitly started.",
-            ),
-            paper_mode_enabled,
+            mcp,
+            mcp_client,
             fallback,
             profiles,
             sessions,
             setup_steps,
             operations,
+        ))
+    }
+
+    fn mcp_client_instruction(&self) -> Option<McpClientInstruction> {
+        let cli_program = self.product.verified_local_mcp_program().ok()?;
+        let appimage_launcher = crate::appimage_mcp_launcher(&cli_program).ok()?;
+        let (program, appimage_dispatch) = match appimage_launcher {
+            Some(launcher) => (launcher.program, true),
+            None => (cli_program, false),
+        };
+        let mut arguments = Vec::with_capacity(9);
+        if appimage_dispatch {
+            arguments.push("--stdio-mcp".to_owned());
+        }
+        if let Some(config_path) = self.config_path.as_deref() {
+            arguments.push("--config".to_owned());
+            arguments.push(path_text(config_path)?);
+        }
+        arguments.push("--data-dir".to_owned());
+        arguments.push(path_text(self.product.paths().root())?);
+        if let Some(training_release_root) = self.config.training_release_root() {
+            arguments.push("--training-release-root".to_owned());
+            arguments.push(path_text(training_release_root)?);
+        }
+        if !appimage_dispatch {
+            arguments.push("mcp".to_owned());
+            arguments.push("serve".to_owned());
+        }
+
+        Some(McpClientInstruction::new(
+            path_text(&program)?,
+            arguments,
+            BTreeMap::new(),
         ))
     }
 
@@ -165,40 +252,39 @@ impl DesktopState {
     }
 }
 
+fn path_text(path: &Path) -> Option<String> {
+    path.to_str().map(str::to_owned)
+}
+
 fn setup_steps(
     sessions: &[OnboardingSessionView],
-    installation_verified: bool,
-    model_runtime_ready: bool,
-    paper_mode_enabled: bool,
+    research_service_available: bool,
+    portfolio_service_available: bool,
+    paper_service_available: bool,
+    mcp_available: bool,
 ) -> Vec<SetupStep> {
     let sources_ready = sessions.iter().any(|session| {
-        !session.surface_id().starts_with("local.")
+        LIVE_MARKET_SETUP_SURFACES.contains(&session.surface_id())
             && session.next_action() == OnboardingNextAction::Active
     });
-    let files_ready = has_active_session(sessions, "local.files");
-    let portfolio_ready = has_active_session(sessions, "local.portfolio-imports");
-    let paper_profile_ready = has_active_session(sessions, "local.paper-execution");
-    let research_ready = files_ready && model_runtime_ready;
-    let paper_ready = paper_profile_ready && paper_mode_enabled;
+    let files_imported = has_active_session(sessions, "local.files");
+    let portfolio_imported = has_active_session(sessions, "local.portfolio-imports");
+    let research_ready = research_service_available;
+    let portfolio_ready = portfolio_service_available;
+    let paper_ready = paper_service_available;
     let review_ready =
-        installation_verified && sources_ready && research_ready && portfolio_ready && paper_ready;
+        sources_ready && research_ready && portfolio_ready && paper_ready && mcp_available;
 
     vec![
         SetupStep::new(
             "system",
             "System",
-            if installation_verified {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::Blocked
-            },
-            installation_verified,
-            "Verify the exact installed Market Squawk release before relying on its identity.",
-            (!installation_verified).then_some("This running build has no admitted installation receipt."),
-            (!installation_verified).then_some(
-                "Install an approved signed package, then reopen Market Squawk from that installation.",
-            ),
-            Some(SetupStepAction::ReviewInstallation),
+            SetupStepState::Complete,
+            true,
+            "Validated configuration, controlled paths, catalogs, and application services initialized successfully.",
+            None,
+            None,
+            None,
         ),
         SetupStep::new(
             "storage",
@@ -219,10 +305,11 @@ fn setup_steps(
                 SetupStepState::ActionRequired
             },
             sources_ready,
-            "Activate at least one supported external market or research source.",
-            (!sources_ready).then_some("No external provider session currently holds active authority."),
+            "Activate at least one supported live market-data source.",
+            (!sources_ready)
+                .then_some("No supported live market provider session currently holds active authority."),
             (!sources_ready).then_some(
-                "Connect a supported zero-fee source and complete its provider-specific verification.",
+                "Connect Coinbase public, Coinbase Exchange direct, or Kraken and complete its provider-specific verification.",
             ),
             Some(SetupStepAction::ConfigureSources),
         ),
@@ -235,11 +322,16 @@ fn setup_steps(
                 SetupStepState::ActionRequired
             },
             research_ready,
-            "Research readiness requires the local-file authority and an admitted local model runtime.",
-            (!research_ready)
-                .then_some("The local-file authority or verified training release is not ready."),
+            if research_service_available && files_imported {
+                "The complete Research contract is initialized and a local-file import authority is active; model-runtime admission remains separate."
+            } else if research_service_available {
+                "The complete Research contract is initialized; importing private local data is optional and no import has been recorded."
+            } else {
+                "The installed application is missing one or more required Research operations."
+            },
+            (!research_ready).then_some("The complete Research application contract is unavailable."),
             (!research_ready).then_some(
-                "Activate Local files and configure an approved absolute training-release root.",
+                "Repair or reinstall the complete native package, then refresh status.",
             ),
             Some(SetupStepAction::ConfigureResearch),
         ),
@@ -252,10 +344,17 @@ fn setup_steps(
                 SetupStepState::ActionRequired
             },
             portfolio_ready,
-            "Portfolio imports become available only after their local authority is active.",
-            (!portfolio_ready).then_some("The portfolio-import authority is not active."),
+            if portfolio_service_available && portfolio_imported {
+                "The complete Portfolio contract is initialized and a private import authority is active."
+            } else if portfolio_service_available {
+                "The complete Portfolio contract is initialized; importing private holdings or transactions is optional."
+            } else {
+                "The installed application is missing one or more required Portfolio operations."
+            },
             (!portfolio_ready)
-                .then_some("Activate Portfolio holdings and transactions imports."),
+                .then_some("The complete Portfolio application contract is unavailable."),
+            (!portfolio_ready)
+                .then_some("Repair or reinstall the complete native package, then refresh status."),
             Some(SetupStepAction::ConfigurePortfolio),
         ),
         SetupStep::new(
@@ -267,22 +366,36 @@ fn setup_steps(
                 SetupStepState::ActionRequired
             },
             paper_ready,
-            "Paper execution requires its local provider authority and explicit paper-mode configuration.",
+            if paper_service_available {
+                "The complete local paper-only Bot and Execution contract is initialized under central risk authority."
+            } else {
+                "The installed application is missing one or more required paper bot or execution operations."
+            },
+            (!paper_ready).then_some("The complete paper application contract is unavailable."),
             (!paper_ready)
-                .then_some("Paper authority is inactive or paper mode is not enabled."),
-            (!paper_ready).then_some(
-                "Activate Local paper execution and restart with paper mode enabled in validated configuration.",
-            ),
+                .then_some("Repair or reinstall the complete native package, then refresh status."),
             Some(SetupStepAction::ConfigurePaper),
         ),
         SetupStep::new(
             "mcp",
             "MCP",
-            SetupStepState::Available,
-            true,
-            "The bounded local stdio MCP server is installed and starts only on explicit request.",
-            None,
-            None,
+            if mcp_available {
+                SetupStepState::Available
+            } else {
+                SetupStepState::Blocked
+            },
+            mcp_available,
+            if mcp_available {
+                "The verified packaged CLI and required workspace identity paths are available as a client configuration; the MCP service is not running."
+            } else {
+                "The local stdio MCP service requires a verified packaged CLI, representable workspace paths, and a valid tool contract."
+            },
+            (!mcp_available).then_some(
+                "The installed CLI, effective paths, or bounded MCP tool contract is unavailable.",
+            ),
+            (!mcp_available).then_some(
+                "Repair or reinstall the complete native package, then refresh setup status.",
+            ),
             Some(SetupStepAction::ReviewMcp),
         ),
         SetupStep::new(

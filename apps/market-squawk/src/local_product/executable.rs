@@ -51,6 +51,40 @@ pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), Executa
     Ok((application, worker))
 }
 
+/// Returns the exact installed CLI path after stable-file and permission verification.
+pub(super) fn installed_application_program() -> Result<PathBuf, ExecutableIdentityError> {
+    let (application, _worker) = installed_release_programs()?;
+    validate_installed_application_permissions(&application)?;
+    let _digest = hash_stable_regular_file(&application, MAXIMUM_APPLICATION_BYTES)?;
+    Ok(application)
+}
+
+#[cfg(unix)]
+fn validate_installed_application_permissions(
+    application: &Path,
+) -> Result<(), ExecutableIdentityError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let current = std::env::current_exe()
+        .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
+    let current =
+        fs::metadata(current).map_err(|source| ExecutableIdentityError::Metadata { source })?;
+    let installed = fs::symlink_metadata(application)
+        .map_err(|source| ExecutableIdentityError::Metadata { source })?;
+    let mode = installed.permissions().mode();
+    if current.uid() != installed.uid() || mode & 0o111 == 0 || mode & 0o022 != 0 {
+        return Err(ExecutableIdentityError::UnsafePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_installed_application_permissions(
+    _application: &Path,
+) -> Result<(), ExecutableIdentityError> {
+    Ok(())
+}
+
 /// Admits the exact sibling ONNX worker against its signed release-manifest digest.
 pub(super) fn admit_installed_onnx_worker(
     expected_digest: [u8; 32],
@@ -149,6 +183,9 @@ pub enum ExecutableIdentityError {
     /// A named executable or helper was a symlink or non-regular file.
     #[error("executable identity names an unsafe file type")]
     UnsafeFileType,
+    /// The installed application was not executable, owner-matched, and protected from writes.
+    #[error("installed application permissions are unsafe")]
+    UnsafePermissions,
     /// Executable metadata could not be read.
     #[error("executable metadata is unavailable")]
     Metadata {

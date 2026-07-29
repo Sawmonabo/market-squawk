@@ -54,6 +54,7 @@ jobs:
               case "$path" in
                 LICENSE-APACHE|LICENSE-MIT|\
                 docs/licenses/geist-ofl-license.txt|\
+                docs/licenses/geist-mono-ofl-license.txt|\
                 docs/licenses/tauri-mpl-notice.md|\
                 docs/licenses/tract-onnx-notice.md)
                   code=true
@@ -72,11 +73,12 @@ jobs:
                 apps/market-squawk/src/local_product/*|\
                 LICENSE-APACHE|LICENSE-MIT|\
                 docs/licenses/geist-ofl-license.txt|\
+                docs/licenses/geist-mono-ofl-license.txt|\
                 docs/licenses/tauri-mpl-notice.md|\
                 docs/licenses/tract-onnx-notice.md|\
                 vendor/glib-0.18.5/*|\
                 Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
-                scripts/verify.sh|.github/workflows/ci.yml)
+                scripts/smoke_mcp.py|scripts/verify.sh|.github/workflows/ci.yml)
                   desktop=true
                   ;;
               esac
@@ -334,6 +336,39 @@ jobs:
             --ci
             --no-sign
             --bundles ${{ matrix.bundles }}
+      - name: Verify Linux AppImage MCP dispatch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' appimages \
+            < <(find target/release/bundle/appimage -maxdepth 1 \
+              -type f -name '*.AppImage' -print0)
+          [[ "${#appimages[@]}" -eq 1 ]]
+          appimage="${appimages[0]}"
+          chmod u+x "$appimage"
+
+          help="$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help)"
+          if grep -F -- '--stdio-mcp' <<<"$help"; then
+            echo "hidden AppImage MCP transport appeared in ordinary help" >&2
+            exit 1
+          fi
+
+          stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
+          stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
+          if target/release/market-squawk-desktop \
+            --stdio-mcp \
+            --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
+            >"$stdout" 2>"$stderr"; then
+            echo "hidden MCP transport ran outside a verified AppImage" >&2
+            exit 1
+          fi
+          [[ ! -s "$stdout" ]]
+          grep -F 'installed MCP transport is unavailable' "$stderr"
+
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            python3 scripts/smoke_mcp.py --desktop-appimage "$appimage"
       # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

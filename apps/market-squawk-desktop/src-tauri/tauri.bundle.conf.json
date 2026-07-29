@@ -5,6 +5,7 @@
   },
   "bundle": {
     "active": true,
+    "useLocalToolsDir": true,
     "externalBin": [
       "binaries/market-squawk",
       "binaries/market-squawk-capture-helper",

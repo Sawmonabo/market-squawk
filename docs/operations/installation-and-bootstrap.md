@@ -248,9 +248,17 @@ The hosted package workflow uses the same locked source and produces:
 
 Generated packages are under `target/release/bundle/`. They include the desktop executable,
 `market-squawk`, `market-squawk-capture-helper`, `market-squawk-onnx-worker`, the Market Squawk
-Apache-2.0/MIT licenses, the Geist OFL notice, and the required Tauri/GTK and tract notices. Current
-package jobs use `--no-sign`; successful compilation and bundling do not establish a
+Apache-2.0/MIT licenses, the exact Geist and Geist Mono OFL notices, and the required Tauri/GTK and
+tract notices. Current package jobs use `--no-sign`; successful compilation and bundling do not
+establish a
 developer-identity signature, notarization, installation, launch, or release acceptance.
+
+On Linux x86-64, package preparation verifies the five reviewed Tauri AppImage tools in
+`target/.tauri/` by exact byte length and SHA-256 before Tauri can execute them. Missing or changed
+inputs are reacquired only through their pinned GitHub asset or commit identities and are verified
+before atomic installation. An unsupported architecture, download failure, or identity mismatch
+stops the package build. The exact identities and current upstream rationale are maintained in
+[Tauri packaging and installed-runtime boundaries](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md#linux-bundler-tool-integrity).
 
 ## Launch the desktop application
 
@@ -258,7 +266,7 @@ For development from the source checkout:
 
 ```bash
 CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk" --paper-mode
+  tauri dev -- -- --data-dir "$PWD/.market-squawk"
 ```
 
 The first separator passes runner arguments through pnpm and Tauri; the second passes the remaining
@@ -268,8 +276,11 @@ arguments to `market-squawk-desktop`. The desktop launcher accepts:
 --config <PATH>
 --data-dir <PATH>
 --training-release-root <PATH>
---paper-mode
 ```
+
+Linux AppImages also contain a hidden package transport used only by the generated MCP client JSON.
+It is absent from normal help, rejects execution outside a validated AppImage mount, opens no
+desktop state, and accepts no arbitrary command. Operators should not invoke it manually.
 
 Without an explicit data-directory layer, an installed desktop uses the operating system's
 application-local data directory. Development commands above remain explicit so their disposable
@@ -280,8 +291,7 @@ On macOS, launch a locally built application bundle with explicit application ar
 
 ```bash
 open "target/release/bundle/macos/Market Squawk.app" --args \
-  --data-dir "$PWD/.market-squawk" \
-  --paper-mode
+  --data-dir "$PWD/.market-squawk"
 ```
 
 The desktop loads only bundled interface assets and opens the same `LocalProduct` and `Application`
@@ -289,6 +299,22 @@ composition used by the CLI and MCP. Setup state is read from the owning Rust se
 public, Coinbase Exchange direct, and Kraken setup can run directly in the desktop; supported
 research providers use the existing protected loopback portal in the system browser. Closing the
 window begins the existing bounded application shutdown.
+
+The setup System step is complete only after validated configuration, controlled paths, catalogs,
+and the application services have initialized. Developer signing remains a separate visible
+installation fact. Research and Portfolio readiness require their complete application operation
+contracts; optional private-data import history is reported separately and never blocks first-run
+setup. An admitted model runtime remains a separate verified state. Local MCP is available only
+when the installed CLI sibling, effective paths, and bounded MCP tool contract verify. Its setup
+step renders client JSON with a durable installed launcher and required workspace identity paths.
+It neither starts the service nor configures a client. Advanced policy supplied only through
+environment variables must also be supplied to that client. Close the desktop before the client
+starts MCP so only one process owns the effective workspace.
+
+Paper setup is derived from the complete production Bot and Execution operation contract, not the
+informational local profile or the diagnostic-capture `paper_bot_enabled` setting. The controller
+starts stopped, remains paper-only, and routes every action through central risk. The desktop never
+labels the informational local profiles as activation authorities.
 
 ## Install the bundle
 
