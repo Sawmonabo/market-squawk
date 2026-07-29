@@ -157,11 +157,17 @@ def host_profile() -> PlatformProfile:
     matches = [
         profile
         for profile in PLATFORM_PROFILES.values()
-        if profile.system == system and machine in profile.machines
+        if profile.system == system and _machine_matches(profile, machine)
     ]
     if len(matches) != 1:
         raise ReleaseBuildError("host is not one exact supported release target")
     return matches[0]
+
+
+def _machine_matches(profile: PlatformProfile, machine: object) -> bool:
+    return isinstance(machine, str) and machine.casefold() in {
+        supported.casefold() for supported in profile.machines
+    }
 
 
 @dataclass(frozen=True)
@@ -1762,14 +1768,19 @@ def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRu
         if (
             evidence.get("implementation") != "cpython"
             or evidence.get("system") != profile.system
-            or evidence.get("machine") not in profile.machines
+            or not _machine_matches(profile, evidence.get("machine"))
             or len(version) != 3
             or version != REQUIRED_PYTHON
             or not lock.minimum <= minor < lock.maximum_exclusive
             or minor not in SUPPORTED_PYTHONS
             or minor in admitted
         ):
-            raise ReleaseBuildError("Python interpreter is outside the exact support matrix")
+            raise ReleaseBuildError(
+                "Python interpreter is outside the exact support matrix "
+                f"(implementation={evidence.get('implementation')!r}, "
+                f"system={evidence.get('system')!r}, "
+                f"machine={evidence.get('machine')!r}, version={version!r})"
+            )
         canonical_paths.add(executable)
         admitted[minor] = PythonRuntime(executable, version)
     if tuple(sorted(admitted)) != SUPPORTED_PYTHONS:
@@ -2824,7 +2835,7 @@ def _admit_created_runtime(
     if (
         evidence.get("implementation") != "cpython"
         or evidence.get("system") != profile.system
-        or evidence.get("machine") not in profile.machines
+        or not _machine_matches(profile, evidence.get("machine"))
         or version != expected
     ):
         raise ReleaseBuildError("created venv does not use its exact admitted interpreter")
