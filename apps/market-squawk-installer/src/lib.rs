@@ -33,8 +33,8 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use super::{
-        InstallRequest, RollbackRequest, SupportedTarget, UninstallRequest, UpdateRequest, install,
-        rollback, status, uninstall, update,
+        InstallRequest, RepairRequest, RollbackRequest, SupportedTarget, UninstallRequest,
+        UpdateRequest, install, repair, rollback, status, uninstall, update,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -87,6 +87,30 @@ mod tests {
             &first.manifest,
             &first.bundle,
         )?)?;
+
+        let installed_version = fs::read_dir(root.join("versions"))?
+            .next()
+            .transpose()?
+            .ok_or_else(|| std::io::Error::other("installed version is unavailable"))?
+            .path();
+        let damaged =
+            installed_version.join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&damaged)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&damaged, permissions)?;
+        }
+        fs::write(&damaged, b"damaged")?;
+        let repaired = repair(RepairRequest::new(root.clone()))?;
+        assert!(repaired.repaired());
+        assert!(status(&root)?.is_healthy());
 
         let second = BundleFixture::create(temporary.path(), "0.2.0", BundleDefect::None)?;
         update(UpdateRequest::from_local(
@@ -217,7 +241,6 @@ mod tests {
     fn sha256_bytes(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
-
     fn sha256_file(path: &Path) -> TestResult<String> {
         let mut file = File::open(path)?;
         let mut digest = Sha256::new();

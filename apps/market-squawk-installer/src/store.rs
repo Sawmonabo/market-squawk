@@ -14,7 +14,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::archive::{ArchiveError, ComponentReceipt, sync_directory};
+use crate::archive::{ArchiveError, ComponentReceipt, seal_tree_root, sync_directory};
 use crate::manifest::{MAXIMUM_ARCHIVE_ENTRIES, is_lower_sha256};
 use crate::platform::SupportedTarget;
 
@@ -304,13 +304,21 @@ impl InstallStore {
             .root
             .join(STAGING_DIRECTORY)
             .join(format!("corrupt-{}", Uuid::new_v4().as_simple()));
-        fs::rename(&final_path, &quarantine)
-            .map_err(|source| StoreError::io("quarantine corrupt version", source))?;
+        set_private_directory_permissions(&final_path)?;
+        if let Err(source) = fs::rename(&final_path, &quarantine) {
+            return match seal_tree_root(&final_path) {
+                Ok(()) => Err(StoreError::io("quarantine corrupt version", source)),
+                Err(_) => Err(StoreError::RepairIndeterminate),
+            };
+        }
         if let Err(source) = fs::rename(stage, &final_path) {
             let restore = fs::rename(&quarantine, &final_path);
             return match restore {
-                Ok(()) => Err(StoreError::io("replace corrupt version", source)),
+                Ok(()) if seal_tree_root(&final_path).is_ok() => {
+                    Err(StoreError::io("replace corrupt version", source))
+                }
                 Err(_) => Err(StoreError::RepairIndeterminate),
+                Ok(()) => Err(StoreError::RepairIndeterminate),
             };
         }
         sync_directory(&self.root.join(VERSIONS_DIRECTORY))?;
