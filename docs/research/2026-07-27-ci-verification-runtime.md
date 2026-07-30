@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-30 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
+| Latest completed correctness candidate | `3f70d48e1e290d019279dcfa91b9a24d7cc90e0c` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -235,6 +235,40 @@ form of `build.jobs`
 The interrupted multi-attempt cache is not acceptance evidence. The exact-head release run must
 start from a clean generated fuzz target, remain below 10 GiB, complete all six required targets,
 and produce the closed evidence document before the release can claim fuzz acceptance.
+
+### 2026-07-30 Intel macOS DMG storage failure
+
+The same exact candidate completed its sealed Python product, complete native inputs, frontend
+checks, 47-minute optimized Tauri build, and `.app` bundle in the
+[Intel package job](https://github.com/Sawmonabo/market-squawk/actions/runs/30568376283/job/90958711442).
+Only the final `bundle_dmg.sh` invocation failed. The nonfatal linker alignment warning appeared
+before the successful executable and `.app` outputs and is not the failure boundary.
+
+The pinned Tauri bundler creates a writable temporary HFS+ image, mounts and populates it, detaches
+it, and then creates the compressed DMG. The standard Intel macOS hosted runner provides only
+14 GB of SSD storage. At that point the same runner still retained the sealed Python build, native
+release dependencies, Tauri release intermediates, staged complete product, and `.app`.
+
+The pinned Tauri action also sets `TAURI_BUNDLER_DMG_IGNORE_CI=true` by default. That suppresses
+Tauri's normal `CI=true` path, which adds the bundled script's `--skip-jenkins` option to avoid
+Finder/AppleScript presentation automation on a noninteractive runner. The retained log exposes
+neither the script's inner disk-image error nor a Finder error, and cleanup terminated an orphaned
+`diskimages-help` process. Constrained storage and noninteractive UI automation are therefore both
+supported contributors; the existing evidence cannot identify one as the sole immediate cause.
+
+The correction preserves the successfully built desktop executable outside Cargo's generated
+target, removes only that target's release intermediates, restores the executable, and invokes the
+pinned Tauri CLI's supported `bundle` command for `app,dmg`. This keeps Tauri's maintained
+packaging, signing, and notarization behavior instead of replacing it with project-owned DMG code.
+The Intel step records disk availability before and after cleanup, explicitly restores Tauri's
+CI-safe DMG mode, and enables verbose bundler output so a fresh run can prove or falsify both
+diagnoses. Apple Silicon, Linux, and Windows package flows are unchanged. The stable-release
+workflow applies the same storage boundary and performs signing only during the final retained
+bundle operation.
+
+Acceptance requires a fresh unchanged Intel job to show reclaimed disk, a successful Tauri
+`app,dmg` bundle, `hdiutil verify`, mounted-app smoke verification, and collection of the closed
+platform artifact set.
 
 ## Root causes
 
@@ -945,6 +979,10 @@ The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 - [actions/cache](https://github.com/actions/cache)
 - [Mozilla sccache](https://github.com/mozilla/sccache)
 - [cargo-nextest](https://github.com/nextest-rs/nextest)
+- [Pinned Tauri CLI bundle command](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-cli/src/bundle.rs)
+- [Pinned Tauri macOS DMG bundler](https://github.com/tauri-apps/tauri/tree/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/macos/dmg)
+- [Pinned Tauri action macOS environment](https://github.com/tauri-apps/tauri-action/blob/1deb371b0cd8bd54025b384f1cd735e725c4060f/src/build.ts)
+- [Tauri DMG behavior in CI](https://github.com/tauri-apps/tauri/issues/3055)
 
 ### Delivery-performance benchmarks
 

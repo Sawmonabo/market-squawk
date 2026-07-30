@@ -323,6 +323,7 @@ jobs:
             executable_suffix: ""
             uv_relative: uv-x86_64-unknown-linux-gnu/uv
             bundles: deb,appimage
+            reclaim_before_dmg: false
             timeout: 180
           - name: macOS Apple Silicon
             os: macos-15
@@ -330,13 +331,15 @@ jobs:
             executable_suffix: ""
             uv_relative: uv-aarch64-apple-darwin/uv
             bundles: app,dmg
+            reclaim_before_dmg: false
             timeout: 210
           - name: macOS Intel
             os: macos-15-intel
             target: x86_64-apple-darwin
             executable_suffix: ""
             uv_relative: uv-x86_64-apple-darwin/uv
-            bundles: app,dmg
+            bundles: app
+            reclaim_before_dmg: true
             timeout: 240
           - name: Windows x64
             os: windows-2025
@@ -344,6 +347,7 @@ jobs:
             executable_suffix: .exe
             uv_relative: uv.exe
             bundles: nsis,msi
+            reclaim_before_dmg: false
             timeout: 240
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -495,6 +499,32 @@ jobs:
             --ci
             --no-sign
             --bundles ${{ matrix.bundles }}
+      - name: Reclaim Intel build storage and finish macOS bundles
+        if: matrix.reclaim_before_dmg
+        shell: bash
+        env:
+          CI: "true"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "false"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          built_binary="target/$TARGET/release/market-squawk-desktop"
+          saved_binary="$RUNNER_TEMP/market-squawk-desktop"
+          install -m 755 "$built_binary" "$saved_binary"
+          df -h .
+          cargo clean --release --target "$TARGET"
+          mkdir -p "$(dirname "$built_binary")"
+          install -m 755 "$saved_binary" "$built_binary"
+          df -h .
+
+          pnpm --dir apps/market-squawk-desktop tauri bundle \
+            --config src-tauri/tauri.bundle.conf.json \
+            --target "$TARGET" \
+            --ci \
+            --no-sign \
+            --bundles app,dmg \
+            --verbose
       - name: Verify the installed complete product
         shell: bash
         env:
