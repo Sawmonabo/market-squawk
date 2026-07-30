@@ -28,6 +28,14 @@ ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
 BUILD_ONLY_PYTHON_PATHS = frozenset({".lock", ".market-squawk-owned-v1"})
+LOCKED_PYTHON_PORTABILITY_EXCLUSIONS = {
+    "x86_64-unknown-linux-gnu": {
+        "share/terminfo/E/Eterm": (
+            2_224,
+            "9c6c23dd46de071e5f5ee24cb2144f82e46365c9011bd8574bf210f0c8245043",
+        ),
+    },
+}
 LICENSE_INPUTS = (
     ("LICENSE-APACHE", "licenses/LICENSE-APACHE"),
     ("LICENSE-MIT", "licenses/LICENSE-MIT"),
@@ -663,11 +671,21 @@ def assemble_staging(root: Path, staging: Path, options: Options) -> None:
     if set(list_regular_paths(native_bundle)) != expected_native:
         raise ReleaseBuildError("native bundle does not contain its exact closed file set")
 
+    portability_exclusions = dict(
+        LOCKED_PYTHON_PORTABILITY_EXCLUSIONS.get(options.target.target, {})
+    )
     for relative in list_regular_paths(python_release):
         if relative in BUILD_ONLY_PYTHON_PATHS:
             continue
         source = python_release / relative
+        exclusion = portability_exclusions.pop(relative, None)
+        if exclusion is not None:
+            expected_size, expected_sha256 = exclusion
+            admit_portability_exclusion(source, expected_size, expected_sha256)
+            continue
         copy_stable(source, staging / relative, executable=is_executable(source))
+    if portability_exclusions:
+        raise ReleaseBuildError("locked Python portability exclusion is unavailable")
     for source_name, destination_name in options.target.native_inputs:
         copy_stable(
             native_bundle / source_name,
@@ -773,6 +791,35 @@ def copy_stable(source: Path, destination: Path, *, executable: bool) -> None:
     destination.chmod(0o755 if executable else 0o644)
     if file_sha256(destination) != digest.hexdigest():
         raise ReleaseBuildError("release staging copy changed after writing")
+
+
+def admit_portability_exclusion(
+    source: Path,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    before = source.lstat()
+    if (
+        source.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size != expected_size
+    ):
+        raise ReleaseBuildError("locked Python portability exclusion changed")
+    digest = hashlib.sha256()
+    observed = 0
+    with source.open("rb") as stream:
+        while chunk := stream.read(COPY_BUFFER_BYTES):
+            observed += len(chunk)
+            if observed > expected_size:
+                raise ReleaseBuildError("locked Python portability exclusion changed")
+            digest.update(chunk)
+    after = source.lstat()
+    if (
+        stable_identity(before) != stable_identity(after)
+        or observed != expected_size
+        or digest.hexdigest() != expected_sha256
+    ):
+        raise ReleaseBuildError("locked Python portability exclusion changed")
 
 
 def stable_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
