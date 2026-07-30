@@ -320,15 +320,20 @@ financial, authority, or operational concepts.
 
 ## Squawk Signal identity
 
+The approved
+[`2026-07-29-market-squawk-logo-design.md`](2026-07-29-market-squawk-logo-design.md)
+supersedes the earlier trace-led treatment **inside the product logo**. The logo now uses the
+approved no-eye S-bird and three-tier market wing. The Squawk Signal defined below remains the
+non-logo identity motif for the product contexts listed in this section.
+
 The Squawk Signal is a thin cobalt trace combining:
 
 - a market-price line;
 - a broadcast or audio waveform; and
 - a heartbeat-like indication of active local state.
 
-It appears sparingly:
+It appears sparingly outside the product logo:
 
-- inside the Market Squawk logo;
 - once in the setup welcome panel;
 - during application startup;
 - as an active-workspace or local-status cue;

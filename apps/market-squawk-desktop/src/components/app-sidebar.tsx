@@ -1,7 +1,8 @@
-import { AudioWaveform, ChevronsUpDown, LockKeyhole } from "lucide-react"
+import { ChevronsUpDown, LockKeyhole } from "lucide-react"
 import { Link, useLocation } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
+import marketSquawkMarkUrl from "@/assets/market-squawk-mark.svg"
 import {
   Sidebar,
   SidebarContent,
@@ -45,24 +46,23 @@ export function AppSidebar() {
               asChild
               size="lg"
               tooltip="Market Squawk workspace"
-              className="h-auto gap-3 px-1.5 py-2"
+              className="h-11 justify-start px-1 py-2 group-data-[collapsible=icon]:justify-center"
             >
               <Link to="/overview" aria-label="Market Squawk workspace">
-                <span className="flex size-9 shrink-0 items-center justify-center rounded-[9px] bg-primary text-primary-foreground shadow-[0_0_0_1px_oklch(0.72_0.18_257/0.18)]">
-                  <AudioWaveform className="size-[19px]" aria-hidden="true" />
-                </span>
-                <span className="grid min-w-0 flex-1 text-left leading-tight">
-                  <span className="truncate text-sm font-semibold text-white">
-                    Market Squawk
+                <span className="flex min-w-0 items-center leading-none">
+                  <span className="text-[17px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
+                    Market
                   </span>
-                  <span className="truncate text-[11px] text-sidebar-foreground/55">
-                    Active local workspace
+                  <img
+                    src={marketSquawkMarkUrl}
+                    alt=""
+                    aria-hidden="true"
+                    className="mx-0.5 h-8 w-auto shrink-0 group-data-[collapsible=icon]:mx-0 group-data-[collapsible=icon]:h-7"
+                  />
+                  <span className="-ml-1 text-[17px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden">
+                    quawk
                   </span>
                 </span>
-                <ChevronsUpDown
-                  className="ml-auto size-3.5 text-sidebar-foreground/50"
-                  aria-hidden="true"
-                />
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

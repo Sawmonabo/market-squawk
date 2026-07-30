@@ -1,12 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img">
   <title>Market Squawk</title>
-  <rect width="1024" height="1024" rx="224" fill="#155dfc"/>
-  <path
-    d="M176 520h96l36-68 50 158 54-286 62 372 70-412 64 348 52-236 48 124h140"
-    fill="none"
-    stroke="#fff"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    stroke-width="44"
-  />
+  <rect width="1024" height="1024" rx="224" fill="#09090b"/>
+  <g transform="translate(176 232) scale(7)">
+    <path
+      fill="#155dfc"
+      d="M4 10h54L47 23H14L4 10Zm9 17h40L43 40H23L13 27Zm10 17h27L39 57h-7L23 44Z"
+    />
+    <path
+      fill="#fafafa"
+      fill-rule="evenodd"
+      d="M91 23 74 18c-4-6-10-9-17-9-10 1-17 7-17 15-1 8 5 13 13 17 6 3 9 7 6 12-3 7-12 13-26 18 17 0 30-5 38-13 7-8 6-17-3-24l-7-5c-4-3-4-6-1-8 4-4 10-1 14 6l14 2-8-6 11-1v1Zm-19-2 14 3-13 2-1-5Z"
+    />
+  </g>
 </svg>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { fireEvent, render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -264,6 +264,12 @@ describe("Market Squawk desktop boundary", () => {
 
     const heading = await screen.findByRole("heading", { name: "Research" })
     expect(heading.tagName).toBe("H1")
+    const workspaceHome = screen.getByRole("link", {
+      name: "Market Squawk workspace",
+    })
+    expect(within(workspaceHome).getByText("Market")).toBeTruthy()
+    expect(within(workspaceHome).getByText("quawk")).toBeTruthy()
+    expect(workspaceHome.querySelector('img[alt=""]')).toBeTruthy()
     const navigation = document.querySelector(
       'nav[aria-label="Market Squawk"]',
     )
