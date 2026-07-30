@@ -15,11 +15,13 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::archive::{ArchiveError, ComponentReceipt, seal_tree_root, sync_directory};
-use crate::manifest::{MAXIMUM_ARCHIVE_ENTRIES, is_lower_sha256};
+use crate::manifest::{MAXIMUM_ARCHIVE_ENTRIES, MAXIMUM_MANIFEST_BYTES, is_lower_sha256};
 use crate::platform::SupportedTarget;
 
 const INSTALLATION_STATE_SCHEMA_VERSION: u32 = 1;
-const MAXIMUM_INSTALLATION_STATE_BYTES: usize = 1024 * 1024;
+// The selector can retain the active and previous component inventories. Keep its admission bound
+// aligned with two admitted release manifests plus fixed selector metadata.
+const MAXIMUM_INSTALLATION_STATE_BYTES: usize = (2 * MAXIMUM_MANIFEST_BYTES) + (64 * 1024);
 const STATE_FILE: &str = "installation.json";
 const VERSIONS_DIRECTORY: &str = "versions";
 const RELEASES_DIRECTORY: &str = "releases";
