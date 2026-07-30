@@ -8,8 +8,8 @@
 | Audience | Product, design, desktop, frontend, packaging, accessibility, and release reviewers |
 | Status | Approved design; production integration is not claimed by this document |
 | Design approved | 2026-07-29 |
-| Last substantive review | 2026-07-29 |
-| Audit base | `968631aba5f71c85341876f905795eb71065ba61` |
+| Last substantive review | 2026-07-30 |
+| Audit base | `a9e777c2113f06010052baa9cfd03974caf7a562` |
 | Approved visual source | [`assets/2026-07-29-market-squawk-logo.png`](assets/2026-07-29-market-squawk-logo.png) |
 | Approved source SHA-256 | `567a3dc04acb791b67eb2a0bb5eed256cb6c9d84c0441ed2dcefc7ae9b7d6ee6` |
 | Parent interface design | [`2026-07-28-market-squawk-obsidian-signal-interface-design.md`](2026-07-28-market-squawk-obsidian-signal-interface-design.md) |
@@ -28,8 +28,9 @@ The Market Squawk identity is one symbiotic wordmark:
 
 The custom mark replaces the capital **S** in “Squawk.” It is not a separate mascot beside the
 complete product name. The white bird's body must read as both an S and a right-facing bird, while
-the cobalt wing reads as a compact market structure. The open beak communicates “squawk” without
-adding an eye, sound rays, speech bubble, microphone, or generic audio waveform.
+the cobalt wing reads as a compact market structure. The head ends in one subtle closed point:
+there is no separate lower jaw, mouth opening, internal mouth line, eye, sound ray, speech bubble,
+microphone, or generic audio waveform.
 
 The approved source contains a large and a small rendering of this same lockup on an Obsidian
 canvas:
@@ -71,7 +72,8 @@ The mark has two inseparable shapes.
 ### White S-bird
 
 - The bird faces right.
-- The head resolves into a clearly open beak through Obsidian negative space.
+- The head resolves into one continuous closed tip. It has no forked outer contour, lower jaw,
+  negative-space mouth wedge, or internal mouth cutout.
 - The neck, chest, belly, and rising tail form one continuous capital-S silhouette.
 - The lower tail sweeps left and upward enough to complete the S without becoming a second wing.
 - The bird has **no eye**: no dot, cutout, cobalt point, highlight, or implied eye at any size.
@@ -109,6 +111,10 @@ or secondary blue.
 - Align the mark optically to the type's cap height; allow the lower S-tail to descend slightly
   below the word baseline.
 - Keep all three pieces on one line. Do not stack or center the mark above the name.
+- In the expanded desktop sidebar, center the complete `Market` + S-bird + `quawk` lockup
+  horizontally as one inseparable group within the full workspace-home control. Do not center its
+  three pieces independently, and do not change the already-centered compact mark when the sidebar
+  is collapsed.
 
 ### Compact mark
 
@@ -116,12 +122,19 @@ Use the complete market-wing plus S-bird mark without word fragments when the ho
 cannot remain legible, including the collapsed sidebar, favicon, and application icon. Do not use
 an `MS` monogram or the earlier waveform tile as a brand substitute.
 
+### Text-only product references
+
+Prose and headings may use the typed product name without substituting the S-bird for the letter
+S. In the setup welcome heading, render `Welcome to Market` in white and the complete normally
+typed word `Squawk` in cobalt. Keep the accessible heading text `Welcome to Market Squawk`; do not
+insert an image, SVG, decorative label, or duplicated S into that sentence.
+
 ### Application icon
 
 The platform application icon uses the compact mark centered in an Obsidian rounded-square
 container:
 
-- preserve generous internal padding so the open beak and S-tail survive at 16–32 pixels;
+- preserve generous internal padding so the closed head tip and S-tail survive at 16–32 pixels;
 - keep the mark flat cobalt and white;
 - use the platform-generated masks and file formats rather than drawing per-platform variants; and
 - do not add text to the icon.
@@ -131,12 +144,14 @@ container:
 Let `x` equal one quarter of the compact mark's rendered height.
 
 - Keep at least `x` of clear space around the compact mark and around the horizontal wordmark.
+- In the expanded sidebar wordmark, pair 18 CSS pixel word fragments with a 21 CSS pixel mark and
+  tighten only the mark-to-`q` join by one CSS pixel. Preserve the existing `Market`-to-mark inset.
 - In product UI, render the compact mark at least 24 CSS pixels high; 32 pixels is preferred in the
   collapsed desktop sidebar.
 - Render the horizontal lockup at least 136 CSS pixels wide. Below that width, switch to the
-  compact mark instead of compressing the letters or closing the beak.
+  compact mark instead of compressing the letters or distorting the bird contour.
 - Platform icon generation may rasterize below 24 pixels, but the simplified filled silhouette and
-  prescribed padding must preserve the wing tiers, open beak, and S reading.
+  prescribed padding must preserve the wing tiers, closed head tip, and S reading.
 
 ## Accessibility
 
@@ -157,7 +172,8 @@ Do not:
 
 - restore an eye or eye-like cutout;
 - make only the wing S-shaped while leaving the bird body generic;
-- close the beak or turn it into an ordinary pointed head;
+- add a forked beak, lower jaw, mouth opening, internal mouth line, or negative-space mouth cutout;
+- round away the approved subtle head point or exaggerate it into a generic bird beak;
 - place a generic bird beside the fully typed `Market Squawk`;
 - type a second S before or after the mark;
 - detach the wing tiers from the bird;
@@ -175,7 +191,9 @@ The identity integration is accepted when:
 - the repository preserves a byte-identical copy of the approved source at the recorded digest;
 - the desktop workspace-home lockup visibly reads `Market` + S-bird + `quawk`;
 - the compact sidebar, favicon, and generated platform icons use the same no-eye mark;
-- the bird body remains the S and the open beak survives compact display;
+- the bird body remains the S and the single closed head contour survives compact display;
+- the expanded sidebar uses the approved 18-pixel word fragments, 21-pixel mark, centered
+  one-line lockup, and one-pixel tighter S-to-`q` join;
 - all runtime logo assets are bundled locally;
 - no dependency, authority, readiness, provider, installation, or release behavior changes;
 - the existing frontend accessibility behaviors, type check, production build, and locked desktop

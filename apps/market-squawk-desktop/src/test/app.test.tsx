@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
 
 import { App } from "@/app/app"
+import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -267,9 +268,33 @@ describe("Market Squawk desktop boundary", () => {
     const workspaceHome = screen.getByRole("link", {
       name: "Market Squawk workspace",
     })
-    expect(within(workspaceHome).getByText("Market")).toBeTruthy()
-    expect(within(workspaceHome).getByText("quawk")).toBeTruthy()
-    expect(workspaceHome.querySelector('img[alt=""]')).toBeTruthy()
+    expect({
+      centered: workspaceHome.classList.contains("justify-center"),
+      leftAligned: workspaceHome.classList.contains("justify-start"),
+    }).toEqual({ centered: true, leftAligned: false })
+    const marketWord = within(workspaceHome).getByText("Market")
+    const quawkWord = within(workspaceHome).getByText("quawk")
+    const marketSquawkMark = workspaceHome.querySelector('img[alt=""]')
+    expect(marketSquawkMark).toBeInstanceOf(HTMLImageElement)
+    if (!(marketSquawkMark instanceof HTMLImageElement)) {
+      throw new Error("Market Squawk mark is absent")
+    }
+    expect({
+      marketText: marketWord.classList.contains("text-[18px]"),
+      markHeight: marketSquawkMark.classList.contains("h-[21px]"),
+      squawkText: quawkWord.classList.contains("text-[18px]"),
+    }).toEqual({ marketText: true, markHeight: true, squawkText: true })
+    expect(quawkWord.style.marginLeft).toBe("-1px")
+    const markDocument = new DOMParser().parseFromString(
+      marketSquawkMarkSvg,
+      "image/svg+xml",
+    )
+    const whiteBird = markDocument.querySelector('path[fill="#fafafa"]')
+    const whiteBirdPath = whiteBird?.getAttribute("d") ?? ""
+    expect({
+      fillRule: whiteBird?.getAttribute("fill-rule") ?? null,
+      contours: whiteBirdPath.match(/[Mm]/g)?.length ?? 0,
+    }).toEqual({ fillRule: null, contours: 1 })
     const navigation = document.querySelector(
       'nav[aria-label="Market Squawk"]',
     )
@@ -347,6 +372,19 @@ describe("Market Squawk desktop boundary", () => {
     )
 
     expect((await screen.findAllByText("Not verified")).length).toBeGreaterThan(0)
+    const welcomeHeading = screen.getByRole("heading", {
+      name: "Welcome to Market Squawk",
+    })
+    const whiteHeadingText = within(welcomeHeading).getByText(
+      "Welcome to Market",
+      { exact: true },
+    )
+    const cobaltHeadingText = within(welcomeHeading).getByText("Squawk", {
+      exact: true,
+    })
+    expect(whiteHeadingText.classList.contains("text-white")).toBe(true)
+    expect(cobaltHeadingText.classList.contains("text-primary")).toBe(true)
+    expect(cobaltHeadingText.querySelector("img,svg")).toBeNull()
     expect(screen.queryByText("Installation verified")).toBeNull()
     expect(screen.getByText("No signed installation receipt was admitted.")).toBeTruthy()
   })

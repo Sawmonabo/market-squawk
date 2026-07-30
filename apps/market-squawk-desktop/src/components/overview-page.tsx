@@ -40,8 +40,9 @@ export function OverviewPage() {
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
             Setup · Step {currentStep} of {bootstrap.setupSteps.length}
           </p>
-          <h1 className="mt-3 text-3xl font-bold tracking-[-0.04em] text-white sm:text-4xl">
-            Welcome to Market Squawk
+          <h1 className="mt-3 text-3xl font-bold tracking-[-0.04em] sm:text-4xl">
+            <span className="text-white">Welcome to Market</span>{" "}
+            <span className="text-primary">Squawk</span>
           </h1>
           <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
             Build a private market workspace for live data, investment research,

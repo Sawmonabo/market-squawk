@@ -353,7 +353,8 @@ The initial route has one clear outcome: begin the complete recommended setup.
 It contains:
 
 - `Setup · Step 1 of N` progress context;
-- the heading **Welcome to Market Squawk**;
+- the text-only heading **Welcome to Market Squawk**, with `Welcome to Market` in white and the
+  normally typed word `Squawk` in cobalt; the logo does not replace its S;
 - a short explanation of the self-hosted market workspace in non-specialist language;
 - the Squawk Signal and current local-control status;
 - verified application, release, managed-Python, and default-safety facts;

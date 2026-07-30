@@ -46,20 +46,23 @@ export function AppSidebar() {
               asChild
               size="lg"
               tooltip="Market Squawk workspace"
-              className="h-11 justify-start px-1 py-2 group-data-[collapsible=icon]:justify-center"
+              className="h-11 justify-center px-1 py-2 group-data-[collapsible=icon]:justify-center"
             >
               <Link to="/overview" aria-label="Market Squawk workspace">
                 <span className="flex min-w-0 items-center leading-none">
-                  <span className="text-[17px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
+                  <span className="text-[18px] font-bold tracking-[-0.045em] text-white group-data-[collapsible=icon]:hidden">
                     Market
                   </span>
                   <img
                     src={marketSquawkMarkUrl}
                     alt=""
                     aria-hidden="true"
-                    className="mx-0.5 h-8 w-auto shrink-0 group-data-[collapsible=icon]:mx-0 group-data-[collapsible=icon]:h-7"
+                    className="ml-0.5 h-[21px] w-auto shrink-0 group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:h-7"
                   />
-                  <span className="-ml-1 text-[17px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden">
+                  <span
+                    className="text-[18px] font-bold tracking-[-0.045em] text-primary group-data-[collapsible=icon]:hidden"
+                    style={{ marginLeft: "-1px" }}
+                  >
                     quawk
                   </span>
                 </span>
