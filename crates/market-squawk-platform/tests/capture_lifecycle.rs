@@ -571,6 +571,7 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("data"))?;
     let first_sink = paths.open_journal_writer("capture-lifecycle")?;
+    let destination = first_sink.destination();
     let (_first_publisher, _first_control, first_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
@@ -584,15 +585,22 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     );
     assert!(pending.is_worker_terminated());
 
-    // Worker exit releases the journal's OS file lock, but the unreaped owner must still fence a
-    // second in-process worker for the same prepared canonical destination.
-    let blocked_sink = paths.open_journal_writer("capture-lifecycle")?;
+    // An unreaped owner must retain the journal's exact in-process destination fence even while
+    // the OS thread is in its final teardown window.
     let (_blocked_publisher, _blocked_control, blocked_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
     )?;
     assert!(matches!(
-        spawn_capture_writer(blocked_writer, blocked_sink, CaptureWriterPolicy::default(),),
+        spawn_capture_writer(
+            blocked_writer,
+            DestinationGatedSink {
+                destination,
+                entered: None,
+                release: None,
+            },
+            CaptureWriterPolicy::default(),
+        ),
         Err(CaptureWriterSpawnError::DestinationFence {
             source: market_squawk_platform::CaptureDestinationFenceError::Busy,
             ..
