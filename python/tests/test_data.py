@@ -301,7 +301,14 @@ def _install_catalog(
 
 
 def _catalog_identity(catalog: Path) -> bytes:
-    path = os.fsencode(catalog.resolve(strict=True))
+    resolved = str(catalog.resolve(strict=True))
+    if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+        resolved = (
+            f"\\\\?\\UNC\\{resolved[2:]}"
+            if resolved.startswith("\\\\")
+            else f"\\\\?\\{resolved}"
+        )
+    path = os.fsencode(resolved)
     metadata = os.stat(catalog, follow_symlinks=False)
     device = metadata.st_dev
     inode = metadata.st_ino

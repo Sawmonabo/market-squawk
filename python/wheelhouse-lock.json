@@ -4372,8 +4372,8 @@
     },
     {
       "path": "python/tests/test_data.py",
-      "sha256": "6c3740f07c15771cbe392018c035054454d733cbf2edc42db1c349d1885fbef3",
-      "size_bytes": 20828
+      "sha256": "0017be5158e40b5477bfb9efbc61bebf5220b9051881fce84b6daf5230ce828b",
+      "size_bytes": 21074
     },
     {
       "path": "python/tests/test_finance_parity.py",
