@@ -957,8 +957,8 @@ jobs:
               exit 1
               ;;
           esac
-          echo "MARKET_SQUAWK_CANDIDATE=$candidate" >> "$GITHUB_ENV"
-          echo "MARKET_SQUAWK_NATIVE_TRUST_MODE=$native_trust_mode" \
+          echo "RELEASE_CANDIDATE=$candidate" >> "$GITHUB_ENV"
+          echo "RELEASE_NATIVE_TRUST_MODE=$native_trust_mode" \
             >> "$GITHUB_ENV"
       - name: Install and launch the DMG
         if: runner.os == 'macOS'
@@ -969,7 +969,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          dmg="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.dmg"
+          dmg="$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.dmg"
           hdiutil verify "$dmg"
           mount="$RUNNER_TEMP/market-squawk-dmg"
           application="$RUNNER_TEMP/Applications/Market Squawk.app"
@@ -984,7 +984,7 @@ jobs:
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
           packaged="$mount/Market Squawk.app"
           [[ -d "$packaged" && ! -L "$packaged" ]]
-          case "$MARKET_SQUAWK_NATIVE_TRUST_MODE" in
+          case "$RELEASE_NATIVE_TRUST_MODE" in
             developer-id-signed-and-notarized)
               codesign --verify --deep --strict --verbose=2 "$packaged"
               spctl --assess --type execute --verbose=4 "$packaged"
@@ -1069,14 +1069,14 @@ jobs:
             ".msi"
           }
           $package = Join-Path `
-            $env:MARKET_SQUAWK_CANDIDATE `
+            $env:RELEASE_CANDIDATE `
             "market-squawk-$env:VERSION-$env:TARGET$suffix"
           $signature = Get-AuthenticodeSignature $package
-          if ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "authenticode-signed") {
+          if ($env:RELEASE_NATIVE_TRUST_MODE -eq "authenticode-signed") {
             if ($signature.Status -ne "Valid") {
               throw "The downloaded Windows package signature is invalid."
             }
-          } elseif ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "provenance-only") {
+          } elseif ($env:RELEASE_NATIVE_TRUST_MODE -eq "provenance-only") {
             if ($signature.Status -ne "NotSigned") {
               throw "The provenance-only Windows package has unexpected publisher state."
             }
@@ -1253,10 +1253,10 @@ jobs:
 
           package_name=""
           if [[ "$PACKAGE_KIND" == "appimage" ]]; then
-            desktop="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.AppImage"
+            desktop="$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.AppImage"
             chmod u+x "$desktop"
           else
-            package="$MARKET_SQUAWK_CANDIDATE/market-squawk-$VERSION-$TARGET.deb"
+            package="$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.deb"
             package_name="$(dpkg-deb --field "$package" Package)"
             [[ "$package_name" =~ ^[a-z0-9][a-z0-9+.-]+$ ]]
             sudo apt-get install --yes "$package"
