@@ -533,10 +533,13 @@ jobs:
           manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
           install_root="$RUNNER_TEMP/installed-product"
           unset \
+            MARKET_SQUAWK_APPLE_SIGNING_IDENTITY \
             MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_NATIVE_TRUST_MODE \
             MARKET_SQUAWK_PYTHON_PRODUCT \
             MARKET_SQUAWK_RELEASE_OUTPUT \
-            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT \
+            MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
           "$bootstrap" --root "$install_root" install \
             --manifest "$manifest" \
             --bundle "$bundle"
@@ -625,6 +628,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          unset \
+            MARKET_SQUAWK_APPLE_SIGNING_IDENTITY \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_NATIVE_TRUST_MODE \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT \
+            MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
           appimage="$(find "target/${{ matrix.target }}/release/bundle/appimage" \
             -maxdepth 1 -type f -name '*.AppImage' -print)"
           [[ -n "$appimage" && "$appimage" != *$'\n'* ]]
