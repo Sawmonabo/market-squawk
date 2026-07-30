@@ -338,7 +338,7 @@ and restart recovery of that same derived generation and complete parent set.
 - `--python-evidence <HEAD-ROOT>/python/market-squawk-release.json`; and
 - `--output-file <HEAD-ROOT>/demo.json`, which must not exist.
 
-It revalidates the provider report, current executable, signed CPython 3.12 and 3.13 environments,
+It revalidates the provider report, current executable, the verified CPython 3.14.6 environment,
 repository identity, and directory topology at admission and publication. It runs production
 live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/doctor, and stdio MCP
 paths. Public-source fixtures remain `DirectUnverified`; the local product starts with the paper bot

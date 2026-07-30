@@ -1,22 +1,23 @@
-# Local Deployment
+# Self-hosted deployment
 
 Market Squawk deploys as operator-controlled local processes and on-disk stores. This page defines
 the supported topology, process boundaries, network exposure, durable layout, startup/shutdown
-order, and recovery surfaces at the reviewed commit.
+order, complete release boundary, and recovery surfaces.
 
 | Metadata | Value |
 | --- | --- |
 | Document type | Deployment architecture |
 | Audience | Operators, maintainers, security reviewers, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | Quarter 4 remediation audited from `03783250a1020d79cdd7f8bda424da62568dd3d5` |
+| Last substantive review | 2026-07-30 |
+| Implementation review base | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
 
 ## Contents
 
 - [Scope](#scope)
 - [Supported topology](#supported-topology)
 - [Process and network view](#process-and-network-view)
+- [Release and installation topology](#release-and-installation-topology)
 - [Desktop distribution boundary](#desktop-distribution-boundary)
 - [On-disk layout](#on-disk-layout)
 - [Startup and shutdown](#startup-and-shutdown)
@@ -52,8 +53,8 @@ The baseline topology is one operator-owned machine:
   I/O for a production live generation;
 - a validated sibling `market-squawk-onnx-worker` process may execute an admitted bounded ONNX
   model when that model generation requires it;
-- an optional sealed CPython environment performs research, visualization, and training outside
-  the live path; and
+- the installed sealed CPython 3.14.6 environment performs optional research, visualization, and
+  training outside the live path; and
 - SQLite, journals, authority records, Parquet datasets, model/backtest/portfolio/paper artifacts,
   and audits remain under local operator control.
 
@@ -160,13 +161,60 @@ runtime authority from the legacy diagnostic-capture setting. The operator must 
 before the client starts MCP against that workspace. Other policy supplied only through environment
 variables is not serialized and must be supplied to the client separately.
 
-The ONNX worker is not a generic executable hook. When a signed training release is selected,
+The ONNX worker is not a generic executable hook. When a verified training release is selected,
 startup verifies that the installed `market-squawk` application identity and bounded regular
-sibling worker are the canonical installed paths and match the signed release-manifest digests.
+sibling worker are the canonical installed paths and match the release-manifest digests.
 When the desktop owns the runtime, it selects that packaged CLI sibling rather than substituting
 the desktop executable's digest. Model admission then fixes graph/operator/tensor/resource policy
 before publication. The capture helper is likewise a validated sibling and receives one confined
 journal destination.
+
+## Release and installation topology
+
+The v1.0.0 release transaction produces one closed component manifest for each supported target
+and one cross-platform index. Native packages and the terminal bootstrap consume the same complete
+target bundle. The application cannot compose a partial desktop-only or Python-free installation.
+
+```mermaid
+flowchart LR
+    Source["Frozen Git commit and tree"]
+    Build["Target-native Rust, Tauri, and Python builders"]
+    Bundle["Closed complete ZIP and component manifest"]
+    Native["DMG · NSIS/MSI · AppImage/DEB"]
+    Curl["Verified POSIX bootstrap"]
+    Attest["Checksums · GitHub attestations · declared native trust"]
+    Stage["Private staging"]
+    Version["Immutable version directory"]
+    Selector["Atomic installation.json selector"]
+    Entry["OS app entrypoint or verified Unix bin entrypoints"]
+    Runtime["Desktop · CLI · MCP · helpers · CPython 3.14.6"]
+
+    Source --> Build --> Bundle
+    Bundle --> Native
+    Bundle --> Curl
+    Bundle --> Attest
+    Native --> Stage
+    Curl --> Stage
+    Attest --> Stage
+    Stage --> Version --> Selector --> Entry --> Runtime
+```
+
+The installer retains the active version, at most one previous known-good version, and each
+version's exact manifest and bundle. Update, repair, rollback, and status operate under one
+exclusive installation lock. Repair may reconstruct only the exact selected version. Update may
+activate only a strictly newer admitted release. Rollback must revalidate the retained previous
+version before selection.
+
+Program state and mutable financial data have separate roots. Ordinary uninstall removes the
+program store and managed entrypoints while preserving configuration, credentials, catalogs,
+portfolios, datasets, models, logs, and artifacts. Each optional data-class deletion requires its
+own exact absolute path and explicit confirmation.
+
+The release manifest records one trust mode per platform. `developer-id-signed-and-notarized` and
+`authenticode-signed` are admitted only when the corresponding external authority verifies.
+`provenance-only` remains a supported zero-cost distribution mode and is never presented as native
+publisher identity; it relies on the immutable release, exact checksums, closed manifest, installed
+product verification, and GitHub attestations.
 
 ## Desktop distribution boundary
 
@@ -191,12 +239,16 @@ The supported package-build matrix is:
 | macOS 15 Intel | Application bundle and DMG |
 | Windows Server 2025 x86-64 | NSIS and MSI installers |
 
-Each package includes the desktop executable, exact sibling CLI, capture helper, ONNX worker,
-project licenses, exact Geist and Geist Mono OFL notices, and required Tauri/GTK and tract notices.
-The current workflow uses no developer-identity signature; a macOS linker-created ad-hoc Mach-O
-signature is not
-distribution signing. Developer signing, notarization, installation, launch, and exact-head
-acceptance remain separate release evidence and are not inferred from bundle creation.
+Each native package carries the desktop shell plus an embedded complete release: CLI, capture
+helper, ONNX worker, model validator, training driver, versioned installer, uv 0.12.0, managed
+CPython 3.14.6, the locked Python environment, licenses, notices, checksums, and manifest. First
+desktop launch admits that embedded release into the program store before composing
+`LocalProduct`.
+
+Native publisher signing is conditional release evidence. A macOS linker-created ad-hoc Mach-O
+signature is not Developer ID distribution signing. The workflow verifies the exact declared mode
+and does not infer signing, notarization, installation, launch, or release acceptance from bundle
+creation alone.
 
 Linux AppImage construction uses Tauri's target-local tools directory. Before the bundler runs,
 Market Squawk verifies or reacquires all five external AppImage tools against reviewed immutable
@@ -204,6 +256,27 @@ asset/commit identities, exact byte lengths, and SHA-256 digests. A cache restor
 without revalidation, and a missing architecture lock or changed upstream byte stops packaging.
 
 ## On-disk layout
+
+The per-user program root is an installer-owned store:
+
+```text
+<program-root>/
+├── installation.json               active and previous complete-release identities
+├── bin/                            stable verified Unix desktop, CLI, and installer copies
+├── versions/
+│   ├── <active-version>-<manifest-sha256>/
+│   └── <previous-version>-<manifest-sha256>/   optional rollback generation
+├── releases/
+│   └── <manifest-sha256>/
+│       ├── manifest.json
+│       └── bundle.zip
+└── staging/                        private interrupted-operation workspace
+```
+
+Windows native packages own their operating-system application entrypoints. On Unix, `bin/`
+contains derived regular executable copies whose digests must equal the selected immutable
+component receipts. They are refreshed on install, update, repair, and rollback and are part of
+installation health.
 
 The CLI's safe default data root is `.market-squawk`. An installed desktop launch instead supplies
 Tauri's operating-system application-local data directory as its safe-default value, so a
@@ -274,7 +347,7 @@ For a production product command or MCP session, startup proceeds in authority o
 2. prepare the local root and open the catalog, object-store authority, and durable source state;
 3. recover provider onboarding/activation recipes, portfolio revisions, governed backtests, and
    model admissions;
-4. require the configured signed training release if durable model admissions exist, and when one
+4. require the configured verified training release if durable model admissions exist, and when one
    is configured verify the running application and sibling ONNX worker against it;
 5. construct every required application-domain service;
 6. admit the exact complete application descriptor; and
@@ -295,14 +368,17 @@ The desktop follows the same composition order with a presentation boundary arou
 
 1. parse the three user-facing desktop options and construct the Tauri application runtime without
    publishing its window;
-2. resolve the operating-system application-local data directory and load normal validated
+2. admit, install, update, or repair the complete packaged release and obtain its active immutable
+   root;
+3. resolve the operating-system application-local data directory and load normal validated
    configuration precedence with that value only as the desktop safe default;
-3. remove CLI logging and release-evidence environment controls from ambient desktop
+4. remove CLI logging and release-evidence environment controls from ambient desktop
    configuration;
-4. construct `LocalProduct` and install its state before the Tauri event loop begins;
-5. register the five closed commands and the main-window capability;
-6. load the bundled React application under the configured content-security policy; and
-7. publish setup, navigation, and bootstrap facts only after the owning Rust authorities return
+5. supply the active complete release as the default training/modeling authority;
+6. construct `LocalProduct` and install its state before the Tauri event loop begins;
+7. register the closed presentation commands and the main-window capability;
+8. load the bundled React application under the configured content-security policy; and
+9. publish setup, navigation, and bootstrap facts only after the owning Rust authorities return
    them.
 
 If argument parsing, configuration, path preparation, authority recovery, or application
@@ -341,12 +417,15 @@ unavailable until recovery.
 
 | Failure | Immediate effect | Recovery boundary |
 | --- | --- | --- |
+| Release manifest, bundle, or component mismatch | Candidate never becomes active. | Reacquire the exact immutable release; do not edit the manifest or staged tree. |
+| Active version or Unix entrypoint mismatch | Installation status becomes unhealthy; product readiness is withheld. | Close running processes and reconstruct the same release with installer repair. |
+| Interrupted update | The last durable selector remains authoritative or the new selector reports unhealthy ancillary state. | Run status and repair under the installation lock; retained exact bundles remain recovery authority. |
 | Provider disconnect, gap, checksum mismatch, or stale market state | Affected generation loses executable authority; other planes continue. | Start a new generation, obtain the required snapshot, and requalify current evidence. |
 | Capture helper or journal failure | Exact capture allocation becomes incomplete; the frame cannot remain execution-eligible. | Terminate/reap the helper, reconcile journal state, and start a new source generation. |
 | SQLite transaction or catalog integrity failure | Publication or request fails; no directory scan is promoted to authority. | Use catalog integrity/backup evidence and the bounded analytical restore service. |
 | Interrupted Parquet publication | Staged objects remain non-current; prior manifest generation remains authoritative. | Orphan recovery verifies authority records and either finalizes or removes bounded residue. |
 | Invalid provider activation recipe | Only the matching provider surface is disabled/quarantined. | Refresh evidence and perform explicit foreground activation/resume. |
-| Missing signed training release for durable models | Application startup refuses to represent durable admissions as empty. | Restore the exact release or intentionally repair the durable model authority. |
+| Missing verified training release for durable models | Application startup refuses to represent durable admissions as empty. | Restore the exact release or intentionally repair the durable model authority. |
 | ONNX worker deadline or uncertain termination | Inference fails closed and produces no model output/action. | Reap the worker and reopen a verified model generation; fallback is allowed only when termination is certain and policy permits it. |
 | Portfolio, backtest, fair-value, or paper checkpoint mismatch | The affected immutable generation is not published or resumed. | Reconcile from producer receipts and the corresponding durable authority/checkpoint protocol. |
 | Disk full or permission/identity change | New writes and publications fail without changing current authority. | Stop mutation, restore capacity/ownership, verify retained identities, then retry through the owning service. |
@@ -401,6 +480,9 @@ must be produced on documented hardware by the final release evidence lane descr
 - [Research data plane](research-data-plane.md)
 - [Backup and recovery](../operations/backup-and-recovery.md)
 - [Configuration and secrets](../operations/configuration-and-secrets.md)
+- [Installation and maintenance](../operations/installation-and-bootstrap.md)
+- [Versioned installer lifecycle](../../apps/market-squawk-installer/src/lifecycle.rs)
+- [Installer store](../../apps/market-squawk-installer/src/store.rs)
 - [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
 - [Configuration composition](../../crates/market-squawk-platform/src/config.rs)
 - [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
@@ -429,7 +511,10 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Tauri architecture](https://v2.tauri.app/concept/architecture/) | Defines the Rust core, system WebView, and IPC boundaries used by the desktop process. | 2026-07-28 |
 | [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-07-28 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the CSP control applied to bundled desktop content. | 2026-07-28 |
-| [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-28 |
+| [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-30 |
 | [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program staging and native-bundle placement. | 2026-07-28 |
 | [Tauri CLI](https://v2.tauri.app/reference/cli/) | Defines ordered configuration overlays used to isolate package-only settings. | 2026-07-28 |
 | [Tauri path API](https://docs.rs/tauri/2.11.5/tauri/path/struct.PathResolver.html#method.app_local_data_dir) | Defines the native application-local data resolver used as the installed desktop default. | 2026-07-28 |
+| [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) | Defines the public build-provenance evidence attached to release assets. | 2026-07-30 |
+| [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Defines the immutable tag and release-asset boundary. | 2026-07-30 |
+| [`directories` 6.0.0](https://docs.rs/directories/6.0.0/directories/struct.ProjectDirs.html) | Defines platform-native per-user program-root derivation. | 2026-07-30 |

@@ -1376,8 +1376,17 @@ Program versions are immutable. Installation retains the active version and one 
 known-good version, changes one atomic active selector only after full verification, and never
 updates an active version in place. Ordinary uninstall preserves configuration, credentials,
 catalogs, portfolios, datasets, models, logs, and artifacts. Stable publication requires the
-platform's native signing or notarization evidence and exact installed-product verification on all
-four targets; unsigned pull-request artifacts remain test evidence only.
+exact installed-product verification on all four targets, a closed checksum manifest, and GitHub
+artifact attestations. Native publisher signing is applied and verified when independently
+configured credentials exist; otherwise the release remains explicitly `provenance-only` and must
+never claim Developer ID, notarization, Authenticode, or Store identity. Unsigned pull-request
+artifacts remain test evidence only.
+
+On POSIX systems, terminal installation must publish stable verified desktop, CLI, and maintenance
+entrypoints inside the per-user program root. Install, update, repair, and rollback refresh those
+derived regular files from the selected immutable release; health checks bind them to the active
+component receipts, and ordinary uninstall removes them with program state. The installer does not
+edit `PATH`. Native Windows packages continue to own operating-system application entrypoints.
 
 This contract was frozen against audit base
 `e6f77d564b00a6e6911c30be60d441f0576e9e08`, tree

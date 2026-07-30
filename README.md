@@ -4,7 +4,7 @@
 
 [![GitHub Actions](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml/badge.svg)](https://github.com/Sawmonabo/market-squawk/actions/workflows/ci.yml)
 [![Rust 1.97.1](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](rust-toolchain.toml)
-[![Version 1.0.0 candidate](https://img.shields.io/badge/version-1.0.0%20candidate-f59e0b)](Cargo.toml)
+[![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-2563eb)](Cargo.toml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-2563eb)](#license)
 
 Market Squawk is a self-hosted platform for live market data, investment research, financial
@@ -17,12 +17,6 @@ The Obsidian Signal desktop application is the primary interactive experience. T
 application services remain available through the complete command-line interface and local stdio
 [Model Context Protocol (MCP)](docs/reference/mcp.md) server. Provider setup runs inside the
 desktop where supported and can open the protected, temporary loopback portal as a fallback.
-
-> [!IMPORTANT]
-> Market Squawk has not published `v1.0.0`. The workspace currently carries the `1.0.0`
-> development candidate; the existing `v0.1.0` tag is a historical development snapshot. Provider
-> acceptance and the final unchanged-candidate release verification still block the first complete
-> release. See the [delivery ledger](docs/plans/delivery-ledger.md) for current details.
 
 ## Table of contents
 
@@ -109,105 +103,78 @@ runtime boundaries, failure behavior, and links to the focused architecture page
 
 ## Quick start
 
-The commands below build and start the current source checkout. For a versioned production-style
-installation, supported-platform details, and success checks, follow
-[Installation and local bootstrap](docs/operations/installation-and-bootstrap.md).
+### Install the complete product
 
-### 1. Get the source and toolchain
+On macOS or x64 Linux, the verified terminal installer detects the platform and installs one
+complete release:
 
 ```bash
-git clone https://github.com/Sawmonabo/market-squawk.git
-cd market-squawk
-rustup show active-toolchain
+curl -fsSL \
+  https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh | sh
 ```
 
-The repository pins Rust `1.97.1` with `rustfmt` and Clippy in
-[`rust-toolchain.toml`](rust-toolchain.toml).
+No existing Rust, Node.js, Python, database, or container installation is required. The release
+includes the Obsidian Signal desktop, CLI, capture and inference helpers, uv, managed CPython
+3.14.6, the locked Python analytics/modeling environment, licenses, and release evidence.
 
-### 2. Launch the desktop application
+Desktop users can instead download the native package for their operating system:
 
-Building the desktop from source also requires Node.js `24.18.0`, pnpm `10.31.0`, and the
-[Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/) for the current operating
-system. These are build tools; an installed desktop package does not require Node.js, pnpm, or
-Rust.
+| Platform | Native packages |
+| --- | --- |
+| macOS 12+, Apple Silicon | [DMG](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-aarch64-apple-darwin.dmg) |
+| macOS 12+, Intel | [DMG](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-apple-darwin.dmg) |
+| Windows 10 1809+, x64 | [Guided installer](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-pc-windows-msvc-setup.exe) · [MSI](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-pc-windows-msvc.msi) |
+| Ubuntu 24.04-compatible, x64 | [AppImage](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-unknown-linux-gnu.AppImage) · [DEB](https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-1.0.0-x86_64-unknown-linux-gnu.deb) |
 
-```bash
-pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk"
-```
+The [GitHub Releases page](https://github.com/Sawmonabo/market-squawk/releases/latest) also
+contains verified complete ZIP bundles for headless and offline installation. Each release records
+whether its native package has Apple or Windows publisher credentials or uses the zero-cost
+GitHub-provenance trust path; package integrity and attestations are always checked by the release
+workflow.
 
-This opens the permanent Obsidian Signal shell with guided setup, source onboarding, and bounded
-views over the local application services. The final `--` separates Tauri runner arguments from
-Market Squawk desktop arguments. An installed desktop uses the operating system's
-application-local data directory when no configuration layer supplies another path, so a
-double-click launch does not depend on its working directory. The production paper service is
-available through the typed Bot and Execution operations, starts stopped, remains paper-only, and
-cannot bypass central risk.
+### Open Market Squawk
 
-Native packages use the package-only Tauri overlay, which compiles and installs the CLI, capture
-helper, and ONNX worker beside the desktop executable:
+A native package creates the normal operating-system application entrypoint. The terminal
+installer prints three durable paths when it finishes:
 
-```bash
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop exec tauri build \
-  --config src-tauri/tauri.bundle.conf.json
-```
+- **Desktop** opens the welcoming guided setup.
+- **CLI** exposes every local product operation.
+- **Updates and repair** manages the verified installation lifecycle.
 
-Choose host-specific package types and the current unsigned-package safety options from the
-[installation runbook](docs/operations/installation-and-bootstrap.md#build-the-desktop-package).
-The desktop reports local MCP as available only after verifying the packaged CLI sibling and the
-bounded MCP tool contract. Guided setup then renders client JSON with a durable installed launcher,
-and the required workspace identity paths. Close the desktop before an MCP client starts it because
-the two processes must not own the same workspace concurrently.
+Open the printed Desktop path. Guided setup explains sources, storage, research, portfolios,
+models, paper execution, risk, fair value, and MCP in plain language and reports a clear readiness
+state. Provider accounts or free API keys are requested only when a selected provider requires
+one.
 
-### 3. Build the local headless bundle
+For terminal use, copy the printed CLI path and choose an absolute directory for local data:
 
 ```bash
-CARGO_INCREMENTAL=0 cargo build --locked --release \
-  --package market-squawk \
-  --bin market-squawk \
-  --bin market-squawk-capture-helper
-
-CARGO_INCREMENTAL=0 cargo build --locked --release \
-  --package market-squawk-modeling \
-  --features onnx-tract \
-  --bin market-squawk-onnx-worker
-```
-
-The three executables are written to `target/release/`. The application, capture helper, and ONNX
-worker should remain sibling files when installed.
-
-### 4. Initialize a local instance
-
-```bash
-MSQ="$PWD/target/release/market-squawk"
-DATA_ROOT="$PWD/.market-squawk"
+MSQ="/path/printed/by/the/installer/market-squawk"
+DATA_ROOT="/absolute/path/to/market-squawk-data"
 
 "$MSQ" --data-dir "$DATA_ROOT" config validate
 "$MSQ" --data-dir "$DATA_ROOT" init
 "$MSQ" --data-dir "$DATA_ROOT" doctor
 ```
 
-The CLI safe default is `.market-squawk/`, which is ignored by Git; the commands above select that
-path explicitly. Use an absolute, operator-owned `--data-dir` for a durable headless installation.
-The installed desktop's separate native default is described above.
+For installation locations, lifecycle commands, offline use, trust verification, rollback,
+uninstall, and recovery, use the
+[installation runbook](docs/operations/installation-and-bootstrap.md).
 
-### 5. Open guided provider setup from the CLI
+## Use Market Squawk
 
-Treasury Fiscal Data is a practical first source because it requires no provider account or API
-key:
+### Set up a first source
+
+The desktop guides this flow. From the CLI, Treasury Fiscal Data is a practical first source
+because it requires no provider account or API key:
 
 ```bash
 "$MSQ" --data-dir "$DATA_ROOT" \
   source setup treasury.fiscal-data --confirm
 ```
 
-Market Squawk opens a temporary portal at `http://127.0.0.1:<port>`. Keep the launching terminal
-open, complete the guided setup in the browser, and then press Ctrl-C after the portal reports a
-successful activation. If the browser does not open automatically, use the exact loopback URL
-printed to stderr.
-
-Verify the local provider state:
+Keep the launching terminal open while the protected temporary setup page is active. Then verify
+the local source state:
 
 ```bash
 "$MSQ" --data-dir "$DATA_ROOT" source status treasury.fiscal-data
@@ -215,11 +182,8 @@ Verify the local provider state:
 "$MSQ" --data-dir "$DATA_ROOT" source health treasury.fiscal-data
 ```
 
-Continue with [Source operations](docs/operations/source-operations.md) to set up other providers
-and [Research ingestion](docs/operations/research-ingestion.md) to discover, ingest, publish, and
-query provider data.
-
-## Use Market Squawk
+Continue with [Source operations](docs/operations/source-operations.md) and
+[Research ingestion](docs/operations/research-ingestion.md).
 
 ### Explore the CLI
 
@@ -331,6 +295,35 @@ lockfile. Crates are grouped by product responsibility:
 | `adapters/` | Provider, file, portfolio, and paper-execution boundaries |
 | `python/` | Optional point-in-time research, finance, visualization, and deterministic training |
 | `docs/` | Architecture, operations, reference, research, plans, reports, and verification |
+
+### Build from source
+
+Source development requires Git, the repository-pinned Rust `1.97.1` toolchain, Node.js `24.18.0`,
+pnpm `10.31.0`, and the official
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform.
+
+```bash
+git clone https://github.com/Sawmonabo/market-squawk.git
+cd market-squawk
+rustup show active-toolchain
+pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
+  tauri dev -- -- --data-dir "$PWD/.market-squawk"
+```
+
+Build the headless Rust application and its required helpers with:
+
+```bash
+CARGO_INCREMENTAL=0 cargo build --locked --release \
+  --package market-squawk \
+  --bin market-squawk \
+  --bin market-squawk-capture-helper
+
+CARGO_INCREMENTAL=0 cargo build --locked --release \
+  --package market-squawk-modeling \
+  --features onnx-tract \
+  --bin market-squawk-onnx-worker
+```
 
 Before contributing:
 

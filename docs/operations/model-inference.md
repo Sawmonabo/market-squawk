@@ -7,16 +7,16 @@ admission, native and ONNX inference, evaluation evidence, and restart recovery.
 | --- | --- |
 | Document type | Operations runbook |
 | Audience | Local research operators, model reviewers, release engineers, and incident responders |
-| Status | Current, with production-driver and ONNX-producer limitations called out below |
-| Last substantive review | 2026-07-24 |
-| Reviewed commit | `3ef05dc8724ec2be808f98543e0bc695f2ae0937` |
+| Status | Current |
+| Last substantive review | 2026-07-30 |
+| Reviewed commit | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
 
 ## Contents
 
 - [Scope](#scope)
 - [Safety and authority boundaries](#safety-and-authority-boundaries)
 - [Preconditions and current product limits](#preconditions-and-current-product-limits)
-- [Prepare the signed Python training release](#prepare-the-signed-python-training-release)
+- [Prepare the verified Python training release](#prepare-the-verified-python-training-release)
 - [Train and export a native candidate](#train-and-export-a-native-candidate)
 - [Prepare an admission request](#prepare-an-admission-request)
 - [Admit a native bundle](#admit-a-native-bundle)
@@ -78,7 +78,7 @@ Set controlled roots:
 
 ```bash
 export DATA_ROOT=/absolute/path/to/market-squawk-data
-export TRAINING_RELEASE_ROOT=/absolute/path/to/python-release/release-cp312
+export TRAINING_RELEASE_ROOT=/absolute/path/to/active/complete-release
 export AUTHORITY_ROOT=/absolute/path/to/model-authority
 ```
 
@@ -101,38 +101,65 @@ Before admission:
 - ONNX admission additionally requires the exact sibling `market-squawk-onnx-worker` beside the
   running application executable.
 
-The signed release installs `market-squawk-train`, the supported production driver. It accepts one
-closed, bounded configuration; deterministically fits `linear` or `logistic`; emits either the
+The verified release installs `market-squawk-train`, the supported production driver. It accepts
+one closed, bounded configuration; deterministically fits `linear` or `logistic`; emits either the
 Gemm regression graph or Gemm-plus-Sigmoid binary-probability graph as a self-contained opset-13
-ONNX artifact; validates the candidate with the signed adjacent Rust validator; and invokes only
-the exact signed application and ONNX worker for admission. Model family and artifact format are
-separate authorities: `modelKind` is `linear` or `logistic`, while `artifactFormat` is `onnx`.
+ONNX artifact; validates the candidate with the release-bound adjacent Rust validator; and invokes
+only the exact release-bound application and ONNX worker for admission. Model family and artifact
+format are separate authorities: `modelKind` is `linear` or `logistic`, while `artifactFormat` is
+`onnx`.
 
-## Prepare the signed Python training release
+## Prepare the verified Python training release
 
-The supported `v0.2.0` target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or newer on arm64.
-Supply absolute paths to both interpreters. The first command explicitly prepares the locked public
-dependency cache; the second is the sealed offline build:
+The v1.0.0 complete installation already contains standard-GIL CPython 3.14.6, uv 0.12.0, and the
+locked Python environment for its target. The desktop automatically selects the active immutable
+complete-release root. A headless process must pass that same active root through
+`--training-release-root`; do not select the retained previous version or an arbitrary virtual
+environment.
+
+Release maintainers build one target-native `release-cp314` product. The first command prepares
+only the exact public artifacts pinned in `distribution/release-components.json`; the second
+builds offline:
 
 ```bash
+TARGET=aarch64-apple-darwin
+ARTIFACT_ROOT=/absolute/path/to/python-release
+COMPONENT_ROOT=/absolute/path/to/release-components
+
 MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
 python3 -I scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
-  --artifact-root /absolute/path/to/python-release \
-  --python /absolute/path/to/python3.12 \
-  --python /absolute/path/to/python3.13 \
+  --target "$TARGET" \
+  --artifact-root "$ARTIFACT_ROOT" \
+  --component-root "$COMPONENT_ROOT" \
   --prepare-cache-only
 
 python3 -I scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
-  --artifact-root /absolute/path/to/python-release \
-  --python /absolute/path/to/python3.12 \
-  --python /absolute/path/to/python3.13 \
+  --target "$TARGET" \
+  --artifact-root "$ARTIFACT_ROOT" \
+  --component-root "$COMPONENT_ROOT" \
   --offline
+
+export TRAINING_RELEASE_ROOT="$ARTIFACT_ROOT/release-cp314"
 ```
 
 The one-time cache preparation is the only step allowed to acquire the hash-pinned public inputs.
 Retain its evidence. Do not let the offline build resolve an unpinned package.
+
+`TARGET` must match the host and be one of:
+
+```text
+aarch64-apple-darwin
+x86_64-apple-darwin
+x86_64-pc-windows-msvc
+x86_64-unknown-linux-gnu
+```
+
+Native publisher signing is a release-authority choice, not a local default. The release workflow
+adds `--sign-native` only when the corresponding Apple or Windows credential authority exists;
+otherwise the target remains `provenance-only` and is still bound by checksums, the closed release
+manifest, and GitHub attestations.
 
 One selected release root must contain and bind at least:
 
@@ -148,10 +175,14 @@ One selected release root must contain and bind at least:
     └── market-squawk-release.json
 ```
 
+The tree and commands in this runbook use Unix names. On Windows, the managed interpreter is
+`<training-release-root>\python.exe`, installed programs use the `.exe` suffix, and the training
+driver is under `Scripts\`.
+
 The verifier also checks the installed interpreter, native extension, wheels, distribution
-`RECORD` entries, signatures, release manifest, and the signed application, validator, and ONNX
-worker identities. The running application and its sibling worker must be those exact installed
-files. File presence alone is not success evidence.
+`RECORD` entries, native trust declaration, release manifest, and the release-bound application,
+validator, and ONNX worker identities. The running application and its sibling worker must be
+those exact installed files. File presence alone is not success evidence.
 
 Use the release's isolated interpreter for an authority-free smoke check:
 
@@ -174,7 +205,7 @@ This proves only that the sealed Python environment can run one bounded kernel. 
 that the application binary accepts the release or that a model is admitted.
 
 Every process that opens the model namespace must run the exact application installed in the
-selected signed release and select that same release root:
+selected verified release and select that same release root:
 
 ```bash
 "$TRAINING_RELEASE_ROOT/bin/market-squawk" \

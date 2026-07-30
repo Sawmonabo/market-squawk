@@ -1,655 +1,393 @@
-# Installation and local bootstrap
+# Installation, first launch, and maintenance
 
-This runbook builds the reviewed Market Squawk source, launches or packages the Obsidian Signal
-desktop application, installs the complete headless executable bundle into an operator-owned
-versioned directory, and initializes a new local data root. The shipping core is a local Rust
-application. It does not require a container runtime, cloud account, paid provider, Python
-interpreter, or external ONNX Runtime library.
+Use this runbook to install the complete Market Squawk v1.0.0 product, open guided setup, verify
+the installed state, update or repair it, roll back one version, and uninstall without deleting
+user data.
 
 | Field | Value |
 | --- | --- |
 | Document type | Operations runbook |
-| Audience | Local operators, release installers, and maintainers |
-| Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | Quarter 4 remediation audited from `03783250a1020d79cdd7f8bda424da62568dd3d5` |
+| Audience | Desktop users, headless operators, support engineers, and release verifiers |
+| Status | Current v1.0.0 contract |
+| Last substantive review | 2026-07-30 |
+| Implementation review base | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
 
 ## Contents
 
-- [Scope and non-goals](#scope-and-non-goals)
-- [Preconditions](#preconditions)
-- [Safety and authority](#safety-and-authority)
-- [Build the locked executable bundle](#build-the-locked-executable-bundle)
-- [Build the desktop package](#build-the-desktop-package)
-- [Launch the desktop application](#launch-the-desktop-application)
-- [Install the bundle](#install-the-bundle)
-- [Bootstrap a new data root](#bootstrap-a-new-data-root)
-- [Expected success evidence](#expected-success-evidence)
-- [Safe restart and upgrade](#safe-restart-and-upgrade)
-- [Rollback and recovery](#rollback-and-recovery)
-- [Known failure modes](#known-failure-modes)
-- [Local logs, data, and artifacts](#local-logs-data-and-artifacts)
+- [Scope](#scope)
+- [What the complete installation contains](#what-the-complete-installation-contains)
+- [Supported platforms](#supported-platforms)
+- [Install](#install)
+- [First launch](#first-launch)
+- [Verify the installation](#verify-the-installation)
+- [Program and data locations](#program-and-data-locations)
+- [Update, repair, and rollback](#update-repair-and-rollback)
+- [Uninstall](#uninstall)
+- [Offline installation](#offline-installation)
+- [Release integrity and platform trust](#release-integrity-and-platform-trust)
+- [Failure and recovery](#failure-and-recovery)
+- [Development installation](#development-installation)
 - [Related documentation and code](#related-documentation-and-code)
 - [Official sources](#official-sources)
 
-## Scope and non-goals
+## Scope
 
-Use this procedure for a source-based local installation at the reviewed product head. It covers:
+This page covers supported per-user installation from the public v1.0.0 release. The normal
+desktop path requires no knowledge of Rust, Python, Node.js, databases, containers, or finance.
+The headless path installs the same component set and exposes durable terminal entrypoints.
 
-- the exact Rust toolchain and locked Cargo dependency graph;
-- the locked desktop frontend and Tauri package;
-- all three executables needed by the installed application;
-- an operator-owned, versioned installation directory;
-- configuration validation, stateful `init`, and the bounded query-only `doctor` check;
-- safe replacement of one installed version with another.
+Installation proves that the complete software release is present and internally consistent. It
+does not:
 
-This runbook does not:
+- create a provider account or accept provider terms for the user;
+- qualify any observation as `DirectVerified`;
+- import private portfolios or datasets without an explicit user action;
+- admit a model, approve an order, or start paper execution; or
+- claim Apple Developer ID or Windows Authenticode identity when a package declares
+  `provenance-only`.
 
-- claim that a local or hosted unsigned package is a signed, notarized, or accepted release
-  candidate, or reproduce the exact-head full release gate;
-- install a container image, system service, hosted component, or external provider account;
-- onboard a data provider, start a bot, or grant source, model, risk, or execution authority;
-- install the optional Python product or optional external ONNX Runtime acceleration library.
+## What the complete installation contains
 
-The [delivery ledger](../plans/delivery-ledger.md) alone owns mutable release state, blockers, exact
-performance evidence, and full-gate acceptance.
+Every supported target is one closed release. It contains:
 
-## Preconditions
+- the Obsidian Signal Tauri desktop;
+- the `market-squawk` CLI and local stdio MCP server;
+- the bounded raw-capture helper;
+- the isolated ONNX worker;
+- the model-bundle validator and supported training driver;
+- the versioned installer and maintenance command;
+- uv 0.12.0;
+- managed CPython 3.14.6;
+- the locked offline Python analytics and modeling environment; and
+- schemas, notices, licenses, checksums, and release metadata.
 
-### Required core toolchain
+The installer rejects a missing, additional, oversized, unsafe, or digest-mismatched component
+before activation. A version is immutable after publication. Activation changes a small local
+selector only after the complete candidate has been admitted.
 
-The repository pins Rust `1.97.1` in `rust-toolchain.toml`, with the minimal rustup profile plus
-`rustfmt` and `clippy`. A source installation needs:
+## Supported platforms
 
-- Git and a checkout containing reviewed commit
-  `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd`;
-- rustup with the pinned `1.97.1` toolchain available;
-- the platform linker and native build tools required by Rust:
-  - Xcode Command Line Tools on macOS;
-  - a C toolchain and linker on Linux;
-  - the MSVC build tools when using the supported MSVC Rust target on Windows;
-- enough operator-owned disk space for Cargo build output, the installed binaries, and the chosen
-  data root.
+| Platform | Minimum | Native packages | Terminal installer |
+| --- | --- | --- | --- |
+| macOS Apple Silicon | macOS 12 | DMG | Yes |
+| macOS Intel | macOS 12 | DMG | Yes |
+| Windows x64 | Windows 10 version 1809 | Guided NSIS installer and MSI | Use the native package |
+| Linux x64 | Ubuntu 24.04-compatible | AppImage and DEB | Yes |
 
-The tracked CI workflow declares Linux, macOS, and Windows jobs. A configured matrix is not
-successful execution evidence; cross-platform acceptance requires completed exact-head jobs and is
-recorded only in the delivery ledger. This runbook's shell examples use a POSIX shell; binary names
-end in `.exe` on Windows.
+The Linux compatibility statement covers the release's glibc and native-library baseline. Other
+distributions may work but are not represented as supported until they pass the same installed
+product checks.
 
-### Desktop source-build toolchain
+## Install
 
-The desktop source build additionally requires:
+### Recommended desktop installation
 
-- Node.js `24.18.0` LTS;
-- pnpm `10.31.0`, pinned by `apps/market-squawk-desktop/package.json`; and
-- the current official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the
-  host: Xcode Command Line Tools on macOS, MSVC plus WebView2 development support on Windows, or
-  WebKitGTK 4.1 and the listed GTK/native packages on Linux.
+Open the [latest GitHub Release](https://github.com/Sawmonabo/market-squawk/releases/latest) and
+choose the package for the computer:
 
-Node.js, pnpm, and Rust are source-build dependencies. They are not runtime dependencies of an
-installed native desktop package, the installed CLI, or headless MCP operation. Linux desktop
-packages still use the distribution's WebKitGTK runtime.
+- **macOS:** use the DMG matching Apple Silicon or Intel, copy **Market Squawk** into
+  Applications, and open it.
+- **Windows:** use the guided `-setup.exe` package for the normal per-user flow. The MSI is
+  available for operators who specifically manage MSI deployment.
+- **Linux:** use the AppImage for a portable desktop or the DEB on a compatible Debian/Ubuntu
+  system.
 
-### Optional Python product
+The first desktop start admits the complete release embedded in the native package, installs it in
+the per-user program store, supplies the active Python/modeling release to the application, and
+then opens guided setup.
 
-Python is not imported or launched by `init`, `config validate`, `doctor`, source onboarding, or
-the core Rust application. Install it only when an admitted Python training/analytics release is
-actually needed.
+### One-command macOS or Linux installation
 
-The reviewed sealed Python product supports normal GIL-enabled CPython `3.12` and `3.13` on macOS
-12 or newer on arm64. Its lock, offline wheelhouse, two-interpreter build, source-closure checks,
-and native-module admission are a separate release workflow; an arbitrary virtual environment is
-not an installed Market Squawk training release. See the
-[Python dependency-admission decision](../research/2026-07-22-python-product-dependency-admission.md)
-and the current release evidence in the [delivery ledger](../plans/delivery-ledger.md).
-
-### Required and optional inference runtime
-
-The required ONNX backend is the Rust `tract` implementation and is compiled into the product.
-The installed bundle also includes `market-squawk-onnx-worker`, which isolates admitted model
-work. No external ONNX library is needed for this required path.
-
-The modeling library contains an optional ONNX Runtime `1.24.4` implementation for admitted Linux
-arm64 and x86-64 targets, but the reviewed product composition does not select it. The shipping
-application always constructs the required tract backend. The
-[model-inference runbook](model-inference.md#optional-external-onnx-runtime-evidence) documents the
-external runtime only for library-integration or retained release evidence, not as a currently
-selectable installation path.
-
-## Safety and authority
-
-1. Build only from the reviewed Git commit and its locked `Cargo.lock`. `--locked` must remain on
-   every release build command.
-2. Use a clean source checkout. Do not treat locally modified manifests, source, lockfiles, build
-   scripts, or adapter code as the reviewed product.
-3. Install all three executables into the same versioned `bin` directory:
-   `market-squawk`, `market-squawk-capture-helper`, and `market-squawk-onnx-worker`.
-4. Do not make either helper a symbolic link. The capture helper must be the exact regular-file
-   sibling of the running application, be executable, have the same owner on Unix, and not be
-   group- or other-writable. The ONNX worker is also admitted as a stable regular file.
-5. Run the application as the operator who owns its installation and data. Do not use elevated
-   privileges to compensate for an incorrectly owned install or data root.
-6. Choose a new, dedicated data root for first bootstrap. `init` owns product initialization,
-   migration, recovery, and bounded shutdown. `doctor` never substitutes for that stateful step.
-7. Keep stdout and stderr separate in automation. Command results use stdout; tracing uses stderr.
-   `mcp serve` reserves stdout for protocol frames.
-8. A successful build or `doctor` call is local evidence only. It does not grant provider rights,
-   data quality, automated-action eligibility, or release approval.
-9. The current native-package workflow intentionally uses `--no-sign`. Treat its output as a
-   development package with no developer-identity signature or notarization until exact signed
-   installation evidence is recorded. A linker-created ad-hoc Mach-O signature is not distribution
-   signing.
-
-## Build the locked executable bundle
-
-### 1. Select and verify the reviewed source
-
-Create or use a dedicated source checkout, then detach it at the reviewed commit:
+Run:
 
 ```bash
-git clone https://github.com/Sawmonabo/market-squawk.git market-squawk-0.2.0
-cd market-squawk-0.2.0
-REVIEWED_COMMIT=REPLACE_WITH_40_CHARACTER_COMMIT_FROM_DELIVERY_LEDGER
-git checkout --detach "$REVIEWED_COMMIT"
-git rev-parse HEAD
-git rev-parse 'HEAD^{tree}'
-git status --short
+curl -fsSL \
+  https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh | sh
 ```
 
-Expected output:
+The script performs only bounded bootstrap work:
 
-- `git rev-parse HEAD` prints the exact 40-character commit selected above;
-- `git rev-parse 'HEAD^{tree}'` matches the tree recorded for that candidate in the
-  [delivery ledger](../plans/delivery-ledger.md);
-- `git status --short` prints nothing.
+1. detects a supported operating system and architecture;
+2. downloads the exact release bootstrap over HTTPS;
+3. verifies its release-published SHA-256 digest;
+4. hands the target-specific manifest to the Rust installer; and
+5. removes its temporary files.
 
-If the commit is already present in a trusted local clone, a second network clone is unnecessary.
-The commit and clean-tree checks remain mandatory.
+The Rust installer downloads, verifies, and activates the complete release. It prints durable
+Desktop, CLI, and maintenance paths when it succeeds. It does not edit the shell profile or
+modify system Python.
 
-### 2. Confirm the pinned toolchain
+The command requires `curl`, `sh`, and either `sha256sum` or `shasum`. It does not require an
+existing Market Squawk build toolchain.
 
-From the repository root:
+## First launch
+
+Open **Market Squawk** from the operating system after a native installation. After a terminal
+installation, run the exact Desktop path printed at completion.
+
+The dark guided setup:
+
+1. opens the local workspace and catalog;
+2. explains each product area in plain language;
+3. helps select and validate zero-fee sources;
+4. handles provider credentials only when a chosen provider requires them;
+5. checks research, portfolio, Python/modeling, MCP, paper-execution, and storage readiness; and
+6. ends with either **Ready** or named recovery actions.
+
+The portal is local. Protected provider setup may open a temporary loopback page. Closing that
+page or the desktop does not publish data or send telemetry.
+
+## Verify the installation
+
+### Desktop
+
+The Overview and Operations views show the installation version, integrity state, setup status,
+and recovery actions. An installed component or active-selector mismatch reports repair required;
+it is never converted into readiness.
+
+### Terminal
+
+Set `INSTALLER` and `MSQ` to the exact maintenance and CLI paths printed by the terminal installer:
 
 ```bash
-rustc --version
-cargo --version
-rustup show active-toolchain
+INSTALLER="/exact/printed/path/market-squawk-installer"
+MSQ="/exact/printed/path/market-squawk"
+DATA_ROOT="/absolute/operator-owned/path/market-squawk-data"
 ```
 
-`rustc --version` must identify Rust `1.97.1`. Stop if rustup cannot select the repository-pinned
-toolchain. Do not silently substitute `1.97.0` or an unpinned newer compiler for this reviewed
-build.
-
-### 3. Build the application and capture helper
+Then verify the program and initialize a new data root:
 
 ```bash
-CARGO_INCREMENTAL=0 cargo build --locked --release \
-  --package market-squawk \
-  --bin market-squawk \
-  --bin market-squawk-capture-helper
-```
-
-### 4. Build the ONNX worker with the required tract backend
-
-```bash
-CARGO_INCREMENTAL=0 cargo build --locked --release \
-  --package market-squawk-modeling \
-  --features onnx-tract \
-  --bin market-squawk-onnx-worker
-```
-
-The resulting POSIX executables are:
-
-```text
-target/release/market-squawk
-target/release/market-squawk-capture-helper
-target/release/market-squawk-onnx-worker
-```
-
-On Windows, use the corresponding paths ending in `.exe`.
-
-These focused commands produce the shipping bundle without claiming the broader all-workspace,
-all-feature release gate. The accepted gate uses the repository's controlled verification
-workflow and is recorded only in the delivery ledger.
-
-## Build the desktop package
-
-Install the exact frontend graph and run its three critical behavioral checks:
-
-```bash
-pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
-pnpm --dir apps/market-squawk-desktop typecheck
-pnpm --dir apps/market-squawk-desktop test --run
-```
-
-Then build only the package types supported by the current host. For Apple Silicon macOS:
-
-```bash
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop exec tauri build \
-  --config src-tauri/tauri.bundle.conf.json \
-  --ci \
-  --no-sign \
-  --bundles app,dmg
-```
-
-The package overlay is mandatory. It activates native bundling, compiles the exact
-`market-squawk`, capture-helper, and tract-enabled ONNX-worker release targets, then stages the
-target-triple filenames expected by Tauri. Direct `cargo check` and `tauri dev` intentionally use
-the base configuration without package-only generated programs.
-
-The hosted package workflow uses the same locked source and produces:
-
-| Host | Package types |
-| --- | --- |
-| Ubuntu 24.04 x86-64 | Debian package and AppImage |
-| macOS 15 Apple Silicon | Application bundle and DMG |
-| macOS 15 Intel | Application bundle and DMG |
-| Windows Server 2025 x86-64 | NSIS and MSI installers |
-
-Generated packages are under `target/release/bundle/`. They include the desktop executable,
-`market-squawk`, `market-squawk-capture-helper`, `market-squawk-onnx-worker`, the Market Squawk
-Apache-2.0/MIT licenses, the exact Geist and Geist Mono OFL notices, and the required Tauri/GTK and
-tract notices. Current package jobs use `--no-sign`; successful compilation and bundling do not
-establish a
-developer-identity signature, notarization, installation, launch, or release acceptance.
-
-On Linux x86-64, package preparation verifies the five reviewed Tauri AppImage tools in
-`target/.tauri/` by exact byte length and SHA-256 before Tauri can execute them. Missing or changed
-inputs are reacquired only through their pinned GitHub asset or commit identities and are verified
-before atomic installation. An unsupported architecture, download failure, or identity mismatch
-stops the package build. The exact identities and current upstream rationale are maintained in
-[Tauri packaging and installed-runtime boundaries](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md#linux-bundler-tool-integrity).
-
-## Launch the desktop application
-
-For development from the source checkout:
-
-```bash
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk"
-```
-
-The first separator passes runner arguments through pnpm and Tauri; the second passes the remaining
-arguments to `market-squawk-desktop`. The desktop launcher accepts:
-
-```text
---config <PATH>
---data-dir <PATH>
---training-release-root <PATH>
-```
-
-Linux AppImages also contain a hidden package transport used only by the generated MCP client JSON.
-It is absent from normal help, rejects execution outside a validated AppImage mount, opens no
-desktop state, and accepts no arbitrary command. Operators should not invoke it manually.
-
-Without an explicit data-directory layer, an installed desktop uses the operating system's
-application-local data directory. Development commands above remain explicit so their disposable
-state is visible in the checkout. A local configuration file, `MARKET_SQUAWK_DATA_DIR`, and
-`--data-dir` retain their normal precedence over the desktop default.
-
-On macOS, launch a locally built application bundle with explicit application arguments using:
-
-```bash
-open "target/release/bundle/macos/Market Squawk.app" --args \
-  --data-dir "$PWD/.market-squawk"
-```
-
-The desktop loads only bundled interface assets and opens the same `LocalProduct` and `Application`
-composition used by the CLI and MCP. Setup state is read from the owning Rust services. Coinbase
-public, Coinbase Exchange direct, and Kraken setup can run directly in the desktop; supported
-research providers use the existing protected loopback portal in the system browser. Closing the
-window begins the existing bounded application shutdown.
-
-The setup System step is complete only after validated configuration, controlled paths, catalogs,
-and the application services have initialized. Developer signing remains a separate visible
-installation fact. Research and Portfolio readiness require their complete application operation
-contracts; optional private-data import history is reported separately and never blocks first-run
-setup. An admitted model runtime remains a separate verified state. Local MCP is available only
-when the installed CLI sibling, effective paths, and bounded MCP tool contract verify. Its setup
-step renders client JSON with a durable installed launcher and required workspace identity paths.
-It neither starts the service nor configures a client. Advanced policy supplied only through
-environment variables must also be supplied to that client. Close the desktop before the client
-starts MCP so only one process owns the effective workspace.
-
-Paper setup is derived from the complete production Bot and Execution operation contract, not the
-informational local profile or the diagnostic-capture `paper_bot_enabled` setting. The controller
-starts stopped, remains paper-only, and routes every action through central risk. The desktop never
-labels the informational local profiles as activation authorities.
-
-## Install the bundle
-
-### POSIX installation
-
-Choose an absolute directory owned by the runtime operator. Keep the version in the path so an
-upgrade never overwrites executables underneath a running process:
-
-```bash
-INSTALL_PARENT=/absolute/operator-owned/market-squawk
-REVIEWED_SHORT=$(git rev-parse --short=7 HEAD)
-INSTALL_ROOT="$INSTALL_PARENT/0.2.0-$REVIEWED_SHORT"
-
-(
-  set -eu
-  umask 022
-
-  test -d "$INSTALL_PARENT"
-  test ! -e "$INSTALL_ROOT"
-  mkdir -m 0755 "$INSTALL_ROOT"
-  mkdir -m 0755 "$INSTALL_ROOT/bin"
-  install -m 0755 target/release/market-squawk \
-    "$INSTALL_ROOT/bin/market-squawk"
-  install -m 0755 target/release/market-squawk-capture-helper \
-    "$INSTALL_ROOT/bin/market-squawk-capture-helper"
-  install -m 0755 target/release/market-squawk-onnx-worker \
-    "$INSTALL_ROOT/bin/market-squawk-onnx-worker"
-)
-```
-
-The subshell exits on the first failed precondition or install. Plain `mkdir` makes an occupied
-version root a hard failure; never rerun against a partially created root. If installation fails,
-inspect and remove only that new, inactive version root, then restart the whole bundle installation
-with a new empty path. Do not point a service or operator command at the version until all three
-siblings pass the checks below.
-
-Inspect the installed files before use:
-
-```bash
-ls -l "$INSTALL_ROOT/bin/market-squawk" \
-  "$INSTALL_ROOT/bin/market-squawk-capture-helper" \
-  "$INSTALL_ROOT/bin/market-squawk-onnx-worker"
-```
-
-All three must be regular executable files with the same owner. Neither helper may be a symlink,
-and the capture helper must not have group or other write bits.
-
-Record SHA-256 values as installation inventory. On Linux:
-
-```bash
-sha256sum "$INSTALL_ROOT"/bin/market-squawk*
-```
-
-On macOS:
-
-```bash
-shasum -a 256 "$INSTALL_ROOT"/bin/market-squawk*
-```
-
-These locally generated digests identify the installed bytes; they are not published release
-approval or a reproducible-build claim.
-
-### Windows installation
-
-Copy all three `.exe` files into one new, versioned, operator-owned `bin` directory. Do not use a
-symlink or junction for either helper, and do not copy a new helper over a file that may be in use.
-Record each file with `Get-FileHash -Algorithm SHA256`, then invoke the application by the exact
-versioned path during bootstrap.
-
-## Bootstrap a new data root
-
-Set the exact installed application path and a new absolute data-root path:
-
-```bash
-MSQ="$INSTALL_ROOT/bin/market-squawk"
-DATA_ROOT=/absolute/operator-owned/market-squawk-data
-```
-
-Do not create `DATA_ROOT` over an unrelated directory. Then run:
-
-```bash
+"$INSTALLER" status --json
 "$MSQ" --version
-"$MSQ" --data-dir "$DATA_ROOT" --output json config validate
+"$MSQ" --data-dir "$DATA_ROOT" config validate
 "$MSQ" --data-dir "$DATA_ROOT" init
-"$MSQ" --data-dir "$DATA_ROOT" --output json doctor
+"$MSQ" --data-dir "$DATA_ROOT" doctor
 ```
 
-`config validate` parses and validates the effective configuration without proving source or
-runtime readiness. `init` prepares the controlled root, initializes or opens the production
-authorities, creates the initial diagnostic journal, and completes application-owned bounded
-shutdown. `doctor` then performs a query-only inspection of the existing layout, catalog,
-descriptor contracts, provider sessions, configuration, and local policy. It does not create,
-migrate, recover, or lock an application/MCP authority and it never probes a remote endpoint.
+Success requires:
 
-For a persistent configuration file, complete
-[Configuration and secrets operations](configuration-and-secrets.md), then pass the same explicit
-file to every command:
+- installer status reports `installed: true`, version `1.0.0`, and `healthy: true`;
+- `market-squawk --version` reports `1.0.0`;
+- configuration validation succeeds without unknown or invalid settings;
+- `init` opens the controlled layout and shuts down cleanly; and
+- `doctor` reports the existing local authorities without creating or repairing them.
 
-```bash
-"$MSQ" --config /absolute/path/market-squawk.toml --output json config validate
-"$MSQ" --config /absolute/path/market-squawk.toml init
-"$MSQ" --config /absolute/path/market-squawk.toml --output json doctor
-```
+`doctor` does not contact providers and does not turn an unconfigured source into a healthy one.
 
-There is no implicit configuration-file discovery.
+## Program and data locations
 
-## Expected success evidence
+The default program store is separate from portfolios, datasets, models, configuration, and logs.
+Ordinary uninstall can therefore remove the software without deleting user work.
 
-### Build and installation
+| Platform | Default program root |
+| --- | --- |
+| macOS | `~/Library/Application Support/com.MarketSquawk.Market-Squawk/program` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/marketsquawk/program` |
+| Windows | `%LOCALAPPDATA%\MarketSquawk\Market Squawk\data\program` |
 
-- Both Cargo commands exit `0`.
-- The three expected release executables exist.
-- The installed executables are regular sibling files in the same versioned `bin` directory.
-- `market-squawk --version` prints `market-squawk 0.2.0`.
-- The desktop type check and three critical frontend checks pass.
-- A requested native package appears under `target/release/bundle/` with the desktop executable,
-  all three exact sibling Rust programs, and every bundled license notice. For the current
-  no-developer-identity workflow, this is package-build evidence only.
+On Linux, a relative `XDG_DATA_HOME` is ignored and the home-directory fallback is used.
 
-### Configuration and initialization
-
-The default JSON from `config validate` includes:
-
-```json
-{
-  "valid": true,
-  "effective": {
-    "schemaVersion": "market-squawk-effective-config-v1",
-    "dataDirectory": {
-      "value": "/absolute/operator-owned/market-squawk-data",
-      "origin": "cli"
-    },
-    "products": {
-      "value": ["BTC-USD"],
-      "origin": "safe_default"
-    },
-    "sourceSecretConfigured": {
-      "value": false,
-      "origin": "safe_default"
-    },
-    "coinbaseConfigured": {
-      "value": false,
-      "origin": "safe_default"
-    },
-    "krakenConfigured": {
-      "value": false,
-      "origin": "safe_default"
-    }
-  }
-}
-```
-
-Additional bounded defaults appear in the actual result. `init` prints `initialized` followed by
-the canonical data-root path.
-
-Immediately after `init`, the root contains at least:
+The managed store has this shape:
 
 ```text
-<data-root>/
-├── artifacts/
-├── control/
-└── journal/
-    └── coinbase-exchange.msj
+program/
+├── installation.json
+├── bin/                              stable Unix desktop, CLI, and installer entrypoints
+├── versions/
+│   ├── 1.0.0-<manifest-sha256>/      active immutable complete release
+│   └── <previous-version>/           one retained rollback version, when available
+├── releases/
+│   └── <manifest-sha256>/            exact retained manifest and complete bundle
+└── staging/                          cleared bounded recovery workspace
 ```
 
-`init` also creates `catalog.sqlite3` and the service-specific control directories required by the
-production composition. `doctor` reports a missing or incomplete layout as a blocker and leaves it
-unchanged.
+Windows native packages own the normal Start menu and application entrypoints. macOS and Linux
+terminal installations use the stable `bin/` entrypoints shown above. Update and rollback refresh
+those derived files from the selected immutable release, and status verifies them against the
+component receipts.
 
-### Doctor interpretation
+The installed desktop uses Tauri's platform application-local data directory as its safe default.
+The CLI uses `.market-squawk` only when no explicit data directory is supplied. For durable
+headless operation, always choose an absolute `--data-dir`. Exact configuration and local storage
+semantics are in [Configuration and secrets](configuration-and-secrets.md) and the
+[configuration reference](../reference/configuration.md).
 
-A valid query-only preflight has:
+## Update, repair, and rollback
 
-```json
-{
-  "localStorage": {
-    "modifiedByInspection": false,
-    "layout": {
-      "state": "available",
-      "error": null
-    },
-    "catalog": {
-      "state": "available",
-      "journalMode": "wal",
-      "error": null
-    }
-  },
-  "application": {
-    "descriptorContractValid": true,
-    "runtimeState": "not_observed",
-    "requiredDomainsComplete": true,
-    "error": null
-  },
-  "mcp": {
-    "descriptorContractValid": true,
-    "runtimeState": "not_observed",
-    "transport": "stdio",
-    "durableAuditConfigured": true,
-    "controlledArtifactsConfigured": true,
-    "error": null
-  }
-}
+The desktop exposes Status, Update, Repair, and Rollback in its Operations area. Update and
+rollback require a restart because they change the active complete release.
+
+The terminal maintenance command uses the retained HTTPS release channel:
+
+```bash
+"$INSTALLER" status
+"$INSTALLER" update
+"$INSTALLER" repair
+"$INSTALLER" rollback
 ```
 
-`runtimeState: "not_observed"` is deliberate: the query-only command does not start an application,
-adapter, bot, or MCP session. That state is neither a positive health claim nor, by itself, a local
-readiness blocker. The top-level `status` remains `blocked` for locally established failures such as
-incomplete onboarding, code-owned evidence or rights gates, invalid contracts, or incomplete local
-storage. Current runtime status, coverage, and health come only from the bounded `Source.GetStatus`,
-`Source.GetCoverage`, and `Source.GetHealth` services in the application that owns the runtime; use
-the corresponding `source status`, `source coverage`, and `source health` commands in that workflow.
-Exact-head provider, hosted-OS, fuzz, performance, security, and publication evidence remains
-authoritative only in the
-[delivery ledger](../plans/delivery-ledger.md); doctor does not infer it.
+- **Update** accepts only a strictly newer semantic version, stages it completely, and changes the
+  selector only after validation.
+- **Repair** revalidates the active tree and durable entrypoints. If needed, it reconstructs the
+  same version from its exact retained manifest and bundle.
+- **Rollback** revalidates the one retained previous version before selecting it. It never rewinds
+  catalog or dataset schemas.
 
-## Safe restart and upgrade
+If an update or rollback reports `restartRequired`, close every Market Squawk desktop, CLI, MCP,
+and helper process, then start the selected release again.
 
-Configuration is immutable for the life of a process; there is no hot reload. A routine restart is:
+## Uninstall
 
-1. Stop long-lived `mcp serve`, capture, bot, or other Market Squawk processes through their normal
-   EOF, Ctrl-C, or controlled stop boundary.
-2. Wait for bounded shutdown to finish. Do not replace either helper while the application could
-   still own it.
-3. Run `config validate` with the exact configuration sources intended for the next process.
-4. Start the exact versioned application path and retain stderr until startup is confirmed.
-5. Run the domain-specific status command appropriate to the restarted workload.
+### Preserve user data
 
-For an upgrade:
+Use the operating system's normal application removal flow for a native package, or run:
 
-1. Quiesce every process using the data root.
-2. Follow [Backup and recovery](backup-and-recovery.md) to take a coherent offline backup of the
-   complete data root, including the catalog and any SQLite sidecar files present after shutdown.
-3. Build from the approved new source and install all three executables into a new versioned
-   directory.
-4. Record the new file hashes and run `--version` plus `config validate`.
-5. Point the service or operator command at the new versioned application path.
-6. Run `init` with the new version to perform the explicit stateful open/migration/recovery and
-   application-owned bounded shutdown.
-7. Run `doctor` to inspect the resulting state without reopening writer or MCP audit authority.
-8. Start the intended workload only after initialization succeeds and doctor reports no unexpected
-   local storage or contract blocker.
-9. Retain the prior versioned binaries and pre-upgrade data backup until recovery evidence has been
-   reviewed.
+```bash
+"$INSTALLER" uninstall
+```
 
-Never overwrite the active version in place. Do not use a symlinked helper as a “current” switch.
+The default removes the program store and managed entrypoints. It preserves configuration,
+credentials, catalogs, portfolios, datasets, models, logs, and artifacts.
 
-## Rollback and recovery
+### Delete selected data classes
 
-- **Build failed:** leave the installed version untouched. Correct the source checkout or
-  toolchain, then rebuild into `target/release`; do not copy a partial bundle.
-- **Install validation failed:** discard only the newly created version directory after verifying
-  its exact path. Reinstall all three files together.
-- **Bootstrap failed on a new root:** preserve stderr and inspect the exact root before cleanup.
-  Remove it only when it was created solely for the failed attempt and contains no wanted state.
-- **New version failed before opening state:** point the launch command back to the previous
-  versioned binary bundle.
-- **New version ran `init` or another stateful command:** do not run the old binary against
-  possibly migrated state on assumption alone. Quiesce the new version and restore the coherent
-  pre-upgrade data-root backup unless compatibility has been explicitly verified.
-- **Wrong data root selected:** stop immediately. Configuration does not move or merge state.
-  Correct the highest-precedence setting, validate again, and restart; do not manually combine two
-  roots.
+Data deletion is separate and must identify each exact absolute directory:
 
-## Known failure modes
+```bash
+"$INSTALLER" uninstall \
+  --confirm-delete-configuration "/absolute/path/to/configuration" \
+  --confirm-delete-logs "/absolute/path/to/logs"
+```
 
-| Symptom | Likely cause | Safe response |
+Available confirmations are:
+
+```text
+--confirm-delete-configuration
+--confirm-delete-credentials
+--confirm-delete-catalogs
+--confirm-delete-portfolios
+--confirm-delete-datasets
+--confirm-delete-models
+--confirm-delete-logs
+--confirm-delete-artifacts
+```
+
+Overlapping, relative, shallow, program-contained, symlinked, or non-directory deletion targets
+are rejected. Back up portfolios, datasets, models, and credentials before requesting deletion.
+
+## Offline installation
+
+From an online machine, download the target-specific complete ZIP, target manifest, bootstrap,
+`SHA256SUMS`, and attestations from the same immutable release. Preserve their filenames and verify
+them before transfer.
+
+On the offline target:
+
+```bash
+"/path/to/market-squawk-bootstrap-TARGET" \
+  install \
+  --manifest "/path/to/market-squawk-release-TARGET.json" \
+  --bundle "/path/to/market-squawk-1.0.0-TARGET.zip"
+```
+
+Replace `TARGET` with one of:
+
+```text
+aarch64-apple-darwin
+x86_64-apple-darwin
+x86_64-pc-windows-msvc
+x86_64-unknown-linux-gnu
+```
+
+Offline installation performs the same manifest, archive, inventory, digest, mode, and activation
+checks. It does not resolve Python packages or download another component.
+
+## Release integrity and platform trust
+
+The public release is all-or-nothing: Linux, Windows, both macOS architectures, complete Python
+3.14.6 products, native package installation, desktop startup, CLI doctor, MCP, lifecycle
+operations, checksums, and GitHub attestations must pass before publication.
+
+With GitHub CLI installed, verify release assets with:
+
+```bash
+mkdir market-squawk-release-verify
+gh release download v1.0.0 \
+  --repo Sawmonabo/market-squawk \
+  --pattern SHA256SUMS \
+  --pattern install.sh \
+  --dir market-squawk-release-verify
+gh release verify v1.0.0 --repo Sawmonabo/market-squawk
+gh release verify-asset v1.0.0 \
+  market-squawk-release-verify/install.sh \
+  --repo Sawmonabo/market-squawk
+gh attestation verify \
+  market-squawk-release-verify/install.sh \
+  --repo Sawmonabo/market-squawk
+```
+
+The cross-platform release index records one native trust mode for each target:
+
+- `developer-id-signed-and-notarized` only after Apple verification, timestamping, notarization,
+  and stapling succeed;
+- `authenticode-signed` only after Windows publisher and timestamp verification succeeds; or
+- `provenance-only` when the zero-cost release relies on GitHub provenance, attestation, exact
+  checksums, and transparent package identity.
+
+An operating system may show an unfamiliar-publisher warning for a provenance-only package. Verify
+the release first, then use the operating system's documented manual-open path if the user chooses
+to trust those exact bytes. Do not disable platform security globally.
+
+## Failure and recovery
+
+| Symptom | Meaning | Recovery |
 | --- | --- | --- |
-| rustup selects a compiler other than `1.97.1` | Pinned toolchain is unavailable or locally overridden | Stop and install/select the repository-pinned toolchain |
-| Cargo reports that the lockfile must change | Source and `Cargo.lock` do not match, or the command omitted `--locked` | Restore a clean reviewed checkout; do not regenerate the lockfile for this installation |
-| pnpm reports an out-of-date lockfile | The desktop manifest and committed `pnpm-lock.yaml` do not match | Restore the reviewed files; do not install without `--frozen-lockfile` |
-| Tauri cannot compile or bundle | A host prerequisite is missing or an unsupported bundle type was requested | Install the official prerequisite for that host and request only the package types in the matrix above |
-| Tauri reports that an `externalBin` file is missing | The package overlay was invoked without completing `bundle:prepare`, or a required release target failed | Use the supported package command, preserve the first compile error, and do not add or commit a placeholder executable |
-| A rebuilt Windows installer retains an older sibling program | Same-version NSIS replacement or retained Tauri output reused stale bytes | Stop the installed programs, build an immutable new release version, inspect installed hashes, and do not approve the release until every sibling changed as expected |
-| Desktop exits before opening a window | Desktop arguments, effective configuration, local paths, or `LocalProduct` startup failed | Run `market-squawk-desktop --help`, inspect the redacted stderr error, and correct the named local input; do not bypass initialization |
-| Application starts but capture helper admission fails | Helper missing, not an exact sibling, symlinked, non-executable, differently owned, or group/other writable | Quiesce the process and reinstall the whole bundle as regular sibling files |
-| ONNX worker is unavailable | Worker omitted, moved, symlinked, changed during admission, or built without the required target | Reinstall the exact worker beside the application |
-| `config validate` fails before state exists | Invalid file, environment, CLI override, or closed-schema value | Follow the configuration runbook; initialization is not a remedy for invalid configuration |
-| `init` rejects the path | Root cannot be safely created or canonicalized, or conflicts with existing state | Correct ownership/path selection; do not elevate or overwrite unrelated data |
-| `doctor` reports an unavailable layout or catalog | `init` was not run, the layout is incomplete, permissions changed, SQLite is unavailable, or catalog identities do not match | Preserve the JSON result; run the explicit bootstrap/upgrade procedure or repair the named local cause without deleting evidence |
-| `doctor` reports an invalid application/MCP descriptor contract | The binary's compiled service contract is internally inconsistent | Stop and use a verified binary; initialization cannot repair a compiled contract |
-| `doctor` reports top-level `blocked` with provider observations | Durable onboarding, rights, or code-owned release evidence is incomplete or invalid | Use provider/source operations and the delivery ledger; query current runtime health through the application-owned source service |
-| Old version cannot open state after an attempted upgrade | New version initialized or migrated durable state | Restore the coherent pre-upgrade backup unless backward compatibility is proven |
+| Terminal installer says its template is unpublished | A source-tree template was run instead of the release asset | Download `install.sh` from `releases/latest/download` |
+| Bootstrap digest mismatch | Downloaded bootstrap differs from the release-bound identity | Stop; remove the temporary download and retry from the official release |
+| `already installed` | An active selector exists | Use `status`, `update`, or `repair` |
+| `healthy: false` | Active release or derived Unix entrypoints differ from receipts | Close running processes and run `repair` |
+| Update is not newer | Candidate version is equal to or older than active | Keep the active version or use the explicit one-version `rollback` |
+| No previous version is available | No second admitted version is retained | Repair the current version or install a newer release |
+| Desktop reports packaged release unavailable | A production package lacks its complete embedded release | Re-download the native package; do not copy only the desktop binary |
+| Provider is not ready after install | Software installation and provider activation are separate | Continue guided setup and resolve the named provider requirement |
+| Python/model readiness fails | The active complete release or admitted model does not match | Repair the release, then revalidate the exact model bundle |
 
-## Local logs, data, and artifacts
+Never edit `installation.json`, an immutable version, a retained manifest, or a bundle by hand.
+Repair from the retained exact release or reinstall from the immutable public release.
 
-| Location or stream | Contents |
-| --- | --- |
-| `<source>/target/release/` | Local Cargo build outputs; generated, replaceable, and not runtime authority |
-| `<source>/target/release/bundle/` | Generated native application packages and installers |
-| `<install-root>/bin/` | The three installed executable files and operator-recorded inventory |
-| `<data-root>/catalog.sqlite3` | Durable catalog after `init`; SQLite `-wal` and `-shm` sidecars may exist while active |
-| `<data-root>/journal/` | Immutable diagnostic/capture journal state |
-| `<data-root>/artifacts/` | Controlled application artifacts |
-| `<data-root>/control/` | Durable control-plane and authority state |
-| stdout | Command results, or MCP protocol frames for `mcp serve` |
-| stderr | Human tracing, or structured tracing with `--json-logs`; no log file is created by default |
+## Development installation
+
+Building from source is a contributor workflow, not the normal installation path. It requires the
+pinned Rust toolchain, Node.js, pnpm, Tauri prerequisites, and platform build tools. Follow the
+[README Development section](../../README.md#development) and
+[CONTRIBUTING.md](../../CONTRIBUTING.md). A source build does not carry public-release
+attestations merely because its tests pass.
 
 ## Related documentation and code
 
+- [README quick start](../../README.md#quick-start)
 - [Configuration and secrets operations](configuration-and-secrets.md)
 - [Source operations](source-operations.md)
+- [Model training and inference](model-inference.md)
 - [Backup and recovery](backup-and-recovery.md)
-- [CLI reference](../reference/cli.md)
-- [Configuration reference](../reference/configuration.md)
 - [Deployment architecture](../architecture/deployment.md)
-- [Security and trust boundaries](../architecture/security-and-trust-boundaries.md)
-- [Delivery ledger](../plans/delivery-ledger.md)
-- [Pinned Rust toolchain](../../rust-toolchain.toml)
-- [Workspace and release profile](../../Cargo.toml)
-- [Application executable targets](../../apps/market-squawk/Cargo.toml)
-- [Desktop frontend manifest](../../apps/market-squawk-desktop/package.json)
-- [Desktop Tauri configuration](../../apps/market-squawk-desktop/src-tauri/tauri.conf.json)
-- [Desktop package overlay](../../apps/market-squawk-desktop/src-tauri/tauri.bundle.conf.json)
-- [Desktop external-program staging](../../apps/market-squawk-desktop/scripts/stage-sidecars.mjs)
-- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
-- [Modeling worker target](../../crates/market-squawk-modeling/Cargo.toml)
-- [Executable sibling admission](../../apps/market-squawk/src/local_product/executable.rs)
-- [Capture-helper admission](../../crates/market-squawk-platform/src/capture/process_journal/config.rs)
-- [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
-- [Full verification workflow](../../scripts/verify.sh)
-- [Tauri packaging research](../research/2026-07-28-tauri-packaging-and-runtime-boundaries.md)
+- [Configuration reference](../reference/configuration.md)
+- [CLI reference](../reference/cli.md)
+- [Release trust decision](../architecture/decisions/0006-complete-versioned-release-bundles.md)
+- [Installer lifecycle implementation](../../apps/market-squawk-installer/src/lifecycle.rs)
+- [Release workflow](../../.github/workflows/release.yml)
 
 ## Official sources
 
-These upstream sources were reviewed directly through 2026-07-28. They describe prerequisite tools and
-formats; the reviewed Market Squawk commit remains authoritative for the exact build, bundle, and
-bootstrap procedure.
-
 | Source | Applied fact | Reviewed |
 | --- | --- | --- |
-| [Install Rust](https://rust-lang.org/tools/install/) | rustup is the supported Rust toolchain installer; Windows Rust installation requires the corresponding Visual Studio prerequisites | 2026-07-23 |
-| [Cargo build command](https://doc.rust-lang.org/cargo/commands/cargo-build.html) | `--release` selects the release profile and `--locked` rejects dependency resolution that would change the lockfile | 2026-07-23 |
-| [Python virtual environments](https://docs.python.org/3/library/venv.html) | Upstream isolation mechanism used only as an input to the separate sealed Python release workflow | 2026-07-23 |
-| [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | Defines the supported host build tools, WebView, and Linux native packages required to compile a Tauri 2 application | 2026-07-28 |
-| [Tauri distribution](https://v2.tauri.app/distribute/) | Defines native platform packaging and signing as separate distribution concerns | 2026-07-28 |
-| [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program naming and native-package placement | 2026-07-28 |
-| [Tauri CLI](https://v2.tauri.app/reference/cli/) | Defines the package-only `--config` overlay used by this runbook | 2026-07-28 |
-| [Node.js releases](https://nodejs.org/en/about/previous-releases) | Node.js 24 is the active LTS line used by the locked desktop build | 2026-07-28 |
+| [Tauri distribution](https://v2.tauri.app/distribute/) | Native package families and platform distribution boundary | 2026-07-30 |
+| [Tauri Windows installers](https://v2.tauri.app/distribute/windows-installer/) | NSIS/MSI and Windows runtime behavior | 2026-07-30 |
+| [Tauri AppImage](https://v2.tauri.app/distribute/appimage/) | Linux AppImage runtime and compatibility considerations | 2026-07-30 |
+| [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) | Public build-provenance verification | 2026-07-30 |
+| [GitHub CLI attestation verification](https://cli.github.com/manual/gh_attestation_verify) | Local artifact-attestation command | 2026-07-30 |
+| [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Tag and asset immutability boundary | 2026-07-30 |
+| [Apple: Open a Mac app from an unidentified developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unidentified-developer-mh40616/mac) | Narrow user-controlled manual-open recovery | 2026-07-30 |
+| [Microsoft SmartScreen overview](https://learn.microsoft.com/en-us/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/) | Windows reputation and warning boundary | 2026-07-30 |
+| [`directories` 6.0.0](https://docs.rs/directories/6.0.0/directories/struct.ProjectDirs.html) | Per-user program-root derivation | 2026-07-30 |

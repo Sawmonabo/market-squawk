@@ -44,7 +44,7 @@ flowchart LR
     Repo["Clean exact Git HEAD and tree"]
     Binary["Running release executable"]
     Providers["Exact provider-evidence.json"]
-    Python["Signed CPython 3.12 and 3.13 releases"]
+    Python["Verified CPython 3.14.6 release"]
     Kernels["Production kernels"]
     Product["Complete LocalProduct"]
     CLI["Shipping CLI transport"]
@@ -100,8 +100,7 @@ target/release-evidence/<HEAD>/
 ├── python/
 │   ├── market-squawk-release.json
 │   ├── market-squawk-release-evidence.json
-│   ├── release-cp312/
-│   └── release-cp313/
+│   └── release-cp314/
 └── demo.json                  # absent before the command
 ```
 
@@ -111,7 +110,7 @@ Admission requires:
 - a clean repository that remains unchanged through publication;
 - real, non-symlink evidence directories and bounded regular files;
 - a provider report for the exact repository and current executable;
-- the exact signed CPython 3.12 and 3.13 training environments;
+- the exact verified CPython 3.14.6 training environment;
 - an output named `demo.json` in the same HEAD-keyed root;
 - no parent traversal and no output overwrite; and
 - no credential material in provider, Python, or demonstration evidence.
@@ -163,8 +162,8 @@ release.
 
 The production demonstration runner and its strict closure predicates are implemented in the
 current release lane. Focused compilation, Clippy, and the consolidated fail-closed admission case
-are the lane gate. The exact invocation above remains blocked until the authorized provider report
-and signed Python releases exist for one frozen clean candidate. No `demo.json` is currently
+are the lane gate. The terminal invocation still requires the current provider report and verified
+CPython 3.14.6 release evidence from the same frozen clean candidate. No `demo.json` is currently
 accepted as release evidence.
 
 ## Related code and documentation

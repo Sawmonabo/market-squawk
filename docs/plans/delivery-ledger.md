@@ -1,12 +1,46 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-28
+Last updated: 2026-07-30
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
-## Current integration state
+## Current v1.0.0 release state
+
+- Active delivery is in the isolated `feature/complete-installer` worktree and draft PR
+  [#39](https://github.com/Sawmonabo/market-squawk/pull/39), stacked on desktop PR
+  [#37](https://github.com/Sawmonabo/market-squawk/pull/37) and release PR
+  [#26](https://github.com/Sawmonabo/market-squawk/pull/26). The frozen installer implementation
+  head is `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3`; the exact commit containing this status update is
+  reported on PR #39 after push rather than self-referenced here.
+- The product release version is `1.0.0`. The complete release carries the Obsidian Signal
+  desktop, CLI, capture helper, ONNX worker, model validator, training driver, Rust installer,
+  uv 0.12.0, managed CPython 3.14.6, and the exact locked Python analytics and training product on
+  Linux x64, Windows x64, macOS Intel, and macOS Apple Silicon.
+- The complete-bundle builder, immutable installation lifecycle, native package assembly,
+  four-platform release workflow, artifact attestations, conditional native publisher signing,
+  truthful zero-cost `provenance-only` mode, and targeted pull-request CI are implemented. The
+  installer now publishes durable verified desktop, CLI, and maintenance entrypoints on POSIX
+  systems and refreshes them across install, update, repair, and rollback.
+- Hosted Actions run
+  [30557934858](https://github.com/Sawmonabo/market-squawk/actions/runs/30557934858) reached
+  10 of 15 successful jobs with zero failures before it was intentionally cancelled. That run was
+  stopped because a release-truth audit found stale maintained documentation and missing durable
+  POSIX entrypoints; it is diagnostic evidence, not exact-head approval.
+- The release-truth and entrypoint gap is closed at the implementation head above. Installer
+  lifecycle, source onboarding, FRED rights, source-lock admission, shell/JSON validation,
+  formatting, and strict affected-package Clippy passed. The next barrier is one completely green
+  unchanged-head CI run, followed by the existing Quarter 4 of 4 review, PR-stack integration,
+  annotated `v1.0.0` publication, public install smoke, and GitHub/worktree/branch closeout.
+- Issue [#38](https://github.com/Sawmonabo/market-squawk/issues/38) and its Project 5 item remain
+  `In Progress`. Nothing in the interrupted run or focused evidence is represented as release
+  approval.
+- The worktree-local Cargo target was safely reclaimed after focused verification; no `target/`
+  directory remains and approximately 152 GiB is free. No Cargo or Rust compiler process was
+  active at this checkpoint.
+
+## Historical integration record through 2026-07-28
 
 - Release branch: `release/market-squawk-v0.1.0`
 - Latest integrated product-capability head:

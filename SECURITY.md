@@ -2,12 +2,12 @@
 
 ## Supported release
 
-The `1.0.0` release candidate is developed on the historically named
-`release/market-squawk-v0.1.0` integration branch; that branch name is retained for audit
-continuity and does not define the package version. No complete local release is currently approved
-or tagged. Security corrections are integrated into the active release branch and then into `main`
-through the reviewed release pull request. This is research infrastructure and not a production
-brokerage or live-order execution system.
+Security support begins with `v1.0.0`. The latest published stable `1.0.x` release receives
+security corrections. Development branches, pull-request artifacts, historical snapshots, and
+older tags are not supported releases unless a repository security advisory says otherwise.
+
+Market Squawk is self-hosted financial research and paper-execution infrastructure. It is not a
+brokerage, and v1.0.0 does not enable live-money order submission.
 
 ## Reporting
 

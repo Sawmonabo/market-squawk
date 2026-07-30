@@ -169,8 +169,9 @@ Audit records explain authority but do not recreate a current capability.
 ## Portability and operability
 
 The product uses stable Rust 1.97.1, Edition 2024, resolver 3, a committed lockfile, and local
-dependencies. Platform code contains explicit Unix and Windows path/process/security branches,
-while the sealed Python v0.1 target is CPython 3.12/3.13 on macOS arm64.
+dependencies. Platform code contains explicit Unix and Windows path/process/security branches.
+The complete v1.0.0 release carries one standard-GIL CPython 3.14.6 product on macOS Apple
+Silicon, macOS Intel, Windows x64, and Linux x64.
 
 The desktop package matrix covers Ubuntu 24.04 x86-64, macOS 15 on Apple Silicon and Intel, and
 Windows Server 2025 x86-64. The system WebView and native package format remain platform-owned;
