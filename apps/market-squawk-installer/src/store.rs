@@ -26,6 +26,8 @@ const STATE_FILE: &str = "installation.json";
 const VERSIONS_DIRECTORY: &str = "versions";
 const RELEASES_DIRECTORY: &str = "releases";
 const STAGING_DIRECTORY: &str = "staging";
+#[cfg(unix)]
+const ENTRYPOINTS_DIRECTORY: &str = "bin";
 const LOCK_FILE: &str = ".market-squawk-installer.lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -281,6 +283,34 @@ impl InstallStore {
         self.root.join(RELEASES_DIRECTORY).join(manifest_sha256)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn entrypoint_path(
+        &self,
+        program: crate::platform::ProgramName,
+        target: SupportedTarget,
+    ) -> Result<PathBuf, StoreError> {
+        let file_name = program
+            .relative_path(target)
+            .file_name()
+            .ok_or(StoreError::CorruptState)?
+            .to_owned();
+        Ok(self.root.join(ENTRYPOINTS_DIRECTORY).join(file_name))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn publish_entrypoint(
+        &self,
+        staged: &Path,
+        program: crate::platform::ProgramName,
+        target: SupportedTarget,
+    ) -> Result<(), StoreError> {
+        let destination = self.entrypoint_path(program, target)?;
+        fs::rename(staged, destination)
+            .map_err(|source| StoreError::io("publish stable program entrypoint", source))?;
+        sync_directory(&self.root.join(ENTRYPOINTS_DIRECTORY))?;
+        Ok(())
+    }
+
     pub(crate) fn publish_new_version(
         &self,
         stage: &Path,
@@ -377,21 +407,25 @@ impl InstallStore {
 
     fn prepare_reserved_directories(&self) -> Result<(), StoreError> {
         for name in [VERSIONS_DIRECTORY, RELEASES_DIRECTORY, STAGING_DIRECTORY] {
-            let path = self.root.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Ok(_) => return Err(StoreError::UnsafeRoot),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&path)
-                        .map_err(|source| StoreError::io("create reserved directory", source))?;
-                    set_private_directory_permissions(&path)?;
-                }
-                Err(source) => {
-                    return Err(StoreError::io("inspect reserved directory", source));
-                }
-            }
+            self.prepare_reserved_directory(name)?;
         }
+        #[cfg(unix)]
+        self.prepare_reserved_directory(ENTRYPOINTS_DIRECTORY)?;
         Ok(())
+    }
+
+    fn prepare_reserved_directory(&self, name: &str) -> Result<(), StoreError> {
+        let path = self.root.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+            Ok(_) => Err(StoreError::UnsafeRoot),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path)
+                    .map_err(|source| StoreError::io("create reserved directory", source))?;
+                set_private_directory_permissions(&path)
+            }
+            Err(source) => Err(StoreError::io("inspect reserved directory", source)),
+        }
     }
 
     fn clear_staging(&self) -> Result<(), StoreError> {

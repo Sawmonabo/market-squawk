@@ -75,4 +75,4 @@ fi
 chmod 700 "$bootstrap"
 "$bootstrap" install --manifest-url "$manifest_url"
 
-echo "Market Squawk is installed. Open the native application or run its installed launcher."
+echo "Market Squawk is installed. The durable desktop, CLI, and maintenance paths are listed above."

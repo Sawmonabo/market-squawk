@@ -287,7 +287,7 @@ const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
 const SEC_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         SEC_PUBLIC_API_AUTHORITY_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/sec-edgar-public-api-2026-07-26.md",
+        "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/research/providers/sec-edgar-public-api-2026-07-26.md",
         "2026-07-26",
         Some(SEC_PUBLIC_API_AUTHORITY_DIGEST),
         false,
@@ -317,21 +317,21 @@ const SEC_EVIDENCE: &[ProfileEvidence] = &[
 const FRED_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         FRED_TERMS_MANIFEST_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/verification/fred-rights-decision.json",
+        "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/verification/fred-rights-decision.json",
         "2026-07-26",
         Some(FRED_TERMS_MANIFEST_DIGEST),
         false,
     ),
     ProfileEvidence::new(
         FRED_UNRATE_RIGHTS_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/verification/fred-unrate-public-domain-rights.json",
+        "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/verification/fred-unrate-public-domain-rights.json",
         "2026-07-26",
         Some(FRED_UNRATE_RIGHTS_DIGEST),
         false,
     ),
     ProfileEvidence::new(
         FRED_SELF_HOSTED_AUTHORITY_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md",
+        "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/research/providers/2026-07-26-fred-alfred-self-hosted-api-authority.md",
         "2026-07-26",
         Some(FRED_SELF_HOSTED_AUTHORITY_DIGEST),
         false,
@@ -368,7 +368,7 @@ const FRED_EVIDENCE: &[ProfileEvidence] = &[
 const BLS_V1_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
         BLS_PUBLIC_V1_AUTHORITY_SOURCE,
-        "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/research/providers/bls-public-data-api-2026-07-21.md",
+        "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/research/providers/bls-public-data-api-2026-07-21.md",
         "2026-07-26",
         Some(BLS_PUBLIC_V1_AUTHORITY_DIGEST),
         false,

@@ -12,6 +12,8 @@ use crate::archive::{
     ArchiveError, ComponentReceipt, extract_bundle, seal_tree_root, sha256_file, sync_directory,
     verify_bundle, verify_installed_tree,
 };
+#[cfg(unix)]
+use crate::archive::{set_component_permissions, verify_component};
 use crate::contracts::{
     InstallReceipt, InstallRequest, InstallStatus, RepairRequest, RollbackRequest,
     UninstallReceipt, UninstallRequest, UpdateRequest,
@@ -19,11 +21,18 @@ use crate::contracts::{
 use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
+use crate::platform::ProgramName;
 use crate::store::{InstallStore, InstallationState, StoreError, StoredVersion, remove_tree};
 
 const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const STABLE_PROGRAMS: [ProgramName; 3] = [
+    ProgramName::Desktop,
+    ProgramName::Cli,
+    ProgramName::Installer,
+];
 
 /// Installs one complete release and creates the first active selector.
 ///
@@ -39,6 +48,7 @@ pub fn install(request: InstallRequest) -> Result<InstallReceipt, InstallError> 
     let active = prepare_candidate(&store, &request.release, &request.bundle)?;
     let state = InstallationState::initial(active, request.channel_manifest_url)?;
     store.write_state(&state)?;
+    publish_stable_programs(&store, &state)?;
     store.prune(&state)?;
     receipt(&state, false)
 }
@@ -62,6 +72,7 @@ pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
     let active = prepare_candidate(&store, &request.release, &request.bundle)?;
     state.activate(active, request.channel_manifest_url)?;
     store.write_state(&state)?;
+    publish_stable_programs(&store, &state)?;
     store.prune(&state)?;
     receipt(&state, false)
 }
@@ -78,7 +89,11 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let active_path = store.version_path(&state.active);
     if verify_installed_tree(&active_path, &state.active.components).is_ok() {
-        return receipt(&state, false);
+        if verify_stable_programs(&store, &state).is_ok() {
+            return receipt(&state, false);
+        }
+        publish_stable_programs(&store, &state)?;
+        return receipt(&state, true);
     }
 
     let release = read_cached_release(&store, &state.active)?;
@@ -107,6 +122,7 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     }
     seal_tree_root(&active_path)?;
     verify_installed_tree(&active_path, &state.active.components)?;
+    publish_stable_programs(&store, &state)?;
     receipt(&state, true)
 }
 
@@ -125,6 +141,7 @@ pub fn rollback(request: RollbackRequest) -> Result<InstallReceipt, InstallError
     verify_installed_tree(&store.version_path(previous), &previous.components)?;
     state.swap_for_rollback()?;
     store.write_state(&state)?;
+    publish_stable_programs(&store, &state)?;
     store.prune(&state)?;
     receipt(&state, false)
 }
@@ -143,7 +160,8 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
         return Ok(absent_status());
     };
     let healthy =
-        verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok();
+        verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok()
+            && verify_stable_programs(&store, &state).is_ok();
     Ok(InstallStatus {
         installed: true,
         active_version: Some(state.active.version.clone()),
@@ -173,6 +191,36 @@ pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
     let active = store.version_path(&state.active);
     verify_installed_tree(&active, &state.active.components)?;
     Ok(active)
+}
+
+/// Returns a revalidated stable installed entrypoint for one code-owned program.
+///
+/// On Unix, the returned path remains constant across update and rollback. Native Windows
+/// packages own their operating-system application entrypoints, so this function returns the
+/// active immutable program path there.
+///
+/// # Errors
+///
+/// Fails when the installation, selected release, or derived stable entrypoints are inconsistent.
+pub fn stable_program_path(root: &Path, program: ProgramName) -> Result<PathBuf, InstallError> {
+    #[cfg(unix)]
+    {
+        if !STABLE_PROGRAMS.contains(&program) {
+            return resolve_program(root, program);
+        }
+        let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+        let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+        if state.active.target != crate::platform::SupportedTarget::current()? {
+            return Err(InstallError::CorruptInstallation);
+        }
+        verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
+        verify_stable_programs(&store, &state)?;
+        Ok(store.entrypoint_path(program, state.active.target)?)
+    }
+    #[cfg(not(unix))]
+    {
+        resolve_program(root, program)
+    }
 }
 
 pub(crate) fn resolve_program(
@@ -207,6 +255,139 @@ pub(crate) fn resolve_program(
     let version_root = store.version_path(&state.active);
     verify_installed_tree(&version_root, &state.active.components)?;
     Ok(version_root.join(relative))
+}
+
+#[cfg(unix)]
+fn publish_stable_programs(
+    store: &InstallStore,
+    state: &InstallationState,
+) -> Result<(), InstallError> {
+    let version_root = store.version_path(&state.active);
+    verify_installed_tree(&version_root, &state.active.components)?;
+    let stage = store.create_stage("entrypoints")?;
+    let result = (|| {
+        for program in STABLE_PROGRAMS {
+            let receipt = program_receipt(state, program)?;
+            let source = version_root.join(program.relative_path(state.active.target));
+            let destination = stage.join(
+                program
+                    .relative_path(state.active.target)
+                    .file_name()
+                    .ok_or(InstallError::CorruptInstallation)?,
+            );
+            let copied = fs::copy(&source, &destination).map_err(|source| InstallError::Io {
+                operation: "stage stable program entrypoint",
+                source,
+            })?;
+            if copied != receipt.size {
+                return Err(InstallError::CorruptInstallation);
+            }
+            set_component_permissions(&destination, true)?;
+            File::open(&destination)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| InstallError::Io {
+                    operation: "synchronize stable program entrypoint",
+                    source,
+                })?;
+            verify_component(&destination, receipt)?;
+        }
+        for program in STABLE_PROGRAMS {
+            let staged = stage.join(
+                program
+                    .relative_path(state.active.target)
+                    .file_name()
+                    .ok_or(InstallError::CorruptInstallation)?,
+            );
+            store.publish_entrypoint(&staged, program, state.active.target)?;
+        }
+        remove_tree(&stage)?;
+        verify_stable_programs(store, state)
+    })();
+    if result.is_err() && stage.exists() {
+        let _ = remove_tree(&stage);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn publish_stable_programs(
+    _store: &InstallStore,
+    _state: &InstallationState,
+) -> Result<(), InstallError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_stable_programs(
+    store: &InstallStore,
+    state: &InstallationState,
+) -> Result<(), InstallError> {
+    let mut observed = fs::read_dir(
+        store
+            .entrypoint_path(ProgramName::Cli, state.active.target)?
+            .parent()
+            .ok_or(InstallError::CorruptInstallation)?,
+    )
+    .map_err(|source| InstallError::Io {
+        operation: "read stable program entrypoints",
+        source,
+    })?
+    .map(|entry| {
+        entry
+            .map_err(|source| InstallError::Io {
+                operation: "read stable program entrypoint",
+                source,
+            })?
+            .file_name()
+            .into_string()
+            .map_err(|_| InstallError::CorruptInstallation)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    observed.sort();
+    let mut expected = STABLE_PROGRAMS
+        .iter()
+        .map(|program| {
+            program
+                .relative_path(state.active.target)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .ok_or(InstallError::CorruptInstallation)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    expected.sort();
+    if observed != expected {
+        return Err(InstallError::CorruptInstallation);
+    }
+    for program in STABLE_PROGRAMS {
+        let receipt = program_receipt(state, program)?;
+        let path = store.entrypoint_path(program, state.active.target)?;
+        verify_component(&path, receipt)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_stable_programs(
+    _store: &InstallStore,
+    _state: &InstallationState,
+) -> Result<(), InstallError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn program_receipt(
+    state: &InstallationState,
+    program: ProgramName,
+) -> Result<&ComponentReceipt, InstallError> {
+    let relative = program.relative_path(state.active.target);
+    let portable = relative.to_str().ok_or(InstallError::CorruptInstallation)?;
+    state
+        .active
+        .components
+        .iter()
+        .find(|receipt| receipt.path.as_ref() == portable && receipt.executable)
+        .ok_or(InstallError::CorruptInstallation)
 }
 
 /// Removes program state and only those mutable-data classes separately confirmed in the request.

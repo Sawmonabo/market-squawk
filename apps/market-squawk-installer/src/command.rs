@@ -222,7 +222,7 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                     let downloaded = download_release(&url, &root).await?;
                     install(
                         InstallRequest::from_local(
-                            root,
+                            root.clone(),
                             &downloaded.manifest,
                             downloaded.bundle.path(),
                         )?
@@ -231,11 +231,11 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 }
                 (None, Some(manifest), Some(bundle)) => {
                     let bytes = read_manifest(&manifest)?;
-                    install(InstallRequest::from_local(root, &bytes, &bundle)?)?
+                    install(InstallRequest::from_local(root.clone(), &bytes, &bundle)?)?
                 }
                 _ => return Err(CommandError::InstallSource),
             };
-            output(json, "installed", &receipt)?;
+            output_install(json, &root, &receipt)?;
         }
         InstallerCommand::Update => {
             let receipt = update_from_channel(&root).await?;
@@ -788,6 +788,37 @@ fn output<T: Serialize>(json: bool, action: &str, value: &T) -> Result<(), Comma
         );
     } else {
         println!("Market Squawk {action}.");
+    }
+    Ok(())
+}
+
+fn output_install(json: bool, _root: &Path, receipt: &InstallReceipt) -> Result<(), CommandError> {
+    #[cfg(unix)]
+    let entrypoints = if json {
+        None
+    } else {
+        let cli = crate::lifecycle::stable_program_path(_root, ProgramName::Cli)?;
+        let directory = cli.parent().ok_or(CommandError::DownloadRoot)?;
+        let desktop = directory.join(
+            ProgramName::Desktop
+                .relative_path(SupportedTarget::current()?)
+                .file_name()
+                .ok_or(CommandError::DownloadRoot)?,
+        );
+        let installer = directory.join(
+            ProgramName::Installer
+                .relative_path(SupportedTarget::current()?)
+                .file_name()
+                .ok_or(CommandError::DownloadRoot)?,
+        );
+        Some((desktop, cli, installer))
+    };
+    output(json, "installed", receipt)?;
+    #[cfg(unix)]
+    if let Some((desktop, cli, installer)) = entrypoints {
+        println!("Desktop: {}", desktop.display());
+        println!("CLI: {}", cli.display());
+        println!("Updates and repair: {}", installer.display());
     }
     Ok(())
 }

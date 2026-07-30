@@ -312,7 +312,7 @@ fn configure_no_follow(options: &mut OpenOptions, _executable: bool) {
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
-fn set_component_permissions(path: &Path, executable: bool) -> Result<(), ArchiveError> {
+pub(crate) fn set_component_permissions(path: &Path, executable: bool) -> Result<(), ArchiveError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -437,7 +437,10 @@ fn collect_regular_files(root: &Path) -> Result<Vec<String>, ArchiveError> {
     Ok(files)
 }
 
-fn verify_component(path: &Path, receipt: &ComponentReceipt) -> Result<(), ArchiveError> {
+pub(crate) fn verify_component(
+    path: &Path,
+    receipt: &ComponentReceipt,
+) -> Result<(), ArchiveError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| ArchiveError::io("inspect installed component", source))?;
     if !metadata.file_type().is_file()

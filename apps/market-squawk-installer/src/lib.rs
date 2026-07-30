@@ -15,7 +15,8 @@ pub use self::contracts::{
     RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
-    InstallError, active_release_root, install, repair, rollback, status, uninstall, update,
+    InstallError, active_release_root, install, repair, rollback, stable_program_path, status,
+    uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
@@ -42,6 +43,8 @@ mod tests {
         InstallRequest, RepairRequest, RollbackRequest, SupportedTarget, UninstallRequest,
         UpdateRequest, install, repair, rollback, status, uninstall, update,
     };
+    #[cfg(unix)]
+    use super::{ProgramName, stable_program_path};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -93,6 +96,25 @@ mod tests {
             &first.manifest,
             &first.bundle,
         )?)?;
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+            b"0.1.0:bin/market-squawk"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
+            fs::set_permissions(&stable_cli, fs::Permissions::from_mode(0o700))?;
+            fs::write(&stable_cli, b"damaged")?;
+            assert!(!status(&root)?.is_healthy());
+            assert!(repair(RepairRequest::new(root.clone()))?.repaired());
+            assert_eq!(
+                fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+                b"0.1.0:bin/market-squawk"
+            );
+        }
 
         let installed_version = fs::read_dir(root.join("versions"))?
             .next()
@@ -124,6 +146,11 @@ mod tests {
             &second.manifest,
             &second.bundle,
         )?)?;
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+            b"0.2.0:bin/market-squawk"
+        );
 
         let updated = status(&root)?;
         assert_eq!(updated.active_version(), Some("0.2.0"));
@@ -133,6 +160,11 @@ mod tests {
         let rolled_back = status(&root)?;
         assert_eq!(rolled_back.active_version(), Some("0.1.0"));
         assert_eq!(rolled_back.previous_version(), Some("0.2.0"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+            b"0.1.0:bin/market-squawk"
+        );
         Ok(())
     }
 

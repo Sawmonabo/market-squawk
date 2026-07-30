@@ -432,8 +432,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-fred/src/rights.rs",
-      "sha256": "76252b80f6f72a7430f118f257f0d1fd4dfdad7dc159f9e8e1c0920c6e0e036a",
-      "size_bytes": 75022
+      "sha256": "e13284c1583dd9295517dfb2a0ca6b2c04aab2dfe0964f128a3db9dd776622af",
+      "size_bytes": 75000
     },
     {
       "path": "adapters/market-squawk-adapter-fred/src/series.rs",
@@ -3927,8 +3927,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/built_in_profiles.rs",
-      "sha256": "26ad5b9f1103e7b4c7d42034d1d3f4f06490bd54f98976bf1a5b9ff885f3a709",
-      "size_bytes": 60684
+      "sha256": "f782792641bdff4b6ec835425de95f2670e5e4afc5f7f7116a22cd32ff4966fc",
+      "size_bytes": 60574
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/capability.rs",

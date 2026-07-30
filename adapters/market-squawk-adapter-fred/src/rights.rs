@@ -147,7 +147,7 @@ const CURRENT_DURABLE_OPERATIONS: [FredOperation; 5] = [
     FredOperation::Archive,
     FredOperation::Train,
 ];
-const CURRENT_UNRATE_EVIDENCE_REFERENCE: &str = "https://github.com/Sawmonabo/market-squawk/blob/release/market-squawk-v0.1.0/docs/verification/fred-unrate-public-domain-rights.json";
+const CURRENT_UNRATE_EVIDENCE_REFERENCE: &str = "https://github.com/Sawmonabo/market-squawk/blob/v1.0.0/docs/verification/fred-unrate-public-domain-rights.json";
 const CURRENT_UNRATE_AUTHORITY_URL: &str = "https://www.bls.gov/opub/copyright-information.htm";
 const CURRENT_UNRATE_CITATION_URL_PREFIX: &str = "https://fred.stlouisfed.org/series/";
 
