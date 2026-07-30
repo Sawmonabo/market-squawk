@@ -821,17 +821,17 @@ impl BudgetPermit {
             }
             return;
         }
-        let Ok(observation) = self.allocation.clock.observation() else {
-            let _reason =
-                budget.terminal_fault(BudgetUnavailableReason::ClockUnavailable, admission);
+        let Ok(mut state) = self.allocation.state.lock() else {
+            let _reason = budget.terminal_fault(BudgetUnavailableReason::StatePoisoned, admission);
             self.released = true;
             if let Some(permit) = &mut self.provider_rate {
                 let _released = permit.release();
             }
             return;
         };
-        let Ok(mut state) = self.allocation.state.lock() else {
-            let _reason = budget.terminal_fault(BudgetUnavailableReason::StatePoisoned, admission);
+        let Ok(observation) = self.allocation.clock.observation() else {
+            let _reason =
+                budget.terminal_fault(BudgetUnavailableReason::ClockUnavailable, admission);
             self.released = true;
             if let Some(permit) = &mut self.provider_rate {
                 let _released = permit.release();

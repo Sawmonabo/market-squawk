@@ -3977,12 +3977,12 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator.rs",
-      "sha256": "632174dc412e04cc0d862f2dedb1f7fedbf17cc5aff9e019492a8fe69afd9f45",
+      "sha256": "bc3e8968157565df60d8f21aa6c170cc7978bfe778875b2fdf7e7b9ad2782631",
       "size_bytes": 6752
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator/durability.rs",
-      "sha256": "bb52db7dfda484a70b3784dd6e8780fe44d0bc08f8785a4e7ec8619ca77b1811",
+      "sha256": "426686083565ee9c11a0982025fbd5b85a4db9675569b5743f04f48256864bbe",
       "size_bytes": 33528
     },
     {
@@ -4062,8 +4062,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/runtime.rs",
-      "sha256": "e1db6c6abdd1c567f85ca1e0b685189baa4c9e363c6f7a79c2bdfc766b6d6342",
-      "size_bytes": 41325
+      "sha256": "686cf477d282bfffc2752fe0333b65cb934accf4d9839e355fed6613f7246cc8",
+      "size_bytes": 42241
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/runtime/failure.rs",

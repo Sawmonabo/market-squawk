@@ -64,16 +64,16 @@ impl SharedProviderBudget {
         if self.allocation.terminal.load(Ordering::Acquire) {
             return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
         }
-        let observation = match self.allocation.clock.observation() {
-            Ok(observation) => observation,
-            Err(_reason) => {
-                return self.terminal_fail(BudgetUnavailableReason::ClockUnavailable, &operation);
-            }
-        };
         let mut state = match self.allocation.state.lock() {
             Ok(state) => state,
             Err(_) => {
                 return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
+            }
+        };
+        let observation = match self.allocation.clock.observation() {
+            Ok(observation) => observation,
+            Err(_reason) => {
+                return self.terminal_fail(BudgetUnavailableReason::ClockUnavailable, &operation);
             }
         };
         if state.disabled {
