@@ -23,10 +23,60 @@ MAX_METADATA_BYTES = 256 * 1024
 MAX_AUTHORITY_BYTES = 256 * 1024
 MAX_VALIDATOR_BYTES = 128 * 1024 * 1024
 VALIDATOR_READ_BYTES = 1024 * 1024
+NATIVE_EXECUTABLES = frozenset(
+    {
+        "market-squawk",
+        "market-squawk-model-validator",
+        "market-squawk-onnx-worker",
+    }
+)
 
 
 class BundleExportError(ValueError):
     """A bundle candidate was not safely written and admitted by Rust."""
+
+
+def _native_release_executable(name: str) -> Path:
+    if name not in NATIVE_EXECUTABLES:
+        raise BundleExportError("native release executable name is invalid")
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(sys.prefix).resolve(strict=True) / "bin" / f"{name}{suffix}"
+
+
+def _native_subprocess_environment() -> dict[str, str]:
+    environment = {"LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+    if os.name != "nt":
+        environment["PATH"] = "/usr/bin:/bin"
+        return environment
+    for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP"):
+        if value := os.environ.get(name):
+            environment[name] = value
+    system_root = environment.get("SYSTEMROOT") or environment.get("WINDIR")
+    environment["PATH"] = str(Path(system_root) / "System32") if system_root else ""
+    return environment
+
+
+def _windows_reparse_point(metadata: os.stat_result) -> bool:
+    if os.name != "nt":
+        return False
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _windows_reparse_path(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return _windows_reparse_point(metadata)
+
+
+def _binary_open_flags() -> int:
+    return getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
 
 
 @dataclass(frozen=True)
@@ -61,11 +111,15 @@ class BundleAuthorityRef:
         sha256: str,
     ) -> BundleAuthorityRef:
         authority_root = Path(root)
-        if authority_root.is_symlink() or not authority_root.is_dir():
+        if (
+            authority_root.is_symlink()
+            or _windows_reparse_path(authority_root)
+            or not authority_root.is_dir()
+        ):
             raise BundleExportError("bundle authority root is not a controlled directory")
         parts = _relative_parts(relative_path)
         path = authority_root.joinpath(*parts)
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or _windows_reparse_path(path) or not path.is_file():
             raise BundleExportError("bundle authority is not a controlled regular file")
         content = path.read_bytes()
         if len(content) > MAX_AUTHORITY_BYTES or hashlib.sha256(content).hexdigest() != sha256:
@@ -165,7 +219,11 @@ class BundleCandidate:
         if type(dataset_receipt) is not _native.DatasetReceipt:
             raise BundleExportError("bundle publication requires a native dataset receipt")
         output_root = Path(output_root)
-        if output_root.is_symlink() or not output_root.is_dir():
+        if (
+            output_root.is_symlink()
+            or _windows_reparse_path(output_root)
+            or not output_root.is_dir()
+        ):
             raise BundleExportError("bundle output root is not a controlled directory")
         resolved_output = output_root.resolve()
         if resolved_output == authority.root or resolved_output.is_relative_to(authority.root):
@@ -173,7 +231,7 @@ class BundleCandidate:
         if authority.root.is_relative_to(resolved_output):
             raise BundleExportError("bundle authority cannot be nested below candidate output")
         final = output_root / "candidate"
-        if final.exists() or final.is_symlink():
+        if final.exists() or final.is_symlink() or _windows_reparse_path(final):
             raise BundleExportError("bundle candidate generation already exists")
         temporary = Path(tempfile.mkdtemp(prefix=".candidate-", dir=output_root))
         try:
@@ -225,7 +283,7 @@ def _canonical(value: Mapping[str, Any], maximum: int) -> bytes:
 
 
 def _write_exact(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _binary_open_flags()
     descriptor = os.open(path, flags, 0o600)
     try:
         offset = 0
@@ -240,6 +298,10 @@ def _write_exact(path: Path, content: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows has no portable directory-fsync contract. Each file is flushed before the
+        # validated same-volume rename, matching the native platform's file-sync authority.
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
@@ -263,18 +325,31 @@ def _expected_validator_sha256() -> str:
 
 
 def _validator_digest(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | _binary_open_flags()
+    )
     try:
+        named_before = os.stat(path, follow_symlinks=False)
         descriptor = os.open(path, flags)
     except OSError as error:
         raise BundleExportError("Rust model bundle validator is unavailable") from error
     try:
         before = os.fstat(descriptor)
+        executable = (
+            path.suffix.lower() == ".exe" if os.name == "nt" else before.st_mode & 0o111
+        )
         if (
             not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named_before.st_mode)
+            or _windows_reparse_point(named_before)
+            or _windows_reparse_point(before)
+            or not os.path.samestat(before, named_before)
             or before.st_size <= 0
             or before.st_size > MAX_VALIDATOR_BYTES
-            or before.st_mode & 0o111 == 0
+            or not executable
         ):
             raise BundleExportError("Rust model bundle validator is not a bounded executable")
         digest = hashlib.sha256()
@@ -288,20 +363,26 @@ def _validator_digest(path: Path) -> str:
                 raise BundleExportError("Rust model bundle validator changed during admission")
             digest.update(chunk)
         after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
     except OSError as error:
         raise BundleExportError("Rust model bundle validator could not be admitted") from error
     finally:
         os.close(descriptor)
     identity_before = (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns)
     identity_after = (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
-    if observed != before.st_size or identity_before != identity_after:
+    if (
+        observed != before.st_size
+        or identity_before != identity_after
+        or _windows_reparse_point(named_after)
+        or not os.path.samestat(after, named_after)
+    ):
         raise BundleExportError("Rust model bundle validator changed during admission")
     return digest.hexdigest()
 
 
 def _validator_path() -> tuple[Path, str]:
     expected_sha256 = _expected_validator_sha256()
-    path = Path(sys.executable).parent / "market-squawk-model-validator"
+    path = _native_release_executable("market-squawk-model-validator")
     if _validator_digest(path) != expected_sha256:
         raise BundleExportError("Rust model bundle validator identity mismatch")
     return path, expected_sha256
@@ -347,7 +428,7 @@ def _validate_with_rust(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
+            env=_native_subprocess_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         if _validator_digest(validator) != validator_sha256:

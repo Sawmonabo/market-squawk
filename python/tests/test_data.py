@@ -303,12 +303,17 @@ def _install_catalog(
 def _catalog_identity(catalog: Path) -> bytes:
     path = os.fsencode(catalog.resolve(strict=True))
     metadata = os.stat(catalog, follow_symlinks=False)
+    device = metadata.st_dev
+    inode = metadata.st_ino
+    if os.name == "nt":
+        device &= (1 << 32) - 1
+        inode &= (1 << 64) - 1
     digest = hashlib.sha256()
     digest.update(b"market-squawk/catalog-artifact-root-binding/v2")
     digest.update(len(path).to_bytes(8, "big"))
     digest.update(path)
-    digest.update(metadata.st_dev.to_bytes(8, "big"))
-    digest.update(metadata.st_ino.to_bytes(8, "big"))
+    digest.update(device.to_bytes(8, "big"))
+    digest.update(inode.to_bytes(8, "big"))
     return digest.digest()
 
 

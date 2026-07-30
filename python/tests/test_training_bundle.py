@@ -17,7 +17,12 @@ import unittest
 import market_squawk.training as installed_training
 import pyarrow as pa
 from market_squawk import training_environment_receipt
-from market_squawk.bundle import BundleAuthorityRef, BundleExportError
+from market_squawk.bundle import (
+    BundleAuthorityRef,
+    BundleExportError,
+    _native_release_executable,
+    _native_subprocess_environment,
+)
 from market_squawk.data import UtcNanoseconds, open_dataset
 from market_squawk.finance import feature_contracts
 from market_squawk.finance import OperationContext
@@ -131,7 +136,7 @@ def _signed_prediction(
     )
     request = _strict_regular_file_coordinate(request, "signed prediction request")
     release_root = Path(sys.prefix).resolve(strict=True)
-    application = release_root / "bin" / "market-squawk"
+    application = _native_release_executable("market-squawk")
     completed = subprocess.run(
         [
             str(application),
@@ -149,7 +154,7 @@ def _signed_prediction(
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=70,
-        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
+        env=_native_subprocess_environment(),
     )
     value = json.loads(completed.stdout.decode("ascii"))
     return value["data"]["score"]
@@ -157,7 +162,7 @@ def _signed_prediction(
 
 def _initialize_signed_data_root(data_root: Path) -> None:
     release_root = Path(sys.prefix).resolve(strict=True)
-    application = (release_root / "bin" / "market-squawk").resolve(strict=True)
+    application = _native_release_executable("market-squawk").resolve(strict=True)
     subprocess.run(
         [
             str(application),
@@ -174,7 +179,7 @@ def _initialize_signed_data_root(data_root: Path) -> None:
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=70,
-        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
+        env=_native_subprocess_environment(),
     )
 
 

@@ -13,7 +13,15 @@ import subprocess
 import sys
 from typing import Any, Mapping, Sequence
 
-from .bundle import BundleAuthorityRef, BundleExportError
+from .bundle import (
+    BundleAuthorityRef,
+    BundleExportError,
+    _binary_open_flags,
+    _native_release_executable,
+    _native_subprocess_environment,
+    _windows_reparse_path,
+    _windows_reparse_point,
+)
 from .data import DatasetIntegrityError, UtcNanoseconds, open_dataset
 from .finance import OperationContext
 from .training import (
@@ -126,9 +134,9 @@ def admit_candidate(
     config = _load_config(config_path)
     receipt = training_environment_receipt()
     release_root = Path(sys.prefix).resolve(strict=True)
-    application = release_root / "bin" / "market-squawk"
-    worker = release_root / "bin" / "market-squawk-onnx-worker"
-    validator = release_root / "bin" / "market-squawk-model-validator"
+    application = _native_release_executable("market-squawk")
+    worker = _native_release_executable("market-squawk-onnx-worker")
+    validator = _native_release_executable("market-squawk-model-validator")
     expected = (
         (application, receipt.application_sha256),
         (worker, receipt.onnx_worker_sha256),
@@ -161,12 +169,7 @@ def admit_candidate(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=70,
-            env={
-                "LANG": "C",
-                "LC_ALL": "C",
-                "PATH": "/usr/bin:/bin",
-                "TZ": "UTC",
-            },
+            env=_native_subprocess_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TrainingDriverError("signed model admission did not complete") from error
@@ -434,7 +437,12 @@ def _absolute_controlled_directory(value: Any, name: str) -> Path:
     if not isinstance(value, str) or not value:
         raise TrainingDriverError(f"{name} is invalid")
     path = Path(value)
-    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or _windows_reparse_path(path)
+        or not path.is_dir()
+    ):
         raise TrainingDriverError(f"{name} is not an absolute controlled directory")
     resolved = path.resolve(strict=True)
     if resolved != path:
@@ -447,7 +455,12 @@ def _authority_ref(
     data_root: Path,
     expected_sha256: str,
 ) -> BundleAuthorityRef:
-    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or _windows_reparse_path(path)
+        or not path.is_file()
+    ):
         raise TrainingDriverError("bundle authority must be one explicit absolute regular file")
     root = path.parent.resolve(strict=True)
     if root == data_root or root.is_relative_to(data_root) or data_root.is_relative_to(root):
@@ -461,6 +474,8 @@ def _authority_ref(
 def _controlled_candidate_parent(data_root: Path, relative: str) -> Path:
     parts = _candidate_parts(relative)
     artifacts = data_root / "artifacts"
+    if os.name == "nt":
+        return _controlled_windows_candidate_parent(artifacts, parts)
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     no_follow_flags = flags | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -482,6 +497,34 @@ def _controlled_candidate_parent(data_root: Path, relative: str) -> Path:
     finally:
         os.close(descriptor)
     return artifacts.joinpath(*parts)
+
+
+def _controlled_windows_candidate_parent(artifacts: Path, parts: tuple[str, ...]) -> Path:
+    try:
+        named_artifacts = os.stat(artifacts, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named_artifacts.st_mode)
+            or _windows_reparse_point(named_artifacts)
+        ):
+            raise TrainingDriverError("data artifact root is unavailable")
+        current = artifacts.resolve(strict=True)
+        metadata = os.stat(current, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode) or _windows_reparse_point(metadata):
+            raise TrainingDriverError("data artifact root is unavailable")
+        for part in parts:
+            current = current / part
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            metadata = os.stat(current, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode) or _windows_reparse_point(metadata):
+                raise TrainingDriverError("candidate parent is not a controlled directory")
+        if current.resolve(strict=True) != current:
+            raise TrainingDriverError("candidate parent is not a controlled directory")
+        return current
+    except OSError as error:
+        raise TrainingDriverError("candidate parent is not a controlled directory") from error
 
 
 def _candidate_parts(value: str) -> tuple[str, ...]:
@@ -507,6 +550,8 @@ def _candidate_parts(value: str) -> tuple[str, ...]:
 def _write_exclusive(path: Path, content: bytes) -> Path:
     if not content or len(content) > MAX_OUTPUT_BYTES:
         raise TrainingDriverError("driver output exceeds its byte bound")
+    if os.name == "nt":
+        return _write_windows_exclusive(path, content)
     parent, leaf, directory = _open_canonical_parent(path, "driver output")
     flags = (
         os.O_WRONLY
@@ -550,7 +595,40 @@ def _write_exclusive(path: Path, content: bytes) -> Path:
     return parent / leaf
 
 
+def _write_windows_exclusive(path: Path, content: bytes) -> Path:
+    parent, leaf, parent_before = _windows_canonical_parent(path, "driver output")
+    target = parent / leaf
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _binary_open_flags()
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except OSError as error:
+        raise TrainingDriverError("driver output cannot be created exclusively") from error
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise TrainingDriverError("driver output write did not make progress")
+            offset += written
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        named = os.stat(target, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != len(content)
+            or _windows_reparse_point(named)
+            or not os.path.samestat(opened, named)
+        ):
+            raise TrainingDriverError("driver output identity changed during write")
+    finally:
+        os.close(descriptor)
+    _validate_windows_parent(parent, parent_before, "driver output")
+    return target
+
+
 def _strict_regular_file_coordinate(path: Path, name: str) -> Path:
+    if os.name == "nt":
+        return _strict_windows_regular_file_coordinate(path, name)
     parent, leaf, directory = _open_canonical_parent(path, name)
     flags = (
         os.O_RDONLY
@@ -576,6 +654,70 @@ def _strict_regular_file_coordinate(path: Path, name: str) -> Path:
     finally:
         os.close(directory)
     return parent / leaf
+
+
+def _strict_windows_regular_file_coordinate(path: Path, name: str) -> Path:
+    parent, leaf, parent_before = _windows_canonical_parent(path, name)
+    target = parent / leaf
+    flags = os.O_RDONLY | _binary_open_flags()
+    try:
+        named_before = os.stat(target, follow_symlinks=False)
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise TrainingDriverError(f"{name} is unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        named_after = os.stat(target, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _windows_reparse_point(named_before)
+            or _windows_reparse_point(named_after)
+            or not os.path.samestat(opened, named_before)
+            or not os.path.samestat(opened, named_after)
+        ):
+            raise TrainingDriverError(f"{name} is not a strict regular file")
+    finally:
+        os.close(descriptor)
+    _validate_windows_parent(parent, parent_before, name)
+    return target
+
+
+def _windows_canonical_parent(
+    path: Path, name: str
+) -> tuple[Path, str, os.stat_result]:
+    absolute = path.absolute()
+    leaf = absolute.name
+    if not leaf or leaf in {".", ".."}:
+        raise TrainingDriverError(f"{name} coordinate is invalid")
+    try:
+        named_parent = os.stat(absolute.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named_parent.st_mode)
+            or _windows_reparse_point(named_parent)
+        ):
+            raise TrainingDriverError(f"{name} parent is not a controlled directory")
+        parent = absolute.parent.resolve(strict=True)
+        metadata = os.stat(parent, follow_symlinks=False)
+    except OSError as error:
+        raise TrainingDriverError(f"{name} parent is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode) or _windows_reparse_point(metadata):
+        raise TrainingDriverError(f"{name} parent is not a controlled directory")
+    return parent, leaf, metadata
+
+
+def _validate_windows_parent(
+    parent: Path, expected: os.stat_result, name: str
+) -> None:
+    try:
+        observed = os.stat(parent, follow_symlinks=False)
+    except OSError as error:
+        raise TrainingDriverError(f"{name} parent identity is unavailable") from error
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or _windows_reparse_point(observed)
+        or not os.path.samestat(expected, observed)
+    ):
+        raise TrainingDriverError(f"{name} parent identity changed")
 
 
 def _open_canonical_parent(path: Path, name: str) -> tuple[Path, str, int]:
@@ -622,18 +764,31 @@ def _validate_open_directory(parent: Path, descriptor: int, name: str) -> None:
 
 
 def _executable_sha256(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | _binary_open_flags()
+    )
     try:
+        named_before = os.stat(path, follow_symlinks=False)
         descriptor = os.open(path, flags)
     except OSError as error:
         raise TrainingDriverError("signed native executable is unavailable") from error
     try:
         before = os.fstat(descriptor)
+        executable = (
+            path.suffix.lower() == ".exe" if os.name == "nt" else before.st_mode & 0o111
+        )
         if (
             not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named_before.st_mode)
+            or _windows_reparse_point(named_before)
+            or _windows_reparse_point(before)
+            or not os.path.samestat(before, named_before)
             or before.st_size <= 0
             or before.st_size > MAX_NATIVE_EXECUTABLE_BYTES
-            or before.st_mode & 0o111 == 0
+            or not executable
         ):
             raise TrainingDriverError("signed native executable is invalid")
         digest = hashlib.sha256()
@@ -647,7 +802,13 @@ def _executable_sha256(path: Path) -> str:
                 raise TrainingDriverError("signed native executable changed")
             digest.update(chunk)
         after = os.fstat(descriptor)
-        if observed != before.st_size or _file_identity(before) != _file_identity(after):
+        named_after = os.stat(path, follow_symlinks=False)
+        if (
+            observed != before.st_size
+            or _file_identity(before) != _file_identity(after)
+            or _windows_reparse_point(named_after)
+            or not os.path.samestat(after, named_after)
+        ):
             raise TrainingDriverError("signed native executable changed")
         return digest.hexdigest()
     finally:

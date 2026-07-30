@@ -85,16 +85,26 @@ class DatasetResult:
 class _ControlledRoot:
     def __init__(self, root: Path) -> None:
         root = Path(root)
+        if os.name == "nt":
+            self._root = _controlled_windows_root(root)
+            self._fd: int | None = None
+            return
         if root.is_symlink() or not root.is_dir():
             raise DatasetIntegrityError("dataset root is not a controlled directory")
+        self._root = root
         self._fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
 
     def close(self) -> None:
-        os.close(self._fd)
+        if self._fd is not None:
+            os.close(self._fd)
 
     def read(self, relative: str, maximum: int, context: OperationContext) -> bytearray:
         context.checkpoint()
         parts = _path_parts(relative)
+        if os.name == "nt":
+            return self._read_windows(parts, maximum, context)
+        if self._fd is None:
+            raise DatasetIntegrityError("controlled dataset root is unavailable")
         directory_fd = os.dup(self._fd)
         try:
             for part in parts[:-1]:
@@ -130,6 +140,94 @@ class _ControlledRoot:
             raise DatasetIntegrityError("controlled dataset read failed") from error
         finally:
             os.close(directory_fd)
+
+    def _read_windows(
+        self,
+        parts: tuple[str, ...],
+        maximum: int,
+        context: OperationContext,
+    ) -> bytearray:
+        try:
+            directory = self._root
+            for part in parts[:-1]:
+                directory = directory / part
+                metadata = os.stat(directory, follow_symlinks=False)
+                if not stat.S_ISDIR(metadata.st_mode) or _windows_reparse_point(metadata):
+                    raise DatasetIntegrityError("dataset object parent is not controlled")
+            path = directory / parts[-1]
+            named_before = os.stat(path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(named_before.st_mode)
+                or _windows_reparse_point(named_before)
+                or named_before.st_size > maximum
+            ):
+                raise DatasetIntegrityError("dataset object is not a bounded regular file")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+            file_fd = os.open(path, flags)
+            try:
+                opened_before = os.fstat(file_fd)
+                if (
+                    not stat.S_ISREG(opened_before.st_mode)
+                    or not os.path.samestat(opened_before, named_before)
+                ):
+                    raise DatasetIntegrityError("dataset object identity changed before read")
+                content = bytearray()
+                while len(content) < opened_before.st_size:
+                    context.checkpoint()
+                    chunk = os.read(
+                        file_fd,
+                        min(1024 * 1024, opened_before.st_size - len(content)),
+                    )
+                    if not chunk:
+                        raise DatasetIntegrityError(
+                            "dataset object changed during controlled read"
+                        )
+                    content.extend(chunk)
+                opened_after = os.fstat(file_fd)
+                named_after = os.stat(path, follow_symlinks=False)
+                if (
+                    _file_identity(opened_before) != _file_identity(opened_after)
+                    or _windows_reparse_point(named_after)
+                    or not os.path.samestat(opened_after, named_after)
+                ):
+                    raise DatasetIntegrityError(
+                        "dataset object changed during controlled read"
+                    )
+                return content
+            finally:
+                os.close(file_fd)
+        except DatasetIntegrityError:
+            raise
+        except OSError as error:
+            raise DatasetIntegrityError("controlled dataset read failed") from error
+
+
+def _controlled_windows_root(root: Path) -> Path:
+    try:
+        metadata = os.stat(root, follow_symlinks=False)
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise DatasetIntegrityError("dataset root is not a controlled directory") from error
+    if not stat.S_ISDIR(metadata.st_mode) or _windows_reparse_point(metadata):
+        raise DatasetIntegrityError("dataset root is not a controlled directory")
+    return resolved
+
+
+def _windows_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+    )
 
 
 def open_dataset(
