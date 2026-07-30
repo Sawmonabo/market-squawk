@@ -56,6 +56,40 @@ class GeneratedArtifactCheckTests(unittest.TestCase):
             [],
         )
 
+    def test_reviewed_visuals_reject_same_size_content_changes(self) -> None:
+        root = SCRIPT.parents[1]
+        reviewed_visuals = (
+            "docs/superpowers/specs/assets/"
+            "2026-07-28-market-squawk-obsidian-signal.png",
+            "docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png",
+        )
+
+        for path in reviewed_visuals:
+            with self.subTest(path=path):
+                content = (root / path).read_bytes()
+                self.assertEqual(check_artifacts.content_violations(path, content), [])
+
+                changed = bytearray(content)
+                changed[-1] ^= 1
+                self.assertTrue(
+                    check_artifacts.content_violations(path, bytes(changed))
+                )
+
+    def test_reviewed_visuals_reject_size_changes(self) -> None:
+        root = SCRIPT.parents[1]
+        reviewed_visuals = (
+            "docs/superpowers/specs/assets/"
+            "2026-07-28-market-squawk-obsidian-signal.png",
+            "docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png",
+        )
+
+        for path in reviewed_visuals:
+            with self.subTest(path=path):
+                content = (root / path).read_bytes()
+                self.assertTrue(
+                    check_artifacts.content_violations(path, content + b"\0")
+                )
+
     def test_inspection_rejects_symlinks_and_accepts_bounded_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -10,7 +10,7 @@
 | Design approved | 2026-07-29 |
 | Last substantive review | 2026-07-29 |
 | Audit base | `968631aba5f71c85341876f905795eb71065ba61` |
-| Approved visual source | [`assets/2026-07-29-market-squawk-logo-option-3-no-eye.png`](assets/2026-07-29-market-squawk-logo-option-3-no-eye.png) |
+| Approved visual source | [`assets/2026-07-29-market-squawk-logo.png`](assets/2026-07-29-market-squawk-logo.png) |
 | Approved source SHA-256 | `567a3dc04acb791b67eb2a0bb5eed256cb6c9d84c0441ed2dcefc7ae9b7d6ee6` |
 | Parent interface design | [`2026-07-28-market-squawk-obsidian-signal-interface-design.md`](2026-07-28-market-squawk-obsidian-signal-interface-design.md) |
 | Governing product memory | [`docs/project-memory.md`](../../project-memory.md) |
@@ -34,7 +34,7 @@ adding an eye, sound rays, speech bubble, microphone, or generic audio waveform.
 The approved source contains a large and a small rendering of this same lockup on an Obsidian
 canvas:
 
-![Approved Market Squawk no-eye S-bird logo](assets/2026-07-29-market-squawk-logo-option-3-no-eye.png)
+![Approved Market Squawk no-eye S-bird logo](assets/2026-07-29-market-squawk-logo.png)
 
 ## Scope and supersession
 

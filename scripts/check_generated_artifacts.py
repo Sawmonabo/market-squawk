@@ -3,13 +3,35 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import hashlib
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+from typing import NamedTuple
 
 
 MAX_REPOSITORY_FILE_BYTES = 5 * 1024 * 1024
+
+
+class ReviewedBinaryIdentity(NamedTuple):
+    size_bytes: int
+    sha256: str
+
+
+# Human-approved canonical visual baselines are admitted only at their exact reviewed content
+# identity. A same-path replacement must return to design and policy review.
+REVIEWED_BINARY_IDENTITIES: Mapping[str, ReviewedBinaryIdentity] = {
+    "docs/superpowers/specs/assets/2026-07-28-market-squawk-obsidian-signal.png": ReviewedBinaryIdentity(
+        size_bytes=170_712,
+        sha256="13584db11237399eb7bafa638f9a34b7970b90c44443c62a76b34e7a9859fe43",
+    ),
+    "docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png": ReviewedBinaryIdentity(
+        size_bytes=985_371,
+        sha256="567a3dc04acb791b67eb2a0bb5eed256cb6c9d84c0441ed2dcefc7ae9b7d6ee6",
+    ),
+}
 
 # Binary protocol fixtures and shipping visual assets must be individually reviewed and listed by
 # exact repository path.
@@ -31,7 +53,6 @@ ALLOWED_BINARY_FILES: frozenset[str] = frozenset(
         "apps/market-squawk-desktop/src-tauri/icons/icon.icns",
         "apps/market-squawk-desktop/src-tauri/icons/icon.ico",
         "apps/market-squawk-desktop/src-tauri/icons/icon.png",
-        "docs/superpowers/specs/assets/2026-07-28-market-squawk-obsidian-signal.png",
     }
 )
 
@@ -152,11 +173,28 @@ def content_violations(
     content: bytes,
     *,
     allowed_binary_files: frozenset[str] = ALLOWED_BINARY_FILES,
+    reviewed_binary_identities: Mapping[
+        str, ReviewedBinaryIdentity
+    ] = REVIEWED_BINARY_IDENTITIES,
 ) -> list[str]:
     if len(content) > MAX_REPOSITORY_FILE_BYTES:
         return [
             f"file exceeds reviewed repository input limit of {MAX_REPOSITORY_FILE_BYTES} bytes"
         ]
+    reviewed_identity = reviewed_binary_identities.get(path)
+    if reviewed_identity is not None:
+        if len(content) != reviewed_identity.size_bytes:
+            return [
+                "reviewed binary size mismatch: "
+                f"expected {reviewed_identity.size_bytes} bytes, found {len(content)}"
+            ]
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != reviewed_identity.sha256:
+            return [
+                "reviewed binary SHA-256 mismatch: "
+                f"expected {reviewed_identity.sha256}, found {digest}"
+            ]
+        return []
     if path in allowed_binary_files:
         return []
     if b"\0" in content:

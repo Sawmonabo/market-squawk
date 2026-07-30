@@ -57,7 +57,7 @@ and the existing Geist/Obsidian Signal visual system.
 **Files:**
 
 - Create:
-  `docs/superpowers/specs/assets/2026-07-29-market-squawk-logo-option-3-no-eye.png`
+  `docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png`
 - Create: `docs/superpowers/specs/2026-07-29-market-squawk-logo-design.md`
 - Modify:
   `docs/superpowers/specs/2026-07-28-market-squawk-obsidian-signal-interface-design.md`
@@ -85,10 +85,10 @@ pnpm --dir apps/market-squawk-desktop test --run
 
 ```bash
 shasum -a 256 \
-  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo-option-3-no-eye.png
+  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png
 cmp \
   /Users/sawmonabo/.codex/generated_images/019faf47-1c0c-7791-818c-b9c174e0d92b/option-3-selected-no-eye-final.png \
-  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo-option-3-no-eye.png
+  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png
 ```
 
 ---
@@ -214,7 +214,7 @@ git add \
   docs/superpowers/plans/2026-07-29-market-squawk-logo-integration.md \
   docs/superpowers/specs/2026-07-29-market-squawk-logo-design.md \
   docs/superpowers/specs/2026-07-28-market-squawk-obsidian-signal-interface-design.md \
-  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo-option-3-no-eye.png \
+  docs/superpowers/specs/assets/2026-07-29-market-squawk-logo.png \
   apps/market-squawk-desktop/index.html \
   apps/market-squawk-desktop/src/assets/market-squawk-mark.svg \
   apps/market-squawk-desktop/src/components/app-sidebar.tsx \
