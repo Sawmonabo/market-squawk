@@ -1,6 +1,16 @@
 {
   "artifacts": [
     {
+      "filename": "colorama-0.4.6-py2.py3-none-any.whl",
+      "license": "BSD-3-Clause",
+      "license_file_sha256": "cac35c02686e5d04a5a7140bfb3b36e73aed496656e891102e428886d7930318",
+      "project": "colorama",
+      "sha256": "4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6",
+      "size_bytes": 25335,
+      "url": "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl",
+      "version": "0.4.6"
+    },
+    {
       "filename": "iniconfig-2.3.0-py3-none-any.whl",
       "license": "MIT",
       "project": "iniconfig",
@@ -4357,8 +4367,8 @@
     },
     {
       "path": "python/requirements.lock",
-      "sha256": "ce37b54024dad5287327f20e6c129f26996b7d1d3f4860b15644d656f634fe53",
-      "size_bytes": 829
+      "sha256": "7b42967ad3d17bddb985c34a4f395ef77e3e8e7f8f5fe4f3f05ae60e94e38ada",
+      "size_bytes": 950
     },
     {
       "path": "python/tests/test_data.py",
@@ -4392,8 +4402,8 @@
     },
     {
       "path": "python/wheelhouse/x86_64-pc-windows-msvc.json",
-      "sha256": "44d5f5eb805dfa3d0b58a7144dc20cfd221f85ff5529e86c82cd09f275e7fbbb",
-      "size_bytes": 447
+      "sha256": "74e39d5a46da961ca3e985b5b2b3972188101bbc1b54eddf4234375cd8b09483",
+      "size_bytes": 490
     },
     {
       "path": "python/wheelhouse/x86_64-unknown-linux-gnu.json",
@@ -4407,13 +4417,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "40cb6832ec58b7354868c8afd2098f6147be010f5e50c445ee9c250482ad41e8",
-      "size_bytes": 161254
+      "sha256": "0abdbce627ad57055583bb38f6ea26a333adfe84a4be6b7e03592d68697f9909",
+      "size_bytes": 163042
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "23d1d065c6a0c5171021f26642242f1533b68def7a92d09f8d2f164742be81c3",
-      "size_bytes": 16927
+      "sha256": "2fcb350d833d09ae6faf966072a20b22ec746e5b51cd709f98e0987dc39a6776",
+      "size_bytes": 18200
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",

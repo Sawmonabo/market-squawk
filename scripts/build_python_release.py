@@ -59,6 +59,7 @@ ALLOWED_LICENSES = {
     "Apache-2.0",
     "MIT",
     "BSD-2-Clause",
+    "BSD-3-Clause",
     "MIT OR Apache-2.0",
     "Apache-2.0 OR BSD-2-Clause",
 }
@@ -202,6 +203,7 @@ class Artifact:
     sha256: str
     size_bytes: int
     url: str
+    license_file_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -430,7 +432,7 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
     artifacts = []
     names: set[str] = set()
     for item in artifacts_value:
-        if not isinstance(item, dict) or set(item) != {
+        required = {
             "project",
             "version",
             "license",
@@ -438,13 +440,22 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
             "sha256",
             "size_bytes",
             "url",
-        }:
+        }
+        if (
+            not isinstance(item, dict)
+            or not required <= set(item)
+            or not set(item) <= required | {"license_file_sha256"}
+        ):
             raise ReleaseBuildError("Python wheel identity is incomplete")
         if item["filename"] in names or item["license"] not in ALLOWED_LICENSES:
             raise ReleaseBuildError("Python wheel identity or license is invalid")
         _sha256(item["sha256"])
+        license_file_sha256 = item.get("license_file_sha256")
+        if license_file_sha256 is not None:
+            _sha256(license_file_sha256)
         if (
             item["sha256"] == "0" * 64
+            or license_file_sha256 == "0" * 64
             or not isinstance(item["size_bytes"], int)
             or item["size_bytes"] <= 0
         ):
@@ -1107,7 +1118,12 @@ def admit_wheelhouse(
         if _compatible(artifact.filename, version, profile)
     )
     projects = {artifact.project.lower() for artifact in selected}
-    if not REQUIRED_PROJECTS <= projects:
+    required_projects = (
+        REQUIRED_PROJECTS | {"colorama"}
+        if profile.system == "Windows"
+        else REQUIRED_PROJECTS
+    )
+    if not required_projects <= projects:
         raise ReleaseBuildError("wheelhouse has no complete compatible dependency set")
     admitted = []
     for artifact in selected:
@@ -1116,7 +1132,7 @@ def admit_wheelhouse(
             raise ReleaseBuildError("offline wheelhouse is missing a locked artifact")
         if _file_digest(path) != (artifact.size_bytes, artifact.sha256):
             raise ReleaseBuildError("offline wheelhouse artifact hash or size mismatch")
-        _admit_license(path, artifact.license)
+        _admit_license(path, artifact.license, artifact.license_file_sha256)
         admitted.append(path)
     return tuple(admitted)
 
@@ -1210,7 +1226,7 @@ def prepare_wheelhouse(
         if _file_digest(temporary) != (artifact.size_bytes, artifact.sha256):
             temporary.unlink(missing_ok=True)
             raise ReleaseBuildError("prepared wheel hash or size mismatch")
-        _admit_license(temporary, artifact.license)
+        _admit_license(temporary, artifact.license, artifact.license_file_sha256)
         os.replace(temporary, destination)
 
 
@@ -4017,7 +4033,8 @@ def _compatible(
 ) -> bool:
     python_tag, _abi, platform_tag = _wheel_tags(filename)
     current = f"cp{version[0]}{version[1]}"
-    python_ok = python_tag == "py3" or current in python_tag.split(".")
+    python_tags = python_tag.split(".")
+    python_ok = "py3" in python_tags or current in python_tags
     platform_ok = platform_tag == "any"
     if profile.target == "aarch64-apple-darwin":
         platform_ok = platform_ok or "arm64" in platform_tag or "universal2" in platform_tag
@@ -4033,18 +4050,42 @@ def _compatible(
     return python_ok and platform_ok
 
 
-def _admit_license(path: Path, expected: str) -> None:
+def _admit_license(
+    path: Path,
+    expected: str,
+    expected_file_sha256: str | None = None,
+) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
             names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
             if len(names) != 1:
                 raise ReleaseBuildError("wheel has no unique core metadata")
             metadata = BytesParser().parsebytes(archive.read(names[0]))
+            observed = metadata.get("License-Expression") or metadata.get("License")
+            if observed is not None and observed.strip() != expected:
+                raise ReleaseBuildError("wheel license differs from the locked expression")
+            if expected_file_sha256 is None:
+                if observed is None:
+                    raise ReleaseBuildError("wheel license differs from the locked expression")
+                return
+            license_files = metadata.get_all("License-File", [])
+            if len(license_files) != 1:
+                raise ReleaseBuildError("wheel has no unique locked license file")
+            license_file = PurePosixPath(license_files[0])
+            if (
+                license_file.is_absolute()
+                or len(license_file.parts) != 1
+                or any(part in {"", ".", ".."} for part in license_file.parts)
+            ):
+                raise ReleaseBuildError("wheel license file path is invalid")
+            license_path = (
+                PurePosixPath(names[0]).parent / "licenses" / license_file
+            ).as_posix()
+            license_payload = archive.read(license_path)
     except (OSError, zipfile.BadZipFile, KeyError) as error:
         raise ReleaseBuildError("wheel metadata is unreadable") from error
-    observed = metadata.get("License-Expression") or metadata.get("License")
-    if observed is None or observed.strip() != expected:
-        raise ReleaseBuildError("wheel license differs from the locked expression")
+    if hashlib.sha256(license_payload).hexdigest() != expected_file_sha256:
+        raise ReleaseBuildError("wheel license file differs from its locked identity")
 
 
 def _wheel_tags(filename: str) -> tuple[str, str, str]:

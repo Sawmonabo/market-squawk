@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 
@@ -54,6 +55,13 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             builder._interpreter_platform_matches(
                 builder.platform_profile("x86_64-pc-windows-msvc"),
                 {"machine": "", "configured_platform": "win-amd64"},
+            )
+        )
+        self.assertTrue(
+            builder._compatible(
+                "colorama-0.4.6-py2.py3-none-any.whl",
+                (3, 14),
+                builder.platform_profile("x86_64-pc-windows-msvc"),
             )
         )
         _raw, linux = builder.load_release_components(
@@ -126,6 +134,28 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             layout = builder.admit_artifact_root(artifact_root, ROOT)
             with self.assertRaises(builder.ReleaseBuildError):
                 builder.admit_wheelhouse(lock, layout.wheelhouse, (3, 12))
+
+    def test_legacy_wheel_license_requires_its_locked_file_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wheel = Path(temporary) / "fixture-1.0-py3-none-any.whl"
+            license_payload = b"audited license text"
+            with zipfile.ZipFile(wheel, mode="w") as archive:
+                archive.writestr(
+                    "fixture-1.0.dist-info/METADATA",
+                    "Metadata-Version: 2.1\n"
+                    "Name: fixture\n"
+                    "Version: 1.0\n"
+                    "License-File: LICENSE.txt\n\n",
+                )
+                archive.writestr(
+                    "fixture-1.0.dist-info/licenses/LICENSE.txt",
+                    license_payload,
+                )
+
+            digest = hashlib.sha256(license_payload).hexdigest()
+            builder._admit_license(wheel, "BSD-3-Clause", digest)
+            with self.assertRaises(builder.ReleaseBuildError):
+                builder._admit_license(wheel, "BSD-3-Clause", "0" * 64)
 
     def test_unowned_artifact_root_is_never_deleted_or_claimed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
