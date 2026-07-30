@@ -227,20 +227,6 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-        if: matrix.rust
-        with:
-          workspaces: ". -> target"
-          shared-key: ci-${{ matrix.lane }}
-          cache-targets: "true"
-          cache-on-failure: "false"
-          cache-all-crates: "false"
-          cache-workspace-crates: "false"
-          save-if: >-
-            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-                (github.event_name == 'pull_request' &&
-                 github.event.pull_request.head.repo.full_name == github.repository) }}
       - name: Report the pinned Rust toolchain
         if: matrix.rust
         run: |
