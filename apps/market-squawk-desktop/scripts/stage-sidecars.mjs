@@ -19,6 +19,21 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const MAXIMUM_RELEASE_MANIFEST_BYTES = 8 * 1024 * 1024
+const NATIVE_TRUST_MODES = Object.freeze({
+  "aarch64-apple-darwin": new Set([
+    "developer-id-signed-and-notarized",
+    "provenance-only",
+  ]),
+  "x86_64-apple-darwin": new Set([
+    "developer-id-signed-and-notarized",
+    "provenance-only",
+  ]),
+  "x86_64-pc-windows-msvc": new Set([
+    "authenticode-signed",
+    "provenance-only",
+  ]),
+  "x86_64-unknown-linux-gnu": new Set(["provenance-only"]),
+})
 const LINUX_BUNDLER_TOOL_LOCK = Object.freeze([
   {
     name: "AppRun-x86_64",
@@ -165,7 +180,7 @@ function stageCompleteRelease() {
     2 * 1024 * 1024 * 1024,
   )
   if (
-    manifest?.schema_version !== 1 ||
+    manifest?.schema_version !== 2 ||
     manifest?.product !== "market-squawk" ||
     manifest?.repository !== "Sawmonabo/market-squawk" ||
     manifest?.version !== packageVersion ||
@@ -173,6 +188,7 @@ function stageCompleteRelease() {
     !Array.isArray(manifest.targets) ||
     manifest.targets.length !== 1 ||
     target?.target !== targetTriple ||
+    !NATIVE_TRUST_MODES[targetTriple]?.has(target?.native_trust_mode) ||
     target?.archive?.size !== bundleMetadata.size ||
     target?.archive?.sha256 !== checksums.get(bundleName) ||
     typeof target?.archive?.url !== "string" ||

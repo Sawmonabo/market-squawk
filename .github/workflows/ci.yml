@@ -464,6 +464,7 @@ jobs:
 
           python3 scripts/build_complete_release.py \
             --target "$TARGET" \
+            --native-trust-mode provenance-only \
             --version 1.0.0 \
             --commit "$CANDIDATE_SHA" \
             --tree "$(git rev-parse 'HEAD^{tree}')" \

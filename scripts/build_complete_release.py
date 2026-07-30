@@ -30,9 +30,105 @@ OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
 BUILD_ONLY_PYTHON_PATHS = frozenset({".lock", ".market-squawk-owned-v1"})
 LOCKED_PYTHON_PORTABILITY_EXCLUSIONS = {
     "x86_64-unknown-linux-gnu": {
+        "share/terminfo/2/2621A": (
+            622,
+            "c60f9af6a0de5ac8a208c2bbcd31a731cad53fc5f2ced90572a6c82fecb34782",
+        ),
         "share/terminfo/E/Eterm": (
             2_224,
             "9c6c23dd46de071e5f5ee24cb2144f82e46365c9011bd8574bf210f0c8245043",
+        ),
+        "share/terminfo/E/Eterm-color": (
+            2_224,
+            "9c6c23dd46de071e5f5ee24cb2144f82e46365c9011bd8574bf210f0c8245043",
+        ),
+        "share/terminfo/h/hp2621A": (
+            622,
+            "c60f9af6a0de5ac8a208c2bbcd31a731cad53fc5f2ced90572a6c82fecb34782",
+        ),
+        "share/terminfo/h/hp70092A": (
+            678,
+            "a43410a1af8685b35113f51fc14c793e32fb066a7fa7b087fe0548b941709dc6",
+        ),
+        "share/terminfo/L/LFT-PC850": (
+            1_295,
+            "9d096ca5252ed4d6d3bd6310b43d5f27dfecb7e1d12e91c6139c54e18ad0440e",
+        ),
+        "share/terminfo/N/NCR260VT300WPP": (
+            1_850,
+            "58968550e6fec57b87b956feb41b70a010f2ac35579045cc0b66f1f4371f01c3",
+        ),
+        "share/terminfo/N/NCRVT100WPP": (
+            1_509,
+            "f0d65694177cbf905049c78ea268fa5f8eb2b449f20bacb108f5596a0c0e927d",
+        ),
+        "share/terminfo/P/P12-M-W": (
+            694,
+            "f232d14d6146890caa90759f2aba06fa82c164435a4b920275172fc85f820e2b",
+        ),
+        "share/terminfo/P/P12-M": (
+            666,
+            "1284842ef226fc27d0a8614f8ee0b8c658ff129cee1f536c0dbbf3e211e14c2b",
+        ),
+        "share/terminfo/P/P12-W": (
+            1_140,
+            "bd307bb71a65c91964f607c16dbb5dd6bec3c1021af40d131c4fff0d21ccb114",
+        ),
+        "share/terminfo/P/P12": (
+            1_149,
+            "39ee96a05890edf7c95cf17d5a5a466335e10e8774c55d2f10fdee4a1aa44e19",
+        ),
+        "share/terminfo/P/P14-M-W": (
+            694,
+            "97535297b9704349ae55bf36441bbe0c5b80684cd239cfa42e1c708eabeeb097",
+        ),
+        "share/terminfo/P/P14-M": (
+            666,
+            "23737c9a205bbbbbc85a62c80254d4ec8cb8eb32a64e986dcf820f4ad768b325",
+        ),
+        "share/terminfo/P/P14-W": (
+            1_140,
+            "6ee79958d432a872619163990ee6910b53d49327444cef231e7746ac7b2b7d53",
+        ),
+        "share/terminfo/P/P14": (
+            1_149,
+            "c53f7b78e43b0b246426a0f26e960ac105a80ccc9be3e3279766b0041f2e130d",
+        ),
+        "share/terminfo/P/P4": (
+            743,
+            "6167139fd4c2d8625340b4a827a34db12cc9d0449ae45c70187fdd7445db8ade",
+        ),
+        "share/terminfo/P/P5": (
+            743,
+            "c348160ac726d6bb6a723d5a58eb5cabd462298091582ef4d06ea29fd7740ac8",
+        ),
+        "share/terminfo/P/P7": (
+            553,
+            "d497651d116ac3449e8970687e4c5a4197315778d213e7ac701eb84e73de174f",
+        ),
+        "share/terminfo/P/P8-W": (
+            614,
+            "edae34a978db3b2242adee4100ceaa5d7912a7f437e5e257da83535aef3e6374",
+        ),
+        "share/terminfo/P/P8": (
+            582,
+            "1c0b7f48758dfd628ab01d198de7359655758465b4019bcbe77cd294d207baf5",
+        ),
+        "share/terminfo/P/P9-8-W": (
+            694,
+            "48a81d8e94b5d7fa313a690e6fea6908d3b376eb305642bb97aeea2e2594bd78",
+        ),
+        "share/terminfo/P/P9-8": (
+            652,
+            "88bcea1dec4da1516465faa17334139187fccfaa7424ac348b3a65a93640a226",
+        ),
+        "share/terminfo/P/P9-W": (
+            1_136,
+            "f5ca03cf8e26f1fe39b116d20324f7476ef6c6dd6d1df87be4ed2fbc6b19cb61",
+        ),
+        "share/terminfo/P/P9": (
+            1_145,
+            "f5803baffa6cb3270c1a5f1451f9ed2156c3b2f49f2d469dda262a2d48caa710",
         ),
     },
 }
@@ -97,11 +193,30 @@ NATIVE_PACKAGE_SUFFIXES = {
     "x86_64-pc-windows-msvc": (".msi", "-setup.exe"),
     "x86_64-unknown-linux-gnu": (".AppImage", ".deb"),
 }
+NATIVE_TRUST_MODES = {
+    "aarch64-apple-darwin": {
+        "developer-id-signed-and-notarized",
+        "provenance-only",
+    },
+    "x86_64-apple-darwin": {
+        "developer-id-signed-and-notarized",
+        "provenance-only",
+    },
+    "x86_64-pc-windows-msvc": {
+        "authenticode-signed",
+        "provenance-only",
+    },
+    "x86_64-unknown-linux-gnu": {"provenance-only"},
+}
+ALL_NATIVE_TRUST_MODES = tuple(
+    sorted({mode for modes in NATIVE_TRUST_MODES.values() for mode in modes})
+)
 
 
 @dataclass(frozen=True)
 class Options:
     target: TargetProfile
+    native_trust_mode: str
     version: str
     commit: str
     tree: str
@@ -317,9 +432,14 @@ def aggregate_release(options: AggregateOptions) -> None:
                 "manifest": manifest_artifact,
                 "minimum_system": release["target"]["minimum_system"],
                 "native_packages": [
-                    _release_artifact(reference["tag"], output / name)
+                    _release_artifact(
+                        reference["tag"],
+                        output / name,
+                        native_trust_mode=release["target"]["native_trust_mode"],
+                    )
                     for name in package_names
                 ],
+                "native_trust_mode": release["target"]["native_trust_mode"],
                 "target": target,
             }
         )
@@ -332,7 +452,7 @@ def aggregate_release(options: AggregateOptions) -> None:
         "kind": "market-squawk-release-index",
         "product": reference["product"],
         "repository": reference["repository"],
-        "schema_version": 1,
+        "schema_version": 2,
         "tag": reference["tag"],
         "targets": index_targets,
         "tree_sha": reference["tree_sha"],
@@ -391,7 +511,7 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
     if (
         not isinstance(manifest, dict)
         or set(manifest) != expected_manifest_fields
-        or manifest["schema_version"] != 1
+        or manifest["schema_version"] != 2
         or manifest["product"] != "market-squawk"
         or manifest["repository"] != "Sawmonabo/market-squawk"
         or VERSION_PATTERN.fullmatch(str(manifest["version"])) is None
@@ -405,10 +525,19 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
     target_release = manifest["targets"][0]
     if (
         not isinstance(target_release, dict)
-        or set(target_release) != {"archive", "components", "minimum_system", "target"}
+        or set(target_release)
+        != {
+            "archive",
+            "components",
+            "minimum_system",
+            "native_trust_mode",
+            "target",
+        }
         or target_release["target"] not in TARGETS
         or target_release["minimum_system"]
         != MINIMUM_SYSTEMS[target_release["target"]]
+        or target_release["native_trust_mode"]
+        not in NATIVE_TRUST_MODES[target_release["target"]]
     ):
         raise ReleaseBuildError("platform release target identity is invalid")
     target = target_release["target"]
@@ -513,8 +642,13 @@ def _admit_platform_checksums(root: Path, bundle_name: str, bootstrap_name: str)
         raise ReleaseBuildError("platform release checksum file is incomplete")
 
 
-def _release_artifact(tag: str, path: Path) -> dict[str, object]:
-    return {
+def _release_artifact(
+    tag: str,
+    path: Path,
+    *,
+    native_trust_mode: str | None = None,
+) -> dict[str, object]:
+    artifact = {
         "sha256": file_sha256(path),
         "size": path.stat().st_size,
         "url": (
@@ -522,6 +656,9 @@ def _release_artifact(tag: str, path: Path) -> dict[str, object]:
             f"{tag}/{path.name}"
         ),
     }
+    if native_trust_mode is not None:
+        artifact["native_trust_mode"] = native_trust_mode
+    return artifact
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -580,6 +717,11 @@ def parse_options() -> Options:
         description="Build one complete immutable Market Squawk platform bundle."
     )
     parser.add_argument("--target", required=True, choices=tuple(TARGETS))
+    parser.add_argument(
+        "--native-trust-mode",
+        required=True,
+        choices=ALL_NATIVE_TRUST_MODES,
+    )
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tree", required=True)
@@ -591,10 +733,12 @@ def parse_options() -> Options:
         VERSION_PATTERN.fullmatch(values.version) is None
         or OBJECT_PATTERN.fullmatch(values.commit) is None
         or OBJECT_PATTERN.fullmatch(values.tree) is None
+        or values.native_trust_mode not in NATIVE_TRUST_MODES[values.target]
     ):
-        raise ReleaseBuildError("version, commit, or tree identity is malformed")
+        raise ReleaseBuildError("release identity or native trust mode is invalid")
     return Options(
         target=TARGETS[values.target],
+        native_trust_mode=values.native_trust_mode,
         version=values.version,
         commit=values.commit,
         tree=values.tree,
@@ -901,6 +1045,8 @@ def build_manifest(
             str(bundle),
             "--archive-url",
             archive_url,
+            "--native-trust-mode",
+            options.native_trust_mode,
             "--output",
             str(manifest),
         ],

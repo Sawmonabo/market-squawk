@@ -65,42 +65,9 @@ jobs:
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
 
-  credentials:
-    name: Require protected native-signing authority
-    needs: freeze
-    runs-on: ubuntu-24.04
-    environment: stable-release
-    steps:
-      - name: Reject an incomplete stable signing configuration
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          for name in \
-            APPLE_CERTIFICATE \
-            APPLE_CERTIFICATE_PASSWORD \
-            APPLE_ID \
-            APPLE_PASSWORD \
-            APPLE_TEAM_ID \
-            WINDOWS_CERTIFICATE \
-            WINDOWS_CERTIFICATE_PASSWORD
-          do
-            [[ -n "${!name}" ]]
-          done
-
   platform:
-    name: Signed platform release (${{ matrix.name }})
-    needs:
-      - freeze
-      - credentials
+    name: Platform release (${{ matrix.name }})
+    needs: freeze
     strategy:
       fail-fast: false
       matrix:
@@ -187,8 +154,95 @@ jobs:
           cache-all-crates: "false"
           cache-workspace-crates: "false"
           save-if: "false"
-      - name: Import Apple Developer ID authority
+      - name: Select provenance-only Linux trust
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "MARKET_SQUAWK_NATIVE_TRUST_MODE=provenance-only" \
+            >> "$GITHUB_ENV"
+      - name: Resolve optional Apple release authority
         if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          mode=provenance-only
+          present=0
+          for value in \
+            "$APPLE_CERTIFICATE" \
+            "$APPLE_CERTIFICATE_PASSWORD" \
+            "$APPLE_ID" \
+            "$APPLE_PASSWORD" \
+            "$APPLE_TEAM_ID"
+          do
+            if [[ -n "$value" ]]; then
+              present=$((present + 1))
+            fi
+          done
+          if [[ "$present" -ne 0 && "$present" -ne 5 ]]; then
+            echo "Apple release authority is only partially configured." >&2
+            exit 1
+          fi
+          if [[ "$present" -eq 5 ]]; then
+            mode=developer-id-signed-and-notarized
+          fi
+          echo "MARKET_SQUAWK_NATIVE_TRUST_MODE=$mode" >> "$GITHUB_ENV"
+      - name: Resolve optional Windows release authority
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          mode=provenance-only
+          present=0
+          for value in \
+            "$WINDOWS_CERTIFICATE" \
+            "$WINDOWS_CERTIFICATE_PASSWORD"
+          do
+            if [[ -n "$value" ]]; then
+              present=$((present + 1))
+            fi
+          done
+          if [[ "$present" -ne 0 && "$present" -ne 2 ]]; then
+            echo "Windows release authority is only partially configured." >&2
+            exit 1
+          fi
+          if [[ "$present" -eq 2 ]]; then
+            mode=authenticode-signed
+          fi
+          echo "MARKET_SQUAWK_NATIVE_TRUST_MODE=$mode" >> "$GITHUB_ENV"
+      - id: trust
+        name: Admit the platform-native trust mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$RUNNER_OS:$MARKET_SQUAWK_NATIVE_TRUST_MODE" in
+            Linux:provenance-only|\
+            macOS:provenance-only|\
+            macOS:developer-id-signed-and-notarized|\
+            Windows:provenance-only|\
+            Windows:authenticode-signed)
+              ;;
+            *)
+              echo "The platform-native trust mode is invalid." >&2
+              exit 1
+              ;;
+          esac
+          echo "mode=$MARKET_SQUAWK_NATIVE_TRUST_MODE" >> "$GITHUB_OUTPUT"
+      - name: Import Apple Developer ID authority
+        if: >-
+          runner.os == 'macOS' &&
+          steps.trust.outputs.mode == 'developer-id-signed-and-notarized'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -228,7 +282,9 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$identities" >> "$GITHUB_ENV"
           echo "MARKET_SQUAWK_APPLE_SIGNING_IDENTITY=$identities" >> "$GITHUB_ENV"
       - name: Import Windows publisher authority
-        if: runner.os == 'Windows'
+        if: >-
+          runner.os == 'Windows' &&
+          steps.trust.outputs.mode == 'authenticode-signed'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -257,7 +313,7 @@ jobs:
           }
           "MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT=$thumbprint" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build the signed sealed Python 3.14 product
+      - name: Build the sealed Python 3.14 product
         shell: bash
         env:
           MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK: "1"
@@ -275,7 +331,7 @@ jobs:
             --prepare-cache-only
           unset MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK
           signing=()
-          if [[ "$RUNNER_OS" != "Linux" ]]; then
+          if [[ "$MARKET_SQUAWK_NATIVE_TRUST_MODE" != "provenance-only" ]]; then
             signing+=(--sign-native)
           fi
           python3 scripts/build_python_release.py \
@@ -285,7 +341,7 @@ jobs:
             --component-root "$component_root" \
             --offline \
             "${signing[@]}"
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
+          if [[ "$MARKET_SQUAWK_NATIVE_TRUST_MODE" == "provenance-only" ]]; then
             jq -e '.native_code_signing.status == "not-requested"' \
               "$artifact_root/market-squawk-release-evidence.json"
           else
@@ -332,7 +388,9 @@ jobs:
           cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
             "$native/uv$EXE"
       - name: Sign and verify complete macOS inputs
-        if: runner.os == 'macOS'
+        if: >-
+          runner.os == 'macOS' &&
+          steps.trust.outputs.mode == 'developer-id-signed-and-notarized'
         shell: bash
         run: |
           set -euo pipefail
@@ -348,7 +406,9 @@ jobs:
             codesign --verify --strict --verbose=2 "$path"
           done
       - name: Sign and verify complete Windows inputs
-        if: runner.os == 'Windows'
+        if: >-
+          runner.os == 'Windows' &&
+          steps.trust.outputs.mode == 'authenticode-signed'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -380,6 +440,7 @@ jobs:
 
           python3 scripts/build_complete_release.py \
             --target "$TARGET" \
+            --native-trust-mode "$MARKET_SQUAWK_NATIVE_TRUST_MODE" \
             --version "${{ needs.freeze.outputs.version }}" \
             --commit "${{ needs.freeze.outputs.commit }}" \
             --tree "${{ needs.freeze.outputs.tree }}" \
@@ -395,7 +456,9 @@ jobs:
           pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
           printf '{}\n' > "$RUNNER_TEMP/tauri-signing.json"
       - name: Configure Windows package signing
-        if: runner.os == 'Windows'
+        if: >-
+          runner.os == 'Windows' &&
+          steps.trust.outputs.mode == 'authenticode-signed'
         shell: pwsh
         run: |
           $configuration = @{
@@ -426,6 +489,7 @@ jobs:
             --config src-tauri/tauri.bundle.conf.json
             --config ${{ runner.temp }}/tauri-signing.json
             --target ${{ matrix.target }}
+            ${{ steps.trust.outputs.mode == 'provenance-only' && '--no-sign' || '' }}
             --ci
             --bundles ${{ matrix.bundles }}
       # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
@@ -441,6 +505,7 @@ jobs:
             --config src-tauri/tauri.bundle.conf.json
             --config ${{ runner.temp }}/tauri-signing.json
             --target ${{ matrix.target }}
+            ${{ steps.trust.outputs.mode == 'provenance-only' && '--no-sign' || '' }}
             --ci
             --bundles ${{ matrix.bundles }}
       # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
@@ -452,6 +517,7 @@ jobs:
             --config src-tauri/tauri.bundle.conf.json
             --config ${{ runner.temp }}/tauri-signing.json
             --target ${{ matrix.target }}
+            ${{ steps.trust.outputs.mode == 'provenance-only' && '--no-sign' || '' }}
             --ci
             --bundles ${{ matrix.bundles }}
       - name: Verify the installed complete product
@@ -489,7 +555,7 @@ jobs:
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
           python3 scripts/smoke_mcp.py "$application"
           "$bootstrap" --root "$install_root" uninstall
-      - name: Verify signed macOS package
+      - name: Verify the macOS package and declared trust
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -504,11 +570,21 @@ jobs:
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
           app="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print)"
           [[ -n "$app" && "$app" != *$'\n'* ]]
-          codesign --verify --deep --strict --verbose=2 "$app"
-          spctl --assess --type execute --verbose=4 "$app"
-          xcrun stapler validate "$app"
+          case "$MARKET_SQUAWK_NATIVE_TRUST_MODE" in
+            developer-id-signed-and-notarized)
+              codesign --verify --deep --strict --verbose=2 "$app"
+              spctl --assess --type execute --verbose=4 "$app"
+              xcrun stapler validate "$app"
+              ;;
+            provenance-only)
+              ;;
+            *)
+              echo "Unexpected macOS native trust mode." >&2
+              exit 1
+              ;;
+          esac
           hdiutil detach "$mount"
-      - name: Verify signed Windows packages
+      - name: Verify the Windows packages and declared trust
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -523,16 +599,24 @@ jobs:
               }
           )
           if ($packages.Count -ne 2) {
-            throw "The signed Windows package set is incomplete."
+            throw "The Windows package set is incomplete."
           }
           foreach ($package in $packages) {
             $signature = Get-AuthenticodeSignature $package.FullName
-            if (
-              $signature.Status -ne "Valid" -or
-              $signature.SignerCertificate.Thumbprint -ne
-                $env:MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
-            ) {
-              throw "A Windows package has no valid expected publisher signature."
+            if ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "authenticode-signed") {
+              if (
+                $signature.Status -ne "Valid" -or
+                $signature.SignerCertificate.Thumbprint -ne
+                  $env:MARKET_SQUAWK_WINDOWS_CERTIFICATE_THUMBPRINT
+              ) {
+                throw "A Windows package has no valid expected publisher signature."
+              }
+            } elseif ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "provenance-only") {
+              if ($signature.Status -ne "NotSigned") {
+                throw "A provenance-only Windows package has unexpected publisher state."
+              }
+            } else {
+              throw "The Windows package declares an unsupported native trust mode."
             }
           }
       - name: Verify Linux AppImage MCP dispatch
@@ -625,7 +709,28 @@ jobs:
             '.commit_sha == $commit
              and .tree_sha == $tree
              and .tag == $tag
-             and (.targets | length) == 4' \
+             and .schema_version == 2
+             and (.targets | length) == 4
+             and all(
+               .targets[];
+               . as $target
+               | all(
+                   .native_packages[];
+                   .native_trust_mode == $target.native_trust_mode
+                 )
+             )
+             and all(
+               .targets[];
+               if (.target | endswith("apple-darwin")) then
+                 .native_trust_mode == "provenance-only"
+                 or .native_trust_mode == "developer-id-signed-and-notarized"
+               elif .target == "x86_64-pc-windows-msvc" then
+                 .native_trust_mode == "provenance-only"
+                 or .native_trust_mode == "authenticode-signed"
+               else
+                 .native_trust_mode == "provenance-only"
+               end
+             )' \
             "$RUNNER_TEMP/release/market-squawk-release.json"
       # actions/attest v4.2.0, verified release commit (2026-07-20).
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
@@ -649,7 +754,7 @@ jobs:
             --draft \
             --target "${{ needs.freeze.outputs.commit }}" \
             --title "Market Squawk ${{ needs.freeze.outputs.version }}" \
-            --notes "Complete signed self-hosted Market Squawk release." \
+            --notes "Complete self-hosted Market Squawk release with per-package native trust recorded in the release manifest." \
             "$RUNNER_TEMP/release/"*
           release_id="$(
             gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
@@ -790,7 +895,60 @@ jobs:
             fi
             gh attestation verify "$candidate/$name" --repo "$GITHUB_REPOSITORY"
           done
+          native_name="market-squawk-$VERSION-$TARGET$NATIVE_SUFFIX"
+          native_trust_mode="$(
+            jq -er \
+              --arg target "$TARGET" \
+              --arg name "$native_name" \
+              '.targets[]
+               | select(.target == $target)
+               | . as $release
+               | [
+                   .native_packages[]
+                   | select(.url | endswith("/" + $name))
+                 ] as $packages
+               | if (
+                   ($packages | length) == 1
+                   and $packages[0].native_trust_mode
+                     == $release.native_trust_mode
+                 )
+                 then $release.native_trust_mode
+                 else error("native trust declaration is inconsistent")
+                 end' \
+              "$candidate/market-squawk-release.json"
+          )"
+          platform_trust_mode="$(
+            jq -er \
+              --arg target "$TARGET" \
+              '.targets
+               | if (
+                   length == 1
+                   and .[0].target == $target
+                   and (.[0].native_trust_mode | type) == "string"
+                 )
+                 then .[0].native_trust_mode
+                 else error("platform trust declaration is invalid")
+                 end' \
+              "$candidate/market-squawk-release-$TARGET.json"
+          )"
+          [[ "$native_trust_mode" == "$platform_trust_mode" ]]
+          case "$TARGET:$native_trust_mode" in
+            aarch64-apple-darwin:provenance-only|\
+            aarch64-apple-darwin:developer-id-signed-and-notarized|\
+            x86_64-apple-darwin:provenance-only|\
+            x86_64-apple-darwin:developer-id-signed-and-notarized|\
+            x86_64-pc-windows-msvc:provenance-only|\
+            x86_64-pc-windows-msvc:authenticode-signed|\
+            x86_64-unknown-linux-gnu:provenance-only)
+              ;;
+            *)
+              echo "The draft package declares an unsupported native trust mode." >&2
+              exit 1
+              ;;
+          esac
           echo "MARKET_SQUAWK_CANDIDATE=$candidate" >> "$GITHUB_ENV"
+          echo "MARKET_SQUAWK_NATIVE_TRUST_MODE=$native_trust_mode" \
+            >> "$GITHUB_ENV"
       - name: Install and launch the DMG
         if: runner.os == 'macOS'
         shell: bash
@@ -815,9 +973,19 @@ jobs:
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
           packaged="$mount/Market Squawk.app"
           [[ -d "$packaged" && ! -L "$packaged" ]]
-          codesign --verify --deep --strict --verbose=2 "$packaged"
-          spctl --assess --type execute --verbose=4 "$packaged"
-          xcrun stapler validate "$packaged"
+          case "$MARKET_SQUAWK_NATIVE_TRUST_MODE" in
+            developer-id-signed-and-notarized)
+              codesign --verify --deep --strict --verbose=2 "$packaged"
+              spctl --assess --type execute --verbose=4 "$packaged"
+              xcrun stapler validate "$packaged"
+              ;;
+            provenance-only)
+              ;;
+            *)
+              echo "Unexpected macOS native trust mode." >&2
+              exit 1
+              ;;
+          esac
           ditto "$packaged" "$application"
           hdiutil detach "$mount"
 
@@ -893,8 +1061,16 @@ jobs:
             $env:MARKET_SQUAWK_CANDIDATE `
             "market-squawk-$env:VERSION-$env:TARGET$suffix"
           $signature = Get-AuthenticodeSignature $package
-          if ($signature.Status -ne "Valid") {
-            throw "The downloaded Windows package signature is invalid."
+          if ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "authenticode-signed") {
+            if ($signature.Status -ne "Valid") {
+              throw "The downloaded Windows package signature is invalid."
+            }
+          } elseif ($env:MARKET_SQUAWK_NATIVE_TRUST_MODE -eq "provenance-only") {
+            if ($signature.Status -ne "NotSigned") {
+              throw "The provenance-only Windows package has unexpected publisher state."
+            }
+          } else {
+            throw "The Windows package declares an unsupported native trust mode."
           }
 
           if ($env:PACKAGE_KIND -eq "nsis") {

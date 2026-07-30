@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::platform::{PlatformError, SupportedTarget};
+use crate::platform::{NativeTrustMode, PlatformError, SupportedTarget};
 
 pub(crate) const MAXIMUM_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAXIMUM_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
@@ -17,7 +17,7 @@ pub(crate) const MAXIMUM_EXPANDED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum encoded byte length of one per-platform release manifest.
 pub const MAXIMUM_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAXIMUM_ARCHIVE_ENTRIES: usize = 32_768;
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const PRODUCT_IDENTITY: &str = "market-squawk";
 const REPOSITORY_IDENTITY: &str = "Sawmonabo/market-squawk";
 const MAXIMUM_COMPONENT_PATH_BYTES: usize = 1_024;
@@ -128,6 +128,11 @@ impl AdmittedRelease {
         self.target_release().target
     }
 
+    /// Returns the native publisher-trust evidence declared for the selected target.
+    pub fn native_trust_mode(&self) -> NativeTrustMode {
+        self.target_release().native_trust_mode
+    }
+
     /// Returns the SHA-256 identity of the exact admitted manifest bytes.
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
@@ -147,6 +152,7 @@ impl AdmittedRelease {
 pub(crate) struct TargetRelease {
     pub(crate) target: SupportedTarget,
     minimum_system: Box<str>,
+    native_trust_mode: NativeTrustMode,
     pub(crate) archive: ArtifactIdentity,
     pub(crate) components: Vec<ComponentIdentity>,
 }
@@ -155,6 +161,11 @@ impl TargetRelease {
     fn validate(&self, tag: &str) -> Result<(), ManifestError> {
         if self.minimum_system.as_ref() != self.target.minimum_system() {
             return Err(ManifestError::MinimumSystem {
+                target: self.target,
+            });
+        }
+        if !self.native_trust_mode.supports(self.target) {
+            return Err(ManifestError::NativeTrustMode {
                 target: self.target,
             });
         }
@@ -344,6 +355,12 @@ pub enum ManifestError {
     #[error("release manifest has the wrong minimum system for {target:?}")]
     MinimumSystem {
         /// Target with the wrong floor.
+        target: SupportedTarget,
+    },
+    /// A target declares native trust that cannot apply to its platform.
+    #[error("release manifest has an invalid native trust mode for {target:?}")]
+    NativeTrustMode {
+        /// Target with the invalid native-trust declaration.
         target: SupportedTarget,
     },
     /// Archive size or digest is invalid.

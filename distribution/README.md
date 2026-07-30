@@ -11,7 +11,9 @@ not a generated-artifact directory.
 `scripts/build_python_release.py` first creates the sealed CPython product.
 `scripts/build_complete_release.py` then combines that product with the native desktop, capture
 helper, installer, uv, licenses, and notices. The result is a deterministic complete ZIP, a
-component-level release manifest, the platform bootstrap, and `SHA256SUMS`.
+component-level release manifest with the exact native-trust mode, the platform bootstrap, and
+`SHA256SUMS`.
 
 Generated release outputs must remain outside the source tree. They are published only by the
-tag-bound release workflow after native package and installed-product verification.
+tag-bound release workflow after native package, declared-trust, installed-product, checksum, and
+GitHub attestation verification.

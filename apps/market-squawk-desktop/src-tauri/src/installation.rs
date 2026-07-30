@@ -16,7 +16,6 @@ use semver::Version;
 use tauri::Manager as _;
 use thiserror::Error;
 
-const LATEST_MANIFEST_URL: &str = "https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-release.json";
 const MAXIMUM_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAXIMUM_BOOTSTRAP_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -32,6 +31,7 @@ pub(crate) struct PreparedInstallation {
 struct PackagedRelease {
     manifest: Vec<u8>,
     bundle: PathBuf,
+    channel_manifest_url: Box<str>,
     version: Version,
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn prepare(
     if let Some(packaged) = packaged {
         install(
             InstallRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
-                .with_channel_manifest_url(LATEST_MANIFEST_URL)?,
+                .with_channel_manifest_url(&packaged.channel_manifest_url)?,
         )?;
         return Ok(PreparedInstallation {
             active_release_root: Some(active_release_root(&root)?),
@@ -133,6 +133,12 @@ fn packaged_release(
     Ok(Some(PackagedRelease {
         manifest,
         bundle,
+        channel_manifest_url: format!(
+            "https://github.com/Sawmonabo/market-squawk/releases/latest/download/\
+             market-squawk-release-{}.json",
+            target.as_str()
+        )
+        .into(),
         version,
     }))
 }

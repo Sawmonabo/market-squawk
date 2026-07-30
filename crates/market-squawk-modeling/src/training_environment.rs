@@ -837,7 +837,7 @@ const fn training_driver_relative_path() -> &'static str {
 
 const fn training_driver_record_path() -> &'static str {
     if cfg!(windows) {
-        "../../../Scripts/market-squawk-train.exe"
+        "../../Scripts/market-squawk-train.exe"
     } else {
         "../../../bin/market-squawk-train"
     }

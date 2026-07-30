@@ -33,7 +33,7 @@ flowchart LR
 ```
 
 cargo-dist 0.32.0 coordinates the four native release targets and GitHub publication. Tauri builds
-the signed native desktop packages. A repository-owned builder combines those outputs with the CLI,
+the native desktop packages. A repository-owned builder combines those outputs with the CLI,
 capture helper, ONNX worker, model validator, training driver, Market Squawk installer, uv 0.12.0,
 standard managed CPython 3.14.6, the exact locked Python environment, licenses, notices, and
 metadata. One closed release manifest binds the repository, tag, commit, tree, target, archive, and
@@ -60,9 +60,13 @@ The V1 targets are:
 - macOS 12 or newer on Intel; and
 - macOS 12 or newer on Apple Silicon.
 
-Stable publication requires native platform signing/notarization where applicable, GitHub release
-attestation, exact installed-product evidence on all four targets, and the unchanged release gate.
-Unsigned pull-request artifacts remain verification inputs and cannot be presented as stable.
+Stable publication requires GitHub release attestations, exact digests, an explicit native-trust
+mode for every package, exact installed-product evidence on all four targets, and the unchanged
+release gate. The core release uses `provenance-only` when no native publisher authority is
+available. Apple Developer ID signing and notarization or Windows Authenticode signing is applied
+and claimed only when the complete optional authority exists and the exact final package passes its
+native verification. Pull-request artifacts remain verification inputs and cannot be presented as
+stable.
 
 ## Consequences
 
@@ -75,8 +79,11 @@ Unsigned pull-request artifacts remain verification inputs and cannot be present
 - Ordinary uninstall preserves configuration, credentials, catalogs, portfolios, datasets, models,
   logs, and artifacts; deleting those classes requires separate explicit choices.
 - Native packages become larger because they carry the complete offline-capable Python product.
-- Stable macOS and Windows publication remains blocked until protected signing credentials and
-  native signature evidence exist.
+- Stable macOS and Windows publication does not require paid signing credentials; packages without
+  native publisher authority are accurately identified as provenance-only.
+- Native publisher claims remain blocked until the corresponding protected authority exists and
+  the exact final package passes signing, timestamp, notarization, and platform checks as
+  applicable.
 - Data-schema compatibility must be admitted before program activation; program rollback does not
   silently rewind catalogs or analytical datasets.
 
@@ -100,6 +107,7 @@ Unsigned pull-request artifacts remain verification inputs and cannot be present
 - [Security and trust boundaries](../security-and-trust-boundaries.md)
 - [Quality attributes](../quality-attributes.md)
 - [Installation research](../../research/2026-07-28-cross-platform-installation-and-guided-setup.md)
+- [Zero-cost desktop distribution research](../../research/2026-07-29-zero-cost-desktop-distribution.md)
 - [Complete installation plan](../../superpowers/plans/2026-07-29-complete-installation-and-public-release.md)
 
 ## Evidence and sources
@@ -121,4 +129,3 @@ Unsigned pull-request artifacts remain verification inputs and cannot be present
 - [Tauri distribution](https://v2.tauri.app/distribute/) and
   [GitHub release pipeline](https://v2.tauri.app/distribute/pipelines/github/), reviewed
   2026-07-29.
-

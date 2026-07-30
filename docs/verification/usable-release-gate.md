@@ -7,7 +7,7 @@ This page defines the sole terminal gate for the first complete local Market Squ
 | Document type | Release gate and evidence contract |
 | Audience | Release owner, reviewers, maintainers, and auditors |
 | Status | Gate and publication authority implemented; terminal execution blocked |
-| Last substantive review | 2026-07-28 |
+| Last substantive review | 2026-07-30 |
 | Implementation review base | Installer candidate `a0e4f01989a6ce91a8589b1a22b204860dee4d54`; refresh against the frozen release head before approval |
 
 ## Contents
@@ -26,7 +26,7 @@ This page defines the sole terminal gate for the first complete local Market Squ
 `usable_complete_local_release = true` is permitted only when one clean, unchanged candidate:
 
 1. satisfies all provider and durable-use predicates;
-2. produces the signed, complete CPython 3.14 product for every supported target;
+2. produces the verified, complete CPython 3.14 product for every supported target;
 3. passes the offline complete-product and native-package demonstrations;
 4. passes fuzz, performance, security, dependency, license, credential, build, and test gates;
 5. receives a grouped Quarter 4 review with no unresolved release-blocking finding; and
@@ -47,7 +47,8 @@ make that decision.
   contacts, credentials, queries, and rights evidence.
 - The locked standard CPython 3.14.6, uv 0.12.0, PyArrow 25.0.0, and sealed wheelhouse inputs are
   available for the native target.
-- Protected Apple Developer ID/notarization and Windows Authenticode credentials are available.
+- Every native package declares its exact trust mode; any configured Apple or Windows signing
+  authority is complete and protected.
 - GitHub immutable releases are enabled and the `stable-release` environment has approved the
   exact annotated tag.
 - One worktree-local Cargo target is below the 20 GiB release ceiling; `CARGO_INCREMENTAL=0`.
@@ -59,12 +60,12 @@ make that decision.
 ```mermaid
 flowchart TD
     Freeze["Freeze clean candidate HEAD/tree"]
-    Build["Signed CPython 3.14 complete-product build"]
+    Build["Verified CPython 3.14 complete-product build"]
     Fuzz["fuzz.json"]
     Perf["performance.json"]
     Providers["providers/provider-evidence.json"]
-    Python["signed release-cp314 product"]
-    Native["signed native packages for four targets"]
+    Python["verified release-cp314 product"]
+    Native["four-target packages + exact native-trust modes"]
     Attest["GitHub artifact attestations"]
     Demo["demo.json"]
     Gate["Supervised full gate"]
@@ -217,8 +218,8 @@ The terminal gate has not run. The current release remains blocked by:
 - authorized unchanged-head Coinbase Direct provider acceptance;
 - required external SEC, BLS, Treasury, and provider-recovery evidence;
 - exact-head fuzz, performance, Python, demonstration, full security/build, and closure evidence;
-- protected Apple and Windows signing credentials;
-- signed package evidence from Linux, Windows, Intel macOS, and Apple Silicon macOS; and
+- final package evidence and truthful native-trust metadata from Linux, Windows, Intel macOS, and
+  Apple Silicon macOS; and
 - the grouped Quarter 4 review, immutable-release setting, and final publication.
 
 The release-demonstration implementation can be integrated while those externally coordinated

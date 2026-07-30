@@ -20,7 +20,9 @@ pub use self::lifecycle::{
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
-pub use self::platform::{PlatformError, ProgramName, SupportedTarget, default_install_root};
+pub use self::platform::{
+    NativeTrustMode, PlatformError, ProgramName, SupportedTarget, default_install_root,
+};
 pub use self::store::StoreError;
 
 #[cfg(test)]
@@ -216,7 +218,7 @@ mod tests {
             let archive_size = fs::metadata(&bundle)?.len();
             let archive_sha256 = sha256_file(&bundle)?;
             let manifest = serde_json::to_vec_pretty(&json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "product": "market-squawk",
                 "version": version,
                 "tag": format!("v{version}"),
@@ -227,6 +229,7 @@ mod tests {
                 "targets": [{
                     "target": target.as_str(),
                     "minimum_system": target.minimum_system(),
+                    "native_trust_mode": "provenance-only",
                     "archive": {
                     "url": format!(
                         "https://github.com/Sawmonabo/market-squawk/releases/download/v{version}/market-squawk-{version}.zip"

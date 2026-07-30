@@ -29,7 +29,7 @@ use crate::manifest::{
     ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_ARCHIVE_ENTRIES,
     MAXIMUM_ENTRY_BYTES, MAXIMUM_MANIFEST_BYTES, ReleaseManifest,
 };
-use crate::platform::{ProgramName, SupportedTarget, default_install_root};
+use crate::platform::{NativeTrustMode, ProgramName, SupportedTarget, default_install_root};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -143,6 +143,9 @@ struct ManifestBuildArguments {
     /// Immutable GitHub Release URL for the complete ZIP archive.
     #[arg(long)]
     archive_url: String,
+    /// Native publisher-trust evidence verified for this target.
+    #[arg(long, value_enum)]
+    native_trust_mode: NativeTrustMode,
     /// New manifest file to create.
     #[arg(long)]
     output: PathBuf,
@@ -284,6 +287,9 @@ fn build_release_manifest(
         return Err(CommandError::ManifestBuild);
     }
     let target = SupportedTarget::current()?;
+    if !arguments.native_trust_mode.supports(target) {
+        return Err(CommandError::ManifestBuild);
+    }
     let root = controlled_staging_root(&arguments.staging_root)?;
     let bundle = controlled_regular_file(&arguments.bundle, MAXIMUM_ARCHIVE_BYTES)?;
     let output = new_output_path(&arguments.output, &root)?;
@@ -315,6 +321,7 @@ fn build_release_manifest(
         "targets": [{
             "target": target,
             "minimum_system": target.minimum_system(),
+            "native_trust_mode": arguments.native_trust_mode,
             "archive": {
                 "url": arguments.archive_url,
                 "size": bundle_size,
@@ -723,19 +730,22 @@ fn admitted_https_url(value: &str) -> Result<Url, CommandError> {
 
 fn admitted_manifest_url(value: &str) -> Result<Url, CommandError> {
     let url = admitted_https_url(value)?;
-    let latest = "/Sawmonabo/market-squawk/releases/latest/download/market-squawk-release.json";
+    let target = SupportedTarget::current()?;
+    let latest = format!(
+        "/Sawmonabo/market-squawk/releases/latest/download/market-squawk-release-{}.json",
+        target.as_str()
+    );
     if url.host_str() != Some("github.com")
         || url.query().is_some()
-        || (url.path() != latest && !is_versioned_manifest_path(url.path()))
+        || (url.path() != latest && !is_versioned_manifest_path(url.path(), target))
     {
         return Err(CommandError::DownloadUrl);
     }
     Ok(url)
 }
 
-fn is_versioned_manifest_path(path: &str) -> bool {
+fn is_versioned_manifest_path(path: &str, target: SupportedTarget) -> bool {
     const PREFIX: &str = "/Sawmonabo/market-squawk/releases/download/";
-    const MANIFEST: &str = "market-squawk-release.json";
 
     let Some(remainder) = path.strip_prefix(PREFIX) else {
         return false;
@@ -746,7 +756,7 @@ fn is_versioned_manifest_path(path: &str) -> bool {
     let Some(version_text) = tag.strip_prefix('v') else {
         return false;
     };
-    asset == MANIFEST
+    asset == format!("market-squawk-release-{}.json", target.as_str())
         && Version::parse(version_text).is_ok_and(|version| version_text == version.to_string())
 }
 
@@ -815,4 +825,36 @@ pub enum CommandError {
     Manifest(#[from] crate::manifest::ManifestError),
     #[error(transparent)]
     Platform(#[from] crate::platform::PlatformError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::{SupportedTarget, admitted_manifest_url};
+
+    #[test]
+    fn manifest_download_uses_only_the_current_target_channel() -> Result<(), Box<dyn Error>> {
+        let target = SupportedTarget::current()?.as_str();
+        for url in [
+            format!(
+                "https://github.com/Sawmonabo/market-squawk/releases/latest/download/\
+                 market-squawk-release-{target}.json"
+            ),
+            format!(
+                "https://github.com/Sawmonabo/market-squawk/releases/download/v1.0.0/\
+                 market-squawk-release-{target}.json"
+            ),
+        ] {
+            admitted_manifest_url(&url)?;
+        }
+        assert!(
+            admitted_manifest_url(
+                "https://github.com/Sawmonabo/market-squawk/releases/latest/download/\
+                 market-squawk-release.json"
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 }

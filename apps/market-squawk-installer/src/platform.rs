@@ -24,6 +24,35 @@ pub enum SupportedTarget {
     X86_64UnknownLinuxGnu,
 }
 
+/// Native publisher-trust evidence carried by one release target.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum NativeTrustMode {
+    /// Integrity and build provenance are verified without a native publisher identity.
+    ProvenanceOnly,
+    /// Apple Developer ID signing, timestamping, notarization, and stapling were verified.
+    DeveloperIdSignedAndNotarized,
+    /// Authenticode publisher signing and timestamping were verified.
+    AuthenticodeSigned,
+}
+
+impl NativeTrustMode {
+    /// Returns whether this trust mode is meaningful for the release target.
+    pub const fn supports(self, target: SupportedTarget) -> bool {
+        match self {
+            Self::ProvenanceOnly => true,
+            Self::DeveloperIdSignedAndNotarized => matches!(
+                target,
+                SupportedTarget::Aarch64AppleDarwin | SupportedTarget::X86_64AppleDarwin
+            ),
+            Self::AuthenticodeSigned => {
+                matches!(target, SupportedTarget::X86_64PcWindowsMsvc)
+            }
+        }
+    }
+}
+
 impl SupportedTarget {
     /// Detects the current supported release target.
     ///
