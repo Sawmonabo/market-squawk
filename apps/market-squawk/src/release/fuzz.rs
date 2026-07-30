@@ -19,7 +19,8 @@ use crate::cli::ReleaseFuzzArguments;
 
 pub(super) const FUZZ_TOOLCHAIN: &str = "nightly-2026-07-15";
 pub(super) const CARGO_FUZZ_VERSION: &str = "cargo-fuzz 0.13.2";
-const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(120 * 60);
+pub(super) const FUZZ_BUILD_RSS_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_CAMPAIGN_SECONDS: u64 = 60 * 60;
 const MINIMUM_RSS_MIB: u64 = 64;
 const MAXIMUM_RSS_MIB: u64 = 8 * 1024;
@@ -86,6 +87,7 @@ struct FuzzEvidence {
     cargo_fuzz_version: String,
     sanitizer: &'static str,
     seconds_per_target: u64,
+    build_rss_limit_bytes: u64,
     rss_limit_bytes: u64,
     target_directory_limit_bytes: u64,
     started_at: String,
@@ -157,7 +159,10 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
         bail!("release fuzz evidence requires {CARGO_FUZZ_VERSION}");
     }
     let target_root = prepare_campaign_root(&fuzz_root, &repository)?;
-    let environment = vec![(OsString::from("CARGO_NET_OFFLINE"), OsString::from("true"))];
+    let environment = vec![
+        (OsString::from("CARGO_BUILD_JOBS"), OsString::from("1")),
+        (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+    ];
     let mut targets = Vec::new();
     targets
         .try_reserve_exact(TARGETS.len())
@@ -181,7 +186,7 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
             environment: &environment,
             limits: ProcessLimits {
                 timeout: BUILD_TIMEOUT,
-                rss_bytes: rss_limit_bytes,
+                rss_bytes: FUZZ_BUILD_RSS_LIMIT_BYTES,
             },
         })?
         .evidence;
@@ -263,6 +268,7 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
         cargo_fuzz_version: cargo_fuzz,
         sanitizer: "address",
         seconds_per_target: arguments.seconds_per_target,
+        build_rss_limit_bytes: FUZZ_BUILD_RSS_LIMIT_BYTES,
         rss_limit_bytes,
         target_directory_limit_bytes: MAXIMUM_FUZZ_TARGET_BYTES,
         started_at,

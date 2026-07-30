@@ -141,7 +141,8 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
                 last_rss_sample_completed_at = Some(Instant::now());
                 if rss > request.limits.rss_bytes {
                     primary_error = Some(anyhow::anyhow!(
-                        "bounded process observed a resident-memory sample above its limit"
+                        "bounded process resident memory {rss} bytes exceeded its {}-byte limit",
+                        request.limits.rss_bytes
                     ));
                     break None;
                 }

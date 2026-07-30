@@ -9,7 +9,7 @@ approximately one-hour Linux verification feedback loop.
 | Audience | Maintainers, CI owners, release reviewers |
 | Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-29 |
+| Last substantive review | 2026-07-30 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
@@ -191,6 +191,50 @@ The earlier 28–32 minute cold projection was not achieved. Change classificati
 policy lane, trusted package-cache writes, and a final gate now exist, but the Linux verification
 body is still serial and the complete-package matrix adds a second, larger critical path. The
 projection remains historical planning evidence only and must not be cited as measured performance.
+
+### 2026-07-30 Windows linker selection failure
+
+Exact candidate `3f70d48e1e290d019279dcfa91b9a24d7cc90e0c` ran in
+[job 90958711466](https://github.com/Sawmonabo/market-squawk/actions/runs/30568376283/job/90958711466).
+Its sealed Python 3.14 product completed successfully in the Windows package lane, including all
+11 tests and two subtests. The immediately following raw Cargo build failed because `rustc`
+selected `C:\Program Files\Git\usr\bin\link.exe`; GNU `link` then rejected the MSVC linker
+arguments. The log therefore establishes an executable-name collision, not a missing Visual Studio
+installation or a Python product failure.
+
+The Python release builder did not reproduce the defect because its closed build environment binds
+the admitted MSVC tools explicitly. The package step crossed back into Git Bash and relied on the
+ambiguous bare name `link.exe`. The correction computes and validates the exact linker beneath the
+`VCToolsInstallDir` exported by the already-pinned MSVC setup action, then exports
+`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` for every later Cargo and Tauri invocation. Cargo
+documents this variable as the environment form of `target.<triple>.linker`
+([Cargo target linker configuration](https://doc.rust-lang.org/cargo/reference/config.html#targettriplelinker)).
+
+The correction does not retry the failed build, rewrite the global runner `PATH`, or weaken the
+MSVC target. Acceptance requires a fresh unchanged Windows package job to prove the exact linker
+binding and the remaining installer flow.
+
+### 2026-07-30 fuzz release-build resource boundary
+
+The release-evidence fuzz builder originally applied the campaign's 2 GiB process-tree RSS limit
+and a 30-minute deadline to both the short fuzz campaign and its optimized, sanitizer-instrumented
+compiler build. A real six-target diagnostic showed that default Cargo parallelism crossed that
+memory limit. Restricting the compiler to one job kept compilation bounded, but the model target did
+not complete within 30 minutes. Continuing from the preserved compiler cache required substantial
+additional build time. Repeated failed diagnostics also brought the generated fuzz target to
+9.96 GiB, immediately below its existing 10 GiB fail-closed storage ceiling.
+
+The correction therefore separates compilation from execution without relaxing the release
+campaign: Cargo receives `CARGO_BUILD_JOBS=1`, each build has a 4 GiB process-tree RSS limit and a
+120-minute deadline, and each exact fuzz campaign remains limited to 120 seconds and 2 GiB. The
+evidence records the build limit separately, and the closer validates build and campaign
+observations against their respective limits. Cargo documents `CARGO_BUILD_JOBS` as the environment
+form of `build.jobs`
+([Cargo environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html#configuration-environment-variables)).
+
+The interrupted multi-attempt cache is not acceptance evidence. The exact-head release run must
+start from a clean generated fuzz target, remain below 10 GiB, complete all six required targets,
+and produce the closed evidence document before the release can claim fuzz acceptance.
 
 ## Root causes
 

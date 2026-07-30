@@ -384,6 +384,15 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: x64
+      - name: Pin the exact MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "The configured MSVC linker is unavailable: $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:

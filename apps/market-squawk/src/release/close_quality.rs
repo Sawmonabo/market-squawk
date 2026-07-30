@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::fuzz::{
-    CARGO_FUZZ_VERSION, FUZZ_TOOLCHAIN, MAXIMUM_CORPUS_BYTES, MAXIMUM_CORPUS_FILES,
-    MAXIMUM_FUZZ_TARGET_BYTES, TARGETS,
+    CARGO_FUZZ_VERSION, FUZZ_BUILD_RSS_LIMIT_BYTES, FUZZ_TOOLCHAIN, MAXIMUM_CORPUS_BYTES,
+    MAXIMUM_CORPUS_FILES, MAXIMUM_FUZZ_TARGET_BYTES, TARGETS,
 };
 use super::identity::RepositoryIdentity;
 use super::io::{RecordedRepositoryIdentity, StableFileIdentity, hash_stable_file, valid_sha256};
@@ -40,6 +40,7 @@ struct RecordedFuzzEvidence {
     cargo_fuzz_version: String,
     sanitizer: String,
     seconds_per_target: u64,
+    build_rss_limit_bytes: u64,
     rss_limit_bytes: u64,
     target_directory_limit_bytes: u64,
     started_at: String,
@@ -118,16 +119,25 @@ pub(super) fn validate_fuzz_evidence(
         || evidence.cargo_fuzz_version != CARGO_FUZZ_VERSION
         || evidence.sanitizer != "address"
         || evidence.seconds_per_target != EXACT_FUZZ_SECONDS
+        || evidence.build_rss_limit_bytes != FUZZ_BUILD_RSS_LIMIT_BYTES
         || evidence.rss_limit_bytes != EXACT_FUZZ_RSS_BYTES
         || evidence.target_directory_limit_bytes != MAXIMUM_FUZZ_TARGET_BYTES
     {
         bail!("fuzz evidence omitted the exact release campaign contract");
     }
     validate_time_order(&evidence.started_at, &evidence.completed_at, "fuzz")?;
-    validate_fuzz_targets(&evidence.targets, evidence.rss_limit_bytes)
+    validate_fuzz_targets(
+        &evidence.targets,
+        evidence.build_rss_limit_bytes,
+        evidence.rss_limit_bytes,
+    )
 }
 
-fn validate_fuzz_targets(targets: &[RecordedFuzzTarget], rss_limit: u64) -> Result<()> {
+fn validate_fuzz_targets(
+    targets: &[RecordedFuzzTarget],
+    build_rss_limit: u64,
+    campaign_rss_limit: u64,
+) -> Result<()> {
     if targets.len() != TARGETS.len() {
         bail!("fuzz evidence does not contain the exact required target set");
     }
@@ -143,8 +153,8 @@ fn validate_fuzz_targets(targets: &[RecordedFuzzTarget], rss_limit: u64) -> Resu
         {
             bail!("fuzz target evidence violates its exact bounded contract");
         }
-        validate_process(&recorded.build, rss_limit, "fuzz build")?;
-        validate_process(&recorded.campaign, rss_limit, "fuzz campaign")?;
+        validate_process(&recorded.build, build_rss_limit, "fuzz build")?;
+        validate_process(&recorded.campaign, campaign_rss_limit, "fuzz campaign")?;
     }
     Ok(())
 }
@@ -253,7 +263,7 @@ mod tests {
 
     #[test]
     fn closing_contract_rejects_incomplete_fuzz_target_set() {
-        assert!(validate_fuzz_targets(&[], 1).is_err());
+        assert!(validate_fuzz_targets(&[], 1, 1).is_err());
         assert_eq!(TARGETS.len(), 6);
     }
 }
