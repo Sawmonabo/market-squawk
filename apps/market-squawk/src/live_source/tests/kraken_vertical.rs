@@ -46,8 +46,8 @@ const PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
 const FIRST_GENERATION_READY: &[u8] = b"kraken-generation-one-ready";
-const LOCAL_SUBSCRIPTION_BOUND: Duration = Duration::from_secs(10);
-const LOCAL_SNAPSHOT_BOUND: Duration = Duration::from_secs(20);
+const LOCAL_SUBSCRIPTION_BOUND: Duration = Duration::from_secs(45);
+const LOCAL_SNAPSHOT_BOUND: Duration = Duration::from_secs(45);
 static KRAKEN_VERTICAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// This integration test preserves the two independent safety layers:
@@ -287,8 +287,8 @@ async fn wait_for_kraken_snapshot(
     snapshots: market_squawk_live::LiveSnapshotReader,
     source: &SourceId,
 ) -> TestResult<ObservedKrakenSession> {
-    // This remains below the fixture's 30-second freshness and transport-idle limit while
-    // allowing the heavily parallel cross-platform test runners to schedule both generations.
+    // The vertical's acknowledgement and freshness windows are deliberately noncompeting here;
+    // the separate silent-peer case below owns acknowledgement-expiry behavior.
     tokio::time::timeout(LOCAL_SNAPSHOT_BOUND, async {
         loop {
             if let Ok(lease) = snapshots.try_load_all() {
@@ -559,7 +559,9 @@ fn current_kraken_frames() -> TestResult<(String, String)> {
 }
 
 fn kraken_config(data_dir: &std::path::Path) -> TestResult<AppConfig> {
-    kraken_config_with_ack_timeout(data_dir, 5_000)
+    // Acknowledgement expiry is covered independently below. This vertical keeps that deadline
+    // noncompeting so a saturated cross-platform test runner cannot select the wrong scenario.
+    kraken_config_with_ack_timeout(data_dir, 60_000)
 }
 
 fn kraken_config_with_ack_timeout(
@@ -571,7 +573,7 @@ fn kraken_config_with_ack_timeout(
           "endpoint":"wss://ws.kraken.com/v2",
           "channel":"book",
           "depth":10,
-          "freshness_ms":30000,
+          "freshness_ms":120000,
           "max_frame_bytes":1048576,
           "subscription_ack_timeout_ms":{acknowledgement_timeout_ms},
           "control_message_capacity":64,

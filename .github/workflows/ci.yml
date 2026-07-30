@@ -138,12 +138,58 @@ jobs:
           echo "$binary_dir" >> "$GITHUB_PATH"
       - run: ./scripts/verify.sh --policy-only
 
-  verify:
-    name: Linux release verification
+  linux:
+    name: Linux ${{ matrix.name }}
     needs: classify
     if: needs.classify.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: script contracts
+            lane: scripts
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 20
+          - name: frontend
+            lane: frontend
+            rust: false
+            frontend: true
+            system_dependencies: false
+            timeout: 20
+          - name: Clippy
+            lane: clippy
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
+          - name: workspace tests
+            lane: tests
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
+          - name: UI and Trybuild
+            lane: ui
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 45
+          - name: exact Loom inventories
+            lane: loom
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 60
+          - name: release and Rustdoc
+            lane: release
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       # actions/checkout v7.0.1, verified release commit (2026-07-22).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -152,6 +198,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Tauri system prerequisites
+        if: matrix.system_dependencies
         shell: bash
         run: |
           sudo apt-get update
@@ -164,48 +211,51 @@ jobs:
             libxdo-dev
       # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        if: matrix.frontend
         with:
           package_json_file: apps/market-squawk-desktop/package.json
       # actions/setup-node v7.0.0, verified release commit (2026-07-21).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: matrix.frontend
         with:
           node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
       # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        if: matrix.rust
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        if: matrix.rust
         with:
           workspaces: ". -> target"
+          shared-key: ci-${{ matrix.lane }}
           cache-targets: "true"
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
-        with:
-          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
-      - name: Install pinned Gitleaks CLI
-        shell: bash
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Report the pinned Rust toolchain
+        if: matrix.rust
         run: |
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          binary_dir="$RUNNER_TEMP/gitleaks-bin"
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --output "$archive" \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" \
-            | sha256sum --check --strict
-          mkdir -p "$binary_dir"
-          tar -xzf "$archive" -C "$binary_dir" gitleaks
-          echo "$binary_dir" >> "$GITHUB_PATH"
-      - run: rustc --version
-      - run: cargo --version
-      - run: ./scripts/verify.sh
+          rustc --version
+          cargo --version
+      - name: Run ${{ matrix.name }}
+        run: ./scripts/verify.sh --lane "${{ matrix.lane }}"
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: matrix.lane == 'release'
+        with:
+          name: cargo-timings-${{ env.CANDIDATE_SHA }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: error
+          retention-days: 14
 
   macos:
     name: macOS workspace
@@ -231,10 +281,13 @@ jobs:
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
       - run: rustc --version
       - run: cargo --version
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --all-features --locked --no-fail-fast
 
   windows:
     name: Windows workspace
@@ -260,12 +313,15 @@ jobs:
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
       - run: rustc --version
       - run: cargo --version
       # The optional capture-benchmark evidence runner requires Linux/macOS process-group
       # containment. Windows validates the complete shipping/default workspace instead.
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
 
   desktop-packages:
     name: Desktop package (${{ matrix.name }})
@@ -539,7 +595,7 @@ jobs:
     needs:
       - classify
       - policy
-      - verify
+      - linux
       - macos
       - windows
       - desktop-packages
@@ -552,7 +608,7 @@ jobs:
           DESKTOP: ${{ needs.classify.outputs.desktop }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
-          VERIFY_RESULT: ${{ needs.verify.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
           MACOS_RESULT: ${{ needs.macos.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           DESKTOP_RESULT: ${{ needs.desktop-packages.result }}
@@ -563,11 +619,11 @@ jobs:
           [[ "$POLICY_RESULT" == "success" ]]
 
           if [[ "$CODE" == "true" ]]; then
-            [[ "$VERIFY_RESULT" == "success" ]]
+            [[ "$LINUX_RESULT" == "success" ]]
             [[ "$MACOS_RESULT" == "success" ]]
             [[ "$WINDOWS_RESULT" == "success" ]]
           else
-            [[ "$VERIFY_RESULT" == "skipped" ]]
+            [[ "$LINUX_RESULT" == "skipped" ]]
             [[ "$MACOS_RESULT" == "skipped" ]]
             [[ "$WINDOWS_RESULT" == "skipped" ]]
           fi

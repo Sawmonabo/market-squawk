@@ -240,23 +240,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     if build_environment.evidence_backend != selected_backend.as_str() {
         return Err("compiled backend differs from its build-environment identity".into());
     }
-    if let Ok(path) = command(
-        &git_executable,
-        repository,
-        &["rev-parse", "--git-path", "HEAD"],
-    ) {
-        rerun(Path::new(&path));
-    }
+    let head_path = git_metadata_path(&git_executable, repository, "HEAD")?
+        .ok_or("Git HEAD metadata path is unavailable")?;
+    rerun(&head_path);
     if let Ok(reference) = command(
         &git_executable,
         repository,
         &["symbolic-ref", "--quiet", "HEAD"],
-    ) && let Ok(path) = command(
-        &git_executable,
-        repository,
-        &["rev-parse", "--git-path", &reference],
-    ) {
-        rerun(Path::new(&path));
+    ) && let Some(path) = git_metadata_path(&git_executable, repository, &reference)?
+    {
+        rerun(&path);
+    }
+    if let Some(path) = git_metadata_path(&git_executable, repository, "packed-refs")? {
+        rerun(&path);
     }
     let source_inventory =
         inventory_hash(repository, platform_sources.iter().chain(&domain_sources))?;
@@ -714,6 +710,27 @@ fn absolute_bound_tool(
         return Err("authoritative benchmark executable binding is invalid".into());
     }
     Ok((path, digest))
+}
+
+fn git_metadata_path(
+    git_executable: &Path,
+    repository: &Path,
+    name: &str,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let path = PathBuf::from(command(
+        git_executable,
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-path", name],
+    )?);
+    if !path.is_absolute() {
+        return Err("Git metadata path is not absolute".into());
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(Some(path)),
+        Ok(_) => Err("Git metadata path is not one regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn rerun(path: &Path) {

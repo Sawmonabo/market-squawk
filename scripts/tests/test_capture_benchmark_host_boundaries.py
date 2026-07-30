@@ -24,6 +24,12 @@ from capture_benchmark_process import GateError  # noqa: E402
 from capture_benchmark_evidence_io import CapabilityRoot  # noqa: E402
 
 
+requires_benchmark_authority_host = unittest.skipIf(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    "GitHub-hosted passwordless-sudo runners are not benchmark-authority hosts",
+)
+
+
 def available_tool(name: str, index: int) -> dict:
     return {
         "state": "available",
@@ -300,6 +306,7 @@ class ObservationContractTest(unittest.TestCase):
             with self.assertRaises(GateError):
                 observation.executable_identity(path)
 
+    @requires_benchmark_authority_host
     def test_tool_resolution_does_not_consult_ambient_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fake_bin = Path(temporary)
@@ -328,6 +335,7 @@ class ObservationContractTest(unittest.TestCase):
                 )
             )
 
+    @requires_benchmark_authority_host
     def test_executable_identity_binds_and_runs_the_exact_resolved_python(self) -> None:
         identity = observation.executable_identity(
             Path(sys.executable), execution_strategy="current-process"
@@ -343,6 +351,7 @@ class ObservationContractTest(unittest.TestCase):
         with self.assertRaises(GateError):
             observation.run_bound_tool(identity, ["-c", "print('bound-tool')"])
 
+    @requires_benchmark_authority_host
     def test_bound_tool_preserves_an_explicit_proxy_invocation_role(self) -> None:
         identity = observation.executable_identity(Path("/bin/sh"))
         self.assertEqual(
@@ -408,6 +417,7 @@ class ObservationContractTest(unittest.TestCase):
                     [record["tool"] for record in records], ["rustup", "rustup"]
                 )
 
+    @requires_benchmark_authority_host
     def test_production_observation_binds_real_toolchain_executables(self) -> None:
         raw = observation.production_observation()
         identities = raw["toolchain"]["tool_identities"]
@@ -439,6 +449,7 @@ class ObservationContractTest(unittest.TestCase):
                     self.assertTrue(execution["path_removed"])
                     self.assertFalse(Path(execution["executed"]["path"]).exists())
 
+    @requires_benchmark_authority_host
     def test_failed_bound_tool_execution_removes_its_ephemeral_copy(self) -> None:
         records: list[dict] = []
         identities = observation._production_tool_identities(records)
@@ -456,6 +467,7 @@ class ObservationContractTest(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual([path for path in captured if path.exists()], [])
 
+    @requires_benchmark_authority_host
     def test_prelaunch_identity_failure_still_removes_the_ephemeral_copy(self) -> None:
         records: list[dict] = []
         identities = observation._production_tool_identities(records)
@@ -482,6 +494,7 @@ class ObservationContractTest(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual([path for path in captured if path.exists()], [])
 
+    @requires_benchmark_authority_host
     def test_copy_creation_validation_failure_removes_the_ephemeral_copy(self) -> None:
         records: list[dict] = []
         identities = observation._production_tool_identities(records)
@@ -495,6 +508,7 @@ class ObservationContractTest(unittest.TestCase):
             execution.create_ephemeral_execution(identities["cargo"], reject_identity)
         self.assertEqual(set(source.parent.glob(".market-squawk-bound-*")), before)
 
+    @requires_benchmark_authority_host
     def test_unsupported_immutable_flag_uses_the_attested_uid_exclusion(self) -> None:
         records: list[dict] = []
         identities = observation._production_tool_identities(records)

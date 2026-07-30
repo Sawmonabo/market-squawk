@@ -225,7 +225,11 @@ def _validate_executable_directory_chain(path: Path, owner: int) -> None:
             or group_writable_by_current_process
             or Path(os.path.realpath(current)) != current
         ):
-            raise GateError("observation tool directory authority is unsafe")
+            raise GateError(
+                "observation tool directory authority is unsafe "
+                f"(path={current}, uid={metadata.st_uid}, gid={metadata.st_gid}, "
+                f"mode={mode:#o})"
+            )
         if owner != 0 or current.parent == current:
             return
         current = current.parent

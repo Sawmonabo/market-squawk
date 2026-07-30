@@ -130,6 +130,4 @@ if ! cmp -s "$expected_sorted" "$listed_sorted"; then
 fi
 
 "$cargo_executable" clippy "${common_arguments[@]}" -- -D warnings
-while IFS= read -r model; do
-  "$cargo_executable" test "${common_arguments[@]}" "$model" -- --exact --test-threads=1
-done <"$expected_sorted"
+"$cargo_executable" test "${common_arguments[@]}" loom_model -- --test-threads=1

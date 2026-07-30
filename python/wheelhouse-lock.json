@@ -1187,8 +1187,8 @@
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/kraken_vertical.rs",
-      "sha256": "c6aa56fdb73c0c85c9f850636f79cbd6a117993478c00a847bed4b0e4314dbfb",
-      "size_bytes": 24601
+      "sha256": "11f95e1c5f5de0b2a56ef3582a3da44889860d445c96b1479c70b2a0b920a23c",
+      "size_bytes": 24786
     },
     {
       "path": "apps/market-squawk/src/live_source/tests/mod.rs",
@@ -3272,8 +3272,8 @@
     },
     {
       "path": "crates/market-squawk-platform/build.rs",
-      "sha256": "ed6335f907172756e50985fb9f9a34e3d7c983b9d28d9624cc2260ecead0c30f",
-      "size_bytes": 28286
+      "sha256": "d01fe3ac27abe813a413b3f0e91c1ca6c6fe64b5fad634f820ffea214df30f56",
+      "size_bytes": 29075
     },
     {
       "path": "crates/market-squawk-platform/build_support.rs",
