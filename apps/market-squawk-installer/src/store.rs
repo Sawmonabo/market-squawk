@@ -925,6 +925,11 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn secure_test_store_parent(path: &Path) -> Result<(), StoreError> {
+    set_private_directory_permissions(path)
+}
+
 #[cfg(unix)]
 fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()

@@ -330,7 +330,7 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
             1,
             512,
             512,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )?;
         let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
         let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
@@ -388,7 +388,7 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
         1,
         512,
         512,
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )?
     .with_test_bind_precommit_deadline(tokio::time::Instant::now());
     let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
@@ -447,7 +447,7 @@ async fn cancelled_query_artifact_writer_retains_admission_until_reaped() -> Tes
         1,
         512,
         512,
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )?;
     let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;

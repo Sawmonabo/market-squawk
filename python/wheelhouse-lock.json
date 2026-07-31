@@ -867,8 +867,8 @@
     },
     {
       "path": "apps/market-squawk-installer/src/lib.rs",
-      "sha256": "817a964b534157195900c243eeb6ad26817345a2c577b0228b58743ac08db588",
-      "size_bytes": 22818
+      "sha256": "2b6d3fa55da0724dedc70b2ab0da85049472bdf5a22a937ab719eb0ebee88a5b",
+      "size_bytes": 22877
     },
     {
       "path": "apps/market-squawk-installer/src/lifecycle.rs",
@@ -892,8 +892,8 @@
     },
     {
       "path": "apps/market-squawk-installer/src/store.rs",
-      "sha256": "5106025924d9e8122253d39c20ed14f8eee9bf1827fcab97f876b1a528ef3f31",
-      "size_bytes": 47684
+      "sha256": "2cf3e348ce9f1ecad8d8e4994c7831166fcac1d6939683043e838cc580917ee1",
+      "size_bytes": 47824
     },
     {
       "path": "apps/market-squawk/Cargo.toml",
@@ -2367,8 +2367,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/query/source/tests.rs",
-      "sha256": "b4e9aa976c6ae7f228d4f3dbfc6a934cbf0c7051871b9bb774f5f4a752ca6ac5",
-      "size_bytes": 28178
+      "sha256": "54bd560583456c0cbcab7be729749cc518b9175d979eed429e7e447537ae9b8a",
+      "size_bytes": 28181
     },
     {
       "path": "crates/market-squawk-data/src/query/tests.rs",

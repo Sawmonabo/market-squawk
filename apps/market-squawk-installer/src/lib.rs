@@ -483,6 +483,7 @@ mod tests {
 
     impl BundleFixture {
         fn create(root: &Path, version: &str, defect: BundleDefect) -> TestResult<Self> {
+            crate::store::secure_test_store_parent(root)?;
             let bundle = root.join(format!("market-squawk-{version}.zip"));
             let target = SupportedTarget::current()?;
             let mut components = Vec::with_capacity(ComponentRole::REQUIRED.len());
