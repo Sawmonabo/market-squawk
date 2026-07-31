@@ -149,6 +149,21 @@ mod tests {
             let repaired = repair(RepairRequest::new(root.clone()))?;
             assert!(repaired.repaired());
             assert_eq!(fs::read(preserved)?, b"preserve");
+
+            crate::store::remove_tree(&installed_version)?;
+            let external_version = temporary.path().join("external-version");
+            fs::create_dir(&external_version)?;
+            fs::write(external_version.join("preserved"), b"preserve")?;
+            let original_mode = fs::metadata(&external_version)?.permissions().mode();
+            symlink(&external_version, &installed_version)?;
+
+            let repaired = repair(RepairRequest::new(root.clone()))?;
+            assert!(repaired.repaired());
+            assert_eq!(fs::read(external_version.join("preserved"))?, b"preserve");
+            assert_eq!(
+                fs::metadata(&external_version)?.permissions().mode(),
+                original_mode
+            );
         }
         #[cfg(windows)]
         {
@@ -238,6 +253,36 @@ mod tests {
         assert_eq!(updated.previous_version(), Some("0.1.0"));
         rollback(RollbackRequest::new(root.clone()))?;
         assert_eq!(status(&root)?.active_version(), Some("0.1.0"));
+
+        let active = fs::read_dir(root.join("versions"))?
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("0.1.0-"))
+            .ok_or_else(|| std::io::Error::other("active version is unavailable"))?
+            .path();
+        let damaged = active.join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&damaged)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&damaged, permissions)?;
+        }
+        fs::write(&damaged, b"damaged")?;
+
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &third.manifest,
+            &third.bundle,
+        )?)?;
+        let reactivated = status(&root)?;
+        assert_eq!(reactivated.active_version(), Some("0.3.0"));
+        assert_eq!(reactivated.previous_version(), None);
+        assert!(reactivated.is_healthy());
         Ok(())
     }
 

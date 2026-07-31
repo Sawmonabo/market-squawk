@@ -63,7 +63,13 @@ impl InstallationState {
         channel_manifest_url: Option<Box<str>>,
         retain_current_as_previous: bool,
     ) -> Result<(), StoreError> {
-        if retain_current_as_previous {
+        let candidate_was_previous = self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.manifest_sha256 == active.manifest_sha256);
+        if candidate_was_previous {
+            self.previous = retain_current_as_previous.then(|| self.active.clone());
+        } else if retain_current_as_previous {
             self.previous = Some(self.active.clone());
         }
         self.active = active;
@@ -362,7 +368,8 @@ impl InstallStore {
         }
         sync_directory(&self.root)?;
         sync_directory(&self.root.join(STAGING_DIRECTORY))?;
-        let _cleanup = remove_quarantined_tree(&retired);
+        // The caller may still be executing from the retired tree. A later store open clears it
+        // after the lifecycle command has returned or the desktop has restarted.
         Ok(())
     }
 
@@ -391,9 +398,13 @@ impl InstallStore {
             .root
             .join(STAGING_DIRECTORY)
             .join(format!("corrupt-{}", Uuid::new_v4().as_simple()));
-        set_private_directory_permissions(&final_path)?;
+        let metadata = fs::symlink_metadata(&final_path)
+            .map_err(|source| StoreError::io("inspect corrupt version root", source))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            set_private_directory_permissions(&final_path)?;
+        }
         if let Err(source) = fs::rename(&final_path, &quarantine) {
-            return match seal_tree_root(&final_path) {
+            return match restore_version_root_permissions(&final_path) {
                 Ok(()) => Err(StoreError::io("quarantine corrupt version", source)),
                 Err(_) => Err(StoreError::RepairIndeterminate),
             };
@@ -401,7 +412,7 @@ impl InstallStore {
         if let Err(source) = fs::rename(stage, &final_path) {
             let restore = fs::rename(&quarantine, &final_path);
             return match restore {
-                Ok(()) if seal_tree_root(&final_path).is_ok() => {
+                Ok(()) if restore_version_root_permissions(&final_path).is_ok() => {
                     Err(StoreError::io("replace corrupt version", source))
                 }
                 Err(_) => Err(StoreError::RepairIndeterminate),
@@ -411,7 +422,7 @@ impl InstallStore {
         sync_directory(&self.root.join(VERSIONS_DIRECTORY))?;
         seal_tree_root(&final_path)?;
         verify_installed_tree(&final_path, &version.components)?;
-        let _cleanup = remove_quarantined_tree(&quarantine);
+        let _cleanup = remove_quarantined_entry(&quarantine);
         Ok(())
     }
 
@@ -494,13 +505,12 @@ impl InstallStore {
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|source| StoreError::io("inspect staging entry", source))?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(StoreError::UnsafeRoot);
-            }
             if entry.file_name().to_str().is_some_and(|name| {
                 name.starts_with("corrupt-") || name.starts_with("entrypoints-retired-")
             }) {
-                let _cleanup = remove_quarantined_tree(&path);
+                let _cleanup = remove_quarantined_entry(&path);
+            } else if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(StoreError::UnsafeRoot);
             } else {
                 remove_tree(&path)?;
             }
@@ -517,6 +527,27 @@ pub(crate) fn remove_tree(path: &Path) -> Result<(), StoreError> {
 fn remove_quarantined_tree(path: &Path) -> Result<(), StoreError> {
     make_quarantined_tree_removable(path)?;
     fs::remove_dir_all(path).map_err(|source| StoreError::io("remove corrupt quarantine", source))
+}
+
+fn remove_quarantined_entry(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect corrupt quarantine root", source))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return remove_quarantined_tree(path);
+    }
+    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        make_file_writable(path)?;
+    }
+    fs::remove_file(path).map_err(|source| StoreError::io("remove corrupt quarantine root", source))
+}
+
+fn restore_version_root_permissions(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect restored version root", source))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        seal_tree_root(path)?;
+    }
+    Ok(())
 }
 
 fn prune_directory(

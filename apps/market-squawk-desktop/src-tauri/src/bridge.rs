@@ -458,6 +458,7 @@ pub(crate) async fn installation_control(
     request: InstallationControlCommand,
     confirmed: bool,
     state: State<'_, DesktopState>,
+    app: tauri::AppHandle,
 ) -> Result<Value, DesktopCommandError> {
     if request.requires_confirmation() && !confirmed {
         return Err(DesktopCommandError::new(
@@ -477,16 +478,10 @@ pub(crate) async fn installation_control(
             }))
         }
         InstallationControlCommand::Update => {
-            let receipt = update_from_channel(&root)
+            update_from_channel(&root)
                 .await
                 .map_err(map_installation_error)?;
-            let current = blocking_installation(move || installation_status(&root)).await?;
-            Ok(json!({
-                "action": "update",
-                "status": current,
-                "receipt": receipt,
-                "restartRequired": true,
-            }))
+            app.restart()
         }
         InstallationControlCommand::Repair => {
             let operation_root = root.clone();
@@ -502,16 +497,8 @@ pub(crate) async fn installation_control(
         }
         InstallationControlCommand::Rollback => {
             let operation_root = root.clone();
-            let receipt =
-                blocking_installation(move || rollback(RollbackRequest::new(operation_root)))
-                    .await?;
-            let current = blocking_installation(move || installation_status(&root)).await?;
-            Ok(json!({
-                "action": "rollback",
-                "status": current,
-                "receipt": receipt,
-                "restartRequired": true,
-            }))
+            blocking_installation(move || rollback(RollbackRequest::new(operation_root))).await?;
+            app.restart()
         }
         InstallationControlCommand::Uninstall => {
             let receipt =

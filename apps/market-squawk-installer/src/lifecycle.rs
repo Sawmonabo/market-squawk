@@ -122,10 +122,17 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
         let _ = remove_tree(&stage);
         return Err(InstallError::CorruptInstallation);
     }
-    if active_path.exists() {
-        store.replace_corrupt_version(&stage, &state.active)?;
-    } else {
-        store.publish_new_version(&stage, &state.active)?;
+    match fs::symlink_metadata(&active_path) {
+        Ok(_) => store.replace_corrupt_version(&stage, &state.active)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            store.publish_new_version(&stage, &state.active)?;
+        }
+        Err(source) => {
+            return Err(InstallError::Io {
+                operation: "inspect active version root",
+                source,
+            });
+        }
     }
     seal_tree_root(&active_path)?;
     verify_installed_tree(&active_path, &state.active.components)?;
