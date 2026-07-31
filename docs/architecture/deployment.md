@@ -210,11 +210,13 @@ program store and managed entrypoints while preserving configuration, credential
 portfolios, datasets, models, logs, and artifacts. Each optional data-class deletion requires its
 own exact absolute path and explicit confirmation.
 
-The release manifest records one trust mode per platform. `developer-id-signed-and-notarized` and
-`authenticode-signed` are admitted only when the corresponding external authority verifies.
-`provenance-only` remains a supported zero-cost distribution mode and is never presented as native
-publisher identity; it relies on the immutable release, exact checksums, closed manifest, installed
-product verification, and GitHub attestations.
+The release index records terminal-archive trust separately from each native package's trust.
+`developer-id-signed-and-notarized` and `authenticode-signed` are admitted only for the exact
+package verified by the corresponding external authority. A macOS terminal ZIP remains
+`provenance-only` unless that exact ZIP-delivered product receives its own notarization evidence;
+notarizing the DMG does not upgrade the ZIP. `provenance-only` remains a supported zero-cost mode
+and is never presented as native publisher identity; it relies on the immutable release, exact
+checksums, closed manifest, installed-product verification, and GitHub attestations.
 
 ## Desktop distribution boundary
 
@@ -515,6 +517,7 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program staging and native-bundle placement. | 2026-07-28 |
 | [Tauri CLI](https://v2.tauri.app/reference/cli/) | Defines ordered configuration overlays used to isolate package-only settings. | 2026-07-28 |
 | [Tauri path API](https://docs.rs/tauri/2.11.5/tauri/path/struct.PathResolver.html#method.app_local_data_dir) | Defines the native application-local data resolver used as the installed desktop default. | 2026-07-28 |
+| [Apple notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow) | Defines artifact-specific notarization and the different stapling behavior of ZIP, app, disk-image, and installer-package deliverables. | 2026-07-31 |
 | [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) | Defines the public build-provenance evidence attached to release assets. | 2026-07-30 |
 | [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Defines the immutable tag and release-asset boundary. | 2026-07-30 |
 | [`directories` 6.0.0](https://docs.rs/directories/6.0.0/directories/struct.ProjectDirs.html) | Defines platform-native per-user program-root derivation. | 2026-07-30 |

@@ -235,6 +235,7 @@ class AggregateOptions:
 @dataclass(frozen=True)
 class CollectOptions:
     target: TargetProfile
+    native_package_trust_mode: str
     version: str
     release_output: Path
     native_bundle: Path
@@ -301,6 +302,11 @@ def parse_collect_options(arguments: list[str]) -> CollectOptions:
         description="Collect one platform's complete bundle and native packages."
     )
     parser.add_argument("--target", required=True, choices=tuple(TARGETS))
+    parser.add_argument(
+        "--native-package-trust-mode",
+        required=True,
+        choices=ALL_NATIVE_TRUST_MODES,
+    )
     parser.add_argument("--version", required=True)
     parser.add_argument("--release-output", required=True, type=Path)
     parser.add_argument("--native-bundle", required=True, type=Path)
@@ -308,8 +314,11 @@ def parse_collect_options(arguments: list[str]) -> CollectOptions:
     values = parser.parse_args(arguments)
     if VERSION_PATTERN.fullmatch(values.version) is None:
         raise ReleaseBuildError("native package version is malformed")
+    if values.native_package_trust_mode not in NATIVE_TRUST_MODES[values.target]:
+        raise ReleaseBuildError("native package trust mode is unsupported for the target")
     return CollectOptions(
         target=TARGETS[values.target],
+        native_package_trust_mode=values.native_package_trust_mode,
         version=values.version,
         release_output=values.release_output.expanduser().absolute(),
         native_bundle=values.native_bundle.expanduser().absolute(),
@@ -362,10 +371,19 @@ def collect_native_packages(options: CollectOptions) -> None:
             destination,
             executable=package_suffix == ".AppImage",
         )
+    trust_receipt = output / "native-package-trust.json"
+    _write_json(
+        trust_receipt,
+        {
+            "native_trust_mode": options.native_package_trust_mode,
+            "schema_version": 1,
+            "target": target,
+        },
+    )
     expected = base_names | {
         f"market-squawk-{options.version}-{target}{package_suffix}"
         for package_suffix in expected_suffixes
-    }
+    } | {trust_receipt.name}
     if {path.name for path in output.iterdir()} != expected:
         raise ReleaseBuildError("platform publish output set is not closed")
 
@@ -435,7 +453,7 @@ def aggregate_release(options: AggregateOptions) -> None:
                     _release_artifact(
                         reference["tag"],
                         output / name,
-                        native_trust_mode=release["target"]["native_trust_mode"],
+                        native_trust_mode=release["native_package_trust_mode"],
                     )
                     for name in package_names
                 ],
@@ -552,6 +570,7 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
     expected_names = {
         "SHA256SUMS",
         "market-squawk-release.json",
+        "native-package-trust.json",
         bundle_name,
         bootstrap_name,
         *package_names,
@@ -563,10 +582,32 @@ def _admit_platform_publish_input(path: Path) -> dict[str, object]:
         raise ReleaseBuildError("platform release publish input set is not closed")
     _admit_manifest_target(root, manifest["tag"], target_release, bundle_name)
     _admit_platform_checksums(root, bundle_name, bootstrap_name)
+    trust_path = root / "native-package-trust.json"
+    if (
+        trust_path.is_symlink()
+        or not trust_path.is_file()
+        or trust_path.stat().st_size == 0
+        or trust_path.stat().st_size > 1024
+    ):
+        raise ReleaseBuildError("native package trust receipt exceeds its fixed bound")
+    try:
+        package_trust = json.loads(trust_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("native package trust receipt is malformed") from error
+    if (
+        not isinstance(package_trust, dict)
+        or set(package_trust)
+        != {"native_trust_mode", "schema_version", "target"}
+        or package_trust["schema_version"] != 1
+        or package_trust["target"] != target
+        or package_trust["native_trust_mode"] not in NATIVE_TRUST_MODES[target]
+    ):
+        raise ReleaseBuildError("native package trust receipt is invalid")
     return {
-        "asset_names": expected_names - {"SHA256SUMS"},
+        "asset_names": expected_names - {"SHA256SUMS", "native-package-trust.json"},
         "bootstrap_name": bootstrap_name,
         "manifest": manifest,
+        "native_package_trust_mode": package_trust["native_trust_mode"],
         "package_names": package_names,
         "root": root,
         "target": target_release,

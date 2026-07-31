@@ -336,13 +336,16 @@ gh attestation verify \
   --repo Sawmonabo/market-squawk
 ```
 
-The cross-platform release index records one native trust mode for each target:
+The cross-platform release index records terminal-archive trust independently from every native
+package. A package may carry stronger native trust than the target's terminal ZIP:
 
-- `developer-id-signed-and-notarized` only after Apple verification, timestamping, notarization,
-  and stapling succeed;
+- `developer-id-signed-and-notarized` only on the exact Apple package for which verification,
+  timestamping, notarization, and stapling succeed;
 - `authenticode-signed` only after Windows publisher and timestamp verification succeeds; or
 - `provenance-only` when the zero-cost release relies on GitHub provenance, attestation, exact
   checksums, and transparent package identity.
+
+The macOS terminal ZIP remains `provenance-only` when only the DMG has been notarized and stapled.
 
 An operating system may show an unfamiliar-publisher warning for a provenance-only package. Verify
 the release first, then use the operating system's documented manual-open path if the user chooses
@@ -394,6 +397,7 @@ attestations merely because its tests pass.
 | [Tauri distribution](https://v2.tauri.app/distribute/) | Native package families and platform distribution boundary | 2026-07-30 |
 | [Tauri Windows installers](https://v2.tauri.app/distribute/windows-installer/) | NSIS/MSI and Windows runtime behavior | 2026-07-30 |
 | [Tauri AppImage](https://v2.tauri.app/distribute/appimage/) | Linux AppImage runtime and compatibility considerations | 2026-07-30 |
+| [Apple notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow) | Notarization evidence is bound to the submitted deliverable; ZIP archives and stapled DMGs have different evidence boundaries | 2026-07-31 |
 | [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) | Public build-provenance verification | 2026-07-30 |
 | [GitHub CLI attestation verification](https://cli.github.com/manual/gh_attestation_verify) | Local artifact-attestation command | 2026-07-30 |
 | [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Tag and asset immutability boundary | 2026-07-30 |

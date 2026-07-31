@@ -91,6 +91,28 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_a_parent_writable_by_other_accounts() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = TempDir::new()?;
+        let fixture = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o777))?;
+        let result = install(InstallRequest::from_local(
+            temporary.path().join("program"),
+            &fixture.manifest,
+            &fixture.bundle,
+        )?);
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+
+        assert!(matches!(
+            result,
+            Err(InstallError::Store(crate::StoreError::UnsafeRoot))
+        ));
+        Ok(())
+    }
+
     #[test]
     fn activation_and_rollback_switch_complete_versions() -> TestResult {
         let temporary = TempDir::new()?;

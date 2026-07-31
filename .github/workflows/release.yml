@@ -443,9 +443,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          terminal_trust_mode="$MARKET_SQUAWK_NATIVE_TRUST_MODE"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            terminal_trust_mode=provenance-only
+          fi
           python3 scripts/build_complete_release.py \
             --target "$TARGET" \
-            --native-trust-mode "$MARKET_SQUAWK_NATIVE_TRUST_MODE" \
+            --native-trust-mode "$terminal_trust_mode" \
             --version "${{ needs.freeze.outputs.version }}" \
             --commit "${{ needs.freeze.outputs.commit }}" \
             --tree "${{ needs.freeze.outputs.tree }}" \
@@ -695,6 +699,7 @@ jobs:
 
           python3 scripts/build_complete_release.py collect \
             --target "$TARGET" \
+            --native-package-trust-mode "$MARKET_SQUAWK_NATIVE_TRUST_MODE" \
             --version "${{ needs.freeze.outputs.version }}" \
             --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
             --native-bundle "target/$TARGET/release/bundle" \
@@ -764,23 +769,30 @@ jobs:
              and (.targets | length) == 4
              and all(
                .targets[];
-               . as $target
-               | all(
-                   .native_packages[];
-                   .native_trust_mode == $target.native_trust_mode
-                 )
-             )
-             and all(
-               .targets[];
                if (.target | endswith("apple-darwin")) then
                  .native_trust_mode == "provenance-only"
-                 or .native_trust_mode == "developer-id-signed-and-notarized"
                elif .target == "x86_64-pc-windows-msvc" then
                  .native_trust_mode == "provenance-only"
                  or .native_trust_mode == "authenticode-signed"
                else
                  .native_trust_mode == "provenance-only"
                end
+             )
+             and all(
+               .targets[];
+               . as $target
+               | all(
+                   .native_packages[];
+                   if ($target.target | endswith("apple-darwin")) then
+                     .native_trust_mode == "provenance-only"
+                     or .native_trust_mode == "developer-id-signed-and-notarized"
+                   elif $target.target == "x86_64-pc-windows-msvc" then
+                     .native_trust_mode == "provenance-only"
+                     or .native_trust_mode == "authenticode-signed"
+                   else
+                     .native_trust_mode == "provenance-only"
+                   end
+                 )
              )' \
             "$RUNNER_TEMP/release/market-squawk-release.json"
       # actions/attest v4.2.0, verified release commit (2026-07-20).
@@ -953,17 +965,14 @@ jobs:
               --arg name "$native_name" \
               '.targets[]
                | select(.target == $target)
-               | . as $release
                | [
                    .native_packages[]
                    | select(.url | endswith("/" + $name))
                  ] as $packages
                | if (
                    ($packages | length) == 1
-                   and $packages[0].native_trust_mode
-                     == $release.native_trust_mode
                  )
-                 then $release.native_trust_mode
+                 then $packages[0].native_trust_mode
                  else error("native trust declaration is inconsistent")
                  end' \
               "$candidate/market-squawk-release.json"
@@ -982,7 +991,18 @@ jobs:
                  end' \
               "$candidate/market-squawk-release-$TARGET.json"
           )"
-          [[ "$native_trust_mode" == "$platform_trust_mode" ]]
+          case "$TARGET:$platform_trust_mode" in
+            aarch64-apple-darwin:provenance-only|\
+            x86_64-apple-darwin:provenance-only|\
+            x86_64-pc-windows-msvc:provenance-only|\
+            x86_64-pc-windows-msvc:authenticode-signed|\
+            x86_64-unknown-linux-gnu:provenance-only)
+              ;;
+            *)
+              echo "The terminal archive declares an unsupported trust mode." >&2
+              exit 1
+              ;;
+          esac
           case "$TARGET:$native_trust_mode" in
             aarch64-apple-darwin:provenance-only|\
             aarch64-apple-darwin:developer-id-signed-and-notarized|\

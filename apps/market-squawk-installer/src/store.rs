@@ -182,7 +182,7 @@ impl InstallStore {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         fs::create_dir_all(parent)
             .map_err(|source| StoreError::io("create installation parent", source))?;
-        ensure_safe_directory(parent)?;
+        validate_store_parent(parent)?;
         let lock = acquire_lock(parent)?;
 
         match fs::symlink_metadata(root) {
@@ -202,6 +202,8 @@ impl InstallStore {
             root: root.to_path_buf(),
             _lock: lock,
         };
+        #[cfg(windows)]
+        store.verify_private_windows_tree()?;
         store.prepare_reserved_directories()?;
         store.clear_staging()?;
         Ok(store)
@@ -217,13 +219,15 @@ impl InstallStore {
             }
         }
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
-        ensure_safe_directory(parent)?;
+        validate_store_parent(parent)?;
         let lock = acquire_lock(parent)?;
         set_private_directory_permissions(root)?;
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
         };
+        #[cfg(windows)]
+        store.verify_private_windows_tree()?;
         store.prepare_reserved_directories()?;
         store.clear_staging()?;
         Ok(Some(store))
@@ -532,6 +536,39 @@ impl InstallStore {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn verify_private_windows_tree(&self) -> Result<(), StoreError> {
+        let mut directories = vec![self.root.clone()];
+        let mut cursor = 0;
+        while cursor < directories.len() {
+            let directory = &directories[cursor];
+            verify_private_windows_path(directory, true)?;
+            for entry in fs::read_dir(directory)
+                .map_err(|source| StoreError::io("read protected installation tree", source))?
+            {
+                let entry = entry.map_err(|source| {
+                    StoreError::io("read protected installation entry", source)
+                })?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|source| {
+                    StoreError::io("inspect protected installation entry", source)
+                })?;
+                if is_directory_redirect(&metadata) {
+                    return Err(StoreError::UnsafeRoot);
+                }
+                if metadata.is_dir() {
+                    directories.push(path);
+                } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                    verify_private_windows_path(&path, false)?;
+                } else {
+                    return Err(StoreError::UnsafeRoot);
+                }
+            }
+            cursor += 1;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn remove_tree(path: &Path) -> Result<(), StoreError> {
@@ -661,6 +698,14 @@ fn acquire_lock(parent: &Path) -> Result<File, StoreError> {
             std::io::ErrorKind::WouldBlock => StoreError::AlreadyLocked,
             _ => StoreError::io("lock installation root", source),
         })?;
+    #[cfg(unix)]
+    secure_private_unix_lock(&lock)?;
+    #[cfg(windows)]
+    let lock = {
+        let mut lock = lock;
+        secure_private_windows_handle(&mut lock, false)?;
+        lock
+    };
     Ok(lock)
 }
 
@@ -678,7 +723,52 @@ fn configure_lock_options(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(unix)]
+fn secure_private_unix_lock(lock: &File) -> Result<(), StoreError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = lock
+        .metadata()
+        .map_err(|source| StoreError::io("inspect installation lock ownership", source))?;
+    if !metadata.file_type().is_file() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(StoreError::UnsafeRoot);
+    }
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| StoreError::io("secure installation lock", source))?;
+    let secured = lock
+        .metadata()
+        .map_err(|source| StoreError::io("verify installation lock ownership", source))?;
+    if secured.uid() != rustix::process::geteuid().as_raw()
+        || secured.permissions().mode() & 0o077 != 0
+    {
+        return Err(StoreError::UnsafeRoot);
+    }
+    Ok(())
+}
+
+fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
+    ensure_safe_directory(path)?;
+    #[cfg(unix)]
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect controlled directory", source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
+    }
+    #[cfg(windows)]
+    verify_exclusive_windows_parent(path)?;
+    Ok(())
 }
 
 fn ensure_safe_directory(path: &Path) -> Result<(), StoreError> {
@@ -739,25 +829,134 @@ fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
+fn verify_exclusive_windows_parent(path: &Path) -> Result<(), StoreError> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
-    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use win_security_identifier::{
+        GetCurrentSid as _, SecurityIdentifier,
+        well_known::{BUILTIN_ADMINISTRATORS, LOCAL_SYSTEM},
+    };
     use windows_permissions::{
-        LocalBox, SecurityDescriptor,
         constants::{AccessRights, AceFlags, AceType, SeObjectType, SecurityInformation},
-        wrappers::{
-            ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo, SetSecurityInfo,
-        },
+        wrappers::GetSecurityInfo,
     };
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
 
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(AccessRights::ReadControl.bits())
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let parent = options
+        .open(path)
+        .map_err(|source| StoreError::io("open installation parent authority", source))?;
+    let metadata = parent
+        .metadata()
+        .map_err(|source| StoreError::io("inspect installation parent handle", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+
     let current_user = SecurityIdentifier::get_current_user_sid()
         .map_err(|_| StoreError::UnsafeRoot)?
         .to_string();
+    let local_system = LOCAL_SYSTEM.as_sid().to_string();
+    let administrators = BUILTIN_ADMINISTRATORS.as_sid().to_string();
+    let trusted = [
+        current_user.as_str(),
+        local_system.as_str(),
+        administrators.as_str(),
+    ];
+    let descriptor = GetSecurityInfo(
+        &parent,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )
+    .map_err(|source| StoreError::io("inspect installation parent ACL", source))?;
+    if descriptor
+        .owner()
+        .is_none_or(|owner| !trusted.contains(&owner.to_string().as_str()))
+    {
+        return Err(StoreError::UnsafeRoot);
+    }
+    let dacl = descriptor.dacl().ok_or(StoreError::UnsafeRoot)?;
+    let dangerous = AccessRights::GenericAll
+        | AccessRights::GenericWrite
+        | AccessRights::Delete
+        | AccessRights::WriteDac
+        | AccessRights::WriteOwner
+        | AccessRights::Bit1
+        | AccessRights::Bit2
+        | AccessRights::Bit6;
+    for index in 0..dacl.len() {
+        let ace = dacl.get_ace(index).ok_or(StoreError::UnsafeRoot)?;
+        let allowed = matches!(
+            ace.ace_type(),
+            AceType::ACCESS_ALLOWED_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        );
+        if allowed
+            && !ace.flags().contains(AceFlags::InheritOnly)
+            && ace.mask().intersects(dangerous)
+            && ace
+                .sid()
+                .is_none_or(|sid| !trusted.contains(&sid.to_string().as_str()))
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_private_windows_path(path: &Path, directory: bool) -> Result<(), StoreError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_permissions::constants::AccessRights;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(AccessRights::ReadControl.bits())
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(flags);
+    let file = options
+        .open(path)
+        .map_err(|source| StoreError::io("open protected installation entry", source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| StoreError::io("inspect protected installation handle", source))?;
+    if metadata.is_dir() != directory || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+    verify_private_windows_handle(&file, directory, false)
+}
+
+#[cfg(windows)]
+fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_permissions::constants::AccessRights;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
 
     let access = AccessRights::ReadControl | AccessRights::WriteDac | AccessRights::WriteOwner;
     let mut options = OpenOptions::new();
@@ -775,15 +974,30 @@ fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
     if !metadata.is_dir() || is_directory_redirect(&metadata) {
         return Err(StoreError::UnsafeRoot);
     }
+    secure_private_windows_handle(&mut directory, true)
+}
 
+#[cfg(windows)]
+fn secure_private_windows_handle(file: &mut File, directory: bool) -> Result<(), StoreError> {
+    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        wrappers::SetSecurityInfo,
+    };
+
+    let current_user = SecurityIdentifier::get_current_user_sid()
+        .map_err(|_| StoreError::UnsafeRoot)?
+        .to_string();
+    let inheritance = if directory { "OICI" } else { "" };
     let descriptor: LocalBox<SecurityDescriptor> =
-        format!("O:{current_user}D:P(A;OICI;FA;;;{current_user})")
+        format!("O:{current_user}D:P(A;{inheritance};FA;;;{current_user})")
             .parse()
             .map_err(|source| StoreError::io("build private directory ACL", source))?;
     let owner = descriptor.owner().ok_or(StoreError::UnsafeRoot)?;
     let dacl = descriptor.dacl().ok_or(StoreError::UnsafeRoot)?;
     SetSecurityInfo(
-        &mut directory,
+        file,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         Some(owner),
@@ -793,8 +1007,26 @@ fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
     )
     .map_err(|source| StoreError::io("secure controlled directory", source))?;
 
+    verify_private_windows_handle(file, directory, true)
+}
+
+#[cfg(windows)]
+fn verify_private_windows_handle(
+    file: &File,
+    directory: bool,
+    require_protected: bool,
+) -> Result<(), StoreError> {
+    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use windows_permissions::{
+        constants::{AccessRights, AceFlags, AceType, SeObjectType, SecurityInformation},
+        wrappers::{ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo},
+    };
+
+    let current_user = SecurityIdentifier::get_current_user_sid()
+        .map_err(|_| StoreError::UnsafeRoot)?
+        .to_string();
     let secured = GetSecurityInfo(
-        &directory,
+        file,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner | SecurityInformation::Dacl,
     )
@@ -807,10 +1039,16 @@ fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
     }
     let secured_dacl = secured.dacl().ok_or(StoreError::UnsafeRoot)?;
     let ace = secured_dacl.get_ace(0).ok_or(StoreError::UnsafeRoot)?;
-    let expected_flags = AceFlags::ContainerInherit | AceFlags::ObjectInherit;
+    let inherited = ace.flags().contains(AceFlags::Inherited);
+    let expected_flags = if directory {
+        AceFlags::ContainerInherit | AceFlags::ObjectInherit
+    } else {
+        AceFlags::empty()
+    };
+    let observed_flags = ace.flags() - AceFlags::Inherited;
     if secured_dacl.len() != 1
         || ace.ace_type() != AceType::ACCESS_ALLOWED_ACE_TYPE
-        || ace.flags() != expected_flags
+        || require_protected && observed_flags != expected_flags
         || ace.mask() != AccessRights::FileAllAccess
         || ace
             .sid()
@@ -821,7 +1059,10 @@ fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
     let dacl_sddl =
         ConvertSecurityDescriptorToStringSecurityDescriptor(&secured, SecurityInformation::Dacl)
             .map_err(|source| StoreError::io("verify private directory ACL protection", source))?;
-    if !dacl_sddl.to_string_lossy().starts_with("D:P") {
+    if require_protected && !dacl_sddl.to_string_lossy().starts_with("D:P") {
+        return Err(StoreError::UnsafeRoot);
+    }
+    if !require_protected && !inherited && !dacl_sddl.to_string_lossy().starts_with("D:P") {
         return Err(StoreError::UnsafeRoot);
     }
     Ok(())
