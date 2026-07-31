@@ -547,6 +547,7 @@ jobs:
             MARKET_SQUAWK_COMPONENT_ROOT \
             MARKET_SQUAWK_PYTHON_PRODUCT \
             MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
             MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
           "$bootstrap" --root "$install_root" install \
             --manifest "$manifest" \
@@ -591,6 +592,7 @@ jobs:
             MARKET_SQUAWK_COMPONENT_ROOT \
             MARKET_SQUAWK_PYTHON_PRODUCT \
             MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
             MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
           mapfile -d '' appimages \
             < <(find "target/${{ matrix.target }}/release/bundle/appimage" -maxdepth 1 \
