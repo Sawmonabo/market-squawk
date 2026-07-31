@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-30 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest completed correctness candidate | `3f70d48e1e290d019279dcfa91b9a24d7cc90e0c` |
+| Latest diagnosed candidate | `1a1d44561e5754fca5970f1aa9fc930cbe5ae3c3` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -214,6 +214,16 @@ The correction does not retry the failed build, rewrite the global runner `PATH`
 MSVC target. Acceptance requires a fresh unchanged Windows package job to prove the exact linker
 binding and the remaining installer flow.
 
+Candidate `1a1d44561e5754fca5970f1aa9fc930cbe5ae3c3` supplied that linker proof in
+[job 91014408185](https://github.com/Sawmonabo/market-squawk/actions/runs/30585037290/job/91014408185):
+all three native Rust inputs built successfully with the exact MSVC linker. The next command then
+failed at `mkdir -m 700 "$RUNNER_TEMP/native-input"` because Git Bash attempted a POSIX mode change
+on a Windows runner path that did not permit it. The directory is temporary staging, not a
+permission authority on Windows. The workflow correction sets `umask 077` and uses `mkdir -p`.
+That retains restrictive creation on Unix, avoids an inapplicable Windows mode-change request, and
+is applied identically to pull-request and stable-release packaging. Acceptance of the remaining
+Windows installer flow still requires the next unchanged package job.
+
 ### 2026-07-30 fuzz release-build resource boundary
 
 The release-evidence fuzz builder originally applied the campaign's 2 GiB process-tree RSS limit
@@ -233,8 +243,39 @@ form of `build.jobs`
 ([Cargo environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html#configuration-environment-variables)).
 
 The interrupted multi-attempt cache is not acceptance evidence. The exact-head release run must
-start from a clean generated fuzz target, remain below 10 GiB, complete all six required targets,
-and produce the closed evidence document before the release can claim fuzz acceptance.
+start from a clean generated fuzz target, remain below its fixed disk ceiling, complete all six
+required targets, and produce the closed evidence document before the release can claim fuzz
+acceptance.
+
+The clean follow-up exposed a separate macOS linker defect only when the model target linked
+AddressSanitizer-instrumented Tract `0.23.4` and Inventory `0.3.24`. Apple's current linker rejected
+Inventory's distributed-registration initializer pointers. The exact failure is independently
+tracked in [Inventory issue 90](https://github.com/dtolnay/inventory/issues/90), and Tract's pinned
+[AddressSanitizer script](https://github.com/sonos/tract/blob/v0.23.4/.travis/asan.sh) documents the
+same Inventory boundary. Tract's historical `-ld_classic` workaround is no longer viable: Apple
+documents that Xcode 27 removed `ld64` and no longer supports `-ld_classic`
+([Xcode 27 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-27-release-notes)).
+
+An exact minimal Inventory reproducer failed with the Apple linker and passed with the pinned Rust
+toolchain's bundled LLD. The correction therefore retains AddressSanitizer and changes only macOS
+fuzz builds to Rust's documented bundled-linker selection:
+`-Clinker-features=+lld -Clink-self-contained=+linker`. Shipping builds retain their platform
+linker. The macOS fuzz profile also sets packed split debug information; Cargo otherwise defaults
+debug-enabled macOS builds to unpacked split information, which caused thousands of loose object
+files in the failed cache. The selected flags follow the
+[Rust code-generation options](https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/codegen-options.html)
+and [Cargo profile](https://doc.rust-lang.org/cargo/reference/profiles.html) contracts. Acceptance
+still requires the complete exact-head six-target campaign.
+
+The clean real modeling build subsequently completed in 80 minutes 29 seconds, including the final
+AddressSanitizer link that the Apple linker had rejected. It used 8.235 GiB of logical generated
+files. Packed split debug information reduced loose object storage from approximately 4.34 GiB
+across 5,081 objects in the failed cache to approximately 25 MiB across 134 objects. Because this
+single required target consumes more than 8 GiB before the other five targets are built, the
+original 10 GiB ceiling did not represent the measured workload. The hard ceiling is therefore
+16 GiB: still bounded far below the prior ungoverned workspace growth, while leaving measured
+headroom for the complete target set. Only a successful clean six-target run can accept that
+ceiling.
 
 ### 2026-07-30 Intel macOS DMG storage failure
 
@@ -914,6 +955,7 @@ The correction therefore does not require a paid runner under the current public
 
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
 The workflow-runtime benchmark sources were reviewed on 2026-07-29.
+The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-30.
 
 ### Cargo, Rust, and toolchain documentation
 
@@ -924,6 +966,7 @@ The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 - [Cargo test targets](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#integration-tests)
 - [Cargo build timings](https://doc.rust-lang.org/cargo/reference/timings.html)
 - [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
+- [Rust nightly code-generation options](https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/codegen-options.html)
 - [Rust Performance Book: compile times](https://nnethercote.github.io/perf-book/compile-times.html)
 - [Rust Windows canonicalization](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
 - [Rust Windows path-prefix classification](https://doc.rust-lang.org/std/path/enum.Prefix.html)
@@ -983,6 +1026,9 @@ The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 - [Pinned Tauri macOS DMG bundler](https://github.com/tauri-apps/tauri/tree/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/macos/dmg)
 - [Pinned Tauri action macOS environment](https://github.com/tauri-apps/tauri-action/blob/1deb371b0cd8bd54025b384f1cd735e725c4060f/src/build.ts)
 - [Tauri DMG behavior in CI](https://github.com/tauri-apps/tauri/issues/3055)
+- [Inventory macOS AddressSanitizer linker issue](https://github.com/dtolnay/inventory/issues/90)
+- [Tract 0.23.4 AddressSanitizer script](https://github.com/sonos/tract/blob/v0.23.4/.travis/asan.sh)
+- [Xcode 27 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-27-release-notes)
 
 ### Delivery-performance benchmarks
 

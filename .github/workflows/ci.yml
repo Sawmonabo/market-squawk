@@ -465,7 +465,8 @@ jobs:
             -p market-squawk-installer
 
           native="$RUNNER_TEMP/native-input"
-          mkdir -m 700 "$native"
+          umask 077
+          mkdir -p "$native"
           cp "target/$TARGET/release/market-squawk-desktop$EXE" \
             "$native/market-squawk-desktop$EXE"
           cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \

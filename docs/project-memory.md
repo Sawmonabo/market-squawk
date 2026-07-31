@@ -1394,3 +1394,25 @@ This contract was frozen against audit base
 approval. Implementation must refresh onto the accepted desktop head before release assembly, and
 the final unchanged candidate must pass the existing release predicates and grouped Quarter 4
 review.
+
+## 2026-07-30 installer and fuzz build boundaries
+
+Cross-platform native staging must use `umask 077` followed by portable directory creation. A
+Windows Git Bash package job proved the exact MSVC linker correction by completing all three native
+Rust builds, then failed only because `mkdir -m 700` attempted an inapplicable POSIX mode change on
+the runner's temporary Windows path. Pull-request and stable-release workflows must retain the same
+portable staging contract.
+
+macOS AddressSanitizer fuzz builds that include Tract and Inventory must use the pinned Rust
+nightly's bundled LLD through Rust's documented linker-feature flags. They must not fall back to
+Apple's removed classic linker, disable AddressSanitizer, or change the shipping application
+linker. Routine macOS fuzz builds also use packed split debug information. A clean real
+`model_artifacts` build passed its previously failing final link in 80 minutes 29 seconds, used
+8.235 GiB of logical generated files, and reduced loose object storage from approximately
+4.34 GiB to approximately 25 MiB.
+
+The fuzz target directory remains fail-closed and measured. Its hard ceiling is 16 GiB because the
+single required modeling target consumes more than 8 GiB before the other five required targets
+are built. Raising that measured ceiling does not authorize duplicate target trees, retained
+completed-lane caches, or unbounded workspace growth. Release acceptance still requires one clean,
+unchanged, exact-head six-target campaign below the ceiling.

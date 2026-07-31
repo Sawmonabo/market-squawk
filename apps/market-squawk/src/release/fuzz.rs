@@ -24,11 +24,15 @@ pub(super) const FUZZ_BUILD_RSS_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAXIMUM_CAMPAIGN_SECONDS: u64 = 60 * 60;
 const MINIMUM_RSS_MIB: u64 = 64;
 const MAXIMUM_RSS_MIB: u64 = 8 * 1024;
-pub(super) const MAXIMUM_FUZZ_TARGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub(super) const MAXIMUM_FUZZ_TARGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAXIMUM_INPUT_FILE_BYTES: u64 = 1024 * 1024;
 pub(super) const MAXIMUM_CORPUS_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const MAXIMUM_CORPUS_FILES: usize = 100_000;
+
+#[cfg(target_os = "macos")]
+const MACOS_FUZZ_RUSTFLAGS: &str =
+    "-Zunstable-options -Clinker-features=+lld -Clink-self-contained=+linker";
 
 pub(super) const TARGETS: [FuzzTarget; 6] = [
     FuzzTarget {
@@ -163,6 +167,21 @@ pub(super) fn run(arguments: ReleaseFuzzArguments) -> Result<serde_json::Value> 
         (OsString::from("CARGO_BUILD_JOBS"), OsString::from("1")),
         (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
     ];
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let mut environment = environment;
+        environment.extend([
+            (
+                OsString::from("CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO"),
+                OsString::from("packed"),
+            ),
+            (
+                OsString::from("RUSTFLAGS"),
+                OsString::from(MACOS_FUZZ_RUSTFLAGS),
+            ),
+        ]);
+        environment
+    };
     let mut targets = Vec::new();
     targets
         .try_reserve_exact(TARGETS.len())

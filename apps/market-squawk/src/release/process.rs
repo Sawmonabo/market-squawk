@@ -91,12 +91,13 @@ pub(super) fn run(request: ProcessRequest<'_>) -> Result<ProcessOutput> {
         .current_dir(request.current_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .envs(request.environment.iter().map(|(key, value)| (key, value)))
-        .env("CARGO_INCREMENTAL", "0");
+        .stderr(Stdio::piped());
     for variable in REMOVED_BUILD_ENVIRONMENT {
         command.env_remove(variable);
     }
+    command
+        .envs(request.environment.iter().map(|(key, value)| (key, value)))
+        .env("CARGO_INCREMENTAL", "0");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
