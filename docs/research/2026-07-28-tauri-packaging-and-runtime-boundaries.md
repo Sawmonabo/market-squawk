@@ -9,6 +9,7 @@ external-program, local MCP, native-package, signing, license, and exact-head CI
 | Audience | Desktop, release, CI, and security maintainers |
 | Status | Applied to Quarter 4 remediation |
 | Research date | 2026-07-28 |
+| Last substantive review | 2026-07-31 |
 | Audit base | `03783250a1020d79cdd7f8bda424da62568dd3d5` |
 | Refresh gate | Recheck Tauri configuration, bundling, and installer behavior before changing package layout or signing policy |
 
@@ -33,6 +34,8 @@ external-program, local MCP, native-package, signing, license, and exact-head CI
 7. How can a portable Linux AppImage expose a durable MCP client command after its desktop payload
    exits?
 8. How can Linux native packages avoid executing mutable, unverified bundler downloads?
+9. How can native package removal invoke the data-preserving lifecycle without copying Tauri's
+   installer templates or deleting another user's state?
 
 ## Findings
 
@@ -163,6 +166,22 @@ execution. Package preparation applies that reviewed transform itself, verifies 
 executable digest shown above, and stores only the derived identity; Tauri's identical transform is
 then idempotent and cache reuse remains exact.
 
+### Native package removal
+
+Tauri 2 exposes maintained NSIS lifecycle hooks and WiX fragment composition, so Market Squawk does
+not copy either upstream installer template. The Windows NSIS pre-uninstall hook and MSI deferred
+custom action run one hidden, fixed desktop command before package files are removed. That command
+calls the Rust data-preserving uninstall lifecycle for the current user's program root. Native
+package upgrades skip cleanup so a package replacement does not remove the selected release.
+
+The equivalent automatic hook does not exist for a macOS application dragged to the Trash or a
+portable AppImage. A system-wide DEB removal script also cannot safely infer which user's
+application-local store owns the managed release. Those platforms therefore require the desktop's
+**Uninstall programs** action before native package removal. Release smoke invokes the same hidden
+desktop boundary under the exact test user's HOME/XDG environment, then removes the copied
+application, AppImage, or DEB package. It does not pre-delete the store with a separately located
+installer executable.
+
 ## Market Squawk decisions
 
 1. The installed desktop's default data root is Tauri's application-local data directory.
@@ -187,6 +206,9 @@ then idempotent and cache reuse remains exact.
 9. Native-package inspection must confirm all three sibling programs and both exact font notices.
 10. Pull-request verification checks out and labels the exact head commit, never the synthetic merge
    commit.
+11. Windows native uninstallers invoke the Rust lifecycle through Tauri's maintained NSIS hook and
+    WiX fragment extension points. macOS and Linux require in-app program cleanup before native
+    package removal because those formats have no safe per-user removal hook.
 
 ## Known upstream caveats
 
@@ -221,6 +243,10 @@ then idempotent and cache reuse remains exact.
 | [Tauri AppImage bundler source](https://github.com/tauri-apps/tauri/blob/872428fe910efe25eeaa959b56adcd9d9a9a2157/crates/tauri-bundler/src/bundle/linux/appimage/linuxdeploy.rs) | Current AppRun selection and AppImage construction path | 2026-07-28 |
 | [Rust Unix `CommandExt::exec`](https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.exec) | Process replacement without fork and inherited stdio | 2026-07-28 |
 | [Tauri configuration reference](https://v2.tauri.app/reference/config/#bundleconfig) | Bundle resources and external-program configuration | 2026-07-28 |
+| [Tauri Windows installer](https://v2.tauri.app/distribute/windows-installer/) | Maintained NSIS pre-uninstall hooks and WiX fragment composition | 2026-07-31 |
+| [Tauri 2.11.4 NSIS template](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi) | Hook order, update-mode flag, installed executable identity, and file-removal boundary | 2026-07-31 |
+| [Tauri 2.11.4 WiX template](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/windows/msi/main.wxs) | Main executable File ID and uninstall custom-action sequencing boundary | 2026-07-31 |
+| [Tauri Debian configuration](https://v2.tauri.app/reference/config/#debconfig) | DEB maintainer-script extension points and their system-package scope | 2026-07-31 |
 | [Tauri CLI reference](https://v2.tauri.app/reference/cli/) | Ordered `--config` overlays for build flavors | 2026-07-28 |
 | [Tauri path API](https://v2.tauri.app/reference/javascript/api/namespacepath/) | Operating-system mapping for the application-local data directory | 2026-07-28 |
 | [Official Tauri GitHub Action](https://github.com/tauri-apps/tauri-action) | `args`, `projectPath`, and relative `--config` path behavior | 2026-07-28 |

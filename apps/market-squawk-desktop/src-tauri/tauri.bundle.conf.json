@@ -22,6 +22,16 @@
     },
     "macOS": {
       "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/installer-hooks.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "windows/lifecycle.wxs"
+        ]
+      }
     }
   }
 }

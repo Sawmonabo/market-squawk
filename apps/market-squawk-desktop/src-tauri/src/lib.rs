@@ -9,6 +9,9 @@ use clap::Parser;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
 use market_squawk::{LocalProduct, LocalProductError};
+use market_squawk_installer::{
+    InstallError, PlatformError, UninstallRequest, default_install_root, uninstall,
+};
 use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
 use tauri::Manager;
 use thiserror::Error;
@@ -48,6 +51,13 @@ struct DesktopArgs {
     /// Dispatch the packaged stdio MCP process from a portable Linux image.
     #[arg(long, hide = true)]
     stdio_mcp: bool,
+    /// Remove the current user's managed program store before native package removal.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["config", "data_dir", "training_release_root", "stdio_mcp"]
+    )]
+    native_uninstall: bool,
 }
 
 #[derive(Debug, Error)]
@@ -75,12 +85,18 @@ enum DesktopStartupError {
     Tauri(#[from] tauri::Error),
     #[error("desktop state was already installed")]
     DuplicateState,
+    #[error("native package cleanup could not determine the program root")]
+    NativeUninstallRoot(#[from] PlatformError),
+    #[error("native package cleanup failed")]
+    NativeUninstall(#[from] InstallError),
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args = DesktopArgs::try_parse().unwrap_or_else(|error| error.exit());
-    let result = if args.stdio_mcp {
+    let result = if args.native_uninstall {
+        run_native_uninstall()
+    } else if args.stdio_mcp {
         run_stdio_mcp(args)
     } else {
         try_run(args)
@@ -93,6 +109,12 @@ pub fn run() {
         }
     };
     std::process::exit(code);
+}
+
+fn run_native_uninstall() -> Result<i32, DesktopStartupError> {
+    let root = default_install_root()?;
+    uninstall(UninstallRequest::preserving_data(root))?;
+    Ok(0)
 }
 
 #[cfg(target_os = "linux")]
@@ -197,10 +219,8 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         }
         tauri::RunEvent::Exit => {
             let state = handle.state::<DesktopState>();
-            #[cfg(unix)]
             let restart_program = state.scheduled_restart_program();
             tauri::async_runtime::block_on(state.finish_shutdown());
-            #[cfg(unix)]
             if let Some(program) = restart_program
                 && std::process::Command::new(program)
                     .args(std::env::args_os().skip(1))

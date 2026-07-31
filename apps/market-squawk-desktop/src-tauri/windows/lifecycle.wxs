@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction
+      Id="MarketSquawkLifecycleUninstall"
+      FileKey="Path"
+      ExeCommand="--native-uninstall"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check"
+    />
+    <InstallExecuteSequence>
+      <Custom
+        Action="MarketSquawkLifecycleUninstall"
+        Before="RemoveFiles"
+      >
+        REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+      </Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

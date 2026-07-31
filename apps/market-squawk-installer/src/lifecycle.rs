@@ -433,14 +433,13 @@ fn program_receipt(
 /// mutable-data path.
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
     preflight_deletions(&request.deletions, &request.root)?;
-    let Some(store) = InstallStore::open_existing(&request.root)? else {
-        return Ok(UninstallReceipt {
-            removed_program: false,
-            deleted_data_classes: Vec::new(),
-        });
+    let removed_program = if let Some(store) = InstallStore::open_existing(&request.root)? {
+        let detached = store.quarantine_for_uninstall()?;
+        remove_tree(&detached)?;
+        true
+    } else {
+        false
     };
-    let detached = store.quarantine_for_uninstall()?;
-    remove_tree(&detached)?;
 
     let mut deleted = Vec::with_capacity(request.deletions.len());
     for (class, path) in request.deletions {
@@ -460,7 +459,7 @@ pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallE
         deleted.push(class);
     }
     Ok(UninstallReceipt {
-        removed_program: true,
+        removed_program,
         deleted_data_classes: deleted,
     })
 }

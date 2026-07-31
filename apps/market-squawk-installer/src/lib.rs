@@ -343,6 +343,7 @@ mod tests {
         let data = temporary.path().join("data");
         fs::create_dir(&data)?;
         fs::write(data.join("portfolio.json"), b"preserve")?;
+        let data = data.canonicalize()?;
         let fixture = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
         install(InstallRequest::from_local(
             root.clone(),
@@ -355,6 +356,13 @@ mod tests {
         assert!(receipt.removed_program());
         assert!(!root.exists());
         assert_eq!(fs::read(data.join("portfolio.json"))?, b"preserve");
+
+        let receipt = uninstall(
+            UninstallRequest::preserving_data(root)
+                .confirm_delete(MutableDataClass::Portfolios, data.clone()),
+        )?;
+        assert!(!receipt.removed_program());
+        assert!(!data.exists());
         Ok(())
     }
 

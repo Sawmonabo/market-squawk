@@ -1091,8 +1091,12 @@ jobs:
           "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
           python3 scripts/smoke_mcp.py "$application_cli"
-          "$installer" --root "$root" uninstall
+          HOME="$home" \
+            "$application/Contents/MacOS/market-squawk-desktop" \
+            --native-uninstall
           [[ ! -e "$state" ]]
+          /bin/rm -rf -- "$application"
+          [[ ! -e "$application" ]]
       - name: Install and launch the Windows package
         if: runner.os == 'Windows'
         shell: pwsh
@@ -1198,6 +1202,7 @@ jobs:
             }
           }
 
+          $statePath = $state[0].FullName
           $root = $state[0].DirectoryName
           $installer = @(
             Get-ChildItem `
@@ -1240,10 +1245,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Managed Python admission failed." }
           python scripts/smoke_mcp.py $application[0].FullName
           if ($LASTEXITCODE -ne 0) { throw "Installed MCP smoke failed." }
-          & $installer[0].FullName --root $root uninstall
-          if ($LASTEXITCODE -ne 0 -or (Test-Path $state[0].FullName)) {
-            throw "Default installed-product uninstall failed."
-          }
 
           if ($env:PACKAGE_KIND -eq "nsis") {
             $uninstallers = @(
@@ -1272,6 +1273,9 @@ jobs:
           if ($remove.ExitCode -ne 0) {
             throw "The Windows package uninstall failed."
           }
+          if (Test-Path $statePath) {
+            throw "The Windows package uninstall left managed program state behind."
+          }
       - name: Install and launch the Linux package
         if: runner.os == 'Linux'
         shell: bash
@@ -1293,7 +1297,10 @@ jobs:
 
           package_name=""
           if [[ "$PACKAGE_KIND" == "appimage" ]]; then
-            desktop="$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.AppImage"
+            desktop="$RUNNER_TEMP/Market-Squawk.AppImage"
+            cp \
+              "$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.AppImage" \
+              "$desktop"
             chmod u+x "$desktop"
           else
             package="$RELEASE_CANDIDATE/market-squawk-$VERSION-$TARGET.deb"
@@ -1368,10 +1375,21 @@ jobs:
           "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
           python3 scripts/smoke_mcp.py "$application"
-          "$installer" --root "$root" uninstall
+          if [[ "$PACKAGE_KIND" == "appimage" ]]; then
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+              HOME="$home" \
+              XDG_DATA_HOME="$xdg" \
+              "$desktop" --native-uninstall
+          else
+            HOME="$home" \
+              XDG_DATA_HOME="$xdg" \
+              "$desktop" --native-uninstall
+          fi
           [[ ! -e "$state" ]]
           if [[ -n "$package_name" ]]; then
             sudo apt-get remove --yes "$package_name"
+          else
+            rm -- "$desktop"
           fi
 
   publish:

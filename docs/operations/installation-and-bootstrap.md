@@ -241,7 +241,15 @@ and helper process, then start the selected release again.
 
 ### Preserve user data
 
-Use the operating system's normal application removal flow for a native package, or run:
+On Windows, removing the NSIS or MSI package through **Installed apps** runs the same
+data-preserving lifecycle before Windows removes the native package.
+
+On macOS and Linux, first open **Backup & Recovery → Uninstall programs** in the desktop, then
+remove the application, AppImage, or DEB package through the platform's normal flow. A dragged
+macOS application or portable AppImage has no operating-system uninstall hook, and a system-wide
+Linux package manager cannot safely infer which user's program store it should delete.
+
+For a terminal installation—or before removing a macOS/Linux native package—run:
 
 ```bash
 "$INSTALLER" uninstall
