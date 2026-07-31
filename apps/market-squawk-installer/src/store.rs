@@ -31,6 +31,8 @@ const RELEASES_DIRECTORY: &str = "releases";
 const STAGING_DIRECTORY: &str = "staging";
 #[cfg(unix)]
 const ENTRYPOINTS_DIRECTORY: &str = "bin";
+#[cfg(unix)]
+const UNIX_STICKY_BIT: u32 = 0o1000;
 const LOCK_FILE: &str = ".market-squawk-installer.lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -819,7 +821,7 @@ fn validate_unix_ancestor_chain(
         } else if (owner != current_user && owner != 0)
             || (!redirect
                 && mode & 0o022 != 0
-                && (mode & libc::S_ISVTX as u32 == 0
+                && (mode & UNIX_STICKY_BIT == 0
                     || child_owner.is_none_or(|child| child != current_user && child != 0)))
         {
             return Err(StoreError::UnsafeRoot);
