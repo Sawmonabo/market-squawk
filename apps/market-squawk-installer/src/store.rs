@@ -202,10 +202,15 @@ impl InstallStore {
             root: root.to_path_buf(),
             _lock: lock,
         };
+        store.prepare_reserved_directories()?;
+        #[cfg(windows)]
+        {
+            verify_private_windows_path(&store.root, true)?;
+            verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
+        }
+        store.clear_staging()?;
         #[cfg(windows)]
         store.verify_private_windows_tree()?;
-        store.prepare_reserved_directories()?;
-        store.clear_staging()?;
         Ok(store)
     }
 
@@ -226,10 +231,15 @@ impl InstallStore {
             root: root.to_path_buf(),
             _lock: lock,
         };
+        store.prepare_reserved_directories()?;
+        #[cfg(windows)]
+        {
+            verify_private_windows_path(&store.root, true)?;
+            verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
+        }
+        store.clear_staging()?;
         #[cfg(windows)]
         store.verify_private_windows_tree()?;
-        store.prepare_reserved_directories()?;
-        store.clear_staging()?;
         Ok(Some(store))
     }
 
@@ -722,8 +732,16 @@ fn configure_lock_options(options: &mut OpenOptions) {
 fn configure_lock_options(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt as _;
 
+    use windows_permissions::constants::AccessRights;
+
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let access = AccessRights::GenericRead
+        | AccessRights::GenericWrite
+        | AccessRights::ReadControl
+        | AccessRights::WriteDac
+        | AccessRights::WriteOwner;
     options
+        .access_mode(access.bits())
         .share_mode(0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
@@ -752,22 +770,57 @@ fn secure_private_unix_lock(lock: &File) -> Result<(), StoreError> {
 }
 
 fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
-    ensure_safe_directory(path)?;
-    #[cfg(unix)]
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| StoreError::io("inspect controlled directory", source))?;
+    if !path.is_absolute() {
+        return Err(StoreError::UnsafeRoot);
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        validate_unix_ancestor_chain(path, true)?;
+        let resolved = fs::canonicalize(path)
+            .map_err(|source| StoreError::io("resolve installation ancestors", source))?;
+        validate_unix_ancestor_chain(&resolved, false)?;
+    }
+    #[cfg(windows)]
+    for (depth, ancestor) in path.ancestors().enumerate() {
+        verify_exclusive_windows_parent(ancestor, depth == 0)?;
+    }
+    Ok(())
+}
 
-        if metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o022 != 0
+#[cfg(unix)]
+fn validate_unix_ancestor_chain(
+    path: &Path,
+    allow_ancestor_redirects: bool,
+) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current_user = rustix::process::geteuid().as_raw();
+    let mut child_owner = None;
+    for (depth, ancestor) in path.ancestors().enumerate() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|source| StoreError::io("inspect installation ancestor", source))?;
+        let redirect = is_directory_redirect(&metadata);
+        if (!metadata.is_dir() && !redirect)
+            || (redirect && (depth == 0 || !allow_ancestor_redirects))
         {
             return Err(StoreError::UnsafeRoot);
         }
+        let owner = metadata.uid();
+        let mode = metadata.mode();
+        if depth == 0 {
+            if owner != current_user || mode & 0o022 != 0 {
+                return Err(StoreError::UnsafeRoot);
+            }
+        } else if (owner != current_user && owner != 0)
+            || (!redirect
+                && mode & 0o022 != 0
+                && (mode & libc::S_ISVTX as u32 == 0
+                    || child_owner.is_none_or(|child| child != current_user && child != 0)))
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
+        child_owner = Some(owner);
     }
-    #[cfg(windows)]
-    verify_exclusive_windows_parent(path)?;
     Ok(())
 }
 
@@ -829,7 +882,10 @@ fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn verify_exclusive_windows_parent(path: &Path) -> Result<(), StoreError> {
+fn verify_exclusive_windows_parent(
+    path: &Path,
+    require_creation_control: bool,
+) -> Result<(), StoreError> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     use win_security_identifier::{
@@ -844,6 +900,8 @@ fn verify_exclusive_windows_parent(path: &Path) -> Result<(), StoreError> {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+    const TRUSTED_INSTALLER_SID: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
     let mut options = OpenOptions::new();
     options
@@ -870,6 +928,7 @@ fn verify_exclusive_windows_parent(path: &Path) -> Result<(), StoreError> {
         current_user.as_str(),
         local_system.as_str(),
         administrators.as_str(),
+        TRUSTED_INSTALLER_SID,
     ];
     let descriptor = GetSecurityInfo(
         &parent,
@@ -884,14 +943,14 @@ fn verify_exclusive_windows_parent(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::UnsafeRoot);
     }
     let dacl = descriptor.dacl().ok_or(StoreError::UnsafeRoot)?;
-    let dangerous = AccessRights::GenericAll
-        | AccessRights::GenericWrite
+    let mut dangerous = AccessRights::GenericAll
         | AccessRights::Delete
         | AccessRights::WriteDac
         | AccessRights::WriteOwner
-        | AccessRights::Bit1
-        | AccessRights::Bit2
         | AccessRights::Bit6;
+    if require_creation_control {
+        dangerous |= AccessRights::GenericWrite | AccessRights::Bit1 | AccessRights::Bit2;
+    }
     for index in 0..dacl.len() {
         let ace = dacl.get_ace(index).ok_or(StoreError::UnsafeRoot)?;
         let allowed = matches!(

@@ -93,14 +93,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn install_rejects_a_parent_writable_by_other_accounts() -> TestResult {
+    fn install_rejects_a_path_replaceable_by_other_accounts() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = TempDir::new()?;
         let fixture = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o777))?;
+        let shared = temporary.path().join("shared");
+        let private = shared.join("private");
+        fs::create_dir_all(&private)?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o711))?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777))?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
         let result = install(InstallRequest::from_local(
-            temporary.path().join("program"),
+            private.join("program"),
             &fixture.manifest,
             &fixture.bundle,
         )?);
