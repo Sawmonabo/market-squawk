@@ -838,7 +838,7 @@ fn reject_redirecting_components(path: &Path) -> Result<(), InstallError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        if !current.has_root() {
+        if matches!(component, std::path::Component::Prefix(_)) || !current.has_root() {
             continue;
         }
         match fs::symlink_metadata(&current) {
