@@ -241,8 +241,9 @@ and helper process, then start the selected release again.
 
 ### Preserve user data
 
-On Windows, removing the NSIS or MSI package through **Installed apps** runs the same
-data-preserving lifecycle before Windows removes the native package.
+On Windows, **Backup & Recovery → Uninstall programs** opens **Installed apps** and exits the
+desktop so no running release is deleted in place. Removing the NSIS or MSI package there runs the
+same data-preserving lifecycle before Windows removes the native package.
 
 On macOS and Linux, first open **Backup & Recovery → Uninstall programs** in the desktop, then
 remove the application, AppImage, or DEB package through the platform's normal flow. A dragged

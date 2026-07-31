@@ -14,10 +14,12 @@ use market_squawk::{
 };
 use market_squawk_data::CatalogLimit;
 use market_squawk_installer::{
-    CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, UninstallRequest,
-    repair, rollback, status as installation_status, uninstall, update_from_channel,
+    CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
+    status as installation_status, update_from_channel,
 };
 use market_squawk_installer::{ProgramName, active_program_path};
+#[cfg(not(target_os = "windows"))]
+use market_squawk_installer::{UninstallRequest, uninstall};
 use market_squawk_platform::SecretValue;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -543,27 +545,54 @@ pub(crate) async fn installation_control(
                 "restartRequired": true,
             }))
         }
-        InstallationControlCommand::Uninstall => {
-            let receipt =
-                blocking_installation(move || uninstall(UninstallRequest::preserving_data(root)))
-                    .await?;
-            app.exit(0);
-            Ok(json!({
-                "action": "uninstall",
-                "status": {
-                    "installed": false,
-                    "active_version": null,
-                    "previous_version": null,
-                    "target": null,
-                    "manifest_sha256": null,
-                    "channel_manifest_url": null,
-                    "healthy": false
-                },
-                "receipt": receipt,
-                "restartRequired": false,
-            }))
-        }
+        InstallationControlCommand::Uninstall => uninstall_programs(root, &app).await,
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn uninstall_programs(
+    root: PathBuf,
+    app: &tauri::AppHandle,
+) -> Result<Value, DesktopCommandError> {
+    let current = blocking_installation(move || installation_status(&root)).await?;
+    tauri_plugin_opener::open_url("ms-settings:appsfeatures", None::<&str>).map_err(|_error| {
+        DesktopCommandError::new(
+            "native_uninstall_handoff_failed",
+            "Windows Installed apps could not be opened. Close Market Squawk and remove it \
+                 from Windows Settings.",
+        )
+    })?;
+    app.exit(0);
+    Ok(json!({
+        "action": "uninstall",
+        "status": current,
+        "receipt": null,
+        "restartRequired": false,
+    }))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn uninstall_programs(
+    root: PathBuf,
+    app: &tauri::AppHandle,
+) -> Result<Value, DesktopCommandError> {
+    let receipt =
+        blocking_installation(move || uninstall(UninstallRequest::preserving_data(root))).await?;
+    app.exit(0);
+    Ok(json!({
+        "action": "uninstall",
+        "status": {
+            "installed": false,
+            "active_version": null,
+            "previous_version": null,
+            "target": null,
+            "manifest_sha256": null,
+            "channel_manifest_url": null,
+            "healthy": false
+        },
+        "receipt": receipt,
+        "restartRequired": false,
+    }))
 }
 
 async fn prepare_installation_restart(

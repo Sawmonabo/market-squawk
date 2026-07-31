@@ -227,9 +227,10 @@ export function InstallationPage({
                   <DialogHeader>
                     <DialogTitle>Uninstall Market Squawk programs?</DialogTitle>
                     <DialogDescription>
-                      This removes installed program versions and launchers.
-                      Configuration, credentials, portfolios, datasets, models,
-                      logs, and artifacts remain untouched.
+                      This closes Market Squawk and starts the platform-safe
+                      program removal flow. Configuration, credentials,
+                      portfolios, datasets, models, logs, and artifacts remain
+                      untouched.
                     </DialogDescription>
                   </DialogHeader>
                   <DialogFooter>
@@ -249,7 +250,7 @@ export function InstallationPage({
                         }
                       }}
                     >
-                      Uninstall programs only
+                      Continue to uninstall
                     </Button>
                   </DialogFooter>
                 </DialogContent>

@@ -182,6 +182,12 @@ desktop boundary under the exact test user's HOME/XDG environment, then removes 
 application, AppImage, or DEB package. It does not pre-delete the store with a separately located
 installer executable.
 
+Windows does not permit a running executable in the selected immutable release to delete its own
+version tree. The in-app removal action therefore opens the official **Installed apps** Settings
+surface and exits; the native uninstaller then runs lifecycle cleanup from the separately installed
+package executable. This also lets Windows Installer use its standard Restart Manager behavior
+instead of inventing a process-termination protocol in the application.
+
 ## Market Squawk decisions
 
 1. The installed desktop's default data root is Tauri's application-local data directory.
@@ -247,6 +253,8 @@ installer executable.
 | [Tauri 2.11.4 NSIS template](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi) | Hook order, update-mode flag, installed executable identity, and file-removal boundary | 2026-07-31 |
 | [Tauri 2.11.4 WiX template](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/windows/msi/main.wxs) | Main executable File ID and uninstall custom-action sequencing boundary | 2026-07-31 |
 | [Tauri Debian configuration](https://v2.tauri.app/reference/config/#debconfig) | DEB maintainer-script extension points and their system-package scope | 2026-07-31 |
+| [Microsoft Windows Settings URI reference](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-settings) | Official `ms-settings:appsfeatures` handoff to Installed apps | 2026-07-31 |
+| [Microsoft Restart Manager overview](https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager) | Windows Installer process/file-in-use lifecycle | 2026-07-31 |
 | [Tauri CLI reference](https://v2.tauri.app/reference/cli/) | Ordered `--config` overlays for build flavors | 2026-07-28 |
 | [Tauri path API](https://v2.tauri.app/reference/javascript/api/namespacepath/) | Operating-system mapping for the application-local data directory | 2026-07-28 |
 | [Official Tauri GitHub Action](https://github.com/tauri-apps/tauri-action) | `args`, `projectPath`, and relative `--config` path behavior | 2026-07-28 |
