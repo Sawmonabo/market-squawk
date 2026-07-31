@@ -1088,6 +1088,11 @@ pub(crate) fn secure_test_store_parent(path: &Path) -> Result<(), StoreError> {
     set_private_directory_permissions(path)
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn secure_test_store_file(path: &Path) -> Result<(), StoreError> {
+    secure_private_windows_path(path, false)
+}
+
 #[cfg(unix)]
 fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()

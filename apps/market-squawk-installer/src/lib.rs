@@ -503,9 +503,13 @@ mod tests {
         );
 
         fs::write(root.join("activation.json"), pending)?;
+        #[cfg(windows)]
+        crate::store::secure_test_store_file(&root.join("activation.json"))?;
 
         let pruning_obstruction = root.join("versions/pruning-obstruction");
         fs::write(&pruning_obstruction, b"obstruct pruning")?;
+        #[cfg(windows)]
+        crate::store::secure_test_store_file(&pruning_obstruction)?;
         assert!(matches!(
             status(&root),
             Err(InstallError::Store(StoreError::UnsafeRoot))
