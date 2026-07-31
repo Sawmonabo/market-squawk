@@ -838,6 +838,9 @@ fn reject_redirecting_components(path: &Path) -> Result<(), InstallError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if !current.has_root() {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_path_redirect(&metadata) => {
                 return Err(InstallError::UnsafeDataRoot);
