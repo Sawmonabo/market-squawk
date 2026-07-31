@@ -205,18 +205,23 @@ impl InstallStore {
         let lock = acquire_lock(parent)?;
         clear_detached_uninstalls(parent)?;
 
-        match fs::symlink_metadata(root) {
-            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
+        let created = match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => false,
             Ok(_) => return Err(StoreError::UnsafeRoot),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(root)
                     .map_err(|source| StoreError::io("create installation root", source))?;
+                true
             }
             Err(source) => {
                 return Err(StoreError::io("inspect installation root", source));
             }
+        };
+        if created {
+            set_private_directory_permissions(root)?;
+        } else {
+            verify_private_directory_permissions(root)?;
         }
-        set_private_directory_permissions(root)?;
 
         let store = Self {
             root: root.to_path_buf(),
@@ -254,7 +259,7 @@ impl InstallStore {
                 return Err(StoreError::io("inspect installation root", source));
             }
         }
-        set_private_directory_permissions(root)?;
+        verify_private_directory_permissions(root)?;
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
@@ -333,12 +338,15 @@ impl InstallStore {
         }
         let atomic = AtomicFile::new(self.root.join(file_name), behavior);
         atomic
-            .write(|file| {
-                file.write_all(&bytes)?;
-                #[cfg(windows)]
-                secure_private_windows_handle(file, false).map_err(std::io::Error::other)?;
-                Ok(())
-            })
+            .write_with_options(
+                |file| {
+                    file.write_all(&bytes)?;
+                    #[cfg(windows)]
+                    secure_private_windows_handle(file, false).map_err(std::io::Error::other)?;
+                    Ok(())
+                },
+                atomic_state_open_options(),
+            )
             .map_err(|error| {
                 let source: std::io::Error = error.into();
                 StoreError::io("publish installation state", source)
@@ -1023,6 +1031,56 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
         secure_private_windows_path(path, true)?;
     }
     Ok(())
+}
+
+fn verify_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect private directory ownership", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
+    }
+    #[cfg(windows)]
+    verify_private_windows_path(path, true)?;
+    Ok(())
+}
+
+fn atomic_state_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        use windows_permissions::constants::AccessRights;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let access = AccessRights::GenericWrite
+            | AccessRights::ReadControl
+            | AccessRights::WriteDac
+            | AccessRights::WriteOwner;
+        options
+            .access_mode(access.bits())
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
 }
 
 #[cfg(test)]
