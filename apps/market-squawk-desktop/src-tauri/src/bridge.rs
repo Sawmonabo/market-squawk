@@ -19,7 +19,7 @@ use market_squawk_installer::{
     repair, rollback, status as installation_status, uninstall, update_from_channel,
 };
 #[cfg(unix)]
-use market_squawk_installer::{ProgramName, stable_program_path};
+use market_squawk_installer::{ProgramName, active_program_path};
 use market_squawk_platform::SecretValue;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -580,7 +580,7 @@ async fn prepare_installation_restart(
     #[cfg(unix)]
     {
         let program =
-            blocking_installation(move || stable_program_path(&root, ProgramName::Desktop)).await?;
+            blocking_installation(move || active_program_path(&root, ProgramName::Desktop)).await?;
         state.schedule_restart(program)?;
     }
     #[cfg(not(unix))]

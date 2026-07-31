@@ -221,7 +221,7 @@ pub fn stable_program_path(root: &Path, program: ProgramName) -> Result<PathBuf,
     #[cfg(unix)]
     {
         if !STABLE_PROGRAMS.contains(&program) {
-            return resolve_program(root, program);
+            return active_program_path(root, program);
         }
         let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
         recover_pending_activation(&store)?;
@@ -235,11 +235,20 @@ pub fn stable_program_path(root: &Path, program: ProgramName) -> Result<PathBuf,
     }
     #[cfg(not(unix))]
     {
-        resolve_program(root, program)
+        active_program_path(root, program)
     }
 }
 
-pub(crate) fn resolve_program(
+/// Returns one revalidated executable from the selected immutable release.
+///
+/// Unlike [`stable_program_path`], this path remains bound to the exact selected release when a
+/// later activation republishes the stable entrypoints.
+///
+/// # Errors
+///
+/// Fails when the installation, selected release, platform, program receipt, or installed tree is
+/// missing or inconsistent.
+pub fn active_program_path(
     root: &Path,
     program: crate::platform::ProgramName,
 ) -> Result<PathBuf, InstallError> {

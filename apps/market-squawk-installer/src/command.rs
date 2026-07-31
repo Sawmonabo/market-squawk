@@ -23,7 +23,7 @@ use crate::contracts::{
     UninstallRequest, UpdateRequest,
 };
 use crate::lifecycle::{
-    InstallError, install, repair, resolve_program, rollback, status, uninstall, update,
+    InstallError, active_program_path, install, repair, rollback, status, uninstall, update,
 };
 use crate::manifest::{
     ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_ARCHIVE_ENTRIES,
@@ -258,7 +258,7 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
             output(json, "status", &current)?;
         }
         InstallerCommand::Launch { program } => {
-            let executable = resolve_program(&root, program)?;
+            let executable = active_program_path(&root, program)?;
             let exit = ProcessCommand::new(executable)
                 .status()
                 .map_err(CommandError::Launch)?;

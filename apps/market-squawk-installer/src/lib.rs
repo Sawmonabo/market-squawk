@@ -15,8 +15,8 @@ pub use self::contracts::{
     RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
-    InstallError, active_release_root, install, repair, rollback, stable_program_path, status,
-    uninstall, update,
+    InstallError, active_program_path, active_release_root, install, repair, rollback,
+    stable_program_path, status, uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
