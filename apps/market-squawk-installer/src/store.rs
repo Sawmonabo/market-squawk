@@ -200,8 +200,14 @@ impl InstallStore {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         fs::create_dir_all(parent)
             .map_err(|source| StoreError::io("create installation parent", source))?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: validate parent {}", parent.display());
         validate_store_parent(parent)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: acquire lock");
         let lock = acquire_lock(parent)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: lock acquired");
 
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
@@ -214,21 +220,39 @@ impl InstallStore {
                 return Err(StoreError::io("inspect installation root", source));
             }
         }
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: secure root {}", root.display());
         set_private_directory_permissions(root)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: root secured");
 
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
         };
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: prepare reserved directories");
         store.prepare_reserved_directories()?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reserved directories prepared");
         #[cfg(windows)]
         {
+            #[cfg(test)]
+            eprintln!("installer-store: verify root and staging");
             verify_private_windows_path(&store.root, true)?;
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
+            #[cfg(test)]
+            eprintln!("installer-store: root and staging verified");
         }
         store.clear_staging()?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: staging cleared");
         #[cfg(windows)]
-        store.verify_private_windows_tree()?;
+        {
+            store.verify_private_windows_tree()?;
+            #[cfg(test)]
+            eprintln!("installer-store: private tree verified");
+        }
         Ok(store)
     }
 
@@ -840,6 +864,11 @@ pub(crate) fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
     }
     #[cfg(windows)]
     for (depth, ancestor) in path.ancestors().enumerate() {
+        #[cfg(test)]
+        eprintln!(
+            "installer-store: validate ancestor depth={depth} path={}",
+            ancestor.display()
+        );
         verify_exclusive_windows_parent(ancestor, depth == 0)?;
     }
     Ok(())
