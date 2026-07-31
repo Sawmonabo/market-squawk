@@ -158,7 +158,7 @@ fn complete_repair(
     } else if publish_programs {
         publish_stable_programs(store, state)?;
     }
-    store.normalize_private_permissions()?;
+    store.verify_private_permissions()?;
     receipt(state, repaired)
 }
 
@@ -548,7 +548,7 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
     publish_stable_programs(store, &state)?;
     store.prune(&state)?;
     store.clear_pending_activation()?;
-    store.normalize_private_permissions()?;
+    store.verify_private_permissions()?;
     Ok(())
 }
 
@@ -821,6 +821,10 @@ fn prepare_candidate(
         let _ = remove_tree(&stage);
         return Err(InstallError::CorruptInstallation);
     }
+    if let Err(error) = store.secure_stage(&stage) {
+        let _ = remove_tree(&stage);
+        return Err(error.into());
+    }
     if replace_existing {
         store.replace_corrupt_version(&stage, &version)?;
     } else {
@@ -851,6 +855,10 @@ fn restore_stored_version(
     if extracted != version.components {
         let _ = remove_tree(&stage);
         return Err(InstallError::CorruptInstallation);
+    }
+    if let Err(error) = store.secure_stage(&stage) {
+        let _ = remove_tree(&stage);
+        return Err(error.into());
     }
     match fs::symlink_metadata(&final_path) {
         Ok(_) => store.replace_corrupt_version(&stage, version)?,
@@ -946,6 +954,10 @@ fn stage_release_cache(
     seal_cache_file(&manifest_path)?;
     seal_cache_file(&bundle_path)?;
     sync_directory(&stage)?;
+    if let Err(error) = store.secure_stage(&stage) {
+        let _ = remove_tree(&stage);
+        return Err(error.into());
+    }
     Ok(stage)
 }
 

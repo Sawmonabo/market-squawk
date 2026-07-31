@@ -229,7 +229,7 @@ impl InstallStore {
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
         }
         store.clear_staging()?;
-        store.normalize_private_permissions()?;
+        store.verify_private_permissions()?;
         Ok(store)
     }
 
@@ -266,7 +266,7 @@ impl InstallStore {
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
         }
         store.clear_staging()?;
-        store.normalize_private_permissions()?;
+        store.verify_private_permissions()?;
         Ok(Some(store))
     }
 
@@ -333,7 +333,12 @@ impl InstallStore {
         }
         let atomic = AtomicFile::new(self.root.join(file_name), behavior);
         atomic
-            .write(|file| file.write_all(&bytes))
+            .write(|file| {
+                file.write_all(&bytes)?;
+                #[cfg(windows)]
+                secure_private_windows_handle(file, false).map_err(std::io::Error::other)?;
+                Ok(())
+            })
             .map_err(|error| {
                 let source: std::io::Error = error.into();
                 StoreError::io("publish installation state", source)
@@ -632,62 +637,31 @@ impl InstallStore {
         Ok(())
     }
 
-    pub(crate) fn normalize_private_permissions(&self) -> Result<(), StoreError> {
+    pub(crate) fn verify_private_permissions(&self) -> Result<(), StoreError> {
         #[cfg(windows)]
         {
-            let entries = self.private_windows_entries()?;
-            let mut requires_normalization = false;
-            for (path, directory) in &entries {
-                match verify_private_windows_path(path, *directory) {
-                    Ok(()) => {}
-                    Err(StoreError::UnsafeRoot) => requires_normalization = true,
-                    Err(error) => return Err(error),
-                }
-            }
-            if requires_normalization {
-                for (path, directory) in &entries {
-                    secure_private_windows_path(path, *directory)?;
-                }
-            }
-            for (path, directory) in entries {
+            for (path, directory) in private_windows_entries(&self.root)? {
                 verify_private_windows_path(&path, directory)?;
             }
         }
         Ok(())
     }
 
-    #[cfg(windows)]
-    fn private_windows_entries(&self) -> Result<Vec<(PathBuf, bool)>, StoreError> {
-        let mut directories = vec![self.root.clone()];
-        let mut entries = vec![(self.root.clone(), true)];
-        let mut cursor = 0;
-        while cursor < directories.len() {
-            let directory = &directories[cursor];
-            for entry in fs::read_dir(directory)
-                .map_err(|source| StoreError::io("read protected installation tree", source))?
-            {
-                let entry = entry.map_err(|source| {
-                    StoreError::io("read protected installation entry", source)
-                })?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path).map_err(|source| {
-                    StoreError::io("inspect protected installation entry", source)
-                })?;
-                if is_directory_redirect(&metadata) {
-                    return Err(StoreError::UnsafeRoot);
-                }
-                if metadata.is_dir() {
-                    directories.push(path.clone());
-                    entries.push((path, true));
-                } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-                    entries.push((path, false));
-                } else {
-                    return Err(StoreError::UnsafeRoot);
-                }
-            }
-            cursor += 1;
+    pub(crate) fn secure_stage(&self, stage: &Path) -> Result<(), StoreError> {
+        if stage.parent() != Some(self.root.join(STAGING_DIRECTORY).as_path()) {
+            return Err(StoreError::UnsafeRoot);
         }
-        Ok(entries)
+        #[cfg(windows)]
+        {
+            let entries = private_windows_entries(stage)?;
+            for (path, directory) in &entries {
+                secure_private_windows_path(path, *directory)?;
+            }
+            for (path, directory) in entries {
+                verify_private_windows_path(&path, directory)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -710,6 +684,38 @@ fn clear_detached_uninstalls(parent: &Path) -> Result<(), StoreError> {
         sync_directory(parent)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn private_windows_entries(root: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut entries = vec![(root.to_path_buf(), true)];
+    let mut cursor = 0;
+    while cursor < directories.len() {
+        let directory = &directories[cursor];
+        for entry in fs::read_dir(directory)
+            .map_err(|source| StoreError::io("read protected installation tree", source))?
+        {
+            let entry = entry
+                .map_err(|source| StoreError::io("read protected installation entry", source))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| StoreError::io("inspect protected installation entry", source))?;
+            if is_directory_redirect(&metadata) {
+                return Err(StoreError::UnsafeRoot);
+            }
+            if metadata.is_dir() {
+                directories.push(path.clone());
+                entries.push((path, true));
+            } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                entries.push((path, false));
+            } else {
+                return Err(StoreError::UnsafeRoot);
+            }
+        }
+        cursor += 1;
+    }
+    Ok(entries)
 }
 
 pub(crate) fn remove_tree(path: &Path) -> Result<(), StoreError> {
