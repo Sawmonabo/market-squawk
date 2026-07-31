@@ -208,6 +208,87 @@ pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
     Ok(active)
 }
 
+/// Resolves the active release root for a verified installed program path.
+///
+/// The path may identify either a stable Unix entrypoint or the executable inside the active
+/// immutable release. Paths that do not belong to an installation return `None`; a path that
+/// claims an installation but disagrees with its retained selector fails closed.
+///
+/// # Errors
+///
+/// Fails when a discovered installation, active release, or program entrypoint is inconsistent.
+pub fn active_release_root_for_installed_program(
+    executable: &Path,
+    program: ProgramName,
+) -> Result<Option<PathBuf>, InstallError> {
+    let target = crate::platform::SupportedTarget::current()?;
+    let relative = program.relative_path(target);
+    let expected_name = relative
+        .file_name()
+        .ok_or(InstallError::CorruptInstallation)?;
+    if executable.file_name() != Some(expected_name) {
+        return Ok(None);
+    }
+    let bin = executable
+        .parent()
+        .ok_or(InstallError::CorruptInstallation)?;
+    if bin.file_name() != relative.parent().and_then(Path::file_name) {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    if let Some(root) = bin.parent()
+        && installation_selector_exists(root)?
+    {
+        let active = active_release_root(root)?;
+        let expected = stable_program_path(root, program)?;
+        if !same_canonical_path(executable, &expected)? {
+            return Err(InstallError::CorruptInstallation);
+        }
+        return Ok(Some(active));
+    }
+
+    let release = bin.parent().ok_or(InstallError::CorruptInstallation)?;
+    let versions = match release.parent() {
+        Some(versions) if versions.file_name().is_some_and(|name| name == "versions") => versions,
+        _ => return Ok(None),
+    };
+    let root = versions.parent().ok_or(InstallError::CorruptInstallation)?;
+    if !installation_selector_exists(root)? {
+        return Ok(None);
+    }
+    let active = active_release_root(root)?;
+    let expected = active_program_path(root, program)?;
+    if !same_canonical_path(release, &active)? || !same_canonical_path(executable, &expected)? {
+        return Err(InstallError::CorruptInstallation);
+    }
+    Ok(Some(active))
+}
+
+fn installation_selector_exists(root: &Path) -> Result<bool, InstallError> {
+    match fs::symlink_metadata(root.join("installation.json")) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(InstallError::CorruptInstallation),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(InstallError::Io {
+            operation: "inspect installed program selector",
+            source,
+        }),
+    }
+}
+
+fn same_canonical_path(left: &Path, right: &Path) -> Result<bool, InstallError> {
+    let left = fs::canonicalize(left).map_err(|source| InstallError::Io {
+        operation: "resolve installed program path",
+        source,
+    })?;
+    let right = fs::canonicalize(right).map_err(|source| InstallError::Io {
+        operation: "resolve installed program path",
+        source,
+    })?;
+    Ok(left == right)
+}
+
 /// Returns a revalidated stable installed entrypoint for one code-owned program.
 ///
 /// On Unix, the returned path remains constant across update and rollback. Native Windows

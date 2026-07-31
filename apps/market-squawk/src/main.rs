@@ -28,6 +28,7 @@ use market_squawk::{
 use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
+use market_squawk_installer::{ProgramName, active_release_root_for_installed_program};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
@@ -65,6 +66,15 @@ async fn run() -> Result<()> {
     initialize_logging(&cli.log, cli.json_logs)?;
     let output = cli.output;
     let config_file = cli.config.clone();
+    let training_release_root = match cli.training_release_root {
+        Some(root) => Some(root),
+        None => {
+            let executable =
+                std::env::current_exe().context("failed to resolve the running CLI executable")?;
+            active_release_root_for_installed_program(&executable, ProgramName::Cli)
+                .context("failed to resolve the installed training runtime")?
+        }
+    };
     let cli_overrides = ConfigOverrides {
         data_dir: cli.data_dir,
         capture_queue_capacity: cli.capture_queue_capacity,
@@ -72,7 +82,7 @@ async fn run() -> Result<()> {
         capture_destination_registry_memory_ceiling_bytes: cli
             .capture_destination_registry_memory_ceiling_bytes,
         source_shutdown_ms: cli.source_shutdown_ms,
-        training_release_root: cli.training_release_root,
+        training_release_root,
         ..ConfigOverrides::default()
     };
 

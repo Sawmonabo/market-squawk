@@ -127,8 +127,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "328b2ef3e71975b8eb3cc603db381f0bb7e2e28b51b6991770290648265d0cf4",
-      "size_bytes": 232034
+      "sha256": "7445ba36a6abc50593b047bc1c05b2fe493a5510d9b1f4e9f1cd4014cd6ddbc1",
+      "size_bytes": 232062
     },
     {
       "path": "Cargo.toml",
@@ -846,9 +846,59 @@
       "size_bytes": 6751
     },
     {
+      "path": "apps/market-squawk-installer/Cargo.toml",
+      "sha256": "5c9d1640abf19d09a3366d553e7549ba1252e054f89753c0a8b8b3ebe5c88ded",
+      "size_bytes": 1216
+    },
+    {
+      "path": "apps/market-squawk-installer/src/archive.rs",
+      "sha256": "33d5802670c7baea7d65af1cb7702d2b63be9abbed7552192619856abfc2baea",
+      "size_bytes": 19016
+    },
+    {
+      "path": "apps/market-squawk-installer/src/command.rs",
+      "sha256": "4d602f8366938c8765e09a028a89839d6d417f01af49f08155cfd64780b27d01",
+      "size_bytes": 31881
+    },
+    {
+      "path": "apps/market-squawk-installer/src/contracts.rs",
+      "sha256": "f40433bd4b835d4561d778773a5b7922e28bf9f4254281dc63434c18965019c1",
+      "size_bytes": 7323
+    },
+    {
+      "path": "apps/market-squawk-installer/src/lib.rs",
+      "sha256": "3eba8672009395ec365769083ff125801fd0016a9bc93a43b2f9de28512e569d",
+      "size_bytes": 19767
+    },
+    {
+      "path": "apps/market-squawk-installer/src/lifecycle.rs",
+      "sha256": "9f35cfdf118072537be3365e38bcec3d7b35ef65a64a5d8e92394880b7e1184e",
+      "size_bytes": 38000
+    },
+    {
+      "path": "apps/market-squawk-installer/src/main.rs",
+      "sha256": "8e68cdc1131d029e00f174939efd21ad107cc872a2051ba8adaff9352bd32665",
+      "size_bytes": 593
+    },
+    {
+      "path": "apps/market-squawk-installer/src/manifest.rs",
+      "sha256": "4effcd34c21eadd872e31fd9716ca320807644b9a6bfd99b248b5369503a023e",
+      "size_bytes": 15808
+    },
+    {
+      "path": "apps/market-squawk-installer/src/platform.rs",
+      "sha256": "84d01c543be6f5112feb2d6442ca362f8bcfa2ab044c0fc009e20c502648c829",
+      "size_bytes": 7631
+    },
+    {
+      "path": "apps/market-squawk-installer/src/store.rs",
+      "sha256": "9c9856fe1e3b348dd669ebe2e179ebf50ddfbbe5ab81963fbf577bd5cf7743ea",
+      "size_bytes": 34410
+    },
+    {
       "path": "apps/market-squawk/Cargo.toml",
-      "sha256": "3d3cfac8b4359080a77f80d30f052d1b04e12c3794c67b9039cf07a895e73934",
-      "size_bytes": 3823
+      "sha256": "2a019a94749890335117326b2c0e633bb9c3822136a10a05bab10925d5d5c58c",
+      "size_bytes": 3870
     },
     {
       "path": "apps/market-squawk/assets/provider-onboarding/index.html",
@@ -1302,8 +1352,8 @@
     },
     {
       "path": "apps/market-squawk/src/main.rs",
-      "sha256": "980e211eebf979014e37d381d1a2fba9fb95f645351e9ddf3397d37dec910011",
-      "size_bytes": 44617
+      "sha256": "07807e6a8b6565c9a92f147a63461ad584149b177137224854b22db9886f28f3",
+      "size_bytes": 45102
     },
     {
       "path": "apps/market-squawk/src/mcp.rs",

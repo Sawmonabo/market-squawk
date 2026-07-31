@@ -4255,6 +4255,7 @@ dependencies = [
  "market-squawk-data",
  "market-squawk-domain",
  "market-squawk-execution",
+ "market-squawk-installer",
  "market-squawk-live",
  "market-squawk-mcp",
  "market-squawk-modeling",

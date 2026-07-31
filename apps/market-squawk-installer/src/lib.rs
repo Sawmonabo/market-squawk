@@ -15,8 +15,9 @@ pub use self::contracts::{
     RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
-    InstallError, active_program_path, active_release_root, install, repair, rollback,
-    stable_program_path, status, uninstall, update,
+    InstallError, active_program_path, active_release_root,
+    active_release_root_for_installed_program, install, repair, rollback, stable_program_path,
+    status, uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
@@ -45,7 +46,10 @@ mod tests {
         uninstall, update,
     };
     #[cfg(unix)]
-    use super::{ProgramName, stable_program_path};
+    use super::{
+        ProgramName, active_release_root, active_release_root_for_installed_program,
+        stable_program_path,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -100,6 +104,10 @@ mod tests {
         #[cfg(unix)]
         {
             let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
+            assert_eq!(
+                active_release_root_for_installed_program(&stable_cli, ProgramName::Cli)?,
+                Some(active_release_root(&root)?)
+            );
             let stable_capture = stable_program_path(&root, ProgramName::CaptureHelper)?;
             let stable_worker = stable_program_path(&root, ProgramName::OnnxWorker)?;
             assert_eq!(stable_capture.parent(), stable_cli.parent());

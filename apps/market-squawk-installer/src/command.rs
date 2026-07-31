@@ -89,7 +89,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum InstallerCommand {
-    /// Install from a stable HTTPS manifest or exact local files.
+    /// Install from an immutable HTTPS manifest or exact local files.
     Install(InstallArguments),
     /// Download and activate the next release from the retained channel.
     Update,
@@ -153,9 +153,12 @@ struct ManifestBuildArguments {
 
 #[derive(Debug, Args)]
 struct InstallArguments {
-    /// Stable HTTPS release-manifest URL.
+    /// Immutable HTTPS release-manifest URL used for this installation.
     #[arg(long, conflicts_with_all = ["manifest", "bundle"])]
     manifest_url: Option<String>,
+    /// Moving HTTPS manifest URL retained for later updates.
+    #[arg(long, requires = "manifest_url")]
+    channel_manifest_url: Option<String>,
     /// Exact local release manifest for offline installation.
     #[arg(long, requires = "bundle")]
     manifest: Option<PathBuf>,
@@ -217,19 +220,25 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
     };
     match command {
         InstallerCommand::Install(arguments) => {
-            let receipt = match (arguments.manifest_url, arguments.manifest, arguments.bundle) {
-                (Some(url), None, None) => {
+            let receipt = match (
+                arguments.manifest_url,
+                arguments.channel_manifest_url,
+                arguments.manifest,
+                arguments.bundle,
+            ) {
+                (Some(url), channel_url, None, None) => {
                     let downloaded = download_release(&url, &root).await?;
+                    let channel_url = channel_url.as_deref().unwrap_or(&url);
                     install(
                         InstallRequest::from_local(
                             root.clone(),
                             &downloaded.manifest,
                             downloaded.bundle.path(),
                         )?
-                        .with_channel_manifest_url(&url)?,
+                        .with_channel_manifest_url(channel_url)?,
                     )?
                 }
-                (None, Some(manifest), Some(bundle)) => {
+                (None, None, Some(manifest), Some(bundle)) => {
                     let bytes = read_manifest(&manifest)?;
                     install(InstallRequest::from_local(root.clone(), &bytes, &bundle)?)?
                 }

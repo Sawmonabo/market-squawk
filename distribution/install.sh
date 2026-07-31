@@ -27,9 +27,10 @@ case "$(uname -s):$(uname -m)" in
 esac
 
 manifest_url="$release_base/market-squawk-release-$target.json"
+channel_manifest_url="https://github.com/Sawmonabo/market-squawk/releases/latest/download/market-squawk-release-$target.json"
 
 case "$tag:$expected_sha256" in
-  *'__MARKET_SQUAWK_'*)
+  _* | *:_*)
     echo "This is the release-builder template, not a published installer." >&2
     exit 2
     ;;
@@ -73,6 +74,8 @@ if [ "$observed_sha256" != "$expected_sha256" ]; then
 fi
 
 chmod 700 "$bootstrap"
-"$bootstrap" install --manifest-url "$manifest_url"
+"$bootstrap" install \
+  --manifest-url "$manifest_url" \
+  --channel-manifest-url "$channel_manifest_url"
 
 echo "Market Squawk is installed. The durable desktop, CLI, and maintenance paths are listed above."
