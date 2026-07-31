@@ -41,9 +41,9 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use super::{
-        InstallError, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest, StoreError,
-        SupportedTarget, UninstallRequest, UpdateRequest, install, repair, rollback, status,
-        uninstall, update,
+        ComponentRole, InstallError, InstallRequest, MutableDataClass, RepairRequest,
+        RollbackRequest, StoreError, SupportedTarget, UninstallRequest, UpdateRequest, install,
+        repair, rollback, status, uninstall, update,
     };
     #[cfg(unix)]
     use super::{
@@ -52,23 +52,6 @@ mod tests {
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-    const COMPONENTS: [(&str, &str, bool); 10] = [
-        ("bin/market-squawk-desktop", "desktop", true),
-        ("bin/market-squawk", "cli", true),
-        ("bin/market-squawk-capture-helper", "capture-helper", true),
-        ("bin/market-squawk-onnx-worker", "onnx-worker", true),
-        ("bin/market-squawk-model-validator", "model-validator", true),
-        ("bin/market-squawk-train", "training-driver", true),
-        ("bin/market-squawk-installer", "installer", true),
-        ("tools/uv", "uv", true),
-        ("bin/python", "python-runtime", true),
-        (
-            "lib/python3.14/site-packages/market_squawk/__init__.py",
-            "python-environment",
-            false,
-        ),
-    ];
 
     #[test]
     fn rejects_unsafe_unlisted_or_mismatched_bundle_before_activation() -> TestResult {
@@ -501,24 +484,31 @@ mod tests {
     impl BundleFixture {
         fn create(root: &Path, version: &str, defect: BundleDefect) -> TestResult<Self> {
             let bundle = root.join(format!("market-squawk-{version}.zip"));
-            let mut components = Vec::with_capacity(COMPONENTS.len());
+            let target = SupportedTarget::current()?;
+            let mut components = Vec::with_capacity(ComponentRole::REQUIRED.len());
             let file = File::create(&bundle)?;
             let mut archive = ZipWriter::new(file);
-            for (path, role, executable) in COMPONENTS {
+            for role in ComponentRole::REQUIRED {
+                let executable = role.requires_executable();
+                let expected_path = role.fixed_path(target).unwrap_or_else(|| {
+                    "lib/python3.14/site-packages/market_squawk/__init__.py".to_owned()
+                });
                 let path = if matches!(defect, BundleDefect::MisplacedRequiredRole)
-                    && role == "python-runtime"
+                    && role == ComponentRole::PythonRuntime
                 {
-                    "tools/python"
+                    "tools/python".to_owned()
                 } else {
-                    path
+                    expected_path
                 };
                 let bytes = format!("{version}:{path}").into_bytes();
                 let options = SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Deflated)
                     .unix_permissions(if executable { 0o755 } else { 0o644 });
-                archive.start_file(path, options)?;
+                archive.start_file(&path, options)?;
                 archive.write_all(&bytes)?;
-                let digest = if matches!(defect, BundleDefect::DigestMismatch) && role == "cli" {
+                let digest = if matches!(defect, BundleDefect::DigestMismatch)
+                    && role == ComponentRole::Cli
+                {
                     "0".repeat(64)
                 } else {
                     sha256_bytes(&bytes)
@@ -548,7 +538,6 @@ mod tests {
             archive.finish()?;
 
             components.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-            let target = SupportedTarget::current()?;
             let archive_size = fs::metadata(&bundle)?.len();
             let archive_sha256 = sha256_file(&bundle)?;
             let manifest = serde_json::to_vec_pretty(&json!({
