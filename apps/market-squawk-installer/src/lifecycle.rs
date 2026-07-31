@@ -115,14 +115,26 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     }
     let active_path = store.version_path(&state.active);
     if verify_installed_tree(&active_path, &state.active.components).is_ok() {
+        let cache_repaired = if let Some((release, bundle)) = supplied_release.as_ref() {
+            restore_release_cache(&store, release, bundle)?.1
+        } else {
+            read_cached_release(&store, &state.active)?;
+            false
+        };
         if verify_stable_programs(&store, &state).is_ok() {
-            return complete_repair(&store, &mut state, channel_manifest_url, false, false);
+            return complete_repair(
+                &store,
+                &mut state,
+                channel_manifest_url,
+                cache_repaired,
+                false,
+            );
         }
         return complete_repair(&store, &mut state, channel_manifest_url, true, true);
     }
 
     let (release, cached_bundle) = if let Some((release, bundle)) = supplied_release {
-        let cached_bundle = restore_release_cache(&store, &release, &bundle)?;
+        let (cached_bundle, _) = restore_release_cache(&store, &release, &bundle)?;
         (release, cached_bundle)
     } else {
         let release = read_cached_release(&store, &state.active)?;
@@ -131,32 +143,7 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
             .join(CACHED_BUNDLE_FILE);
         (release, cached_bundle)
     };
-    let stage = store.create_stage("repair")?;
-    let extracted = match extract_bundle(&cached_bundle, release.target_release(), &stage) {
-        Ok(extracted) => extracted,
-        Err(error) => {
-            let _ = remove_tree(&stage);
-            return Err(error.into());
-        }
-    };
-    if extracted != state.active.components {
-        let _ = remove_tree(&stage);
-        return Err(InstallError::CorruptInstallation);
-    }
-    match fs::symlink_metadata(&active_path) {
-        Ok(_) => store.replace_corrupt_version(&stage, &state.active)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            store.publish_new_version(&stage, &state.active)?;
-        }
-        Err(source) => {
-            return Err(InstallError::Io {
-                operation: "inspect active version root",
-                source,
-            });
-        }
-    }
-    seal_tree_root(&active_path)?;
-    verify_installed_tree(&active_path, &state.active.components)?;
+    restore_stored_version(&store, &state.active, &release, &cached_bundle, "repair")?;
     complete_repair(&store, &mut state, channel_manifest_url, true, true)
 }
 
@@ -179,19 +166,57 @@ fn complete_repair(
 ///
 /// # Errors
 ///
-/// Fails if no previous version exists or if any retained component no longer matches its receipt.
+/// Fails if no previous version exists, neither the retained cache nor supplied exact source can
+/// recover it, or the recovered version cannot be activated safely.
 pub fn rollback(request: RollbackRequest) -> Result<InstallReceipt, InstallError> {
-    let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    let RollbackRequest {
+        root,
+        release,
+        bundle,
+        channel_manifest_url,
+    } = request;
+    let supplied_release = match (release, bundle) {
+        (Some(release), Some(bundle)) => Some((release, bundle)),
+        (None, None) => None,
+        _ => return Err(InstallError::CorruptInstallation),
+    };
+    let store = InstallStore::open_existing(&root)?.ok_or(InstallError::NotInstalled)?;
     recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let previous = state
         .previous
         .as_ref()
+        .cloned()
         .ok_or(InstallError::RollbackUnavailable)?;
-    verify_installed_tree(&store.version_path(previous), &previous.components)?;
+    let (release, cached_bundle, cache_repaired) = if let Some((release, bundle)) = supplied_release
+    {
+        validate_recovery_release(&previous, &release)?;
+        let (cached_bundle, cache_repaired) = restore_release_cache(&store, &release, &bundle)?;
+        (release, cached_bundle, cache_repaired)
+    } else {
+        let release = read_cached_release(&store, &previous)?;
+        let cached_bundle = store
+            .release_path(&previous.manifest_sha256)
+            .join(CACHED_BUNDLE_FILE);
+        (release, cached_bundle, false)
+    };
+    let version_repaired =
+        if verify_installed_tree(&store.version_path(&previous), &previous.components).is_ok() {
+            false
+        } else {
+            restore_stored_version(
+                &store,
+                &previous,
+                &release,
+                &cached_bundle,
+                "rollback-recovery",
+            )?;
+            true
+        };
     state.swap_for_rollback()?;
+    state.bind_channel_manifest_url(channel_manifest_url)?;
     commit_activation(&store, &state)?;
-    receipt(&state, false)
+    receipt(&state, cache_repaired || version_repaired)
 }
 
 /// Reads and revalidates current installation status.
@@ -695,7 +720,7 @@ fn prepare_candidate(
     release: &AdmittedRelease,
     bundle: &Path,
 ) -> Result<StoredVersion, InstallError> {
-    let cached_bundle = restore_release_cache(store, release, bundle)?;
+    let (cached_bundle, _) = restore_release_cache(store, release, bundle)?;
     let version = stored_version_for_release(release)?;
     let final_path = store.version_path(&version);
     let replace_existing = match fs::symlink_metadata(&final_path) {
@@ -739,6 +764,44 @@ fn prepare_candidate(
     Ok(version)
 }
 
+fn restore_stored_version(
+    store: &InstallStore,
+    version: &StoredVersion,
+    release: &AdmittedRelease,
+    cached_bundle: &Path,
+    stage_purpose: &str,
+) -> Result<(), InstallError> {
+    validate_recovery_release(version, release)?;
+    let final_path = store.version_path(version);
+    let stage = store.create_stage(stage_purpose)?;
+    let extracted = match extract_bundle(cached_bundle, release.target_release(), &stage) {
+        Ok(extracted) => extracted,
+        Err(error) => {
+            let _ = remove_tree(&stage);
+            return Err(error.into());
+        }
+    };
+    if extracted != version.components {
+        let _ = remove_tree(&stage);
+        return Err(InstallError::CorruptInstallation);
+    }
+    match fs::symlink_metadata(&final_path) {
+        Ok(_) => store.replace_corrupt_version(&stage, version)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            store.publish_new_version(&stage, version)?;
+        }
+        Err(source) => {
+            return Err(InstallError::Io {
+                operation: "inspect retained version root",
+                source,
+            });
+        }
+    }
+    seal_tree_root(&final_path)?;
+    verify_installed_tree(&final_path, &version.components)?;
+    Ok(())
+}
+
 fn stored_version_for_release(release: &AdmittedRelease) -> Result<StoredVersion, InstallError> {
     let expected_receipts: Vec<ComponentReceipt> = release
         .target_release()
@@ -777,18 +840,18 @@ fn restore_release_cache(
     store: &InstallStore,
     release: &AdmittedRelease,
     source_bundle: &Path,
-) -> Result<PathBuf, InstallError> {
+) -> Result<(PathBuf, bool), InstallError> {
     verify_bundle(source_bundle, &release.target_release().archive)?;
     let final_directory = store.release_path(release.manifest_sha256());
     if verify_cached_release(&final_directory, release).is_ok() {
-        return Ok(final_directory.join(CACHED_BUNDLE_FILE));
+        return Ok((final_directory.join(CACHED_BUNDLE_FILE), false));
     }
 
     let stage = stage_release_cache(store, release, source_bundle, "release-recovery")?;
     store.replace_corrupt_release_cache(&stage, release.manifest_sha256())?;
     seal_cache_directory(&final_directory)?;
     verify_cached_release(&final_directory, release)?;
-    Ok(final_directory.join(CACHED_BUNDLE_FILE))
+    Ok((final_directory.join(CACHED_BUNDLE_FILE), true))
 }
 
 fn stage_release_cache(

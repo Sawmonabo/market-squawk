@@ -267,21 +267,37 @@ impl InstallStore {
         }
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         validate_store_parent(parent)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reopen acquire lock");
         let lock = acquire_lock(parent)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reopen lock acquired");
         set_private_directory_permissions(root)?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reopen root secured");
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
         };
         store.prepare_reserved_directories()?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reopen reserved directories prepared");
         #[cfg(windows)]
         {
             verify_private_windows_path(&store.root, true)?;
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
+            #[cfg(test)]
+            eprintln!("installer-store: reopen root and staging verified");
         }
         store.clear_staging()?;
+        #[cfg(all(test, windows))]
+        eprintln!("installer-store: reopen staging cleared");
         #[cfg(windows)]
-        store.verify_private_windows_tree()?;
+        {
+            store.verify_private_windows_tree()?;
+            #[cfg(test)]
+            eprintln!("installer-store: reopen private tree verified");
+        }
         Ok(Some(store))
     }
 
@@ -508,6 +524,12 @@ impl InstallStore {
         }
         fs::rename(stage, &final_path)
             .map_err(|source| StoreError::io("publish immutable release cache", source))?;
+        if let Err(error) = seal_release_cache_root(&final_path) {
+            return match fs::rename(&final_path, stage) {
+                Ok(()) => Err(error),
+                Err(_) => Err(StoreError::RepairIndeterminate),
+            };
+        }
         sync_directory(&self.root.join(RELEASES_DIRECTORY))?;
         Ok(final_path)
     }
@@ -534,12 +556,27 @@ impl InstallStore {
         if metadata.is_dir() && !is_directory_redirect(&metadata) {
             set_private_directory_permissions(&final_path)?;
         }
-        fs::rename(&final_path, &quarantine)
-            .map_err(|source| StoreError::io("quarantine corrupt release cache", source))?;
+        if let Err(source) = fs::rename(&final_path, &quarantine) {
+            return match seal_release_cache_root(&final_path) {
+                Ok(()) => Err(StoreError::io("quarantine corrupt release cache", source)),
+                Err(_) => Err(StoreError::RepairIndeterminate),
+            };
+        }
         if let Err(source) = fs::rename(stage, &final_path) {
             return match fs::rename(&quarantine, &final_path) {
-                Ok(()) => Err(StoreError::io("replace corrupt release cache", source)),
+                Ok(()) if seal_release_cache_root(&final_path).is_ok() => {
+                    Err(StoreError::io("replace corrupt release cache", source))
+                }
                 Err(_) => Err(StoreError::RepairIndeterminate),
+                Ok(()) => Err(StoreError::RepairIndeterminate),
+            };
+        }
+        if let Err(error) = seal_release_cache_root(&final_path) {
+            let restore_stage = fs::rename(&final_path, stage);
+            let restore_cache = fs::rename(&quarantine, &final_path);
+            return match (restore_stage, restore_cache) {
+                (Ok(()), Ok(())) if seal_release_cache_root(&final_path).is_ok() => Err(error),
+                _ => Err(StoreError::RepairIndeterminate),
             };
         }
         sync_directory(&self.root.join(RELEASES_DIRECTORY))?;
@@ -630,6 +667,11 @@ impl InstallStore {
         let mut cursor = 0;
         while cursor < directories.len() {
             let directory = &directories[cursor];
+            #[cfg(test)]
+            eprintln!(
+                "installer-store: verify private directory {}",
+                directory.display()
+            );
             verify_private_windows_path(directory, true)?;
             for entry in fs::read_dir(directory)
                 .map_err(|source| StoreError::io("read protected installation tree", source))?
@@ -647,6 +689,8 @@ impl InstallStore {
                 if metadata.is_dir() {
                     directories.push(path);
                 } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                    #[cfg(test)]
+                    eprintln!("installer-store: verify private file {}", path.display());
                     verify_private_windows_path(&path, false)?;
                 } else {
                     return Err(StoreError::UnsafeRoot);
@@ -690,6 +734,22 @@ fn restore_version_root_permissions(path: &Path) -> Result<(), StoreError> {
         .map_err(|source| StoreError::io("inspect restored version root", source))?;
     if metadata.is_dir() && !is_directory_redirect(&metadata) {
         seal_tree_root(path)?;
+    }
+    Ok(())
+}
+
+fn seal_release_cache_root(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect retained release cache root", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+            .map_err(|source| StoreError::io("seal retained release cache", source))?;
     }
     Ok(())
 }
@@ -1182,10 +1242,13 @@ fn verify_private_windows_handle(
         SecurityInformation::Owner | SecurityInformation::Dacl,
     )
     .map_err(|source| StoreError::io("verify controlled directory ACL", source))?;
-    if secured
-        .owner()
-        .is_none_or(|owner| owner.to_string() != current_user)
-    {
+    let observed_owner = secured.owner().map(|owner| owner.to_string());
+    if observed_owner.as_deref() != Some(current_user.as_str()) {
+        #[cfg(test)]
+        eprintln!(
+            "installer-store: private ACL owner rejected observed={observed_owner:?} \
+             expected={current_user}"
+        );
         return Err(StoreError::UnsafeRoot);
     }
     let secured_dacl = secured.dacl().ok_or(StoreError::UnsafeRoot)?;
@@ -1205,15 +1268,36 @@ fn verify_private_windows_handle(
             .sid()
             .is_none_or(|allowed| allowed.to_string() != current_user)
     {
+        #[cfg(test)]
+        eprintln!(
+            "installer-store: private ACL rejected directory={directory} \
+             require_protected={require_protected} ace_count={} ace_type={:?} flags={:?} \
+             mask={:#010x} sid={:?} expected_sid={current_user}",
+            secured_dacl.len(),
+            ace.ace_type(),
+            ace.flags(),
+            ace.mask().bits(),
+            ace.sid().map(|sid| sid.to_string())
+        );
         return Err(StoreError::UnsafeRoot);
     }
     let dacl_sddl =
         ConvertSecurityDescriptorToStringSecurityDescriptor(&secured, SecurityInformation::Dacl)
             .map_err(|source| StoreError::io("verify private directory ACL protection", source))?;
     if require_protected && !dacl_sddl.to_string_lossy().starts_with("D:P") {
+        #[cfg(test)]
+        eprintln!(
+            "installer-store: private ACL is not protected sddl={}",
+            dacl_sddl.to_string_lossy()
+        );
         return Err(StoreError::UnsafeRoot);
     }
     if !require_protected && !inherited && !dacl_sddl.to_string_lossy().starts_with("D:P") {
+        #[cfg(test)]
+        eprintln!(
+            "installer-store: private ACL is neither inherited nor protected sddl={}",
+            dacl_sddl.to_string_lossy()
+        );
         return Err(StoreError::UnsafeRoot);
     }
     Ok(())

@@ -75,6 +75,11 @@ enum DesktopStartupError {
         #[source]
         source: std::io::Error,
     },
+    #[error("selected managed desktop release could not start")]
+    ManagedReleaseStart {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
     #[error("complete product installation failed")]
@@ -181,6 +186,9 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         ])
         .build(tauri::generate_context!())?;
     let installation = installation::prepare(app.handle())?;
+    if let Some(program) = installation.handoff_program.as_ref() {
+        return handoff_to_selected_release(program);
+    }
     let desktop_data_directory = app.path().app_local_data_dir()?;
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
@@ -233,6 +241,25 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         _ => {}
     });
     Ok(exit_code)
+}
+
+fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupError> {
+    let mut command = std::process::Command::new(program);
+    command.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let source = command.exec();
+        Err(DesktopStartupError::ManagedReleaseStart { source })
+    }
+    #[cfg(windows)]
+    {
+        command
+            .spawn()
+            .map_err(|source| DesktopStartupError::ManagedReleaseStart { source })?;
+        Ok(0)
+    }
 }
 
 #[derive(Debug)]

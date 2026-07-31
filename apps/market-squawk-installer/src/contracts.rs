@@ -129,16 +129,52 @@ impl RepairRequest {
     }
 }
 
-/// Request to reactivate the retained previous known-good version.
+/// Request to revalidate and reactivate the retained previous known-good version.
 #[derive(Debug)]
 pub struct RollbackRequest {
     pub(crate) root: PathBuf,
+    pub(crate) release: Option<AdmittedRelease>,
+    pub(crate) bundle: Option<PathBuf>,
+    pub(crate) channel_manifest_url: Option<Box<str>>,
 }
 
 impl RollbackRequest {
-    /// Creates a rollback request for one controlled program root.
+    /// Creates a rollback request that uses the retained previous release cache.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            release: None,
+            bundle: None,
+            channel_manifest_url: None,
+        }
+    }
+
+    /// Creates a rollback request with an admitted exact copy of the retained previous release.
+    ///
+    /// The lifecycle uses this source only when it identifies the retained previous release
+    /// exactly. A damaged retained cache or version tree is reconstructed before activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError`] when the manifest cannot be admitted for this platform.
+    pub fn from_local(root: PathBuf, manifest: &[u8], bundle: &Path) -> Result<Self, InstallError> {
+        Ok(Self {
+            root,
+            release: Some(ReleaseManifest::admit_current(manifest)?),
+            bundle: Some(bundle.to_path_buf()),
+            channel_manifest_url: None,
+        })
+    }
+
+    /// Binds a validated HTTPS update channel to the recovered installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::ManifestUrl`] when the URL is not an uncredentialed HTTPS URL.
+    pub fn with_channel_manifest_url(mut self, url: &str) -> Result<Self, InstallError> {
+        validate_manifest_url(url)?;
+        self.channel_manifest_url = Some(url.into());
+        Ok(self)
     }
 }
 

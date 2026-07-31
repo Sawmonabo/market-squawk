@@ -579,6 +579,7 @@ jobs:
             --version "$MARKET_SQUAWK_RELEASE_VERSION" \
             --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
             --native-bundle "target/$TARGET/release/bundle" \
+            --native-package-trust-mode provenance-only \
             --output "$RUNNER_TEMP/platform-publish"
       - name: Verify Linux AppImage MCP dispatch
         if: runner.os == 'Linux'

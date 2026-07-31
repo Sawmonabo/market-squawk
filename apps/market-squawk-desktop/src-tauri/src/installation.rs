@@ -9,8 +9,9 @@ use std::{
 
 use market_squawk_installer::{
     InstallError, InstallRequest, MAXIMUM_MANIFEST_BYTES, ManifestError, PlatformError,
-    ReleaseManifest, RepairRequest, RollbackRequest, SupportedTarget, UpdateRequest,
-    active_release_root, default_install_root, install, repair, rollback, status, update,
+    ProgramName, ReleaseManifest, RepairRequest, RollbackRequest, SupportedTarget, UpdateRequest,
+    active_program_path, active_release_root, default_install_root, install, repair, rollback,
+    status, update,
 };
 use semver::Version;
 use tauri::Manager as _;
@@ -25,6 +26,7 @@ const MAXIMUM_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) struct PreparedInstallation {
     pub(crate) root: PathBuf,
     pub(crate) active_release_root: Option<PathBuf>,
+    pub(crate) handoff_program: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -62,7 +64,7 @@ pub(crate) fn prepare(
                     UpdateRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,
                 )?;
-            } else if !current.is_healthy() && packaged.version == active {
+            } else if packaged.version == active {
                 repair(
                     RepairRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,
@@ -71,8 +73,8 @@ pub(crate) fn prepare(
                 match recover_active_or_previous(&root) {
                     Ok(()) => {}
                     Err(_) if packaged_was_previous => {
-                        update(
-                            UpdateRequest::from_local(
+                        rollback(
+                            RollbackRequest::from_local(
                                 root.clone(),
                                 &packaged.manifest,
                                 &packaged.bundle,
@@ -82,14 +84,16 @@ pub(crate) fn prepare(
                     }
                     Err(error) => return Err(error.into()),
                 }
+            } else {
+                repair(
+                    RepairRequest::new(root.clone())
+                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
+                )?;
             }
         } else if !current.is_healthy() {
             recover_active_or_previous(&root)?;
         }
-        return Ok(PreparedInstallation {
-            active_release_root: Some(active_release_root(&root)?),
-            root,
-        });
+        return prepared_installed(root);
     }
 
     if let Some(packaged) = packaged {
@@ -97,19 +101,29 @@ pub(crate) fn prepare(
             InstallRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                 .with_channel_manifest_url(&packaged.channel_manifest_url)?,
         )?;
-        return Ok(PreparedInstallation {
-            active_release_root: Some(active_release_root(&root)?),
-            root,
-        });
+        return prepared_installed(root);
     }
 
     if cfg!(debug_assertions) {
         return Ok(PreparedInstallation {
             root,
             active_release_root: None,
+            handoff_program: None,
         });
     }
     Err(InstallationStartupError::PackagedReleaseUnavailable)
+}
+
+fn prepared_installed(root: PathBuf) -> Result<PreparedInstallation, InstallationStartupError> {
+    let active_release_root = active_release_root(&root)?;
+    let active_desktop = active_program_path(&root, ProgramName::Desktop)?;
+    let current = fs::canonicalize(std::env::current_exe()?)?;
+    let selected = fs::canonicalize(&active_desktop)?;
+    Ok(PreparedInstallation {
+        root,
+        active_release_root: Some(active_release_root),
+        handoff_program: (current != selected).then_some(active_desktop),
+    })
 }
 
 fn recover_active_or_previous(root: &Path) -> Result<(), InstallError> {

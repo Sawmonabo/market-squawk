@@ -230,6 +230,26 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt as _;
 
+            fs::set_permissions(&release_cache, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&release_cache)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&release_cache, permissions)?;
+        }
+        fs::write(&release_cache, b"damaged cache")?;
+        repair(RepairRequest::from_local(
+            root.clone(),
+            &first.manifest,
+            &first.bundle,
+        )?)?;
+        assert_eq!(fs::read(&release_cache)?, fs::read(&first.bundle)?);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
             fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
             fs::set_permissions(&release_cache, fs::Permissions::from_mode(0o600))?;
         }
@@ -270,10 +290,43 @@ mod tests {
         assert_eq!(updated.active_version(), Some("0.2.0"));
         assert_eq!(updated.previous_version(), Some("0.1.0"));
 
-        rollback(RollbackRequest::new(root.clone()))?;
+        let previous_component = fs::read_dir(root.join("versions"))?
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("0.1.0-"))
+            .ok_or_else(|| std::io::Error::other("previous version is unavailable"))?
+            .path()
+            .join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        let previous_cache = root
+            .join("releases")
+            .join(sha256_bytes(&first.manifest))
+            .join("bundle.zip");
+        for path in [&previous_component, &previous_cache] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
+            #[cfg(windows)]
+            {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions)?;
+            }
+            fs::write(path, b"damaged")?;
+        }
+        rollback(
+            RollbackRequest::from_local(root.clone(), &first.manifest, &first.bundle)?
+                .with_channel_manifest_url("https://example.com/release.json")?,
+        )?;
         let rolled_back = status(&root)?;
         assert_eq!(rolled_back.active_version(), Some("0.1.0"));
         assert_eq!(rolled_back.previous_version(), Some("0.2.0"));
+        assert_eq!(
+            rolled_back.channel_manifest_url(),
+            Some("https://example.com/release.json")
+        );
+        assert!(rolled_back.is_healthy());
         #[cfg(unix)]
         assert_eq!(
             fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
