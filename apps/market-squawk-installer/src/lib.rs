@@ -53,6 +53,24 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+    #[cfg(windows)]
+    fn test_directory() -> TestResult<TempDir> {
+        let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Windows local application-data directory is unavailable",
+            )
+        })?;
+        Ok(tempfile::Builder::new()
+            .prefix("market-squawk-installer-")
+            .tempdir_in(local_app_data)?)
+    }
+
+    #[cfg(not(windows))]
+    fn test_directory() -> TestResult<TempDir> {
+        Ok(TempDir::new()?)
+    }
+
     #[test]
     fn rejects_unsafe_unlisted_or_mismatched_bundle_before_activation() -> TestResult {
         for defect in [
@@ -61,7 +79,7 @@ mod tests {
             BundleDefect::DigestMismatch,
             BundleDefect::MisplacedRequiredRole,
         ] {
-            let temporary = TempDir::new()?;
+            let temporary = test_directory()?;
             let fixture = BundleFixture::create(temporary.path(), "0.1.0", defect)?;
             let result = InstallRequest::from_local(
                 temporary.path().join("program"),
@@ -81,7 +99,7 @@ mod tests {
     fn install_rejects_a_path_replaceable_by_other_accounts() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let fixture = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
         let shared = temporary.path().join("shared");
         let private = shared.join("private");
@@ -105,7 +123,7 @@ mod tests {
 
     #[test]
     fn activation_and_rollback_switch_complete_versions() -> TestResult {
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let root = temporary.path().join("program");
         let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
         install(InstallRequest::from_local(
@@ -317,7 +335,7 @@ mod tests {
 
     #[test]
     fn update_preserves_the_last_known_good_previous_version() -> TestResult {
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let root = temporary.path().join("program");
         let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
         install(InstallRequest::from_local(
@@ -399,7 +417,7 @@ mod tests {
 
     #[test]
     fn pending_activation_recovers_the_selector_and_stable_program_set() -> TestResult {
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let root = temporary.path().join("program");
         let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
         install(InstallRequest::from_local(
@@ -458,7 +476,7 @@ mod tests {
 
     #[test]
     fn default_uninstall_preserves_separately_rooted_data() -> TestResult {
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let root = temporary.path().join("program");
         let data = temporary.path().join("data");
         fs::create_dir(&data)?;
@@ -491,7 +509,7 @@ mod tests {
     fn uninstall_rejects_a_data_root_with_a_symlinked_ancestor() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temporary = TempDir::new()?;
+        let temporary = test_directory()?;
         let base = temporary.path().canonicalize()?;
         let root = base.join("program");
         let actual_data = base.join("actual-data");

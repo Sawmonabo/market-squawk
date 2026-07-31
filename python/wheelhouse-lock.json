@@ -867,8 +867,8 @@
     },
     {
       "path": "apps/market-squawk-installer/src/lib.rs",
-      "sha256": "0f359a5b548cb12679e4303e82ddfaecedeeb382a44e541dd9261816876f5716",
-      "size_bytes": 24924
+      "sha256": "fe2a34952f0ecdb61d51fcd81d97ff19b4a863b59a600f02680f9727989d224f",
+      "size_bytes": 25508
     },
     {
       "path": "apps/market-squawk-installer/src/lifecycle.rs",
