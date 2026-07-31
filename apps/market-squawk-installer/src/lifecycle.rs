@@ -433,7 +433,8 @@ fn program_receipt(
 /// mutable-data path.
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
     preflight_deletions(&request.deletions, &request.root)?;
-    let removed_program = if let Some(store) = InstallStore::open_existing(&request.root)? {
+    let store = InstallStore::open_existing(&request.root)?;
+    let removed_program = if let Some(store) = store.as_ref() {
         let detached = store.quarantine_for_uninstall()?;
         remove_tree(&detached)?;
         true
@@ -468,8 +469,9 @@ fn preflight_deletions(
     deletions: &[(crate::contracts::MutableDataClass, PathBuf)],
     program_root: &Path,
 ) -> Result<(), InstallError> {
+    let mut comparison_roots = Vec::with_capacity(deletions.len());
     for (_, path) in deletions {
-        validate_mutable_data_root(path, program_root)?;
+        comparison_roots.push(validate_mutable_data_root(path, program_root)?);
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -482,8 +484,8 @@ fn preflight_deletions(
             }
         }
     }
-    for (index, (_, left)) in deletions.iter().enumerate() {
-        for (_, right) in &deletions[index + 1..] {
+    for (index, left) in comparison_roots.iter().enumerate() {
+        for right in &comparison_roots[index + 1..] {
             if left == right || left.starts_with(right) || right.starts_with(left) {
                 return Err(InstallError::UnsafeDataRoot);
             }
@@ -513,10 +515,20 @@ fn prepare_candidate(
         expected_receipts,
     )?;
     let final_path = store.version_path(&version);
-    if final_path.exists() {
-        seal_tree_root(&final_path)?;
-        verify_installed_tree(&final_path, &version.components)?;
-        return Ok(version);
+    match fs::symlink_metadata(&final_path) {
+        Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {
+            seal_tree_root(&final_path)?;
+            verify_installed_tree(&final_path, &version.components)?;
+            return Ok(version);
+        }
+        Ok(_) => return Err(InstallError::CorruptInstallation),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(InstallError::Io {
+                operation: "inspect retained version root",
+                source,
+            });
+        }
     }
 
     let stage = store.create_stage("version")?;
@@ -543,10 +555,20 @@ fn persist_release_cache(
     source_bundle: &Path,
 ) -> Result<PathBuf, InstallError> {
     let final_directory = store.release_path(release.manifest_sha256());
-    if final_directory.exists() {
-        seal_cache_directory(&final_directory)?;
-        verify_cached_release(&final_directory, release)?;
-        return Ok(final_directory.join(CACHED_BUNDLE_FILE));
+    match fs::symlink_metadata(&final_directory) {
+        Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {
+            seal_cache_directory(&final_directory)?;
+            verify_cached_release(&final_directory, release)?;
+            return Ok(final_directory.join(CACHED_BUNDLE_FILE));
+        }
+        Ok(_) => return Err(InstallError::CorruptInstallation),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(InstallError::Io {
+                operation: "inspect retained release root",
+                source,
+            });
+        }
     }
 
     let stage = store.create_stage("release")?;
@@ -814,7 +836,7 @@ fn absent_status() -> InstallStatus {
     }
 }
 
-fn validate_mutable_data_root(path: &Path, program_root: &Path) -> Result<(), InstallError> {
+fn validate_mutable_data_root(path: &Path, program_root: &Path) -> Result<PathBuf, InstallError> {
     if !path.is_absolute()
         || path.parent().is_none()
         || path.components().count() < 3
@@ -824,14 +846,48 @@ fn validate_mutable_data_root(path: &Path, program_root: &Path) -> Result<(), In
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
-        || path == program_root
-        || path.starts_with(program_root)
-        || program_root.starts_with(path)
     {
         return Err(InstallError::UnsafeDataRoot);
     }
     reject_redirecting_components(path)?;
-    Ok(())
+    let data_comparison = canonical_comparison_path(path)?;
+    let program_comparison = canonical_comparison_path(program_root)?;
+    if data_comparison == program_comparison
+        || data_comparison.starts_with(&program_comparison)
+        || program_comparison.starts_with(&data_comparison)
+    {
+        return Err(InstallError::UnsafeDataRoot);
+    }
+    Ok(data_comparison)
+}
+
+fn canonical_comparison_path(path: &Path) -> Result<PathBuf, InstallError> {
+    let mut cursor = path;
+    let mut missing_components = Vec::new();
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut canonical) => {
+                for component in missing_components.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor
+                    .file_name()
+                    .ok_or(InstallError::UnsafeDataRoot)?
+                    .to_owned();
+                missing_components.push(component);
+                cursor = cursor.parent().ok_or(InstallError::UnsafeDataRoot)?;
+            }
+            Err(source) => {
+                return Err(InstallError::Io {
+                    operation: "resolve deletion root identity",
+                    source,
+                });
+            }
+        }
+    }
 }
 
 fn reject_redirecting_components(path: &Path) -> Result<(), InstallError> {

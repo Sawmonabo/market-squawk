@@ -186,17 +186,17 @@ impl InstallStore {
         let lock = acquire_lock(parent)?;
 
         match fs::symlink_metadata(root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
             Ok(_) => return Err(StoreError::UnsafeRoot),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(root)
                     .map_err(|source| StoreError::io("create installation root", source))?;
-                set_private_directory_permissions(root)?;
             }
             Err(source) => {
                 return Err(StoreError::io("inspect installation root", source));
             }
         }
+        set_private_directory_permissions(root)?;
 
         let store = Self {
             root: root.to_path_buf(),
@@ -210,7 +210,7 @@ impl InstallStore {
     pub(crate) fn open_existing(root: &Path) -> Result<Option<Self>, StoreError> {
         match fs::symlink_metadata(root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
             Ok(_) => return Err(StoreError::UnsafeRoot),
             Err(source) => {
                 return Err(StoreError::io("inspect installation root", source));
@@ -219,6 +219,7 @@ impl InstallStore {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         ensure_safe_directory(parent)?;
         let lock = acquire_lock(parent)?;
+        set_private_directory_permissions(root)?;
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
@@ -379,8 +380,15 @@ impl InstallStore {
         version: &StoredVersion,
     ) -> Result<PathBuf, StoreError> {
         let final_path = self.version_path(version);
-        if final_path.exists() {
-            return Err(StoreError::ImmutableVersionExists);
+        match fs::symlink_metadata(&final_path) {
+            Ok(_) => return Err(StoreError::ImmutableVersionExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StoreError::io(
+                    "inspect immutable version destination",
+                    source,
+                ));
+            }
         }
         fs::rename(stage, &final_path)
             .map_err(|source| StoreError::io("publish immutable version", source))?;
@@ -400,7 +408,7 @@ impl InstallStore {
             .join(format!("corrupt-{}", Uuid::new_v4().as_simple()));
         let metadata = fs::symlink_metadata(&final_path)
             .map_err(|source| StoreError::io("inspect corrupt version root", source))?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if metadata.is_dir() && !is_directory_redirect(&metadata) {
             set_private_directory_permissions(&final_path)?;
         }
         if let Err(source) = fs::rename(&final_path, &quarantine) {
@@ -432,8 +440,15 @@ impl InstallStore {
         manifest_sha256: &str,
     ) -> Result<PathBuf, StoreError> {
         let final_path = self.release_path(manifest_sha256);
-        if final_path.exists() {
-            return Err(StoreError::ImmutableReleaseExists);
+        match fs::symlink_metadata(&final_path) {
+            Ok(_) => return Err(StoreError::ImmutableReleaseExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StoreError::io(
+                    "inspect immutable release destination",
+                    source,
+                ));
+            }
         }
         fs::rename(stage, &final_path)
             .map_err(|source| StoreError::io("publish immutable release cache", source))?;
@@ -461,7 +476,7 @@ impl InstallStore {
         Ok(())
     }
 
-    pub(crate) fn quarantine_for_uninstall(self) -> Result<PathBuf, StoreError> {
+    pub(crate) fn quarantine_for_uninstall(&self) -> Result<PathBuf, StoreError> {
         let parent = self.root.parent().ok_or(StoreError::UnsafeRoot)?;
         let quarantine = parent.join(format!(
             ".market-squawk-program-removing-{}",
@@ -485,7 +500,7 @@ impl InstallStore {
     fn prepare_reserved_directory(&self, name: &str) -> Result<(), StoreError> {
         let path = self.root.join(name);
         match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => Ok(()),
             Ok(_) => Err(StoreError::UnsafeRoot),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&path)
@@ -509,7 +524,7 @@ impl InstallStore {
                 name.starts_with("corrupt-") || name.starts_with("entrypoints-retired-")
             }) {
                 let _cleanup = remove_quarantined_entry(&path);
-            } else if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            } else if !metadata.is_dir() || is_directory_redirect(&metadata) {
                 return Err(StoreError::UnsafeRoot);
             } else {
                 remove_tree(&path)?;
@@ -532,7 +547,7 @@ fn remove_quarantined_tree(path: &Path) -> Result<(), StoreError> {
 fn remove_quarantined_entry(path: &Path) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| StoreError::io("inspect corrupt quarantine root", source))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if metadata.is_dir() && !is_directory_redirect(&metadata) {
         return remove_quarantined_tree(path);
     }
     if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
@@ -544,7 +559,7 @@ fn remove_quarantined_entry(path: &Path) -> Result<(), StoreError> {
 fn restore_version_root_permissions(path: &Path) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| StoreError::io("inspect restored version root", source))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if metadata.is_dir() && !is_directory_redirect(&metadata) {
         seal_tree_root(path)?;
     }
     Ok(())
@@ -563,7 +578,7 @@ fn prune_directory(
             .file_name()
             .into_string()
             .map_err(|_| StoreError::UnsafeRoot)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir() || is_directory_redirect(&metadata) {
             return Err(StoreError::UnsafeRoot);
         }
         if !retained.contains(name.as_str()) {
@@ -586,7 +601,7 @@ fn make_tree_removable(path: &Path) -> Result<(), StoreError> {
                 entry.map_err(|source| StoreError::io("read removable program entry", source))?;
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|source| StoreError::io("inspect removable program entry", source))?;
-            if metadata.file_type().is_symlink() {
+            if is_directory_redirect(&metadata) {
                 return Err(StoreError::UnsafeRoot);
             }
             if metadata.is_dir() {
@@ -616,7 +631,7 @@ fn make_quarantined_tree_removable(path: &Path) -> Result<(), StoreError> {
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|source| StoreError::io("inspect corrupt quarantine entry", source))?;
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if metadata.is_dir() && !is_directory_redirect(&metadata) {
                 directories.push(path);
             } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
                 make_file_writable(&path)?;
@@ -669,23 +684,133 @@ fn configure_lock_options(options: &mut OpenOptions) {
 fn ensure_safe_directory(path: &Path) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| StoreError::io("inspect controlled directory", source))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
         return Err(StoreError::UnsafeRoot);
     }
     Ok(())
 }
 
 fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| StoreError::io("inspect controlled directory ownership", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        return Err(StoreError::UnsafeRoot);
+    }
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(StoreError::UnsafeRoot);
+        }
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|source| StoreError::io("secure controlled directory", source))?;
+        let secured = fs::symlink_metadata(path)
+            .map_err(|source| StoreError::io("verify controlled directory ownership", source))?;
+        if !secured.is_dir()
+            || is_directory_redirect(&secured)
+            || secured.uid() != rustix::process::geteuid().as_raw()
+            || secured.mode() & 0o077 != 0
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
     }
     #[cfg(windows)]
     {
-        let _ = path;
+        secure_private_windows_directory(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
+    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{AccessRights, AceFlags, AceType, SeObjectType, SecurityInformation},
+        wrappers::{
+            ConvertSecurityDescriptorToStringSecurityDescriptor, GetNamedSecurityInfo,
+            SetNamedSecurityInfo,
+        },
+    };
+
+    let current_user = SecurityIdentifier::get_current_user_sid()
+        .map_err(|_| StoreError::UnsafeRoot)?
+        .to_string();
+    let existing = GetNamedSecurityInfo(
+        path,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner,
+    )
+    .map_err(|source| StoreError::io("inspect controlled directory owner", source))?;
+    if existing
+        .owner()
+        .is_none_or(|owner| owner.to_string() != current_user)
+    {
+        return Err(StoreError::UnsafeRoot);
+    }
+
+    let descriptor: LocalBox<SecurityDescriptor> = format!("D:P(A;OICI;FA;;;{current_user})")
+        .parse()
+        .map_err(|source| StoreError::io("build private directory ACL", source))?;
+    let dacl = descriptor.dacl().ok_or(StoreError::UnsafeRoot)?;
+    SetNamedSecurityInfo(
+        path,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        None,
+        None,
+        Some(dacl),
+        None,
+    )
+    .map_err(|source| StoreError::io("secure controlled directory", source))?;
+
+    let secured = GetNamedSecurityInfo(
+        path,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )
+    .map_err(|source| StoreError::io("verify controlled directory ACL", source))?;
+    if secured
+        .owner()
+        .is_none_or(|owner| owner.to_string() != current_user)
+    {
+        return Err(StoreError::UnsafeRoot);
+    }
+    let secured_dacl = secured.dacl().ok_or(StoreError::UnsafeRoot)?;
+    let ace = secured_dacl.get_ace(0).ok_or(StoreError::UnsafeRoot)?;
+    let expected_flags = AceFlags::ContainerInherit | AceFlags::ObjectInherit;
+    if secured_dacl.len() != 1
+        || ace.ace_type() != AceType::ACCESS_ALLOWED_ACE_TYPE
+        || ace.flags() != expected_flags
+        || ace.mask() != AccessRights::FileAllAccess
+        || ace
+            .sid()
+            .is_none_or(|allowed| allowed.to_string() != current_user)
+    {
+        return Err(StoreError::UnsafeRoot);
+    }
+    let dacl_sddl =
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&secured, SecurityInformation::Dacl)
+            .map_err(|source| StoreError::io("verify private directory ACL protection", source))?;
+    if !dacl_sddl.to_string_lossy().starts_with("D:P") {
+        return Err(StoreError::UnsafeRoot);
     }
     Ok(())
 }

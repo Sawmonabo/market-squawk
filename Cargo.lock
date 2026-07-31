@@ -4636,6 +4636,7 @@ dependencies = [
  "futures-util",
  "libc",
  "reqwest",
+ "rustix 1.1.4",
  "rustls",
  "semver",
  "serde",
@@ -4646,6 +4647,8 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "win-security-identifier",
+ "windows-permissions",
  "zip",
 ]
 

@@ -50,7 +50,11 @@ pub(crate) fn prepare(
                 .ok_or(InstallationStartupError::InvalidInstalledVersion)?;
             let active = Version::parse(active_version)
                 .map_err(|_| InstallationStartupError::InvalidInstalledVersion)?;
-            if packaged.version > active {
+            if should_activate_packaged_release(
+                &packaged.version,
+                &active,
+                current.previous_version(),
+            ) {
                 update(UpdateRequest::from_local(
                     root.clone(),
                     &packaged.manifest,
@@ -86,6 +90,15 @@ pub(crate) fn prepare(
         });
     }
     Err(InstallationStartupError::PackagedReleaseUnavailable)
+}
+
+fn should_activate_packaged_release(
+    packaged: &Version,
+    active: &Version,
+    previous: Option<&str>,
+) -> bool {
+    let packaged_version = packaged.to_string();
+    packaged > active && previous != Some(packaged_version.as_str())
 }
 
 fn packaged_release(
@@ -201,4 +214,25 @@ pub(crate) enum InstallationStartupError {
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Install(#[from] InstallError),
+}
+
+#[cfg(test)]
+mod tests {
+    use semver::Version;
+
+    use super::should_activate_packaged_release;
+
+    #[test]
+    fn packaged_startup_preserves_an_intentional_rollback() {
+        let older = Version::new(1, 0, 0);
+        let packaged = Version::new(1, 1, 0);
+
+        assert!(should_activate_packaged_release(&packaged, &older, None));
+        assert!(!should_activate_packaged_release(
+            &packaged,
+            &older,
+            Some("1.1.0")
+        ));
+        assert!(!should_activate_packaged_release(&older, &packaged, None));
+    }
 }
