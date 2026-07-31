@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use cap_fs_ext::DirExt as _;
 use semver::Version;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -22,7 +23,9 @@ use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
 use crate::platform::ProgramName;
-use crate::store::{InstallStore, InstallationState, StoreError, StoredVersion, remove_tree};
+use crate::store::{
+    InstallStore, InstallationState, StoreError, StoredVersion, remove_tree, validate_store_parent,
+};
 
 const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
@@ -84,34 +87,52 @@ pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
 }
 
 /// Re-verifies and, when necessary, reconstructs the active immutable version from its retained
-/// exact release cache.
+/// exact release cache or an explicitly supplied exact copy of the active release.
 ///
 /// # Errors
 ///
-/// Fails if no active installation exists, the retained cache no longer matches the selector, or
-/// the reconstructed version cannot be published safely.
+/// Fails if no active installation exists, supplied recovery material does not identify the active
+/// release, no valid exact release is available, or the reconstructed version cannot be published
+/// safely.
 pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
-    let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    let RepairRequest {
+        root,
+        release,
+        bundle,
+        channel_manifest_url,
+    } = request;
+    let supplied_release = match (release, bundle) {
+        (Some(release), Some(bundle)) => Some((release, bundle)),
+        (None, None) => None,
+        _ => return Err(InstallError::CorruptInstallation),
+    };
+    let store = InstallStore::open_existing(&root)?.ok_or(InstallError::NotInstalled)?;
     recover_pending_activation(&store)?;
-    let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+    let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+    if let Some((release, bundle)) = supplied_release.as_ref() {
+        validate_recovery_release(&state.active, release)?;
+        verify_bundle(bundle, &release.target_release().archive)?;
+    }
     let active_path = store.version_path(&state.active);
     if verify_installed_tree(&active_path, &state.active.components).is_ok() {
         if verify_stable_programs(&store, &state).is_ok() {
-            return receipt(&state, false);
+            return complete_repair(&store, &mut state, channel_manifest_url, false, false);
         }
-        publish_stable_programs(&store, &state)?;
-        return receipt(&state, true);
+        return complete_repair(&store, &mut state, channel_manifest_url, true, true);
     }
 
-    let release = read_cached_release(&store, &state.active)?;
-    let stage = store.create_stage("repair")?;
-    let extracted = match extract_bundle(
-        &store
+    let (release, cached_bundle) = if let Some((release, bundle)) = supplied_release {
+        let cached_bundle = restore_release_cache(&store, &release, &bundle)?;
+        (release, cached_bundle)
+    } else {
+        let release = read_cached_release(&store, &state.active)?;
+        let cached_bundle = store
             .release_path(&state.active.manifest_sha256)
-            .join(CACHED_BUNDLE_FILE),
-        release.target_release(),
-        &stage,
-    ) {
+            .join(CACHED_BUNDLE_FILE);
+        (release, cached_bundle)
+    };
+    let stage = store.create_stage("repair")?;
+    let extracted = match extract_bundle(&cached_bundle, release.target_release(), &stage) {
         Ok(extracted) => extracted,
         Err(error) => {
             let _ = remove_tree(&stage);
@@ -136,8 +157,22 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     }
     seal_tree_root(&active_path)?;
     verify_installed_tree(&active_path, &state.active.components)?;
-    publish_stable_programs(&store, &state)?;
-    receipt(&state, true)
+    complete_repair(&store, &mut state, channel_manifest_url, true, true)
+}
+
+fn complete_repair(
+    store: &InstallStore,
+    state: &mut InstallationState,
+    channel_manifest_url: Option<Box<str>>,
+    repaired: bool,
+    publish_programs: bool,
+) -> Result<InstallReceipt, InstallError> {
+    if state.bind_channel_manifest_url(channel_manifest_url)? {
+        commit_activation(store, state)?;
+    } else if publish_programs {
+        publish_stable_programs(store, state)?;
+    }
+    receipt(state, repaired)
 }
 
 /// Reactivates the retained previous version after complete revalidation.
@@ -513,7 +548,7 @@ fn program_receipt(
 /// Fails closed for unsafe program or data roots. A default request never opens or deletes a
 /// mutable-data path.
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
-    preflight_deletions(&request.deletions, &request.root)?;
+    let prepared_deletions = preflight_deletions(&request.deletions, &request.root)?;
     let store = InstallStore::open_existing(&request.root)?;
     let removed_program = if let Some(store) = store.as_ref() {
         let detached = store.quarantine_for_uninstall()?;
@@ -523,22 +558,9 @@ pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallE
         false
     };
 
-    let mut deleted = Vec::with_capacity(request.deletions.len());
-    for (class, path) in request.deletions {
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                remove_tree(&path)?;
-            }
-            Ok(_) => return Err(InstallError::UnsafeDataRoot),
-            Err(source) => {
-                return Err(InstallError::Io {
-                    operation: "inspect mutable data root",
-                    source,
-                });
-            }
-        }
-        deleted.push(class);
+    let mut deleted = Vec::with_capacity(prepared_deletions.len());
+    for deletion in prepared_deletions {
+        deleted.push(deletion.remove()?);
     }
     Ok(UninstallReceipt {
         removed_program,
@@ -549,21 +571,12 @@ pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallE
 fn preflight_deletions(
     deletions: &[(crate::contracts::MutableDataClass, PathBuf)],
     program_root: &Path,
-) -> Result<(), InstallError> {
+) -> Result<Vec<ConfirmedDataDeletion>, InstallError> {
     let mut comparison_roots = Vec::with_capacity(deletions.len());
-    for (_, path) in deletions {
+    let mut prepared = Vec::with_capacity(deletions.len());
+    for (class, path) in deletions {
         comparison_roots.push(validate_mutable_data_root(path, program_root)?);
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => return Err(InstallError::UnsafeDataRoot),
-            Err(source) => {
-                return Err(InstallError::Io {
-                    operation: "inspect mutable data root",
-                    source,
-                });
-            }
-        }
+        prepared.push(ConfirmedDataDeletion::open(*class, path)?);
     }
     for (index, left) in comparison_roots.iter().enumerate() {
         for right in &comparison_roots[index + 1..] {
@@ -572,7 +585,113 @@ fn preflight_deletions(
             }
         }
     }
-    Ok(())
+    Ok(prepared)
+}
+
+#[derive(Debug)]
+struct ConfirmedDataDeletion {
+    class: crate::contracts::MutableDataClass,
+    parent_authority: Option<cap_std::fs::Dir>,
+    directory: Option<cap_std::fs::Dir>,
+}
+
+impl ConfirmedDataDeletion {
+    fn open(class: crate::contracts::MutableDataClass, path: &Path) -> Result<Self, InstallError> {
+        let named_metadata = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    class,
+                    parent_authority: None,
+                    directory: None,
+                });
+            }
+            Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => metadata,
+            Ok(_) => return Err(InstallError::UnsafeDataRoot),
+            Err(source) => {
+                return Err(InstallError::Io {
+                    operation: "inspect mutable data root",
+                    source,
+                });
+            }
+        };
+
+        let parent_path = path.parent().ok_or(InstallError::UnsafeDataRoot)?;
+        match validate_store_parent(parent_path) {
+            Ok(()) => {}
+            Err(StoreError::UnsafeRoot) => return Err(InstallError::UnsafeDataRoot),
+            Err(error) => return Err(error.into()),
+        }
+        let name = path.file_name().ok_or(InstallError::UnsafeDataRoot)?;
+        let parent = cap_std::fs::Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())
+            .map_err(|source| InstallError::Io {
+                operation: "open mutable data parent authority",
+                source,
+            })?;
+        let directory = parent
+            .open_dir_nofollow(name)
+            .map_err(|source| InstallError::Io {
+                operation: "open confirmed mutable data root",
+                source,
+            })?;
+        let opened_metadata = directory
+            .dir_metadata()
+            .map_err(|source| InstallError::Io {
+                operation: "inspect confirmed mutable data root",
+                source,
+            })?;
+        let named_metadata = cap_std::fs::Metadata::from_just_metadata(named_metadata);
+        if !same_directory_identity(&named_metadata, &opened_metadata) {
+            return Err(InstallError::UnsafeDataRoot);
+        }
+        Ok(Self {
+            class,
+            parent_authority: Some(parent),
+            directory: Some(directory),
+        })
+    }
+
+    fn remove(self) -> Result<crate::contracts::MutableDataClass, InstallError> {
+        let Self {
+            class,
+            parent_authority,
+            directory,
+        } = self;
+        if let Some(directory) = directory {
+            directory
+                .remove_open_dir_all()
+                .map_err(|source| InstallError::Io {
+                    operation: "remove confirmed mutable data root",
+                    source,
+                })?;
+        }
+        drop(parent_authority);
+        Ok(class)
+    }
+}
+
+#[cfg(unix)]
+fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    left.is_dir()
+        && right.is_dir()
+        && matches!(
+            (
+                left.volume_serial_number(),
+                left.file_index(),
+                right.volume_serial_number(),
+                right.file_index(),
+            ),
+            (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+                if left_volume == right_volume && left_index == right_index
+        )
 }
 
 fn prepare_candidate(
@@ -582,19 +701,7 @@ fn prepare_candidate(
 ) -> Result<StoredVersion, InstallError> {
     verify_bundle(bundle, &release.target_release().archive)?;
     let cached_bundle = persist_release_cache(store, release, bundle)?;
-    let expected_receipts: Vec<ComponentReceipt> = release
-        .target_release()
-        .components
-        .iter()
-        .map(ComponentReceipt::from)
-        .collect();
-    let version = StoredVersion::new(
-        release.version(),
-        release.manifest_sha256(),
-        &release.target_release().archive.sha256,
-        release.target(),
-        expected_receipts,
-    )?;
+    let version = stored_version_for_release(release)?;
     let final_path = store.version_path(&version);
     match fs::symlink_metadata(&final_path) {
         Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {
@@ -630,6 +737,40 @@ fn prepare_candidate(
     Ok(version)
 }
 
+fn stored_version_for_release(release: &AdmittedRelease) -> Result<StoredVersion, InstallError> {
+    let expected_receipts: Vec<ComponentReceipt> = release
+        .target_release()
+        .components
+        .iter()
+        .map(ComponentReceipt::from)
+        .collect();
+    StoredVersion::new(
+        release.version(),
+        release.manifest_sha256(),
+        &release.target_release().archive.sha256,
+        release.target(),
+        expected_receipts,
+    )
+    .map_err(InstallError::from)
+}
+
+fn validate_recovery_release(
+    active: &StoredVersion,
+    release: &AdmittedRelease,
+) -> Result<(), InstallError> {
+    let supplied = stored_version_for_release(release)?;
+    if supplied.version != active.version
+        || supplied.manifest_sha256 != active.manifest_sha256
+        || supplied.archive_sha256 != active.archive_sha256
+        || supplied.target != active.target
+        || supplied.directory != active.directory
+        || supplied.components != active.components
+    {
+        return Err(InstallError::RepairReleaseMismatch);
+    }
+    Ok(())
+}
+
 fn persist_release_cache(
     store: &InstallStore,
     release: &AdmittedRelease,
@@ -652,7 +793,38 @@ fn persist_release_cache(
         }
     }
 
-    let stage = store.create_stage("release")?;
+    let stage = stage_release_cache(store, release, source_bundle, "release")?;
+    store.publish_release_cache(&stage, release.manifest_sha256())?;
+    seal_cache_directory(&final_directory)?;
+    verify_cached_release(&final_directory, release)?;
+    Ok(final_directory.join(CACHED_BUNDLE_FILE))
+}
+
+fn restore_release_cache(
+    store: &InstallStore,
+    release: &AdmittedRelease,
+    source_bundle: &Path,
+) -> Result<PathBuf, InstallError> {
+    verify_bundle(source_bundle, &release.target_release().archive)?;
+    let final_directory = store.release_path(release.manifest_sha256());
+    if verify_cached_release(&final_directory, release).is_ok() {
+        return Ok(final_directory.join(CACHED_BUNDLE_FILE));
+    }
+
+    let stage = stage_release_cache(store, release, source_bundle, "release-recovery")?;
+    store.replace_corrupt_release_cache(&stage, release.manifest_sha256())?;
+    seal_cache_directory(&final_directory)?;
+    verify_cached_release(&final_directory, release)?;
+    Ok(final_directory.join(CACHED_BUNDLE_FILE))
+}
+
+fn stage_release_cache(
+    store: &InstallStore,
+    release: &AdmittedRelease,
+    source_bundle: &Path,
+    purpose: &str,
+) -> Result<PathBuf, InstallError> {
+    let stage = store.create_stage(purpose)?;
     let manifest_path = stage.join(CACHED_MANIFEST_FILE);
     let bundle_path = stage.join(CACHED_BUNDLE_FILE);
     if let Err(error) = write_new_file(&manifest_path, release.manifest_bytes()) {
@@ -671,10 +843,7 @@ fn persist_release_cache(
     seal_cache_file(&manifest_path)?;
     seal_cache_file(&bundle_path)?;
     sync_directory(&stage)?;
-    store.publish_release_cache(&stage, release.manifest_sha256())?;
-    seal_cache_directory(&final_directory)?;
-    verify_cached_release(&final_directory, release)?;
-    Ok(final_directory.join(CACHED_BUNDLE_FILE))
+    Ok(stage)
 }
 
 fn verify_cached_release(directory: &Path, release: &AdmittedRelease) -> Result<(), InstallError> {
@@ -1038,6 +1207,9 @@ pub enum InstallError {
     /// Installed state or retained release evidence is inconsistent.
     #[error("installed program state is corrupt or inconsistent")]
     CorruptInstallation,
+    /// User-supplied repair material does not identify the active release exactly.
+    #[error("repair material does not match the active release")]
+    RepairReleaseMismatch,
     /// An explicitly selected mutable-data root is unsafe.
     #[error("refusing to delete an unsafe or program-overlapping mutable-data root")]
     UnsafeDataRoot,
@@ -1053,4 +1225,52 @@ pub enum InstallError {
     /// Current release platform detection failed.
     #[error(transparent)]
     Platform(#[from] crate::platform::PlatformError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::contracts::MutableDataClass;
+
+    #[test]
+    fn confirmed_data_deletion_stays_bound_to_the_opened_directory() -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let base = temporary.path().canonicalize()?;
+        let confirmed = base.join("confirmed-data");
+        let moved = base.join("moved-confirmed-data");
+        let replacement = confirmed.join("replacement.txt");
+        fs::create_dir(&confirmed)?;
+        fs::write(confirmed.join("confirmed.txt"), b"confirmed")?;
+
+        let mut prepared = preflight_deletions(
+            &[(MutableDataClass::Logs, confirmed.clone())],
+            &base.join("program"),
+        )?;
+        let deletion = prepared
+            .pop()
+            .ok_or("confirmed deletion was not prepared")?;
+
+        #[cfg(unix)]
+        {
+            fs::rename(&confirmed, &moved)?;
+            fs::create_dir(&confirmed)?;
+            fs::write(&replacement, b"replacement")?;
+        }
+        #[cfg(windows)]
+        assert!(fs::rename(&confirmed, &moved).is_err());
+
+        assert_eq!(deletion.remove()?, MutableDataClass::Logs);
+        #[cfg(unix)]
+        {
+            assert!(!moved.exists());
+            assert_eq!(fs::read(replacement)?, b"replacement");
+        }
+        #[cfg(windows)]
+        assert!(!confirmed.exists());
+        Ok(())
+    }
 }

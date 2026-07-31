@@ -366,6 +366,10 @@ jobs:
           [[ -n "$foundation" && "$foundation" != *$'\n'* && "$foundation" != *$'\r'* ]]
           printf 'MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT=%s\n' "$foundation" \
             >> "$GITHUB_ENV"
+      - name: Build the production desktop frontend
+        run: |
+          pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+          pnpm --dir apps/market-squawk-desktop build
       - name: Build and stage complete native inputs
         shell: bash
         env:
@@ -376,7 +380,7 @@ jobs:
           set -euo pipefail
 
           cargo build --release --locked --offline --target "$TARGET" \
-            -p market-squawk-desktop
+            -p market-squawk-desktop --features tauri/custom-protocol
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk --bin market-squawk-capture-helper
           cargo build --release --locked --offline --target "$TARGET" \
@@ -458,11 +462,10 @@ jobs:
             --output "$RUNNER_TEMP/complete-release"
           echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release" \
             >> "$GITHUB_ENV"
-      - name: Install desktop dependencies and signing overlay
+      - name: Prepare the desktop signing overlay
         shell: bash
         run: |
           set -euo pipefail
-          pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
           printf '{}\n' > "$RUNNER_TEMP/tauri-signing.json"
       - name: Configure Windows package signing
         if: >-
@@ -485,8 +488,6 @@ jobs:
             Set-Content `
               -Path (Join-Path $env:RUNNER_TEMP "tauri-signing.json") `
               -Encoding utf8NoBOM
-      - name: Typecheck the desktop
-        run: pnpm --dir apps/market-squawk-desktop typecheck
       - name: Run the three critical desktop tests
         run: pnpm --dir apps/market-squawk-desktop test --run
       # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).

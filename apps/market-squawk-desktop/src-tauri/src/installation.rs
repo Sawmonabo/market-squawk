@@ -59,6 +59,15 @@ pub(crate) fn prepare(
                     UpdateRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,
                 )?;
+            } else if !current.is_healthy() && packaged.version == active {
+                repair(
+                    market_squawk_installer::RepairRequest::from_local(
+                        root.clone(),
+                        &packaged.manifest,
+                        &packaged.bundle,
+                    )?
+                    .with_channel_manifest_url(&packaged.channel_manifest_url)?,
+                )?;
             } else if !current.is_healthy() {
                 repair(market_squawk_installer::RepairRequest::new(root.clone()))?;
             }

@@ -92,6 +92,22 @@ impl InstallationState {
         self.validate()
     }
 
+    pub(crate) fn bind_channel_manifest_url(
+        &mut self,
+        channel_manifest_url: Option<Box<str>>,
+    ) -> Result<bool, StoreError> {
+        let Some(channel_manifest_url) = channel_manifest_url else {
+            return Ok(false);
+        };
+        if self.channel_manifest_url.as_deref() == Some(channel_manifest_url.as_ref()) {
+            return Ok(false);
+        }
+        self.channel_manifest_url = Some(channel_manifest_url);
+        self.changed_at_unix_seconds = unix_time()?;
+        self.validate()?;
+        Ok(true)
+    }
+
     fn validate(&self) -> Result<(), StoreError> {
         if self.schema_version != INSTALLATION_STATE_SCHEMA_VERSION {
             return Err(StoreError::CorruptState);
@@ -472,6 +488,41 @@ impl InstallStore {
         Ok(final_path)
     }
 
+    pub(crate) fn replace_corrupt_release_cache(
+        &self,
+        stage: &Path,
+        manifest_sha256: &str,
+    ) -> Result<PathBuf, StoreError> {
+        let final_path = self.release_path(manifest_sha256);
+        let quarantine = self
+            .root
+            .join(STAGING_DIRECTORY)
+            .join(format!("release-retired-{}", Uuid::new_v4().as_simple()));
+        let metadata = match fs::symlink_metadata(&final_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.publish_release_cache(stage, manifest_sha256);
+            }
+            Err(source) => {
+                return Err(StoreError::io("inspect corrupt release cache", source));
+            }
+        };
+        if metadata.is_dir() && !is_directory_redirect(&metadata) {
+            set_private_directory_permissions(&final_path)?;
+        }
+        fs::rename(&final_path, &quarantine)
+            .map_err(|source| StoreError::io("quarantine corrupt release cache", source))?;
+        if let Err(source) = fs::rename(stage, &final_path) {
+            return match fs::rename(&quarantine, &final_path) {
+                Ok(()) => Err(StoreError::io("replace corrupt release cache", source)),
+                Err(_) => Err(StoreError::RepairIndeterminate),
+            };
+        }
+        sync_directory(&self.root.join(RELEASES_DIRECTORY))?;
+        let _cleanup = remove_quarantined_entry(&quarantine);
+        Ok(final_path)
+    }
+
     pub(crate) fn prune(&self, state: &InstallationState) -> Result<(), StoreError> {
         let mut retained_versions = BTreeSet::from([state.active.directory.as_ref()]);
         let mut retained_releases = BTreeSet::from([state.active.manifest_sha256.as_ref()]);
@@ -776,7 +827,7 @@ fn secure_private_unix_lock(lock: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::UnsafeRoot);
     }

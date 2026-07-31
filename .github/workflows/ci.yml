@@ -445,6 +445,10 @@ jobs:
           [[ -n "$foundation" && "$foundation" != *$'\n'* && "$foundation" != *$'\r'* ]]
           printf 'MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT=%s\n' "$foundation" \
             >> "$GITHUB_ENV"
+      - name: Build the production desktop frontend
+        run: |
+          pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+          pnpm --dir apps/market-squawk-desktop build
       - name: Build complete native inputs
         shell: bash
         env:
@@ -455,11 +459,15 @@ jobs:
           set -euo pipefail
 
           cargo build --release --locked --offline --target "$TARGET" \
-            -p market-squawk-desktop
+            -p market-squawk-desktop --features tauri/custom-protocol
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk --bin market-squawk-capture-helper
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk-installer
+          version="$(cargo metadata --format-version 1 --no-deps --locked --offline \
+            | jq -er \
+              '[.packages[] | select(.name == "market-squawk") | .version]
+               | if length == 1 then .[0] else error("application version is not unique") end')"
 
           native="$RUNNER_TEMP/native-input"
           umask 077
@@ -476,16 +484,16 @@ jobs:
           python3 scripts/build_complete_release.py \
             --target "$TARGET" \
             --native-trust-mode provenance-only \
-            --version 1.0.0 \
+            --version "$version" \
             --commit "$CANDIDATE_SHA" \
             --tree "$(git rev-parse 'HEAD^{tree}')" \
             --python-release "$MARKET_SQUAWK_PYTHON_PRODUCT" \
             --native-bundle "$native" \
             --output "$RUNNER_TEMP/complete-release"
-          echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release" \
-            >> "$GITHUB_ENV"
-      - run: pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
-      - run: pnpm --dir apps/market-squawk-desktop typecheck
+          {
+            echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release"
+            echo "MARKET_SQUAWK_RELEASE_VERSION=$version"
+          } >> "$GITHUB_ENV"
       - run: pnpm --dir apps/market-squawk-desktop test --run
       # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
@@ -532,7 +540,7 @@ jobs:
           set -euo pipefail
 
           bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
-          bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-1.0.0-$TARGET.zip"
+          bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-$MARKET_SQUAWK_RELEASE_VERSION-$TARGET.zip"
           manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
           install_root="$RUNNER_TEMP/installed-product"
           unset \
@@ -568,7 +576,7 @@ jobs:
 
           python3 scripts/build_complete_release.py collect \
             --target "$TARGET" \
-            --version 1.0.0 \
+            --version "$MARKET_SQUAWK_RELEASE_VERSION" \
             --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
             --native-bundle "target/$TARGET/release/bundle" \
             --output "$RUNNER_TEMP/platform-publish"

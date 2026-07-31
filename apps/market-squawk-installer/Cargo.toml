@@ -19,6 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 atomicwrites.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 chrono.workspace = true
 clap.workspace = true
 directories.workspace = true

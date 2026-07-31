@@ -85,12 +85,47 @@ impl UpdateRequest {
 #[derive(Debug)]
 pub struct RepairRequest {
     pub(crate) root: PathBuf,
+    pub(crate) release: Option<AdmittedRelease>,
+    pub(crate) bundle: Option<PathBuf>,
+    pub(crate) channel_manifest_url: Option<Box<str>>,
 }
 
 impl RepairRequest {
-    /// Creates a repair request for one controlled program root.
+    /// Creates a repair request that uses the exact retained release cache.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            release: None,
+            bundle: None,
+            channel_manifest_url: None,
+        }
+    }
+
+    /// Creates a repair request with an admitted same-release recovery bundle.
+    ///
+    /// The lifecycle rejects recovery material that does not identify the active release exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError`] when the manifest cannot be admitted for this platform.
+    pub fn from_local(root: PathBuf, manifest: &[u8], bundle: &Path) -> Result<Self, InstallError> {
+        Ok(Self {
+            root,
+            release: Some(ReleaseManifest::admit_current(manifest)?),
+            bundle: Some(bundle.to_path_buf()),
+            channel_manifest_url: None,
+        })
+    }
+
+    /// Binds a validated HTTPS update channel to recovered state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::ManifestUrl`] when the URL is not an uncredentialed HTTPS URL.
+    pub fn with_channel_manifest_url(mut self, url: &str) -> Result<Self, InstallError> {
+        validate_manifest_url(url)?;
+        self.channel_manifest_url = Some(url.into());
+        Ok(self)
     }
 }
 

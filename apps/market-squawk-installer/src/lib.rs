@@ -213,6 +213,46 @@ mod tests {
         }
         assert!(status(&root)?.is_healthy());
 
+        let active = fs::read_dir(root.join("versions"))?
+            .next()
+            .transpose()?
+            .ok_or_else(|| std::io::Error::other("active version is unavailable"))?
+            .path();
+        let damaged = active.join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        let release_cache = fs::read_dir(root.join("releases"))?
+            .next()
+            .transpose()?
+            .ok_or_else(|| std::io::Error::other("release cache is unavailable"))?
+            .path()
+            .join("bundle.zip");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&release_cache, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        for path in [&damaged, &release_cache] {
+            let mut permissions = fs::metadata(path)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+        }
+        fs::write(&damaged, b"damaged")?;
+        fs::write(&release_cache, b"damaged")?;
+
+        let repaired = repair(
+            RepairRequest::from_local(root.clone(), &first.manifest, &first.bundle)?
+                .with_channel_manifest_url("https://example.com/release.json")?,
+        )?;
+        assert!(repaired.repaired());
+        let recovered = status(&root)?;
+        assert!(recovered.is_healthy());
+        assert_eq!(
+            recovered.channel_manifest_url(),
+            Some("https://example.com/release.json")
+        );
+
         let second = BundleFixture::create(temporary.path(), "0.2.0", BundleDefect::None)?;
         update(UpdateRequest::from_local(
             root.clone(),

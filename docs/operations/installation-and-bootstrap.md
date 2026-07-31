@@ -230,7 +230,9 @@ The terminal maintenance command uses the retained HTTPS release channel:
 - **Update** accepts only a strictly newer semantic version, stages it completely, and changes the
   selector only after validation.
 - **Repair** revalidates the active tree and durable entrypoints. If needed, it reconstructs the
-  same version from its exact retained manifest and bundle.
+  same version from its exact retained manifest and bundle. Native-package startup can also restore
+  the same active version from the package's admitted embedded bundle when both the installed tree
+  and retained cache are damaged.
 - **Rollback** revalidates the one retained previous version before selecting it. It never rewinds
   catalog or dataset schemas.
 

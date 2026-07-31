@@ -86,6 +86,16 @@ development. The supported package command applies the overlay; its pre-build co
 three release programs and stages the exact host-triple filenames before the desktop build begins.
 No placeholder binary is committed.
 
+### Production-protocol terminal bundles
+
+Tauri's pinned macros treat a direct Cargo build without `tauri/custom-protocol` as development
+mode, which selects `devUrl` instead of embedding `frontendDist`. A terminal release bundle cannot
+copy that executable: no development server exists after installation. The complete-release lanes
+therefore install and build the frontend first, then compile the managed desktop with
+`--features tauri/custom-protocol` before copying that exact binary into the immutable bundle. The
+later Tauri package build remains responsible for package resources and native package formats
+([Tauri maintainer guidance](https://github.com/tauri-apps/tauri/discussions/11585#discussioncomment-11145442)).
+
 ### Pull-request candidate identity
 
 GitHub's official checkout action documents that pull requests otherwise operate on a merge
@@ -199,20 +209,22 @@ instead of inventing a process-termination protocol in the application.
    stages the names required by Tauri.
 4. Package-only settings live in `src-tauri/tauri.bundle.conf.json`. The supported `pnpm bundle`
    command and hosted package matrix always apply that overlay.
-5. Desktop MCP readiness requires both the safely installed CLI sibling and successful bounded
+5. Complete terminal bundles build `frontendDist` first and compile their managed desktop with
+   Tauri's production-protocol feature; they never copy a development-protocol Cargo binary.
+6. Desktop MCP readiness requires both the safely installed CLI sibling and successful bounded
    capability-contract validation; availability does not mean a server is currently running.
-6. Installed package formats expose the durable CLI directly. AppImage client JSON instead invokes
+7. Installed package formats expose the durable CLI directly. AppImage client JSON instead invokes
    the stable outer image through the hidden typed stdio-MCP dispatch before Tauri startup.
-7. The Linux package lane runs the existing initialize/list/call/EOF MCP smoke through the produced
+8. The Linux package lane runs the existing initialize/list/call/EOF MCP smoke through the produced
    AppImage with extract-and-run, verifies the transport is hidden from normal help, and verifies
    it fails without a valid AppImage context.
-8. Linux package preparation admits and verifies the five exact bundler-tool identities above
+9. Linux package preparation admits and verifies the five exact bundler-tool identities above
    before Tauri executes them; Tauri's network fallback cannot run because every expected cache
    path already exists.
-9. Native-package inspection must confirm all three sibling programs and both exact font notices.
-10. Pull-request verification checks out and labels the exact head commit, never the synthetic merge
+10. Native-package inspection must confirm all three sibling programs and both exact font notices.
+11. Pull-request verification checks out and labels the exact head commit, never the synthetic merge
    commit.
-11. Windows native uninstallers invoke the Rust lifecycle through Tauri's maintained NSIS hook and
+12. Windows native uninstallers invoke the Rust lifecycle through Tauri's maintained NSIS hook and
     WiX fragment extension points. macOS and Linux require in-app program cleanup before native
     package removal because those formats have no safe per-user removal hook.
 
@@ -256,6 +268,7 @@ instead of inventing a process-termination protocol in the application.
 | [Microsoft Windows Settings URI reference](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-settings) | Official `ms-settings:appsfeatures` handoff to Installed apps | 2026-07-31 |
 | [Microsoft Restart Manager overview](https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager) | Windows Installer process/file-in-use lifecycle | 2026-07-31 |
 | [Tauri CLI reference](https://v2.tauri.app/reference/cli/) | Ordered `--config` overlays for build flavors | 2026-07-28 |
+| [Tauri maintainer production-protocol guidance](https://github.com/tauri-apps/tauri/discussions/11585#discussioncomment-11145442) | A direct Cargo release build requires `tauri/custom-protocol` to select the embedded production frontend | 2026-07-31 |
 | [Tauri path API](https://v2.tauri.app/reference/javascript/api/namespacepath/) | Operating-system mapping for the application-local data directory | 2026-07-28 |
 | [Official Tauri GitHub Action](https://github.com/tauri-apps/tauri-action) | `args`, `projectPath`, and relative `--config` path behavior | 2026-07-28 |
 | [Official checkout action](https://github.com/actions/checkout) | Pull-request head-SHA checkout pattern | 2026-07-28 |

@@ -4629,6 +4629,8 @@ name = "market-squawk-installer"
 version = "1.0.0"
 dependencies = [
  "atomicwrites",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "clap",
  "directories",
