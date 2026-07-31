@@ -740,49 +740,61 @@ fn is_directory_redirect(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
     use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{AccessRights, AceFlags, AceType, SeObjectType, SecurityInformation},
         wrappers::{
-            ConvertSecurityDescriptorToStringSecurityDescriptor, GetNamedSecurityInfo,
-            SetNamedSecurityInfo,
+            ConvertSecurityDescriptorToStringSecurityDescriptor, GetSecurityInfo, SetSecurityInfo,
         },
     };
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
 
     let current_user = SecurityIdentifier::get_current_user_sid()
         .map_err(|_| StoreError::UnsafeRoot)?
         .to_string();
-    let existing = GetNamedSecurityInfo(
-        path,
-        SeObjectType::SE_FILE_OBJECT,
-        SecurityInformation::Owner,
-    )
-    .map_err(|source| StoreError::io("inspect controlled directory owner", source))?;
-    if existing
-        .owner()
-        .is_none_or(|owner| owner.to_string() != current_user)
-    {
+
+    let access = AccessRights::ReadControl | AccessRights::WriteDac | AccessRights::WriteOwner;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(access.bits())
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut directory = options
+        .open(path)
+        .map_err(|source| StoreError::io("open controlled directory authority", source))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| StoreError::io("inspect controlled directory handle", source))?;
+    if !metadata.is_dir() || is_directory_redirect(&metadata) {
         return Err(StoreError::UnsafeRoot);
     }
 
-    let descriptor: LocalBox<SecurityDescriptor> = format!("D:P(A;OICI;FA;;;{current_user})")
-        .parse()
-        .map_err(|source| StoreError::io("build private directory ACL", source))?;
+    let descriptor: LocalBox<SecurityDescriptor> =
+        format!("O:{current_user}D:P(A;OICI;FA;;;{current_user})")
+            .parse()
+            .map_err(|source| StoreError::io("build private directory ACL", source))?;
+    let owner = descriptor.owner().ok_or(StoreError::UnsafeRoot)?;
     let dacl = descriptor.dacl().ok_or(StoreError::UnsafeRoot)?;
-    SetNamedSecurityInfo(
-        path,
+    SetSecurityInfo(
+        &mut directory,
         SeObjectType::SE_FILE_OBJECT,
-        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
-        None,
+        SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        Some(owner),
         None,
         Some(dacl),
         None,
     )
     .map_err(|source| StoreError::io("secure controlled directory", source))?;
 
-    let secured = GetNamedSecurityInfo(
-        path,
+    let secured = GetSecurityInfo(
+        &directory,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner | SecurityInformation::Dacl,
     )
