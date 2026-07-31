@@ -594,8 +594,13 @@ fn remove_quarantined_tree(path: &Path) -> Result<(), StoreError> {
 fn remove_quarantined_entry(path: &Path) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| StoreError::io("inspect corrupt quarantine root", source))?;
-    if metadata.is_dir() && !is_directory_redirect(&metadata) {
-        return remove_quarantined_tree(path);
+    if metadata.is_dir() {
+        if !is_directory_redirect(&metadata) {
+            return remove_quarantined_tree(path);
+        }
+        #[cfg(windows)]
+        return fs::remove_dir(path)
+            .map_err(|source| StoreError::io("remove corrupt quarantine redirect", source));
     }
     if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
         make_file_writable(path)?;
