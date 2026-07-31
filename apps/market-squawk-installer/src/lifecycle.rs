@@ -455,8 +455,8 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
     verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
     store.write_state(&state)?;
     publish_stable_programs(store, &state)?;
+    store.prune(&state)?;
     store.clear_pending_activation()?;
-    let _cleanup = store.prune(&state);
     Ok(())
 }
 
@@ -560,7 +560,9 @@ pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallE
 
     let mut deleted = Vec::with_capacity(prepared_deletions.len());
     for deletion in prepared_deletions {
-        deleted.push(deletion.remove()?);
+        if let Some(class) = deletion.remove()? {
+            deleted.push(class);
+        }
     }
     Ok(UninstallReceipt {
         removed_program,
@@ -662,22 +664,23 @@ impl ConfirmedDataDeletion {
         })
     }
 
-    fn remove(self) -> Result<crate::contracts::MutableDataClass, InstallError> {
+    fn remove(self) -> Result<Option<crate::contracts::MutableDataClass>, InstallError> {
         let Self {
             class,
             parent_authority,
             directory,
         } = self;
-        if let Some(directory) = directory {
-            directory
-                .remove_open_dir_all()
-                .map_err(|source| InstallError::Io {
-                    operation: "remove confirmed mutable data root",
-                    source,
-                })?;
-        }
+        let Some(directory) = directory else {
+            return Ok(None);
+        };
+        directory
+            .remove_open_dir_all()
+            .map_err(|source| InstallError::Io {
+                operation: "remove confirmed mutable data root",
+                source,
+            })?;
         drop(parent_authority);
-        Ok(class)
+        Ok(Some(class))
     }
 }
 
@@ -1233,6 +1236,23 @@ mod tests {
     fn confirmed_data_deletion_stays_bound_to_the_opened_directory() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
         let base = temporary.path().canonicalize()?;
+        let absent = base.join("absent-data");
+        let mut absent_prepared = preflight_deletions(
+            &[(MutableDataClass::Artifacts, absent.clone())],
+            &base.join("program"),
+        )?;
+        let absent_deletion = absent_prepared
+            .pop()
+            .ok_or("absent deletion was not prepared")?;
+        fs::create_dir(&absent)?;
+        fs::write(absent.join("late.txt"), b"created after confirmation")?;
+
+        assert_eq!(absent_deletion.remove()?, None);
+        assert_eq!(
+            fs::read(absent.join("late.txt"))?,
+            b"created after confirmation"
+        );
+
         let confirmed = base.join("confirmed-data");
         let moved = base.join("moved-confirmed-data");
         let replacement = confirmed.join("replacement.txt");
@@ -1256,7 +1276,7 @@ mod tests {
         #[cfg(windows)]
         assert!(fs::rename(&confirmed, &moved).is_err());
 
-        assert_eq!(deletion.remove()?, MutableDataClass::Logs);
+        assert_eq!(deletion.remove()?, Some(MutableDataClass::Logs));
         #[cfg(unix)]
         {
             assert!(!moved.exists());

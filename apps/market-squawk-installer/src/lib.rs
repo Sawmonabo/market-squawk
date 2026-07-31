@@ -41,7 +41,7 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use super::{
-        InstallError, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest,
+        InstallError, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest, StoreError,
         SupportedTarget, UninstallRequest, UpdateRequest, install, repair, rollback, status,
         uninstall, update,
     };
@@ -389,6 +389,15 @@ mod tests {
         );
 
         fs::write(root.join("activation.json"), pending)?;
+
+        let pruning_obstruction = root.join("versions/pruning-obstruction");
+        fs::write(&pruning_obstruction, b"obstruct pruning")?;
+        assert!(matches!(
+            status(&root),
+            Err(InstallError::Store(StoreError::UnsafeRoot))
+        ));
+        assert!(root.join("activation.json").exists());
+        fs::remove_file(pruning_obstruction)?;
 
         let recovered = status(&root)?;
         assert_eq!(recovered.active_version(), Some("0.2.0"));

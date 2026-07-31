@@ -1465,11 +1465,12 @@ jobs:
       attestations: read
       contents: read
     steps:
-      - name: Install through the public stable endpoint
+      - name: Install the exact frozen public release
         shell: bash
         run: |
           set -euo pipefail
 
+          install_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/install.sh"
           curl \
             --fail \
             --location \
@@ -1480,7 +1481,7 @@ jobs:
             --retry 6 \
             --retry-all-errors \
             --retry-delay 5 \
-            https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh |
+            "$install_url" |
             sh
       - name: Verify immutable release assets and attestations
         shell: bash
