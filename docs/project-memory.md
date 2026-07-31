@@ -1417,6 +1417,22 @@ are built. Raising that measured ceiling does not authorize duplicate target tre
 completed-lane caches, or unbounded workspace growth. Release acceptance still requires one clean,
 unchanged, exact-head six-target campaign below the ceiling.
 
+The first exact six-target campaign on this correction stopped during the modeling build when its
+process-group resident memory reached 4,862,574,592 bytes and exceeded the original 4 GiB
+build-only limit. This was not a fuzz crash or an application-runtime measurement. The host has
+16 GiB of physical memory, compilation was already serialized to one job, and the campaign itself
+remains limited to 2 GiB. The build-only ceiling is therefore 8 GiB, leaving half of host memory
+outside the supervised compiler group while retaining the two-hour deadline and 16 GiB disk
+ceiling. This correction remains unapproved until the final frozen release candidate completes the
+exact campaign.
+
+Full platform packages are not routine feature-branch output. Ordinary pull requests and `main`
+pushes retain policy and affected code verification, while the CI package matrix requires an
+explicit `workflow_dispatch` with platform verification selected on a `release/*` branch. The
+stable-release workflow remains independently gated by an annotated version tag or explicit
+release invocation. Final fuzz, platform-package, and release evidence runs occur only after all
+required product work is integrated and one release candidate is frozen.
+
 Packed macOS debug information creates Cargo-owned `.dSYM` alias symlinks inside the generated
 target tree. Disk measurement admits only links that resolve beneath the canonical target root,
 counts the link rather than following it, and validates the boundary again while measuring.

@@ -21,7 +21,7 @@ use crate::cli::ReleaseFuzzArguments;
 pub(super) const FUZZ_TOOLCHAIN: &str = "nightly-2026-07-15";
 pub(super) const CARGO_FUZZ_VERSION: &str = "cargo-fuzz 0.13.2";
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120 * 60);
-pub(super) const FUZZ_BUILD_RSS_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(super) const FUZZ_BUILD_RSS_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAXIMUM_CAMPAIGN_SECONDS: u64 = 60 * 60;
 const MINIMUM_RSS_MIB: u64 = 64;
 const MAXIMUM_RSS_MIB: u64 = 8 * 1024;

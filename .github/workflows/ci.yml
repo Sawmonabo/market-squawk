@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      platform_verification:
+        description: Run complete platform verification on a frozen release branch
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
@@ -22,8 +29,29 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.changes.outputs.code }}
-      desktop: ${{ steps.changes.outputs.desktop }}
+      platform: ${{ steps.release_scope.outputs.platform }}
     steps:
+      - id: release_scope
+        name: Admit explicit release platform verification
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLATFORM_VERIFICATION: ${{ inputs.platform_verification || false }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          platform=false
+          if [[ "$PLATFORM_VERIFICATION" == "true" ]]; then
+            if [[ "$EVENT_NAME" != "workflow_dispatch" \
+              || "$WORKFLOW_REF" != refs/heads/release/* ]]; then
+              echo "Complete platform verification requires an explicit release-branch dispatch." \
+                >&2
+              exit 1
+            fi
+            platform=true
+          fi
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
       # actions/checkout v7.0.1, verified release commit (2026-07-22).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -40,7 +68,6 @@ jobs:
           set -euo pipefail
 
           code=false
-          desktop=false
           resolved=true
 
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
@@ -58,7 +85,6 @@ jobs:
                 docs/licenses/tauri-mpl-notice.md|\
                 docs/licenses/tract-onnx-notice.md)
                   code=true
-                  desktop=true
                   ;;
                 docs/*|*.md)
                   ;;
@@ -66,42 +92,13 @@ jobs:
                   code=true
                   ;;
               esac
-
-              case "$path" in
-                apps/market-squawk-desktop/*|\
-                apps/market-squawk-installer/*|\
-                apps/market-squawk/assets/provider-onboarding/*|\
-                apps/market-squawk/src/local_product/*|\
-                distribution/*|\
-                python/wheelhouse-lock.json|\
-                python/wheelhouse/*|\
-                LICENSE-APACHE|LICENSE-MIT|\
-                docs/licenses/geist-ofl-license.txt|\
-                docs/licenses/geist-mono-ofl-license.txt|\
-                docs/licenses/tauri-mpl-notice.md|\
-                docs/licenses/tract-onnx-notice.md|\
-                vendor/glib-0.18.5/*|\
-                Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
-                dist-workspace.toml|\
-                scripts/build_complete_release.py|\
-                scripts/build_python_release.py|\
-                scripts/check_workspace_boundaries.py|\
-                scripts/smoke_mcp.py|scripts/verify.sh|\
-                .github/workflows/ci.yml|.github/workflows/release.yml)
-                  desktop=true
-                  ;;
-              esac
             done < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
           else
             # An unresolved comparison is never treated as documentation-only.
             code=true
-            desktop=true
           fi
 
-          {
-            echo "code=$code"
-            echo "desktop=$desktop"
-          } >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
   policy:
     name: Policy and security
@@ -312,7 +309,7 @@ jobs:
   desktop-packages:
     name: Desktop package (${{ matrix.name }})
     needs: classify
-    if: needs.classify.outputs.desktop == 'true'
+    if: needs.classify.outputs.platform == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -637,7 +634,7 @@ jobs:
         shell: bash
         env:
           CODE: ${{ needs.classify.outputs.code }}
-          DESKTOP: ${{ needs.classify.outputs.desktop }}
+          PLATFORM: ${{ needs.classify.outputs.platform }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
           LINUX_RESULT: ${{ needs.linux.result }}
@@ -660,7 +657,7 @@ jobs:
             [[ "$WINDOWS_RESULT" == "skipped" ]]
           fi
 
-          if [[ "$DESKTOP" == "true" ]]; then
+          if [[ "$PLATFORM" == "true" ]]; then
             [[ "$DESKTOP_RESULT" == "success" ]]
           else
             [[ "$DESKTOP_RESULT" == "skipped" ]]
