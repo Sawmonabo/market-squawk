@@ -1512,7 +1512,7 @@
     },
     {
       "path": "apps/market-squawk/src/release/fuzz.rs",
-      "sha256": "5c1c3a232c8a3797daab44612d84751fc30313a3e3a69d396b7004b350790110",
+      "sha256": "94861ffc0f3867f7e10133085baf56864f1e2b1093427e93ab976aa876222a1b",
       "size_bytes": 21518
     },
     {
