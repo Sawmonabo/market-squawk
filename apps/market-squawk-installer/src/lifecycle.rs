@@ -695,25 +695,27 @@ fn prepare_candidate(
     release: &AdmittedRelease,
     bundle: &Path,
 ) -> Result<StoredVersion, InstallError> {
-    verify_bundle(bundle, &release.target_release().archive)?;
-    let cached_bundle = persist_release_cache(store, release, bundle)?;
+    let cached_bundle = restore_release_cache(store, release, bundle)?;
     let version = stored_version_for_release(release)?;
     let final_path = store.version_path(&version);
-    match fs::symlink_metadata(&final_path) {
+    let replace_existing = match fs::symlink_metadata(&final_path) {
         Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {
-            seal_tree_root(&final_path)?;
-            verify_installed_tree(&final_path, &version.components)?;
-            return Ok(version);
+            if seal_tree_root(&final_path).is_ok()
+                && verify_installed_tree(&final_path, &version.components).is_ok()
+            {
+                return Ok(version);
+            }
+            true
         }
-        Ok(_) => return Err(InstallError::CorruptInstallation),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(source) => {
             return Err(InstallError::Io {
                 operation: "inspect retained version root",
                 source,
             });
         }
-    }
+    };
 
     let stage = store.create_stage("version")?;
     let extracted = match extract_bundle(&cached_bundle, release.target_release(), &stage) {
@@ -727,7 +729,11 @@ fn prepare_candidate(
         let _ = remove_tree(&stage);
         return Err(InstallError::CorruptInstallation);
     }
-    store.publish_new_version(&stage, &version)?;
+    if replace_existing {
+        store.replace_corrupt_version(&stage, &version)?;
+    } else {
+        store.publish_new_version(&stage, &version)?;
+    }
     seal_tree_root(&final_path)?;
     verify_installed_tree(&final_path, &version.components)?;
     Ok(version)
@@ -765,35 +771,6 @@ fn validate_recovery_release(
         return Err(InstallError::RepairReleaseMismatch);
     }
     Ok(())
-}
-
-fn persist_release_cache(
-    store: &InstallStore,
-    release: &AdmittedRelease,
-    source_bundle: &Path,
-) -> Result<PathBuf, InstallError> {
-    let final_directory = store.release_path(release.manifest_sha256());
-    match fs::symlink_metadata(&final_directory) {
-        Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {
-            seal_cache_directory(&final_directory)?;
-            verify_cached_release(&final_directory, release)?;
-            return Ok(final_directory.join(CACHED_BUNDLE_FILE));
-        }
-        Ok(_) => return Err(InstallError::CorruptInstallation),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(InstallError::Io {
-                operation: "inspect retained release root",
-                source,
-            });
-        }
-    }
-
-    let stage = stage_release_cache(store, release, source_bundle, "release")?;
-    store.publish_release_cache(&stage, release.manifest_sha256())?;
-    seal_cache_directory(&final_directory)?;
-    verify_cached_release(&final_directory, release)?;
-    Ok(final_directory.join(CACHED_BUNDLE_FILE))
 }
 
 fn restore_release_cache(

@@ -867,13 +867,13 @@
     },
     {
       "path": "apps/market-squawk-installer/src/lib.rs",
-      "sha256": "2b6d3fa55da0724dedc70b2ab0da85049472bdf5a22a937ab719eb0ebee88a5b",
-      "size_bytes": 22877
+      "sha256": "0f359a5b548cb12679e4303e82ddfaecedeeb382a44e541dd9261816876f5716",
+      "size_bytes": 24924
     },
     {
       "path": "apps/market-squawk-installer/src/lifecycle.rs",
-      "sha256": "95f956fa5ad76ffc346db772ceecd2aab5d95255813cedbdd47621a9a5a8506d",
-      "size_bytes": 46267
+      "sha256": "2e4316ea6534c34ba6c96882fcffc408114a4e0bb523cbf7d24a0e1dce347c7f",
+      "size_bytes": 45207
     },
     {
       "path": "apps/market-squawk-installer/src/main.rs",

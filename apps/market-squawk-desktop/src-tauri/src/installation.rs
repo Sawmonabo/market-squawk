@@ -9,8 +9,8 @@ use std::{
 
 use market_squawk_installer::{
     InstallError, InstallRequest, MAXIMUM_MANIFEST_BYTES, ManifestError, PlatformError,
-    ReleaseManifest, SupportedTarget, UpdateRequest, active_release_root, default_install_root,
-    install, repair, status, update,
+    ReleaseManifest, RepairRequest, RollbackRequest, SupportedTarget, UpdateRequest,
+    active_release_root, default_install_root, install, repair, rollback, status, update,
 };
 use semver::Version;
 use tauri::Manager as _;
@@ -50,6 +50,9 @@ pub(crate) fn prepare(
                 .ok_or(InstallationStartupError::InvalidInstalledVersion)?;
             let active = Version::parse(active_version)
                 .map_err(|_| InstallationStartupError::InvalidInstalledVersion)?;
+            let packaged_version = packaged.version.to_string();
+            let packaged_was_previous =
+                current.previous_version() == Some(packaged_version.as_str());
             if should_activate_packaged_release(
                 &packaged.version,
                 &active,
@@ -61,18 +64,27 @@ pub(crate) fn prepare(
                 )?;
             } else if !current.is_healthy() && packaged.version == active {
                 repair(
-                    market_squawk_installer::RepairRequest::from_local(
-                        root.clone(),
-                        &packaged.manifest,
-                        &packaged.bundle,
-                    )?
-                    .with_channel_manifest_url(&packaged.channel_manifest_url)?,
+                    RepairRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
+                        .with_channel_manifest_url(&packaged.channel_manifest_url)?,
                 )?;
             } else if !current.is_healthy() {
-                repair(market_squawk_installer::RepairRequest::new(root.clone()))?;
+                match recover_active_or_previous(&root) {
+                    Ok(()) => {}
+                    Err(_) if packaged_was_previous => {
+                        update(
+                            UpdateRequest::from_local(
+                                root.clone(),
+                                &packaged.manifest,
+                                &packaged.bundle,
+                            )?
+                            .with_channel_manifest_url(&packaged.channel_manifest_url)?,
+                        )?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         } else if !current.is_healthy() {
-            repair(market_squawk_installer::RepairRequest::new(root.clone()))?;
+            recover_active_or_previous(&root)?;
         }
         return Ok(PreparedInstallation {
             active_release_root: Some(active_release_root(&root)?),
@@ -98,6 +110,15 @@ pub(crate) fn prepare(
         });
     }
     Err(InstallationStartupError::PackagedReleaseUnavailable)
+}
+
+fn recover_active_or_previous(root: &Path) -> Result<(), InstallError> {
+    match repair(RepairRequest::new(root.to_path_buf())) {
+        Ok(_) => Ok(()),
+        Err(repair_error) => rollback(RollbackRequest::new(root.to_path_buf()))
+            .map(|_| ())
+            .map_err(|_| repair_error),
+    }
 }
 
 fn should_activate_packaged_release(

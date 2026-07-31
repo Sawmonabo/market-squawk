@@ -261,6 +261,57 @@ mod tests {
             fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
             b"0.1.0:bin/market-squawk"
         );
+
+        let active_component = fs::read_dir(root.join("versions"))?
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("0.1.0-"))
+            .ok_or_else(|| std::io::Error::other("active version is unavailable"))?
+            .path()
+            .join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        let retained_component = fs::read_dir(root.join("versions"))?
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("0.2.0-"))
+            .ok_or_else(|| std::io::Error::other("retained version is unavailable"))?
+            .path()
+            .join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        let active_cache = root
+            .join("releases")
+            .join(sha256_bytes(&first.manifest))
+            .join("bundle.zip");
+        let retained_cache = root
+            .join("releases")
+            .join(sha256_bytes(&second.manifest))
+            .join("bundle.zip");
+        for path in [
+            &active_component,
+            &retained_component,
+            &active_cache,
+            &retained_cache,
+        ] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
+            #[cfg(windows)]
+            {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions)?;
+            }
+            fs::write(path, b"damaged")?;
+        }
+
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &second.manifest,
+            &second.bundle,
+        )?)?;
+        let recovered_previous = status(&root)?;
+        assert_eq!(recovered_previous.active_version(), Some("0.2.0"));
+        assert_eq!(recovered_previous.previous_version(), None);
+        assert!(recovered_previous.is_healthy());
         Ok(())
     }
 
