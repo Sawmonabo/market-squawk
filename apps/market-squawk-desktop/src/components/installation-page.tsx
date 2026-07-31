@@ -69,7 +69,7 @@ export function InstallationPage({
   const installed = status?.installed === true
   const healthy = installed && status.healthy
   const canUpdate = healthy && status.channel_manifest_url !== null
-  const canRollback = healthy && status.previous_version !== null
+  const canRollback = installed && status.previous_version !== null
 
   return (
     <main className="mx-auto w-full max-w-6xl p-6 lg:p-8">
@@ -100,6 +100,17 @@ export function InstallationPage({
           <AlertDescription>
             Close and reopen the desktop application to use the newly selected
             program version.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {result?.action === "update" &&
+      result.receipt === null &&
+      !result.restartRequired ? (
+        <Alert className="mt-6">
+          <ShieldCheck aria-hidden="true" />
+          <AlertTitle>Market Squawk is up to date</AlertTitle>
+          <AlertDescription>
+            The verified update channel does not contain a newer release.
           </AlertDescription>
         </Alert>
       ) : null}

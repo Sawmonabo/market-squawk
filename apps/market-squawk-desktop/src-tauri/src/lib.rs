@@ -197,7 +197,18 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         }
         tauri::RunEvent::Exit => {
             let state = handle.state::<DesktopState>();
+            #[cfg(unix)]
+            let restart_program = state.scheduled_restart_program();
             tauri::async_runtime::block_on(state.finish_shutdown());
+            #[cfg(unix)]
+            if let Some(program) = restart_program
+                && std::process::Command::new(program)
+                    .args(std::env::args_os().skip(1))
+                    .spawn()
+                    .is_err()
+            {
+                eprintln!("market-squawk-desktop: failed to restart the selected release");
+            }
         }
         _ => {}
     });

@@ -1,5 +1,7 @@
 //! Least-privilege Tauri bridge over the existing local application authorities.
 
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -13,9 +15,11 @@ use market_squawk::{
 };
 use market_squawk_data::CatalogLimit;
 use market_squawk_installer::{
-    RepairRequest, RollbackRequest, UninstallRequest, repair, rollback,
-    status as installation_status, uninstall, update_from_channel,
+    CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, UninstallRequest,
+    repair, rollback, status as installation_status, uninstall, update_from_channel,
 };
+#[cfg(unix)]
+use market_squawk_installer::{ProgramName, stable_program_path};
 use market_squawk_platform::SecretValue;
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
@@ -86,6 +90,8 @@ pub(crate) struct DesktopState {
     installation_root: PathBuf,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     cancellation: CancellationToken,
+    #[cfg(unix)]
+    restart_program: OnceLock<PathBuf>,
 }
 
 impl DesktopState {
@@ -103,7 +109,24 @@ impl DesktopState {
             installation_root,
             portal_activation,
             cancellation: CancellationToken::new(),
+            #[cfg(unix)]
+            restart_program: OnceLock::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn schedule_restart(&self, program: PathBuf) -> Result<(), DesktopCommandError> {
+        self.restart_program.set(program).map_err(|_| {
+            DesktopCommandError::new(
+                "installation_restart_pending",
+                "Market Squawk is already restarting into the selected release.",
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn scheduled_restart_program(&self) -> Option<PathBuf> {
+        self.restart_program.get().cloned()
     }
 
     fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
@@ -478,10 +501,27 @@ pub(crate) async fn installation_control(
             }))
         }
         InstallationControlCommand::Update => {
-            update_from_channel(&root)
-                .await
-                .map_err(map_installation_error)?;
-            app.restart()
+            let receipt = match update_from_channel(&root).await {
+                Ok(receipt) => receipt,
+                Err(CommandError::Lifecycle(InstallError::UpdateNotNewer)) => {
+                    let current = blocking_installation(move || installation_status(&root)).await?;
+                    return Ok(json!({
+                        "action": "update",
+                        "status": current,
+                        "receipt": null,
+                        "restartRequired": false,
+                    }));
+                }
+                Err(error) => return Err(map_installation_error(error)),
+            };
+            let current = prepare_installation_restart(root, &state).await?;
+            request_installation_restart(&app);
+            Ok(json!({
+                "action": "update",
+                "status": current,
+                "receipt": receipt,
+                "restartRequired": true,
+            }))
         }
         InstallationControlCommand::Repair => {
             let operation_root = root.clone();
@@ -497,8 +537,17 @@ pub(crate) async fn installation_control(
         }
         InstallationControlCommand::Rollback => {
             let operation_root = root.clone();
-            blocking_installation(move || rollback(RollbackRequest::new(operation_root))).await?;
-            app.restart()
+            let receipt =
+                blocking_installation(move || rollback(RollbackRequest::new(operation_root)))
+                    .await?;
+            let current = prepare_installation_restart(root, &state).await?;
+            request_installation_restart(&app);
+            Ok(json!({
+                "action": "rollback",
+                "status": current,
+                "receipt": receipt,
+                "restartRequired": true,
+            }))
         }
         InstallationControlCommand::Uninstall => {
             let receipt =
@@ -520,6 +569,35 @@ pub(crate) async fn installation_control(
             }))
         }
     }
+}
+
+async fn prepare_installation_restart(
+    root: PathBuf,
+    state: &DesktopState,
+) -> Result<InstallStatus, DesktopCommandError> {
+    let status_root = root.clone();
+    let current = blocking_installation(move || installation_status(&status_root)).await?;
+    #[cfg(unix)]
+    {
+        let program =
+            blocking_installation(move || stable_program_path(&root, ProgramName::Desktop)).await?;
+        state.schedule_restart(program)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, state);
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn request_installation_restart(app: &tauri::AppHandle) {
+    app.exit(0);
+}
+
+#[cfg(not(unix))]
+fn request_installation_restart(app: &tauri::AppHandle) -> ! {
+    app.restart()
 }
 
 async fn blocking_installation<T>(
