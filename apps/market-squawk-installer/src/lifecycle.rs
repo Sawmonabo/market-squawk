@@ -16,8 +16,8 @@ use crate::archive::{
 #[cfg(unix)]
 use crate::archive::{set_component_permissions, verify_component};
 use crate::contracts::{
-    InstallReceipt, InstallRequest, InstallStatus, RepairRequest, RollbackRequest,
-    UninstallReceipt, UninstallRequest, UpdateRequest,
+    InstallReceipt, InstallRequest, InstallStatus, ProgramInstallSnapshot, RepairRequest,
+    RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
@@ -236,7 +236,73 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
     let healthy =
         verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok()
             && verify_stable_programs(&store, &state).is_ok();
-    Ok(InstallStatus {
+    Ok(installed_status(&state, healthy))
+}
+
+/// Revalidates startup status, one requested program, and the retained recovery source under one
+/// installer lock.
+///
+/// # Errors
+///
+/// Fails when the store or selector is unsafe or corrupt, or when a healthy selected release does
+/// not contain the requested executable for the current platform. Component or recovery-cache
+/// corruption is reported through the returned snapshot rather than treated as readiness.
+pub fn program_install_snapshot(
+    root: &Path,
+    program: ProgramName,
+) -> Result<ProgramInstallSnapshot, InstallError> {
+    let Some(store) = InstallStore::open_existing(root)? else {
+        return Ok(ProgramInstallSnapshot::absent());
+    };
+    recover_pending_activation(&store)?;
+    let Some(state) = store.load_state()? else {
+        return Ok(ProgramInstallSnapshot::absent());
+    };
+    let active_release_root = store.version_path(&state.active);
+    let healthy = verify_installed_tree(&active_release_root, &state.active.components).is_ok()
+        && verify_stable_programs(&store, &state).is_ok();
+    let recovery_ready = read_cached_release(&store, &state.active).is_ok();
+    let status = installed_status(&state, healthy);
+    if !healthy {
+        return Ok(ProgramInstallSnapshot {
+            status,
+            active_release_root: None,
+            program_path: None,
+            recovery_ready,
+        });
+    }
+    if state.active.target != crate::platform::SupportedTarget::current()? {
+        return Err(InstallError::CorruptInstallation);
+    }
+    let relative = program.relative_path(state.active.target);
+    let portable = relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .ok_or(InstallError::CorruptInstallation)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    if !state
+        .active
+        .components
+        .iter()
+        .any(|receipt| receipt.path.as_ref() == portable && receipt.executable)
+    {
+        return Err(InstallError::CorruptInstallation);
+    }
+    Ok(ProgramInstallSnapshot {
+        status,
+        program_path: Some(active_release_root.join(relative)),
+        active_release_root: Some(active_release_root),
+        recovery_ready,
+    })
+}
+
+fn installed_status(state: &InstallationState, healthy: bool) -> InstallStatus {
+    InstallStatus {
         installed: true,
         active_version: Some(state.active.version.clone()),
         previous_version: state
@@ -247,7 +313,7 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
         manifest_sha256: Some(state.active.manifest_sha256.clone()),
         channel_manifest_url: state.channel_manifest_url.clone(),
         healthy,
-    })
+    }
 }
 
 /// Returns the revalidated active immutable release root.

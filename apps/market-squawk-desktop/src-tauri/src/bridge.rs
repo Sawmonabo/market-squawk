@@ -17,7 +17,7 @@ use market_squawk_installer::{
     CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
     status as installation_status, update_from_channel,
 };
-use market_squawk_installer::{ProgramName, active_program_path};
+use market_squawk_installer::{ProgramName, program_install_snapshot};
 #[cfg(not(target_os = "windows"))]
 use market_squawk_installer::{UninstallRequest, uninstall};
 use market_squawk_platform::SecretValue;
@@ -88,6 +88,7 @@ pub(crate) struct DesktopState {
     config: AppConfig,
     config_path: Option<PathBuf>,
     installation_root: PathBuf,
+    installation_status: InstallStatus,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     cancellation: CancellationToken,
     restart_program: OnceLock<PathBuf>,
@@ -99,6 +100,7 @@ impl DesktopState {
         config: AppConfig,
         config_path: Option<PathBuf>,
         installation_root: PathBuf,
+        installation_status: InstallStatus,
     ) -> Self {
         let portal_activation = product.provider_portal_activation();
         Self {
@@ -106,6 +108,7 @@ impl DesktopState {
             config,
             config_path,
             installation_root,
+            installation_status,
             portal_activation,
             cancellation: CancellationToken::new(),
             restart_program: OnceLock::new(),
@@ -201,8 +204,7 @@ impl DesktopState {
                 "A complete local MCP client instruction could not be generated from verified installed state.",
             )
         };
-        let installation = installation_status(&self.installation_root)
-            .map_err(|_error| DesktopCommandError::internal())?;
+        let installation = &self.installation_status;
         let installation = if installation.is_installed() && installation.is_healthy() {
             Readiness::new(
                 ReadinessState::Ready,
@@ -599,10 +601,14 @@ async fn prepare_installation_restart(
     root: PathBuf,
     state: &DesktopState,
 ) -> Result<InstallStatus, DesktopCommandError> {
-    let status_root = root.clone();
-    let current = blocking_installation(move || installation_status(&status_root)).await?;
-    let program =
-        blocking_installation(move || active_program_path(&root, ProgramName::Desktop)).await?;
+    let snapshot =
+        blocking_installation(move || program_install_snapshot(&root, ProgramName::Desktop))
+            .await?;
+    let current = snapshot.status().clone();
+    let program = snapshot
+        .program_path()
+        .ok_or_else(DesktopCommandError::internal)?
+        .to_path_buf();
     state.schedule_restart(program)?;
     Ok(current)
 }

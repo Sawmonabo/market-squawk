@@ -11,13 +11,13 @@ mod store;
 pub use self::archive::ArchiveError;
 pub use self::command::{CommandError, run_cli, update_from_channel};
 pub use self::contracts::{
-    InstallReceipt, InstallRequest, InstallStatus, MutableDataClass, RepairRequest,
-    RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
+    InstallReceipt, InstallRequest, InstallStatus, MutableDataClass, ProgramInstallSnapshot,
+    RepairRequest, RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
     InstallError, active_program_path, active_release_root,
-    active_release_root_for_installed_program, install, repair, rollback, stable_program_path,
-    status, uninstall, update,
+    active_release_root_for_installed_program, install, program_install_snapshot, repair, rollback,
+    stable_program_path, status, uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
@@ -41,14 +41,13 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use super::{
-        ComponentRole, InstallError, InstallRequest, MutableDataClass, RepairRequest,
+        ComponentRole, InstallError, InstallRequest, MutableDataClass, ProgramName, RepairRequest,
         RollbackRequest, StoreError, SupportedTarget, UninstallRequest, UpdateRequest, install,
-        repair, rollback, status, uninstall, update,
+        program_install_snapshot, repair, rollback, status, uninstall, update,
     };
     #[cfg(unix)]
     use super::{
-        ProgramName, active_release_root, active_release_root_for_installed_program,
-        stable_program_path,
+        active_release_root, active_release_root_for_installed_program, stable_program_path,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -239,12 +238,22 @@ mod tests {
             fs::set_permissions(&release_cache, permissions)?;
         }
         fs::write(&release_cache, b"damaged cache")?;
+        let damaged_recovery = program_install_snapshot(&root, ProgramName::Cli)?;
+        assert!(damaged_recovery.status().is_healthy());
+        assert!(!damaged_recovery.recovery_ready());
         repair(RepairRequest::from_local(
             root.clone(),
             &first.manifest,
             &first.bundle,
         )?)?;
         assert_eq!(fs::read(&release_cache)?, fs::read(&first.bundle)?);
+        assert!(program_install_snapshot(&root, ProgramName::Cli)?.recovery_ready());
+
+        let retired_release_cache = root.join("staging/release-retired-fixture");
+        fs::create_dir(&retired_release_cache)?;
+        fs::write(retired_release_cache.join("retained"), b"remove")?;
+        assert!(status(&root)?.is_healthy());
+        assert!(!retired_release_cache.exists());
 
         #[cfg(unix)]
         {
@@ -548,11 +557,19 @@ mod tests {
         assert!(!root.exists());
         assert_eq!(fs::read(data.join("portfolio.json"))?, b"preserve");
 
+        let detached = temporary.path().join(format!(
+            ".market-squawk-program-removing-{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        fs::create_dir(&detached)?;
+        fs::write(detached.join("retained"), b"remove")?;
+
         let receipt = uninstall(
             UninstallRequest::preserving_data(root)
                 .confirm_delete(MutableDataClass::Portfolios, data.clone()),
         )?;
         assert!(!receipt.removed_program());
+        assert!(!detached.exists());
         assert!(!data.exists());
         Ok(())
     }

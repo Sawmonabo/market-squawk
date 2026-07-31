@@ -34,6 +34,7 @@ const ENTRYPOINTS_DIRECTORY: &str = "bin";
 #[cfg(unix)]
 const UNIX_STICKY_BIT: u32 = 0o1000;
 const LOCK_FILE: &str = ".market-squawk-installer.lock";
+const UNINSTALL_QUARANTINE_PREFIX: &str = ".market-squawk-program-removing-";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -202,6 +203,7 @@ impl InstallStore {
             .map_err(|source| StoreError::io("create installation parent", source))?;
         validate_store_parent(parent)?;
         let lock = acquire_lock(parent)?;
+        clear_detached_uninstalls(parent)?;
 
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
@@ -232,6 +234,18 @@ impl InstallStore {
     }
 
     pub(crate) fn open_existing(root: &Path) -> Result<Option<Self>, StoreError> {
+        let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => return Err(StoreError::UnsafeRoot),
+            Err(source) => {
+                return Err(StoreError::io("inspect installation parent", source));
+            }
+        }
+        validate_store_parent(parent)?;
+        let lock = acquire_lock(parent)?;
+        clear_detached_uninstalls(parent)?;
         match fs::symlink_metadata(root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
@@ -240,9 +254,6 @@ impl InstallStore {
                 return Err(StoreError::io("inspect installation root", source));
             }
         }
-        let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
-        validate_store_parent(parent)?;
-        let lock = acquire_lock(parent)?;
         set_private_directory_permissions(root)?;
         let store = Self {
             root: root.to_path_buf(),
@@ -565,7 +576,7 @@ impl InstallStore {
     pub(crate) fn quarantine_for_uninstall(&self) -> Result<PathBuf, StoreError> {
         let parent = self.root.parent().ok_or(StoreError::UnsafeRoot)?;
         let quarantine = parent.join(format!(
-            ".market-squawk-program-removing-{}",
+            "{UNINSTALL_QUARANTINE_PREFIX}{}",
             Uuid::new_v4().as_simple()
         ));
         fs::rename(&self.root, &quarantine)
@@ -607,9 +618,11 @@ impl InstallStore {
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|source| StoreError::io("inspect staging entry", source))?;
             if entry.file_name().to_str().is_some_and(|name| {
-                name.starts_with("corrupt-") || name.starts_with("entrypoints-retired-")
+                name.starts_with("corrupt-")
+                    || name.starts_with("entrypoints-retired-")
+                    || name.starts_with("release-retired-")
             }) {
-                let _cleanup = remove_quarantined_entry(&path);
+                remove_quarantined_entry(&path)?;
             } else if !metadata.is_dir() || is_directory_redirect(&metadata) {
                 return Err(StoreError::UnsafeRoot);
             } else {
@@ -676,6 +689,27 @@ impl InstallStore {
         }
         Ok(entries)
     }
+}
+
+fn clear_detached_uninstalls(parent: &Path) -> Result<(), StoreError> {
+    let mut removed = false;
+    for entry in
+        fs::read_dir(parent).map_err(|source| StoreError::io("read installation parent", source))?
+    {
+        let entry =
+            entry.map_err(|source| StoreError::io("read installation parent entry", source))?;
+        if entry.file_name().to_str().is_some_and(|name| {
+            name.strip_prefix(UNINSTALL_QUARANTINE_PREFIX)
+                .is_some_and(|suffix| suffix.len() == 32 && Uuid::parse_str(suffix).is_ok())
+        }) {
+            remove_quarantined_entry(&entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn remove_tree(path: &Path) -> Result<(), StoreError> {

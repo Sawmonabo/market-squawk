@@ -288,6 +288,58 @@ impl InstallStatus {
     }
 }
 
+/// One revalidated installed-program view for startup composition.
+///
+/// Paths are present only when the active release, stable entrypoints, target, and requested
+/// executable all pass one locked verification. Recovery readiness independently reports whether
+/// the exact retained release cache can reconstruct that active release.
+#[derive(Clone, Debug)]
+pub struct ProgramInstallSnapshot {
+    pub(crate) status: InstallStatus,
+    pub(crate) active_release_root: Option<PathBuf>,
+    pub(crate) program_path: Option<PathBuf>,
+    pub(crate) recovery_ready: bool,
+}
+
+impl ProgramInstallSnapshot {
+    /// Returns the status derived from the same locked verification.
+    pub const fn status(&self) -> &InstallStatus {
+        &self.status
+    }
+
+    /// Returns the verified active immutable release root.
+    pub fn active_release_root(&self) -> Option<&Path> {
+        self.active_release_root.as_deref()
+    }
+
+    /// Returns the verified requested program in the active release.
+    pub fn program_path(&self) -> Option<&Path> {
+        self.program_path.as_deref()
+    }
+
+    /// Returns whether the retained exact release cache passed complete verification.
+    pub const fn recovery_ready(&self) -> bool {
+        self.recovery_ready
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            status: InstallStatus {
+                installed: false,
+                active_version: None,
+                previous_version: None,
+                target: None,
+                manifest_sha256: None,
+                channel_manifest_url: None,
+                healthy: false,
+            },
+            active_release_root: None,
+            program_path: None,
+            recovery_ready: false,
+        }
+    }
+}
+
 /// Completed uninstall receipt.
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]

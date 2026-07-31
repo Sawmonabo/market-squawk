@@ -217,7 +217,13 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let product_config = config.clone();
     let product =
         tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(product, config, config_path, installation.root);
+    let state = DesktopState::new(
+        product,
+        config,
+        config_path,
+        installation.root,
+        installation.status,
+    );
     if !app.manage(state) {
         return Err(DesktopStartupError::DuplicateState);
     }
@@ -246,6 +252,8 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupError> {
     let mut command = std::process::Command::new(program);
     command.args(std::env::args_os().skip(1));
+    #[cfg(target_os = "linux")]
+    command.env_remove("APPIMAGE").env_remove("APPDIR");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
