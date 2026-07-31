@@ -200,14 +200,8 @@ impl InstallStore {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         fs::create_dir_all(parent)
             .map_err(|source| StoreError::io("create installation parent", source))?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: validate parent {}", parent.display());
         validate_store_parent(parent)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: acquire lock");
         let lock = acquire_lock(parent)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: lock acquired");
 
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() && !is_directory_redirect(&metadata) => {}
@@ -220,39 +214,20 @@ impl InstallStore {
                 return Err(StoreError::io("inspect installation root", source));
             }
         }
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: secure root {}", root.display());
         set_private_directory_permissions(root)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: root secured");
 
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
         };
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: prepare reserved directories");
         store.prepare_reserved_directories()?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reserved directories prepared");
         #[cfg(windows)]
         {
-            #[cfg(test)]
-            eprintln!("installer-store: verify root and staging");
             verify_private_windows_path(&store.root, true)?;
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
-            #[cfg(test)]
-            eprintln!("installer-store: root and staging verified");
         }
         store.clear_staging()?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: staging cleared");
-        #[cfg(windows)]
-        {
-            store.verify_private_windows_tree()?;
-            #[cfg(test)]
-            eprintln!("installer-store: private tree verified");
-        }
+        store.normalize_private_permissions()?;
         Ok(store)
     }
 
@@ -267,37 +242,20 @@ impl InstallStore {
         }
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         validate_store_parent(parent)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reopen acquire lock");
         let lock = acquire_lock(parent)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reopen lock acquired");
         set_private_directory_permissions(root)?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reopen root secured");
         let store = Self {
             root: root.to_path_buf(),
             _lock: lock,
         };
         store.prepare_reserved_directories()?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reopen reserved directories prepared");
         #[cfg(windows)]
         {
             verify_private_windows_path(&store.root, true)?;
             verify_private_windows_path(&store.root.join(STAGING_DIRECTORY), true)?;
-            #[cfg(test)]
-            eprintln!("installer-store: reopen root and staging verified");
         }
         store.clear_staging()?;
-        #[cfg(all(test, windows))]
-        eprintln!("installer-store: reopen staging cleared");
-        #[cfg(windows)]
-        {
-            store.verify_private_windows_tree()?;
-            #[cfg(test)]
-            eprintln!("installer-store: reopen private tree verified");
-        }
+        store.normalize_private_permissions()?;
         Ok(Some(store))
     }
 
@@ -661,18 +619,37 @@ impl InstallStore {
         Ok(())
     }
 
+    pub(crate) fn normalize_private_permissions(&self) -> Result<(), StoreError> {
+        #[cfg(windows)]
+        {
+            let entries = self.private_windows_entries()?;
+            let mut requires_normalization = false;
+            for (path, directory) in &entries {
+                match verify_private_windows_path(path, *directory) {
+                    Ok(()) => {}
+                    Err(StoreError::UnsafeRoot) => requires_normalization = true,
+                    Err(error) => return Err(error),
+                }
+            }
+            if requires_normalization {
+                for (path, directory) in &entries {
+                    secure_private_windows_path(path, *directory)?;
+                }
+            }
+            for (path, directory) in entries {
+                verify_private_windows_path(&path, directory)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(windows)]
-    fn verify_private_windows_tree(&self) -> Result<(), StoreError> {
+    fn private_windows_entries(&self) -> Result<Vec<(PathBuf, bool)>, StoreError> {
         let mut directories = vec![self.root.clone()];
+        let mut entries = vec![(self.root.clone(), true)];
         let mut cursor = 0;
         while cursor < directories.len() {
             let directory = &directories[cursor];
-            #[cfg(test)]
-            eprintln!(
-                "installer-store: verify private directory {}",
-                directory.display()
-            );
-            verify_private_windows_path(directory, true)?;
             for entry in fs::read_dir(directory)
                 .map_err(|source| StoreError::io("read protected installation tree", source))?
             {
@@ -687,18 +664,17 @@ impl InstallStore {
                     return Err(StoreError::UnsafeRoot);
                 }
                 if metadata.is_dir() {
-                    directories.push(path);
+                    directories.push(path.clone());
+                    entries.push((path, true));
                 } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-                    #[cfg(test)]
-                    eprintln!("installer-store: verify private file {}", path.display());
-                    verify_private_windows_path(&path, false)?;
+                    entries.push((path, false));
                 } else {
                     return Err(StoreError::UnsafeRoot);
                 }
             }
             cursor += 1;
         }
-        Ok(())
+        Ok(entries)
     }
 }
 
@@ -924,11 +900,6 @@ pub(crate) fn validate_store_parent(path: &Path) -> Result<(), StoreError> {
     }
     #[cfg(windows)]
     for (depth, ancestor) in path.ancestors().enumerate() {
-        #[cfg(test)]
-        eprintln!(
-            "installer-store: validate ancestor depth={depth} path={}",
-            ancestor.display()
-        );
         verify_exclusive_windows_parent(ancestor, depth == 0)?;
     }
     Ok(())
@@ -1009,7 +980,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
     }
     #[cfg(windows)]
     {
-        secure_private_windows_directory(path)?;
+        secure_private_windows_path(path, true)?;
     }
     Ok(())
 }
@@ -1160,7 +1131,7 @@ fn verify_private_windows_path(path: &Path, directory: bool) -> Result<(), Store
 }
 
 #[cfg(windows)]
-fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
+fn secure_private_windows_path(path: &Path, directory: bool) -> Result<(), StoreError> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     use windows_permissions::constants::AccessRights;
@@ -1171,21 +1142,27 @@ fn secure_private_windows_directory(path: &Path) -> Result<(), StoreError> {
 
     let access = AccessRights::ReadControl | AccessRights::WriteDac | AccessRights::WriteOwner;
     let mut options = OpenOptions::new();
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
     options
         .read(true)
         .access_mode(access.bits())
         .share_mode(FILE_SHARE_READ_WRITE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let mut directory = options
+        .custom_flags(flags);
+    let mut entry = options
         .open(path)
-        .map_err(|source| StoreError::io("open controlled directory authority", source))?;
-    let metadata = directory
+        .map_err(|source| StoreError::io("open controlled entry authority", source))?;
+    let metadata = entry
         .metadata()
-        .map_err(|source| StoreError::io("inspect controlled directory handle", source))?;
-    if !metadata.is_dir() || is_directory_redirect(&metadata) {
+        .map_err(|source| StoreError::io("inspect controlled entry handle", source))?;
+    if metadata.is_dir() != directory || is_directory_redirect(&metadata) {
         return Err(StoreError::UnsafeRoot);
     }
-    secure_private_windows_handle(&mut directory, true)
+    secure_private_windows_handle(&mut entry, directory)
 }
 
 #[cfg(windows)]
@@ -1244,11 +1221,6 @@ fn verify_private_windows_handle(
     .map_err(|source| StoreError::io("verify controlled directory ACL", source))?;
     let observed_owner = secured.owner().map(|owner| owner.to_string());
     if observed_owner.as_deref() != Some(current_user.as_str()) {
-        #[cfg(test)]
-        eprintln!(
-            "installer-store: private ACL owner rejected observed={observed_owner:?} \
-             expected={current_user}"
-        );
         return Err(StoreError::UnsafeRoot);
     }
     let secured_dacl = secured.dacl().ok_or(StoreError::UnsafeRoot)?;
@@ -1268,36 +1240,15 @@ fn verify_private_windows_handle(
             .sid()
             .is_none_or(|allowed| allowed.to_string() != current_user)
     {
-        #[cfg(test)]
-        eprintln!(
-            "installer-store: private ACL rejected directory={directory} \
-             require_protected={require_protected} ace_count={} ace_type={:?} flags={:?} \
-             mask={:#010x} sid={:?} expected_sid={current_user}",
-            secured_dacl.len(),
-            ace.ace_type(),
-            ace.flags(),
-            ace.mask().bits(),
-            ace.sid().map(|sid| sid.to_string())
-        );
         return Err(StoreError::UnsafeRoot);
     }
     let dacl_sddl =
         ConvertSecurityDescriptorToStringSecurityDescriptor(&secured, SecurityInformation::Dacl)
             .map_err(|source| StoreError::io("verify private directory ACL protection", source))?;
     if require_protected && !dacl_sddl.to_string_lossy().starts_with("D:P") {
-        #[cfg(test)]
-        eprintln!(
-            "installer-store: private ACL is not protected sddl={}",
-            dacl_sddl.to_string_lossy()
-        );
         return Err(StoreError::UnsafeRoot);
     }
     if !require_protected && !inherited && !dacl_sddl.to_string_lossy().starts_with("D:P") {
-        #[cfg(test)]
-        eprintln!(
-            "installer-store: private ACL is neither inherited nor protected sddl={}",
-            dacl_sddl.to_string_lossy()
-        );
         return Err(StoreError::UnsafeRoot);
     }
     Ok(())

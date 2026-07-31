@@ -64,7 +64,11 @@ pub(crate) fn prepare(
                     UpdateRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,
                 )?;
-            } else if packaged.version == active {
+            } else if packaged.version == active
+                && (!current.is_healthy()
+                    || current.channel_manifest_url()
+                        != Some(packaged.channel_manifest_url.as_ref()))
+            {
                 repair(
                     RepairRequest::from_local(root.clone(), &packaged.manifest, &packaged.bundle)?
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,
@@ -84,7 +88,8 @@ pub(crate) fn prepare(
                     }
                     Err(error) => return Err(error.into()),
                 }
-            } else {
+            } else if current.channel_manifest_url() != Some(packaged.channel_manifest_url.as_ref())
+            {
                 repair(
                     RepairRequest::new(root.clone())
                         .with_channel_manifest_url(&packaged.channel_manifest_url)?,

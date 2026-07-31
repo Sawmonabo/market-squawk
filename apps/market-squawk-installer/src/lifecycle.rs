@@ -109,9 +109,8 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     let store = InstallStore::open_existing(&root)?.ok_or(InstallError::NotInstalled)?;
     recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
-    if let Some((release, bundle)) = supplied_release.as_ref() {
+    if let Some((release, _)) = supplied_release.as_ref() {
         validate_recovery_release(&state.active, release)?;
-        verify_bundle(bundle, &release.target_release().archive)?;
     }
     let active_path = store.version_path(&state.active);
     if verify_installed_tree(&active_path, &state.active.components).is_ok() {
@@ -159,6 +158,7 @@ fn complete_repair(
     } else if publish_programs {
         publish_stable_programs(store, state)?;
     }
+    store.normalize_private_permissions()?;
     receipt(state, repaired)
 }
 
@@ -482,6 +482,7 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
     publish_stable_programs(store, &state)?;
     store.prune(&state)?;
     store.clear_pending_activation()?;
+    store.normalize_private_permissions()?;
     Ok(())
 }
 
@@ -890,22 +891,66 @@ fn verify_cached_release(directory: &Path, release: &AdmittedRelease) -> Result<
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(InstallError::CorruptInstallation);
     }
-    let manifest = read_bounded_file(
-        &directory.join(CACHED_MANIFEST_FILE),
-        MAXIMUM_MANIFEST_BYTES,
-    )?;
+    verify_cache_directory_sealed(directory)?;
+    let manifest_path = directory.join(CACHED_MANIFEST_FILE);
+    let bundle_path = directory.join(CACHED_BUNDLE_FILE);
+    verify_cache_file_sealed(&manifest_path)?;
+    verify_cache_file_sealed(&bundle_path)?;
+    let manifest = read_bounded_file(&manifest_path, MAXIMUM_MANIFEST_BYTES)?;
     if manifest.as_slice() != release.manifest_bytes()
-        || sha256_file(
-            &directory.join(CACHED_MANIFEST_FILE),
-            MAXIMUM_MANIFEST_BYTES as u64,
-        )? != release.manifest_sha256()
+        || sha256_file(&manifest_path, MAXIMUM_MANIFEST_BYTES as u64)? != release.manifest_sha256()
     {
         return Err(InstallError::CorruptInstallation);
     }
-    verify_bundle(
-        &directory.join(CACHED_BUNDLE_FILE),
-        &release.target_release().archive,
-    )?;
+    verify_bundle(&bundle_path, &release.target_release().archive)?;
+    Ok(())
+}
+
+fn verify_cache_directory_sealed(path: &Path) -> Result<(), InstallError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if fs::symlink_metadata(path)
+            .map_err(|source| InstallError::Io {
+                operation: "inspect retained release directory permissions",
+                source,
+            })?
+            .permissions()
+            .mode()
+            & 0o777
+            != 0o500
+        {
+            return Err(InstallError::CorruptInstallation);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn verify_cache_file_sealed(path: &Path) -> Result<(), InstallError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| InstallError::Io {
+        operation: "inspect retained release file permissions",
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(InstallError::CorruptInstallation);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o777 != 0o400 {
+            return Err(InstallError::CorruptInstallation);
+        }
+    }
+    #[cfg(windows)]
+    if !metadata.permissions().readonly() {
+        return Err(InstallError::CorruptInstallation);
+    }
     Ok(())
 }
 
