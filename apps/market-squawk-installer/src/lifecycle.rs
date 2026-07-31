@@ -597,7 +597,7 @@ struct ConfirmedDataDeletion {
 
 impl ConfirmedDataDeletion {
     fn open(class: crate::contracts::MutableDataClass, path: &Path) -> Result<Self, InstallError> {
-        let named_metadata = match fs::symlink_metadata(path) {
+        match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self {
                     class,
@@ -605,7 +605,7 @@ impl ConfirmedDataDeletion {
                     directory: None,
                 });
             }
-            Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => metadata,
+            Ok(metadata) if metadata.is_dir() && !is_path_redirect(&metadata) => {}
             Ok(_) => return Err(InstallError::UnsafeDataRoot),
             Err(source) => {
                 return Err(InstallError::Io {
@@ -613,7 +613,7 @@ impl ConfirmedDataDeletion {
                     source,
                 });
             }
-        };
+        }
 
         let parent_path = path.parent().ok_or(InstallError::UnsafeDataRoot)?;
         match validate_store_parent(parent_path) {
@@ -633,13 +633,25 @@ impl ConfirmedDataDeletion {
                 operation: "open confirmed mutable data root",
                 source,
             })?;
+        let named_directory =
+            parent
+                .open_dir_nofollow(name)
+                .map_err(|source| InstallError::Io {
+                    operation: "reopen named mutable data root",
+                    source,
+                })?;
         let opened_metadata = directory
             .dir_metadata()
             .map_err(|source| InstallError::Io {
                 operation: "inspect confirmed mutable data root",
                 source,
             })?;
-        let named_metadata = cap_std::fs::Metadata::from_just_metadata(named_metadata);
+        let named_metadata = named_directory
+            .dir_metadata()
+            .map_err(|source| InstallError::Io {
+                operation: "inspect named mutable data root",
+                source,
+            })?;
         if !same_directory_identity(&named_metadata, &opened_metadata) {
             return Err(InstallError::UnsafeDataRoot);
         }
@@ -669,29 +681,10 @@ impl ConfirmedDataDeletion {
     }
 }
 
-#[cfg(unix)]
 fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
+    use cap_fs_ext::MetadataExt as _;
 
     left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-
-    left.is_dir()
-        && right.is_dir()
-        && matches!(
-            (
-                left.volume_serial_number(),
-                left.file_index(),
-                right.volume_serial_number(),
-                right.file_index(),
-            ),
-            (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
-                if left_volume == right_volume && left_index == right_index
-        )
 }
 
 fn prepare_candidate(
