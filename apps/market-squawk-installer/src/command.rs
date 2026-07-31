@@ -512,39 +512,11 @@ fn portable_relative_path(path: &Path) -> Result<String, CommandError> {
 }
 
 fn component_role(path: &str, target: SupportedTarget) -> ComponentRole {
-    let suffix = target.executable_suffix();
-    if path == format!("bin/market-squawk-desktop{suffix}") {
-        ComponentRole::Desktop
-    } else if path == format!("bin/market-squawk{suffix}") {
-        ComponentRole::Cli
-    } else if path == format!("bin/market-squawk-capture-helper{suffix}") {
-        ComponentRole::CaptureHelper
-    } else if path == format!("bin/market-squawk-onnx-worker{suffix}") {
-        ComponentRole::OnnxWorker
-    } else if path == format!("bin/market-squawk-model-validator{suffix}") {
-        ComponentRole::ModelValidator
-    } else if path
-        == match target {
-            SupportedTarget::X86_64PcWindowsMsvc => "Scripts/market-squawk-train.exe",
-            SupportedTarget::Aarch64AppleDarwin
-            | SupportedTarget::X86_64AppleDarwin
-            | SupportedTarget::X86_64UnknownLinuxGnu => "bin/market-squawk-train",
-        }
+    if let Some(role) = ComponentRole::REQUIRED
+        .into_iter()
+        .find(|role| role.fixed_path(target).as_deref() == Some(path))
     {
-        ComponentRole::TrainingDriver
-    } else if path == format!("bin/market-squawk-installer{suffix}") {
-        ComponentRole::Installer
-    } else if path == format!("tools/uv{suffix}") {
-        ComponentRole::Uv
-    } else if path
-        == match target {
-            SupportedTarget::X86_64PcWindowsMsvc => "python.exe",
-            SupportedTarget::Aarch64AppleDarwin
-            | SupportedTarget::X86_64AppleDarwin
-            | SupportedTarget::X86_64UnknownLinuxGnu => "bin/python",
-        }
-    {
-        ComponentRole::PythonRuntime
+        role
     } else if path.starts_with("desktop/") {
         ComponentRole::DesktopResource
     } else if path.starts_with("licenses/") {

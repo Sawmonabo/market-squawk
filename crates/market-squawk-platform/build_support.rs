@@ -2,7 +2,9 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -47,6 +49,11 @@ const BACKEND_DISPATCHER_RELATIVE_PATH: &str = "benches/capture_admission/backen
 const STANDARD_BACKEND_RELATIVE_PATH: &str = "benches/capture_admission/backend/standard.rs";
 const CANDIDATE_BACKEND_RELATIVE_PATH: &str = "benches/capture_admission/backend/candidate.rs";
 const BACKEND_DIGEST_DOMAIN: &[u8] = b"market-squawk:capture-benchmark-backend:v1\0";
+
+#[cfg(windows)]
+type BoundedChild = Box<dyn process_wrap::std::ChildWrapper>;
+#[cfg(not(windows))]
+type BoundedChild = Child;
 
 /// Closed compile-time identity for the capture benchmark implementation under measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,7 +394,8 @@ fn run_command_with_charged_post_spawn_deadline_inner(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    let mut execution = BoundedExecution::new(command.spawn()?, spec.policy)?;
+    let mut execution =
+        BoundedExecution::new(spawn_bounded_child(command, spec.policy)?, spec.policy)?;
     let setup_result = execution.start_readers(
         spec.maximum_stdout,
         spec.maximum_stderr,
@@ -453,12 +461,10 @@ struct CleanupOutcome {
 
 #[derive(Debug)]
 struct BoundedExecution {
-    child: Child,
+    child: BoundedChild,
     policy: CommandPolicy,
     #[cfg(unix)]
     process_group_id: Option<rustix::process::Pid>,
-    #[cfg(windows)]
-    process_job: Option<win32job::Job>,
     stdout_reader: Option<BoundedReader>,
     stderr_reader: Option<BoundedReader>,
     status: Option<ExitStatus>,
@@ -466,9 +472,7 @@ struct BoundedExecution {
 }
 
 impl BoundedExecution {
-    fn new(child: Child, policy: CommandPolicy) -> Result<Self, Box<dyn Error>> {
-        #[cfg(windows)]
-        let mut child = child;
+    fn new(child: BoundedChild, policy: CommandPolicy) -> Result<Self, Box<dyn Error>> {
         #[cfg(unix)]
         let process_group_id = policy
             .owns_process_group()
@@ -476,29 +480,11 @@ impl BoundedExecution {
             .transpose()
             .ok()
             .flatten();
-        #[cfg(windows)]
-        let process_job = if policy.owns_process_group() {
-            match create_windows_process_job(&child) {
-                Ok(job) => Some(job),
-                Err(error) => {
-                    let _kill_result = child.kill();
-                    let _reap_result = wait_for_child_exit(&mut child, LEADER_REAP_GRACE);
-                    return Err(format!(
-                        "failed to establish Windows bounded-command containment: {error}"
-                    )
-                    .into());
-                }
-            }
-        } else {
-            None
-        };
         Ok(Self {
             child,
             policy,
             #[cfg(unix)]
             process_group_id,
-            #[cfg(windows)]
-            process_job,
             stdout_reader: None,
             stderr_reader: None,
             status: None,
@@ -515,11 +501,11 @@ impl BoundedExecution {
         test_readiness: Option<&Path>,
     ) -> Result<(), Box<dyn Error>> {
         ensure_before_execution_deadline(deadline, "stdout reader initialization")?;
-        let stdout = self
-            .child
-            .stdout
-            .take()
-            .ok_or("bounded command stdout is absent")?;
+        #[cfg(windows)]
+        let stdout = self.child.stdout().take();
+        #[cfg(not(windows))]
+        let stdout = self.child.stdout.take();
+        let stdout = stdout.ok_or("bounded command stdout is absent")?;
         self.stdout_reader = Some(bounded_reader(stdout, maximum_stdout, fault.stdout_read())?);
         if fault.second_reader_setup() {
             wait_for_test_readiness(test_readiness, deadline)?;
@@ -529,11 +515,11 @@ impl BoundedExecution {
         if fault.second_reader_setup() {
             return Err("injected second-reader setup failure".into());
         }
-        let stderr = self
-            .child
-            .stderr
-            .take()
-            .ok_or("bounded command stderr is absent")?;
+        #[cfg(windows)]
+        let stderr = self.child.stderr().take();
+        #[cfg(not(windows))]
+        let stderr = self.child.stderr.take();
+        let stderr = stderr.ok_or("bounded command stderr is absent")?;
         self.stderr_reader = Some(bounded_reader(stderr, maximum_stderr, false)?);
         ensure_before_execution_deadline(deadline, "reader initialization completion")?;
         Ok(())
@@ -625,22 +611,14 @@ impl BoundedExecution {
         };
         #[cfg(windows)]
         let group_result = if self.policy.owns_process_group() {
-            self.process_job.take().map_or_else(
-                || Err("bounded child Windows job object is absent".to_owned()),
-                |job| {
-                    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes the kernel terminate the entire
-                    // contained process tree when this final handle is closed.
-                    drop(job);
-                    Ok(())
-                },
-            )
+            self.child.start_kill().map_err(|error| error.to_string())
         } else {
             Ok(())
         };
         #[cfg(not(any(unix, windows)))]
         let group_result = Err("bounded execution has no supported process containment".to_owned());
         if self.status.is_none() {
-            let _kill_result = self.child.kill();
+            let _kill_result = start_child_kill(&mut self.child);
         }
         let leader_result = if self.status.is_none() {
             let leader_grace = cleanup_deadline
@@ -680,17 +658,6 @@ impl Drop for BoundedExecution {
             let _cleanup = self.cleanup();
         }
     }
-}
-
-#[cfg(windows)]
-fn create_windows_process_job(child: &Child) -> Result<win32job::Job, Box<dyn Error>> {
-    use std::os::windows::io::AsRawHandle as _;
-
-    let mut limits = win32job::ExtendedLimitInfo::new();
-    limits.limit_kill_on_job_close();
-    let job = win32job::Job::create_with_limit_info(&limits)?;
-    job.assign_process(child.as_raw_handle() as isize)?;
-    Ok(job)
 }
 
 fn ensure_before_execution_deadline(deadline: Instant, phase: &str) -> Result<(), Box<dyn Error>> {
@@ -1001,7 +968,10 @@ pub(crate) fn validate_process_group_support(
     Ok(())
 }
 
-fn wait_for_child_exit(child: &mut Child, grace: Duration) -> Result<ExitStatus, Box<dyn Error>> {
+fn wait_for_child_exit(
+    child: &mut BoundedChild,
+    grace: Duration,
+) -> Result<ExitStatus, Box<dyn Error>> {
     let deadline = Instant::now()
         .checked_add(grace)
         .ok_or("child exit deadline overflowed")?;
@@ -1014,4 +984,36 @@ fn wait_for_child_exit(child: &mut Child, grace: Duration) -> Result<ExitStatus,
         }
         std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
     }
+}
+
+#[cfg(windows)]
+fn spawn_bounded_child(
+    command: Command,
+    policy: CommandPolicy,
+) -> Result<BoundedChild, Box<dyn Error>> {
+    use process_wrap::std::{CommandWrap, JobObject};
+
+    let mut command = CommandWrap::from(command);
+    if policy.owns_process_group() {
+        command.wrap(JobObject);
+    }
+    command.spawn().map_err(Into::into)
+}
+
+#[cfg(not(windows))]
+fn spawn_bounded_child(
+    mut command: Command,
+    _policy: CommandPolicy,
+) -> Result<BoundedChild, Box<dyn Error>> {
+    command.spawn().map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn start_child_kill(child: &mut BoundedChild) -> std::io::Result<()> {
+    child.start_kill()
+}
+
+#[cfg(not(windows))]
+fn start_child_kill(child: &mut BoundedChild) -> std::io::Result<()> {
+    child.kill()
 }

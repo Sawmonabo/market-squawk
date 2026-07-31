@@ -205,6 +205,19 @@ impl TargetRelease {
             {
                 return Err(ManifestError::MissingRequiredRole { role });
             }
+            if let Some(expected) = role.fixed_path(self.target) {
+                let component = self
+                    .components
+                    .iter()
+                    .find(|component| component.role == role)
+                    .ok_or(ManifestError::MissingRequiredRole { role })?;
+                if component.path.as_ref() != expected {
+                    return Err(ManifestError::RequiredRolePath {
+                        role,
+                        expected: expected.into(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -287,7 +300,7 @@ pub enum ComponentRole {
 }
 
 impl ComponentRole {
-    const REQUIRED: [Self; 10] = [
+    pub(crate) const REQUIRED: [Self; 10] = [
         Self::Desktop,
         Self::Cli,
         Self::CaptureHelper,
@@ -313,6 +326,38 @@ impl ComponentRole {
                 | Self::Uv
                 | Self::PythonRuntime
         )
+    }
+
+    pub(crate) fn fixed_path(self, target: SupportedTarget) -> Option<String> {
+        let suffix = target.executable_suffix();
+        match self {
+            Self::Desktop => Some(format!("bin/market-squawk-desktop{suffix}")),
+            Self::Cli => Some(format!("bin/market-squawk{suffix}")),
+            Self::CaptureHelper => Some(format!("bin/market-squawk-capture-helper{suffix}")),
+            Self::OnnxWorker => Some(format!("bin/market-squawk-onnx-worker{suffix}")),
+            Self::ModelValidator => Some(format!("bin/market-squawk-model-validator{suffix}")),
+            Self::TrainingDriver => Some(
+                match target {
+                    SupportedTarget::X86_64PcWindowsMsvc => "Scripts/market-squawk-train.exe",
+                    SupportedTarget::Aarch64AppleDarwin
+                    | SupportedTarget::X86_64AppleDarwin
+                    | SupportedTarget::X86_64UnknownLinuxGnu => "bin/market-squawk-train",
+                }
+                .to_owned(),
+            ),
+            Self::Installer => Some(format!("bin/market-squawk-installer{suffix}")),
+            Self::Uv => Some(format!("tools/uv{suffix}")),
+            Self::PythonRuntime => Some(
+                match target {
+                    SupportedTarget::X86_64PcWindowsMsvc => "python.exe",
+                    SupportedTarget::Aarch64AppleDarwin
+                    | SupportedTarget::X86_64AppleDarwin
+                    | SupportedTarget::X86_64UnknownLinuxGnu => "bin/python",
+                }
+                .to_owned(),
+            ),
+            Self::PythonEnvironment | Self::DesktopResource | Self::License | Self::Notice => None,
+        }
     }
 }
 
@@ -386,6 +431,14 @@ pub enum ManifestError {
     MissingRequiredRole {
         /// Missing or duplicated role.
         role: ComponentRole,
+    },
+    /// A singleton role was assigned to a path other than its platform-defined program path.
+    #[error("release manifest {role:?} role must use the fixed path {expected}")]
+    RequiredRolePath {
+        /// Role whose component was misplaced.
+        role: ComponentRole,
+        /// Code-owned path required for the selected target.
+        expected: Box<str>,
     },
     /// Current platform detection failed.
     #[error(transparent)]

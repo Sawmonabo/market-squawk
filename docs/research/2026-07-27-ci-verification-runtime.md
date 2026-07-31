@@ -9,7 +9,7 @@ approximately one-hour Linux verification feedback loop.
 | Audience | Maintainers, CI owners, release reviewers |
 | Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-30 |
+| Last substantive review | 2026-07-31 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Latest diagnosed candidate | `49ff79d10877516fc403796fe31771ac0e3ad014` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
@@ -832,6 +832,24 @@ timestamp precision. Candidate `d02a2f1` subsequently passed all 48 Windows plat
 configuration/security tests, supplying the hosted evidence that candidate `0039429` could not
 reach.
 
+### Windows build-helper descendant containment
+
+The development build helper previously spawned a process and assigned it to a Job Object
+afterward. That ordering leaves a race in which the new process can create a descendant before job
+membership exists. Microsoft documents that Job Objects manage associated process groups and that
+new child processes join the parent's job by default, but that inheritance protects descendants
+only after the parent is already associated
+([Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)).
+
+The corrected Windows boundary uses `process-wrap 9.1.0`'s standard-library `JobObject` wrapper.
+Its implementation creates the process suspended, assigns it to the Job Object, and resumes the
+primary thread only after assignment succeeds
+([`process-wrap` Job Object implementation](https://docs.rs/process-wrap/9.1.0/src/process_wrap/std/job_object.rs.html)).
+Job ownership therefore exists before application code can create descendants, and terminating the
+wrapped child terminates the owned job. The dependency is Windows-only, keeps the workspace's
+`unsafe_code = "forbid"` boundary, and replaces the post-spawn assignment rather than adding a
+second containment layer.
+
 ### Tokio runtime topology and paper-recovery sequence handoff
 
 The Kraken production verticals formerly used plain `#[tokio::test]`. Tokio 1.53.1 documents that
@@ -1034,6 +1052,7 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [Microsoft Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
 - [Microsoft Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
+- [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
 - [Microsoft `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
 - [Microsoft `CreateFileW` sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 - [Microsoft `GetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
@@ -1048,6 +1067,7 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [`fs2 0.4.3` Windows locking implementation](https://github.com/danburkert/fs2-rs/blob/e1d4843b7c19e3ce1ecbae92255223de31b36d3b/src/windows.rs#L89-L112)
 - [`win32job 2.0.3` source](https://github.com/ohadravid/win32job-rs/tree/v2.0.3)
 - [`win32job` extended-limit issue](https://github.com/ohadravid/win32job-rs/issues/6)
+- [`process-wrap 9.1.0` Job Object implementation](https://docs.rs/process-wrap/9.1.0/src/process_wrap/std/job_object.rs.html)
 
 ### Official GitHub documentation and maintained tools
 

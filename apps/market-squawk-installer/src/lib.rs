@@ -76,14 +76,16 @@ mod tests {
             BundleDefect::ParentTraversal,
             BundleDefect::UnlistedEntry,
             BundleDefect::DigestMismatch,
+            BundleDefect::MisplacedRequiredRole,
         ] {
             let temporary = TempDir::new()?;
             let fixture = BundleFixture::create(temporary.path(), "0.1.0", defect)?;
-            let result = install(InstallRequest::from_local(
+            let result = InstallRequest::from_local(
                 temporary.path().join("program"),
                 &fixture.manifest,
                 &fixture.bundle,
-            )?);
+            )
+            .and_then(install);
 
             assert!(result.is_err());
             assert!(!temporary.path().join("program/installation.json").exists());
@@ -439,6 +441,7 @@ mod tests {
         ParentTraversal,
         UnlistedEntry,
         DigestMismatch,
+        MisplacedRequiredRole,
     }
 
     struct BundleFixture {
@@ -453,6 +456,13 @@ mod tests {
             let file = File::create(&bundle)?;
             let mut archive = ZipWriter::new(file);
             for (path, role, executable) in COMPONENTS {
+                let path = if matches!(defect, BundleDefect::MisplacedRequiredRole)
+                    && role == "python-runtime"
+                {
+                    "tools/python"
+                } else {
+                    path
+                };
                 let bytes = format!("{version}:{path}").into_bytes();
                 let options = SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Deflated)

@@ -98,6 +98,10 @@ parquet = { version = "=58.3.0", default-features = false, features = [
     "crc",
     "zstd",
 ] }
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+    "job-object",
+    "std",
+] }
 quick-xml = { version = "=0.41.0", default-features = false, features = ["encoding"] }
 reqwest = { version = "=0.13.4", default-features = false, features = [
     "gzip",
