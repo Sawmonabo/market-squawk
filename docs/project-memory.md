@@ -1416,3 +1416,21 @@ single required modeling target consumes more than 8 GiB before the other five r
 are built. Raising that measured ceiling does not authorize duplicate target trees, retained
 completed-lane caches, or unbounded workspace growth. Release acceptance still requires one clean,
 unchanged, exact-head six-target campaign below the ceiling.
+
+Packed macOS debug information creates Cargo-owned `.dSYM` alias symlinks inside the generated
+target tree. Disk measurement admits only links that resolve beneath the canonical target root,
+counts the link rather than following it, and validates the boundary again while measuring.
+Dangling, root-aliasing, or escaping links remain rejected. Corpus, crash-artifact, and release
+evidence trees continue to reject every symlink.
+
+The release authority creates `fuzz/target` before Cargo so it can establish campaign directories.
+It must therefore create and validate the standard `CACHEDIR.TAG` signature itself. This keeps
+Cargo's explicit-target cleanup safeguard effective and allows completed fuzz build state to be
+reclaimed with `cargo clean --target-dir fuzz/target` without manual deletion.
+
+Intel macOS package job `91014408267` accepted the storage-reclamation and CI-safe DMG correction
+on candidate `1a1d44561e5754fca5970f1aa9fc930cbe5ae3c3`. It reclaimed 3.3 GiB through Cargo,
+completed Tauri's maintained `app,dmg` bundler, verified and mounted the DMG, passed the installed
+product and 63-tool MCP smoke, collected the closed artifacts, and uploaded them. That candidate is
+not a release candidate because its separate Windows package job failed at the staging command
+corrected after the run.

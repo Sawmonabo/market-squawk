@@ -1512,8 +1512,8 @@
     },
     {
       "path": "apps/market-squawk/src/release/fuzz.rs",
-      "sha256": "57b2ae2ea98ce40b1813e1a866b0fe9ddfd9af4ce2168d8cf3f25744fd9374b4",
-      "size_bytes": 19111
+      "sha256": "5c1c3a232c8a3797daab44612d84751fc30313a3e3a69d396b7004b350790110",
+      "size_bytes": 21518
     },
     {
       "path": "apps/market-squawk/src/release/gate.rs",

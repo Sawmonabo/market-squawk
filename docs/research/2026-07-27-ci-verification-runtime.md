@@ -11,7 +11,7 @@ approximately one-hour Linux verification feedback loop.
 | Research date | 2026-07-27 |
 | Last substantive review | 2026-07-30 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest diagnosed candidate | `1a1d44561e5754fca5970f1aa9fc930cbe5ae3c3` |
+| Latest diagnosed candidate | `49ff79d10877516fc403796fe31771ac0e3ad014` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -277,6 +277,31 @@ original 10 GiB ceiling did not represent the measured workload. The hard ceilin
 headroom for the complete target set. Only a successful clean six-target run can accept that
 ceiling.
 
+The first exact-head attempt at `49ff79d10877516fc403796fe31771ac0e3ad014`
+then exposed an interaction between packed debug information and the disk meter before any fuzz
+campaign began. Cargo creates relative `.dSYM` alias symlinks whose destinations are real
+directories inside the same target root. The meter had treated every symlink as hostile even
+though those generated aliases are part of the selected profile.
+
+The correction remains fail-closed: only a resolvable link whose canonical destination is strictly
+beneath the canonical generated-target root is admitted, the link's own metadata is counted
+without traversing the alias, and the boundary is checked again during measurement. Dangling,
+root-aliasing, and escaping links remain rejected. Content-hashed corpora and crash-artifact trees
+still reject every symlink. Rust documents that
+[`canonicalize`](https://doc.rust-lang.org/std/fs/fn.canonicalize.html) resolves symbolic links and
+that [`symlink_metadata`](https://doc.rust-lang.org/std/fs/fn.symlink_metadata.html) inspects the
+link itself without following it. Acceptance still requires a new clean exact-head campaign.
+
+Cleanup of that failed attempt exposed a related ownership defect. The release authority creates
+`fuzz/target` before invoking Cargo so it can establish no-clobber campaign directories. Cargo
+therefore did not create the root `CACHEDIR.TAG`, and `cargo clean --target-dir fuzz/target`
+correctly refused to delete the explicit path. Cargo's current implementation validates that tag
+before explicit-target cleanup to prevent accidental deletion of unrelated files
+([Cargo clean source](https://doc.rust-lang.org/stable/nightly-rustc/src/cargo/ops/cargo_clean.rs.html)).
+The creator now writes the standard signature through create-new semantics and then validates a
+bounded, regular, non-symlink tag before any build starts. Completed fuzz state can consequently be
+reclaimed through Cargo's guarded cleanup path rather than a project-owned recursive deletion.
+
 ### 2026-07-30 Intel macOS DMG storage failure
 
 The same exact candidate completed its sealed Python product, complete native inputs, frontend
@@ -310,6 +335,17 @@ bundle operation.
 Acceptance requires a fresh unchanged Intel job to show reclaimed disk, a successful Tauri
 `app,dmg` bundle, `hdiutil verify`, mounted-app smoke verification, and collection of the closed
 platform artifact set.
+
+Candidate `1a1d44561e5754fca5970f1aa9fc930cbe5ae3c3` supplied that evidence in
+[job 91014408267](https://github.com/Sawmonabo/market-squawk/actions/runs/30585037290/job/91014408267).
+The job completed successfully in 3 hours 40 minutes 46 seconds. After its initial maintained
+`.app` build, the correction removed 8,412 generated files and 3.3 GiB through Cargo, increasing
+reported free disk from 95 GiB to 98 GiB. It then restored the CI-safe DMG path, invoked Tauri's
+maintained `app,dmg` bundler with `--skip-jenkins`, created both bundles, verified and mounted the
+DMG, passed the installed-product and 63-tool MCP smoke, collected the closed platform artifact
+set, and uploaded it. This accepts the Intel packaging correction on that exact candidate. The
+candidate itself remains rejected because its separate Windows package job failed at the
+subsequently corrected staging command.
 
 ## Root causes
 
@@ -966,7 +1002,10 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [Cargo test targets](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#integration-tests)
 - [Cargo build timings](https://doc.rust-lang.org/cargo/reference/timings.html)
 - [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
+- [Cargo explicit-target clean validation](https://doc.rust-lang.org/stable/nightly-rustc/src/cargo/ops/cargo_clean.rs.html)
 - [Rust nightly code-generation options](https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/codegen-options.html)
+- [Rust `canonicalize`](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
+- [Rust `symlink_metadata`](https://doc.rust-lang.org/std/fs/fn.symlink_metadata.html)
 - [Rust Performance Book: compile times](https://nnethercote.github.io/perf-book/compile-times.html)
 - [Rust Windows canonicalization](https://doc.rust-lang.org/std/fs/fn.canonicalize.html)
 - [Rust Windows path-prefix classification](https://doc.rust-lang.org/std/path/enum.Prefix.html)

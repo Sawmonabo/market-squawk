@@ -1,7 +1,8 @@
 //! Closed, serial fuzz campaign and its exact machine-readable evidence.
 
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,8 +28,13 @@ const MAXIMUM_RSS_MIB: u64 = 8 * 1024;
 pub(super) const MAXIMUM_FUZZ_TARGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAXIMUM_INPUT_FILE_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_CARGO_CACHE_TAG_BYTES: u64 = 4 * 1024;
 pub(super) const MAXIMUM_CORPUS_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const MAXIMUM_CORPUS_FILES: usize = 100_000;
+const CARGO_CACHE_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+const CARGO_CACHE_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by Market Squawk.\n\
+# For information about cache directory tags see https://bford.info/cachedir/\n";
 
 #[cfg(target_os = "macos")]
 const MACOS_FUZZ_RUSTFLAGS: &str =
@@ -391,6 +397,7 @@ fn tool_version(
 
 fn prepare_campaign_root(fuzz_root: &Path, repository: &RepositoryIdentity) -> Result<PathBuf> {
     let target = prepare_directory(fuzz_root, "target", false)?;
+    ensure_cargo_cache_tag(&target)?;
     let campaigns = prepare_directory(&target, "release-campaigns", false)?;
     let identity = if repository.clean {
         repository.head.as_str()
@@ -398,6 +405,33 @@ fn prepare_campaign_root(fuzz_root: &Path, repository: &RepositoryIdentity) -> R
         "provisional"
     };
     prepare_directory(&campaigns, identity, true)
+}
+
+fn ensure_cargo_cache_tag(target: &Path) -> Result<()> {
+    let path = target.join("CACHEDIR.TAG");
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(CARGO_CACHE_TAG)
+                .context("Cargo cache-directory tag could not be written")?;
+            file.sync_all()
+                .context("Cargo cache-directory tag could not be synchronized")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("Cargo cache-directory tag could not be created"),
+    }
+    let metadata =
+        fs::symlink_metadata(&path).context("Cargo cache-directory tag metadata is unavailable")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAXIMUM_CARGO_CACHE_TAG_BYTES
+    {
+        bail!("Cargo cache-directory tag is not an admissible regular file");
+    }
+    let content = fs::read(&path).context("Cargo cache-directory tag could not be read")?;
+    if !content.starts_with(CARGO_CACHE_TAG_SIGNATURE) {
+        bail!("Cargo cache-directory tag has an invalid signature");
+    }
+    Ok(())
 }
 
 fn prepare_target_root(root: &Path, target: &str) -> Result<PathBuf> {
@@ -468,22 +502,24 @@ fn bounded_tree_identity(
                 .file_type()
                 .context("bounded tree entry type is unavailable")?;
             if metadata.is_symlink() {
-                bail!("bounded tree contains a symbolic link");
-            }
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if metadata.is_file() {
-                let relative = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .context("bounded tree path escaped its root")?
-                    .to_path_buf();
-                files.push(relative);
-                if files.len() > maximum_files {
-                    bail!("bounded tree exceeded its file-count limit");
+                if hash_contents {
+                    bail!("bounded tree contains a symbolic link");
                 }
-            } else {
+                admit_internal_symlink(&entry.path(), &root)?;
+            } else if metadata.is_dir() {
+                pending.push(entry.path());
+                continue;
+            } else if !metadata.is_file() {
                 bail!("bounded tree contains an unsupported file type");
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .context("bounded tree path escaped its root")?
+                .to_path_buf();
+            files.push(relative);
+            if files.len() > maximum_files {
+                bail!("bounded tree exceeded its file-count limit");
             }
         }
     }
@@ -496,7 +532,16 @@ fn bounded_tree_identity(
             .ok_or_else(|| anyhow::anyhow!("bounded tree contains a non-UTF-8 path"))?;
         hasher.update(u64::try_from(name.len())?.to_le_bytes());
         hasher.update(name.as_bytes());
-        let metadata = fs::metadata(root.join(relative)).context("bounded tree metadata failed")?;
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).context("bounded tree metadata failed")?;
+        if metadata.file_type().is_symlink() {
+            if hash_contents {
+                bail!("bounded tree contains a symbolic link");
+            }
+            admit_internal_symlink(&path, &root)?;
+        } else if !metadata.is_file() {
+            bail!("bounded tree entry type changed during measurement");
+        }
         bytes = bytes
             .checked_add(metadata.len())
             .ok_or_else(|| anyhow::anyhow!("bounded tree size overflow"))?;
@@ -505,7 +550,7 @@ fn bounded_tree_identity(
         }
         hasher.update(metadata.len().to_le_bytes());
         if hash_contents {
-            let file = hash_stable_file(&root.join(relative), maximum_bytes)?;
+            let file = hash_stable_file(&path, maximum_bytes)?;
             hasher.update(file.sha256.as_bytes());
         }
     }
@@ -514,6 +559,16 @@ fn bounded_tree_identity(
         files: files.len(),
         bytes,
     })
+}
+
+fn admit_internal_symlink(path: &Path, root: &Path) -> Result<()> {
+    let resolved = path
+        .canonicalize()
+        .context("bounded tree symbolic link cannot be resolved")?;
+    if resolved == root || !resolved.starts_with(root) {
+        bail!("bounded tree symbolic link escaped its root");
+    }
+    Ok(())
 }
 
 fn hex_digest(digest: [u8; 32]) -> String {
