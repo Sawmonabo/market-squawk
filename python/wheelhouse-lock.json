@@ -127,8 +127,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "7445ba36a6abc50593b047bc1c05b2fe493a5510d9b1f4e9f1cd4014cd6ddbc1",
-      "size_bytes": 232062
+      "sha256": "2ff96b535ab37dae13d0d60890a1aaa00418fef3ec1d9fc9554f12c89233ce9d",
+      "size_bytes": 232041
     },
     {
       "path": "Cargo.toml",
