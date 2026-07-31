@@ -6,7 +6,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use atomicwrites::{AllowOverwrite, AtomicFile};
+use atomicwrites::{AllowOverwrite, AtomicFile, DisallowOverwrite, OverwriteBehavior};
 use fs2::FileExt as _;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::archive::{ArchiveError, ComponentReceipt, seal_tree_root, sync_directory};
+use crate::archive::{
+    ArchiveError, ComponentReceipt, seal_tree_root, sync_directory, verify_installed_tree,
+};
 use crate::manifest::{MAXIMUM_ARCHIVE_ENTRIES, MAXIMUM_MANIFEST_BYTES, is_lower_sha256};
 use crate::platform::SupportedTarget;
 
@@ -23,6 +25,7 @@ const INSTALLATION_STATE_SCHEMA_VERSION: u32 = 1;
 // aligned with two admitted release manifests plus fixed selector metadata.
 const MAXIMUM_INSTALLATION_STATE_BYTES: usize = (2 * MAXIMUM_MANIFEST_BYTES) + (64 * 1024);
 const STATE_FILE: &str = "installation.json";
+const PENDING_ACTIVATION_FILE: &str = "activation.json";
 const VERSIONS_DIRECTORY: &str = "versions";
 const RELEASES_DIRECTORY: &str = "releases";
 const STAGING_DIRECTORY: &str = "staging";
@@ -58,8 +61,11 @@ impl InstallationState {
         &mut self,
         active: StoredVersion,
         channel_manifest_url: Option<Box<str>>,
+        retain_current_as_previous: bool,
     ) -> Result<(), StoreError> {
-        self.previous = Some(self.active.clone());
+        if retain_current_as_previous {
+            self.previous = Some(self.active.clone());
+        }
         self.active = active;
         if channel_manifest_url.is_some() {
             self.channel_manifest_url = channel_manifest_url;
@@ -217,7 +223,15 @@ impl InstallStore {
     }
 
     pub(crate) fn load_state(&self) -> Result<Option<InstallationState>, StoreError> {
-        let path = self.root.join(STATE_FILE);
+        self.load_state_file(STATE_FILE)
+    }
+
+    pub(crate) fn load_pending_activation(&self) -> Result<Option<InstallationState>, StoreError> {
+        self.load_state_file(PENDING_ACTIVATION_FILE)
+    }
+
+    fn load_state_file(&self, file_name: &str) -> Result<Option<InstallationState>, StoreError> {
+        let path = self.root.join(file_name);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -247,19 +261,48 @@ impl InstallStore {
     }
 
     pub(crate) fn write_state(&self, state: &InstallationState) -> Result<(), StoreError> {
+        self.write_state_file(STATE_FILE, state, AllowOverwrite)
+    }
+
+    pub(crate) fn write_pending_activation(
+        &self,
+        state: &InstallationState,
+    ) -> Result<(), StoreError> {
+        self.write_state_file(PENDING_ACTIVATION_FILE, state, DisallowOverwrite)
+    }
+
+    fn write_state_file(
+        &self,
+        file_name: &str,
+        state: &InstallationState,
+        behavior: OverwriteBehavior,
+    ) -> Result<(), StoreError> {
         state.validate()?;
         let mut bytes = serde_json::to_vec_pretty(state).map_err(|_| StoreError::CorruptState)?;
         bytes.push(b'\n');
         if bytes.len() > MAXIMUM_INSTALLATION_STATE_BYTES {
             return Err(StoreError::CorruptState);
         }
-        let atomic = AtomicFile::new(self.root.join(STATE_FILE), AllowOverwrite);
+        let atomic = AtomicFile::new(self.root.join(file_name), behavior);
         atomic
             .write(|file| file.write_all(&bytes))
             .map_err(|error| {
                 let source: std::io::Error = error.into();
                 StoreError::io("publish installation state", source)
             })?;
+        sync_directory(&self.root)?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_pending_activation(&self) -> Result<(), StoreError> {
+        let path = self.root.join(PENDING_ACTIVATION_FILE);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|source| StoreError::io("inspect pending activation", source))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(StoreError::CorruptState);
+        }
+        fs::remove_file(path)
+            .map_err(|source| StoreError::io("clear pending activation", source))?;
         sync_directory(&self.root)?;
         Ok(())
     }
@@ -298,16 +341,28 @@ impl InstallStore {
     }
 
     #[cfg(unix)]
-    pub(crate) fn publish_entrypoint(
-        &self,
-        staged: &Path,
-        program: crate::platform::ProgramName,
-        target: SupportedTarget,
-    ) -> Result<(), StoreError> {
-        let destination = self.entrypoint_path(program, target)?;
-        fs::rename(staged, destination)
-            .map_err(|source| StoreError::io("publish stable program entrypoint", source))?;
-        sync_directory(&self.root.join(ENTRYPOINTS_DIRECTORY))?;
+    pub(crate) fn replace_entrypoint_directory(&self, stage: &Path) -> Result<(), StoreError> {
+        let destination = self.root.join(ENTRYPOINTS_DIRECTORY);
+        let retired = self.root.join(STAGING_DIRECTORY).join(format!(
+            "entrypoints-retired-{}",
+            Uuid::new_v4().as_simple()
+        ));
+        set_private_directory_permissions(&destination)?;
+        fs::rename(&destination, &retired)
+            .map_err(|source| StoreError::io("retire stable program entrypoints", source))?;
+        if let Err(source) = fs::rename(stage, &destination) {
+            return match fs::rename(&retired, &destination) {
+                Ok(()) => {
+                    sync_directory(&self.root)?;
+                    sync_directory(&self.root.join(STAGING_DIRECTORY))?;
+                    Err(StoreError::io("publish stable program entrypoints", source))
+                }
+                Err(_) => Err(StoreError::ActivationIndeterminate),
+            };
+        }
+        sync_directory(&self.root)?;
+        sync_directory(&self.root.join(STAGING_DIRECTORY))?;
+        let _cleanup = remove_quarantined_tree(&retired);
         Ok(())
     }
 
@@ -354,7 +409,9 @@ impl InstallStore {
             };
         }
         sync_directory(&self.root.join(VERSIONS_DIRECTORY))?;
-        remove_tree(&quarantine)?;
+        seal_tree_root(&final_path)?;
+        verify_installed_tree(&final_path, &version.components)?;
+        let _cleanup = remove_quarantined_tree(&quarantine);
         Ok(())
     }
 
@@ -434,12 +491,19 @@ impl InstallStore {
             .map_err(|source| StoreError::io("read staging directory", source))?
         {
             let entry = entry.map_err(|source| StoreError::io("read staging entry", source))?;
-            let metadata = fs::symlink_metadata(entry.path())
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
                 .map_err(|source| StoreError::io("inspect staging entry", source))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(StoreError::UnsafeRoot);
             }
-            remove_tree(&entry.path())?;
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("corrupt-") || name.starts_with("entrypoints-retired-")
+            }) {
+                let _cleanup = remove_quarantined_tree(&path);
+            } else {
+                remove_tree(&path)?;
+            }
         }
         Ok(())
     }
@@ -448,6 +512,11 @@ impl InstallStore {
 pub(crate) fn remove_tree(path: &Path) -> Result<(), StoreError> {
     make_tree_removable(path)?;
     fs::remove_dir_all(path).map_err(|source| StoreError::io("remove program tree", source))
+}
+
+fn remove_quarantined_tree(path: &Path) -> Result<(), StoreError> {
+    make_quarantined_tree_removable(path)?;
+    fs::remove_dir_all(path).map_err(|source| StoreError::io("remove corrupt quarantine", source))
 }
 
 fn prune_directory(
@@ -467,7 +536,7 @@ fn prune_directory(
             return Err(StoreError::UnsafeRoot);
         }
         if !retained.contains(name.as_str()) {
-            remove_tree(&entry.path())?;
+            remove_quarantined_tree(&entry.path())?;
         }
     }
     sync_directory(root)?;
@@ -495,6 +564,31 @@ fn make_tree_removable(path: &Path) -> Result<(), StoreError> {
                 make_file_writable(&entry.path())?;
             } else {
                 return Err(StoreError::UnsafeRoot);
+            }
+        }
+        cursor += 1;
+    }
+    Ok(())
+}
+
+fn make_quarantined_tree_removable(path: &Path) -> Result<(), StoreError> {
+    ensure_safe_directory(path)?;
+    let mut directories = vec![path.to_path_buf()];
+    let mut cursor = 0;
+    while cursor < directories.len() {
+        set_private_directory_permissions(&directories[cursor])?;
+        for entry in fs::read_dir(&directories[cursor])
+            .map_err(|source| StoreError::io("read corrupt quarantine", source))?
+        {
+            let entry =
+                entry.map_err(|source| StoreError::io("read corrupt quarantine entry", source))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| StoreError::io("inspect corrupt quarantine entry", source))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                directories.push(path);
+            } else if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                make_file_writable(&path)?;
             }
         }
         cursor += 1;
@@ -617,6 +711,8 @@ pub enum StoreError {
     RollbackUnavailable,
     #[error("repair replacement became indeterminate and requires recovery")]
     RepairIndeterminate,
+    #[error("activation became indeterminate and requires recovery")]
+    ActivationIndeterminate,
     #[error("system time precedes the Unix epoch")]
     Clock,
     #[error(transparent)]

@@ -40,8 +40,9 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use super::{
-        InstallRequest, RepairRequest, RollbackRequest, SupportedTarget, UninstallRequest,
-        UpdateRequest, install, repair, rollback, status, uninstall, update,
+        InstallError, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest,
+        SupportedTarget, UninstallRequest, UpdateRequest, install, repair, rollback, status,
+        uninstall, update,
     };
     #[cfg(unix)]
     use super::{ProgramName, stable_program_path};
@@ -97,23 +98,32 @@ mod tests {
             &first.bundle,
         )?)?;
         #[cfg(unix)]
-        assert_eq!(
-            fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
-            b"0.1.0:bin/market-squawk"
-        );
+        {
+            let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
+            let stable_capture = stable_program_path(&root, ProgramName::CaptureHelper)?;
+            let stable_worker = stable_program_path(&root, ProgramName::OnnxWorker)?;
+            assert_eq!(stable_capture.parent(), stable_cli.parent());
+            assert_eq!(stable_worker.parent(), stable_cli.parent());
+            assert_eq!(fs::read(&stable_cli)?, b"0.1.0:bin/market-squawk");
+            assert_eq!(
+                fs::read(stable_capture)?,
+                b"0.1.0:bin/market-squawk-capture-helper"
+            );
+            assert_eq!(
+                fs::read(stable_worker)?,
+                b"0.1.0:bin/market-squawk-onnx-worker"
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
 
             let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
-            fs::set_permissions(&stable_cli, fs::Permissions::from_mode(0o700))?;
-            fs::write(&stable_cli, b"damaged")?;
+            fs::set_permissions(&stable_cli, fs::Permissions::from_mode(0o400))?;
             assert!(!status(&root)?.is_healthy());
             assert!(repair(RepairRequest::new(root.clone()))?.repaired());
-            assert_eq!(
-                fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
-                b"0.1.0:bin/market-squawk"
-            );
+            let repaired_cli = stable_program_path(&root, ProgramName::Cli)?;
+            assert_ne!(fs::metadata(&repaired_cli)?.permissions().mode() & 0o111, 0);
         }
 
         let installed_version = fs::read_dir(root.join("versions"))?
@@ -126,18 +136,29 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            use std::os::unix::fs::symlink;
 
-            fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
+            let preserved = temporary.path().join("preserved-outside-version");
+            fs::write(&preserved, b"preserve")?;
+            let parent = damaged
+                .parent()
+                .ok_or_else(|| std::io::Error::other("damaged component has no parent"))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            fs::remove_file(&damaged)?;
+            symlink(&preserved, &damaged)?;
+            let repaired = repair(RepairRequest::new(root.clone()))?;
+            assert!(repaired.repaired());
+            assert_eq!(fs::read(preserved)?, b"preserve");
         }
         #[cfg(windows)]
         {
             let mut permissions = fs::metadata(&damaged)?.permissions();
             permissions.set_readonly(false);
             fs::set_permissions(&damaged, permissions)?;
+            fs::write(&damaged, b"damaged")?;
+            let repaired = repair(RepairRequest::new(root.clone()))?;
+            assert!(repaired.repaired());
         }
-        fs::write(&damaged, b"damaged")?;
-        let repaired = repair(RepairRequest::new(root.clone()))?;
-        assert!(repaired.repaired());
         assert!(status(&root)?.is_healthy());
 
         let second = BundleFixture::create(temporary.path(), "0.2.0", BundleDefect::None)?;
@@ -169,6 +190,108 @@ mod tests {
     }
 
     #[test]
+    fn update_preserves_the_last_known_good_previous_version() -> TestResult {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("program");
+        let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
+        install(InstallRequest::from_local(
+            root.clone(),
+            &first.manifest,
+            &first.bundle,
+        )?)?;
+        let second = BundleFixture::create(temporary.path(), "0.2.0", BundleDefect::None)?;
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &second.manifest,
+            &second.bundle,
+        )?)?;
+
+        let active = fs::read_dir(root.join("versions"))?
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("0.2.0-"))
+            .ok_or_else(|| std::io::Error::other("active version is unavailable"))?
+            .path();
+        let damaged = active.join("lib/python3.14/site-packages/market_squawk/__init__.py");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&damaged)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&damaged, permissions)?;
+        }
+        fs::write(&damaged, b"damaged")?;
+
+        let third = BundleFixture::create(temporary.path(), "0.3.0", BundleDefect::None)?;
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &third.manifest,
+            &third.bundle,
+        )?)?;
+
+        let updated = status(&root)?;
+        assert_eq!(updated.active_version(), Some("0.3.0"));
+        assert_eq!(updated.previous_version(), Some("0.1.0"));
+        rollback(RollbackRequest::new(root.clone()))?;
+        assert_eq!(status(&root)?.active_version(), Some("0.1.0"));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_activation_recovers_the_selector_and_stable_program_set() -> TestResult {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("program");
+        let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
+        install(InstallRequest::from_local(
+            root.clone(),
+            &first.manifest,
+            &first.bundle,
+        )?)?;
+        let second = BundleFixture::create(temporary.path(), "0.2.0", BundleDefect::None)?;
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &second.manifest,
+            &second.bundle,
+        )?)?;
+        let pending = fs::read(root.join("installation.json"))?;
+        rollback(RollbackRequest::new(root.clone()))?;
+        assert_eq!(status(&root)?.active_version(), Some("0.1.0"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+            b"0.1.0:bin/market-squawk"
+        );
+
+        fs::write(root.join("activation.json"), pending)?;
+
+        let recovered = status(&root)?;
+        assert_eq!(recovered.active_version(), Some("0.2.0"));
+        assert_eq!(recovered.previous_version(), Some("0.1.0"));
+        assert!(recovered.is_healthy());
+        assert!(!root.join("activation.json").exists());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read(stable_program_path(&root, ProgramName::Cli)?)?,
+                b"0.2.0:bin/market-squawk"
+            );
+            assert_eq!(
+                fs::read(stable_program_path(&root, ProgramName::CaptureHelper)?)?,
+                b"0.2.0:bin/market-squawk-capture-helper"
+            );
+            assert_eq!(
+                fs::read(stable_program_path(&root, ProgramName::OnnxWorker)?)?,
+                b"0.2.0:bin/market-squawk-onnx-worker"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn default_uninstall_preserves_separately_rooted_data() -> TestResult {
         let temporary = TempDir::new()?;
         let root = temporary.path().join("program");
@@ -187,6 +310,38 @@ mod tests {
         assert!(receipt.removed_program());
         assert!(!root.exists());
         assert_eq!(fs::read(data.join("portfolio.json"))?, b"preserve");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_rejects_a_data_root_with_a_symlinked_ancestor() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let base = temporary.path().canonicalize()?;
+        let root = base.join("program");
+        let actual_data = base.join("actual-data");
+        let logs = actual_data.join("logs");
+        fs::create_dir_all(&logs)?;
+        fs::write(logs.join("market-squawk.log"), b"preserve")?;
+        let alias = base.join("data-alias");
+        symlink(&actual_data, &alias)?;
+        let fixture = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
+        install(InstallRequest::from_local(
+            root.clone(),
+            &fixture.manifest,
+            &fixture.bundle,
+        )?)?;
+
+        let result = uninstall(
+            UninstallRequest::preserving_data(root.clone())
+                .confirm_delete(MutableDataClass::Logs, alias.join("logs")),
+        );
+
+        assert!(matches!(result, Err(InstallError::UnsafeDataRoot)));
+        assert!(root.exists());
+        assert_eq!(fs::read(logs.join("market-squawk.log"))?, b"preserve");
         Ok(())
     }
 

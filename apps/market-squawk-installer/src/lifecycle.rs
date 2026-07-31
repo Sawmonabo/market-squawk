@@ -28,9 +28,11 @@ const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const STABLE_PROGRAMS: [ProgramName; 3] = [
+const STABLE_PROGRAMS: [ProgramName; 5] = [
     ProgramName::Desktop,
     ProgramName::Cli,
+    ProgramName::CaptureHelper,
+    ProgramName::OnnxWorker,
     ProgramName::Installer,
 ];
 
@@ -42,14 +44,13 @@ const STABLE_PROGRAMS: [ProgramName; 3] = [
 /// immutable publication is invalid.
 pub fn install(request: InstallRequest) -> Result<InstallReceipt, InstallError> {
     let store = InstallStore::open_or_create(&request.root)?;
+    recover_pending_activation(&store)?;
     if store.load_state()?.is_some() {
         return Err(InstallError::AlreadyInstalled);
     }
     let active = prepare_candidate(&store, &request.release, &request.bundle)?;
     let state = InstallationState::initial(active, request.channel_manifest_url)?;
-    store.write_state(&state)?;
-    publish_stable_programs(&store, &state)?;
-    store.prune(&state)?;
+    commit_activation(&store, &state)?;
     receipt(&state, false)
 }
 
@@ -61,6 +62,7 @@ pub fn install(request: InstallRequest) -> Result<InstallReceipt, InstallError> 
 /// [`InstallError::UpdateNotNewer`] unless the admitted semantic version is strictly newer.
 pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
     let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let current =
         Version::parse(&state.active.version).map_err(|_| InstallError::CorruptInstallation)?;
@@ -69,11 +71,15 @@ pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
     if candidate <= current {
         return Err(InstallError::UpdateNotNewer);
     }
+    let retain_current_as_previous =
+        verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok();
     let active = prepare_candidate(&store, &request.release, &request.bundle)?;
-    state.activate(active, request.channel_manifest_url)?;
-    store.write_state(&state)?;
-    publish_stable_programs(&store, &state)?;
-    store.prune(&state)?;
+    state.activate(
+        active,
+        request.channel_manifest_url,
+        retain_current_as_previous,
+    )?;
+    commit_activation(&store, &state)?;
     receipt(&state, false)
 }
 
@@ -86,6 +92,7 @@ pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
 /// the reconstructed version cannot be published safely.
 pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
     let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
     let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let active_path = store.version_path(&state.active);
     if verify_installed_tree(&active_path, &state.active.components).is_ok() {
@@ -133,6 +140,7 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
 /// Fails if no previous version exists or if any retained component no longer matches its receipt.
 pub fn rollback(request: RollbackRequest) -> Result<InstallReceipt, InstallError> {
     let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let previous = state
         .previous
@@ -140,9 +148,7 @@ pub fn rollback(request: RollbackRequest) -> Result<InstallReceipt, InstallError
         .ok_or(InstallError::RollbackUnavailable)?;
     verify_installed_tree(&store.version_path(previous), &previous.components)?;
     state.swap_for_rollback()?;
-    store.write_state(&state)?;
-    publish_stable_programs(&store, &state)?;
-    store.prune(&state)?;
+    commit_activation(&store, &state)?;
     receipt(&state, false)
 }
 
@@ -156,6 +162,7 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
     let Some(store) = InstallStore::open_existing(root)? else {
         return Ok(absent_status());
     };
+    recover_pending_activation(&store)?;
     let Some(state) = store.load_state()? else {
         return Ok(absent_status());
     };
@@ -184,6 +191,7 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
 /// component differs from its retained receipt.
 pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
     let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
     let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     if state.active.target != crate::platform::SupportedTarget::current()? {
         return Err(InstallError::CorruptInstallation);
@@ -209,6 +217,7 @@ pub fn stable_program_path(root: &Path, program: ProgramName) -> Result<PathBuf,
             return resolve_program(root, program);
         }
         let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+        recover_pending_activation(&store)?;
         let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
         if state.active.target != crate::platform::SupportedTarget::current()? {
             return Err(InstallError::CorruptInstallation);
@@ -228,6 +237,7 @@ pub(crate) fn resolve_program(
     program: crate::platform::ProgramName,
 ) -> Result<PathBuf, InstallError> {
     let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
     let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     if state.active.target != crate::platform::SupportedTarget::current()? {
         return Err(InstallError::CorruptInstallation);
@@ -291,22 +301,31 @@ fn publish_stable_programs(
                 })?;
             verify_component(&destination, receipt)?;
         }
-        for program in STABLE_PROGRAMS {
-            let staged = stage.join(
-                program
-                    .relative_path(state.active.target)
-                    .file_name()
-                    .ok_or(InstallError::CorruptInstallation)?,
-            );
-            store.publish_entrypoint(&staged, program, state.active.target)?;
-        }
-        remove_tree(&stage)?;
+        sync_directory(&stage)?;
+        store.replace_entrypoint_directory(&stage)?;
         verify_stable_programs(store, state)
     })();
     if result.is_err() && stage.exists() {
         let _ = remove_tree(&stage);
     }
     result
+}
+
+fn commit_activation(store: &InstallStore, state: &InstallationState) -> Result<(), InstallError> {
+    store.write_pending_activation(state)?;
+    recover_pending_activation(store)
+}
+
+fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> {
+    let Some(state) = store.load_pending_activation()? else {
+        return Ok(());
+    };
+    verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
+    store.write_state(&state)?;
+    publish_stable_programs(store, &state)?;
+    store.clear_pending_activation()?;
+    let _cleanup = store.prune(&state);
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -796,7 +815,42 @@ fn validate_mutable_data_root(path: &Path, program_root: &Path) -> Result<(), In
     {
         return Err(InstallError::UnsafeDataRoot);
     }
+    reject_redirecting_components(path)?;
     Ok(())
+}
+
+fn reject_redirecting_components(path: &Path) -> Result<(), InstallError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_path_redirect(&metadata) => {
+                return Err(InstallError::UnsafeDataRoot);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(InstallError::Io {
+                    operation: "inspect mutable data root ancestor",
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_path_redirect(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_path_redirect(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// Complete installation lifecycle failure.

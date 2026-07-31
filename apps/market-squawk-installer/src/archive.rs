@@ -446,6 +446,7 @@ pub(crate) fn verify_component(
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() != receipt.size
+        || !component_permissions_match(&metadata, receipt.executable)
         || sha256_file(path, receipt.size)? != receipt.sha256.as_ref()
     {
         return Err(ArchiveError::ComponentIdentity {
@@ -453,6 +454,19 @@ pub(crate) fn verify_component(
         });
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn component_permissions_match(metadata: &fs::Metadata, executable: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let expected = if executable { 0o500 } else { 0o400 };
+    metadata.permissions().mode() & 0o7777 == expected
+}
+
+#[cfg(windows)]
+const fn component_permissions_match(_metadata: &fs::Metadata, _executable: bool) -> bool {
+    true
 }
 
 pub(crate) fn sync_directory(path: &Path) -> Result<(), ArchiveError> {
