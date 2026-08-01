@@ -1187,14 +1187,15 @@ jobs:
           $desktop = $desktops[0]
           $stdout = Join-Path $env:RUNNER_TEMP "native-desktop.stdout.log"
           $stderr = Join-Path $env:RUNNER_TEMP "native-desktop.stderr.log"
-          $process = Start-Process `
+          $packageProcess = Start-Process `
             -FilePath $desktop.FullName `
             -ArgumentList @("--data-dir", (Join-Path $env:RUNNER_TEMP "native-data")) `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
             -PassThru
+          $managedProcess = $null
           try {
-            $state = $null
+            $state = @()
             foreach ($attempt in 1..120) {
               $state = @(
                 Get-ChildItem `
@@ -1205,10 +1206,38 @@ jobs:
                   -ErrorAction SilentlyContinue |
                   Where-Object { $_.DirectoryName -like "*Market*Squawk*program" }
               )
-              if ($state.Count -eq 1) {
-                break
+              if ($state.Count -gt 1) {
+                throw "The installed Windows desktop created ambiguous program state."
               }
-              if ($process.HasExited) {
+              if ($state.Count -eq 1) {
+                $managedDesktops = @(
+                  Get-ChildItem `
+                    -Path (Join-Path $state[0].DirectoryName "versions") `
+                    -Filter market-squawk-desktop.exe `
+                    -File `
+                    -Recurse `
+                    -ErrorAction SilentlyContinue
+                )
+                if ($managedDesktops.Count -gt 1) {
+                  throw "The installed Windows release contains ambiguous desktops."
+                }
+                if ($managedDesktops.Count -eq 1) {
+                  $managedProcesses = @(
+                    Get-Process `
+                      -Name market-squawk-desktop `
+                      -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Path -eq $managedDesktops[0].FullName }
+                  )
+                  if ($managedProcesses.Count -gt 1) {
+                    throw "Multiple managed Windows desktops are running."
+                  }
+                  if ($managedProcesses.Count -eq 1) {
+                    $managedProcess = $managedProcesses[0]
+                    break
+                  }
+                }
+              }
+              if ($packageProcess.HasExited -and $packageProcess.ExitCode -ne 0) {
                 Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
                 throw "The installed Windows desktop exited before startup completed."
               }
@@ -1217,14 +1246,26 @@ jobs:
             if ($state.Count -ne 1) {
               throw "The installed Windows desktop did not activate its complete release."
             }
+            if ($null -eq $managedProcess) {
+              Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+              throw "The managed Windows desktop did not start."
+            }
             Start-Sleep -Seconds 3
-            if ($process.HasExited) {
+            $managedProcess.Refresh()
+            if ($managedProcess.HasExited) {
               throw "The installed Windows desktop did not remain operational."
             }
           } finally {
-            if (-not $process.HasExited) {
-              Stop-Process -Id $process.Id -Force
-              $process.WaitForExit()
+            if ($null -ne $managedProcess) {
+              $managedProcess.Refresh()
+              if (-not $managedProcess.HasExited) {
+                Stop-Process -Id $managedProcess.Id -Force
+                $managedProcess.WaitForExit()
+              }
+            }
+            if (-not $packageProcess.HasExited) {
+              Stop-Process -Id $packageProcess.Id -Force
+              $packageProcess.WaitForExit()
             }
           }
 
