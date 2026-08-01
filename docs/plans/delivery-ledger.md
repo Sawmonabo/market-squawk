@@ -12,9 +12,13 @@ evidence; it does not replace the README capability truth or the canonical relea
   `1611c268bb04cf5ed872749bfe44d7e3bfca8c04`, tree
   `6489b4bd5fbc6d3d68157dd8efc37d3d957ee2bc`. Installer PR
   [#39](https://github.com/Sawmonabo/market-squawk/pull/39) and desktop PR
-  [#37](https://github.com/Sawmonabo/market-squawk/pull/37) are merged at that unchanged commit,
-  and `release/market-squawk-v0.1.0` is pushed to the same product head. Draft release PR
-  [#26](https://github.com/Sawmonabo/market-squawk/pull/26) remains open; no public release was
+  [#37](https://github.com/Sawmonabo/market-squawk/pull/37) are merged at that unchanged commit.
+  Mainline reconciliation commit `d2a5fe16538b335018c0f05edac9c9b16c846c07` records
+  `origin/main` head `da0dbf845136fad475fca3b9fb45faf6cb6be150` as integrated without
+  changing the accepted product tree: the release and fuzz locks already contained the exact
+  `futures-util` 0.3.33, `async-trait` 0.1.91, and Serde 1.0.229 dependency records plus the
+  release-only graph. Draft release PR
+  [#26](https://github.com/Sawmonabo/market-squawk/pull/26) is now mergeable; no public release was
   created.
 - The product release version is `1.0.0`. The complete release carries the Obsidian Signal
   desktop, CLI, capture helper, ONNX worker, model validator, training driver, Rust installer,
@@ -40,9 +44,10 @@ evidence; it does not replace the README capability truth or the canonical relea
 - V1 release work remains open under provider/external-evidence issue
   [#7](https://github.com/Sawmonabo/market-squawk/issues/7), provider-onboarding issue
   [#31](https://github.com/Sawmonabo/market-squawk/issues/31), public distribution issue #38, and
-  terminal release issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25). Release PR
-  #26 also requires normal mainline reconciliation before it can merge; the accepted desktop and
-  installer implementation is not represented as terminal V1 publication.
+  terminal release issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25). Mainline
+  reconciliation is complete. The dependency locks, full all-target/all-feature workspace check,
+  workspace-boundary check, formatting diff check, and clean-tree check passed at `d2a5fe1`; the
+  accepted desktop and installer implementation is not represented as terminal V1 publication.
 - The completed installer worktree and its 8.7 GiB of generated Cargo output were removed. The
   merged local/origin installer and desktop branches and temporary platform-verification branch
   were deleted, and worktree/remote metadata was pruned. Only the clean release worktree remains;
