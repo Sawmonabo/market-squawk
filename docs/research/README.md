@@ -57,6 +57,13 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Normal installation and first-run experience](2026-08-01-normal-installation-and-first-run.md)
+  — decision-grade review of 35 maintained repositories, 28 official documentation sources,
+  22 research papers, and 23 reputable guidance sources; defines the complete native install,
+  first-value, guided setup, terminal, update, recovery, and removal journey.
+- [Normal installation source matrix](2026-08-01-normal-installation-source-matrix.md) — all 108
+  selected sources with stable IDs, direct links, research dates, evidence classes, and principal
+  relevance so the decision remains auditable after temporary research cleanup.
 - [Zero-cost macOS and Windows desktop distribution](2026-07-29-zero-cost-desktop-distribution.md)
   — independently audited Apple, Microsoft Store/MSIX, SignPath, native-trust, provenance, and
   repository-integration findings for a release with no mandatory paid credentials.
