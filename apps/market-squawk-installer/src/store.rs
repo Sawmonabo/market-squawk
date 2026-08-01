@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomicwrites::{AllowOverwrite, AtomicFile, DisallowOverwrite, OverwriteBehavior};
@@ -35,6 +37,12 @@ const ENTRYPOINTS_DIRECTORY: &str = "bin";
 const UNIX_STICKY_BIT: u32 = 0o1000;
 const LOCK_FILE: &str = ".market-squawk-installer.lock";
 const UNINSTALL_QUARANTINE_PREFIX: &str = ".market-squawk-program-removing-";
+#[cfg(windows)]
+const WINDOWS_DETACH_RETRY_LIMIT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const WINDOWS_DETACH_INITIAL_DELAY: Duration = Duration::from_millis(25);
+#[cfg(windows)]
+const WINDOWS_DETACH_MAX_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -592,8 +600,7 @@ impl InstallStore {
             "{UNINSTALL_QUARANTINE_PREFIX}{}",
             Uuid::new_v4().as_simple()
         ));
-        fs::rename(&self.root, &quarantine)
-            .map_err(|source| StoreError::io("detach installation root", source))?;
+        detach_installation_root(&self.root, &quarantine)?;
         sync_directory(parent)?;
         Ok(quarantine)
     }
@@ -670,6 +677,43 @@ impl InstallStore {
             }
         }
         Ok(())
+    }
+}
+
+fn detach_installation_root(root: &Path, quarantine: &Path) -> Result<(), StoreError> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(root, quarantine)
+            .map_err(|source| StoreError::io("detach installation root", source))
+    }
+    #[cfg(windows)]
+    {
+        // Newly executed binaries can remain briefly locked by Windows scanners. Rust's rename
+        // fallback can report that contention as access denied when it cannot obtain DELETE.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+
+        let deadline = Instant::now() + WINDOWS_DETACH_RETRY_LIMIT;
+        let mut delay = WINDOWS_DETACH_INITIAL_DELAY;
+        loop {
+            match fs::rename(root, quarantine) {
+                Ok(()) => return Ok(()),
+                Err(source)
+                    if matches!(
+                        source.raw_os_error(),
+                        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                    ) && Instant::now() < deadline =>
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(delay.min(remaining));
+                    delay = delay.saturating_mul(2).min(WINDOWS_DETACH_MAX_DELAY);
+                }
+                Err(source) => {
+                    return Err(StoreError::io("detach installation root", source));
+                }
+            }
+        }
     }
 }
 
@@ -1415,7 +1459,7 @@ pub enum StoreError {
     Clock,
     #[error(transparent)]
     Archive(#[from] ArchiveError),
-    #[error("installer store operation failed during {operation}")]
+    #[error("installer store operation failed during {operation}: {source}")]
     Io {
         operation: &'static str,
         #[source]
