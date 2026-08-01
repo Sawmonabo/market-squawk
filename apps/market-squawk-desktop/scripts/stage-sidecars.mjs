@@ -63,9 +63,9 @@ const LINUX_BUNDLER_TOOL_LOCK = Object.freeze([
   },
   {
     name: "linuxdeploy-plugin-appimage.AppImage",
-    size: 16_484_856,
-    sha256: "1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a",
-    url: "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/462804774",
+    size: 15_889_136,
+    sha256: "992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3",
+    url: "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/228937581",
   },
 ])
 

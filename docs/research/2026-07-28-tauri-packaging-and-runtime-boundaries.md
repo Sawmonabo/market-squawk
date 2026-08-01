@@ -9,8 +9,8 @@ external-program, local MCP, native-package, signing, license, and exact-head CI
 | Audience | Desktop, release, CI, and security maintainers |
 | Status | Applied to Quarter 4 remediation |
 | Research date | 2026-07-28 |
-| Last substantive review | 2026-07-31 |
-| Audit base | `03783250a1020d79cdd7f8bda424da62568dd3d5` |
+| Last substantive review | 2026-08-01 |
+| Audit base | `e12fb63571744f12f9a05f748f6c15c6160680f4` |
 | Refresh gate | Recheck Tauri configuration, bundling, and installer behavior before changing package layout or signing policy |
 
 ## Contents
@@ -155,20 +155,28 @@ helper rather than its available digest-verifying helper. Two inputs are raw `ma
 one is a `continuous` release asset, so an exact Market Squawk source head alone cannot identify
 the executed package toolchain.
 
+The original Market Squawk lock selected an exact asset from that rolling `continuous` release.
+On 2026-08-01 the upstream replaced the release assets, deleting the locked object and causing a
+deterministic HTTP 404. The replacement bytes had a different digest even though the release tag
+and target commit were unchanged. The lock now selects the dated `1-alpha-20250213-1` release asset
+instead. That upstream release is not marked immutable by GitHub, so Market Squawk continues to
+fail closed on an unavailable asset or any size or digest change; the dated release avoids using
+the upstream project's intentionally rolling distribution point.
+
 Market Squawk enables Tauri's package-only `useLocalToolsDir` setting and prepares the exact cache
 names under Cargo's `target/.tauri/` before Tauri checks them. The existing package-preparation
 program admits only Linux x86-64 and these five reviewed identities:
 
-| Cache name | Immutable source identity | Bytes | Reviewed source SHA-256 | Executed/cache SHA-256 |
+| Cache name | Pinned source identity | Bytes | Reviewed source SHA-256 | Executed/cache SHA-256 |
 | --- | --- | ---: | --- | --- |
 | `AppRun-x86_64` | GitHub release asset `274691722` | 31,552 | `f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f` | Same as source |
 | `linuxdeploy-x86_64.AppImage` | GitHub release asset `182515537` | 13,264,064 | `e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef` | `20eebde3c18ae2e44279bd624fc72482503aece216d5d77f10932235342f71c1` |
 | `linuxdeploy-plugin-gtk.sh` | Commit `b5eb8d05b4c0ed40107fe2158c5d8527f94568ef` | 11,648 | `cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a` | Same as source |
 | `linuxdeploy-plugin-gstreamer.sh` | Commit `2a2e67491c32995a3f279ad0ecbe77abd512b42a` | 4,857 | `c107b49d84edbffc6ab226ed1007e0626a4f7aa2c3a36b7782bef62351d49e94` | Same as source |
-| `linuxdeploy-plugin-appimage.AppImage` | GitHub release asset `462804774` | 16,484,856 | `1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a` | Same as source |
+| `linuxdeploy-plugin-appimage.AppImage` | `1-alpha-20250213-1` release asset `228937581`, commit `a96502d15ce19ec1df3d46e6cbe87ddf38589a71` | 15,889,136 | `992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3` | Same as source |
 
 Every package run verifies existing cache bytes, including cache restores, before use. A missing or
-mismatched input is downloaded through its immutable asset API or commit URL into a bounded
+mismatched input is downloaded through its pinned asset API or commit URL into a bounded
 temporary file, checked for exact length and SHA-256, atomically installed, and verified again.
 Unsupported Linux architectures and any acquisition or identity mismatch stop packaging. Tauri
 deterministically zeroes AppImage type-magic bytes 8 through 10 in the linuxdeploy launcher before
@@ -254,7 +262,9 @@ instead of inventing a process-termination protocol in the application.
 | [Tauri local-tools directory](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-cli/src/interface/mod.rs#L77-L83) | `useLocalToolsDir` resolves package tools below Cargo's target directory | 2026-07-28 |
 | [Pinned GTK plugin commit](https://github.com/tauri-apps/linuxdeploy-plugin-gtk/tree/b5eb8d05b4c0ed40107fe2158c5d8527f94568ef) | Immutable GTK plugin script identity | 2026-07-28 |
 | [Pinned GStreamer plugin commit](https://github.com/tauri-apps/linuxdeploy-plugin-gstreamer/tree/2a2e67491c32995a3f279ad0ecbe77abd512b42a) | Immutable GStreamer plugin script identity | 2026-07-28 |
-| [AppImage output plugin release](https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/tag/continuous) | Reviewed release asset identity, size, and GitHub-published digest | 2026-07-28 |
+| [Dated AppImage output plugin release](https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/tag/1-alpha-20250213-1) | Pinned asset, source commit, exact size, and locally verified SHA-256; replaces the rolling `continuous` asset | 2026-08-01 |
+| [GitHub release-assets API](https://docs.github.com/en/rest/releases/assets?apiVersion=2022-11-28) | Asset API download contract and asset identity metadata | 2026-08-01 |
+| [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Only a release explicitly marked immutable prevents tag and asset replacement; the upstream dated release is therefore still guarded by Market Squawk's fail-closed identity checks | 2026-08-01 |
 | [AppImage runtime overview](https://docs.appimage.org/introduction/software-overview.html) | Temporary payload mount and cleanup after payload exit | 2026-07-28 |
 | [AppImage runtime environment](https://docs.appimage.org/packaging-guide/environment-variables.html) | Stable resolved `APPIMAGE` path and temporary `APPDIR` mount path | 2026-07-28 |
 | [AppImage Type-2 runtime source](https://github.com/AppImage/type2-runtime/blob/75849dce7cc37e4319b633df1f116ca895c71a12/src/runtime/runtime.c) | Normal runtime replaces itself with the mounted `AppRun`; extract-and-run uses a wrapper process | 2026-07-28 |
