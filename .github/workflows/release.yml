@@ -576,7 +576,12 @@ jobs:
           bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
           bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-${{ needs.freeze.outputs.version }}-$TARGET.zip"
           manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
-          install_root="$RUNNER_TEMP/installed-product"
+          # Windows runner temp has runner-managed ACLs; exercise the per-user install boundary.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            install_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/release-verification/program"
+          else
+            install_root="$RUNNER_TEMP/installed-product"
+          fi
           unset \
             MARKET_SQUAWK_APPLE_SIGNING_IDENTITY \
             MARKET_SQUAWK_COMPONENT_ROOT \
