@@ -357,7 +357,7 @@ sequenceDiagram
     Bundle-->>Installer: Verified immutable components
     Installer->>OS: Register app, stable CLI/MCP entrypoints and lifecycle
     Installer->>Installer: Activate release atomically
-    Installer-->>User: Installation complete; Launch selected
+    Installer-->>User: Installation complete and launch selected
     User->>App: First launch
     App->>App: Verify workspace and per-user service
     App-->>User: Permanent Overview and guided setup
