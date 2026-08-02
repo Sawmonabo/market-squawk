@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write as _},
     path::Path,
     process::{ExitStatus, Stdio},
-    sync::{Arc, mpsc},
+    sync::{Arc, mpsc as std_mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +17,7 @@ use process_wrap::std::ProcessGroup;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::JobResultReference;
@@ -29,6 +30,7 @@ use reaper::{PROCESS_CLEANUP_DEADLINE, ProcessCleanupReservation, ProcessExecuti
 const MAXIMUM_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAXIMUM_ARGUMENTS: usize = 128;
 const MAXIMUM_ARGUMENT_BYTES: usize = 16 * 1024;
+const STDOUT_FRAME_CHANNEL_CAPACITY: usize = 8;
 
 /// Invalid or unsafe contained worker program.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -187,12 +189,95 @@ impl ContainedProcessLimits {
     }
 }
 
+/// Per-frame ceiling for optional live newline-delimited standard output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContainedStdoutFrameLimits {
+    maximum_frame_bytes: usize,
+}
+
+impl ContainedStdoutFrameLimits {
+    /// Creates a positive frame-byte ceiling.
+    pub fn try_new(maximum_frame_bytes: usize) -> Result<Self, ContainedProcessError> {
+        if maximum_frame_bytes == 0 {
+            return Err(ContainedProcessError::InvalidRequest);
+        }
+        Ok(Self {
+            maximum_frame_bytes,
+        })
+    }
+}
+
+/// Opaque bounded live-frame capability consumed by one contained process run.
+pub struct ContainedStdoutFrameSink {
+    limits: ContainedStdoutFrameLimits,
+    sender: tokio_mpsc::Sender<Box<[u8]>>,
+}
+
+impl std::fmt::Debug for ContainedStdoutFrameSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContainedStdoutFrameSink")
+            .field("limits", &self.limits)
+            .field("sender", &"[BOUNDED STDOUT FRAME SENDER]")
+            .finish()
+    }
+}
+
+/// Exclusive receiver for one contained process's bounded live standard-output frames.
+#[derive(Debug)]
+pub struct ContainedStdoutFrameReceiver {
+    receiver: tokio_mpsc::Receiver<Box<[u8]>>,
+}
+
+impl ContainedStdoutFrameReceiver {
+    /// Waits for the next complete frame, or returns `None` after the run drops its sole sender.
+    pub async fn recv(&mut self) -> Option<Box<[u8]>> {
+        self.receiver.recv().await
+    }
+}
+
+/// Creates one fixed-capacity live-frame channel for a single contained process run.
+///
+/// The sink is consumed by [`ContainedProcessSupervisor::run_with_stdout_frames`]. The receiver
+/// must be drained concurrently with that future; eight queued frames are admitted before
+/// backpressure fails the run closed.
+#[must_use]
+pub fn contained_stdout_frame_channel(
+    limits: ContainedStdoutFrameLimits,
+) -> (ContainedStdoutFrameSink, ContainedStdoutFrameReceiver) {
+    let (sender, receiver) = tokio_mpsc::channel(STDOUT_FRAME_CHANNEL_CAPACITY);
+    (
+        ContainedStdoutFrameSink { limits, sender },
+        ContainedStdoutFrameReceiver { receiver },
+    )
+}
+
 /// Bounded process completion evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainedProcessOutput {
     success: bool,
     stdout: Box<[u8]>,
     stderr: Box<[u8]>,
+}
+
+impl ContainedProcessOutput {
+    /// Returns whether the supervised process exited successfully.
+    #[must_use]
+    pub const fn success(&self) -> bool {
+        self.success
+    }
+
+    /// Returns the complete bounded standard-output bytes.
+    #[must_use]
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    /// Returns the complete bounded standard-error bytes.
+    #[must_use]
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
 }
 
 /// Contained worker execution failure.
@@ -216,6 +301,15 @@ pub enum ContainedProcessError {
     /// A worker output stream exceeded its exact byte ceiling.
     #[error("contained worker output exceeded its byte ceiling")]
     OutputTooLarge,
+    /// One live standard-output frame exceeded its exact byte ceiling.
+    #[error("contained worker stdout frame exceeded its byte ceiling")]
+    StdoutFrameTooLarge,
+    /// The worker ended with a nonempty standard-output frame lacking a newline delimiter.
+    #[error("contained worker stdout ended with an incomplete frame")]
+    StdoutFrameIncomplete,
+    /// The bounded live-frame receiver was full or unavailable.
+    #[error("contained worker stdout frame delivery failed")]
+    StdoutFrameDelivery,
     /// Fixed cleanup ownership was exhausted before spawn.
     #[error("contained worker cleanup capacity is exhausted")]
     ReaperCapacity,
@@ -239,7 +333,31 @@ impl ContainedProcessSupervisor {
         let execution = ProcessExecutionReservation::try_acquire()?;
         tokio::task::spawn_blocking(move || {
             let _execution = execution;
-            run_blocking(request, limits, cancellation)
+            run_blocking(request, limits, cancellation, None)
+        })
+        .await
+        .map_err(|_| ContainedProcessError::Unavailable)?
+    }
+
+    /// Runs one contained process while publishing bounded newline-delimited stdout frames.
+    ///
+    /// The returned future and the paired [`ContainedStdoutFrameReceiver`] must be polled
+    /// concurrently. The sole sender is dropped before this future resolves, allowing the caller
+    /// to drain every already-queued frame to `None` before accepting protocol completion.
+    pub async fn run_with_stdout_frames(
+        self,
+        request: ContainedProcessRequest,
+        limits: ContainedProcessLimits,
+        cancellation: CancellationToken,
+        frames: ContainedStdoutFrameSink,
+    ) -> Result<ContainedProcessOutput, ContainedProcessError> {
+        if frames.limits.maximum_frame_bytes > limits.maximum_stdout_bytes {
+            return Err(ContainedProcessError::InvalidRequest);
+        }
+        let execution = ProcessExecutionReservation::try_acquire()?;
+        tokio::task::spawn_blocking(move || {
+            let _execution = execution;
+            run_blocking(request, limits, cancellation, Some(frames))
         })
         .await
         .map_err(|_| ContainedProcessError::Unavailable)?
@@ -250,6 +368,7 @@ fn run_blocking(
     request: ContainedProcessRequest,
     limits: ContainedProcessLimits,
     cancellation: CancellationToken,
+    stdout_frames: Option<ContainedStdoutFrameSink>,
 ) -> Result<ContainedProcessOutput, ContainedProcessError> {
     let cleanup = ProcessCleanupReservation::try_acquire()?;
     let metadata = request
@@ -310,18 +429,20 @@ fn run_blocking(
     let Some(stderr) = child.stderr().take() else {
         return fail_after_spawn(child, cleanup, ContainedProcessError::Unavailable);
     };
-    let (sender, receiver) = mpsc::sync_channel(2);
+    let (sender, receiver) = std_mpsc::sync_channel(2);
     let stdout_reader = spawn_reader(
         OutputStream::Stdout,
         stdout,
         limits.maximum_stdout_bytes,
         sender.clone(),
+        stdout_frames,
     );
     let stderr_reader = spawn_reader(
         OutputStream::Stderr,
         stderr,
         limits.maximum_stderr_bytes,
         sender,
+        None,
     );
     let started = Instant::now();
     let mut status: Option<ExitStatus> = None;
@@ -417,10 +538,12 @@ fn spawn_reader<R: Read + Send + 'static>(
     stream: OutputStream,
     mut reader: R,
     limit: usize,
-    sender: mpsc::SyncSender<ReaderMessage>,
+    sender: std_mpsc::SyncSender<ReaderMessage>,
+    stdout_frames: Option<ContainedStdoutFrameSink>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut output = Vec::new();
+        let mut frame_start = 0_usize;
         let mut buffer = [0_u8; 8 * 1024];
         let result = loop {
             let read = match reader.read(&mut buffer) {
@@ -434,9 +557,61 @@ fn spawn_reader<R: Read + Send + 'static>(
                 break Err(ContainedProcessError::OutputTooLarge);
             }
             output.extend_from_slice(&buffer[..read]);
+            if let Some(frames) = stdout_frames.as_ref()
+                && let Err(error) = publish_stdout_frames(&output, &mut frame_start, frames)
+            {
+                break Err(error);
+            }
+        };
+        let result = match (result, stdout_frames.as_ref()) {
+            (Ok(_output), Some(frames)) if frames.sender.is_closed() => {
+                Err(ContainedProcessError::StdoutFrameDelivery)
+            }
+            (Ok(output), Some(_frames)) if frame_start != output.len() => {
+                Err(ContainedProcessError::StdoutFrameIncomplete)
+            }
+            (result, _) => result,
         };
         let _ignored = sender.send(ReaderMessage { stream, result });
     })
+}
+
+fn publish_stdout_frames(
+    output: &[u8],
+    frame_start: &mut usize,
+    frames: &ContainedStdoutFrameSink,
+) -> Result<(), ContainedProcessError> {
+    while let Some(relative_end) = output[*frame_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+    {
+        let frame_end = (*frame_start)
+            .checked_add(relative_end)
+            .ok_or(ContainedProcessError::StdoutFrameTooLarge)?;
+        let frame = output
+            .get(*frame_start..frame_end)
+            .ok_or(ContainedProcessError::Unavailable)?;
+        let frame = frame.strip_suffix(b"\r").unwrap_or(frame);
+        if frame.len() > frames.limits.maximum_frame_bytes {
+            return Err(ContainedProcessError::StdoutFrameTooLarge);
+        }
+        frames
+            .sender
+            .try_send(frame.to_vec().into_boxed_slice())
+            .map_err(|_error| ContainedProcessError::StdoutFrameDelivery)?;
+        *frame_start = frame_end
+            .checked_add(1)
+            .ok_or(ContainedProcessError::StdoutFrameTooLarge)?;
+    }
+    let pending = output
+        .len()
+        .checked_sub(*frame_start)
+        .ok_or(ContainedProcessError::Unavailable)?;
+    let maximum_pending = frames.limits.maximum_frame_bytes.saturating_add(1);
+    if pending > maximum_pending {
+        return Err(ContainedProcessError::StdoutFrameTooLarge);
+    }
+    Ok(())
 }
 
 fn join_reader(handle: thread::JoinHandle<()>) -> Result<(), ContainedProcessError> {
