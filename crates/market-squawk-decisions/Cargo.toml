@@ -1,0 +1,22 @@
+[package]
+name = "market-squawk-decisions"
+description = "Immutable investment screens, candidates, dossiers, targets, and review evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+market-squawk-analytics.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-modeling.workspace = true
+market-squawk-portfolio.workspace = true
+market-squawk-valuation.workspace = true
+
+[dev-dependencies]
+rust_decimal.workspace = true
+
+[lints]
+workspace = true

@@ -4621,6 +4621,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-decisions"
+version = "1.0.0"
+dependencies = [
+ "market-squawk-analytics",
+ "market-squawk-domain",
+ "market-squawk-modeling",
+ "market-squawk-portfolio",
+ "market-squawk-valuation",
+ "rust_decimal",
+]
+
+[[package]]
 name = "market-squawk-desktop"
 version = "1.0.0"
 dependencies = [

@@ -3,127 +3,1373 @@
     {
       "filename": "colorama-0.4.6-py2.py3-none-any.whl",
       "license": "BSD-3-Clause",
-      "license_file_sha256": "cac35c02686e5d04a5a7140bfb3b36e73aed496656e891102e428886d7930318",
+      "license_files": [
+        {
+          "path": "colorama-0.4.6.dist-info/licenses/LICENSE.txt",
+          "sha256": "cac35c02686e5d04a5a7140bfb3b36e73aed496656e891102e428886d7930318",
+          "size_bytes": 1491
+        }
+      ],
+      "metadata_sha256": "7baed29eb50c3b29bdb33ff84e3177bf1bc05784f7685ecdcaa4471c7dd810cc",
       "project": "colorama",
+      "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,!=3.5.*,!=3.6.*,>=2.7",
       "sha256": "4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6",
       "size_bytes": 25335,
+      "tags": [
+        "py2-none-any",
+        "py3-none-any"
+      ],
+      "upload_time": "2022-10-25T02:36:20.889702Z",
       "url": "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl",
-      "version": "0.4.6"
+      "version": "0.4.6",
+      "yanked": false
     },
     {
       "filename": "iniconfig-2.3.0-py3-none-any.whl",
       "license": "MIT",
+      "license_files": [
+        {
+          "path": "iniconfig-2.3.0.dist-info/licenses/LICENSE",
+          "sha256": "3409fa91f7ace557894632676656e32264fe5ef7581535725dc9a23774551bd4",
+          "size_bytes": 1098
+        }
+      ],
+      "metadata_sha256": "40d773f84e4e112f495bbf4f1be9cbd2d456c0aeb6ef5311f75d1bf322f2165b",
       "project": "iniconfig",
+      "requires_python": ">=3.10",
       "sha256": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
       "size_bytes": 7484,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2025-10-18T21:55:41.639305Z",
       "url": "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl",
-      "version": "2.3.0"
+      "version": "2.3.0",
+      "yanked": false
+    },
+    {
+      "filename": "joblib-1.5.3-py3-none-any.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "joblib-1.5.3.dist-info/licenses/LICENSE.txt",
+          "sha256": "42612911c1872c5e4b43f6ae0e8ee59467cd350332241cf72ce90640264fae6a",
+          "size_bytes": 1527
+        }
+      ],
+      "metadata_sha256": "cee9c60896ae4e7a965a840fbde50d111d2f8018f61201d1ed2e9fc3dd4883e6",
+      "project": "joblib",
+      "requires_python": ">=3.9",
+      "sha256": "5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713",
+      "size_bytes": 309071,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2025-12-15T08:41:44.973259Z",
+      "url": "https://files.pythonhosted.org/packages/7b/91/984aca2ec129e2757d1e4e3c81c3fcda9d0f85b74670a094cc443d9ee949/joblib-1.5.3-py3-none-any.whl",
+      "version": "1.5.3",
+      "yanked": false
+    },
+    {
+      "filename": "mapie-1.4.1-py3-none-any.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "mapie-1.4.1.dist-info/licenses/LICENSE",
+          "sha256": "92372faa472615c49bd4255fb56d998644e60b255b1093c7dad969ac70c1a60c",
+          "size_bytes": 1575
+        }
+      ],
+      "metadata_sha256": "1faedb8d0037356ff44d9fc70f690ef28f2874bf36d2dbf5e92db5ff7f3a7e31",
+      "project": "mapie",
+      "requires_python": ">=3.9",
+      "sha256": "cb79bd98d30d3d370d2c74bc04e0f0d8ccfb1e90973d9773c0c9e956c4d1046b",
+      "size_bytes": 271613,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-06-08T13:22:27.235366Z",
+      "url": "https://files.pythonhosted.org/packages/31/e3/01c64297e98676c3ac58d141ea0149464c7ed02d0160ef68c94f23756a2e/mapie-1.4.1-py3-none-any.whl",
+      "version": "1.4.1",
+      "yanked": false
     },
     {
       "filename": "maturin-1.14.1-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
       "license": "MIT OR Apache-2.0",
+      "license_files": [
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-apache",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "size_bytes": 10847
+        },
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-mit",
+          "sha256": "ea7882c559733766ad08343bde1d1ec80a4967c03a738fb8e0058ef6289f7b7c",
+          "size_bytes": 1051
+        }
+      ],
+      "metadata_sha256": "143d06aba37ca819d542fb1a1201ac7db7fd57ba73ea484197e01196c9e4a0fa",
       "project": "maturin",
+      "requires_python": ">=3.7",
       "sha256": "ffe5ad71f21d1e6603c4dd75f7fee34adf5ed5ebcebb692886549888ebb329ed",
       "size_bytes": 19680113,
+      "tags": [
+        "py3-none-macosx_10_12_universal2",
+        "py3-none-macosx_10_12_x86_64",
+        "py3-none-macosx_11_0_arm64"
+      ],
+      "upload_time": "2026-06-19T05:19:13.430057Z",
       "url": "https://files.pythonhosted.org/packages/fe/83/294bca639b0e052f1e2f65199b3db258780c7d4e31408b934c9c974a1379/maturin-1.14.1-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
-      "version": "1.14.1"
+      "version": "1.14.1",
+      "yanked": false
+    },
+    {
+      "filename": "maturin-1.14.1-py3-none-macosx_10_12_x86_64.whl",
+      "license": "MIT OR Apache-2.0",
+      "license_files": [
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-apache",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "size_bytes": 10847
+        },
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-mit",
+          "sha256": "ea7882c559733766ad08343bde1d1ec80a4967c03a738fb8e0058ef6289f7b7c",
+          "size_bytes": 1051
+        }
+      ],
+      "metadata_sha256": "143d06aba37ca819d542fb1a1201ac7db7fd57ba73ea484197e01196c9e4a0fa",
+      "project": "maturin",
+      "requires_python": ">=3.7",
+      "sha256": "f3306078070c1508fd715b9116070cbcaff5959024272a9f1e6f5cb29768b86c",
+      "size_bytes": 10169205,
+      "tags": [
+        "py3-none-macosx_10_12_x86_64"
+      ],
+      "upload_time": "2026-06-19T05:19:16.615931Z",
+      "url": "https://files.pythonhosted.org/packages/43/b6/79c881410a3b1c187f7eb3d407aecae646c6a4433d630d72200359015e83/maturin-1.14.1-py3-none-macosx_10_12_x86_64.whl",
+      "version": "1.14.1",
+      "yanked": false
     },
     {
       "filename": "maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
       "license": "MIT OR Apache-2.0",
+      "license_files": [
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-apache",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "size_bytes": 10847
+        },
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-mit",
+          "sha256": "ea7882c559733766ad08343bde1d1ec80a4967c03a738fb8e0058ef6289f7b7c",
+          "size_bytes": 1051
+        }
+      ],
+      "metadata_sha256": "143d06aba37ca819d542fb1a1201ac7db7fd57ba73ea484197e01196c9e4a0fa",
       "project": "maturin",
+      "requires_python": ">=3.7",
       "sha256": "dfc54ae32e6fcb18302193ab9a30b0b25eefffba994ae13238974805533ef75e",
       "size_bytes": 10627576,
+      "tags": [
+        "py3-none-manylinux2010_x86_64",
+        "py3-none-manylinux_2_12_x86_64",
+        "py3-none-musllinux_1_1_x86_64"
+      ],
+      "upload_time": "2026-06-19T05:19:22.713275Z",
       "url": "https://files.pythonhosted.org/packages/1a/bd/9c0d5d6983905ce2c9edaa073a7e89355a9cf7f396988e05d32f1c37785d/maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
-      "version": "1.14.1"
+      "version": "1.14.1",
+      "yanked": false
     },
     {
       "filename": "maturin-1.14.1-py3-none-win_amd64.whl",
       "license": "MIT OR Apache-2.0",
+      "license_files": [
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-apache",
+          "sha256": "7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c",
+          "size_bytes": 11048
+        },
+        {
+          "path": "maturin-1.14.1.dist-info/licenses/license-mit",
+          "sha256": "c3143857f9e9abccb11b91b324e5ed5bbbf814b008bf2249c43930eba87f093b",
+          "size_bytes": 1076
+        }
+      ],
+      "metadata_sha256": "b1ba38af05383be636db987d1780aaec3fb825e28be5cbeba3dba84abffd9e5d",
       "project": "maturin",
+      "requires_python": ">=3.7",
       "sha256": "3c9f94640ecc4895e94abaf834a0684430032c865b2748a36c12461fd9252fdd",
       "size_bytes": 10314067,
+      "tags": [
+        "py3-none-win_amd64"
+      ],
+      "upload_time": "2026-06-19T05:19:44.389939Z",
       "url": "https://files.pythonhosted.org/packages/63/4b/585adeb9167b08d3cdff0032a938b0e72655c92003df4f52c3f696a1bcc2/maturin-1.14.1-py3-none-win_amd64.whl",
-      "version": "1.14.1"
+      "version": "1.14.1",
+      "yanked": false
+    },
+    {
+      "filename": "ml_dtypes-0.5.4-cp314-cp314-macosx_10_13_universal2.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE.eigen",
+          "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+          "size_bytes": 16726
+        }
+      ],
+      "metadata_sha256": "51b5729b48ce71736748bbf43d4f355485f42b44977d6016717bbd6b11b7dfc0",
+      "project": "ml-dtypes",
+      "requires_python": ">=3.9",
+      "sha256": "2b857d3af6ac0d39db1de7c706e69c7f9791627209c3d6dedbfca8c7e5faec22",
+      "size_bytes": 673781,
+      "tags": [
+        "cp314-cp314-macosx_10_13_universal2"
+      ],
+      "upload_time": "2025-11-17T22:32:11.364386Z",
+      "url": "https://files.pythonhosted.org/packages/72/4e/1339dc6e2557a344f5ba5590872e80346f76f6cb2ac3dd16e4666e88818c/ml_dtypes-0.5.4-cp314-cp314-macosx_10_13_universal2.whl",
+      "version": "0.5.4",
+      "yanked": false
+    },
+    {
+      "filename": "ml_dtypes-0.5.4-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE.eigen",
+          "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+          "size_bytes": 16726
+        }
+      ],
+      "metadata_sha256": "51b5729b48ce71736748bbf43d4f355485f42b44977d6016717bbd6b11b7dfc0",
+      "project": "ml-dtypes",
+      "requires_python": ">=3.9",
+      "sha256": "14a4fd3228af936461db66faccef6e4f41c1d82fcc30e9f8d58a08916b1d811f",
+      "size_bytes": 5010230,
+      "tags": [
+        "cp314-cp314-manylinux_2_27_x86_64",
+        "cp314-cp314-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2025-11-17T22:32:14.380182Z",
+      "url": "https://files.pythonhosted.org/packages/c6/bb/82c7dcf38070b46172a517e2334e665c5bf374a262f99a283ea454bece7c/ml_dtypes-0.5.4-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "version": "0.5.4",
+      "yanked": false
+    },
+    {
+      "filename": "ml_dtypes-0.5.4-cp314-cp314-win_amd64.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE",
+          "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+          "size_bytes": 11560
+        },
+        {
+          "path": "ml_dtypes-0.5.4.dist-info/licenses/LICENSE.eigen",
+          "sha256": "9221c2f936159b8446d329249fb4c0f25be510f447383a0f13336ac7985668a3",
+          "size_bytes": 17099
+        }
+      ],
+      "metadata_sha256": "9ab61bf467463ee4d73ef173fc6c56a7f9ff598293ec3a589521aba0bd0e48b5",
+      "project": "ml-dtypes",
+      "requires_python": ">=3.9",
+      "sha256": "8c6a2dcebd6f3903e05d51960a8058d6e131fe69f952a5397e5dbabc841b6d56",
+      "size_bytes": 221032,
+      "tags": [
+        "cp314-cp314-win_amd64"
+      ],
+      "upload_time": "2025-11-17T22:32:15.763402Z",
+      "url": "https://files.pythonhosted.org/packages/e9/93/2bfed22d2498c468f6bcd0d9f56b033eaa19f33320389314c19ef6766413/ml_dtypes-0.5.4-cp314-cp314-win_amd64.whl",
+      "version": "0.5.4",
+      "yanked": false
+    },
+    {
+      "filename": "narwhals-2.24.0-py3-none-any.whl",
+      "license": "MIT",
+      "license_files": [
+        {
+          "path": "narwhals-2.24.0.dist-info/licenses/LICENSE.md",
+          "sha256": "811445f30147b8f0c9d444c9025fd528f9532c54b7b83f6e2368473dc91cfdf0",
+          "size_bytes": 1082
+        }
+      ],
+      "metadata_sha256": "c8aa441e88f6ee9e37ac5232c33552426f87a6a200c6c66038d37c17b3c1ca56",
+      "project": "narwhals",
+      "requires_python": ">=3.10",
+      "sha256": "42fdedf44e5b2ca7505630d45b4ac3058f38d8485cba9fe1652ca23152df7489",
+      "size_bytes": 461030,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-07-13T10:49:17.571855Z",
+      "url": "https://files.pythonhosted.org/packages/7e/85/a5bfaebfd305ac18b57b0854d74e37e586809061a91fda62f0bd50c8518e/narwhals-2.24.0-py3-none-any.whl",
+      "version": "2.24.0",
+      "yanked": false
+    },
+    {
+      "filename": "numpy-2.5.1-cp314-cp314-macosx_10_15_x86_64.whl",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "license_files": [
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/LICENSE.txt",
+          "sha256": "649a589ab31076e79e9ce62ba24eae9959598124176640dbc95f87bd10f34fcf",
+          "size_bytes": 46826
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/include/numpy/libdivide/LICENSE.txt",
+          "sha256": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+          "size_bytes": 1018
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/common/pythoncapi-compat/COPYING",
+          "sha256": "3f2c1ffa76383a55ae0aac01c9737cd70050dff63e1f026694fbe9d662573c98",
+          "size_bytes": 690
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/highway/LICENSE",
+          "sha256": "e340270d4f64384569a91d546acb5b094d69ce47f0c015db77abb74dc6f815af",
+          "size_bytes": 20785
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+          "sha256": "f7b14309e5f54e5022b26448eefd419988ada2aec01d3c1162d84a0ea8f21f2c",
+          "size_bytes": 1414
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+          "sha256": "211e7d737d6179a08f791ebb0a99897ce7cd2457410c542876d125576edfe910",
+          "size_bytes": 1514
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/umath/svml/LICENSE",
+          "sha256": "c17011467b4fe6e20fbfbeda4df09e58c2bca5480a063e55735a4000a379aad9",
+          "size_bytes": 1543
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/fft/pocketfft/LICENSE.md",
+          "sha256": "a85ca13fdf90160b64a0698215868c13b74d835ad0a4e2ba44713b8c5058a056",
+          "size_bytes": 1498
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/linalg/lapack_lite/LICENSE.txt",
+          "sha256": "a14cc25e10d40a3aa705b7de2fb764a6535d8ee9b2db4e1724900585457dfd55",
+          "size_bytes": 2266
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/ma/LICENSE",
+          "sha256": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+          "size_bytes": 1593
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/LICENSE.md",
+          "sha256": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f",
+          "size_bytes": 3511
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/distributions/LICENSE.md",
+          "sha256": "469778be8f33d54e1bcaab28c281cc472916d2d273f835e55bc487d30503face",
+          "size_bytes": 2745
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/mt19937/LICENSE.md",
+          "sha256": "0e111337b25494a773106695f0e799f642b8567aaacca4f116a74a8177179156",
+          "size_bytes": 2926
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/pcg64/LICENSE.md",
+          "sha256": "e7d4f4fb20358f314210a892ae17351e04993813646f697ec387385ca2a36918",
+          "size_bytes": 1154
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/philox/LICENSE.md",
+          "sha256": "6f5828a57223d4cc7f8ea505a2623e7b978b242752c1515e355f46ba2cec1800",
+          "size_bytes": 1509
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/sfc64/LICENSE.md",
+          "sha256": "9d4098846018319cd68e228ee6220361787f73bccbf00237a85e4fc9621b998f",
+          "size_bytes": 1226
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/splitmix64/LICENSE.md",
+          "sha256": "268b0ca06759d31ea3ca68dd35f20e877916e927b1c2a835e4592a3c4354b1f9",
+          "size_bytes": 332
+        }
+      ],
+      "metadata_sha256": "6ae45122ee97050e48849438320430d05f01814f72e66e69cbeed027d2c6a1e8",
+      "project": "numpy",
+      "requires_python": ">=3.12",
+      "sha256": "7c786fe9a5bbe360022e584c5a34cf6b54265c71bd7ec8ac3d8fec38968071f8",
+      "size_bytes": 16795063,
+      "tags": [
+        "cp314-cp314-macosx_10_15_x86_64"
+      ],
+      "upload_time": "2026-07-04T17:07:07.374865Z",
+      "url": "https://files.pythonhosted.org/packages/db/f4/731b6085a83faf6ca843394cbd5e217280c214399f7e8b21b9f552af0ae2/numpy-2.5.1-cp314-cp314-macosx_10_15_x86_64.whl",
+      "version": "2.5.1",
+      "yanked": false
+    },
+    {
+      "filename": "numpy-2.5.1-cp314-cp314-macosx_11_0_arm64.whl",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "license_files": [
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/LICENSE.txt",
+          "sha256": "649a589ab31076e79e9ce62ba24eae9959598124176640dbc95f87bd10f34fcf",
+          "size_bytes": 46826
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/include/numpy/libdivide/LICENSE.txt",
+          "sha256": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+          "size_bytes": 1018
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/common/pythoncapi-compat/COPYING",
+          "sha256": "3f2c1ffa76383a55ae0aac01c9737cd70050dff63e1f026694fbe9d662573c98",
+          "size_bytes": 690
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/highway/LICENSE",
+          "sha256": "e340270d4f64384569a91d546acb5b094d69ce47f0c015db77abb74dc6f815af",
+          "size_bytes": 20785
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+          "sha256": "f7b14309e5f54e5022b26448eefd419988ada2aec01d3c1162d84a0ea8f21f2c",
+          "size_bytes": 1414
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+          "sha256": "211e7d737d6179a08f791ebb0a99897ce7cd2457410c542876d125576edfe910",
+          "size_bytes": 1514
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/umath/svml/LICENSE",
+          "sha256": "c17011467b4fe6e20fbfbeda4df09e58c2bca5480a063e55735a4000a379aad9",
+          "size_bytes": 1543
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/fft/pocketfft/LICENSE.md",
+          "sha256": "a85ca13fdf90160b64a0698215868c13b74d835ad0a4e2ba44713b8c5058a056",
+          "size_bytes": 1498
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/linalg/lapack_lite/LICENSE.txt",
+          "sha256": "a14cc25e10d40a3aa705b7de2fb764a6535d8ee9b2db4e1724900585457dfd55",
+          "size_bytes": 2266
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/ma/LICENSE",
+          "sha256": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+          "size_bytes": 1593
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/LICENSE.md",
+          "sha256": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f",
+          "size_bytes": 3511
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/distributions/LICENSE.md",
+          "sha256": "469778be8f33d54e1bcaab28c281cc472916d2d273f835e55bc487d30503face",
+          "size_bytes": 2745
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/mt19937/LICENSE.md",
+          "sha256": "0e111337b25494a773106695f0e799f642b8567aaacca4f116a74a8177179156",
+          "size_bytes": 2926
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/pcg64/LICENSE.md",
+          "sha256": "e7d4f4fb20358f314210a892ae17351e04993813646f697ec387385ca2a36918",
+          "size_bytes": 1154
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/philox/LICENSE.md",
+          "sha256": "6f5828a57223d4cc7f8ea505a2623e7b978b242752c1515e355f46ba2cec1800",
+          "size_bytes": 1509
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/sfc64/LICENSE.md",
+          "sha256": "9d4098846018319cd68e228ee6220361787f73bccbf00237a85e4fc9621b998f",
+          "size_bytes": 1226
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/splitmix64/LICENSE.md",
+          "sha256": "268b0ca06759d31ea3ca68dd35f20e877916e927b1c2a835e4592a3c4354b1f9",
+          "size_bytes": 332
+        }
+      ],
+      "metadata_sha256": "6ae45122ee97050e48849438320430d05f01814f72e66e69cbeed027d2c6a1e8",
+      "project": "numpy",
+      "requires_python": ">=3.12",
+      "sha256": "32985c896d897419ef8da6917872d80b78ad0ea26d85b23245c7366ffde76d75",
+      "size_bytes": 11776652,
+      "tags": [
+        "cp314-cp314-macosx_11_0_arm64"
+      ],
+      "upload_time": "2026-07-04T17:07:09.907544Z",
+      "url": "https://files.pythonhosted.org/packages/bf/64/0e215f2048dd11a55bb989ed41b3585ef57452404e638d703a211a3e4157/numpy-2.5.1-cp314-cp314-macosx_11_0_arm64.whl",
+      "version": "2.5.1",
+      "yanked": false
+    },
+    {
+      "filename": "numpy-2.5.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "license_files": [
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/LICENSE.txt",
+          "sha256": "4860083caa0de2ac3292ca98bd074bd8f45d8b32624e37b1e70a240bff61e488",
+          "size_bytes": 46794
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/include/numpy/libdivide/LICENSE.txt",
+          "sha256": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+          "size_bytes": 1018
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/common/pythoncapi-compat/COPYING",
+          "sha256": "3f2c1ffa76383a55ae0aac01c9737cd70050dff63e1f026694fbe9d662573c98",
+          "size_bytes": 690
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/highway/LICENSE",
+          "sha256": "e340270d4f64384569a91d546acb5b094d69ce47f0c015db77abb74dc6f815af",
+          "size_bytes": 20785
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+          "sha256": "f7b14309e5f54e5022b26448eefd419988ada2aec01d3c1162d84a0ea8f21f2c",
+          "size_bytes": 1414
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+          "sha256": "211e7d737d6179a08f791ebb0a99897ce7cd2457410c542876d125576edfe910",
+          "size_bytes": 1514
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/umath/svml/LICENSE",
+          "sha256": "c17011467b4fe6e20fbfbeda4df09e58c2bca5480a063e55735a4000a379aad9",
+          "size_bytes": 1543
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/fft/pocketfft/LICENSE.md",
+          "sha256": "a85ca13fdf90160b64a0698215868c13b74d835ad0a4e2ba44713b8c5058a056",
+          "size_bytes": 1498
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/linalg/lapack_lite/LICENSE.txt",
+          "sha256": "a14cc25e10d40a3aa705b7de2fb764a6535d8ee9b2db4e1724900585457dfd55",
+          "size_bytes": 2266
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/ma/LICENSE",
+          "sha256": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+          "size_bytes": 1593
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/LICENSE.md",
+          "sha256": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f",
+          "size_bytes": 3511
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/distributions/LICENSE.md",
+          "sha256": "469778be8f33d54e1bcaab28c281cc472916d2d273f835e55bc487d30503face",
+          "size_bytes": 2745
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/mt19937/LICENSE.md",
+          "sha256": "0e111337b25494a773106695f0e799f642b8567aaacca4f116a74a8177179156",
+          "size_bytes": 2926
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/pcg64/LICENSE.md",
+          "sha256": "e7d4f4fb20358f314210a892ae17351e04993813646f697ec387385ca2a36918",
+          "size_bytes": 1154
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/philox/LICENSE.md",
+          "sha256": "6f5828a57223d4cc7f8ea505a2623e7b978b242752c1515e355f46ba2cec1800",
+          "size_bytes": 1509
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/sfc64/LICENSE.md",
+          "sha256": "9d4098846018319cd68e228ee6220361787f73bccbf00237a85e4fc9621b998f",
+          "size_bytes": 1226
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/splitmix64/LICENSE.md",
+          "sha256": "268b0ca06759d31ea3ca68dd35f20e877916e927b1c2a835e4592a3c4354b1f9",
+          "size_bytes": 332
+        }
+      ],
+      "metadata_sha256": "6ae45122ee97050e48849438320430d05f01814f72e66e69cbeed027d2c6a1e8",
+      "project": "numpy",
+      "requires_python": ">=3.12",
+      "sha256": "54ad769f17bc2d833b620851989f62054fb9ab93c969d9e1dc3c8e3d56beea21",
+      "size_bytes": 16664835,
+      "tags": [
+        "cp314-cp314-manylinux_2_27_x86_64",
+        "cp314-cp314-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2026-07-04T17:07:19.021186Z",
+      "url": "https://files.pythonhosted.org/packages/41/5f/0f992cb24560673496c5d68de61913b57166ce530ffda07c1f280e0cc464/numpy-2.5.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "version": "2.5.1",
+      "yanked": false
+    },
+    {
+      "filename": "numpy-2.5.1-cp314-cp314-win_amd64.whl",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "license_files": [
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/LICENSE.txt",
+          "sha256": "a804dff0ead9fadc5293456410bcbfc32bf024be9c4513459663fb7b442d2341",
+          "size_bytes": 45831
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/include/numpy/libdivide/LICENSE.txt",
+          "sha256": "d544761558b510866c21f7e8a2d5716fca76e0b98117e3b6b86314db7244d150",
+          "size_bytes": 1039
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/common/pythoncapi-compat/COPYING",
+          "sha256": "aea41976c720f91bd19725c16916a1ace40eb1ea42620d340e587a5de4bbcea0",
+          "size_bytes": 704
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/highway/LICENSE",
+          "sha256": "d208152e2777ffd0126eacc1bd21c0320d69e4e6b622d21a2a12a47e8ef73763",
+          "size_bytes": 21155
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+          "sha256": "b0fd592d4ead563148e3977e7b589169d46a5ef2ff133c755a81af880a3fc919",
+          "size_bytes": 1441
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+          "sha256": "a732977853530066790c42817087f4829b518dd98d340c916acbfd227e39d3cb",
+          "size_bytes": 1542
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/_core/src/umath/svml/LICENSE",
+          "sha256": "585483905b13d4b42f800c55ba99e89d6e2e33ccd5f503e201c07531d148ff41",
+          "size_bytes": 1573
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/fft/pocketfft/LICENSE.md",
+          "sha256": "8db000e158c162e7249787852d8c69764706502ccee725c06641b31c1e95c8af",
+          "size_bytes": 1523
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/linalg/lapack_lite/LICENSE.txt",
+          "sha256": "19060ef465e1797d682ee0fc3081bd25ab1395e995e43d25c9d13c95d9a3cd6b",
+          "size_bytes": 2314
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/ma/LICENSE",
+          "sha256": "d78dbb208b80d92b4d333e41a4baae50d12444f46e53199fa7726a91de6e2da7",
+          "size_bytes": 1616
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/LICENSE.md",
+          "sha256": "b4bc2f4fa1c95778f1ed3dd8f14706bece399475b978f9f34b5d3cd72521b48a",
+          "size_bytes": 3582
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/distributions/LICENSE.md",
+          "sha256": "cf5619f25b112d5ce7c896efffc8e610bcb345dfadcc19f2c1460aa48fff2c9e",
+          "size_bytes": 2805
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/mt19937/LICENSE.md",
+          "sha256": "92c10699884321f1c2947fe2a70ab23b0fbf1507f756d89dd08f38c61fc3d4fa",
+          "size_bytes": 2986
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/pcg64/LICENSE.md",
+          "sha256": "41190663b77bee5302386495a07b7eabfbfa571aa0ae2f11da6764162062fc4f",
+          "size_bytes": 1176
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/philox/LICENSE.md",
+          "sha256": "322ac46d870c8aeead6c53adcccc839296fb3c8e456eae155081297daf7f8013",
+          "size_bytes": 1540
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/sfc64/LICENSE.md",
+          "sha256": "28cad82ce1379dc529df30da78ec012d7d0d1d576b03ddcb93388aee53659f59",
+          "size_bytes": 1253
+        },
+        {
+          "path": "numpy-2.5.1.dist-info/licenses/numpy/random/src/splitmix64/LICENSE.md",
+          "sha256": "454ec7350e478e037061850b67395753b425b1cb0a34bbc26290b020bf89d763",
+          "size_bytes": 340
+        }
+      ],
+      "metadata_sha256": "6ae45122ee97050e48849438320430d05f01814f72e66e69cbeed027d2c6a1e8",
+      "project": "numpy",
+      "requires_python": ">=3.12",
+      "sha256": "24d0eb82c0541d3415a33425db64ae439dffccd7b4dbcb30e7c35120205c506a",
+      "size_bytes": 12562177,
+      "tags": [
+        "cp314-cp314-win_amd64"
+      ],
+      "upload_time": "2026-07-04T17:07:29.887234Z",
+      "url": "https://files.pythonhosted.org/packages/c1/1a/837f9ed7405adcd7a40538792eb169eddd8fa5630c16a1ef49dae71a30f4/numpy-2.5.1-cp314-cp314-win_amd64.whl",
+      "version": "2.5.1",
+      "yanked": false
+    },
+    {
+      "filename": "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/NOTICE",
+          "sha256": "4d680fb1f48f07f134c9f7a8d715303b8f5160b5757bc9eec4cac783703ea592",
+          "size_bytes": 2133
+        }
+      ],
+      "metadata_sha256": "05e268109e1131e7e33ceeb1525934de515d1e32ed327dcc70b21793e0a2e760",
+      "project": "onnx",
+      "requires_python": ">=3.10",
+      "sha256": "596fbf0490947533c1c1045ba860851dc9fb77471023dac9a71ba5b42ceab103",
+      "size_bytes": 20167081,
+      "tags": [
+        "cp312-abi3-macosx_12_0_universal2"
+      ],
+      "upload_time": "2026-06-15T12:49:32.078717Z",
+      "url": "https://files.pythonhosted.org/packages/ee/6a/481561f1093834376ed493e4ca42a73e5be0d50031f2969c86593bdc7c96/onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+      "version": "1.22.0",
+      "yanked": false
+    },
+    {
+      "filename": "onnx-1.22.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/NOTICE",
+          "sha256": "4d680fb1f48f07f134c9f7a8d715303b8f5160b5757bc9eec4cac783703ea592",
+          "size_bytes": 2133
+        }
+      ],
+      "metadata_sha256": "05e268109e1131e7e33ceeb1525934de515d1e32ed327dcc70b21793e0a2e760",
+      "project": "onnx",
+      "requires_python": ">=3.10",
+      "sha256": "955e02e1f6d385b53d52f9cd7b9cdf5caf417c300bcfe3c64c6d542be763845b",
+      "size_bytes": 19106514,
+      "tags": [
+        "cp312-abi3-manylinux_2_27_x86_64",
+        "cp312-abi3-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2026-06-15T12:49:37.424852Z",
+      "url": "https://files.pythonhosted.org/packages/09/a6/bd32357e6cc1ecb473afd78193d7231724f284435d2db25696ecfaaa1503/onnx-1.22.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "version": "1.22.0",
+      "yanked": false
+    },
+    {
+      "filename": "onnx-1.22.0-cp312-abi3-win_amd64.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/LICENSE",
+          "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+          "size_bytes": 11560
+        },
+        {
+          "path": "onnx-1.22.0.dist-info/licenses/NOTICE",
+          "sha256": "62c2c7bb3be2833f5e2c8a2576ac10666cf26aa09b7b631b55fed77bc7dc91c7",
+          "size_bytes": 2192
+        }
+      ],
+      "metadata_sha256": "05e268109e1131e7e33ceeb1525934de515d1e32ed327dcc70b21793e0a2e760",
+      "project": "onnx",
+      "requires_python": ">=3.10",
+      "sha256": "72ccebab3bac07215c204ce8848d42e78eaaa666badbf72d25cd359b9f269e3a",
+      "size_bytes": 17213290,
+      "tags": [
+        "cp312-abi3-win_amd64"
+      ],
+      "upload_time": "2026-06-15T12:49:45.933600Z",
+      "url": "https://files.pythonhosted.org/packages/13/a8/734725bb703c5fabb687f79c79e51249475212b3eb37771ac4a4ac9b487f/onnx-1.22.0-cp312-abi3-win_amd64.whl",
+      "version": "1.22.0",
+      "yanked": false
     },
     {
       "filename": "packaging-26.2-py3-none-any.whl",
       "license": "Apache-2.0 OR BSD-2-Clause",
+      "license_files": [
+        {
+          "path": "packaging-26.2.dist-info/licenses/LICENSE",
+          "sha256": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48",
+          "size_bytes": 197
+        },
+        {
+          "path": "packaging-26.2.dist-info/licenses/LICENSE.APACHE",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+          "size_bytes": 10174
+        },
+        {
+          "path": "packaging-26.2.dist-info/licenses/LICENSE.BSD",
+          "sha256": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
+          "size_bytes": 1344
+        }
+      ],
+      "metadata_sha256": "4f9cbcd7933415a4793f7767c98a2b6a512c823fc81c87337815705f230ecabf",
       "project": "packaging",
+      "requires_python": ">=3.8",
       "sha256": "5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e",
       "size_bytes": 100195,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-04-24T20:15:22.081511Z",
       "url": "https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl",
-      "version": "26.2"
+      "version": "26.2",
+      "yanked": false
     },
     {
       "filename": "pluggy-1.6.0-py3-none-any.whl",
       "license": "MIT",
+      "license_files": [
+        {
+          "path": "pluggy-1.6.0.dist-info/licenses/LICENSE",
+          "sha256": "d6b65e6c213a5d0b577911d34d6e5949b9f59d76c238c5071a2f3fc16cfb2606",
+          "size_bytes": 1110
+        }
+      ],
+      "metadata_sha256": "7438c35ee25a095eb7416f84b461c2d74425c5e734ad54c3912453c65244e01c",
       "project": "pluggy",
+      "requires_python": ">=3.9",
       "sha256": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
       "size_bytes": 20538,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2025-05-15T12:30:06.134003Z",
       "url": "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl",
-      "version": "1.6.0"
+      "version": "1.6.0",
+      "yanked": false
+    },
+    {
+      "filename": "protobuf-7.35.1-cp310-abi3-macosx_10_9_universal2.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "protobuf-7.35.1.dist-info/LICENSE",
+          "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+          "size_bytes": 1732
+        }
+      ],
+      "metadata_sha256": "1c58cfd7acd805c087ceb1f14c27cdba3c52d074e1d7b05dacf31fdf413c0a8c",
+      "project": "protobuf",
+      "requires_python": ">=3.10",
+      "sha256": "24f857477359a85c0c235261b8ba905fd51b2562f4a64ca1df5473f29850cbf6",
+      "size_bytes": 433226,
+      "tags": [
+        "cp310-abi3-macosx_10_9_universal2"
+      ],
+      "upload_time": "2026-06-11T21:55:31.719008Z",
+      "url": "https://files.pythonhosted.org/packages/10/03/8aeeb7458d22546bf64b5250ca1daeb5ff757d900e8e4a7476c6f0db843e/protobuf-7.35.1-cp310-abi3-macosx_10_9_universal2.whl",
+      "version": "7.35.1",
+      "yanked": false
+    },
+    {
+      "filename": "protobuf-7.35.1-cp310-abi3-manylinux2014_x86_64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "protobuf-7.35.1.dist-info/LICENSE",
+          "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+          "size_bytes": 1732
+        }
+      ],
+      "metadata_sha256": "1c58cfd7acd805c087ceb1f14c27cdba3c52d074e1d7b05dacf31fdf413c0a8c",
+      "project": "protobuf",
+      "requires_python": ">=3.10",
+      "sha256": "74758715c53d7158fb76caf4f0cfdacc5329a4b1bb994f865d6cf302d413a1c4",
+      "size_bytes": 327130,
+      "tags": [
+        "cp310-abi3-manylinux2014_x86_64"
+      ],
+      "upload_time": "2026-06-11T21:55:35.921980Z",
+      "url": "https://files.pythonhosted.org/packages/e4/be/5b3cfe508bfab6761414ff944e3366eb13be4fd71efcd69450f89ba39f43/protobuf-7.35.1-cp310-abi3-manylinux2014_x86_64.whl",
+      "version": "7.35.1",
+      "yanked": false
+    },
+    {
+      "filename": "protobuf-7.35.1-cp310-abi3-win_amd64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "protobuf-7.35.1.dist-info/LICENSE",
+          "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+          "size_bytes": 1732
+        }
+      ],
+      "metadata_sha256": "1c58cfd7acd805c087ceb1f14c27cdba3c52d074e1d7b05dacf31fdf413c0a8c",
+      "project": "protobuf",
+      "requires_python": ">=3.10",
+      "sha256": "230a75ddfc2de4806e56696ce9640c1cdfdb6543b7cfce98d42a4c0a0e7bdb87",
+      "size_bytes": 439996,
+      "tags": [
+        "cp310-abi3-win_amd64"
+      ],
+      "upload_time": "2026-06-11T21:55:38.123562Z",
+      "url": "https://files.pythonhosted.org/packages/0a/19/8d0cb6f20a1ef7b18f1c8986ad5783f22f84cce39c6ce9a6e645ea55192e/protobuf-7.35.1-cp310-abi3-win_amd64.whl",
+      "version": "7.35.1",
+      "yanked": false
     },
     {
       "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
       "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/LICENSE.txt",
+          "sha256": "d1c981370f1ffd4edcdd2fb3565c8939cc40c75e24e1f92d581d04e54f0dff81",
+          "size_bytes": 112295
+        },
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/NOTICE.txt",
+          "sha256": "afd895d61a00101f6d5a41cf518c83865d815e8109e956f512a0ce4ea9738c06",
+          "size_bytes": 2916
+        }
+      ],
+      "metadata_sha256": "ec5c33ae4ab245a331da32755edf8d2812bba1eb636c5d29f41f139d2fb90a17",
       "project": "pyarrow",
+      "requires_python": ">=3.10",
       "sha256": "72132b9a8a0a1840197794d4dea26080069b6b0981c116bc078762dc9691b21b",
       "size_bytes": 35878945,
+      "tags": [
+        "cp314-cp314-macosx_12_0_arm64"
+      ],
+      "upload_time": "2026-07-10T08:28:18.222616Z",
       "url": "https://files.pythonhosted.org/packages/55/c7/581ccbcdb3d897eb2893328d68db3d52eca373bf2a7e964d0a6276b8e85b/pyarrow-25.0.0-cp314-cp314-macosx_12_0_arm64.whl",
-      "version": "25.0.0"
+      "version": "25.0.0",
+      "yanked": false
     },
     {
       "filename": "pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
       "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/LICENSE.txt",
+          "sha256": "d1c981370f1ffd4edcdd2fb3565c8939cc40c75e24e1f92d581d04e54f0dff81",
+          "size_bytes": 112295
+        },
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/NOTICE.txt",
+          "sha256": "afd895d61a00101f6d5a41cf518c83865d815e8109e956f512a0ce4ea9738c06",
+          "size_bytes": 2916
+        }
+      ],
+      "metadata_sha256": "ec5c33ae4ab245a331da32755edf8d2812bba1eb636c5d29f41f139d2fb90a17",
       "project": "pyarrow",
+      "requires_python": ">=3.10",
       "sha256": "e009ef945e498dca2f050ea10d2e9764cb44017254826fc4574fdb8d2530173b",
       "size_bytes": 37630854,
+      "tags": [
+        "cp314-cp314-macosx_12_0_x86_64"
+      ],
+      "upload_time": "2026-07-10T08:28:23.452017Z",
       "url": "https://files.pythonhosted.org/packages/64/d1/ccb01db7329ea0411ef4fbd9b62a04d3268b36777d4e758d5e39b91ddeab/pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
-      "version": "25.0.0"
+      "version": "25.0.0",
+      "yanked": false
     },
     {
       "filename": "pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
       "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/LICENSE.txt",
+          "sha256": "d1c981370f1ffd4edcdd2fb3565c8939cc40c75e24e1f92d581d04e54f0dff81",
+          "size_bytes": 112295
+        },
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/NOTICE.txt",
+          "sha256": "afd895d61a00101f6d5a41cf518c83865d815e8109e956f512a0ce4ea9738c06",
+          "size_bytes": 2916
+        }
+      ],
+      "metadata_sha256": "ec5c33ae4ab245a331da32755edf8d2812bba1eb636c5d29f41f139d2fb90a17",
       "project": "pyarrow",
+      "requires_python": ">=3.10",
       "sha256": "447df764beb07c544f0178a5f6b70ef44b9ecf382b3cdfad4c2d7867353c3887",
       "size_bytes": 50119765,
+      "tags": [
+        "cp314-cp314-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2026-07-10T08:28:35.826912Z",
       "url": "https://files.pythonhosted.org/packages/6a/29/0ed312ec800fb536f93783215126cee4b8977dcfeccba6f0f44df0cc87d7/pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
-      "version": "25.0.0"
+      "version": "25.0.0",
+      "yanked": false
     },
     {
       "filename": "pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
       "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/LICENSE.txt",
+          "sha256": "b410defd7f5f8cac9cfa54a3a49fcd971de2be0462bbab980c8f869f1aac94d3",
+          "size_bytes": 114602
+        },
+        {
+          "path": "pyarrow-25.0.0.dist-info/licenses/NOTICE.txt",
+          "sha256": "2ccca1e730e671f55b8028facf2261a6f74b561a4d96a2ccd743be19c5619236",
+          "size_bytes": 2997
+        }
+      ],
+      "metadata_sha256": "ec5c33ae4ab245a331da32755edf8d2812bba1eb636c5d29f41f139d2fb90a17",
       "project": "pyarrow",
+      "requires_python": ">=3.10",
       "sha256": "2e093efbecb5317372f819228fa4b4e6157eee48d3f0a7b0303705ebf81a7104",
       "size_bytes": 28613262,
+      "tags": [
+        "cp314-cp314-win_amd64"
+      ],
+      "upload_time": "2026-07-10T08:29:47.544002Z",
       "url": "https://files.pythonhosted.org/packages/fa/65/da20806de93ca6ee91e72cb6a9b08b3ac890b46efc8d94a7326c651c4c81/pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
-      "version": "25.0.0"
+      "version": "25.0.0",
+      "yanked": false
     },
     {
       "filename": "pygments-2.20.0-py3-none-any.whl",
       "license": "BSD-2-Clause",
-      "project": "Pygments",
+      "license_files": [
+        {
+          "path": "pygments-2.20.0.dist-info/licenses/AUTHORS",
+          "sha256": "0db603a5f4499f690c4425477ff664c166da325d3acc3b5a8d4de3db072443d0",
+          "size_bytes": 10873
+        },
+        {
+          "path": "pygments-2.20.0.dist-info/licenses/LICENSE",
+          "sha256": "a9d66f1d526df02e29dce73436d34e56e8632f46c275bbdffc70569e882f9f17",
+          "size_bytes": 1331
+        }
+      ],
+      "metadata_sha256": "e0528f51b30427fae94723662ba622f8d8db2a4d8d3f1365698d67a52450a845",
+      "project": "pygments",
+      "requires_python": ">=3.9",
       "sha256": "81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176",
       "size_bytes": 1231151,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-03-29T13:29:30.038266Z",
       "url": "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl",
-      "version": "2.20.0"
+      "version": "2.20.0",
+      "yanked": false
     },
     {
       "filename": "pytest-9.1.1-py3-none-any.whl",
       "license": "MIT",
+      "license_files": [
+        {
+          "path": "pytest-9.1.1.dist-info/licenses/LICENSE",
+          "sha256": "ca836a5f9ecca3b2f350230faa20a48fb8b145653b5568d784862df864706b9b",
+          "size_bytes": 1091
+        }
+      ],
+      "metadata_sha256": "c5d032518012789cabc870d46589aca3aeda36cf9fa4399ee88bda3d10438451",
       "project": "pytest",
+      "requires_python": ">=3.10",
       "sha256": "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
       "size_bytes": 386536,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-06-19T10:58:31.347074Z",
       "url": "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl",
-      "version": "9.1.1"
+      "version": "9.1.1",
+      "yanked": false
+    },
+    {
+      "filename": "scikit_learn-1.9.0-cp314-cp314-macosx_10_15_x86_64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scikit_learn-1.9.0.dist-info/licenses/COPYING",
+          "sha256": "fc8dc597df0e3f51da65e2a71021e7f92e0b481998ec572a53c03ac0441db040",
+          "size_bytes": 16881
+        }
+      ],
+      "metadata_sha256": "ee61a579f42d3edabe3e483db483475e33fffec04d7f3e69c539527bd93eaca6",
+      "project": "scikit-learn",
+      "requires_python": ">=3.11",
+      "sha256": "9656acd4e93f74e0b66c8a36c88830a99252dfa900044d36bc2212ae89a47162",
+      "size_bytes": 8713289,
+      "tags": [
+        "cp314-cp314-macosx_10_15_x86_64"
+      ],
+      "upload_time": "2026-06-02T11:53:58.788508Z",
+      "url": "https://files.pythonhosted.org/packages/f4/7d/c9a35cf59b20a86fec24d306f1547b78dec194b08d367ce2a3e4854169d9/scikit_learn-1.9.0-cp314-cp314-macosx_10_15_x86_64.whl",
+      "version": "1.9.0",
+      "yanked": false
+    },
+    {
+      "filename": "scikit_learn-1.9.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scikit_learn-1.9.0.dist-info/licenses/COPYING",
+          "sha256": "fc8dc597df0e3f51da65e2a71021e7f92e0b481998ec572a53c03ac0441db040",
+          "size_bytes": 16881
+        }
+      ],
+      "metadata_sha256": "ee61a579f42d3edabe3e483db483475e33fffec04d7f3e69c539527bd93eaca6",
+      "project": "scikit-learn",
+      "requires_python": ">=3.11",
+      "sha256": "24360002ae845e7866522b0a5bbf690802e7bc388cac8663502e78aa98598aa2",
+      "size_bytes": 8245141,
+      "tags": [
+        "cp314-cp314-macosx_12_0_arm64"
+      ],
+      "upload_time": "2026-06-02T11:54:01.694847Z",
+      "url": "https://files.pythonhosted.org/packages/3c/a7/552a7821597c632b907f7bfe8f36f9f572777af8ef8a48353041cf8e091a/scikit_learn-1.9.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "version": "1.9.0",
+      "yanked": false
+    },
+    {
+      "filename": "scikit_learn-1.9.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scikit_learn-1.9.0.dist-info/licenses/COPYING",
+          "sha256": "8752dfe82d4a768e76ee309b202e7b33906d1ea9004d68cc61564391cc6b1a96",
+          "size_bytes": 5078
+        }
+      ],
+      "metadata_sha256": "ee61a579f42d3edabe3e483db483475e33fffec04d7f3e69c539527bd93eaca6",
+      "project": "scikit-learn",
+      "requires_python": ">=3.11",
+      "sha256": "1fea2cc5677ab49d6f5bade978c866da44957b712d92e9635e8b4f723013c3cb",
+      "size_bytes": 9118104,
+      "tags": [
+        "cp314-cp314-manylinux_2_27_x86_64",
+        "cp314-cp314-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2026-06-02T11:54:07.205057Z",
+      "url": "https://files.pythonhosted.org/packages/f0/af/4d72d9e475ac83719160c662619e4bf7b95c19507cd582e7d0167a3c3dae/scikit_learn-1.9.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "version": "1.9.0",
+      "yanked": false
+    },
+    {
+      "filename": "scikit_learn-1.9.0-cp314-cp314-win_amd64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scikit_learn-1.9.0.dist-info/licenses/COPYING",
+          "sha256": "014b1b1ad74cf00997f7081a1635c3c203cd70c08f39c13d9a39347fcd464979",
+          "size_bytes": 2629
+        }
+      ],
+      "metadata_sha256": "ee61a579f42d3edabe3e483db483475e33fffec04d7f3e69c539527bd93eaca6",
+      "project": "scikit-learn",
+      "requires_python": ">=3.11",
+      "sha256": "64fa347efc1c839c487433e40c5144d38c336e8a2b59c81aa8660373945c2673",
+      "size_bytes": 8290674,
+      "tags": [
+        "cp314-cp314-win_amd64"
+      ],
+      "upload_time": "2026-06-02T11:54:10.087572Z",
+      "url": "https://files.pythonhosted.org/packages/a2/d5/6a58eea2cb9abbb9b3f2bb8b2cfb3243d1152d69f442d256c7af71304769/scikit_learn-1.9.0-cp314-cp314-win_amd64.whl",
+      "version": "1.9.0",
+      "yanked": false
+    },
+    {
+      "filename": "scipy-1.18.0-cp314-cp314-macosx_10_15_x86_64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scipy-1.18.0.dist-info/LICENSE.txt",
+          "sha256": "09a1b9e19573045b0784a181cc4bef677039d4f2111631c747bf72b7f19017d4",
+          "size_bytes": 46848
+        }
+      ],
+      "metadata_sha256": "e4d61952d7ad676ee40477dbf4ba511b813a55a9ad3541d1180a7c9d18a6cd48",
+      "project": "scipy",
+      "requires_python": ">=3.12",
+      "sha256": "4c256ee70c0d1a8a2ace807e199ccd4e3f57037433842abb3fb36bc17eaa9578",
+      "size_bytes": 31036253,
+      "tags": [
+        "cp314-cp314-macosx_10_15_x86_64"
+      ],
+      "upload_time": "2026-06-19T15:00:43.216483Z",
+      "url": "https://files.pythonhosted.org/packages/78/b5/915a19b3de2f7430062b509653563db1633ddbb6f021b06731521115d4e2/scipy-1.18.0-cp314-cp314-macosx_10_15_x86_64.whl",
+      "version": "1.18.0",
+      "yanked": false
+    },
+    {
+      "filename": "scipy-1.18.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scipy-1.18.0.dist-info/LICENSE.txt",
+          "sha256": "09a1b9e19573045b0784a181cc4bef677039d4f2111631c747bf72b7f19017d4",
+          "size_bytes": 46848
+        }
+      ],
+      "metadata_sha256": "e4d61952d7ad676ee40477dbf4ba511b813a55a9ad3541d1180a7c9d18a6cd48",
+      "project": "scipy",
+      "requires_python": ">=3.12",
+      "sha256": "2ef3abc54a4ffc53765374b0d5728532dfdd2585ed23f6b11c206a1f0b1b9af8",
+      "size_bytes": 28673758,
+      "tags": [
+        "cp314-cp314-macosx_12_0_arm64"
+      ],
+      "upload_time": "2026-06-19T15:00:46.663140Z",
+      "url": "https://files.pythonhosted.org/packages/d7/88/b72def7262e150d16be13fca37a96481138d624e700340bc3362a7588929/scipy-1.18.0-cp314-cp314-macosx_12_0_arm64.whl",
+      "version": "1.18.0",
+      "yanked": false
+    },
+    {
+      "filename": "scipy-1.18.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scipy-1.18.0.dist-info/LICENSE.txt",
+          "sha256": "17e7db9ffa4913121fa2df484633a362456a482da736c99db4711a98473770ea",
+          "size_bytes": 46845
+        }
+      ],
+      "metadata_sha256": "157bd150af3af33b40ec61489be8153752b269fb10c4b45b8cea5104f3235420",
+      "project": "scipy",
+      "requires_python": ">=3.12",
+      "sha256": "8ca01e8ae69f1b18e9a58d91afead31be3cef0dd905a10249dac559ee15460a0",
+      "size_bytes": 35283333,
+      "tags": [
+        "cp314-cp314-manylinux_2_27_x86_64",
+        "cp314-cp314-manylinux_2_28_x86_64"
+      ],
+      "upload_time": "2026-06-19T15:00:58.152972Z",
+      "url": "https://files.pythonhosted.org/packages/7f/c4/bc41eb19b0fd0db868f4132920879019318d80cc522ad8f2bca4611af808/scipy-1.18.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "version": "1.18.0",
+      "yanked": false
+    },
+    {
+      "filename": "scipy-1.18.0-cp314-cp314-win_amd64.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "scipy-1.18.0.dist-info/LICENSE.txt",
+          "sha256": "f0f5c56b298ec9795df1199edc328a987242716d14a1bde6813112e22dc15f99",
+          "size_bytes": 45881
+        }
+      ],
+      "metadata_sha256": "763cde904cd382a6194247f5aeac2bc03475759e676147608d5bc65c22a006a6",
+      "project": "scipy",
+      "requires_python": ">=3.12",
+      "sha256": "2d8bbdc6c817f5b4006a54d799d4f5bab6f910193cbb9a1ff310833d4d270f61",
+      "size_bytes": 37288845,
+      "tags": [
+        "cp314-cp314-win_amd64"
+      ],
+      "upload_time": "2026-06-19T15:01:07.822988Z",
+      "url": "https://files.pythonhosted.org/packages/93/3e/902d836831474b0ab5a37d16404f7bc5fafd9efba632890e271ba952635f/scipy-1.18.0-cp314-cp314-win_amd64.whl",
+      "version": "1.18.0",
+      "yanked": false
+    },
+    {
+      "filename": "skl2onnx-1.20.0-py3-none-any.whl",
+      "license": "Apache-2.0",
+      "license_files": [
+        {
+          "path": "skl2onnx-1.20.0.dist-info/licenses/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        {
+          "path": "skl2onnx-1.20.0.dist-info/licenses/NOTICE",
+          "sha256": "9166b51d1bff87da1da1b097ffa8b3583b3d77547398cc63a2a8dbe31f3baf14",
+          "size_bytes": 180
+        }
+      ],
+      "metadata_sha256": "a88d525869263624aa6fa7d48e9581f21f187b1d5a657e03b97ed3ce81989fc1",
+      "project": "skl2onnx",
+      "requires_python": ">=3.8",
+      "sha256": "30cac34803d1776c14b336ae945e48ef28debfc339215acde1cc04b963ed3f7b",
+      "size_bytes": 317169,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-01-30T10:52:05.824437Z",
+      "url": "https://files.pythonhosted.org/packages/24/d3/b0db77025a4683ec1b9aafc301b78c7e2e2059a1e2543e918435f3d03582/skl2onnx-1.20.0-py3-none-any.whl",
+      "version": "1.20.0",
+      "yanked": false
+    },
+    {
+      "filename": "threadpoolctl-3.6.0-py3-none-any.whl",
+      "license": "BSD-3-Clause",
+      "license_files": [
+        {
+          "path": "threadpoolctl-3.6.0.dist-info/licenses/LICENSE",
+          "sha256": "81ac619075248b06e53660b652d10e485f4675f5d0ae0f97ea22370da1f7e23b",
+          "size_bytes": 1507
+        }
+      ],
+      "metadata_sha256": "a45df8d07ea1883d772183a501d7d526076aa70dfcfddb276a2cbdc04def5341",
+      "project": "threadpoolctl",
+      "requires_python": ">=3.9",
+      "sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb",
+      "size_bytes": 18638,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2025-03-13T13:49:21.846456Z",
+      "url": "https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl",
+      "version": "3.6.0",
+      "yanked": false
+    },
+    {
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "license": "PSF-2.0",
+      "license_files": [
+        {
+          "path": "typing_extensions-4.16.0.dist-info/licenses/LICENSE",
+          "sha256": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
+          "size_bytes": 13936
+        }
+      ],
+      "metadata_sha256": "b05084ca1d50879865178d9fff9fabeab61bdfb1f361bfbde95421ffc8f9be46",
+      "project": "typing-extensions",
+      "requires_python": ">=3.9",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "size_bytes": 45571,
+      "tags": [
+        "py3-none-any"
+      ],
+      "upload_time": "2026-07-02T08:40:04.659120Z",
+      "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+      "version": "4.16.0",
+      "yanked": false
     }
   ],
+  "inventory_generation": "4dc8aee225412f0fee0d2bff3f77f56b4b65268d234ef8c25518da7891c01b8b",
   "python": {
     "maximum_exclusive": "3.15",
     "minimum": "3.14"
   },
-  "schema_version": 2,
+  "schema_version": 3,
   "sources": [
     {
       "path": "Cargo.lock",

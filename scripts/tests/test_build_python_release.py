@@ -57,19 +57,88 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 {"machine": "", "configured_platform": "win-amd64"},
             )
         )
-        self.assertTrue(
-            builder._compatible(
-                "colorama-0.4.6-py2.py3-none-any.whl",
-                (3, 14),
-                builder.platform_profile("x86_64-pc-windows-msvc"),
+        try:
+            import packaging
+        except ImportError:
+            with self.assertRaises(builder.ReleaseBuildError):
+                builder._compatible(
+                    "colorama-0.4.6-py2.py3-none-any.whl",
+                    (3, 14),
+                    builder.platform_profile("x86_64-pc-windows-msvc"),
+                )
+        else:
+            self.assertEqual(packaging.__version__, "26.2")
+            self.assertTrue(
+                builder._compatible(
+                    "colorama-0.4.6-py2.py3-none-any.whl",
+                    (3, 14),
+                    builder.platform_profile("x86_64-pc-windows-msvc"),
+                )
             )
-        )
         _raw, linux = builder.load_release_components(
             ROOT / "distribution" / "release-components.json",
             builder.platform_profile("x86_64-unknown-linux-gnu"),
         )
         self.assertEqual(linux["zig"]["format"], "tar.xz")
         self.assertEqual(linux["zig"]["binary_path"], "zig-x86_64-linux-0.16.0/zig")
+
+    def test_wheel_admission_uses_the_exact_standard_gil_target_tags(self) -> None:
+        mac_arm = builder.platform_profile("aarch64-apple-darwin")
+        linux = builder.platform_profile("x86_64-unknown-linux-gnu")
+        try:
+            import packaging
+        except ImportError:
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError, "packaging 26.2 is required"
+            ):
+                builder._compatible(
+                    "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+                    (3, 14),
+                    mac_arm,
+                )
+            return
+        self.assertEqual(packaging.__version__, "26.2")
+
+        self.assertTrue(
+            builder._compatible(
+                "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
+                (3, 14),
+                mac_arm,
+            )
+        )
+        for filename, profile in (
+            ("onnx-1.22.0-cp314-cp314t-macosx_12_0_arm64.whl", mac_arm),
+            ("fixture-1.0-cp314-cp314-macosx_14_0_arm64.whl", mac_arm),
+            ("fixture-1.0-cp314-cp314-linux_x86_64.whl", linux),
+            ("fixture-1.0-cp314-cp314-musllinux_1_2_x86_64.whl", linux),
+        ):
+            with self.subTest(filename=filename):
+                self.assertFalse(builder._compatible(filename, (3, 14), profile))
+        self.assertTrue(
+            builder._compatible(
+                "fixture-1.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                (3, 14),
+                linux,
+            )
+        )
+
+    def test_source_refresh_changes_only_the_complete_source_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "wheelhouse-lock.json"
+            before = json.loads((ROOT / "python/wheelhouse-lock.json").read_text())
+            destination.write_text(json.dumps(before), encoding="utf-8")
+
+            builder.refresh_source_closure(destination, ROOT)
+
+            after = json.loads(destination.read_text())
+            self.assertEqual(
+                {key: value for key, value in before.items() if key != "sources"},
+                {key: value for key, value in after.items() if key != "sources"},
+            )
+            self.assertEqual(
+                [entry["path"] for entry in after["sources"]],
+                list(builder.expected_source_paths(ROOT)),
+            )
 
     def test_release_signing_seed_is_zeroed_when_the_build_fails(self) -> None:
         signer = builder.ReleaseSigner.__new__(builder.ReleaseSigner)
@@ -137,6 +206,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             wheel = Path(temporary) / "fixture-1.0-py3-none-any.whl"
             license_payload = b"audited license text"
             with zipfile.ZipFile(wheel, mode="w") as archive:
+                archive.writestr("fixture-1.0.dist-info/licenses/", b"")
                 archive.writestr(
                     "fixture-1.0.dist-info/METADATA",
                     "Metadata-Version: 2.1\n"
@@ -150,9 +220,31 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 )
 
             digest = hashlib.sha256(license_payload).hexdigest()
-            builder._admit_license(wheel, "BSD-3-Clause", digest)
+            with zipfile.ZipFile(wheel) as archive:
+                metadata = builder.BytesParser().parsebytes(
+                    archive.read("fixture-1.0.dist-info/METADATA")
+                )
+                del metadata["License-File"]
+                locked = builder._inspect_wheel_license_files(
+                    archive,
+                    "fixture-1.0.dist-info/METADATA",
+                    metadata,
+                )
+            self.assertEqual(locked[0]["sha256"], digest)
+            expected = (
+                builder.LicenseFile(
+                    locked[0]["path"],
+                    locked[0]["sha256"],
+                    locked[0]["size_bytes"],
+                ),
+            )
+            builder._admit_license(wheel, "BSD-3-Clause", expected)
             with self.assertRaises(builder.ReleaseBuildError):
-                builder._admit_license(wheel, "BSD-3-Clause", "0" * 64)
+                builder._admit_license(
+                    wheel,
+                    "BSD-3-Clause",
+                    (builder.LicenseFile(expected[0].path, "0" * 64, expected[0].size_bytes),),
+                )
 
     def test_unowned_artifact_root_is_never_deleted_or_claimed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

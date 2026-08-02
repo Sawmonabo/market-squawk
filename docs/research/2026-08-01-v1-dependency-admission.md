@@ -6,8 +6,9 @@
 | --- | --- |
 | Document type | Implementation dependency and platform admission record |
 | Audience | Runtime, MCP, desktop, modeling, installer, security, and release owners |
-| Status | Task 0 decision baseline; exact locks and artifact identities remain Task 1/7/14 evidence |
+| Status | Task 0 decision baseline with Task 7 Python artifact admission recorded; release approval remains pending |
 | Research date | 2026-08-01 |
+| Last substantive review | 2026-08-02 |
 | Audited commit | `f43da3aa5cbd887a35c9ef25c748b722c9d5c028` |
 | Audited tree | `7387a1db499cf3fc6afb58792a28adfb7e5e4d84` |
 | Governing design | [V1 installed-product design](../superpowers/specs/2026-08-01-market-squawk-v1-installed-product-experience-design.md) |
@@ -39,11 +40,11 @@ and protocol facts immediately before each serialized lock mutation.
 | MCP SDK | Upgrade RMCP 2.2.0 to 3.1.0 behind a Market Squawk protocol facade | Breaking source migration and lock required |
 | MCP wire protocol | Use stable 2026-07-28 as the shared service's only primary protocol | Design/plan refreshed; implementation/conformance required |
 | Forecast reduction | Use scikit-learn 1.9.0 primitives behind a bounded Market Squawk horizon adapter | Python lock and implementation required |
-| Conformal evidence | Add MAPIE 1.4.1 for the explicitly approved time-series conformal path | Python lock and method-evidence implementation required |
+| Conformal evidence | Add MAPIE 1.4.1 for the explicitly approved time-series conformal path | Exact Python lock implemented; method-evidence implementation required |
 | Rejected forecast package | Do not admit skforecast 0.23.0 | Rejected: no CPython 3.14 Intel-macOS Numba/llvmlite closure |
 | Model export | Keep skl2onnx 1.20.0 and ONNX 1.22.0 only behind exact estimator/export/tract parity | Builder fix and exact matrix required |
-| Wheel policy | Use packaging 26.2 public tag/parser/marker APIs | Builder implementation required |
-| Python toolchain | Keep CPython 3.14.6 and PyArrow 25.0.0; refresh uv 0.12.0 to 0.12.1 | Four-target artifact identities required |
+| Wheel policy | Use packaging 26.2 public tag/parser/marker APIs | Builder and exact four-target inventories implemented |
+| Python toolchain | Keep CPython 3.14.6 and PyArrow 25.0.0; refresh uv 0.12.0 to 0.12.1 | Exact four-target uv identities and wheel inventories implemented |
 | Frontend | Admit the exact planned TanStack, chart, React peer, and dialog versions | Frontend/native locks and notices required |
 | macOS service | Keep macOS 12+ and use a per-user LaunchAgent | Installer implementation and exact-floor evidence required |
 | Windows service | Use Task Scheduler 2.0 at the exact current-user SID and least privilege | Installer implementation and exact-floor evidence required |
@@ -161,14 +162,74 @@ Use packaging 26.2 public APIs:
 Generate foreign-target tags explicitly; never use a developer host's `sys_tags()` as proof for
 another target. Derive the Linux ordered manylinux tags inside the exact admitted glibc-2.28
 release-builder image and compare them in the native lane. Reject sdists, free-threaded ABI tags,
-musllinux, generic Linux, too-new floors, wrong architectures, yanked/prerelease artifacts,
-mutable/VCS/local URLs, missing hashes/sizes, and ambiguous equal-rank candidates.
+musllinux-only wheels, generic Linux, too-new floors, wrong architectures, yanked/prerelease
+artifacts, mutable/VCS/local URLs, missing hashes/sizes, and ambiguous equal-rank candidates.
+For the implemented selector, ambiguity means equal preferred-tag rank and equal declared-tag
+breadth; a uniquely narrower candidate at the same rank is deterministic.
 
 Every target lock binds the selected wheel's filename, normalized name/version, complete tags,
 URL, SHA-256, size, yanked state, `Requires-Python`, metadata digest, and target selection. Inspect
 the exact wheel archive for repeatable `License-File` entries, SPDX expressions, `RECORD` coverage,
 and bundled native-library notices. Requirements, master wheel lock, target inventory, offline
 installed distributions, and bundled native libraries must agree exactly.
+
+### Task 7 exact artifact admission
+
+The 2026-08-02 Task 7 refresh implemented the sole hashed requirements authority and one
+generation-bound master/target manifest set. The activation generation is
+`4dc8aee225412f0fee0d2bff3f77f56b4b65268d234ef8c25518da7891c01b8b`. The master contains 41
+immutable wheel identities across 20 projects; each target inventory selects exactly one wheel per
+applicable project:
+
+| Target | Selected wheels | Platform condition |
+| --- | ---: | --- |
+| `aarch64-apple-darwin` | 19 | standard-GIL CPython 3.14, macOS 12+, arm64/universal2 |
+| `x86_64-apple-darwin` | 19 | standard-GIL CPython 3.14, macOS 12+, x86-64/universal2 |
+| `x86_64-unknown-linux-gnu` | 19 | standard-GIL CPython 3.14, admitted manylinux x86-64 tags through glibc 2.28 |
+| `x86_64-pc-windows-msvc` | 20 | standard-GIL CPython 3.14, `win_amd64`; includes Windows-only Colorama |
+
+The exact installed/test closure is Colorama 0.4.6 where its Windows marker applies, Iniconfig
+2.3.0, Joblib 1.5.3, MAPIE 1.4.1, ml-dtypes 0.5.4, Narwhals 2.24.0, NumPy 2.5.1, ONNX 1.22.0,
+packaging 26.2, Pluggy 1.6.0, protobuf 7.35.1, PyArrow 25.0.0, Pygments 2.20.0, pytest 9.1.1,
+scikit-learn 1.9.0, SciPy 1.18.0, skl2onnx 1.20.0, threadpoolctl 3.6.0, and typing-extensions
+4.16.0. Maturin 1.14.1 is the exact build-only root. MAPIE is an admitted mandatory V1 dependency,
+not a deferred alternative.
+
+The lock refresh downloads only the selected official PyPI wheels into temporary storage, checks
+their URL, size, SHA-256, metadata digest, interpreter requirement, repeatable license files, and
+complete wheel `RECORD`, then replays target markers and `Requires-Dist` against the exact selected
+closure. Target inventories are written first and the master activation record last; all readers
+require one matching generation and fail closed on partial replacement.
+
+#### Compressed-tag ordering and deterministic selection
+
+Packaging 26.2's public `parse_wheel_filename` API defaults `validate_order` to `False`. Market
+Squawk retains that public default because Maturin 1.14.1's only arm-capable macOS wheel declares
+the official compressed platform set as
+`macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2`, which is not lexical order.
+Enabling the optional order validator would reject that official immutable artifact even though
+its expanded tags contain the required arm64/universal2 compatibility. This exception changes only
+compressed-component ordering: the builder still parses and binds every expanded tag and enforces
+the standard-GIL ABI, supported architecture, operating-system floor, immutable identity, and
+closed project set.
+
+Wheel selection ranks candidates by the earliest matching tag in Market Squawk's ordered target
+tag set. When candidates share that best rank, it selects the candidate declaring fewer tags so the
+narrowest compatible artifact wins—for example, the exact x86-64 Maturin wheel rather than its
+broader universal wheel on Intel macOS. Equal rank and equal tag breadth remain an ambiguity and are
+rejected; filename order never grants authority.
+
+#### Exact uv 0.12.1 component identities
+
+The four uv archives were fetched from the official 0.12.1 GitHub release, checked against the
+upstream checksum list, extracted, and recorded with both archive and executable identity:
+
+| Target | Archive bytes / SHA-256 | Executable bytes / SHA-256 |
+| --- | --- | --- |
+| `aarch64-apple-darwin` | 17,679,560 / `77d2906988e8074fd43f2f329ec452ebbf9b0c257ba1c66451c71de70a6baf42` | 40,218,304 / `cf8774f78b8df0768991aeb5a1c78f9c61f3a0b4993c875b83d2b4a66b80bf9e` |
+| `x86_64-apple-darwin` | 19,622,543 / `69d9f9a00337f25a50dcb13882052da08b8469bac11091c98c5694c3c6721467` | 48,074,964 / `88af0b228e9eaa017c670d73e8c74fbd220450cb74195025203dc0009335351e` |
+| `x86_64-pc-windows-msvc` | 19,073,343 / `8fcb0cb46e1229065e344758980924e569bef5882ef45f46fada8fb24e06b74a` | 48,254,464 / `f537cc65c1791d9d1a022132302b21ecd48cdf0a605a7b345809fbe8af4e807d` |
+| `x86_64-unknown-linux-gnu` | 21,760,555 / `90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb` | 56,107,008 / `92face6b1f0462ad911857957bd168cd4ae45515e2a2cb3fcc3ecbda3d4d82b1` |
 
 ### Model export parity
 
@@ -255,7 +316,8 @@ smokes on all four targets.
 
 ## Primary sources
 
-Sources were checked on 2026-08-01.
+Sources were checked on 2026-08-01; Python artifact and Packaging API evidence was refreshed on
+2026-08-02.
 
 - Rust and runtime: [Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/),
   [Tokio releases](https://github.com/tokio-rs/tokio/releases), [Axum
@@ -276,20 +338,22 @@ Sources were checked on 2026-08-01.
   3.1.0](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.1.0).
 - Python: [Python 3.14](https://www.python.org/downloads/), [uv
   0.12.1](https://github.com/astral-sh/uv/releases/tag/0.12.1), [PyArrow
-  installation](https://arrow.apache.org/docs/python/install.html), [scikit-learn
-  1.9.0](https://pypi.org/project/scikit-learn/), [MAPIE
-  1.4.1](https://pypi.org/project/mapie/), [skl2onnx
-  1.20.0](https://pypi.org/project/skl2onnx/), [ONNX
-  1.22.0](https://pypi.org/project/onnx/), and [packaging
-  26.2](https://pypi.org/project/packaging/).
+  installation](https://arrow.apache.org/docs/python/install.html), exact release metadata for
+  [scikit-learn 1.9.0](https://pypi.org/pypi/scikit-learn/1.9.0/json), [MAPIE
+  1.4.1](https://pypi.org/pypi/mapie/1.4.1/json), [Maturin
+  1.14.1](https://pypi.org/pypi/maturin/1.14.1/json), [skl2onnx
+  1.20.0](https://pypi.org/pypi/skl2onnx/1.20.0/json), [ONNX
+  1.22.0](https://pypi.org/pypi/onnx/1.22.0/json), and [packaging
+  26.2](https://pypi.org/pypi/packaging/26.2/json).
 - Forecast methods: [scikit-learn lagged forecasting and
   quantiles](https://scikit-learn.org/stable/auto_examples/applications/plot_time_series_lagged_features.html),
   [`TimeSeriesSplit`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html),
   [`MultiOutputRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.MultiOutputRegressor.html),
   [MAPIE `TimeSeriesRegressor`](https://mapie.readthedocs.io/en/v1.4/generated/mapie.regression.TimeSeriesRegressor.html),
   and [EnbPI research](https://proceedings.mlr.press/v139/xu21h.html).
-- Packaging: [wheel tags](https://packaging.pypa.io/en/stable/tags.html), [utility
-  APIs](https://packaging.pypa.io/en/stable/utils.html), [platform tag
+- Packaging: [wheel tags and ordered compatibility](https://packaging.pypa.io/en/stable/tags.html),
+  [`parse_wheel_filename` and its public `validate_order=False`
+  default](https://packaging.pypa.io/en/stable/utils.html), [platform tag
   specification](https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/),
   [Core Metadata](https://packaging.python.org/en/latest/specifications/core-metadata/), [PEP
   639](https://peps.python.org/pep-0639/), and [SPDX expressions](https://spdx.github.io/spdx-spec/v3.0.1/annexes/spdx-license-expressions/).

@@ -29,6 +29,7 @@ EXPECTED_MANIFESTS = {
     "market-squawk-jobs": "crates/market-squawk-jobs/Cargo.toml",
     "market-squawk-data": "crates/market-squawk-data/Cargo.toml",
     "market-squawk-analytics": "crates/market-squawk-analytics/Cargo.toml",
+    "market-squawk-decisions": "crates/market-squawk-decisions/Cargo.toml",
     "market-squawk-services": "crates/market-squawk-services/Cargo.toml",
     "market-squawk-modeling": "crates/market-squawk-modeling/Cargo.toml",
     "market-squawk-portfolio": "crates/market-squawk-portfolio/Cargo.toml",
@@ -91,6 +92,13 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-domain",
         "market-squawk-analytics",
         "market-squawk-data",
+    },
+    "market-squawk-decisions": {
+        "market-squawk-domain",
+        "market-squawk-analytics",
+        "market-squawk-modeling",
+        "market-squawk-portfolio",
+        "market-squawk-valuation",
     },
     "market-squawk-portfolio": {
         "market-squawk-domain",
