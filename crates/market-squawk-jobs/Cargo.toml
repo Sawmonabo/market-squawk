@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-services.workspace = true
 process-wrap.workspace = true
 rusqlite.workspace = true

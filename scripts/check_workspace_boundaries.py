@@ -76,7 +76,11 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-sources",
     },
     "market-squawk-services": {"market-squawk-domain", "market-squawk-platform"},
-    "market-squawk-jobs": {"market-squawk-domain", "market-squawk-services"},
+    "market-squawk-jobs": {
+        "market-squawk-domain",
+        "market-squawk-platform",
+        "market-squawk-services",
+    },
     "market-squawk-runtime": {
         "market-squawk-domain",
         "market-squawk-jobs",
