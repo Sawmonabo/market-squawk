@@ -219,6 +219,25 @@ impl TargetRelease {
                 }
             }
         }
+        let update_roots = self
+            .components
+            .iter()
+            .filter(|component| component.role == ComponentRole::UpdateRoot)
+            .collect::<Vec<_>>();
+        if update_roots.len() > 1 {
+            return Err(ManifestError::ComponentSet);
+        }
+        if let Some(component) = update_roots.first()
+            && component.path.as_ref()
+                != ComponentRole::UpdateRoot
+                    .fixed_path(self.target)
+                    .ok_or(ManifestError::ComponentSet)?
+        {
+            return Err(ManifestError::RequiredRolePath {
+                role: ComponentRole::UpdateRoot,
+                expected: "share/market-squawk/update/1.root.json".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -296,13 +315,15 @@ pub enum ComponentRole {
     Uv,
     PythonRuntime,
     PythonEnvironment,
+    UpdateChannel,
+    UpdateRoot,
     DesktopResource,
     License,
     Notice,
 }
 
 impl ComponentRole {
-    pub(crate) const REQUIRED: [Self; 12] = [
+    pub(crate) const REQUIRED: [Self; 13] = [
         Self::Desktop,
         Self::Service,
         Self::McpRelay,
@@ -315,6 +336,7 @@ impl ComponentRole {
         Self::Uv,
         Self::PythonRuntime,
         Self::PythonEnvironment,
+        Self::UpdateChannel,
     ];
 
     pub(crate) const fn requires_executable(self) -> bool {
@@ -364,6 +386,8 @@ impl ComponentRole {
                 }
                 .to_owned(),
             ),
+            Self::UpdateChannel => Some("share/market-squawk/update/channel.json".to_owned()),
+            Self::UpdateRoot => Some("share/market-squawk/update/1.root.json".to_owned()),
             Self::PythonEnvironment | Self::DesktopResource | Self::License | Self::Notice => None,
         }
     }

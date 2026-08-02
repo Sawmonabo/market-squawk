@@ -580,6 +580,8 @@ fn component_role(path: &str, target: SupportedTarget) -> ComponentRole {
         .find(|role| role.fixed_path(target).as_deref() == Some(path))
     {
         role
+    } else if ComponentRole::UpdateRoot.fixed_path(target).as_deref() == Some(path) {
+        ComponentRole::UpdateRoot
     } else if path.starts_with("desktop/") {
         ComponentRole::DesktopResource
     } else if path.starts_with("licenses/") {
