@@ -11,9 +11,10 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Active branch: `feature/v1-installed-product-experience`, based on
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
-- Wave 3 implementation is frozen and pushed at commit
-  `e0b21e08f31c94d134d0becedca00c8173d1c7d3`, tree
-  `960c56566858d25080c47c9b0446c17b3e277b21`. It replaces generic state projections with real
+- Wave 3 implementation was frozen at `e0b21e08f31c94d134d0becedca00c8173d1c7d3` and its
+  focused-review remediation is accepted and pushed at commit
+  `cb03f2e4ea6ae76b05ffac29dbd93343907b22fd`, tree
+  `9a0c8b9ae9ff591c13939272a11f24f7391937a5`. It replaces generic state projections with real
   installed-service workspaces for Overview and lookup, Markets, Sources, Research, Operations,
   Portfolio, Models and forecasts, Decisions and targets, Backtests, Paper Execution, Risk, and
   Fair Value.
@@ -21,21 +22,30 @@ evidence; it does not replace the README capability truth or the canonical relea
   outside JavaScript's exact range as decimal strings; stages training inputs through native file
   custody; and starts governed backtests from canonical JSON selected and parsed entirely in Rust.
   The WebView does not receive an ambient path or approximate point-in-time cutoff.
-- Fresh implementation evidence before freezing the commit:
+- Fresh unchanged-head evidence at `cb03f2e`:
 
   - Desktop production build and TypeScript type check passed.
   - The existing three critical desktop journeys passed; no additional broad UI suite was added.
   - Locked offline `cargo check -p market-squawk-desktop` passed from a clean generated cache in
     1 minute 59 seconds.
-  - The desktop library's three focused tests passed, including exact WebView integer transport.
+  - The desktop library's three focused tests and the complete 33-test control-plane harness
+    passed, including exact WebView integer transport and shared native/MCP service authority.
   - Rust formatting, diff integrity, and workspace-boundary policy passed.
   - Route-level loading reduced the common JavaScript entry from about 641 kB to about 491 kB;
     product workspaces are emitted as separate chunks.
 - Generated build state reached the agreed 20 GiB ceiling during concurrent verification. The
   active worktree's `target/` was safely cleared without touching source or Git state, reclaiming
   19.4 GiB; the clean focused Rust gates then rebuilt only the required dependency graph.
-- Wave 3 is not yet an accepted checkpoint. Task 20 still requires exact-head focused gates and the
-  grouped integration review with no unresolved substantiated finding.
+- Task 20's focused integration review found and closed two substantiated findings: generic browser
+  confirmation for source lifecycle mutation was replaced by an evidence-aware dialog, and unused
+  raw-object WebView mutations were removed from the research, decision, forecast, fair-value, and
+  portfolio bridge surfaces. Application, CLI, and MCP authority remain available through their
+  proper closed contracts. The remediated exact head passed the complete Wave 3 gate with no
+  unresolved finding. This closes an internal Quarter 4 remediation barrier; it is not final
+  Quarter 4 or release approval.
+- The plan's obsolete `dashboard_contracts` test-name filter selected zero tests. The integration
+  owner detected that instead of treating it as evidence and ran the complete current
+  `control_plane` harness: 33 passed, zero failed, zero ignored.
 - Remaining implementation after Task 20 is the Stage 4 barrier:
 
   1. Product backup, restore, updates, structured logs, typed settings, and workspace coordination.
