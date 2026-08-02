@@ -57,6 +57,9 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Installed Operations authority boundaries](2026-08-02-installed-operations-authority-boundaries.md)
+  — exact-head source audit of the Operations composition gap and the required coherent backup,
+  signed-update, settings/logging, and cross-generation recovery boundaries.
 - [Normal installation and first-run experience](2026-08-01-normal-installation-and-first-run.md)
   — decision-grade review of 35 maintained repositories, 28 official documentation sources,
   22 research papers, and 23 reputable guidance sources; defines the complete native install,
