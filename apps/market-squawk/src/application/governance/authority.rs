@@ -14,6 +14,8 @@ use market_squawk_platform::{
 use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::GovernanceAuditError;
 use super::identity::{GOVERNANCE_SECRET_SCOPE, GovernanceEffect, SECRET_OPERATION_TIMEOUT};
 use super::{
     GovernanceActionDigest, GovernanceActionPreview, GovernanceAuditKind, GovernanceAuditReceipt,

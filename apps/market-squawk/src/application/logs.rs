@@ -183,7 +183,8 @@ impl StructuredLogEvent {
                 }
                 Ok((
                     name.clone(),
-                    if is_sensitive_field_name(&name) {
+                    if is_sensitive_field_name(&name) || contains_sensitive_message_pattern(&value)
+                    {
                         "[REDACTED]".to_owned()
                     } else {
                         value
@@ -363,6 +364,7 @@ fn validate_optional_label(value: Option<String>) -> Result<Option<String>, Stru
         value.is_empty()
             || value.len() > MAXIMUM_FILTER_BYTES
             || value.chars().any(char::is_control)
+            || contains_sensitive_message_pattern(value)
     }) {
         return Err(StructuredLogError::UnsafeRecord);
     }
@@ -479,6 +481,10 @@ mod tests {
         fields.insert("api_key".to_owned(), "must-not-persist".to_owned());
         fields.insert("accessToken".to_owned(), "must-not-persist".to_owned());
         fields.insert("clientSecret".to_owned(), "must-not-persist".to_owned());
+        fields.insert(
+            "response".to_owned(),
+            "authorization: Bearer must-not-persist".to_owned(),
+        );
         let event = StructuredLogEvent::try_new(
             Timestamp::from_unix_nanos(1_000_000_000),
             LogSeverity::Info,
@@ -500,6 +506,10 @@ mod tests {
         );
         assert_eq!(
             event.fields.get("clientSecret").map(String::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            event.fields.get("response").map(String::as_str),
             Some("[REDACTED]")
         );
         assert!(matches!(
@@ -526,6 +536,20 @@ mod tests {
                 None,
                 None,
                 r#"provider response: {"refreshToken":"must-not-persist"}"#,
+                BTreeMap::new(),
+            ),
+            Err(StructuredLogError::UnsafeRecord)
+        ));
+        assert!(matches!(
+            StructuredLogEvent::try_new(
+                Timestamp::from_unix_nanos(1_000_000_003),
+                LogSeverity::Error,
+                LogDomain::Source,
+                None,
+                Some("access_token=must-not-persist".to_owned()),
+                None,
+                None,
+                "provider request failed",
                 BTreeMap::new(),
             ),
             Err(StructuredLogError::UnsafeRecord)
