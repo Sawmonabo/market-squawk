@@ -8,7 +8,9 @@ use std::{
     sync::Mutex,
 };
 
-use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{
+    DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _,
+};
 use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::ControlRoot;
@@ -411,25 +413,36 @@ fn prepare_log_directory(control_root: &ControlRoot) -> Result<Dir, StructuredLo
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(source) => return Err(StructuredLogError::Io { source }),
     }
-    let directory = control
-        .open_dir_nofollow(LOG_DIRECTORY)
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let opened = control
+        .open_with(LOG_DIRECTORY, &options)
         .map_err(|source| StructuredLogError::Io { source })?;
+    if !opened
+        .metadata()
+        .map_err(|source| StructuredLogError::Io { source })?
+        .is_dir()
+    {
+        return Err(StructuredLogError::UnsafeFilesystemEntry);
+    }
+    let opened = opened.into_std();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        opened
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|source| StructuredLogError::Io { source })?;
+    }
+    let directory = Dir::from_std_file(opened);
     if !directory
         .dir_metadata()
         .map_err(|source| StructuredLogError::Io { source })?
         .is_dir()
     {
         return Err(StructuredLogError::UnsafeFilesystemEntry);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        directory
-            .try_clone()
-            .map_err(|source| StructuredLogError::Io { source })?
-            .into_std_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
-            .map_err(|source| StructuredLogError::Io { source })?;
     }
     Ok(directory)
 }
