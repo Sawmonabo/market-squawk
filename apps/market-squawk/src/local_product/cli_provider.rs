@@ -1498,6 +1498,66 @@ pub(super) fn restore_research_providers(
     }
 }
 
+/// Reconstructs one exact retained research recipe for explicit source-lifecycle resume.
+///
+/// Unlike startup recovery, this path may unlock the already admitted credential generation. It
+/// never accepts provider configuration from the lifecycle caller: the existing durable recipe,
+/// digest-addressed evidence, active onboarding lease, and provider-specific builder remain the
+/// sole construction authority.
+pub(super) async fn resume_exact_research_provider(
+    paths: &LocalPaths,
+    onboarding: &crate::ProviderOnboardingService,
+    activation_authority: &crate::ProviderAdapterActivation,
+    state: &DurableProviderActivationState,
+    surface_id: &str,
+    expected_session_id: Uuid,
+    cancellation: CancellationToken,
+) -> Result<ResearchProviderRuntimeGeneration, CliProviderActivationError> {
+    if cancellation.is_cancelled() {
+        return Err(CliProviderActivationError::Cancelled);
+    }
+    let recipe = match state
+        .load_recipe_for_lifecycle(surface_id)
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?
+    {
+        DurableActivationRecipeState::Desired(recipe)
+            if recipe.session_id == expected_session_id =>
+        {
+            recipe
+        }
+        DurableActivationRecipeState::Missing
+        | DurableActivationRecipeState::Desired(_)
+        | DurableActivationRecipeState::Staged(_)
+        | DurableActivationRecipeState::Cutover(_)
+        | DurableActivationRecipeState::Quarantined(_) => {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+    };
+    let prepared = prepare_research_provider_recovery(
+        paths,
+        onboarding,
+        activation_authority,
+        state,
+        surface_id,
+        &recipe,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err(CliProviderActivationError::Cancelled);
+    }
+    let expected = prepared.generation.clone();
+    let outcome = activation_authority
+        .activate_exact_research_profile(&expected, prepared.request, cancellation)
+        .await
+        .map_err(CliProviderActivationError::Activation)?;
+    let ProviderActivationOutcome::Research(activated) = outcome else {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    };
+    if activated.generation() != &expected {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    Ok(expected)
+}
+
 #[derive(Clone, Copy)]
 enum DurableReplacementRecoveryPhase {
     Staged,

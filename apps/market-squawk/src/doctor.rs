@@ -604,6 +604,7 @@ fn classify_path_error(error: &PathError) -> &'static str {
         PathError::PreparedRootChanged => "storage.identity_changed",
         PathError::CatalogAlreadyLocked => "storage.catalog_writer_active",
         PathError::JobDatabaseAlreadyLocked => "storage.job_database_writer_active",
+        PathError::DecisionDatabaseAlreadyLocked => "storage.decision_database_writer_active",
         PathError::ArtifactRootUnavailable
         | PathError::ControlRootUnavailable
         | PathError::CatalogLocationUnavailable => "storage.layout_incomplete",

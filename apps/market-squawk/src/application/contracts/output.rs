@@ -6,6 +6,22 @@ use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 
 pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
     let schema = match operation {
+        "Job.List" => closed(
+            vec![
+                ("jobs", bounded_array(job_view(), 1_024)),
+                ("next", nullable(text())),
+            ],
+            &["jobs", "next"],
+        ),
+        "Job.Get" | "Job.Cancel" | "Job.Confirm" => job_view(),
+        "Job.Retry" => job_receipt(),
+        "Job.Watch" => closed(
+            vec![
+                ("events", bounded_array(record(), 4_096)),
+                ("next", nullable(unsigned())),
+            ],
+            &["events", "next"],
+        ),
         "Source.Register" => closed(
             vec![
                 ("profile", record()),
@@ -98,6 +114,13 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "receipts_survive_restart",
             ],
         ),
+        "Source.Start"
+        | "Source.Stop"
+        | "Source.Retry"
+        | "Source.Resynchronize"
+        | "Source.Verify"
+        | "Source.Reconfigure"
+        | "Source.Remove" => source_lifecycle_receipt(),
         "Market.GetSnapshot" => market_rows(&["sourceId", "instrumentId", "phase", "book"]),
         "Market.GetTrades" => market_rows(&[
             "sourceId",
@@ -141,6 +164,12 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Macro.GetObservations"
         | "Macro.GetVintages"
         | "Macro.GetRevisions" => observation_result(),
+        "Research.StartIngestSource"
+        | "Research.StartDatasetBuild"
+        | "Research.StartExport"
+        | "Analysis.StartScenarioBatch"
+        | "Analysis.StartFeatureDatasetBuild"
+        | "Analysis.StartBacktest" => job_receipt(),
         "Research.IngestSource" => closed(
             vec![
                 ("manifest", manifest()),
@@ -181,6 +210,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "reconciliationDiscrepancies",
             ],
         ),
+        "Portfolio.ListAccounts" | "Portfolio.ListRevisions" => nullable_rows(record()),
         "Portfolio.GetHoldings" => array(signature(vec![
             ("instrument_id", text()),
             ("market_value", record()),
@@ -213,6 +243,11 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("confidence", number()),
             ("scenario", record()),
         ]),
+        "Portfolio.GetAttribution"
+        | "Portfolio.EvaluateScenario"
+        | "Portfolio.EvaluateScenarioBatch"
+        | "Portfolio.ProposeRebalance"
+        | "Portfolio.EvaluateCandidateImpact" => portfolio_advanced_report(),
         "Analysis.GetReturns" => closed(
             vec![
                 ("manifest", manifest()),
@@ -220,6 +255,33 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("values", array(number())),
             ],
             &["manifest", "returnKind", "values"],
+        ),
+        "Analysis.Lookup" => closed(
+            vec![
+                ("query", text()),
+                ("matches", bounded_array(record(), 64)),
+                ("categories", bounded_array(record(), 9)),
+                ("truncated", boolean()),
+            ],
+            &["query", "matches", "categories", "truncated"],
+        ),
+        "Analysis.GetDecisionOverview" => closed(
+            vec![
+                ("providers", record()),
+                ("datasets", record()),
+                ("screens", record()),
+                ("jobs", record()),
+                ("commands", record()),
+                ("unavailable", bounded_array(record(), 4)),
+            ],
+            &[
+                "providers",
+                "datasets",
+                "screens",
+                "jobs",
+                "commands",
+                "unavailable",
+            ],
         ),
         "Analysis.GetFactors" => closed(
             vec![
@@ -292,6 +354,80 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         ),
         "Model.Evaluate" => model_output(true),
         "Model.Predict" => model_output(false),
+        "Model.StartTraining" => job_receipt(),
+        "Model.StartForecast" => job_receipt(),
+        "Model.GenerateForecast" | "Model.GetForecast" => forecast_vintage(),
+        "Model.ListForecasts" => closed(
+            vec![
+                ("forecasts", bounded_array(record(), 4_096)),
+                ("available", unsigned()),
+                ("truncated", boolean()),
+            ],
+            &["forecasts", "available", "truncated"],
+        ),
+        "Model.GetForecastOutcomes" => closed(
+            vec![
+                ("vintageId", text()),
+                ("outcomes", bounded_array(record(), 4_096)),
+                ("available", unsigned()),
+                ("truncated", boolean()),
+            ],
+            &["vintageId", "outcomes", "available", "truncated"],
+        ),
+        "Decision.SaveScreen"
+        | "Decision.CreateTargetSet"
+        | "Decision.ReviewTargetSet"
+        | "Decision.ReevaluateTargetSet" => closed(
+            vec![("outcome", enumeration(&["appended", "already_present"]))],
+            &["outcome"],
+        ),
+        "Decision.RunScreen" => closed(
+            vec![("run", record()), ("candidates", array(record()))],
+            &["run", "candidates"],
+        ),
+        "Decision.GetDossier" => signature(vec![
+            ("id", text()),
+            ("candidateId", text()),
+            ("instrumentId", text()),
+            ("assembledAt", integer()),
+            ("evidence", record()),
+            ("references", array(record())),
+        ]),
+        "Decision.GetTargetSet" => closed(
+            vec![
+                ("target", record()),
+                ("status", text()),
+                ("latestReview", nullable(record())),
+                ("latestInvalidation", nullable(record())),
+            ],
+            &["target", "status", "latestReview", "latestInvalidation"],
+        ),
+        "Decision.ListScreens" => closed(
+            vec![("screens", bounded_array(record(), 4_096))],
+            &["screens"],
+        ),
+        "Decision.GetCandidates" => closed(
+            vec![("candidates", bounded_array(record(), 4_096))],
+            &["candidates"],
+        ),
+        "Decision.ListTargetSets" => closed(
+            vec![("targets", bounded_array(record(), 4_096))],
+            &["targets"],
+        ),
+        "Decision.GetTargetSetStatus" => closed(
+            vec![(
+                "status",
+                enumeration(&[
+                    "pending_review",
+                    "active",
+                    "rejected",
+                    "needs_changes",
+                    "needs_review",
+                    "superseded",
+                ]),
+            )],
+            &["status"],
+        ),
         "FairValue.ListMeasurements" => closed(
             vec![("measurements", array(measurement()))],
             &["measurements"],
@@ -349,6 +485,19 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             &["classification", "classificationReplay"],
         ),
         "FairValue.Approve" => closed(vec![("approval", record())], &["approval"]),
+        "FairValue.ProposeOverride" => closed(
+            vec![("override", record()), ("classification", classification())],
+            &["override", "classification"],
+        ),
+        "FairValue.RevokeApproval" => closed(vec![("approval", record())], &["approval"]),
+        "FairValue.ListAuditEvents" => closed(
+            vec![
+                ("events", bounded_array(record(), 10_000)),
+                ("totalEventCount", unsigned()),
+                ("nextCursor", nullable(record())),
+            ],
+            &["events", "totalEventCount", "nextCursor"],
+        ),
         "FairValue.ApproveMarketAccess" | "FairValue.GetMarketAccess" => {
             closed(vec![("marketAccess", record())], &["marketAccess"])
         }
@@ -560,6 +709,53 @@ fn backtest_record() -> Value {
     )
 }
 
+fn job_receipt() -> Value {
+    closed(
+        vec![
+            ("jobId", uuid()),
+            ("generation", bounded_unsigned(u64::MAX)),
+            ("sequence", unsigned()),
+            ("state", constant("queued")),
+        ],
+        &["jobId", "generation", "sequence", "state"],
+    )
+}
+
+fn source_lifecycle_receipt() -> Value {
+    signature(vec![
+        ("operationId", text()),
+        ("provider", text()),
+        ("action", text()),
+        ("disposition", text()),
+        ("state", text()),
+        ("stateRevision", unsigned()),
+        ("previousGeneration", nullable(unsigned())),
+        ("currentGeneration", nullable(unsigned())),
+        ("runtimeGenerationSha256", nullable(text())),
+        ("coverage", nullable(text())),
+        ("integrity", nullable(text())),
+        ("quality", nullable(text())),
+        ("rateBudget", record()),
+        ("authorization", text()),
+        ("availability", text()),
+        ("rightsEvidence", nullable(record())),
+        ("blocker", nullable(text())),
+        ("publicConfigurationSha256", nullable(text())),
+        ("observedAt", integer()),
+    ])
+}
+
+fn portfolio_advanced_report() -> Value {
+    signature(vec![
+        ("accountId", text()),
+        ("revisionId", text()),
+        ("policy", text()),
+        ("effectiveAtUnixNanos", text()),
+        ("availableAtUnixNanos", nullable(text())),
+        ("markEvidence", record()),
+    ])
+}
+
 fn model_output(evaluation: bool) -> Value {
     let mut fields = vec![
         ("modelId", text()),
@@ -578,6 +774,29 @@ fn model_output(evaluation: bool) -> Value {
         fields.push(("validationMetrics", array(record())));
     }
     signature(fields)
+}
+
+fn forecast_vintage() -> Value {
+    signature(vec![
+        ("vintageId", text()),
+        ("requestHash", text()),
+        ("instrumentId", text()),
+        ("modelId", text()),
+        ("bundleId", text()),
+        ("bundleVersion", unsigned()),
+        ("observedThroughUnixNanos", integer()),
+        ("availableAtUnixNanos", integer()),
+        ("createdAtUnixNanos", integer()),
+        ("expiresAtUnixNanos", integer()),
+        ("horizonPoints", unsigned()),
+        ("horizonStepNanos", unsigned()),
+        ("quality", text()),
+        ("points", bounded_array(record(), 4_096)),
+        ("calibration", nullable(record())),
+        ("limitations", bounded_array(text(), 256)),
+        ("unavailableReason", nullable(text())),
+        ("controlledArtifact", nullable(record())),
+    ])
 }
 
 fn measurement() -> Value {
@@ -603,6 +822,41 @@ fn money() -> Value {
     closed(
         vec![("amount", text()), ("currency", text())],
         &["amount", "currency"],
+    )
+}
+
+fn job_view() -> Value {
+    closed(
+        vec![
+            ("jobId", uuid()),
+            ("generation", bounded_unsigned_range(1, u64::MAX)),
+            ("sequence", unsigned()),
+            ("kind", text()),
+            ("state", text()),
+            ("phase", nullable(text())),
+            ("completedUnits", nullable(unsigned())),
+            ("totalUnits", nullable(unsigned())),
+            ("cancellationRequested", boolean()),
+            ("result", nullable(record())),
+            ("failure", nullable(record())),
+            ("updatedAt", integer()),
+            ("recovery", nullable(text())),
+        ],
+        &[
+            "jobId",
+            "generation",
+            "sequence",
+            "kind",
+            "state",
+            "phase",
+            "completedUnits",
+            "totalUnits",
+            "cancellationRequested",
+            "result",
+            "failure",
+            "updatedAt",
+            "recovery",
+        ],
     )
 }
 

@@ -90,12 +90,23 @@ pub(crate) async fn build_point_in_time_dataset_from_file(
     let (bytes, ownership) = read_request(request)?;
     let request: DatasetBuildRequestDto =
         serde_json::from_slice(bytes.as_bytes()).map_err(|_| CliDatasetError::RequestJson)?;
-    let admitted = request.into_domain(ownership)?;
+    let admitted = request.into_domain(Some(ownership))?;
     product
         .research()
         .build_dataset(admitted, CancellationToken::new())
         .await
         .map_err(Into::into)
+}
+
+/// Admits an inline transport registration only when it carries independent reviewed-terms
+/// evidence. Local-file ownership remains available solely through the retained file authority.
+pub(crate) fn admit_inline_dataset_registration(
+    registration: &serde_json::Map<String, Value>,
+) -> Result<market_squawk_data::DatasetBuildRequest, CliDatasetError> {
+    let request: DatasetBuildRequestDto =
+        serde_json::from_value(Value::Object(registration.clone()))
+            .map_err(|_| CliDatasetError::RequestJson)?;
+    request.into_domain(None)
 }
 
 fn read_request(

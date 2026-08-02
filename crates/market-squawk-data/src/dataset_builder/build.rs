@@ -24,7 +24,9 @@ use super::model::{
     DatasetBuildRequest, DatasetExample, DatasetSplit, DatasetSplitCounts,
     FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
 };
-use super::{DatasetBuildError, DatasetBuilderService, admission, canonical};
+use super::{
+    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuilderService, admission, canonical,
+};
 use crate::schema::{
     FEATURE_LABEL_COMPONENT_NAME_BYTES, FEATURE_LABEL_CURRENCY_BYTES,
     FEATURE_LABEL_EXAMPLE_ID_BYTES, FEATURE_LABEL_MISSING_REASON_BYTES, FEATURE_LABEL_UNIT_BYTES,
@@ -94,6 +96,7 @@ pub(super) async fn build(
     builder: &DatasetBuilderService<'_>,
     request: DatasetBuildRequest,
     cancellation: CancellationToken,
+    precommit_authority: Option<Arc<dyn DatasetBuildPrecommitAuthority>>,
 ) -> Result<FeatureLabelDataset, DatasetBuildError> {
     let deadline = Instant::now()
         .checked_add(request.limits().max_duration())
@@ -221,7 +224,14 @@ pub(super) async fn build(
             durable.artifact().artifact_id(),
         )?;
         check_control(&cancellation, deadline)?;
-        authority.publish_derived_generation(input)?
+        if let Some(precommit_authority) = precommit_authority.as_deref() {
+            precommit_authority.validate_precommit()?;
+        }
+        let derived = authority.publish_derived_generation(input)?;
+        if let Some(precommit_authority) = precommit_authority.as_deref() {
+            precommit_authority.commit_succeeded();
+        }
+        derived
     };
     drop(publication);
     check_control(&cancellation, deadline)?;

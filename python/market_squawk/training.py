@@ -17,6 +17,13 @@ from . import _native
 from .bundle import BundleAuthorityRef, BundleCandidate, BundleReceipt
 from .data import ComponentIdentity, DatasetIntegrityError, DatasetResult, _verify_dataset_receipt
 from .finance import OperationContext
+from .forecasting import (
+    ConformalMethod,
+    ForecastFit,
+    ForecastSpecification,
+    ForecastValidationError,
+    fit_forecast,
+)
 from ._onnx import (
     OnnxEncodingError,
     encode_fitted_model,
@@ -101,6 +108,27 @@ class TrainingProposal:
             authority,
             dataset_receipt=self.dataset._receipt,
         )
+
+
+@dataclass(frozen=True)
+class ForecastArtifact:
+    """One immutable bundle-ready forecast artifact."""
+
+    path: str
+    content: bytes = field(repr=False)
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ForecastTrainingProposal:
+    """Dataset-bound central ONNX path plus hashed calibration artifacts."""
+
+    fit: ForecastFit
+    training_run_bytes: bytes = field(repr=False)
+    training_run_sha256: str
+    artifacts: tuple[ForecastArtifact, ...]
+    forecast_metadata: Mapping[str, Any]
+    dataset: DatasetResult = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -303,6 +331,195 @@ class TrainingRun:
         if artifact_format == "onnx":
             authority["output_semantics"] = output_semantics
         return TrainingProposal(candidate, authority, self.dataset)
+
+    def fit_research_forecast(
+        self,
+        specification: ForecastSpecification,
+        *,
+        future_exogenous: Sequence[Sequence[float]],
+        conformal_method: ConformalMethod | None,
+        dependence_assumptions: str | None,
+        context: OperationContext,
+    ) -> ForecastTrainingProposal:
+        """Fit a distinct research forecast against one exact PIT dataset receipt.
+
+        The returned artifacts are not independently authoritative bundles.  They
+        are immutable candidate inputs for the normal Rust admission path.
+        """
+
+        try:
+            _verify_dataset_receipt(self.dataset, context)
+        except DatasetIntegrityError as error:
+            raise TrainingValidationError("forecast dataset receipt is invalid") from error
+        if (
+            not isinstance(specification, ForecastSpecification)
+            or not specification.horizons
+            or not specification.lags
+        ):
+            raise TrainingValidationError("forecast specification is invalid")
+        config = self._validated_config("linear", "onnx")
+        estimate = _checked_mul(
+            max(1, len(self.dataset.rows)),
+            _checked_mul(
+                max(1, len(config["features"])),
+                _checked_mul(
+                    max(1, len(specification.horizons)),
+                    max(1, specification.rolling_splits),
+                ),
+            ),
+        )
+        _admit_operation_context(context, estimate)
+        rows, targets, splits, split_sha256, split_counts, period = _dataset_matrix(
+            self.dataset,
+            config["features"],
+            config["label"],
+            self.missing_policy,
+            context,
+        )
+        retained = [index for index, split in enumerate(splits) if split != "test"]
+        if len(retained) <= max(specification.lags) + max(specification.horizons):
+            raise TrainingValidationError("non-test history is insufficient for forecasting")
+        observed = [targets[index] for index in retained]
+        exogenous = [rows[index] for index in retained]
+        selected_cutoffs = []
+        component_count = len(self.dataset.components)
+        for offset in range(0, len(self.dataset.rows), component_count):
+            group = self.dataset.rows[offset : offset + component_count]
+            if group[0]["split"] != "test":
+                selected_cutoffs.append(group[0]["cutoff_at"].unix_nanos)
+        if (
+            len(selected_cutoffs) != len(observed)
+            or not selected_cutoffs
+            or selected_cutoffs != sorted(selected_cutoffs)
+            or specification.observed_cutoff_unix_nanos != selected_cutoffs[-1]
+            or specification.observed_cutoff_unix_nanos
+            > self.dataset.identity.selection_as_of_unix_nanos
+        ):
+            raise TrainingValidationError("forecast cutoff differs from the exact PIT history")
+        try:
+            fit = fit_forecast(
+                observed,
+                specification,
+                exogenous=exogenous,
+                future_exogenous=future_exogenous,
+                quantile_intervals=True,
+                conformal_method=conformal_method,
+                dependence_assumptions=dependence_assumptions,
+            )
+        except ForecastValidationError as error:
+            raise TrainingValidationError("research forecast fit was rejected") from error
+        _checkpoint(context)
+        selected = fit.conformal_intervals or fit.quantile_intervals
+        if selected is None:
+            raise TrainingValidationError("forecast calibration artifact is unavailable")
+        residual_path = "calibration/residuals.f64le"
+        policy_path = "calibration/policy.json"
+        start_index = selected.calibration_start_index
+        if not 0 <= start_index < len(selected_cutoffs):
+            raise TrainingValidationError("calibration window is outside the PIT history")
+        policy_record = {
+            "schema_version": 1,
+            "kind": selected.kind.value,
+            "method": selected.method,
+            "calibration_window": {
+                "start_unix_nanos": selected_cutoffs[start_index],
+                "end_unix_nanos": specification.observed_cutoff_unix_nanos + 1,
+                "observations": len(selected.residuals_bytes) // 8,
+            },
+            "dependence_assumptions": selected.dependence_assumptions,
+            "residuals_sha256": selected.residuals_sha256,
+            "bands": [
+                {
+                    "target_coverage_basis_points": int(
+                        band.target_coverage * 10_000
+                    ),
+                    "lower_offset": band.lower[0] - fit.central[0],
+                    "upper_offset": band.upper[0] - fit.central[0],
+                    "realized_covered": band.realized_covered,
+                    "realized_total": band.realized_total,
+                }
+                for band in selected.bands
+            ],
+        }
+        policy_bytes = _canonical(policy_record)
+        policy_sha256 = hashlib.sha256(policy_bytes).hexdigest()
+        forecast_metadata = {
+            "residuals": {
+                "path": residual_path,
+                "sha256": selected.residuals_sha256,
+                "size_bytes": len(selected.residuals_bytes),
+            },
+            "policy": {
+                "path": policy_path,
+                "sha256": policy_sha256,
+                "size_bytes": len(policy_bytes),
+            },
+        }
+        artifacts = [
+            ForecastArtifact("model.onnx", fit.onnx_bytes, fit.onnx_sha256),
+            ForecastArtifact(
+                residual_path,
+                selected.residuals_bytes,
+                selected.residuals_sha256,
+            ),
+            ForecastArtifact(policy_path, policy_bytes, policy_sha256),
+        ]
+        trial = {
+            "bundle_id": self.bundle_id,
+            "bundle_version": self.bundle_version,
+            "dataset": dict(config["dataset"]),
+            "dataset_export_sha256": self.dataset.export_sha256,
+            "environment_sha256": self.environment_sha256,
+            "features": list(config["features"]),
+            "label": dict(config["label"]),
+            "missing_policy": self.missing_policy,
+            "model_id": self.model_id,
+            "model_kind": "linear",
+            "output_semantics": "regression",
+            "seed": self.seed,
+            "split_counts": split_counts,
+            "split_sha256": split_sha256,
+            "training_code_revision": self.training_code_revision,
+            "training_period": period,
+            "universe_id": self.dataset.universe_id,
+            "forecast": {
+                "strategy": fit.strategy.value,
+                "horizons": list(specification.horizons),
+                "lags": list(specification.lags),
+                "observed_cutoff_unix_nanos": specification.observed_cutoff_unix_nanos,
+                "rolling_splits": specification.rolling_splits,
+                "ridge_alpha": specification.ridge_alpha,
+                "selection_sha256": fit.validation.selection_sha256,
+                "package_versions": dict(fit.package_versions),
+            },
+        }
+        record = {
+            "schema_version": 4,
+            "trial": trial,
+            "trial_sha256": hashlib.sha256(_canonical(trial)).hexdigest(),
+            "validation_metrics": [
+                {
+                    "name": "mean_squared_error",
+                    "value": fit.validation.mean_squared_error,
+                }
+            ],
+            "forecast_calibration": forecast_metadata,
+        }
+        encoded = _canonical(record)
+        try:
+            _verify_dataset_receipt(self.dataset, context)
+        except DatasetIntegrityError as error:
+            raise TrainingValidationError(
+                "dataset receipt failed immediately after forecast fit"
+            ) from error
+        return ForecastTrainingProposal(
+            fit,
+            encoded,
+            hashlib.sha256(encoded).hexdigest(),
+            tuple(artifacts),
+            forecast_metadata,
+            self.dataset,
+        )
 
     def _validated_config(
         self, model_kind: str, artifact_format: str

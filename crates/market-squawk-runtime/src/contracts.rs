@@ -7,7 +7,8 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceLimits, validate_json_contract,
+    JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceLimits,
+    validate_json_contract,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -437,12 +438,12 @@ impl AppRequestEnvelope {
         let deadline = monotonic_now
             .checked_add(remaining)
             .ok_or(RuntimeContractError::DeadlineTooDistant)?;
-        Ok(RequestContext::new(
-            self.request_id.clone(),
-            cancellation,
-            deadline,
-            limits,
-        ))
+        let origin = RequestOrigin::try_new(self.workspace_id.as_uuid(), self.client_id.as_uuid())
+            .map_err(|_error| RuntimeContractError::NilIdentity)?;
+        Ok(
+            RequestContext::new(self.request_id.clone(), cancellation, deadline, limits)
+                .with_origin(origin),
+        )
     }
 
     /// Returns the validated remaining wall-clock lifetime for transport admission.

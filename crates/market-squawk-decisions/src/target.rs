@@ -1,6 +1,10 @@
 //! Immutable investment targets, reviews, and invalidation evidence.
 
-use market_squawk_domain::{InstrumentId, Money, RevisionNumber, Timestamp};
+use std::num::NonZeroU32;
+
+use market_squawk_domain::{DataQuality, InstrumentId, Money, RevisionNumber, Timestamp};
+use market_squawk_portfolio::PortfolioRevisionToken;
+use market_squawk_valuation::DecisionId;
 
 use crate::identity::{
     DecisionActorId, DecisionContentDigest, DecisionContractError, DossierId,
@@ -426,6 +430,17 @@ pub enum InvalidationKind {
     Assumption,
 }
 
+impl InvalidationKind {
+    /// Complete invalidation family set used by deterministic evidence scanners.
+    pub const ALL: [Self; 5] = [
+        Self::CorporateAction,
+        Self::Model,
+        Self::Data,
+        Self::ReferenceMark,
+        Self::Assumption,
+    ];
+}
+
 /// Immutable invalidation evidence for one exact target revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetInvalidation {
@@ -505,5 +520,426 @@ fn ensure_currency(left: Money, right: Money) -> Result<(), DecisionContractErro
         Ok(())
     } else {
         Err(DecisionContractError::CurrencyMismatch)
+    }
+}
+
+/// Maximum UTF-8 bytes retained in one target narrative value.
+pub const MAX_DECISION_TEXT_BYTES: usize = 4_096;
+/// Maximum assumptions, risks, or invalidation conditions retained by one target revision.
+pub const MAX_TARGET_NARRATIVE_ITEMS: usize = 32;
+
+/// Bounded canonical human decision narrative with no executable meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionText(Box<str>);
+
+impl DecisionText {
+    /// Constructs trimmed nonempty text without ASCII control characters.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, DecisionContractError> {
+        let value = value.as_ref();
+        if value.is_empty()
+            || value.len() > MAX_DECISION_TEXT_BYTES
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(DecisionContractError::InvalidText);
+        }
+        Ok(Self(value.into()))
+    }
+
+    /// Narrative text without allocation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Closed analytical method used to produce a target set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetMethod {
+    /// Comparable-company or instrument evidence.
+    ComparableEvidence,
+    /// Discounted-cash-flow evidence.
+    DiscountedCashFlow,
+    /// Residual-income evidence.
+    ResidualIncome,
+    /// Admitted forecast distribution.
+    ForecastDistribution,
+    /// Approved fair-value measurement evidence.
+    FairValueMeasurement,
+}
+
+/// One human-readable assumption bound to exact evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetAssumption {
+    text: DecisionText,
+    evidence_identity: DecisionContentDigest,
+}
+
+impl TargetAssumption {
+    /// Constructs one bounded, evidence-bound assumption.
+    #[must_use]
+    pub const fn new(text: DecisionText, evidence_identity: DecisionContentDigest) -> Self {
+        Self {
+            text,
+            evidence_identity,
+        }
+    }
+
+    /// Assumption narrative.
+    #[must_use]
+    pub const fn text(&self) -> &DecisionText {
+        &self.text
+    }
+
+    /// Exact evidence commitment.
+    #[must_use]
+    pub const fn evidence_identity(&self) -> DecisionContentDigest {
+        self.evidence_identity
+    }
+}
+
+/// Exact dossier and optional portfolio revision supporting the decision context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetDecisionContext {
+    dossier_id: DossierId,
+    portfolio_revision: Option<PortfolioRevisionToken>,
+}
+
+impl TargetDecisionContext {
+    /// Constructs a reference-only decision context.
+    #[must_use]
+    pub const fn new(
+        dossier_id: DossierId,
+        portfolio_revision: Option<PortfolioRevisionToken>,
+    ) -> Self {
+        Self {
+            dossier_id,
+            portfolio_revision,
+        }
+    }
+
+    /// Supporting dossier identity.
+    #[must_use]
+    pub const fn dossier_id(&self) -> &DossierId {
+        &self.dossier_id
+    }
+
+    /// Immutable portfolio revision, when portfolio impact informed the target.
+    #[must_use]
+    pub const fn portfolio_revision(&self) -> Option<&PortfolioRevisionToken> {
+        self.portfolio_revision.as_ref()
+    }
+}
+
+/// Existing upstream forecast and fair-value evidence identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TargetEvidence {
+    forecast: Option<DecisionContentDigest>,
+    fair_value: Option<DecisionId>,
+}
+
+impl TargetEvidence {
+    /// Constructs a path-free evidence set without changing valuation classification.
+    #[must_use]
+    pub const fn new(
+        forecast: Option<DecisionContentDigest>,
+        fair_value: Option<DecisionId>,
+    ) -> Self {
+        Self {
+            forecast,
+            fair_value,
+        }
+    }
+
+    /// Forecast evidence identity, when used.
+    #[must_use]
+    pub const fn forecast(self) -> Option<DecisionContentDigest> {
+        self.forecast
+    }
+
+    /// Existing fair-value classification decision, when used.
+    #[must_use]
+    pub const fn fair_value(self) -> Option<DecisionId> {
+        self.fair_value
+    }
+}
+
+/// Validated construction input for a complete governed target revision.
+#[derive(Clone, Debug)]
+pub struct TargetGovernanceInput {
+    /// Frozen Task 7 financial, identity, and core-time contract.
+    pub target: InvestmentTargetSet,
+    /// Add case retained separately from base/upside/downside and trading ranges.
+    pub add_case: Money,
+    /// Closed analytical method.
+    pub method: TargetMethod,
+    /// Evidence-bound analytical assumptions.
+    pub assumptions: Vec<TargetAssumption>,
+    /// Dossier and optional portfolio context.
+    pub decision_context: TargetDecisionContext,
+    /// Earliest time this revision may be considered after review.
+    pub effective_at: Timestamp,
+    /// Mandatory review time.
+    pub review_due_at: Timestamp,
+    /// Exact prior revision and supersession time for a successor.
+    pub supersedes: Option<(RevisionNumber, Timestamp)>,
+    /// Primary target thesis.
+    pub thesis: DecisionText,
+    /// Bounded risk narratives.
+    pub risks: Vec<DecisionText>,
+    /// Bounded explicit invalidation conditions.
+    pub invalidation_conditions: Vec<DecisionText>,
+    /// Existing forecast and fair-value references.
+    pub evidence: TargetEvidence,
+    /// Quality of the exact reference mark.
+    pub mark_quality: DataQuality,
+    /// Target author.
+    pub author: DecisionActorId,
+    /// Code-owned governance ruleset version.
+    pub ruleset_version: NonZeroU32,
+}
+
+/// Complete immutable target revision; it owns no order or valuation-classification authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedTargetSet {
+    target: InvestmentTargetSet,
+    add_case: Money,
+    method: TargetMethod,
+    assumptions: Box<[TargetAssumption]>,
+    decision_context: TargetDecisionContext,
+    effective_at: Timestamp,
+    review_due_at: Timestamp,
+    supersedes: Option<(RevisionNumber, Timestamp)>,
+    thesis: DecisionText,
+    risks: Box<[DecisionText]>,
+    invalidation_conditions: Box<[DecisionText]>,
+    evidence: TargetEvidence,
+    mark_quality: DataQuality,
+    author: DecisionActorId,
+    ruleset_version: NonZeroU32,
+}
+
+impl GovernedTargetSet {
+    /// Validates complete financial, temporal, narrative, evidence, and supersession governance.
+    pub fn try_new(input: TargetGovernanceInput) -> Result<Self, DecisionContractError> {
+        let target = &input.target;
+        let expected_prior = target.revision().get().checked_sub(1);
+        let supersession_valid = match (target.revision().get(), input.supersedes) {
+            (1, None) => true,
+            (revision, Some((prior, at))) => {
+                expected_prior == Some(prior.get())
+                    && prior.get() < revision
+                    && at >= target.created_at()
+                    && at <= input.effective_at
+            }
+            _ => false,
+        };
+        if input.add_case.currency() != target.reference_mark().price().currency()
+            || input.add_case.amount().is_sign_negative()
+            || target.dossier_id() != input.decision_context.dossier_id()
+            || input.assumptions.is_empty()
+            || input.assumptions.len() > MAX_TARGET_NARRATIVE_ITEMS
+            || input.risks.is_empty()
+            || input.risks.len() > MAX_TARGET_NARRATIVE_ITEMS
+            || input.invalidation_conditions.is_empty()
+            || input.invalidation_conditions.len() > MAX_TARGET_NARRATIVE_ITEMS
+            || input.effective_at < target.created_at()
+            || input.effective_at >= target.expires_at()
+            || input.review_due_at < input.effective_at
+            || input.review_due_at > target.expires_at()
+            || (input.evidence.forecast.is_none() && input.evidence.fair_value.is_none())
+            || (matches!(input.method, TargetMethod::ForecastDistribution)
+                && input.evidence.forecast.is_none())
+            || (matches!(input.method, TargetMethod::FairValueMeasurement)
+                && input.evidence.fair_value.is_none())
+            || !supersession_valid
+        {
+            return Err(DecisionContractError::InvalidTargetGovernance);
+        }
+        Ok(Self {
+            target: input.target,
+            add_case: input.add_case,
+            method: input.method,
+            assumptions: input.assumptions.into_boxed_slice(),
+            decision_context: input.decision_context,
+            effective_at: input.effective_at,
+            review_due_at: input.review_due_at,
+            supersedes: input.supersedes,
+            thesis: input.thesis,
+            risks: input.risks.into_boxed_slice(),
+            invalidation_conditions: input.invalidation_conditions.into_boxed_slice(),
+            evidence: input.evidence,
+            mark_quality: input.mark_quality,
+            author: input.author,
+            ruleset_version: input.ruleset_version,
+        })
+    }
+
+    /// Frozen financial and identity core.
+    #[must_use]
+    pub const fn target(&self) -> &InvestmentTargetSet {
+        &self.target
+    }
+
+    /// Separate add case.
+    #[must_use]
+    pub const fn add_case(&self) -> Money {
+        self.add_case
+    }
+
+    /// Analytical method.
+    #[must_use]
+    pub const fn method(&self) -> TargetMethod {
+        self.method
+    }
+
+    /// Evidence-bound assumptions.
+    #[must_use]
+    pub fn assumptions(&self) -> &[TargetAssumption] {
+        &self.assumptions
+    }
+
+    /// Dossier and portfolio decision context.
+    #[must_use]
+    pub const fn decision_context(&self) -> &TargetDecisionContext {
+        &self.decision_context
+    }
+
+    /// Earliest review-activated effective time.
+    #[must_use]
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    /// Mandatory review time.
+    #[must_use]
+    pub const fn review_due_at(&self) -> Timestamp {
+        self.review_due_at
+    }
+
+    /// Exact prior revision and supersession time.
+    #[must_use]
+    pub const fn supersedes(&self) -> Option<(RevisionNumber, Timestamp)> {
+        self.supersedes
+    }
+
+    /// Primary thesis.
+    #[must_use]
+    pub const fn thesis(&self) -> &DecisionText {
+        &self.thesis
+    }
+
+    /// Risk narratives.
+    #[must_use]
+    pub fn risks(&self) -> &[DecisionText] {
+        &self.risks
+    }
+
+    /// Explicit invalidation conditions.
+    #[must_use]
+    pub fn invalidation_conditions(&self) -> &[DecisionText] {
+        &self.invalidation_conditions
+    }
+
+    /// Forecast and fair-value evidence references.
+    #[must_use]
+    pub const fn evidence(&self) -> TargetEvidence {
+        self.evidence
+    }
+
+    /// Reference-mark quality.
+    #[must_use]
+    pub const fn mark_quality(&self) -> DataQuality {
+        self.mark_quality
+    }
+
+    /// Target author.
+    #[must_use]
+    pub const fn author(&self) -> &DecisionActorId {
+        &self.author
+    }
+
+    /// Code-owned governance ruleset version.
+    #[must_use]
+    pub const fn ruleset_version(&self) -> NonZeroU32 {
+        self.ruleset_version
+    }
+}
+
+/// Effective read-side status derived only from append-only target/review/invalidation records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetStatus {
+    /// No explicit review has activated or rejected the revision.
+    PendingReview,
+    /// The latest lifecycle evidence is an activation review.
+    Active,
+    /// The latest review rejected the revision.
+    Rejected,
+    /// The latest review requires a successor.
+    NeedsChanges,
+    /// A later invalidation requires explicit review before activation.
+    NeedsReview,
+    /// A later immutable revision supersedes this revision.
+    Superseded,
+}
+
+/// Owned read model for one target revision and its latest immutable governance evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetState {
+    target: GovernedTargetSet,
+    status: TargetStatus,
+    latest_review: Option<TargetReview>,
+    latest_invalidation: Option<TargetInvalidation>,
+}
+
+impl TargetState {
+    pub(crate) const fn new(
+        target: GovernedTargetSet,
+        status: TargetStatus,
+        latest_review: Option<TargetReview>,
+        latest_invalidation: Option<TargetInvalidation>,
+    ) -> Self {
+        Self {
+            target,
+            status,
+            latest_review,
+            latest_invalidation,
+        }
+    }
+
+    /// Immutable target content.
+    #[must_use]
+    pub const fn target(&self) -> &GovernedTargetSet {
+        &self.target
+    }
+
+    /// Append-derived effective status.
+    #[must_use]
+    pub const fn status(&self) -> TargetStatus {
+        self.status
+    }
+
+    /// Latest explicit reviewer evidence, including reviewer and review time.
+    #[must_use]
+    pub const fn latest_review(&self) -> Option<&TargetReview> {
+        self.latest_review.as_ref()
+    }
+
+    /// Active approval evidence, available only while the derived status remains active.
+    #[must_use]
+    pub fn approval(&self) -> Option<&TargetReview> {
+        if self.status == TargetStatus::Active {
+            self.latest_review
+                .as_ref()
+                .filter(|review| matches!(review.disposition(), TargetReviewDisposition::Activate))
+        } else {
+            None
+        }
+    }
+
+    /// Latest invalidation evidence, when any was appended.
+    #[must_use]
+    pub const fn latest_invalidation(&self) -> Option<&TargetInvalidation> {
+        self.latest_invalidation.as_ref()
     }
 }

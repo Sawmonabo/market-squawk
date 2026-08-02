@@ -2,14 +2,17 @@
 use std::env;
 use std::fs;
 use std::mem::size_of;
+use std::num::{NonZeroU16, NonZeroU64};
 #[cfg(feature = "onnx-runtime")]
 use std::path::Component;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use market_squawk_data::Sha256Digest;
+use market_squawk_domain::{InstrumentId, Timestamp};
 #[cfg(feature = "onnx-runtime")]
 use market_squawk_modeling::{
     ControlledOnnxRuntimeRoot, ExternalOnnxRuntimeBackend, ExternalOnnxRuntimeReference,
@@ -30,9 +33,9 @@ use market_squawk_modeling::{
 ))]
 use market_squawk_modeling::{ExternalOnnxRuntimeError, optional_onnx_runtime_policy_digest};
 use market_squawk_modeling::{
-    InferenceBackend, MAX_ONNX_MODEL_BYTES, ModelFeatureValue, ModelInput, ModelOutputSemantics,
-    OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram,
-    TractOnnxBackend,
+    ForecastHorizon, ForecastRequest, InferenceBackend, MAX_ONNX_MODEL_BYTES, ModelFeatureValue,
+    ModelInput, ModelOutputSemantics, OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy,
+    OnnxPolicyError, OnnxWorkerProgram, ResearchForecastBackend, TractOnnxBackend,
 };
 use prost::Message;
 use serde::Deserialize;
@@ -305,6 +308,66 @@ fn tract_backend_runs_the_exact_bundle_with_finite_bounded_output() -> TestResul
         [0; 32]
     );
     assert_ne!(backend.runtime_evidence().warm_up_digest(), [0; 32]);
+    drop(backend);
+    wait_for_active_generations(&program, 0)?;
+    Ok(())
+}
+
+#[test]
+fn onnx_research_forecast_never_fabricates_intervals_without_admitted_calibration() -> TestResult {
+    let model = golden_model()?;
+    let fixture = valid_onnx_fixture(&model)?;
+    let bundle = Arc::new(fixture.load()?);
+    let policy = policy_for(&model, 13, &[1, 2], &[1, 1])?;
+    let program = worker_program()?;
+    let backend = TractOnnxBackend::try_from_bundle(bundle, policy, &program)?;
+    let values = [
+        [
+            ModelFeatureValue::try_new(fixture.feature(0)?, 3.0)?,
+            ModelFeatureValue::try_new(fixture.feature(1)?, 14.0)?,
+        ],
+        [
+            ModelFeatureValue::try_new(fixture.feature(0)?, 4.0)?,
+            ModelFeatureValue::try_new(fixture.feature(1)?, 14.0)?,
+        ],
+    ];
+    let inputs = [
+        ModelInput::try_new(backend.metadata(), &values[0])?,
+        ModelInput::try_new(backend.metadata(), &values[1])?,
+    ];
+    let horizon = ForecastHorizon::try_new(
+        NonZeroU16::new(2).ok_or("horizon")?,
+        NonZeroU64::new(86_400_000_000_000).ok_or("daily step")?,
+    )?;
+    let request = ForecastRequest::try_new(
+        InstrumentId::from_str("018f3c2a-91ab-7ccd-b3de-123456789aab")?,
+        Timestamp::from_unix_nanos(1_000_000_000_000_000),
+        Timestamp::from_unix_nanos(999_000_000_000_000),
+        horizon,
+        4,
+        &inputs,
+    )?;
+
+    let forecast = backend.forecast(&request, None)?;
+
+    assert_eq!(forecast.horizon(), horizon);
+    assert_eq!(forecast.points().len(), 2);
+    assert!(forecast.calibration().is_none());
+    assert!(
+        forecast
+            .points()
+            .iter()
+            .all(|point| point.intervals().is_none())
+    );
+    assert!(
+        forecast
+            .points()
+            .iter()
+            .all(|point| point.central().to_f64().is_finite())
+    );
+    assert_eq!(forecast.model_id(), backend.metadata().model_id());
+    assert_eq!(forecast.dataset(), backend.metadata().dataset());
+    assert_eq!(program.active_generations(), 1);
     drop(backend);
     wait_for_active_generations(&program, 0)?;
     Ok(())

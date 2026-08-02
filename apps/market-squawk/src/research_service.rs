@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
-    CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
-    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
-    ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
-    RightsError, SourceOperation, extraction_provider_payload_digest,
+    CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildPrecommitAuthority,
+    DatasetBuildRequest, DatasetBuilder, DatasetId, FairValueCatalogCapability,
+    FeatureLabelDataset, IngestError, IngestIdentity, IngestPrecommitAuthority,
+    InstrumentDefinitionReadCapability, ManifestCatalogError, ObjectStoreConfig,
+    OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput, RightsError,
+    SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{DigestAlgorithm, ExactPayloadEvidence};
 use market_squawk_platform::{LocalPaths, PathError};
@@ -306,6 +307,20 @@ impl ResearchService {
         self.analytical
             .dataset_builder()
             .build(request, cancellation)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Builds while retaining exact caller authority through derived-generation publication.
+    pub async fn build_dataset_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, ResearchServiceError> {
+        self.analytical
+            .dataset_builder()
+            .build_with_precommit_authority(request, cancellation, precommit_authority)
             .await
             .map_err(Into::into)
     }

@@ -30,7 +30,7 @@ use super::CliDatasetError;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct DatasetBuildRequestDto {
+pub(crate) struct DatasetBuildRequestDto {
     output_dataset: String,
     parents: Vec<ManifestDto>,
     universe: UniverseDto,
@@ -44,9 +44,9 @@ pub(super) struct DatasetBuildRequestDto {
 }
 
 impl DatasetBuildRequestDto {
-    pub(super) fn into_domain(
+    pub(crate) fn into_domain(
         self,
-        ownership: UserOwnedInputEvidence,
+        ownership: Option<UserOwnedInputEvidence>,
     ) -> Result<DatasetBuildRequest, CliDatasetError> {
         let parents = convert_all(self.parents, ManifestDto::into_domain)?;
         let component_specs = convert_all(self.component_specs, ComponentSpecDto::into_domain)?;
@@ -783,14 +783,16 @@ struct OutputAuthorizationDto {
 impl OutputAuthorizationDto {
     fn into_domain(
         self,
-        ownership: UserOwnedInputEvidence,
+        ownership: Option<UserOwnedInputEvidence>,
     ) -> Result<DatasetOutputAuthorization, CliDatasetError> {
         let basis = match self.basis {
             RightsBasisDto::ReviewedTerms { url, terms_sha256 } => {
                 RightsBasis::reviewed_terms(url, evidence(&terms_sha256)?)
                     .map_err(|_| CliDatasetError::InvalidRequest)?
             }
-            RightsBasisDto::RequestFileOwnership => RightsBasis::user_owned_local(ownership),
+            RightsBasisDto::RequestFileOwnership => {
+                RightsBasis::user_owned_local(ownership.ok_or(CliDatasetError::InvalidRequest)?)
+            }
         };
         DatasetOutputAuthorization::try_new(
             self.source_id,

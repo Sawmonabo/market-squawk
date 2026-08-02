@@ -15,8 +15,9 @@ use chrono::DateTime;
 use market_squawk_data::{
     AnalyticalGeneration, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
     AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit, DatasetId,
-    DatasetManifestRef, GenerationKind, GenerationParentRelation, ManifestCatalogError,
-    PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits, QueryResult,
+    DatasetManifestRef, GenerationKind, GenerationParentRelation, IngestPrecommitAuthority,
+    ManifestCatalogError, PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits,
+    QueryResult,
 };
 use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
@@ -76,11 +77,29 @@ pub trait ResearchIngestCoordinator: Send + Sync + 'static {
         limits: ServiceLimits,
     ) -> Result<TypedToolResult, ServiceError>;
 
+    /// Executes ingestion while composing one additional process-local commit authority.
+    ///
+    /// The implementation must validate its ordinary provider-generation authority first and
+    /// invoke `additional` only at the exact durable catalog/manifest commit boundary.
+    async fn ingest_with_precommit(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+        additional: Arc<dyn ResearchIngestCommitAuthority>,
+    ) -> Result<TypedToolResult, ServiceError>;
+
     /// Rejects new extraction work and cancels owned background activity without blocking.
     fn begin_shutdown(&self);
 
     /// Completes bounded adapter and persistence shutdown.
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
+}
+
+/// Additional application authority spanning the exact ingest commit boundary.
+pub trait ResearchIngestCommitAuthority: IngestPrecommitAuthority {
+    /// Seals the already-claimed authority immediately after durable ingest publication succeeds.
+    fn commit_succeeded(&self);
 }
 
 /// Receipt-minting discovery authority shared with the Source domain.

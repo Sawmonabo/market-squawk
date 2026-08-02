@@ -21,6 +21,12 @@ pub struct PortfolioRevisionId(pub(crate) [u8; 32]);
 pub struct PortfolioRevisionToken(PortfolioRevisionId);
 
 impl PortfolioRevisionToken {
+    /// Reconstructs the exact opaque revision identity from its complete stable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(PortfolioRevisionId(bytes))
+    }
+
     /// Returns the stable bytes of the revision identity carried by this precondition.
     pub const fn bytes(&self) -> [u8; 32] {
         self.0.0

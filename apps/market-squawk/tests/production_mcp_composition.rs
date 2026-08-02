@@ -59,13 +59,13 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         .invoke_operation(
             RequestId::try_string("installed-job-list")?,
             "Job.List",
-            json!({"afterJobId": null, "limit": 16}),
+            json!({"limit": 16}),
             Duration::from_secs(5),
             CancellationToken::new(),
         )
         .await?;
     assert_eq!(jobs.result()["ok"], true);
-    assert_eq!(jobs.result()["value"]["snapshots"], json!([]));
+    assert_eq!(jobs.result()["value"]["data"]["jobs"], json!([]));
 
     let shutdown = CancellationToken::new();
     let service_task = tokio::spawn(service.run(shutdown.clone()));

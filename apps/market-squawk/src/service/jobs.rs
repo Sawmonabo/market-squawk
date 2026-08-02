@@ -1,154 +1,182 @@
-//! Typed native job control over the installed service's sole durable authority.
+//! Typed job control shared by every installed transport.
 
-use std::sync::Arc;
-
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_jobs::{
-    JobAuthority, JobConfirmation, JobEventPageLimit, JobEventSequence, JobGeneration, JobId,
-    JobListCursor, JobListPageLimit, JobRepository as _, SqliteJobRepository,
+    JobConfirmation, JobEventPageLimit, JobEventSequence, JobGeneration, JobId, JobListCursor,
+    JobListPageLimit, JobOrigin, SqliteJobRepository,
 };
-use market_squawk_runtime::{DispatchError, OperationEffect};
-use market_squawk_services::RequestContext;
+use market_squawk_services::{
+    RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
+};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::jobs::InstalledJobAuthority;
+use crate::{
+    application::job::{JobAdmission, JobApplication, JobApplicationError},
+    jobs::InstalledJobAuthority,
+};
 
-pub(super) const OPERATIONS: [&str; 6] = [
-    "Job.List",
-    "Job.Get",
-    "Job.Watch",
-    "Job.Cancel",
-    "Job.Confirm",
-    "Job.Retry",
-];
-
-/// Closed installed-service job query and mutation authority.
+/// Closed typed job query and mutation authority.
 pub(super) struct InstalledJobOperations {
-    repository: Arc<SqliteJobRepository>,
-    authority: Arc<JobAuthority<SqliteJobRepository>>,
+    application: JobApplication<SqliteJobRepository>,
 }
 
 impl InstalledJobOperations {
     pub(super) fn new(jobs: &InstalledJobAuthority) -> Self {
         Self {
-            repository: jobs.repository(),
-            authority: jobs.authority(),
+            application: JobApplication::new(jobs.repository(), jobs.authority()),
         }
     }
 
-    pub(super) fn effect(operation: &str) -> Option<OperationEffect> {
-        match operation {
-            "Job.List" | "Job.Get" | "Job.Watch" => Some(OperationEffect::Read),
-            "Job.Cancel" | "Job.Confirm" | "Job.Retry" => Some(OperationEffect::Mutation),
-            _ => None,
-        }
+    pub(super) fn owns(operation: &str) -> bool {
+        matches!(
+            operation,
+            "Job.List" | "Job.Get" | "Job.Watch" | "Job.Cancel" | "Job.Confirm" | "Job.Retry"
+        )
     }
 
-    pub(super) async fn dispatch(
+    pub(super) async fn call(
         &self,
-        operation: &str,
-        arguments: &Value,
+        request: &TypedToolRequest,
         context: &RequestContext,
-    ) -> Result<Value, DispatchError> {
+    ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
-        let value = match operation {
+        let arguments = mutation_arguments(request.arguments());
+        let content = match request.name() {
             "Job.List" => {
-                let request: ListRequest = decode(arguments)?;
-                let cursor = request
+                let input: ListRequest = decode(&arguments)?;
+                let cursor = input
                     .after_job_id
                     .map(|value| {
                         SourceIdentifier::try_from(value)
                             .map(JobListCursor::new)
-                            .map_err(|_error| DispatchError::Rejected)
+                            .map_err(|_error| ServiceError::InvalidRequest)
                     })
                     .transpose()?;
-                let limit = JobListPageLimit::try_new(request.limit)
-                    .map_err(|_error| DispatchError::Rejected)?;
-                serde_json::to_value(
-                    self.repository
+                let limit = JobListPageLimit::try_new(input.limit)
+                    .map_err(|_error| ServiceError::InvalidRequest)?;
+                encode(
+                    self.application
                         .list(cursor.as_ref(), limit)
                         .await
-                        .map_err(map_repository)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
             "Job.Get" => {
-                let request: IdentityRequest = decode(arguments)?;
-                serde_json::to_value(
-                    self.repository
-                        .get_latest(parse_id(&request.job_id)?)
+                let input: IdentityRequest = decode(&arguments)?;
+                encode(
+                    self.application
+                        .get(parse_id(&input.job_id)?)
                         .await
-                        .map_err(map_repository)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
             "Job.Watch" => {
-                let request: WatchRequest = decode(arguments)?;
-                serde_json::to_value(
-                    self.repository
-                        .events_after(
-                            parse_id(&request.job_id)?,
-                            parse_generation(request.generation)?,
-                            JobEventSequence::new(request.after_sequence),
-                            JobEventPageLimit::try_new(request.limit)
-                                .map_err(|_error| DispatchError::Rejected)?,
+                let input: WatchRequest = decode(&arguments)?;
+                encode(
+                    self.application
+                        .watch(
+                            parse_id(&input.job_id)?,
+                            parse_generation(input.generation)?,
+                            JobEventSequence::new(input.after_sequence),
+                            JobEventPageLimit::try_new(input.limit)
+                                .map_err(|_error| ServiceError::InvalidRequest)?,
                         )
                         .await
-                        .map_err(map_repository)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
             "Job.Cancel" => {
-                let request: MutationRequest = decode(arguments)?;
-                serde_json::to_value(
-                    self.authority
+                let input: MutationRequest = decode(&arguments)?;
+                encode(
+                    self.application
                         .cancel(
-                            parse_id(&request.job_id)?,
-                            parse_generation(request.generation)?,
-                            JobEventSequence::new(request.expected_sequence),
-                            crate::service::runtime::current_timestamp()
-                                .map_err(|_error| DispatchError::Unavailable)?,
+                            parse_id(&input.job_id)?,
+                            parse_generation(input.generation)?,
+                            JobEventSequence::new(input.expected_sequence),
+                            super::runtime::current_timestamp()
+                                .map_err(|_error| ServiceError::Unavailable)?,
                         )
                         .await
-                        .map_err(map_authority)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
             "Job.Confirm" => {
-                let request: ConfirmRequest = decode(arguments)?;
+                let input: ConfirmRequest = decode(&arguments)?;
                 let confirmation = JobConfirmation::new(
-                    parse_id(&request.job_id)?,
-                    parse_generation(request.generation)?,
-                    JobEventSequence::new(request.expected_sequence),
-                    request.identity,
-                    request.digest,
+                    parse_id(&input.job_id)?,
+                    parse_generation(input.generation)?,
+                    JobEventSequence::new(input.expected_sequence),
+                    input.identity,
+                    parse_sha256(&input.digest)?,
                 );
-                serde_json::to_value(
-                    self.authority
+                encode(
+                    self.application
                         .confirm(
                             &confirmation,
-                            crate::service::runtime::current_timestamp()
-                                .map_err(|_error| DispatchError::Unavailable)?,
+                            super::runtime::current_timestamp()
+                                .map_err(|_error| ServiceError::Unavailable)?,
                         )
                         .await
-                        .map_err(map_authority)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
             "Job.Retry" => {
-                let request: MutationRequest = decode(arguments)?;
-                serde_json::to_value(
-                    self.authority
+                let input: MutationRequest = decode(&arguments)?;
+                encode(
+                    self.application
                         .retry(
-                            parse_id(&request.job_id)?,
-                            parse_generation(request.generation)?,
-                            JobEventSequence::new(request.expected_sequence),
-                            crate::service::runtime::current_timestamp()
-                                .map_err(|_error| DispatchError::Unavailable)?,
+                            parse_id(&input.job_id)?,
+                            parse_generation(input.generation)?,
+                            JobEventSequence::new(input.expected_sequence),
+                            super::runtime::current_timestamp()
+                                .map_err(|_error| ServiceError::Unavailable)?,
                         )
                         .await
-                        .map_err(map_authority)?,
-                )
+                        .map_err(map_application)?,
+                )?
             }
-            _ => return Err(DispatchError::Rejected),
+            _ => return Err(ServiceError::NotFound),
         };
-        value.map_err(|_error| DispatchError::Unavailable)
+        ensure_live(context)?;
+        TypedToolResult::try_new(
+            content,
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
+    }
+
+    pub(super) async fn start(
+        &self,
+        admission: JobAdmission,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        ensure_live(context)?;
+        let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+        let workspace = SourceIdentifier::try_from(origin.workspace_id().to_string())
+            .map_err(|_error| ServiceError::Unauthorized)?;
+        let client = SourceIdentifier::try_from(origin.client_id().to_string())
+            .map_err(|_error| ServiceError::Unauthorized)?;
+        let receipt = self
+            .application
+            .start(
+                admission,
+                JobOrigin::new(workspace, client),
+                context.request_id().clone(),
+                super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?,
+            )
+            .await
+            .map_err(map_application)?;
+        ensure_live(context)?;
+        TypedToolResult::try_new(
+            encode(receipt)?,
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -156,8 +184,7 @@ impl std::fmt::Debug for InstalledJobOperations {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("InstalledJobOperations")
-            .field("repository", &"[DURABLE JOB READ AUTHORITY]")
-            .field("authority", &"[DURABLE JOB MUTATION AUTHORITY]")
+            .field("application", &"[DURABLE JOB APPLICATION]")
             .finish()
     }
 }
@@ -199,46 +226,63 @@ struct ConfirmRequest {
     generation: u64,
     expected_sequence: u64,
     identity: SourceIdentifier,
-    digest: EvidenceDigest,
+    digest: String,
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T, DispatchError> {
-    serde_json::from_value(arguments.clone()).map_err(|_error| DispatchError::Rejected)
+fn mutation_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
+    let mut admitted = arguments.clone();
+    admitted.remove("confirm");
+    admitted
 }
 
-fn parse_id(value: &str) -> Result<JobId, DispatchError> {
-    JobId::try_from_str(value).map_err(|_error| DispatchError::Rejected)
+fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
+    serde_json::from_value(Value::Object(arguments.clone()))
+        .map_err(|_error| ServiceError::InvalidRequest)
 }
 
-fn parse_generation(value: u64) -> Result<JobGeneration, DispatchError> {
-    JobGeneration::try_new(value).map_err(|_error| DispatchError::Rejected)
+fn encode(value: impl serde::Serialize) -> Result<Value, ServiceError> {
+    serde_json::to_value(value).map_err(|_error| ServiceError::Internal)
 }
 
-fn ensure_live(context: &RequestContext) -> Result<(), DispatchError> {
-    if context.cancellation().is_cancelled() || std::time::Instant::now() >= context.deadline() {
-        Err(DispatchError::Interrupted)
+fn parse_id(value: &str) -> Result<JobId, ServiceError> {
+    JobId::try_from_str(value).map_err(|_error| ServiceError::InvalidRequest)
+}
+
+fn parse_generation(value: u64) -> Result<JobGeneration, ServiceError> {
+    JobGeneration::try_new(value).map_err(|_error| ServiceError::InvalidRequest)
+}
+
+fn parse_sha256(value: &str) -> Result<EvidenceDigest, ServiceError> {
+    if value.len() != 64 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).map_err(|_error| ServiceError::InvalidRequest)?;
+        bytes[index] =
+            u8::from_str_radix(pair, 16).map_err(|_error| ServiceError::InvalidRequest)?;
+    }
+    Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
+}
+
+fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
+    if context.cancellation().is_cancelled() {
+        Err(ServiceError::Cancelled)
+    } else if std::time::Instant::now() >= context.deadline() {
+        Err(ServiceError::DeadlineExceeded)
     } else {
         Ok(())
     }
 }
 
-fn map_repository(error: market_squawk_jobs::JobRepositoryError) -> DispatchError {
+fn map_application(error: JobApplicationError) -> ServiceError {
     match error {
-        market_squawk_jobs::JobRepositoryError::NotFound
-        | market_squawk_jobs::JobRepositoryError::Conflict
-        | market_squawk_jobs::JobRepositoryError::InvalidTransition
-        | market_squawk_jobs::JobRepositoryError::Terminal
-        | market_squawk_jobs::JobRepositoryError::InvalidState => DispatchError::Rejected,
-        market_squawk_jobs::JobRepositoryError::Unavailable => DispatchError::Unavailable,
-    }
-}
-
-fn map_authority(error: market_squawk_jobs::JobAuthorityError) -> DispatchError {
-    match error {
-        market_squawk_jobs::JobAuthorityError::UnknownKind
-        | market_squawk_jobs::JobAuthorityError::Capacity
-        | market_squawk_jobs::JobAuthorityError::Contract => DispatchError::Rejected,
-        market_squawk_jobs::JobAuthorityError::Repository
-        | market_squawk_jobs::JobAuthorityError::ShutdownIncomplete => DispatchError::Unavailable,
+        JobApplicationError::NotFound => ServiceError::NotFound,
+        JobApplicationError::WaitCancelled => ServiceError::Cancelled,
+        JobApplicationError::WaitDeadlineExceeded => ServiceError::DeadlineExceeded,
+        JobApplicationError::Contract => ServiceError::InvalidRequest,
+        JobApplicationError::Repository | JobApplicationError::Authority => {
+            ServiceError::Unavailable
+        }
     }
 }

@@ -3,7 +3,9 @@
 use std::{
     collections::HashMap,
     fmt,
+    io::Read as _,
     num::NonZeroUsize,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -163,6 +165,59 @@ impl InputStager {
             .map_err(|_| InputStagingError::Storage)
     }
 
+    /// Transfers one exact staged input to its owning application operation.
+    ///
+    /// The returned capability is one-shot: resolving the same ticket again fails, and dropping
+    /// the capability removes the controlled staging file.
+    pub fn claim(
+        &self,
+        id: InputTicketId,
+        client_id: ClientId,
+        expected_media_type: &market_squawk_domain::SourceIdentifier,
+        now: Timestamp,
+    ) -> Result<ClaimedInput, InputStagingError> {
+        self.reap_expired(now)?;
+        let (ticket, path) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| InputStagingError::Unavailable)?;
+            let staged = state
+                .staged
+                .get(&id)
+                .ok_or(InputStagingError::TicketRejected)?;
+            if staged.ticket.installation_id() != self.runtime.installation_id()
+                || staged.ticket.workspace_id() != self.runtime.workspace_id()
+                || staged.ticket.generation() != self.runtime.service_generation()
+                || staged.ticket.client_id() != client_id
+                || staged.ticket.media_type() != expected_media_type
+                || staged.ticket.expires_at() <= now
+            {
+                return Err(InputStagingError::TicketRejected);
+            }
+            (staged.ticket.clone(), staged.path.clone())
+        };
+        read_and_verify(&path, &ticket)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| InputStagingError::Unavailable)?;
+        if state.staged.get(&id).map(|staged| &staged.ticket) != Some(&ticket) {
+            return Err(InputStagingError::TicketRejected);
+        }
+        let staged = state
+            .staged
+            .remove(&id)
+            .ok_or(InputStagingError::Unavailable)?;
+        let display_path = self.root.root().join(staged.path.relative());
+        Ok(ClaimedInput {
+            root: self.root.clone(),
+            ticket: staged.ticket,
+            path: Some(staged.path),
+            display_path,
+        })
+    }
+
     fn reap_expired(&self, now: Timestamp) -> Result<(), InputStagingError> {
         let mut state = self
             .state
@@ -189,6 +244,55 @@ impl InputStager {
             state.reservations -= 1;
         }
         error
+    }
+}
+
+/// One-shot ownership of an exact native-streamed input.
+pub struct ClaimedInput {
+    root: ArtifactRoot,
+    ticket: InputTicket,
+    path: Option<ResolvedArtifactPath>,
+    display_path: PathBuf,
+}
+
+impl ClaimedInput {
+    /// Returns the verified staged-input evidence.
+    #[must_use]
+    pub const fn ticket(&self) -> &InputTicket {
+        &self.ticket
+    }
+
+    /// Returns the controlled path used only for an admitted local child process.
+    #[must_use]
+    pub fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    /// Reopens and verifies the exact staged bytes without granting ambient path authority.
+    pub fn read_verified(&self, maximum_bytes: u64) -> Result<Box<[u8]>, InputStagingError> {
+        if self.ticket.byte_length() > maximum_bytes {
+            return Err(InputStagingError::AdmissionRejected);
+        }
+        let path = self.path.as_ref().ok_or(InputStagingError::Unavailable)?;
+        read_and_verify(path, &self.ticket)
+    }
+}
+
+impl fmt::Debug for ClaimedInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimedInput")
+            .field("ticket", &self.ticket)
+            .field("path", &"[CONTROLLED STAGING PATH]")
+            .finish()
+    }
+}
+
+impl Drop for ClaimedInput {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            remove_staged(&self.root, &path);
+        }
     }
 }
 
@@ -309,6 +413,33 @@ fn remove_staged(root: &ArtifactRoot, path: &ResolvedArtifactPath) {
     if let Ok(directory) = root.try_clone_directory() {
         let _ignored = directory.remove_file(path.relative());
     }
+}
+
+fn read_and_verify(
+    path: &ResolvedArtifactPath,
+    ticket: &InputTicket,
+) -> Result<Box<[u8]>, InputStagingError> {
+    let file = path.open_read().map_err(|_| InputStagingError::Storage)?;
+    let metadata = file.metadata().map_err(|_| InputStagingError::Storage)?;
+    if metadata.len() != ticket.byte_length() {
+        return Err(InputStagingError::DigestMismatch);
+    }
+    let capacity =
+        usize::try_from(ticket.byte_length()).map_err(|_| InputStagingError::CapacityExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| InputStagingError::CapacityExceeded)?;
+    file.take(ticket.byte_length().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| InputStagingError::Storage)?;
+    if bytes.len() != capacity
+        || EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&bytes).into())
+            != ticket.digest()
+    {
+        return Err(InputStagingError::DigestMismatch);
+    }
+    Ok(bytes.into_boxed_slice())
 }
 
 /// Stream staging or ticket-resolution failure.

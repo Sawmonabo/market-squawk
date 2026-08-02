@@ -1,24 +1,34 @@
 //! Closed bundle grammar and exact Task 11/12 relationship validation.
 
-use std::num::NonZeroU32;
+use std::collections::BTreeMap;
+use std::mem::size_of;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use market_squawk_analytics::{FeatureKey, FeatureRegistry};
 use market_squawk_data::{ComponentKind, ComponentScope, CorporateActionSensitivity, Sha256Digest};
+use market_squawk_domain::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::BundleError;
 use crate::native::NativeArtifact;
 use crate::{
-    BundleExpectations, DecisionThresholds, FeatureNormalizer, MAX_MODEL_FEATURES,
-    ModelFeatureBinding, ModelFormat, ModelOutputSemantics, ValidationMetric, ValidationMetricName,
+    BundleExpectations, CalibrationBand, CalibrationMethod, CalibrationWindow, DecisionThresholds,
+    FeatureNormalizer, ForecastCalibrationArtifacts, ForecastCoverage, MAX_MODEL_FEATURES,
+    ModelFeatureBinding, ModelFormat, ModelOutputSemantics, RealizedCoverage, ValidationMetric,
+    ValidationMetricName,
 };
 
 pub(super) const LEGACY_METADATA_SCHEMA_VERSION: u32 = 4;
 pub(super) const METADATA_SCHEMA_VERSION: u32 = 5;
+pub(super) const FORECAST_METADATA_SCHEMA_VERSION: u32 = 6;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
 pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 2;
 pub(super) const OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION: u32 = 3;
+pub(super) const FORECAST_TRAINING_RUN_SCHEMA_VERSION: u32 = 4;
+pub(super) const FORECAST_POLICY_SCHEMA_VERSION: u32 = 1;
+pub(super) const FORECAST_RESIDUALS_PATH: &str = "calibration/residuals.f64le";
+pub(super) const FORECAST_POLICY_PATH: &str = "calibration/policy.json";
 const MAX_VALIDATION_METRICS: usize = 32;
 const MAX_LIMITATIONS: usize = 32;
 const MAX_PROSE_BYTES: usize = 512;
@@ -34,6 +44,7 @@ pub(super) struct MetadataWire {
     pub(super) artifact: ArtifactRefWire,
     pub(super) output_semantics: Option<String>,
     pub(super) training_run: FileRefWire,
+    pub(super) forecast_calibration: Option<ForecastCalibrationRefWire>,
     pub(super) features: Vec<FeatureWire>,
     pub(super) training_dataset: DatasetWire,
     pub(super) training_universe_id: String,
@@ -48,12 +59,19 @@ pub(super) struct MetadataWire {
     pub(super) fallback: FallbackWire,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FileRefWire {
     pub(super) path: String,
     pub(super) sha256: String,
     pub(super) size_bytes: u64,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForecastCalibrationRefWire {
+    pub(super) residuals: FileRefWire,
+    pub(super) policy: FileRefWire,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +152,37 @@ pub(super) struct TrainingRunWire {
     pub(super) trial: TrainingTrialWire,
     pub(super) trial_sha256: String,
     pub(super) validation_metrics: Vec<MetricWire>,
+    pub(super) forecast_calibration: Option<ForecastCalibrationRefWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForecastPolicyWire {
+    schema_version: u32,
+    kind: String,
+    method: String,
+    calibration_window: ForecastCalibrationWindowWire,
+    dependence_assumptions: String,
+    residuals_sha256: String,
+    bands: Vec<ForecastBandWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForecastCalibrationWindowWire {
+    start_unix_nanos: i64,
+    end_unix_nanos: i64,
+    observations: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForecastBandWire {
+    target_coverage_basis_points: u16,
+    lower_offset: f64,
+    upper_offset: f64,
+    realized_covered: u64,
+    realized_total: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -157,6 +206,21 @@ pub(super) struct TrainingTrialWire {
     training_code_revision: String,
     training_period: TrainingPeriodWire,
     universe_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<ForecastTrialWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ForecastTrialWire {
+    strategy: String,
+    horizons: Vec<u32>,
+    lags: Vec<u32>,
+    observed_cutoff_unix_nanos: i64,
+    rolling_splits: u32,
+    ridge_alpha: f64,
+    selection_sha256: String,
+    package_versions: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -321,7 +385,9 @@ pub(super) fn validate_training_run(
 ) -> Result<(), BundleError> {
     if !matches!(
         run.schema_version,
-        TRAINING_RUN_SCHEMA_VERSION | OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION
+        TRAINING_RUN_SCHEMA_VERSION
+            | OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION
+            | FORECAST_TRAINING_RUN_SCHEMA_VERSION
     ) {
         return Err(BundleError::UnsupportedTrainingRunVersion);
     }
@@ -349,6 +415,10 @@ pub(super) fn validate_training_run(
             },
             Some(output_semantics_name(output_semantics)),
         ),
+        FORECAST_TRAINING_RUN_SCHEMA_VERSION => (
+            "linear",
+            Some(output_semantics_name(ModelOutputSemantics::Regression)),
+        ),
         _ => return Err(BundleError::UnsupportedTrainingRunVersion),
     };
     let relationships_match =
@@ -369,7 +439,26 @@ pub(super) fn validate_training_run(
             && trial.model_kind == expected_kind
             && trial.output_semantics.as_deref() == expected_output_semantics
             && output_semantics_bound
-                == (run.schema_version == OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION)
+                == matches!(
+                    run.schema_version,
+                    OUTPUT_BOUND_TRAINING_RUN_SCHEMA_VERSION | FORECAST_TRAINING_RUN_SCHEMA_VERSION
+                )
+            && match run.schema_version {
+                FORECAST_TRAINING_RUN_SCHEMA_VERSION => {
+                    metadata.schema_version == FORECAST_METADATA_SCHEMA_VERSION
+                        && format == ModelFormat::Onnx
+                        && output_semantics == ModelOutputSemantics::Regression
+                        && run.forecast_calibration == metadata.forecast_calibration
+                        && run.forecast_calibration.is_some()
+                        && trial.forecast.is_some()
+                }
+                _ => {
+                    metadata.schema_version != FORECAST_METADATA_SCHEMA_VERSION
+                        && run.forecast_calibration.is_none()
+                        && metadata.forecast_calibration.is_none()
+                        && trial.forecast.is_none()
+                }
+            }
             && trial.training_code_revision == metadata.training_code_revision
             && trial.environment_sha256 == metadata.training_environment_sha256
             && trial.training_period == metadata.training_period
@@ -408,7 +497,134 @@ pub(super) fn validate_training_run(
     {
         return Err(BundleError::TrainingRunRelationshipMismatch);
     }
+    if let Some(forecast) = &trial.forecast {
+        let ordered_positive = |values: &[u32], maximum: usize| {
+            !values.is_empty()
+                && values.len() <= maximum
+                && values.iter().all(|value| *value > 0)
+                && values.windows(2).all(|pair| pair[0] < pair[1])
+        };
+        if !matches!(
+            forecast.strategy.as_str(),
+            "direct" | "recursive" | "multi_output" | "chained"
+        ) || !ordered_positive(&forecast.horizons, 512)
+            || !ordered_positive(&forecast.lags, 1_024)
+            || forecast.observed_cutoff_unix_nanos
+                > metadata.training_dataset.selection_as_of_unix_nanos
+            || !(2..=32).contains(&forecast.rolling_splits)
+            || !forecast.ridge_alpha.is_finite()
+            || forecast.ridge_alpha < 0.0
+            || parse_digest(&forecast.selection_sha256)?.bytes() == [0; 32]
+            || forecast.package_versions.len() != 5
+            || forecast.package_versions.iter().any(|(name, version)| {
+                !matches!(
+                    name.as_str(),
+                    "numpy" | "scikit-learn" | "mapie" | "skl2onnx" | "onnx"
+                ) || version.is_empty()
+                    || version.len() > 64
+                    || version.bytes().any(|byte| byte.is_ascii_control())
+            })
+        {
+            return Err(BundleError::TrainingRunRelationshipMismatch);
+        }
+    }
     Ok(())
+}
+
+pub(super) fn validate_forecast_calibration(
+    reference: &ForecastCalibrationRefWire,
+    policy: ForecastPolicyWire,
+    residuals: &[u8],
+) -> Result<ForecastCalibrationArtifacts, BundleError> {
+    if policy.schema_version != FORECAST_POLICY_SCHEMA_VERSION
+        || reference.residuals.path != FORECAST_RESIDUALS_PATH
+        || reference.policy.path != FORECAST_POLICY_PATH
+        || residuals.is_empty()
+        || !residuals.len().is_multiple_of(size_of::<f64>())
+    {
+        return Err(BundleError::InvalidForecastCalibration);
+    }
+    let method = match (policy.kind.as_str(), policy.method.as_str()) {
+        ("mapie_time_series_conformal", "mapie_enbpi") => CalibrationMethod::MapieEnbpi,
+        ("mapie_time_series_conformal", "mapie_aci") => CalibrationMethod::MapieAci,
+        ("residual_quantile", "residual_quantile") => CalibrationMethod::ResidualQuantile,
+        _ => return Err(BundleError::InvalidForecastCalibration),
+    };
+    let observations = NonZeroU32::new(policy.calibration_window.observations)
+        .ok_or(BundleError::InvalidForecastCalibration)?;
+    if usize::try_from(observations.get()).ok() != Some(residuals.len() / size_of::<f64>())
+        || policy.dependence_assumptions.is_empty()
+        || policy.dependence_assumptions.len() > 512
+        || policy
+            .dependence_assumptions
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || parse_digest(&policy.residuals_sha256)? != parse_digest(&reference.residuals.sha256)?
+    {
+        return Err(BundleError::InvalidForecastCalibration);
+    }
+    for chunk in residuals.chunks_exact(size_of::<f64>()) {
+        let bytes: [u8; 8] = chunk
+            .try_into()
+            .map_err(|_| BundleError::InvalidForecastCalibration)?;
+        if !f64::from_le_bytes(bytes).is_finite() {
+            return Err(BundleError::InvalidForecastCalibration);
+        }
+    }
+    let window = CalibrationWindow::try_new(
+        Timestamp::from_unix_nanos(policy.calibration_window.start_unix_nanos),
+        Timestamp::from_unix_nanos(policy.calibration_window.end_unix_nanos),
+        observations,
+    )
+    .map_err(|_| BundleError::InvalidForecastCalibration)?;
+    let wires: [ForecastBandWire; 3] = policy
+        .bands
+        .try_into()
+        .map_err(|_| BundleError::InvalidForecastCalibration)?;
+    let coverages = [
+        ForecastCoverage::Fifty,
+        ForecastCoverage::Eighty,
+        ForecastCoverage::NinetyFive,
+    ];
+    let mut decoded = Vec::with_capacity(3);
+    for (index, wire) in wires.iter().enumerate() {
+        if wire.target_coverage_basis_points != coverages[index].basis_points() {
+            return Err(BundleError::InvalidForecastCalibration);
+        }
+        let total =
+            NonZeroU64::new(wire.realized_total).ok_or(BundleError::InvalidForecastCalibration)?;
+        let realized = RealizedCoverage::try_new(wire.realized_covered, total)
+            .map_err(|_| BundleError::InvalidForecastCalibration)?;
+        decoded.push(
+            CalibrationBand::try_new(
+                coverages[index],
+                wire.lower_offset,
+                wire.upper_offset,
+                realized,
+            )
+            .map_err(|_| BundleError::InvalidForecastCalibration)?,
+        );
+    }
+    let bands: [CalibrationBand; 3] = decoded
+        .try_into()
+        .map_err(|_| BundleError::InvalidForecastCalibration)?;
+    if bands[2].lower_offset() > bands[1].lower_offset()
+        || bands[1].lower_offset() > bands[0].lower_offset()
+        || bands[0].upper_offset() > bands[1].upper_offset()
+        || bands[1].upper_offset() > bands[2].upper_offset()
+    {
+        return Err(BundleError::InvalidForecastCalibration);
+    }
+    Ok(ForecastCalibrationArtifacts::new(
+        method,
+        window,
+        parse_digest(&reference.policy.sha256)?,
+        reference.policy.size_bytes,
+        parse_digest(&reference.residuals.sha256)?,
+        reference.residuals.size_bytes,
+        bands,
+        policy.dependence_assumptions,
+    ))
 }
 
 pub(super) fn validate_metrics(
@@ -491,7 +707,7 @@ pub(super) fn validate_output_semantics(
             },
             false,
         ),
-        METADATA_SCHEMA_VERSION => {
+        METADATA_SCHEMA_VERSION | FORECAST_METADATA_SCHEMA_VERSION => {
             let semantics = match value {
                 Some("regression") => ModelOutputSemantics::Regression,
                 Some("binary_probability") => ModelOutputSemantics::BinaryProbability,

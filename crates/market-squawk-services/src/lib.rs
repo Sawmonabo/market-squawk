@@ -30,7 +30,7 @@ pub use progress::{
 
 pub use request::{
     JsonContractError, JsonStructureLimits, RequestContext, RequestId, RequestIdError,
-    ServiceLimits, ServiceLimitsError, validate_json_contract,
+    RequestOrigin, RequestOriginError, ServiceLimits, ServiceLimitsError, validate_json_contract,
 };
 pub use response::{ResultCompleteness, ServiceContractError, ToolResultMetadata, TypedToolResult};
 pub use traits::{

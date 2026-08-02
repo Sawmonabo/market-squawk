@@ -26,7 +26,7 @@ use market_squawk_mcp::{
     McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest, McpServer,
     McpStdioRelay, MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
 };
-use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient};
+use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient, WorkspaceId};
 use market_squawk_services::{
     ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
     ServiceDomain, ServiceError, SourceEvidencePolicy, TOOL_INSTRUMENT_IDS_FIELD,
@@ -1372,12 +1372,15 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         ..McpLimitSpec::default()
     })?;
     let audit = Arc::new(CollectingAudit::default());
+    let workspace_id: WorkspaceId =
+        serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"")?;
     let factory = McpHandlerFactory::try_new(
         services.clone(),
         limits,
         audit.clone(),
         Arc::new(RejectingArtifacts),
         Arc::new(HttpResources),
+        workspace_id,
     )?;
     let authenticator = Arc::new(FixedHttpAuthenticator::try_new()?);
     let http = McpHttpService::new(

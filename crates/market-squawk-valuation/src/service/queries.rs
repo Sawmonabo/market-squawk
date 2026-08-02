@@ -13,6 +13,91 @@ impl FairValueService {
         self.measurements.len()
     }
 
+    /// Returns one bounded oldest-to-newest page of the retained audit hash chain.
+    ///
+    /// A cursor names both sequence and event identity, preventing a stale or unrelated chain
+    /// position from silently skipping records. The returned continuation always identifies the
+    /// last event in this page and is present only while another retained event exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FairValueError::QueryLimitExceeded`] for an invalid limit,
+    /// [`FairValueError::InvalidAuditCursor`] for an unknown chain position, or
+    /// [`FairValueError::CorruptPersistence`] when retained sequence/link continuity is broken.
+    pub fn audit_page(
+        &self,
+        after: Option<FairValueAuditCursor>,
+        limit: usize,
+    ) -> Result<FairValueAuditPage, FairValueError> {
+        self.validate_query_limit(limit)?;
+        let start = match after {
+            None => 0,
+            Some(cursor) => {
+                let index = usize::try_from(
+                    cursor
+                        .sequence()
+                        .checked_sub(1)
+                        .ok_or(FairValueError::InvalidAuditCursor)?,
+                )
+                .map_err(|_| FairValueError::InvalidAuditCursor)?;
+                let event = self
+                    .audit
+                    .get(index)
+                    .ok_or(FairValueError::InvalidAuditCursor)?;
+                if event.sequence() != cursor.sequence() || event.id() != cursor.event_id() {
+                    return Err(FairValueError::InvalidAuditCursor);
+                }
+                index.checked_add(1).ok_or(FairValueError::Arithmetic)?
+            }
+        };
+        let available_from_cursor = self
+            .audit
+            .len()
+            .checked_sub(start)
+            .ok_or(FairValueError::CorruptPersistence)?;
+        let end = start
+            .checked_add(limit)
+            .ok_or(FairValueError::Arithmetic)?
+            .min(self.audit.len());
+        let events = self.audit[start..end].to_vec();
+        let expected_previous = after.map(FairValueAuditCursor::event_id);
+        let expected_first_sequence = u64::try_from(start)
+            .map_err(|_| FairValueError::Arithmetic)?
+            .checked_add(1)
+            .ok_or(FairValueError::Arithmetic)?;
+        if events.first().is_some_and(|event| {
+            event.previous_event_id() != expected_previous
+                || event.sequence() != expected_first_sequence
+        }) {
+            return Err(FairValueError::CorruptPersistence);
+        }
+        for pair in events.windows(2) {
+            let expected_sequence = pair[0]
+                .sequence()
+                .checked_add(1)
+                .ok_or(FairValueError::Arithmetic)?;
+            if pair[1].previous_event_id() != Some(pair[0].id())
+                || pair[1].sequence() != expected_sequence
+            {
+                return Err(FairValueError::CorruptPersistence);
+            }
+        }
+        let next_cursor = if end < self.audit.len() {
+            events
+                .last()
+                .map(|event| FairValueAuditCursor::after(event))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(FairValueAuditPage {
+            events,
+            total_count: self.audit.len(),
+            available_from_cursor,
+            next_cursor,
+        })
+    }
+
     /// Returns measurements in deterministic content-identity order under an explicit bound.
     pub fn measurements(
         &self,

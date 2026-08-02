@@ -75,11 +75,11 @@ pub use corporate_actions::{
 pub use dataset_builder::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildError,
-    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
-    DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
-    DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,
-    FeatureLabelDataset, FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES,
-    MissingValuePolicy, PythonDatasetAdmission,
+    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildPrecommitAuthority,
+    DatasetBuildRequest, DatasetBuilder, DatasetBuilderService, DatasetExample,
+    DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput,
+    FeatureLabelComponentSpec, FeatureLabelDataset, FeatureLabelPythonExport,
+    MAX_FEATURE_LABEL_EXPORT_BYTES, MissingValuePolicy, PythonDatasetAdmission,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,

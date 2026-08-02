@@ -145,6 +145,9 @@ pub enum FairValueError {
         /// Configured maximum rows.
         limit: usize,
     },
+    /// An audit cursor is empty, stale, or does not identify the retained chain position.
+    #[error("fair-value audit cursor is invalid")]
+    InvalidAuditCursor,
     /// The local catalog rejected an otherwise validated fair-value operation.
     #[error("fair-value catalog persistence failed")]
     Persistence,
@@ -183,8 +186,8 @@ pub use rules::{
     DecisionReasonCode, Predicate, PredicateResult, RulesetHash,
 };
 pub use service::{
-    AuditEventId, AuditEventKind, FairValueAuditEvent, FairValueLimitInput, FairValueLimits,
-    FairValueService,
+    AuditEventId, AuditEventKind, FairValueAuditCursor, FairValueAuditEvent, FairValueAuditPage,
+    FairValueLimitInput, FairValueLimits, FairValueService,
 };
 
 pub(crate) struct CanonicalHasher(Sha256);

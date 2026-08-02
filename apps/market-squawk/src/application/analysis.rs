@@ -37,11 +37,12 @@ pub use backtest::{
     GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
     GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
     GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
-    GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestRepository,
-    GovernedBacktestRepositoryLimits, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
-    ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
-    ProductionGovernedBacktestInputAuthorityError, ProductionGovernedBacktestRepository,
-    ProductionGovernedBacktestRepositoryError, ResolvedGovernedBacktestInput,
+    GovernedBacktestPrepublishAuthority, GovernedBacktestQueryLimitsInput, GovernedBacktestRecord,
+    GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
+    MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionBacktestAuthority,
+    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
+    ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
+    ResolvedGovernedBacktestInput,
 };
 pub use catalog::{
     AnalysisCatalog, AnalysisCatalogError, AnalysisDataset, AnalysisDatasetScope,

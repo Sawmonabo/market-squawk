@@ -4,6 +4,8 @@
 
 #[path = "../backtest_vertical.rs"]
 mod backtest_vertical;
+#[path = "../decision_persistence.rs"]
+mod decision_persistence;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../journal_path_integration.rs"]

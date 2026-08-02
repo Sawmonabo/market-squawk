@@ -1,0 +1,668 @@
+//! Bounded single-writer append journal and deterministic restart recovery.
+
+use std::fmt;
+
+use market_squawk_domain::RevisionNumber;
+
+use crate::{
+    DecisionDossier, GovernedTargetSet, InvestmentTargetSetId, SavedScreen, ScreenExecution,
+    ScreenId, ScreenRunId, TargetInvalidation, TargetReview, TargetReviewDisposition, TargetState,
+    TargetStatus,
+};
+
+const MAX_REPOSITORY_LIMIT: usize = 65_536;
+const MAX_REPOSITORY_CANDIDATES: usize = 1_000_000;
+
+/// Fixed resource ceilings for the in-process decision index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecisionRepositoryLimits {
+    maximum_screen_revisions: usize,
+    maximum_screen_runs: usize,
+    maximum_candidates_per_run: usize,
+    maximum_dossiers: usize,
+    maximum_target_revisions: usize,
+    maximum_reviews: usize,
+    maximum_invalidations: usize,
+    maximum_records: usize,
+}
+
+impl DecisionRepositoryLimits {
+    /// Constructs positive limits below the process-wide hard ceiling.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each independently bounded persisted record family remains explicit"
+    )]
+    pub fn try_new(
+        maximum_screen_revisions: usize,
+        maximum_screen_runs: usize,
+        maximum_candidates_per_run: usize,
+        maximum_dossiers: usize,
+        maximum_target_revisions: usize,
+        maximum_reviews: usize,
+        maximum_invalidations: usize,
+    ) -> Result<Self, DecisionRepositoryError> {
+        let values = [
+            maximum_screen_revisions,
+            maximum_screen_runs,
+            maximum_candidates_per_run,
+            maximum_dossiers,
+            maximum_target_revisions,
+            maximum_reviews,
+            maximum_invalidations,
+        ];
+        if values
+            .into_iter()
+            .any(|value| value == 0 || value > MAX_REPOSITORY_LIMIT)
+        {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let maximum_records = maximum_screen_revisions
+            .checked_add(maximum_screen_runs)
+            .and_then(|value| value.checked_add(maximum_dossiers))
+            .and_then(|value| value.checked_add(maximum_target_revisions))
+            .and_then(|value| value.checked_add(maximum_reviews))
+            .and_then(|value| value.checked_add(maximum_invalidations))
+            .ok_or(DecisionRepositoryError::InvalidLimits)?;
+        let maximum_candidates = maximum_screen_runs
+            .checked_mul(maximum_candidates_per_run)
+            .ok_or(DecisionRepositoryError::InvalidLimits)?;
+        if maximum_records > MAX_REPOSITORY_LIMIT || maximum_candidates > MAX_REPOSITORY_CANDIDATES
+        {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        Ok(Self {
+            maximum_screen_revisions,
+            maximum_screen_runs,
+            maximum_candidates_per_run,
+            maximum_dossiers,
+            maximum_target_revisions,
+            maximum_reviews,
+            maximum_invalidations,
+            maximum_records,
+        })
+    }
+}
+
+/// Result of an idempotent append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppendOutcome {
+    /// A new immutable record was appended.
+    Appended,
+    /// The exact same stable identity and immutable content was already present.
+    AlreadyPresent,
+}
+
+/// One typed persisted record. No variant contains a path, query, formula, credential, or order.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "journal records retain owned typed values without an extra infallible box allocation per append"
+)]
+pub enum DecisionRecord {
+    /// Immutable saved-screen revision.
+    Screen(SavedScreen),
+    /// Exact point-in-time run and bounded ranked candidates.
+    ScreenExecution(ScreenExecution),
+    /// Immutable reference-only dossier.
+    Dossier(DecisionDossier),
+    /// Immutable governed target revision.
+    Target(GovernedTargetSet),
+    /// Immutable explicit review.
+    Review(TargetReview),
+    /// Immutable invalidation evidence.
+    Invalidation(TargetInvalidation),
+}
+
+/// Fully typed restart payload. A durable application adapter controls byte persistence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionJournalSnapshot {
+    records: Box<[DecisionRecord]>,
+}
+
+impl DecisionJournalSnapshot {
+    /// Admits a bounded decoded journal for ordinary invariant-checked recovery.
+    pub fn try_from_records(records: Vec<DecisionRecord>) -> Result<Self, DecisionRepositoryError> {
+        if records.len() > MAX_REPOSITORY_LIMIT {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        Ok(Self {
+            records: records.into_boxed_slice(),
+        })
+    }
+
+    /// Ordered immutable records.
+    #[must_use]
+    pub fn records(&self) -> &[DecisionRecord] {
+        &self.records
+    }
+}
+
+/// Repository validation or compare-and-append failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecisionRepositoryError {
+    /// A configured count limit was zero, excessive, or overflowed.
+    InvalidLimits,
+    /// A fixed record-family capacity would be exceeded.
+    Capacity,
+    /// A stable identity already names different immutable content.
+    Conflict,
+    /// The expected head revision does not equal the current head.
+    StaleRevision,
+    /// A referenced saved screen, run, candidate, dossier, target, or revision does not exist.
+    NotFound,
+    /// A supplied identity or semantic binding does not match its authoritative parent.
+    EvidenceMismatch,
+    /// Fallible retained-memory allocation failed before mutation.
+    Allocation,
+}
+
+impl fmt::Display for DecisionRepositoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidLimits => "decision repository limits are invalid",
+            Self::Capacity => "decision repository capacity is exhausted",
+            Self::Conflict => "decision record identity conflicts with retained content",
+            Self::StaleRevision => "decision append expected a different head revision",
+            Self::NotFound => "referenced decision record was not found",
+            Self::EvidenceMismatch => "decision evidence does not match its authoritative parent",
+            Self::Allocation => "decision repository allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for DecisionRepositoryError {}
+
+/// One-writer, compare-and-append repository with scan-only bounded indexes.
+#[derive(Debug)]
+pub struct DecisionRepository {
+    limits: DecisionRepositoryLimits,
+    records: Vec<DecisionRecord>,
+}
+
+impl DecisionRepository {
+    /// Preallocates the complete journal capacity before accepting writes.
+    pub fn try_new(limits: DecisionRepositoryLimits) -> Result<Self, DecisionRepositoryError> {
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(limits.maximum_records)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        Ok(Self { limits, records })
+    }
+
+    /// Replays a typed snapshot through every ordinary append invariant.
+    pub fn recover(
+        limits: DecisionRepositoryLimits,
+        snapshot: DecisionJournalSnapshot,
+    ) -> Result<Self, DecisionRepositoryError> {
+        let mut repository = Self::try_new(limits)?;
+        for record in snapshot.records.into_vec() {
+            match record {
+                DecisionRecord::Screen(value) => {
+                    let expected = repository.screen_head(value.revision().id());
+                    repository.append_screen(expected, value)?;
+                }
+                DecisionRecord::ScreenExecution(value) => {
+                    repository.append_screen_execution(value)?;
+                }
+                DecisionRecord::Dossier(value) => {
+                    repository.append_dossier(value)?;
+                }
+                DecisionRecord::Target(value) => {
+                    let expected = repository.target_head(value.target().id());
+                    repository.append_target(expected, value)?;
+                }
+                DecisionRecord::Review(value) => {
+                    repository.append_review(value)?;
+                }
+                DecisionRecord::Invalidation(value) => {
+                    repository.append_invalidation(value)?;
+                }
+            }
+        }
+        Ok(repository)
+    }
+
+    /// Clones a bounded restart snapshot with fallible preallocation.
+    pub fn try_snapshot(&self) -> Result<DecisionJournalSnapshot, DecisionRepositoryError> {
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(self.records.len())
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        records.extend(self.records.iter().cloned());
+        Ok(DecisionJournalSnapshot {
+            records: records.into_boxed_slice(),
+        })
+    }
+
+    /// Consumes the one-writer repository into its restart payload without copying.
+    #[must_use]
+    pub fn into_snapshot(self) -> DecisionJournalSnapshot {
+        DecisionJournalSnapshot {
+            records: self.records.into_boxed_slice(),
+        }
+    }
+
+    /// Compare-and-appends an immutable screen revision.
+    pub fn append_screen(
+        &mut self,
+        expected: Option<RevisionNumber>,
+        screen: SavedScreen,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.screen(screen.revision().id(), screen.revision().revision()) {
+            return if existing == &screen {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let current = self.screen_head(screen.revision().id());
+        if current != expected {
+            return Err(DecisionRepositoryError::StaleRevision);
+        }
+        let required = current
+            .map_or(Some(1), |revision| revision.get().checked_add(1))
+            .ok_or(DecisionRepositoryError::StaleRevision)?;
+        if screen.revision().revision().get() != required
+            || self.screen_count() >= self.limits.maximum_screen_revisions
+        {
+            return Err(
+                if self.screen_count() >= self.limits.maximum_screen_revisions {
+                    DecisionRepositoryError::Capacity
+                } else {
+                    DecisionRepositoryError::StaleRevision
+                },
+            );
+        }
+        self.push(DecisionRecord::Screen(screen))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one exact run and its complete candidate batch atomically.
+    pub fn append_screen_execution(
+        &mut self,
+        execution: ScreenExecution,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.screen_execution(execution.run().id()) {
+            return if existing == &execution {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let Some(screen) = self.screen(
+            execution.run().screen().id(),
+            execution.run().screen().revision(),
+        ) else {
+            return Err(DecisionRepositoryError::NotFound);
+        };
+        if execution.run().universe_identity() != screen.universe_identity()
+            || execution.run().feature_bindings() != screen.feature_bindings()
+            || execution.candidates().len() > self.limits.maximum_candidates_per_run
+            || execution.candidates().iter().any(|candidate| {
+                candidate.record().screen_run_id() != execution.run().id()
+                    || candidate.record().screen() != execution.run().screen()
+            })
+        {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        if self.screen_run_count() >= self.limits.maximum_screen_runs {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::ScreenExecution(execution))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends one dossier only when its candidate and instrument match an exact retained run.
+    pub fn append_dossier(
+        &mut self,
+        dossier: DecisionDossier,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.dossier(dossier.dossier().id()) {
+            return if existing == &dossier {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let candidate = self
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DecisionRecord::ScreenExecution(execution) => Some(execution.candidates()),
+                _ => None,
+            })
+            .flatten()
+            .find(|candidate| candidate.record().id() == dossier.dossier().candidate_id())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        if candidate.record().instrument_id() != dossier.dossier().instrument_id() {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        if self.dossier_count() >= self.limits.maximum_dossiers {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::Dossier(dossier))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Compare-and-appends an immutable governed target revision.
+    pub fn append_target(
+        &mut self,
+        expected: Option<RevisionNumber>,
+        target: GovernedTargetSet,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) =
+            self.target_revision(target.target().id(), target.target().revision())
+        {
+            return if existing == &target {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let current = self.target_head(target.target().id());
+        if current != expected {
+            return Err(DecisionRepositoryError::StaleRevision);
+        }
+        let required = current
+            .map_or(Some(1), |revision| revision.get().checked_add(1))
+            .ok_or(DecisionRepositoryError::StaleRevision)?;
+        if target.target().revision().get() != required {
+            return Err(DecisionRepositoryError::StaleRevision);
+        }
+        if let Some(prior) = current {
+            let Some(previous) = self.target_revision(target.target().id(), prior) else {
+                return Err(DecisionRepositoryError::NotFound);
+            };
+            if previous.target().instrument_id() != target.target().instrument_id()
+                || target.supersedes().map(|value| value.0) != Some(prior)
+            {
+                return Err(DecisionRepositoryError::EvidenceMismatch);
+            }
+        }
+        if self.target_count() >= self.limits.maximum_target_revisions {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::Target(target))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends explicit review evidence for the current exact revision.
+    pub fn append_review(
+        &mut self,
+        review: TargetReview,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.records.iter().find_map(|record| match record {
+            DecisionRecord::Review(existing) if existing.id() == review.id() => Some(existing),
+            _ => None,
+        }) {
+            return if existing == &review {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        let target = self
+            .target_revision(review.target_id(), review.target_revision())
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let latest_invalidation = self
+            .invalidations(review.target_id(), review.target_revision())
+            .map(TargetInvalidation::observed_at)
+            .max();
+        if self.target_head(review.target_id()) != Some(review.target_revision())
+            || (matches!(review.disposition(), TargetReviewDisposition::Activate)
+                && (review.reviewed_at() < target.effective_at()
+                    || latest_invalidation
+                        .is_some_and(|observed_at| review.reviewed_at() < observed_at)))
+        {
+            return Err(DecisionRepositoryError::EvidenceMismatch);
+        }
+        if self.review_count() >= self.limits.maximum_reviews {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::Review(review))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Appends invalidation evidence idempotently without changing a target or approval record.
+    pub fn append_invalidation(
+        &mut self,
+        invalidation: TargetInvalidation,
+    ) -> Result<AppendOutcome, DecisionRepositoryError> {
+        if let Some(existing) = self.records.iter().find_map(|record| match record {
+            DecisionRecord::Invalidation(existing) if existing.id() == invalidation.id() => {
+                Some(existing)
+            }
+            _ => None,
+        }) {
+            return if existing == &invalidation {
+                Ok(AppendOutcome::AlreadyPresent)
+            } else {
+                Err(DecisionRepositoryError::Conflict)
+            };
+        }
+        if self
+            .target_revision(invalidation.target_id(), invalidation.target_revision())
+            .is_none()
+        {
+            return Err(DecisionRepositoryError::NotFound);
+        }
+        if self.invalidation_count() >= self.limits.maximum_invalidations {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.push(DecisionRecord::Invalidation(invalidation))?;
+        Ok(AppendOutcome::Appended)
+    }
+
+    /// Lists screen revisions in append order without allocating.
+    pub fn screens(&self) -> impl Iterator<Item = &SavedScreen> {
+        self.records.iter().filter_map(|record| match record {
+            DecisionRecord::Screen(screen) => Some(screen),
+            _ => None,
+        })
+    }
+
+    /// Finds one exact saved-screen revision.
+    pub fn screen(&self, id: &ScreenId, revision: RevisionNumber) -> Option<&SavedScreen> {
+        self.screens()
+            .find(|screen| screen.revision().id() == id && screen.revision().revision() == revision)
+    }
+
+    /// Finds one exact screen execution.
+    pub fn screen_execution(&self, id: &ScreenRunId) -> Option<&ScreenExecution> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::ScreenExecution(execution) if execution.run().id() == id => {
+                Some(execution)
+            }
+            _ => None,
+        })
+    }
+
+    /// Finds one immutable dossier.
+    pub fn dossier(&self, id: &crate::DossierId) -> Option<&DecisionDossier> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::Dossier(dossier) if dossier.dossier().id() == id => Some(dossier),
+            _ => None,
+        })
+    }
+
+    /// Lists immutable revisions for one target series.
+    pub fn target_revisions<'a>(
+        &'a self,
+        id: &'a InvestmentTargetSetId,
+    ) -> impl Iterator<Item = &'a GovernedTargetSet> + 'a {
+        self.records.iter().filter_map(move |record| match record {
+            DecisionRecord::Target(target) if target.target().id() == id => Some(target),
+            _ => None,
+        })
+    }
+
+    /// Finds one exact target revision.
+    pub fn target_revision(
+        &self,
+        id: &InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> Option<&GovernedTargetSet> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::Target(target)
+                if target.target().id() == id && target.target().revision() == revision =>
+            {
+                Some(target)
+            }
+            _ => None,
+        })
+    }
+
+    /// Lists reviews for one exact target revision without allocating.
+    pub fn reviews<'a>(
+        &'a self,
+        id: &'a InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> impl Iterator<Item = &'a TargetReview> + 'a {
+        self.records.iter().filter_map(move |record| match record {
+            DecisionRecord::Review(review)
+                if review.target_id() == id && review.target_revision() == revision =>
+            {
+                Some(review)
+            }
+            _ => None,
+        })
+    }
+
+    /// Lists invalidations for one exact target revision without allocating.
+    pub fn invalidations<'a>(
+        &'a self,
+        id: &'a InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> impl Iterator<Item = &'a TargetInvalidation> + 'a {
+        self.records.iter().filter_map(move |record| match record {
+            DecisionRecord::Invalidation(invalidation)
+                if invalidation.target_id() == id && invalidation.target_revision() == revision =>
+            {
+                Some(invalidation)
+            }
+            _ => None,
+        })
+    }
+
+    /// Derives target status from immutable history; it never rewrites approval or target bytes.
+    pub fn target_status(
+        &self,
+        id: &InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> Result<TargetStatus, DecisionRepositoryError> {
+        if self.target_revision(id, revision).is_none() {
+            return Err(DecisionRepositoryError::NotFound);
+        }
+        if self
+            .target_revisions(id)
+            .any(|target| target.target().revision().get() > revision.get())
+        {
+            return Ok(TargetStatus::Superseded);
+        }
+        let mut status = TargetStatus::PendingReview;
+        for record in &self.records {
+            match record {
+                DecisionRecord::Review(review)
+                    if review.target_id() == id && review.target_revision() == revision =>
+                {
+                    status = match review.disposition() {
+                        TargetReviewDisposition::Activate => TargetStatus::Active,
+                        TargetReviewDisposition::Reject => TargetStatus::Rejected,
+                        TargetReviewDisposition::NeedsChanges => TargetStatus::NeedsChanges,
+                    };
+                }
+                DecisionRecord::Invalidation(invalidation)
+                    if invalidation.target_id() == id
+                        && invalidation.target_revision() == revision =>
+                {
+                    status = TargetStatus::NeedsReview;
+                }
+                _ => {}
+            }
+        }
+        Ok(status)
+    }
+
+    /// Builds an owned target read model with reviewer, approval, status, and invalidation facts.
+    pub fn target_state(
+        &self,
+        id: &InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> Result<TargetState, DecisionRepositoryError> {
+        let target = self
+            .target_revision(id, revision)
+            .cloned()
+            .ok_or(DecisionRepositoryError::NotFound)?;
+        let latest_review = self.reviews(id, revision).last().cloned();
+        let latest_invalidation = self.invalidations(id, revision).last().cloned();
+        Ok(TargetState::new(
+            target,
+            self.target_status(id, revision)?,
+            latest_review,
+            latest_invalidation,
+        ))
+    }
+
+    fn screen_head(&self, id: &ScreenId) -> Option<RevisionNumber> {
+        self.screens()
+            .filter(|screen| screen.revision().id() == id)
+            .map(|screen| screen.revision().revision())
+            .max_by_key(|revision| revision.get())
+    }
+
+    fn target_head(&self, id: &InvestmentTargetSetId) -> Option<RevisionNumber> {
+        self.target_revisions(id)
+            .map(|target| target.target().revision())
+            .max_by_key(|revision| revision.get())
+    }
+
+    fn push(&mut self, record: DecisionRecord) -> Result<(), DecisionRepositoryError> {
+        if self.records.len() >= self.limits.maximum_records {
+            return Err(DecisionRepositoryError::Capacity);
+        }
+        self.records.push(record);
+        Ok(())
+    }
+
+    fn screen_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::Screen(_)))
+            .count()
+    }
+
+    fn screen_run_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::ScreenExecution(_)))
+            .count()
+    }
+
+    fn dossier_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::Dossier(_)))
+            .count()
+    }
+
+    fn target_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::Target(_)))
+            .count()
+    }
+
+    fn review_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::Review(_)))
+            .count()
+    }
+
+    fn invalidation_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, DecisionRecord::Invalidation(_)))
+            .count()
+    }
+}

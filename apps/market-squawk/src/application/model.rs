@@ -30,7 +30,15 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
 };
 
+pub mod forecast;
+mod read_image;
 pub mod runtime;
+
+pub use forecast::{
+    ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
+};
+
+use read_image::{ModelReadImage, ModelReadImageState};
 
 const GET_METADATA: &str = "Model.GetMetadata";
 const LIST_BUNDLES: &str = "Model.ListBundles";
@@ -38,9 +46,10 @@ const EVALUATE: &str = "Model.Evaluate";
 const PREDICT: &str = "Model.Predict";
 const MAXIMUM_EVALUATION_RECORDS: usize = 100_000;
 
-/// Application-owned model surface over one complete immutable registry/backend generation set.
+/// Application-owned model surface over atomically replaceable immutable runtime generations.
 pub struct ModelDomainService {
-    backends: Box<[Arc<dyn InferenceBackend>]>,
+    read_image: Arc<ModelReadImageState>,
+    forecasts: Option<Arc<ForecastApplicationService>>,
     evaluations: Mutex<EvaluationStore>,
     lifecycle: Arc<DomainLifecycle>,
 }
@@ -54,41 +63,61 @@ impl ModelDomainService {
     /// evaluation retention.
     pub fn try_new(
         registry: Arc<ModelRegistry>,
-        mut backends: Vec<Arc<dyn InferenceBackend>>,
+        backends: Vec<Arc<dyn InferenceBackend>>,
         maximum_evaluation_records: NonZeroUsize,
+    ) -> Result<Self, ModelDomainServiceError> {
+        let image = Arc::new(ModelReadImage::try_new(registry, backends)?);
+        Self::try_from_read_image(
+            Arc::new(ModelReadImageState::new(image)),
+            maximum_evaluation_records,
+            None,
+        )
+    }
+
+    /// Binds this service directly to a runtime-owned atomically published read image.
+    ///
+    /// Existing calls retain the immutable generation loaded at call entry. A durable runtime
+    /// admission replaces the shared image in one pointer publication, so later calls observe the
+    /// complete new registry/backend set without an inconsistent intermediate state.
+    pub fn try_from_runtime_snapshot(
+        snapshot: runtime::ModelRuntimeSnapshot,
+        maximum_evaluation_records: NonZeroUsize,
+    ) -> Result<Self, ModelDomainServiceError> {
+        Self::try_from_read_image(snapshot.into_read_image(), maximum_evaluation_records, None)
+    }
+
+    /// Binds an installed runtime snapshot and its sole durable forecast publication authority.
+    pub fn try_from_runtime_snapshot_with_forecasts(
+        snapshot: runtime::ModelRuntimeSnapshot,
+        maximum_evaluation_records: NonZeroUsize,
+        forecasts: Arc<ForecastApplicationService>,
+    ) -> Result<Self, ModelDomainServiceError> {
+        Self::try_from_read_image(
+            snapshot.into_read_image(),
+            maximum_evaluation_records,
+            Some(forecasts),
+        )
+    }
+
+    fn try_from_read_image(
+        read_image: Arc<ModelReadImageState>,
+        maximum_evaluation_records: NonZeroUsize,
+        forecasts: Option<Arc<ForecastApplicationService>>,
     ) -> Result<Self, ModelDomainServiceError> {
         if maximum_evaluation_records.get() > MAXIMUM_EVALUATION_RECORDS {
             return Err(ModelDomainServiceError::EvaluationCapacity);
         }
-        backends.sort_unstable_by(|left, right| {
-            model_coordinate(left.metadata()).cmp(&model_coordinate(right.metadata()))
-        });
-        if backends.windows(2).any(|pair| {
-            bundle_coordinate(pair[0].metadata()) == bundle_coordinate(pair[1].metadata())
-        }) {
-            return Err(ModelDomainServiceError::DuplicateBackend);
-        }
-        let registry_length = registry
-            .len()
-            .map_err(|_| ModelDomainServiceError::Registry)?;
-        if registry_length != backends.len() {
-            return Err(ModelDomainServiceError::IncompleteBackendSet);
-        }
-        for backend in &backends {
-            let metadata = backend.metadata();
-            let registered = registry
-                .get(metadata.bundle_id(), metadata.bundle_version())
-                .map_err(|_| ModelDomainServiceError::Registry)?
-                .ok_or(ModelDomainServiceError::IncompleteBackendSet)?;
-            if registered.metadata() != metadata {
-                return Err(ModelDomainServiceError::BackendIdentityMismatch);
-            }
-        }
         Ok(Self {
-            backends: backends.into_boxed_slice(),
+            read_image,
+            forecasts,
             evaluations: Mutex::new(EvaluationStore::new(maximum_evaluation_records)),
             lifecycle: DomainLifecycle::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_generation_count(&self) -> usize {
+        self.read_image.load().len()
     }
 
     fn metadata(
@@ -97,7 +126,8 @@ impl ModelDomainService {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let model_id = admitted_model_id(request.arguments())?;
-        let bundle = self
+        let image = self.read_image.load();
+        let bundle = image
             .backends
             .iter()
             .filter(|backend| backend.metadata().model_id() == model_id)
@@ -112,8 +142,9 @@ impl ModelDomainService {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let limits = admitted_result_limits(request, context)?;
-        let available = self.backends.len();
-        let bundles = self
+        let image = self.read_image.load();
+        let available = image.backends.len();
+        let bundles = image
             .backends
             .iter()
             .take(limits.maximum_result_items())
@@ -142,7 +173,8 @@ impl ModelDomainService {
             .and_then(Value::as_object)
             .ok_or(ServiceError::InvalidRequest)?;
         let parsed = ParsedModelInput::try_from(input_value)?;
-        let backend = self
+        let image = self.read_image.load();
+        let backend = image
             .backends
             .iter()
             .find(|backend| {
@@ -199,9 +231,12 @@ impl ModelDomainService {
 
 impl fmt::Debug for ModelDomainService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let image = self.read_image.load();
         formatter
             .debug_struct("ModelDomainService")
-            .field("backend_count", &self.backends.len())
+            .field("backend_count", &image.backends.len())
+            .field("registry", &"[IMMUTABLE MODEL REGISTRY]")
+            .field("forecasts_configured", &self.forecasts.is_some())
             .field("evaluations", &"[BOUNDED EVALUATION EVIDENCE]")
             .field("lifecycle", &self.lifecycle)
             .finish()
@@ -223,14 +258,21 @@ impl ApplicationDomainService for ModelDomainService {
             return Err(ServiceError::InvalidRequest);
         }
         let _call = DomainLifecycle::enter(&self.lifecycle, &context)?;
+        let forecast_commit = request.name() == forecast::GENERATE_FORECAST;
         let result = match request.name() {
             GET_METADATA => self.metadata(&request, &context),
             LIST_BUNDLES => self.bundles(&request, &context),
             EVALUATE => self.infer(&request, &context, true),
             PREDICT => self.infer(&request, &context, false),
+            forecast::GENERATE_FORECAST => self.generate_forecast(&request, &context).await,
+            forecast::GET_FORECAST => self.get_forecast(&request, &context).await,
+            forecast::LIST_FORECASTS => self.list_forecasts(&request, &context).await,
+            forecast::GET_FORECAST_OUTCOMES => self.get_forecast_outcomes(&request, &context).await,
             _ => Err(ServiceError::NotFound),
         }?;
-        ensure_request_live(&context, &self.lifecycle)?;
+        if !forecast_commit {
+            ensure_request_live(&context, &self.lifecycle)?;
+        }
         Ok(result)
     }
 

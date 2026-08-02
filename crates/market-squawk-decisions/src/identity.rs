@@ -26,6 +26,18 @@ pub enum DecisionContractError {
     InvalidPriceOrder,
     /// A target-activation review occurred at or after target expiry.
     ExpiredActivation,
+    /// A configured count, statistical limit, or retained value exceeded its closed bound.
+    InvalidBound,
+    /// A screen selected a feature absent from the code-owned point-in-time registry.
+    UnknownScreenFeature,
+    /// Screen predicates, ranking, universe, or point-in-time semantics were inconsistent.
+    InvalidScreen,
+    /// Candidate observations, constraints, evidence, or score inputs were inconsistent.
+    InvalidCandidate,
+    /// A bounded decision narrative was empty, oversized, or contained a control character.
+    InvalidText,
+    /// Target governance did not match its financial, temporal, evidence, or supersession core.
+    InvalidTargetGovernance,
 }
 
 impl fmt::Display for DecisionContractError {
@@ -45,6 +57,16 @@ impl fmt::Display for DecisionContractError {
             }
             Self::InvalidPriceOrder => formatter.write_str("decision prices are not ordered"),
             Self::ExpiredActivation => formatter.write_str("an expired target cannot be activated"),
+            Self::InvalidBound => formatter.write_str("decision resource bound is invalid"),
+            Self::UnknownScreenFeature => {
+                formatter.write_str("screen feature is not code-owned point-in-time semantics")
+            }
+            Self::InvalidScreen => formatter.write_str("saved screen semantics are invalid"),
+            Self::InvalidCandidate => formatter.write_str("candidate evidence is invalid"),
+            Self::InvalidText => formatter.write_str("decision narrative is invalid"),
+            Self::InvalidTargetGovernance => {
+                formatter.write_str("target governance is inconsistent")
+            }
         }
     }
 }

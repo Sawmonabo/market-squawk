@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_platform::{EncryptedFileSecretStore, SecretStore, SecretValue};
+use market_squawk_platform::{EncryptedFileSecretStore, LocalPaths, SecretStore, SecretValue};
 use market_squawk_services::{JsonStructureLimits, RequestId};
 use serde_json::json;
+use sha2::Digest as _;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -115,6 +116,61 @@ fn event_overflow_requires_snapshot_resynchronization() -> TestResult {
             oldest_available: 2
         })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_input_claim_is_owner_bound_and_one_shot() -> TestResult {
+    let directory = TempDir::new()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let runtime = runtime_identity(1, 2, 3)?;
+    let stager = InputStager::new(
+        paths.artifacts()?.clone(),
+        runtime,
+        InputStagingLimits::try_new(2, 1_024)?,
+    );
+    let bytes = b"exact staged input";
+    let media_type = SourceIdentifier::try_from("market-squawk.training-config.v1")?;
+    let admission = InputAdmission::try_new(
+        media_type.clone(),
+        u64::try_from(bytes.len())?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, sha2::Sha256::digest(bytes).into()),
+    )?;
+    let owner = client_id(5)?;
+    let mut stage = stager.begin(
+        owner,
+        admission,
+        Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(100),
+    )?;
+    stage.write_chunk(bytes).await?;
+    let ticket = stage.finish(Timestamp::from_unix_nanos(200)).await?;
+
+    assert!(matches!(
+        stager.claim(
+            ticket.id(),
+            client_id(6)?,
+            &media_type,
+            Timestamp::from_unix_nanos(300),
+        ),
+        Err(InputStagingError::TicketRejected)
+    ));
+    let claimed = stager.claim(
+        ticket.id(),
+        owner,
+        &media_type,
+        Timestamp::from_unix_nanos(300),
+    )?;
+    assert_eq!(claimed.read_verified(1_024)?.as_ref(), bytes);
+    assert!(matches!(
+        stager.claim(
+            ticket.id(),
+            owner,
+            &media_type,
+            Timestamp::from_unix_nanos(300),
+        ),
+        Err(InputStagingError::TicketRejected)
+    ));
     Ok(())
 }
 

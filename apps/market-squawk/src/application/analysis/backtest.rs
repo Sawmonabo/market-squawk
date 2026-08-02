@@ -4,9 +4,12 @@ use std::{fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use market_squawk_backtesting::{BacktestOutcome, TrialStatus};
-use market_squawk_domain::{InstrumentId, SourceId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_services::ServiceError;
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +48,21 @@ pub struct BacktestScope {
 }
 
 impl BacktestScope {
+    /// Admits a canonical bounded scope for a registered immutable backtest input.
+    pub fn try_new(
+        instruments: Vec<InstrumentId>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        sources: Vec<SourceId>,
+    ) -> Result<Self, ServiceError> {
+        if instruments.windows(2).any(|pair| pair[0] >= pair[1])
+            || sources.windows(2).any(|pair| pair[0] >= pair[1])
+            || time_range.is_some_and(|(starts_at, ends_at)| starts_at >= ends_at)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(Self::new(instruments, time_range, sources))
+    }
+
     pub(super) fn new(
         instruments: Vec<InstrumentId>,
         time_range: Option<(Timestamp, Timestamp)>,
@@ -85,6 +103,21 @@ pub struct GovernedBacktestCommand {
 }
 
 impl GovernedBacktestCommand {
+    /// Constructs an exact command whose opaque input identity is revalidated by the resolver.
+    pub fn try_new(
+        strategy_id: SourceIdentifier,
+        input_id: SourceIdentifier,
+        instruments: Vec<InstrumentId>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        sources: Vec<SourceId>,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self::new(
+            strategy_id,
+            input_id,
+            BacktestScope::try_new(instruments, time_range, sources)?,
+        ))
+    }
+
     pub(super) const fn new(
         strategy_id: SourceIdentifier,
         input_id: SourceIdentifier,
@@ -113,6 +146,34 @@ impl GovernedBacktestCommand {
     #[must_use]
     pub const fn scope(&self) -> &BacktestScope {
         &self.scope
+    }
+
+    /// Content digest binding the registered strategy, input identity, and complete scope.
+    pub fn evidence_digest(&self) -> Result<EvidenceDigest, ServiceError> {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/governed-backtest-command/v1");
+        hash_text(&mut hash, self.strategy_id.as_str())?;
+        hash_text(&mut hash, self.input_id.as_str())?;
+        hash_count(&mut hash, self.scope.instruments.len())?;
+        for instrument in &self.scope.instruments {
+            hash.update(instrument.as_uuid().as_bytes());
+        }
+        match self.scope.time_range {
+            Some((starts_at, ends_at)) => {
+                hash.update([1]);
+                hash.update(starts_at.unix_nanos().to_be_bytes());
+                hash.update(ends_at.unix_nanos().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        hash_count(&mut hash, self.scope.sources.len())?;
+        for source in &self.scope.sources {
+            hash_text(&mut hash, source.as_str())?;
+        }
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            hash.finalize().into(),
+        ))
     }
 }
 
@@ -266,6 +327,15 @@ impl GovernedBacktestRecord {
     pub const fn content(&self) -> &Value {
         &self.content
     }
+
+    /// Exact digest of the canonical bounded terminal record.
+    pub fn evidence_digest(&self) -> Result<EvidenceDigest, ServiceError> {
+        let encoded = serde_json::to_vec(&self.content).map_err(|_| ServiceError::InvalidResult)?;
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(encoded).into(),
+        ))
+    }
 }
 
 impl fmt::Debug for GovernedBacktestRecord {
@@ -313,6 +383,15 @@ pub trait GovernedBacktestRepository: Send + Sync + 'static {
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
 }
 
+/// Additional application authority spanning one governed terminal publication boundary.
+pub trait GovernedBacktestPrepublishAuthority: fmt::Debug + Send + Sync + 'static {
+    /// Claims publication immediately before the durable governed repository commit.
+    fn validate_prepublish(&self) -> Result<(), ServiceError>;
+
+    /// Seals the claimed authority immediately after durable publication succeeds.
+    fn commit_succeeded(&self);
+}
+
 /// Backtest authority consumed by the transport-neutral Analysis domain service.
 #[async_trait]
 pub trait GovernedBacktestAuthority: Send + Sync + 'static {
@@ -322,6 +401,15 @@ pub trait GovernedBacktestAuthority: Send + Sync + 'static {
         command: GovernedBacktestCommand,
         cancellation: CancellationToken,
         deadline: Instant,
+    ) -> Result<GovernedBacktestRecord, ServiceError>;
+
+    /// Runs with one additional exact prepublication authority used by durable jobs.
+    async fn run_with_prepublish(
+        &self,
+        command: GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        deadline: Instant,
+        prepublish: Arc<dyn GovernedBacktestPrepublishAuthority>,
     ) -> Result<GovernedBacktestRecord, ServiceError>;
 
     /// Loads one durable governed result.
@@ -376,6 +464,41 @@ impl ProductionBacktestAuthority {
         }
         Ok(())
     }
+
+    async fn run_inner(
+        &self,
+        command: GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        deadline: Instant,
+        prepublish: Option<Arc<dyn GovernedBacktestPrepublishAuthority>>,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        self.ensure_live(&cancellation, deadline)?;
+        let linked = LinkedCancellation::new(cancellation, self.shutdown.child_token(), deadline);
+        let input = self
+            .repository
+            .resolve(&command, linked.token().clone(), deadline)
+            .await?;
+        self.ensure_live(linked.token(), deadline)?;
+        let service = Arc::clone(&self.service);
+        let strategy_id = command.strategy_id().clone();
+        let worker_cancellation = linked.token().clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            service.run(input, &strategy_id, &worker_cancellation)
+        });
+        let outcome = join_backtest(worker, linked.token(), deadline).await?;
+        let record = GovernedBacktestRecord::from_outcome(&outcome)?;
+        self.ensure_live(linked.token(), deadline)?;
+        if let Some(prepublish) = &prepublish {
+            prepublish.validate_prepublish()?;
+        }
+        self.repository
+            .publish(&command, record.clone(), linked.token().clone(), deadline)
+            .await?;
+        if let Some(prepublish) = &prepublish {
+            prepublish.commit_succeeded();
+        }
+        Ok(record)
+    }
 }
 
 impl fmt::Debug for ProductionBacktestAuthority {
@@ -397,26 +520,18 @@ impl GovernedBacktestAuthority for ProductionBacktestAuthority {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<GovernedBacktestRecord, ServiceError> {
-        self.ensure_live(&cancellation, deadline)?;
-        let linked = LinkedCancellation::new(cancellation, self.shutdown.child_token(), deadline);
-        let input = self
-            .repository
-            .resolve(&command, linked.token().clone(), deadline)
-            .await?;
-        self.ensure_live(linked.token(), deadline)?;
-        let service = Arc::clone(&self.service);
-        let strategy_id = command.strategy_id().clone();
-        let worker_cancellation = linked.token().clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            service.run(input, &strategy_id, &worker_cancellation)
-        });
-        let outcome = join_backtest(worker, linked.token(), deadline).await?;
-        let record = GovernedBacktestRecord::from_outcome(&outcome)?;
-        self.repository
-            .publish(&command, record.clone(), linked.token().clone(), deadline)
-            .await?;
-        self.ensure_live(linked.token(), deadline)?;
-        Ok(record)
+        self.run_inner(command, cancellation, deadline, None).await
+    }
+
+    async fn run_with_prepublish(
+        &self,
+        command: GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        deadline: Instant,
+        prepublish: Arc<dyn GovernedBacktestPrepublishAuthority>,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        self.run_inner(command, cancellation, deadline, Some(prepublish))
+            .await
     }
 
     async fn get(
@@ -657,6 +772,18 @@ fn canonical_artifact_reference(value: &str) -> bool {
                     .chars()
                     .all(|character| !character.is_control() && !character.is_whitespace())
         })
+}
+
+fn hash_text(hash: &mut Sha256, value: &str) -> Result<(), ServiceError> {
+    hash_count(hash, value.len())?;
+    hash.update(value.as_bytes());
+    Ok(())
+}
+
+fn hash_count(hash: &mut Sha256, value: usize) -> Result<(), ServiceError> {
+    let value = u64::try_from(value).map_err(|_| ServiceError::ResourceExhausted)?;
+    hash.update(value.to_be_bytes());
+    Ok(())
 }
 
 fn has_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> bool {

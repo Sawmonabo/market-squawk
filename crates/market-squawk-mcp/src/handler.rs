@@ -3,11 +3,12 @@
 use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use market_squawk_runtime::WorkspaceId;
 use market_squawk_services::{
     ProgressDelivery as ServiceProgressDelivery, ProgressError, ProgressSink,
-    RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, ServiceCapabilities,
-    ServiceError, ServiceErrorClass, ToolArtifactPolicy, ToolAuthorization, ToolDescriptor,
-    ToolServices,
+    RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, RequestOrigin,
+    ServiceCapabilities, ServiceError, ServiceErrorClass, ToolArtifactPolicy, ToolAuthorization,
+    ToolDescriptor, ToolServices,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -48,6 +49,7 @@ pub struct McpHandlerFactory {
     audit: Arc<dyn AuditSink>,
     artifacts: Arc<dyn ArtifactRepository>,
     resources: Arc<dyn McpResourceProvider>,
+    workspace_id: WorkspaceId,
 }
 
 impl std::fmt::Debug for McpHandlerFactory {
@@ -77,6 +79,7 @@ impl McpHandlerFactory {
         audit: Arc<dyn AuditSink>,
         artifacts: Arc<dyn ArtifactRepository>,
         resources: Arc<dyn McpResourceProvider>,
+        workspace_id: WorkspaceId,
     ) -> Result<Self, HandlerFactoryError> {
         let capabilities = services.capabilities();
         let tools = crate::server::validated_protocol_tools(&capabilities, limits)
@@ -99,6 +102,7 @@ impl McpHandlerFactory {
             audit,
             artifacts,
             resources,
+            workspace_id,
         })
     }
 
@@ -113,6 +117,7 @@ impl McpHandlerFactory {
             audit: Arc::clone(&self.audit),
             artifacts: Arc::clone(&self.artifacts),
             resources: Arc::clone(&self.resources),
+            workspace_id: self.workspace_id,
         }
     }
 
@@ -141,6 +146,7 @@ pub(crate) struct StatelessMcpHandler {
     audit: Arc<dyn AuditSink>,
     artifacts: Arc<dyn ArtifactRepository>,
     resources: Arc<dyn McpResourceProvider>,
+    workspace_id: WorkspaceId,
 }
 
 impl std::fmt::Debug for StatelessMcpHandler {
@@ -159,7 +165,12 @@ impl StatelessMcpHandler {
         request: CallToolRequestParams,
         context: McpRequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        require_authenticated(&context)?;
+        let authenticated = require_authenticated(&context)?;
+        let origin = RequestOrigin::try_new(
+            self.workspace_id.as_uuid(),
+            authenticated.client_id().as_uuid(),
+        )
+        .map_err(|_error| McpError::internal_error("authenticated identity is invalid", None))?;
         let descriptor = self
             .capabilities
             .find(request.name.as_ref())
@@ -242,6 +253,7 @@ impl StatelessMcpHandler {
                 self.limits.service_limits(),
             ),
         };
+        let service_context = service_context.with_origin(origin);
         let progress = service_context.progress().clone();
         let service_outcome = tokio::select! {
             biased;

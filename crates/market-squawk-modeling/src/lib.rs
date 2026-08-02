@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod admission;
 mod bundle;
+mod forecast;
 mod input;
 mod metadata;
 mod native;
@@ -34,17 +35,25 @@ pub use bundle::benchmark_support::{
 pub use bundle::fuzz_parse_bundle_metadata;
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
-    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES,
-    MAX_TRAINING_RUN_BYTES, ModelBundle,
+    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_FORECAST_POLICY_BYTES, MAX_FORECAST_RESIDUAL_BYTES,
+    MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
+};
+pub use forecast::{
+    CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow, ForecastCoverage,
+    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastOutcome,
+    ForecastOutcomeId, ForecastPath, ForecastPoint, ForecastRequest, ForecastValue,
+    ForecastVintage, ForecastVintageId, MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_POINTS,
+    RealizedCoverage, ResearchForecastBackend,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
 };
 pub use metadata::{
-    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, MAX_BUNDLE_ID_BYTES,
-    MAX_MODEL_FEATURES, MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat,
-    ModelMetadata, ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity,
-    TrainingPeriod, ValidationMetric, ValidationMetricName,
+    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer,
+    ForecastCalibrationArtifacts, MAX_BUNDLE_ID_BYTES, MAX_MODEL_FEATURES,
+    MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat, ModelMetadata,
+    ModelMetadataError, ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod,
+    ValidationMetric, ValidationMetricName,
 };
 pub use native::{InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend};
 #[cfg(feature = "onnx-runtime")]
@@ -306,6 +315,12 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::TrainingRunTrialHashMismatch => 45,
         BundleError::TrainingRunRelationshipMismatch => 46,
         BundleError::UnsupportedArtifactSchemaVersion => 47,
+        BundleError::ForecastCalibrationTooLarge => 49,
+        BundleError::ForecastCalibrationSizeMismatch => 50,
+        BundleError::ForecastCalibrationHashMismatch => 51,
+        BundleError::ForecastCalibrationStructureLimit => 52,
+        BundleError::ForecastCalibrationSyntax => 53,
+        BundleError::InvalidForecastCalibration => 54,
     }
 }
 

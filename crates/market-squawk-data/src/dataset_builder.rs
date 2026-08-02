@@ -31,6 +31,15 @@ pub use model::{
     FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
 };
 
+/// Process-local authority that must remain live through derived-generation publication.
+pub trait DatasetBuildPrecommitAuthority: fmt::Debug + Send + Sync {
+    /// Revalidates the exact caller authority immediately before the derived-generation commit.
+    fn validate_precommit(&self) -> Result<(), DatasetBuildError>;
+
+    /// Records that the derived-generation commit succeeded before any later fallible work.
+    fn commit_succeeded(&self);
+}
+
 /// Rights-bound builder scoped to one active analytical catalog and artifact root.
 pub struct DatasetBuilderService<'service> {
     service: &'service AnalyticalDataService,
@@ -82,6 +91,14 @@ pub trait DatasetBuilder {
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
     ) -> Result<FeatureLabelDataset, DatasetBuildError>;
+
+    /// Builds while retaining exact caller authority through derived-generation publication.
+    async fn build_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, DatasetBuildError>;
 }
 
 impl DatasetBuilder for DatasetBuilderService<'_> {
@@ -90,7 +107,16 @@ impl DatasetBuilder for DatasetBuilderService<'_> {
         request: DatasetBuildRequest,
         cancellation: CancellationToken,
     ) -> Result<FeatureLabelDataset, DatasetBuildError> {
-        build::build(self, request, cancellation).await
+        build::build(self, request, cancellation, None).await
+    }
+
+    async fn build_with_precommit_authority(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn DatasetBuildPrecommitAuthority>,
+    ) -> Result<FeatureLabelDataset, DatasetBuildError> {
+        build::build(self, request, cancellation, Some(precommit_authority)).await
     }
 }
 
@@ -142,6 +168,9 @@ pub enum DatasetBuildError {
     /// The caller-selected monotonic deadline elapsed before commit.
     #[error("dataset build deadline elapsed")]
     DeadlineExceeded,
+    /// The caller's publication authority was revoked before the durable generation commit.
+    #[error("dataset build publication authority was revoked")]
+    PublicationAuthorityRevoked,
     /// The process-owned catalog writer lock is unavailable.
     #[error("dataset build catalog authority is unavailable")]
     AuthorityLockPoisoned,

@@ -57,6 +57,12 @@ const DATA_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
 );
+const JOB_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+);
 const PORTFOLIO_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Optional,
     ScopeRequirement::Optional,
@@ -76,6 +82,10 @@ const OPTIONAL_DATASET_ARGUMENT: &[ArgumentSpec] =
 const FEATURE_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("dataset", ArgumentKind::Identifier),
     ArgumentSpec::optional("afterDataset", ArgumentKind::Identifier),
+];
+const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("query", ArgumentKind::Text),
+    ArgumentSpec::optional("categories", ArgumentKind::Array),
 ];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
@@ -102,6 +112,26 @@ const SOURCE_INSPECTION_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
+const SOURCE_LIFECYCLE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("provider", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "expectedStateRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::optional(
+        "expectedGeneration",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::optional("onboardingSessionId", ArgumentKind::Uuid),
+    ArgumentSpec::optional("publicConfigurationSha256", ArgumentKind::Sha256),
+    ArgumentSpec::optional("reason", ArgumentKind::Identifier),
+];
 const ACCOUNT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "accountId",
     ArgumentKind::Identifier,
@@ -110,11 +140,103 @@ const PORTFOLIO_IMPORT_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("accountId", ArgumentKind::Identifier),
     ArgumentSpec::required("artifactId", ArgumentKind::Identifier),
 ];
+const LIST_ACCOUNTS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
+    "afterAccountId",
+    ArgumentKind::Identifier,
+)];
+const LIST_REVISIONS_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("afterRevisionId", ArgumentKind::Sha256),
+];
+const PORTFOLIO_ATTRIBUTION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("baselineRevisionId", ArgumentKind::Sha256),
+];
+const PORTFOLIO_SCENARIO_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("scenario", ArgumentKind::Object),
+];
+const PORTFOLIO_SCENARIO_BATCH_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("scenarios", ArgumentKind::Array),
+];
+const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("proposal", ArgumentKind::Object),
+];
+const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("candidate", ArgumentKind::Object),
+];
 const MODEL_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("modelId", ArgumentKind::Identifier)];
 const MODEL_EVALUATION_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("modelId", ArgumentKind::Identifier),
     ArgumentSpec::required("input", ArgumentKind::Object),
+];
+const MODEL_TRAINING_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("configTicketId", ArgumentKind::Uuid),
+    ArgumentSpec::required("authorityTicketId", ArgumentKind::Uuid),
+];
+const MODEL_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("modelId", ArgumentKind::Identifier),
+    ArgumentSpec::required("request", ArgumentKind::Object),
+];
+const MODEL_FORECAST_ID_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("vintageId", ArgumentKind::Sha256)];
+const DECISION_SAVE_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("screen", ArgumentKind::Object),
+];
+const DECISION_RUN_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("run", ArgumentKind::Object),
+    ArgumentSpec::required("candidates", ArgumentKind::Array),
+    ArgumentSpec::required("selectedAt", ArgumentKind::Timestamp),
+];
+const DECISION_LIST_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "limit",
+    ArgumentKind::Unsigned {
+        minimum: 1,
+        maximum: 4_096,
+    },
+)];
+const DECISION_RUN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
+const DECISION_DOSSIER_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "dossierId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_TARGET_CREATE_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("target", ArgumentKind::Object)];
+const DECISION_TARGET_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("targetId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "revision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+];
+const DECISION_TARGET_LIST_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("targetId", ArgumentKind::Identifier)];
+const DECISION_TARGET_REVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("review", ArgumentKind::Object)];
+const DECISION_TARGET_REEVALUATE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("successor", ArgumentKind::Object),
 ];
 const MEASUREMENT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "measurementId",
@@ -134,6 +256,34 @@ const FAIR_VALUE_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("approvedBy", ArgumentKind::Identifier),
     ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
     ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
+];
+const FAIR_VALUE_OVERRIDE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("measurementId", ArgumentKind::Identifier),
+    ArgumentSpec::required("decisionId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "requestedHierarchy",
+        ArgumentKind::Enumeration(&["level_2", "level_3"]),
+    ),
+    ArgumentSpec::required("justification", ArgumentKind::Text),
+    ArgumentSpec::required("preparedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("preparedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
+];
+const FAIR_VALUE_REVOCATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("approvalId", ArgumentKind::Identifier),
+    ArgumentSpec::required("revokedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("revokedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("reason", ArgumentKind::Text),
+];
+const FAIR_VALUE_AUDIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("after", ArgumentKind::Object),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 10_000,
+        },
+    ),
 ];
 const MARKET_ACCESS_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "assessmentId",
@@ -156,6 +306,8 @@ const FAIR_VALUE_MARKET_ACCESS_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
 ];
 const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("registration", ArgumentKind::Object)];
+const DATASET_BUILD_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("registration", ArgumentKind::Object)];
 const RUN_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
 const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
@@ -211,8 +363,127 @@ const INGEST_SOURCE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
     ArgumentSpec::required("discoveryReceipt", ArgumentKind::Identifier),
 ];
+const JOB_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterJobId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_024,
+        },
+    ),
+];
+const JOB_ID_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required("jobId", ArgumentKind::Uuid)];
+const JOB_WATCH_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "afterSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 4_096,
+        },
+    ),
+];
+const JOB_MUTATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const JOB_CONFIRM_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("identity", ArgumentKind::Identifier),
+    ArgumentSpec::required("digest", ArgumentKind::Sha256),
+];
 
 const OPERATION_SPECS: &[OperationSpec] = &[
+    read(
+        "Job.List",
+        "List bounded latest job generations in stable identity order.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Job.Get",
+        "Return one durable sanitized job generation.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_ID_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Job.Watch",
+        "Return a bounded ordered page of durable job events.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_WATCH_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Job.Cancel",
+        "Request cooperative cancellation of one exact job generation.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_MUTATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Job.Confirm",
+        "Confirm one exact generation-bound job request.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_CONFIRM_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Job.Retry",
+        "Start the next bounded generation after a retryable terminal failure.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_MUTATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
     mutation(
         "Source.Register",
         "Register one code-supported provider capability in the local catalog.",
@@ -274,6 +545,62 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SOURCE_DISCOVERY_SCOPE,
         SOURCE_DISCOVERY_ARGUMENTS,
     ),
+    mutation(
+        "Source.Start",
+        "Start one admitted source configuration under exact state revision fencing.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Stop",
+        "Stop source activity while preserving registration and retained data.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Retry",
+        "Retry one blocked source lifecycle phase under the existing provider budget.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Resynchronize",
+        "Invalidate one source generation and establish a verified successor.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Verify",
+        "Revalidate source readiness without starting runtime activity.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Reconfigure",
+        "Activate an already prepared public source configuration generation.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Remove",
+        "Revoke source runtime authority under the selected local cleanup contract.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
     read(
         "Market.GetSnapshot",
         "Return current bounded market state with explicit coverage and quality evidence.",
@@ -330,11 +657,35 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::Required,
     ),
     source_ingest(
-        "Research.IngestSource",
-        "Extract and ingest one configured provider object under retained rights authority.",
+        "Research.StartIngestSource",
+        "Start durable extraction and ingestion of one receipt-admitted provider object.",
         ServiceDomain::Research,
         SOURCE_SCOPE,
         INGEST_SOURCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    source_ingest(
+        "Research.IngestSource",
+        "Compatibility wait for durable extraction and ingestion under the caller deadline.",
+        ServiceDomain::Research,
+        SOURCE_SCOPE,
+        INGEST_SOURCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.StartDatasetBuild",
+        "Start one durable point-in-time dataset publication from an admitted build registration.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        DATASET_BUILD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.StartExport",
+        "Start one durable manifest-pinned research export to controlled local artifacts.",
+        ServiceDomain::Research,
+        DATA_SCOPE,
+        DATASET_ARGUMENT,
         ToolAuthorization::LocalConfirmation,
     ),
     read_observations(
@@ -385,6 +736,22 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PORTFOLIO_IMPORT_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
+    read(
+        "Portfolio.ListAccounts",
+        "List bounded portfolio accounts with their current immutable revisions.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        LIST_ACCOUNTS_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.ListRevisions",
+        "List bounded append-only revisions for one portfolio account.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        LIST_REVISIONS_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
     read_portfolio(
         "Portfolio.GetHoldings",
         "Return bounded current holdings under an exact revision.",
@@ -405,9 +772,65 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Portfolio.GetRisk",
         "Return point-in-time portfolio risk and scenarios.",
     ),
+    read(
+        "Portfolio.GetAttribution",
+        "Return source-mark change attribution between two immutable revisions.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_ATTRIBUTION_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateScenario",
+        "Evaluate one bounded exact scenario over pinned holdings.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_SCENARIO_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateScenarioBatch",
+        "Evaluate a bounded batch of exact scenarios over pinned holdings.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_SCENARIO_BATCH_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.ProposeRebalance",
+        "Produce a non-executable rebalance proposal over one pinned revision.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_REBALANCE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateCandidateImpact",
+        "Evaluate a cash-funded candidate's portfolio and scenario impact.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_CANDIDATE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
     read_analysis(
         "Analysis.GetReturns",
         "Return bounded price and total returns.",
+    ),
+    read(
+        "Analysis.Lookup",
+        "Search bounded installed-product indexes and report unavailable categories explicitly.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        ANALYSIS_LOOKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.GetDecisionOverview",
+        "Return a bounded current overview of local decision-support authorities.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
     ),
     read_analysis("Analysis.GetFactors", "Return bounded factor estimates."),
     read_analysis(
@@ -418,6 +841,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Analysis.GetScenarios",
         "Return bounded scenario and stress-analysis outputs.",
     ),
+    mutation(
+        "Analysis.StartScenarioBatch",
+        "Start one durable deterministic scenario and stress-analysis batch.",
+        ServiceDomain::Analysis,
+        DATA_SCOPE,
+        DATASET_ARGUMENT,
+        ToolAuthorization::LocalConfirmation,
+    ),
     read(
         "Analysis.GetFeatureDatasets",
         "Return registered feature contracts and immutable feature datasets.",
@@ -425,6 +856,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         DATA_SCOPE,
         FEATURE_DATASET_ARGUMENTS,
         SourceEvidencePolicy::Required,
+    ),
+    mutation(
+        "Analysis.StartFeatureDatasetBuild",
+        "Start one durable point-in-time feature and label dataset publication.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        DATASET_BUILD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     read(
         "Analysis.GetBacktests",
@@ -435,8 +874,16 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::NotApplicable,
     ),
     mutation(
+        "Analysis.StartBacktest",
+        "Start one durable governed point-in-time backtest experiment.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_RUN_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
         "Analysis.RunBacktest",
-        "Run one governed point-in-time backtest experiment.",
+        "Compatibility wait for a durable governed backtest under the caller deadline.",
         ServiceDomain::Analysis,
         LOCAL_SCOPE,
         BACKTEST_RUN_ARGUMENTS,
@@ -477,6 +924,142 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Model,
         LOCAL_SCOPE,
         MODEL_EVALUATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Model.StartTraining",
+        "Start one durable governed training run from exact native-streamed inputs.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_TRAINING_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Model.StartForecast",
+        "Start one durable point-in-time forecast generation.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Model.GenerateForecast",
+        "Generate and durably publish one point-in-time forecast vintage.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Model.GetForecast",
+        "Return one immutable forecast vintage by exact identity.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_ID_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.ListForecasts",
+        "List bounded immutable forecast vintages.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.GetForecastOutcomes",
+        "Return bounded realized outcomes for one forecast vintage.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_ID_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.SaveScreen",
+        "Save one validated point-in-time investment screen revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_SAVE_SCREEN_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Decision.RunScreen",
+        "Run one immutable point-in-time screen and retain ranked candidates.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_SCREEN_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.ListScreens",
+        "List bounded saved investment screens.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetCandidates",
+        "Return ranked candidates for one exact screen run.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetDossier",
+        "Return one point-in-time investment dossier.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.CreateTargetSet",
+        "Create one immutable governed investment target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_CREATE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.GetTargetSet",
+        "Return one exact governed investment target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListTargetSets",
+        "List bounded revisions for one governed investment target.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.ReviewTargetSet",
+        "Record one immutable review of a governed investment target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_REVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Decision.ReevaluateTargetSet",
+        "Create a governed successor after evidence or assumption invalidation.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_REEVALUATE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.GetTargetSetStatus",
+        "Return the current governed status of one exact target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
@@ -542,6 +1125,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         FAIR_VALUE_APPROVAL_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "FairValue.ProposeOverride",
+        "Propose an expiring Level 2 or Level 3 override with retained justification.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_OVERRIDE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "FairValue.RevokeApproval",
+        "Revoke one exact valuation approval with actor, time, and reason evidence.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_REVOCATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "FairValue.ListAuditEvents",
+        "List a bounded hash-verified page of fair-value audit events.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_AUDIT_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
     ),
     idempotent_mutation(
         "FairValue.ApproveMarketAccess",
@@ -920,6 +1527,7 @@ enum ArgumentKind {
     Text,
     Decimal,
     Object,
+    Array,
     Timestamp,
     FairValueMeasurement,
     Enumeration(&'static [&'static str]),
@@ -1068,6 +1676,7 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "maxLength": 128
         }),
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
+        ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
@@ -1281,6 +1890,11 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::Object => value
             .as_object()
             .filter(|value| !value.is_empty())
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Array => value
+            .as_array()
+            .filter(|values| !values.is_empty())
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Timestamp => admit_timestamp(value),

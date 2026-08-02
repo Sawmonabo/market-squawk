@@ -1209,7 +1209,8 @@ fn map_artifact_root_clone_error(error: PathError) -> ParquetStoreError {
         | PathError::ArtifactRootUnavailable
         | PathError::CatalogLocationUnavailable
         | PathError::CatalogAlreadyLocked
-        | PathError::JobDatabaseAlreadyLocked => ParquetStoreError::RootCatalogMismatch,
+        | PathError::JobDatabaseAlreadyLocked
+        | PathError::DecisionDatabaseAlreadyLocked => ParquetStoreError::RootCatalogMismatch,
         PathError::CatalogRestoreConflict => ParquetStoreError::CatalogRestoreConflict,
         PathError::CatalogRestoreIndeterminate => ParquetStoreError::CatalogRestoreIndeterminate,
     }

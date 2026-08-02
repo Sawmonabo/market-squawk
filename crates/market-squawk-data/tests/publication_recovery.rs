@@ -5,7 +5,10 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{StringArray, TimestampNanosecondArray, UInt32Array};
@@ -17,16 +20,17 @@ use market_squawk_data::{
     ComponentAdjustmentEvidence, ComponentKind, ComponentScope, ComponentSelector, ComponentValue,
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPolicy,
     CorporateActionSensitivity, DatasetBuildError, DatasetBuildInputs, DatasetBuildLimits,
-    DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetId, DatasetManifestRef,
-    DatasetOutputAuthorization, DatasetSchemaRegistry, FeatureLabelComponentInput,
-    FeatureLabelComponentSpec, IngestError, IngestIdentity, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
-    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, MissingValuePolicy,
-    ObjectStoreConfig, ObservationFamilyKey, ObservationKnowledgeRange, ParquetStoreError,
-    PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
-    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
-    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
-    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_provider_payload_digest,
+    DatasetBuildPolicy, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
+    DatasetId, DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRegistry,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, IngestError, IngestIdentity,
+    MAX_RETAINED_PYTHON_DATASET_ADMISSIONS, MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES,
+    ManifestCatalogError, MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey,
+    ObservationKnowledgeRange, ParquetStoreError, PointInTimeLimits, PointInTimePolicy,
+    PointInTimeRevisionMode, QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest,
+    QueryResult, ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, ResearchUse,
+    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
+    Sha256Digest, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -58,6 +62,21 @@ const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS c(value)
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS d(value)
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(value)";
+
+#[derive(Debug, Default)]
+struct RejectDatasetPublication {
+    committed: AtomicBool,
+}
+
+impl DatasetBuildPrecommitAuthority for RejectDatasetPublication {
+    fn validate_precommit(&self) -> Result<(), DatasetBuildError> {
+        Err(DatasetBuildError::PublicationAuthorityRevoked)
+    }
+
+    fn commit_succeeded(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+}
 
 #[test]
 fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> TestResult {
@@ -1056,8 +1075,9 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         ),
         "unexpected fabricated-membership result: {fabricated_result:?}"
     );
+    let output_dataset = DatasetId::try_from("derived.feature-labels.gdp-v1")?;
     let request = DatasetBuildRequest::try_new(
-        market_squawk_data::DatasetId::try_from("derived.feature-labels.gdp-v1")?,
+        output_dataset.clone(),
         inputs,
         policy,
         ResearchUse::LocalAnalysis,
@@ -1065,6 +1085,27 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         output_authorization,
         limits,
     )?;
+
+    let rejected_authority = Arc::new(RejectDatasetPublication::default());
+    let rejected = service
+        .dataset_builder()
+        .build_with_precommit_authority(
+            request.clone(),
+            CancellationToken::new(),
+            rejected_authority.clone(),
+        )
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(DatasetBuildError::PublicationAuthorityRevoked)
+    ));
+    assert!(!rejected_authority.committed.load(Ordering::Acquire));
+    let rejected_lookup = service.analytical_reader().latest(
+        &output_dataset,
+        Instant::now() + Duration::from_secs(30),
+        &CancellationToken::new(),
+    )?;
+    assert!(rejected_lookup.is_none());
 
     let built = service
         .dataset_builder()

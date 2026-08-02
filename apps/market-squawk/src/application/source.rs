@@ -11,7 +11,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use market_squawk_data::CatalogLimit;
-use market_squawk_domain::{ExactPayloadEvidence, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    ConnectionGeneration, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
+    Timestamp,
+};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ServiceLimits, ToolResultMetadata,
     TypedToolRequest, TypedToolResult,
@@ -30,16 +33,24 @@ use uuid::Uuid;
 use super::{
     ApplicationDomainService, ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator,
     ResearchSourceObjectListing,
-    domain_support::{DomainLifecycle, admitted_result_limits, ensure_request_live},
+    domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
 };
 use crate::{
     ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
     ProviderPortalActivationError, ProviderPortalConfig, ProviderPortalError,
 };
 
+mod lifecycle;
 mod results;
 mod runtime;
 
+pub use lifecycle::{
+    SourceAuthorizationState, SourceAvailabilityState, SourceLifecycleAction,
+    SourceLifecycleAuthority, SourceLifecycleBlocker, SourceLifecycleCommand,
+    SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError,
+    SourceLifecycleReceipt, SourceLifecycleReceiptInput, SourceLifecycleState,
+    SourceLifecycleStatus, SourceLifecycleStatusInput, SourceRateBudgetState, SourceRightsEvidence,
+};
 pub use runtime::{
     SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
     SourceRuntimeSnapshotError, SourceRuntimeView, SourceRuntimeViewError,
@@ -60,6 +71,13 @@ const SOURCE_SETUP: &str = "Source.Setup";
 const SOURCE_LIST_OBJECTS: &str = "Source.ListObjects";
 const SOURCE_DISCOVER: &str = "Source.Discover";
 const SOURCE_INSPECT: &str = "Source.Inspect";
+const SOURCE_START: &str = "Source.Start";
+const SOURCE_STOP: &str = "Source.Stop";
+const SOURCE_RETRY: &str = "Source.Retry";
+const SOURCE_RESYNCHRONIZE: &str = "Source.Resynchronize";
+const SOURCE_VERIFY: &str = "Source.Verify";
+const SOURCE_RECONFIGURE: &str = "Source.Reconfigure";
+const SOURCE_REMOVE: &str = "Source.Remove";
 
 const MAX_CURRENT_SESSIONS: usize = 32;
 const MAXIMUM_INSPECTION_PAGE_INDEX: u16 = 63;
@@ -244,6 +262,7 @@ impl SourceDomainService {
         discovery: Arc<dyn ResearchSourceDiscoveryCoordinator>,
         portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
         inspection: Arc<dyn EphemeralSourceInspectionAuthority>,
+        source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
     ) -> Result<Self, SourceApplicationError> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_error| SourceApplicationError::AsyncRuntimeUnavailable)?;
@@ -260,6 +279,7 @@ impl SourceDomainService {
                 discovery,
                 portal_activation,
                 inspection,
+                source_lifecycle,
                 lifecycle: DomainLifecycle::new(),
                 session_limit: CatalogLimit::new(MAX_CURRENT_SESSIONS)
                     .map_err(|_error| SourceApplicationError::InvalidCodeOwnedLimit)?,
@@ -303,6 +323,51 @@ impl ApplicationDomainService for SourceDomainService {
             }
             SOURCE_DISCOVER => self.controller.discover(&request, &context, limits).await,
             SOURCE_INSPECT => self.controller.inspect(&request, &context, limits).await,
+            SOURCE_START => {
+                self.controller
+                    .source_lifecycle(&request, &context, limits, SourceLifecycleAction::Start)
+                    .await
+            }
+            SOURCE_STOP => {
+                self.controller
+                    .source_lifecycle(&request, &context, limits, SourceLifecycleAction::Stop)
+                    .await
+            }
+            SOURCE_RETRY => {
+                self.controller
+                    .source_lifecycle(&request, &context, limits, SourceLifecycleAction::Retry)
+                    .await
+            }
+            SOURCE_RESYNCHRONIZE => {
+                self.controller
+                    .source_lifecycle(
+                        &request,
+                        &context,
+                        limits,
+                        SourceLifecycleAction::Resynchronize,
+                    )
+                    .await
+            }
+            SOURCE_VERIFY => {
+                self.controller
+                    .source_lifecycle(&request, &context, limits, SourceLifecycleAction::Verify)
+                    .await
+            }
+            SOURCE_RECONFIGURE => {
+                self.controller
+                    .source_lifecycle(
+                        &request,
+                        &context,
+                        limits,
+                        SourceLifecycleAction::Reconfigure,
+                    )
+                    .await
+            }
+            SOURCE_REMOVE => {
+                self.controller
+                    .source_lifecycle(&request, &context, limits, SourceLifecycleAction::Remove)
+                    .await
+            }
             SOURCE_GET_STATUS => {
                 self.controller
                     .read(&request, &context, limits, SourceReadKind::Status)
@@ -352,6 +417,7 @@ struct SourceController {
     discovery: Arc<dyn ResearchSourceDiscoveryCoordinator>,
     portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     inspection: Arc<dyn EphemeralSourceInspectionAuthority>,
+    source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
     lifecycle: Arc<DomainLifecycle>,
     session_limit: CatalogLimit,
     portal_state: Arc<Mutex<PortalState>>,
@@ -360,6 +426,82 @@ struct SourceController {
 }
 
 impl SourceController {
+    async fn source_lifecycle(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+        action: SourceLifecycleAction,
+    ) -> Result<TypedToolResult, ServiceError> {
+        ensure_request_live(context, &self.lifecycle)?;
+        let provider = required_identifier(request, "provider")?;
+        ensure_exact_provider_scope(request, &provider)?;
+        let expected_state_revision = request
+            .arguments()
+            .get("expectedStateRevision")
+            .and_then(Value::as_u64)
+            .and_then(NonZeroU64::new)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let expected_generation = optional_nonzero_u64(request, "expectedGeneration")?
+            .map(|value| {
+                ConnectionGeneration::new(value.get())
+                    .map_err(|_error| ServiceError::InvalidRequest)
+            })
+            .transpose()?;
+        let onboarding_session_id = optional_uuid(request, "onboardingSessionId")?;
+        let public_configuration_digest = request
+            .arguments()
+            .get("publicConfigurationSha256")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(ServiceError::InvalidRequest)
+                    .and_then(parse_sha256)
+            })
+            .transpose()?;
+        let reason = request
+            .arguments()
+            .get("reason")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(ServiceError::InvalidRequest)
+                    .and_then(|value| {
+                        SourceIdentifier::try_from(value)
+                            .map_err(|_error| ServiceError::InvalidRequest)
+                    })
+            })
+            .transpose()?;
+        let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+            provider,
+            action,
+            expected_state_revision,
+            expected_generation,
+            onboarding_session_id,
+            public_configuration_digest,
+            reason,
+            cancellation: context.cancellation().clone(),
+            deadline: context.deadline(),
+        })
+        .map_err(map_source_lifecycle_error)?;
+        let deadline = TokioInstant::from_std(context.deadline());
+        let receipt = tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            () = self.lifecycle.shutdown_token().cancelled() => {
+                return Err(ServiceError::Unavailable);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            result = self.source_lifecycle.execute(command) => {
+                result.map_err(map_source_lifecycle_error)?
+            }
+        };
+        ensure_request_live(context, &self.lifecycle)?;
+        not_applicable_result(source_lifecycle_value(&receipt)?, limits)
+    }
+
     async fn inspect(
         &self,
         request: &TypedToolRequest,
@@ -706,6 +848,14 @@ impl SourceController {
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_request_live(context, &self.lifecycle)?;
         let filters = requested_sources(request)?;
+        let lifecycle_status = if matches!(kind, SourceReadKind::Status) && filters.len() == 1 {
+            Some(
+                self.current_source_lifecycle_status(&filters[0], context)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let profiles = self.onboarding.profiles();
         let sessions = self
             .onboarding
@@ -775,25 +925,29 @@ impl SourceController {
                 None
             };
             if selected_runtime.is_empty() {
-                rows.push(inactive_row(
+                let mut row = inactive_row(
                     kind,
                     profile,
                     &profile_value,
                     session_value,
                     provider_dataset_identifier.as_ref(),
-                )?);
+                )?;
+                attach_lifecycle_status(&mut row, lifecycle_status.as_ref())?;
+                rows.push(row);
             } else {
                 rows.try_reserve(selected_runtime.len())
                     .map_err(|_error| ServiceError::ResourceExhausted)?;
                 for record in selected_runtime {
-                    rows.push(runtime_row(
+                    let mut row = runtime_row(
                         kind,
                         profile,
                         &profile_value,
                         session_value.clone(),
                         provider_dataset_identifier.as_ref(),
                         record,
-                    )?);
+                    )?;
+                    attach_lifecycle_status(&mut row, lifecycle_status.as_ref())?;
+                    rows.push(row);
                 }
             }
         }
@@ -830,6 +984,31 @@ impl SourceController {
             () = tokio::time::sleep_until(deadline) => Err(ServiceError::DeadlineExceeded),
             result = self.runtime.current(request) => result.map_err(map_runtime_error),
         }
+    }
+
+    async fn current_source_lifecycle_status(
+        &self,
+        provider: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<Value, ServiceError> {
+        let deadline = TokioInstant::from_std(context.deadline());
+        let status = tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            () = self.lifecycle.shutdown_token().cancelled() => {
+                return Err(ServiceError::Unavailable);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            result = self.source_lifecycle.status(
+                provider,
+                context.cancellation(),
+                context.deadline(),
+            ) => result.map_err(map_source_lifecycle_error)?,
+        };
+        ensure_request_live(context, &self.lifecycle)?;
+        source_lifecycle_status_value(&status)
     }
 
     async fn ensure_portal(
@@ -1100,6 +1279,231 @@ fn discovery_quality(metadata: &SourceMetadata) -> Value {
         "exactSourceObjectEvidence": true,
         "executionEligible": false,
     })
+}
+
+fn optional_nonzero_u64(
+    request: &TypedToolRequest,
+    field: &str,
+) -> Result<Option<NonZeroU64>, ServiceError> {
+    request
+        .arguments()
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(NonZeroU64::new)
+                .ok_or(ServiceError::InvalidRequest)
+        })
+        .transpose()
+}
+
+fn optional_uuid(request: &TypedToolRequest, field: &str) -> Result<Option<Uuid>, ServiceError> {
+    request
+        .arguments()
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(ServiceError::InvalidRequest)
+                .and_then(|value| {
+                    Uuid::parse_str(value).map_err(|_error| ServiceError::InvalidRequest)
+                })
+        })
+        .transpose()
+}
+
+fn parse_sha256(value: &str) -> Result<EvidenceDigest, ServiceError> {
+    if value.len() != 64 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or(ServiceError::InvalidRequest)?;
+        let low = hex_nibble(pair[1]).ok_or(ServiceError::InvalidRequest)?;
+        bytes[index] = (high << 4) | low;
+    }
+    if bytes == [0; 32] {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn source_lifecycle_value(receipt: &SourceLifecycleReceipt) -> Result<Value, ServiceError> {
+    let fields = receipt.fields();
+    let rights_evidence = fields
+        .rights_evidence
+        .as_ref()
+        .map(|evidence| -> Result<Value, ServiceError> {
+            Ok(json!({
+                "id": evidence.evidence_id().as_str(),
+                "sha256": sha256_value(evidence.digest())?,
+                "effectiveAt": timestamp_value(evidence.effective_at()),
+                "expiresAt": evidence.expires_at().map(timestamp_value),
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "operationId": fields.operation_id.as_str(),
+        "provider": fields.provider.as_str(),
+        "action": lifecycle_action_name(fields.action),
+        "disposition": lifecycle_disposition_name(fields.disposition),
+        "state": lifecycle_state_name(fields.state),
+        "stateRevision": fields.state_revision.get(),
+        "previousGeneration": fields.previous_generation.map(ConnectionGeneration::get),
+        "currentGeneration": fields.current_generation.map(ConnectionGeneration::get),
+        "runtimeGenerationSha256": fields.runtime_generation_digest.map(sha256_value).transpose()?,
+        "coverage": fields.coverage.map(|value| to_json(&value)).transpose()?,
+        "integrity": fields.integrity.map(|value| to_json(&value)).transpose()?,
+        "quality": fields.quality.map(data_quality_name),
+        "rateBudget": rate_budget_value(fields.rate_budget),
+        "authorization": authorization_name(fields.authorization),
+        "availability": availability_name(fields.availability),
+        "rightsEvidence": rights_evidence,
+        "blocker": fields.blocker.map(blocker_name),
+        "publicConfigurationSha256": fields
+            .public_configuration_digest
+            .map(sha256_value)
+            .transpose()?,
+        "observedAt": timestamp_value(fields.observed_at),
+    }))
+}
+
+fn source_lifecycle_status_value(status: &SourceLifecycleStatus) -> Result<Value, ServiceError> {
+    let fields = status.fields();
+    Ok(json!({
+        "provider": fields.provider.as_str(),
+        "stateRevision": fields.state_revision.get(),
+        "state": lifecycle_state_name(fields.state),
+        "currentGeneration": fields.current_generation.map(ConnectionGeneration::get),
+        "runtimeGenerationSha256": fields.runtime_generation_digest.map(sha256_value).transpose()?,
+        "publicConfigurationSha256": fields
+            .public_configuration_digest
+            .map(sha256_value)
+            .transpose()?,
+        "blocker": fields.blocker.map(blocker_name),
+        "observedAt": timestamp_value(fields.observed_at),
+    }))
+}
+
+fn attach_lifecycle_status(row: &mut Value, status: Option<&Value>) -> Result<(), ServiceError> {
+    let Some(status) = status else {
+        return Ok(());
+    };
+    row.as_object_mut()
+        .ok_or(ServiceError::InvalidResult)?
+        .insert("lifecycle".to_owned(), status.clone());
+    Ok(())
+}
+
+fn sha256_value(digest: EvidenceDigest) -> Result<String, ServiceError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(encode_hex(digest.bytes()))
+}
+
+fn timestamp_value(timestamp: Timestamp) -> String {
+    DateTime::<Utc>::from_timestamp_nanos(timestamp.unix_nanos())
+        .to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn rate_budget_value(state: SourceRateBudgetState) -> Value {
+    match state {
+        SourceRateBudgetState::Available => json!({"state": "available"}),
+        SourceRateBudgetState::CoolingDown { until } => json!({
+            "state": "cooling_down",
+            "until": timestamp_value(until),
+        }),
+        SourceRateBudgetState::Unavailable => json!({"state": "unavailable"}),
+        SourceRateBudgetState::Indeterminate => json!({"state": "indeterminate"}),
+    }
+}
+
+const fn lifecycle_action_name(action: SourceLifecycleAction) -> &'static str {
+    match action {
+        SourceLifecycleAction::Start => "start",
+        SourceLifecycleAction::Stop => "stop",
+        SourceLifecycleAction::Retry => "retry",
+        SourceLifecycleAction::Resynchronize => "resynchronize",
+        SourceLifecycleAction::Verify => "verify",
+        SourceLifecycleAction::Reconfigure => "reconfigure",
+        SourceLifecycleAction::Remove => "remove",
+    }
+}
+
+const fn lifecycle_disposition_name(disposition: SourceLifecycleDisposition) -> &'static str {
+    match disposition {
+        SourceLifecycleDisposition::Applied => "applied",
+        SourceLifecycleDisposition::Replay => "replay",
+        SourceLifecycleDisposition::Rejected => "rejected",
+        SourceLifecycleDisposition::ReconciliationRequired => "reconciliation_required",
+    }
+}
+
+const fn lifecycle_state_name(state: SourceLifecycleState) -> &'static str {
+    match state {
+        SourceLifecycleState::Stopped => "stopped",
+        SourceLifecycleState::Starting => "starting",
+        SourceLifecycleState::Active => "active",
+        SourceLifecycleState::Resynchronizing => "resynchronizing",
+        SourceLifecycleState::Blocked => "blocked",
+        SourceLifecycleState::Removed => "removed",
+    }
+}
+
+const fn authorization_name(state: SourceAuthorizationState) -> &'static str {
+    match state {
+        SourceAuthorizationState::Admitted => "admitted",
+        SourceAuthorizationState::Pending => "pending",
+        SourceAuthorizationState::Blocked => "blocked",
+        SourceAuthorizationState::NotRequired => "not_required",
+    }
+}
+
+const fn availability_name(state: SourceAvailabilityState) -> &'static str {
+    match state {
+        SourceAvailabilityState::Available => "available",
+        SourceAvailabilityState::TemporarilyUnavailable => "temporarily_unavailable",
+        SourceAvailabilityState::Removed => "removed",
+        SourceAvailabilityState::Indeterminate => "indeterminate",
+    }
+}
+
+const fn blocker_name(blocker: SourceLifecycleBlocker) -> &'static str {
+    match blocker {
+        SourceLifecycleBlocker::Credential => "credential",
+        SourceLifecycleBlocker::Rights => "rights",
+        SourceLifecycleBlocker::RateBudget => "rate_budget",
+        SourceLifecycleBlocker::Integrity => "integrity",
+        SourceLifecycleBlocker::ProviderAvailability => "provider_availability",
+        SourceLifecycleBlocker::Reconciliation => "reconciliation",
+        SourceLifecycleBlocker::StalePrecondition => "stale_precondition",
+    }
+}
+
+const fn map_source_lifecycle_error(error: SourceLifecycleError) -> ServiceError {
+    match error {
+        SourceLifecycleError::InvalidRequest | SourceLifecycleError::Conflict => {
+            ServiceError::InvalidRequest
+        }
+        SourceLifecycleError::InvalidResult => ServiceError::InvalidResult,
+        SourceLifecycleError::NotFound => ServiceError::NotFound,
+        SourceLifecycleError::Unauthorized => ServiceError::Unauthorized,
+        SourceLifecycleError::RateLimited
+        | SourceLifecycleError::Unavailable
+        | SourceLifecycleError::ReconciliationRequired => ServiceError::Unavailable,
+        SourceLifecycleError::Cancelled => ServiceError::Cancelled,
+        SourceLifecycleError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        SourceLifecycleError::Internal => ServiceError::Internal,
+    }
 }
 
 /// Revokes an unpublished receipt batch on every scope-exit path.

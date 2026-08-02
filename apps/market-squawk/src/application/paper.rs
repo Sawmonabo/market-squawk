@@ -1,6 +1,7 @@
 //! Lifecycle-owned paper bot and execution application services.
 
 mod market;
+mod source_lifecycle;
 mod source_runtime;
 
 use std::{
@@ -40,6 +41,8 @@ use crate::{
         local_paper_bot_with_provider_rate,
     },
 };
+
+pub(crate) use source_lifecycle::PaperSourceLifecycleControl;
 
 const BOT_GET_STATUS: &str = "Bot.GetStatus";
 const BOT_START: &str = "Bot.Start";
@@ -100,6 +103,11 @@ impl PaperApplicationServices {
         Arc::new(source_runtime::PaperSourceRuntimeView::new(Arc::clone(
             &self.controller,
         )))
+    }
+
+    /// Returns lifecycle control sharing this exact paper/live runtime owner.
+    pub(crate) fn source_lifecycle_control(&self) -> PaperSourceLifecycleControl {
+        PaperSourceLifecycleControl::new(Arc::clone(&self.controller))
     }
 }
 
@@ -237,6 +245,7 @@ struct PaperController {
     accepting: AtomicBool,
     lifecycle: CancellationToken,
     state: Mutex<PaperState>,
+    restart_request: Mutex<Option<TypedToolRequest>>,
     changed: watch::Sender<u64>,
 }
 
@@ -258,6 +267,7 @@ impl PaperController {
             state: Mutex::new(PaperState::Stopped {
                 last_complete: None,
             }),
+            restart_request: Mutex::new(None),
             changed,
         }
     }
@@ -312,6 +322,16 @@ impl PaperController {
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<Value, ServiceError> {
+        self.start_before(request, context.deadline(), context.cancellation())
+            .await
+    }
+
+    async fn start_before(
+        &self,
+        request: &TypedToolRequest,
+        deadline: Instant,
+        request_cancellation: &CancellationToken,
+    ) -> Result<Value, ServiceError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ServiceError::Unavailable);
         }
@@ -328,8 +348,7 @@ impl PaperController {
         let run_id = Uuid::new_v4();
         let run_cancellation = self.lifecycle.child_token();
         {
-            let mut state =
-                bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
+            let mut state = bounded_lock(&self.state, deadline, request_cancellation).await?;
             if !matches!(*state, PaperState::Stopped { .. }) {
                 return Err(ServiceError::InvalidRequest);
             }
@@ -339,6 +358,7 @@ impl PaperController {
             };
         }
         self.signal_change();
+        *self.restart_request.lock().await = Some(request.clone());
 
         let composition = match provider {
             PaperProvider::Public(provider) => local_paper_bot_with_provider_rate(
@@ -354,9 +374,9 @@ impl PaperController {
             } => {
                 tokio::select! {
                     biased;
-                    () = context.cancellation().cancelled() => Err(ServiceError::Cancelled),
+                    () = request_cancellation.cancelled() => Err(ServiceError::Cancelled),
                     () = tokio::time::sleep_until(
-                        tokio::time::Instant::from_std(context.deadline())
+                        tokio::time::Instant::from_std(deadline)
                     ) => Err(ServiceError::DeadlineExceeded),
                     result = local_coinbase_direct_paper_bot_with_activation(
                         self.config.clone(),
@@ -385,7 +405,7 @@ impl PaperController {
                         composition.maximum_message_bytes(),
                         Arc::clone(&self.live_fair_value),
                         run_cancellation.clone(),
-                        context.deadline(),
+                        deadline,
                     )
                     .await
                     {
@@ -398,12 +418,12 @@ impl PaperController {
                     };
                 let result = tokio::select! {
                     biased;
-                    () = context.cancellation().cancelled() => {
+                    () = request_cancellation.cancelled() => {
                         run_cancellation.cancel();
                         Err(ServiceError::Cancelled)
                     }
                     () = tokio::time::sleep_until(
-                        tokio::time::Instant::from_std(context.deadline())
+                        tokio::time::Instant::from_std(deadline)
                     ) => {
                         run_cancellation.cancel();
                         Err(ServiceError::DeadlineExceeded)
@@ -418,12 +438,12 @@ impl PaperController {
             PaperProvider::CoinbaseDirect { .. } => {
                 let result = tokio::select! {
                     biased;
-                    () = context.cancellation().cancelled() => {
+                    () = request_cancellation.cancelled() => {
                         run_cancellation.cancel();
                         Err(ServiceError::Cancelled)
                     }
                     () = tokio::time::sleep_until(
-                        tokio::time::Instant::from_std(context.deadline())
+                        tokio::time::Instant::from_std(deadline)
                     ) => {
                         run_cancellation.cancel();
                         Err(ServiceError::DeadlineExceeded)
@@ -467,13 +487,9 @@ impl PaperController {
                     *state = PaperState::Stopping;
                 }
                 drop(state);
-                let shutdown = bounded_runtime_shutdown(
-                    runtime,
-                    exports,
-                    context.deadline(),
-                    context.cancellation(),
-                )
-                .await;
+                let shutdown =
+                    bounded_runtime_shutdown(runtime, exports, deadline, request_cancellation)
+                        .await;
                 self.set_stopped(Some(shutdown.as_ref().copied().unwrap_or(false)))
                     .await;
                 let _complete = shutdown?;

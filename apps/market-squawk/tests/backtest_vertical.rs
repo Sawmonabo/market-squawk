@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -9,10 +10,12 @@ use market_squawk::application::analysis::{
     AnalysisCatalog, AnalysisDatasetScope, AnalysisDomainService, FeatureDatasetRegistration,
     GovernedBacktestAuthority, GovernedBacktestCommand, GovernedBacktestInputRegistrar,
     GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
-    GovernedBacktestRecord,
+    GovernedBacktestPrepublishAuthority, GovernedBacktestRecord,
 };
+use market_squawk::application::job::{JobApplication, JobApplicationError};
 use market_squawk::application::{ApplicationDomainService, application_capabilities};
 use market_squawk::cli::{Cli, Command, FeatureCommand};
+use market_squawk::jobs::BacktestJobRunner;
 use market_squawk::{
     AppPaths, PinnedBacktestInput, ProductionBacktestService, ProductionBacktestServiceError,
     ResearchIngestRequest, ResearchService,
@@ -53,6 +56,7 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, UniverseMembershipObservation,
 };
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
+use market_squawk_jobs::{JobOrigin, JobRunner, JobState};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ResultCompleteness, ServiceError,
@@ -68,9 +72,246 @@ use market_squawk_sources::{
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[derive(Debug)]
+struct ControlledBacktestAuthority {
+    started: Semaphore,
+    release: Notify,
+    published: AtomicBool,
+    record: GovernedBacktestRecord,
+}
+
+impl ControlledBacktestAuthority {
+    async fn run_inner(
+        &self,
+        cancellation: CancellationToken,
+        prepublish: Option<Arc<dyn GovernedBacktestPrepublishAuthority>>,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        self.started.add_permits(1);
+        tokio::select! {
+            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+            () = self.release.notified() => {
+                if cancellation.is_cancelled() {
+                    return Err(ServiceError::Cancelled);
+                }
+                if let Some(prepublish) = &prepublish {
+                    prepublish.validate_prepublish()?;
+                }
+                self.published.store(true, Ordering::Release);
+                if let Some(prepublish) = &prepublish {
+                    prepublish.commit_succeeded();
+                }
+                Ok(self.record.clone())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl GovernedBacktestAuthority for ControlledBacktestAuthority {
+    async fn run(
+        &self,
+        _command: GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        self.run_inner(cancellation, None).await
+    }
+
+    async fn run_with_prepublish(
+        &self,
+        _command: GovernedBacktestCommand,
+        cancellation: CancellationToken,
+        _deadline: Instant,
+        prepublish: Arc<dyn GovernedBacktestPrepublishAuthority>,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        self.run_inner(cancellation, Some(prepublish)).await
+    }
+
+    async fn get(
+        &self,
+        _run_id: &str,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<Option<GovernedBacktestRecord>, ServiceError> {
+        Ok(self
+            .published
+            .load(Ordering::Acquire)
+            .then(|| self.record.clone()))
+    }
+
+    fn begin_shutdown(&self) {}
+
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn job_domain_start_backtest_returns_before_completion_and_survives_disconnect() -> TestResult
+{
+    let temporary = tempfile::tempdir()?;
+    let paths = AppPaths::prepare(temporary.path().join("market-squawk"))?;
+    let governed = Arc::new(ControlledBacktestAuthority {
+        started: Semaphore::new(0),
+        release: Notify::new(),
+        published: AtomicBool::new(false),
+        record: governed_record_fixture()?,
+    });
+    let runner = Arc::new(BacktestJobRunner::try_new(
+        governed.clone(),
+        8,
+        Duration::from_secs(5),
+    )?);
+    let runner_trait: Arc<dyn JobRunner> = runner.clone();
+    let jobs = market_squawk::jobs::InstalledJobAuthority::open(
+        &paths,
+        vec![runner_trait],
+        Timestamp::from_unix_nanos(100),
+    )
+    .await?;
+    let application = JobApplication::new(jobs.repository(), jobs.authority());
+    let admission = runner.admit(governed_command_fixture()?, Timestamp::from_unix_nanos(100))?;
+
+    let receipt = tokio::time::timeout(
+        Duration::from_millis(250),
+        application.start(
+            admission,
+            job_origin_fixture()?,
+            RequestId::try_string("backtest-start")?,
+            Timestamp::from_unix_nanos(100),
+        ),
+    )
+    .await??;
+    governed.started.acquire().await?.forget();
+
+    let disconnected = CancellationToken::new();
+    disconnected.cancel();
+    assert_eq!(
+        application
+            .wait_terminal(
+                receipt.job_id(),
+                &disconnected,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(JobApplicationError::WaitCancelled)
+    );
+
+    governed.release.notify_one();
+    let reconnected = JobApplication::new(jobs.repository(), jobs.authority());
+    let completed = reconnected
+        .wait_terminal(
+            receipt.job_id(),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await?;
+    assert_eq!(completed.state(), JobState::Completed);
+    assert!(completed.result().is_some());
+
+    jobs.shutdown_authority(Timestamp::from_unix_nanos(200), Duration::from_secs(1))
+        .await?;
+    jobs.shutdown_repository().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn job_domain_explicit_backtest_cancel_cannot_publish_a_governed_record() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let paths = AppPaths::prepare(temporary.path().join("market-squawk"))?;
+    let governed = Arc::new(ControlledBacktestAuthority {
+        started: Semaphore::new(0),
+        release: Notify::new(),
+        published: AtomicBool::new(false),
+        record: governed_record_fixture()?,
+    });
+    let runner = Arc::new(BacktestJobRunner::try_new(
+        governed.clone(),
+        8,
+        Duration::from_secs(5),
+    )?);
+    let runner_trait: Arc<dyn JobRunner> = runner.clone();
+    let jobs = market_squawk::jobs::InstalledJobAuthority::open(
+        &paths,
+        vec![runner_trait],
+        Timestamp::from_unix_nanos(100),
+    )
+    .await?;
+    let application = JobApplication::new(jobs.repository(), jobs.authority());
+    let admission = runner.admit(governed_command_fixture()?, Timestamp::from_unix_nanos(100))?;
+    let receipt = application
+        .start(
+            admission,
+            job_origin_fixture()?,
+            RequestId::try_string("backtest-cancel")?,
+            Timestamp::from_unix_nanos(100),
+        )
+        .await?;
+    governed.started.acquire().await?.forget();
+    let running = application.get(receipt.job_id()).await?;
+    assert_eq!(running.state(), JobState::Running);
+
+    application
+        .cancel(
+            running.job_id(),
+            running.generation(),
+            running.sequence(),
+            Timestamp::from_unix_nanos(101),
+        )
+        .await?;
+    let terminal = application
+        .wait_terminal(
+            receipt.job_id(),
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await?;
+    assert_eq!(terminal.state(), JobState::Cancelled);
+    assert!(!governed.published.load(Ordering::Acquire));
+
+    jobs.shutdown_authority(Timestamp::from_unix_nanos(200), Duration::from_secs(1))
+        .await?;
+    jobs.shutdown_repository().await?;
+    Ok(())
+}
+
+fn governed_command_fixture() -> TestResult<GovernedBacktestCommand> {
+    Ok(GovernedBacktestCommand::try_new(
+        SourceIdentifier::try_from("strategy-build-v1")?,
+        SourceIdentifier::try_from("backtest-input-v1")?,
+        Vec::new(),
+        None,
+        Vec::new(),
+    )?)
+}
+
+fn governed_record_fixture() -> TestResult<GovernedBacktestRecord> {
+    let digest = "11".repeat(32);
+    Ok(GovernedBacktestRecord::try_from_persisted(json!({
+        "recordVersion": 1,
+        "runId": digest,
+        "datasetIdentity": "22".repeat(32),
+        "objectGraphDigest": "33".repeat(32),
+        "executionAssumptionDigest": "44".repeat(32),
+        "cohortAuthorityDigest": null,
+        "cohortUniverseDigest": null,
+        "seed": 7,
+        "selectionCriterion": "total-return",
+        "status": {"state": "failed"}
+    }))?)
+}
+
+fn job_origin_fixture() -> TestResult<JobOrigin> {
+    Ok(JobOrigin::new(
+        SourceIdentifier::try_from("default-workspace")?,
+        SourceIdentifier::try_from("test-client")?,
+    ))
+}
 
 #[derive(Debug)]
 struct UnusedBacktestInputRegistrar;
@@ -97,6 +338,16 @@ impl GovernedBacktestAuthority for UnusedBacktestAuthority {
         _command: GovernedBacktestCommand,
         _cancellation: CancellationToken,
         _deadline: Instant,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    async fn run_with_prepublish(
+        &self,
+        _command: GovernedBacktestCommand,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+        _prepublish: Arc<dyn GovernedBacktestPrepublishAuthority>,
     ) -> Result<GovernedBacktestRecord, ServiceError> {
         Err(ServiceError::Unavailable)
     }

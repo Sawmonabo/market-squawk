@@ -1,6 +1,7 @@
 //! Local directory layout and capability-confined artifact publication.
 
 mod catalog;
+mod decisions;
 mod jobs;
 mod sqlite;
 
@@ -24,6 +25,9 @@ pub use self::catalog::{
     CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard, CatalogWriterGuard,
 };
 pub use self::catalog::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
+pub use self::decisions::{
+    DecisionDatabaseFileGuard, DecisionDatabaseLocation, DecisionDatabaseWriterGuard,
+};
 pub use self::jobs::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatabaseWriterGuard};
 use self::sqlite::open_prepared_root;
 
@@ -64,6 +68,9 @@ pub enum PathError {
     /// Another process owns the prepared job-database writer lock.
     #[error("prepared job database already has an active writer")]
     JobDatabaseAlreadyLocked,
+    /// Another process owns the prepared decision-database writer lock.
+    #[error("prepared decision database already has an active writer")]
+    DecisionDatabaseAlreadyLocked,
     /// A catalog restore stage or final target contains different immutable bytes.
     #[error("prepared catalog restore target conflicts with retained state")]
     CatalogRestoreConflict,

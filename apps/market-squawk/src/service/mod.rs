@@ -1,10 +1,13 @@
 //! Single per-user installed-service composition and lifecycle authority.
 
+mod analysis;
+mod decision;
 mod dispatch;
 mod jobs;
 mod mcp_client;
 mod resources;
 mod runtime;
+mod tool_services;
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,6 +29,7 @@ use market_squawk_services::{JsonStructureLimits, ServiceLimits, ToolServices};
 use resources::InstalledResourceProvider;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use tool_services::InstalledToolServices;
 use uuid::Uuid;
 
 use mcp_client::InstalledMcpRelayTransport;
@@ -201,19 +205,28 @@ impl InstalledService {
     ) -> Result<Self, InstalledServiceError> {
         let mut runtime = PreparedRuntime::prepare(&paths, secret_store).await?;
         let product = LocalProduct::try_new(config)?;
-        let jobs = match InstalledJobAuthority::open(&paths, Vec::new(), current_timestamp()?).await
-        {
-            Ok(jobs) => jobs,
+        let runners = match crate::jobs::InstalledJobRunners::try_new(&product) {
+            Ok(runners) => Arc::new(runners),
             Err(error) => {
                 shutdown_application(product.application()).await;
                 return Err(error.into());
             }
         };
+        let jobs =
+            match InstalledJobAuthority::open(&paths, runners.registered(), current_timestamp()?)
+                .await
+            {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    shutdown_application(product.application()).await;
+                    return Err(error.into());
+                }
+            };
         let ComposedTransport {
             audit,
             server,
             readiness,
-        } = match compose_transport(&paths, &mut runtime, &product, &jobs) {
+        } = match compose_transport(&paths, &mut runtime, &product, &jobs, runners) {
             Ok(composed) => composed,
             Err(error) => {
                 cleanup_startup(&product, &jobs).await;
@@ -293,6 +306,7 @@ fn compose_transport(
     runtime: &mut PreparedRuntime,
     product: &LocalProduct,
     jobs: &InstalledJobAuthority,
+    runners: Arc<crate::jobs::InstalledJobRunners>,
 ) -> Result<ComposedTransport, InstalledServiceError> {
     let structure = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
@@ -311,14 +325,25 @@ fn compose_transport(
     )
     .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let application = product.application();
-    let dispatcher = Arc::new(
-        InstalledApplicationDispatcher::try_new(
+    let inputs = Arc::new(InputStager::new(
+        product.paths().artifacts()?.clone(),
+        runtime.runtime(),
+        InputStagingLimits::try_new(MAXIMUM_STAGED_INPUTS, MAXIMUM_STAGED_INPUT_BYTES)
+            .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+    ));
+    let services = Arc::new(
+        InstalledToolServices::try_new(
             Arc::clone(&application),
             product,
             jobs,
-            runtime.runtime(),
+            runners,
+            Arc::clone(&inputs),
         )
         .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+    );
+    let dispatcher = Arc::new(
+        InstalledApplicationDispatcher::try_new(Arc::clone(&services), product, runtime.runtime())
+            .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     );
     let replay = Arc::new(
         MutationReplayGuard::try_new(
@@ -335,12 +360,6 @@ fn compose_transport(
         )
         .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     );
-    let inputs = Arc::new(InputStager::new(
-        product.paths().artifacts()?.clone(),
-        runtime.runtime(),
-        InputStagingLimits::try_new(MAXIMUM_STAGED_INPUTS, MAXIMUM_STAGED_INPUT_BYTES)
-            .map_err(|_error| InstalledServiceError::InvalidComposition)?,
-    ));
     let native = RuntimeRouter::try_new(
         runtime.runtime(),
         runtime.endpoint(),
@@ -367,11 +386,17 @@ fn compose_transport(
     ));
     let limits = McpLimits::try_from(McpLimitSpec::default())
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
-    let services: Arc<dyn ToolServices> = application;
+    let services: Arc<dyn ToolServices> = services;
     let audit_sink: Arc<dyn AuditSink> = audit.clone();
-    let factory =
-        McpHandlerFactory::try_new(services, limits, audit_sink, product.artifacts(), resources)
-            .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+    let factory = McpHandlerFactory::try_new(
+        services,
+        limits,
+        audit_sink,
+        product.artifacts(),
+        resources,
+        runtime.runtime().workspace_id(),
+    )
+    .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let authenticator = Arc::new(
         InstalledMcpAuthenticator::new(
             runtime.credentials(),

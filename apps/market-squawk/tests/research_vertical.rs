@@ -18,11 +18,14 @@ use market_squawk::application::{
     ApplicationDomainService, EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
     EphemeralSourceInspectionResult, ManagedResearchExtractionSource,
     PrepublishedResearchSourceRegistration, ProductionResearchIngestCoordinator,
-    ResearchExtractionLimits, ResearchIngestCoordinator, ResearchRevisionPlanError,
-    ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator, SourceDomainService,
-    SourceRuntimeRequest, SourceRuntimeSnapshotBatch, SourceRuntimeView, SourceRuntimeViewError,
+    ResearchExtractionLimits, ResearchIngestCommitAuthority, ResearchIngestCoordinator,
+    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator,
+    SourceDomainService, SourceLifecycleAuthority, SourceLifecycleCommand, SourceLifecycleError,
+    SourceLifecycleReceipt, SourceLifecycleStatus, SourceRuntimeRequest,
+    SourceRuntimeSnapshotBatch, SourceRuntimeView, SourceRuntimeViewError,
     application_capabilities,
 };
+use market_squawk::jobs::ResearchJobRunner;
 use market_squawk::{
     LocalProduct, ProviderOnboardingPortal, ProviderOnboardingService,
     ProviderPortalActivationAuthority, ProviderPortalActivationError,
@@ -45,14 +48,20 @@ use market_squawk_domain::{
     SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, Timestamp,
     VersionPinnedSourceLocator,
 };
+use market_squawk_jobs::{
+    JobEvent, JobGeneration, JobId, JobRepository as _, JobRepositoryConfig, JobRunner, JobState,
+    SqliteJobRepository, recover_one,
+};
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileFallbackStatus,
     EncryptedFileSecretStore, LocalAuthorityStateStore, LocalPaths, PreferredSecretStore,
     SecretValue,
 };
 use market_squawk_services::{
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
     JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
-    SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, TypedToolRequest,
+    SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, TypedToolRequest, TypedToolResult,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
@@ -100,6 +109,25 @@ impl EphemeralSourceInspectionAuthority for UnusedAdapterActivation {
         _request: EphemeralSourceInspectionRequest,
     ) -> Result<EphemeralSourceInspectionResult, ServiceError> {
         Err(ServiceError::Unavailable)
+    }
+}
+
+#[async_trait]
+impl SourceLifecycleAuthority for UnusedAdapterActivation {
+    async fn status(
+        &self,
+        _provider: &SourceIdentifier,
+        _cancellation: &CancellationToken,
+        _deadline: Instant,
+    ) -> Result<SourceLifecycleStatus, SourceLifecycleError> {
+        Err(SourceLifecycleError::Unavailable)
+    }
+
+    async fn execute(
+        &self,
+        _command: SourceLifecycleCommand,
+    ) -> Result<SourceLifecycleReceipt, SourceLifecycleError> {
+        Err(SourceLifecycleError::Unavailable)
     }
 }
 
@@ -191,6 +219,164 @@ impl SourceRuntimeView for EmptySourceRuntime {
     ) -> Result<SourceRuntimeSnapshotBatch, SourceRuntimeViewError> {
         SourceRuntimeSnapshotBatch::try_new(Vec::new())
     }
+}
+
+#[derive(Debug)]
+struct RestartResearchDomain;
+
+#[derive(Debug)]
+struct UnavailableArtifacts;
+
+#[async_trait]
+impl ArtifactRepository for UnavailableArtifacts {
+    async fn publish(
+        &self,
+        _publication: ArtifactPublication,
+        _context: ArtifactPublicationContext,
+    ) -> Result<ArtifactReference, ArtifactError> {
+        Err(ArtifactError::Unavailable)
+    }
+
+    async fn read(
+        &self,
+        _request: ArtifactReadRequest,
+        _context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        Err(ArtifactError::Unavailable)
+    }
+}
+
+#[async_trait]
+impl ApplicationDomainService for RestartResearchDomain {
+    fn domain(&self) -> market_squawk_services::ServiceDomain {
+        market_squawk_services::ServiceDomain::Research
+    }
+
+    async fn call(
+        &self,
+        _request: TypedToolRequest,
+        _context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn begin_shutdown(&self) {}
+
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ResearchIngestCoordinator for RestartResearchDomain {
+    async fn ingest(
+        &self,
+        _request: &TypedToolRequest,
+        _context: &RequestContext,
+        _limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    async fn ingest_with_precommit(
+        &self,
+        _request: &TypedToolRequest,
+        _context: &RequestContext,
+        _limits: ServiceLimits,
+        _additional: Arc<dyn ResearchIngestCommitAuthority>,
+    ) -> Result<TypedToolResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn begin_shutdown(&self) {}
+
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn job_domain_research_restart_interrupts_without_changing_input_identity()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let request = admitted_ingest(
+        &SourceIdentifier::try_from("test-profile")?,
+        &SourceIdentifier::try_from("test-dataset")?,
+        &SourceIdentifier::try_from("test-object")?,
+        "test-discovery-receipt",
+    )?;
+    let context = deadline_context("research-job-restart")?;
+    let runner = ResearchJobRunner::try_new_ingest(
+        Arc::new(RestartResearchDomain),
+        Arc::new(RestartResearchDomain),
+        Arc::new(UnavailableArtifacts),
+        8,
+        Duration::from_secs(5),
+    )?;
+    let admission = runner.admit(request, context.limits(), Timestamp::from_unix_nanos(100))?;
+    let spec = admission.into_spec(
+        JobId::try_from_uuid(Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")?)?,
+        market_squawk_jobs::JobOrigin::new(
+            SourceIdentifier::try_from("default-workspace")?,
+            SourceIdentifier::try_from("test-client")?,
+        ),
+        context.request_id().clone(),
+        Timestamp::from_unix_nanos(100),
+    )?;
+    let original_identity = spec.input().identity().clone();
+    let original_digest = spec.input().digest();
+    let config = JobRepositoryConfig::try_new(Duration::from_millis(750), 32)?;
+    let location = paths.control_root()?.job_database_location();
+    let repository = SqliteJobRepository::open(location.clone(), config).await?;
+    let queued = repository.create(&spec).await?;
+    let preparing = repository
+        .append(
+            queued.id(),
+            queued.generation(),
+            queued.sequence(),
+            JobEvent::try_new(
+                JobState::Preparing,
+                Timestamp::from_unix_nanos(101),
+                None,
+                None,
+                None,
+            )?,
+        )
+        .await?;
+    repository
+        .append(
+            preparing.id(),
+            preparing.generation(),
+            preparing.sequence(),
+            JobEvent::try_new(
+                JobState::Running,
+                Timestamp::from_unix_nanos(102),
+                None,
+                None,
+                None,
+            )?,
+        )
+        .await?;
+    repository.shutdown().await?;
+
+    let reopened = SqliteJobRepository::open(location, config).await?;
+    let restarted = ResearchJobRunner::try_new_ingest(
+        Arc::new(RestartResearchDomain),
+        Arc::new(RestartResearchDomain),
+        Arc::new(UnavailableArtifacts),
+        8,
+        Duration::from_secs(5),
+    )?;
+    let runner_trait: &dyn JobRunner = &restarted;
+    let recovered = recover_one(&reopened, runner_trait, Timestamp::from_unix_nanos(103)).await?;
+
+    assert_eq!(recovered.state(), JobState::Interrupted);
+    assert_eq!(recovered.generation(), JobGeneration::try_new(1)?);
+    assert_eq!(recovered.spec().input().identity(), &original_identity);
+    assert_eq!(recovered.spec().input().digest(), original_digest);
+    reopened.shutdown().await?;
+    Ok(())
 }
 
 #[test]
@@ -371,6 +557,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         discovery,
         Arc::new(UnusedAdapterActivation),
         Arc::new(CanonicalFredInspection),
+        Arc::new(UnusedAdapterActivation),
     )?;
     let capabilities = application_capabilities()?;
     let inspect = capabilities

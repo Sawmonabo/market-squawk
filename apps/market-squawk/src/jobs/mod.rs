@@ -1,11 +1,32 @@
 //! Installed-service ownership of durable job persistence and bounded execution.
 
-use std::{sync::Arc, time::Duration};
+mod backtest;
+mod forecast;
+mod research;
+mod scenario;
+mod screen;
+mod training;
+
+pub use backtest::{BacktestJobRunner, BacktestJobRunnerError};
+pub use forecast::{ForecastJobRunner, ForecastJobRunnerError};
+pub use research::{
+    DatasetJobRunner, ResearchExportJobRunner, ResearchJobRunner, ResearchJobRunnerError,
+};
+pub use scenario::ScenarioJobRunner;
+pub use screen::{ScreenJobCommand, ScreenJobRunner, ScreenJobRunnerError};
+pub use training::{GovernedTrainingInput, TrainingJobRunner, TrainingJobRunnerError};
+
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use market_squawk_domain::Timestamp;
 use market_squawk_jobs::{
-    JobAuthority, JobAuthorityError, JobRepositoryConfig, JobRepositoryError, JobRunner,
-    JobShutdownOutcome, SchedulerError, SchedulerLimits, SqliteJobRepository,
+    JobAuthority, JobAuthorityError, JobEventSequence, JobPublishedPermit, JobRepositoryConfig,
+    JobRepositoryError, JobRunContext, JobRunError, JobRunner, JobShutdownOutcome, SchedulerError,
+    SchedulerLimits, SqliteJobRepository,
 };
 use market_squawk_platform::LocalPaths;
 use thiserror::Error;
@@ -16,6 +37,256 @@ const MAXIMUM_QUEUED_JOBS: usize = 256;
 const MAXIMUM_RUNNING_JOBS: usize = 8;
 const MAXIMUM_QUEUED_PER_KIND: usize = 64;
 const MAXIMUM_RUNNING_PER_KIND: usize = 2;
+const RUNNER_PENDING_CAPACITY: usize = 256;
+const RUNNER_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+/// Code-owned installed runner set retained for both scheduling and typed admission.
+pub struct InstalledJobRunners {
+    ingest: Arc<ResearchJobRunner>,
+    dataset: Arc<DatasetJobRunner>,
+    feature: Arc<DatasetJobRunner>,
+    export: Arc<ResearchExportJobRunner>,
+    scenario: Arc<ScenarioJobRunner>,
+    backtest: Arc<BacktestJobRunner>,
+    backtest_registrar: Arc<dyn crate::application::analysis::GovernedBacktestInputRegistrar>,
+    forecast: Arc<ForecastJobRunner>,
+    training: Option<Arc<TrainingJobRunner>>,
+    screen: Arc<ScreenJobRunner>,
+}
+
+impl InstalledJobRunners {
+    /// Binds every installed runner to the same product authorities used by synchronous calls.
+    pub fn try_new(product: &crate::LocalProduct) -> Result<Self, InstalledJobError> {
+        let artifacts = product.artifacts();
+        let ingest_authority: Arc<dyn crate::application::ResearchIngestCoordinator> =
+            product.research_ingest();
+        let ingest = Arc::new(
+            ResearchJobRunner::try_new_ingest(
+                product.research_domain(),
+                ingest_authority,
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let dataset = Arc::new(
+            DatasetJobRunner::try_new_dataset(
+                product.research(),
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let feature = Arc::new(
+            DatasetJobRunner::try_new_feature(
+                product.research(),
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let export = Arc::new(
+            ResearchExportJobRunner::try_new(
+                product.research_domain(),
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let scenario = Arc::new(
+            ScenarioJobRunner::try_new(
+                product.analysis_domain(),
+                Arc::clone(&artifacts),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let backtest = Arc::new(
+            BacktestJobRunner::try_new(
+                product.backtests(),
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let forecast = Arc::new(
+            ForecastJobRunner::try_new(
+                product.model_domain(),
+                artifacts,
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let training = product
+            .model_runtime()
+            .map(|runtime| {
+                TrainingJobRunner::try_new(
+                    product.paths(),
+                    runtime,
+                    RUNNER_PENDING_CAPACITY,
+                    RUNNER_DEADLINE,
+                )
+                .map(Arc::new)
+                .map_err(|_error| InstalledJobError::RunnerComposition)
+            })
+            .transpose()?;
+        let screen = Arc::new(
+            ScreenJobRunner::try_new(product.decisions(), RUNNER_PENDING_CAPACITY)
+                .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        Ok(Self {
+            ingest,
+            dataset,
+            feature,
+            export,
+            scenario,
+            backtest,
+            backtest_registrar: product.backtest_registrar(),
+            forecast,
+            training,
+            screen,
+        })
+    }
+
+    /// Returns a deterministic registration list while retaining typed admission handles.
+    pub fn registered(&self) -> Vec<Arc<dyn JobRunner>> {
+        let mut runners: Vec<Arc<dyn JobRunner>> = vec![
+            self.ingest.clone(),
+            self.dataset.clone(),
+            self.feature.clone(),
+            self.export.clone(),
+            self.scenario.clone(),
+            self.backtest.clone(),
+            self.forecast.clone(),
+            self.screen.clone(),
+        ];
+        if let Some(training) = &self.training {
+            runners.push(training.clone());
+        }
+        runners
+    }
+
+    pub(crate) const fn ingest(&self) -> &Arc<ResearchJobRunner> {
+        &self.ingest
+    }
+
+    pub(crate) const fn export(&self) -> &Arc<ResearchExportJobRunner> {
+        &self.export
+    }
+
+    pub(crate) const fn dataset(&self) -> &Arc<DatasetJobRunner> {
+        &self.dataset
+    }
+
+    pub(crate) const fn feature(&self) -> &Arc<DatasetJobRunner> {
+        &self.feature
+    }
+
+    pub(crate) const fn scenario(&self) -> &Arc<ScenarioJobRunner> {
+        &self.scenario
+    }
+
+    pub(crate) const fn backtest(&self) -> &Arc<BacktestJobRunner> {
+        &self.backtest
+    }
+
+    pub(crate) fn backtest_registrar(
+        &self,
+    ) -> Arc<dyn crate::application::analysis::GovernedBacktestInputRegistrar> {
+        Arc::clone(&self.backtest_registrar)
+    }
+
+    pub(crate) fn training(&self) -> Option<&Arc<TrainingJobRunner>> {
+        self.training.as_ref()
+    }
+
+    pub(crate) const fn forecast(&self) -> &Arc<ForecastJobRunner> {
+        &self.forecast
+    }
+}
+
+impl fmt::Debug for InstalledJobRunners {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledJobRunners")
+            .field("registered", &self.registered().len())
+            .field("training", &self.training.is_some())
+            .finish()
+    }
+}
+
+/// One application-private slot retaining an unsealed publication permit across a domain commit.
+pub(super) struct JobTerminalCommitSlot {
+    context: JobRunContext,
+    expected: JobEventSequence,
+    permit: Mutex<Option<market_squawk_jobs::JobTerminalPublicationPermit>>,
+    published: Mutex<Option<JobPublishedPermit>>,
+}
+
+impl JobTerminalCommitSlot {
+    pub(super) fn new(context: &JobRunContext, expected: JobEventSequence) -> Self {
+        Self {
+            context: context.clone(),
+            expected,
+            permit: Mutex::new(None),
+            published: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn claim(&self) -> Result<(), JobRunError> {
+        let mut permit = match self.permit.lock() {
+            Ok(permit) => permit,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if permit.is_some() {
+            return Err(JobRunError::Recovery);
+        }
+        *permit = Some(self.context.claim_terminal_publication(self.expected)?);
+        Ok(())
+    }
+
+    pub(super) fn seal_domain_commit(&self) {
+        let permit = match self.permit.lock() {
+            Ok(mut permit) => permit.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(permit) = permit else {
+            return;
+        };
+        let mut published = match self.published.lock() {
+            Ok(published) => published,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if published.is_none() {
+            *published = Some(permit.seal());
+        }
+    }
+
+    pub(super) fn take_published(&self) -> Result<JobPublishedPermit, JobRunError> {
+        match self.published.lock() {
+            Ok(mut published) => published.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+        .ok_or(JobRunError::Recovery)
+    }
+}
+
+impl fmt::Debug for JobTerminalCommitSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobTerminalCommitSlot")
+            .field("expected", &self.expected)
+            .field("permit", &"[TERMINAL PUBLICATION PERMIT]")
+            .field("published", &"[SEALED PUBLICATION PERMIT]")
+            .finish()
+    }
+}
 
 /// Sole installed-process owner for durable job state and runner scheduling.
 #[derive(Debug)]
@@ -121,6 +392,9 @@ pub enum InstalledJobError {
     /// Scheduler limits are invalid.
     #[error(transparent)]
     Scheduler(#[from] SchedulerError),
+    /// One or more code-owned runner adapters could not bind the installed authorities.
+    #[error("installed job runner composition is invalid")]
+    RunnerComposition,
     /// Job scheduling, recovery, or shutdown failed.
     #[error(transparent)]
     Authority(#[from] JobAuthorityError),

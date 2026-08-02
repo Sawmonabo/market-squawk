@@ -25,7 +25,7 @@ pub(super) struct ReadScope {
 }
 
 impl ReadScope {
-    fn from_request(
+    pub(super) fn from_request(
         request: &TypedToolRequest,
         application_limits: PortfolioApplicationLimits,
     ) -> Result<Self, PortfolioApplicationServiceError> {
@@ -122,6 +122,11 @@ pub(super) fn call(
     context: &RequestContext,
     limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    match request.name() {
+        "Portfolio.ListAccounts" => return list_accounts(image, request, context, limits),
+        "Portfolio.ListRevisions" => return list_revisions(image, request, context, limits),
+        _ => {}
+    }
     let scope = ReadScope::from_request(request, limits)?;
     let revision = select_revision(image, &scope)?;
     match request.name() {
@@ -130,11 +135,238 @@ pub(super) fn call(
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
         "Portfolio.GetExposure" => analytics::exposure(revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
+        "Portfolio.GetAttribution"
+        | "Portfolio.EvaluateScenario"
+        | "Portfolio.EvaluateScenarioBatch"
+        | "Portfolio.ProposeRebalance"
+        | "Portfolio.EvaluateCandidateImpact" => {
+            super::advanced::call(image, revision, &scope, request, context)
+        }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }
 
-fn select_revision<'image>(
+fn list_accounts(
+    image: &PortfolioReadImage,
+    request: &TypedToolRequest,
+    context: &RequestContext,
+    application_limits: PortfolioApplicationLimits,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    let (maximum_items, maximum_bytes) = read_result_limits(request, application_limits)?;
+    let requested_sources = source_filters(request)?;
+    let after_account = request
+        .arguments()
+        .get("afterAccountId")
+        .and_then(Value::as_str)
+        .map(str::parse::<AccountId>)
+        .transpose()
+        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+    let rows = image
+        .accounts
+        .iter()
+        .filter(|(account_id, _)| after_account.is_none_or(|after| **account_id > after))
+        .filter_map(|(_, history)| history.revisions.last())
+        .filter(|revision| {
+            requested_sources.is_empty()
+                || requested_sources.iter().all(|source| {
+                    revision
+                        .source_coverage
+                        .iter()
+                        .any(|covered| covered.as_str() == source)
+                })
+        })
+        .map(account_summary)
+        .collect::<Vec<_>>();
+    portfolio_page(
+        rows,
+        maximum_items,
+        maximum_bytes,
+        context,
+        json!({
+            "authority": "immutable_portfolio_publication",
+            "sourceFilters": requested_sources,
+        }),
+    )
+}
+
+fn list_revisions(
+    image: &PortfolioReadImage,
+    request: &TypedToolRequest,
+    context: &RequestContext,
+    application_limits: PortfolioApplicationLimits,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    let scope = ReadScope::from_request(request, application_limits)?;
+    let after_revision = request
+        .arguments()
+        .get("afterRevisionId")
+        .and_then(Value::as_str);
+    let history = image
+        .accounts
+        .get(&scope.account_id)
+        .ok_or(PortfolioApplicationServiceError::NotFound)?;
+    let mut cursor_seen = after_revision.is_none();
+    let mut rows = Vec::new();
+    for revision in &history.revisions {
+        let revision_id = hex(&revision.token().bytes());
+        if !cursor_seen {
+            if after_revision == Some(revision_id.as_str()) {
+                cursor_seen = true;
+            }
+            continue;
+        }
+        if !scope.admits_time(revision.effective_at)
+            || scope.end.is_some_and(|end| {
+                revision
+                    .available_at
+                    .is_none_or(|available| available > end)
+            })
+            || (!scope.sources.is_empty()
+                && !scope.sources.iter().all(|source| {
+                    revision
+                        .source_coverage
+                        .iter()
+                        .any(|covered| covered.as_str() == source)
+                }))
+        {
+            continue;
+        }
+        rows.push(revision_summary(revision));
+    }
+    if !cursor_seen {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    portfolio_page(
+        rows,
+        scope.maximum_items,
+        scope.maximum_bytes,
+        context,
+        json!({
+            "authority": "append_only_portfolio_revision_history",
+            "accountId": scope.account_id.to_string(),
+            "sourceFilters": scope.sources,
+        }),
+    )
+}
+
+fn account_summary(revision: &PublishedRevision) -> Value {
+    json!({
+        "accountId": revision.account.account_id().to_string(),
+        "currency": revision.account.currency().as_str(),
+        "currentRevision": revision_summary(revision),
+        "holdingCount": revision.holdings.len(),
+        "transactionCount": revision.transactions.len(),
+        "reconciliationDiscrepancies": revision.discrepancies.len(),
+    })
+}
+
+fn revision_summary(revision: &PublishedRevision) -> Value {
+    json!({
+        "revisionId": hex(&revision.token().bytes()),
+        "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
+        "availableAtUnixNanos": revision
+            .available_at
+            .map(|value| value.unix_nanos().to_string()),
+        "sourceId": revision.source_id.as_str(),
+        "sourceCoverage": revision
+            .source_coverage
+            .iter()
+            .map(|source| source.as_str())
+            .collect::<Vec<_>>(),
+        "artifactSha256": hex(&revision.artifact_sha256),
+        "holdingCount": revision.holdings.len(),
+        "transactionCount": revision.transactions.len(),
+        "reconciliationDiscrepancies": revision.discrepancies.len(),
+    })
+}
+
+fn source_filters(
+    request: &TypedToolRequest,
+) -> Result<BTreeSet<String>, PortfolioApplicationServiceError> {
+    request
+        .arguments()
+        .get("sourceCoverage")
+        .map(|values| {
+            values
+                .as_array()
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or(PortfolioApplicationServiceError::InvalidRequest)
+                })
+                .collect()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn read_result_limits(
+    request: &TypedToolRequest,
+    application_limits: PortfolioApplicationLimits,
+) -> Result<(usize, usize), PortfolioApplicationServiceError> {
+    let limits = request
+        .arguments()
+        .get("resultLimits")
+        .and_then(Value::as_object)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let maximum_items = limits
+        .get("maximumItems")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+        .min(application_limits.max_result_items);
+    let maximum_bytes = limits
+        .get("maximumBytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+        .min(application_limits.max_retained_bytes);
+    Ok((maximum_items, maximum_bytes))
+}
+
+fn portfolio_page(
+    rows: Vec<Value>,
+    maximum_items: usize,
+    maximum_bytes: usize,
+    context: &RequestContext,
+    coverage: Value,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    let available = rows.len();
+    let upper = available
+        .min(maximum_items)
+        .min(context.limits().maximum_result_items());
+    let quality = json!({
+        "class": "direct_unverified",
+        "executionEligible": false,
+        "rawEvidenceRetained": true,
+    });
+    let limits = narrowed_limits(context, maximum_items, maximum_bytes)?;
+    let mut count = upper;
+    loop {
+        let metadata = if count < available {
+            ToolResultMetadata::try_truncated(available, coverage.clone(), quality.clone())
+        } else {
+            ToolResultMetadata::try_complete(coverage.clone(), quality.clone())
+        }
+        .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        match TypedToolResult::try_new(
+            Value::Array(rows[..count].to_vec()),
+            count,
+            metadata,
+            limits,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(_) if count > 0 => count -= 1,
+            Err(_) => return Err(PortfolioApplicationServiceError::ResourceExhausted),
+        }
+    }
+}
+
+pub(super) fn select_revision<'image>(
     image: &'image PortfolioReadImage,
     scope: &ReadScope,
 ) -> Result<&'image PublishedRevision, PortfolioApplicationServiceError> {

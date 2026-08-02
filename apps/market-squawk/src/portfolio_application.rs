@@ -1,5 +1,6 @@
 //! Lifecycle-owned transport-neutral portfolio imports, immutable reads, and analytics.
 
+mod advanced;
 mod analytics;
 mod import;
 mod model;

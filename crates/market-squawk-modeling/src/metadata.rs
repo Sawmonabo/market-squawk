@@ -11,12 +11,107 @@ use market_squawk_data::{
 use market_squawk_domain::{ModelId, Timestamp};
 use thiserror::Error;
 
+use crate::{CalibrationBand, CalibrationMethod, CalibrationWindow};
+
 /// Maximum features consumed by one native model.
 pub const MAX_MODEL_FEATURES: usize = 1_024;
 /// Maximum bytes in a stable bundle identity.
 pub const MAX_BUNDLE_ID_BYTES: usize = 128;
 /// Maximum bytes in a training-code revision.
 pub const MAX_TRAINING_CODE_REVISION_BYTES: usize = 128;
+
+/// Immutable admitted calibration members and decoded interval policy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForecastCalibrationArtifacts {
+    method: CalibrationMethod,
+    window: CalibrationWindow,
+    policy_hash: Sha256Digest,
+    policy_size_bytes: u64,
+    residuals_hash: Sha256Digest,
+    residuals_size_bytes: u64,
+    bands: [CalibrationBand; 3],
+    dependence_assumptions: Box<str>,
+}
+
+impl ForecastCalibrationArtifacts {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "decoded policy and both immutable bundle members remain explicit"
+    )]
+    pub(crate) fn new(
+        method: CalibrationMethod,
+        window: CalibrationWindow,
+        policy_hash: Sha256Digest,
+        policy_size_bytes: u64,
+        residuals_hash: Sha256Digest,
+        residuals_size_bytes: u64,
+        bands: [CalibrationBand; 3],
+        dependence_assumptions: String,
+    ) -> Self {
+        Self {
+            method,
+            window,
+            policy_hash,
+            policy_size_bytes,
+            residuals_hash,
+            residuals_size_bytes,
+            bands,
+            dependence_assumptions: dependence_assumptions.into_boxed_str(),
+        }
+    }
+
+    /// Closed admitted interval method.
+    #[must_use]
+    pub const fn method(&self) -> CalibrationMethod {
+        self.method
+    }
+
+    /// Exact decoded calibration window.
+    #[must_use]
+    pub const fn window(&self) -> CalibrationWindow {
+        self.window
+    }
+
+    /// Exact interval-policy member digest.
+    #[must_use]
+    pub const fn policy_hash(&self) -> Sha256Digest {
+        self.policy_hash
+    }
+
+    /// Exact interval-policy member size.
+    #[must_use]
+    pub const fn policy_size_bytes(&self) -> u64 {
+        self.policy_size_bytes
+    }
+
+    /// Exact retained-residual member digest.
+    #[must_use]
+    pub const fn residuals_hash(&self) -> Sha256Digest {
+        self.residuals_hash
+    }
+
+    /// Exact retained-residual member size.
+    #[must_use]
+    pub const fn residuals_size_bytes(&self) -> u64 {
+        self.residuals_size_bytes
+    }
+
+    /// Ordered decoded 50/80/95 policy bands.
+    #[must_use]
+    pub const fn bands(&self) -> &[CalibrationBand; 3] {
+        &self.bands
+    }
+
+    /// Bounded dependence and coverage interpretation.
+    #[must_use]
+    pub fn dependence_assumptions(&self) -> &str {
+        &self.dependence_assumptions
+    }
+
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.dependence_assumptions.len())
+    }
+}
 
 /// Stable model-bundle series identity; a version selects one immutable generation.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -596,6 +691,7 @@ pub struct ModelMetadata {
     metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
+    forecast_calibration: Option<ForecastCalibrationArtifacts>,
     format: ModelFormat,
     format_version: u32,
     output_semantics: ModelOutputSemantics,
@@ -647,6 +743,7 @@ impl ModelMetadata {
             metadata_hash,
             artifact_hash,
             training_run_hash: expectations.training_run_hash,
+            forecast_calibration: None,
             format,
             format_version,
             output_semantics,
@@ -669,6 +766,14 @@ impl ModelMetadata {
                 .into_boxed_slice(),
             fallback_reason: fallback_reason.into_boxed_str(),
         }
+    }
+
+    pub(crate) fn with_forecast_calibration(
+        mut self,
+        calibration: Option<ForecastCalibrationArtifacts>,
+    ) -> Self {
+        self.forecast_calibration = calibration;
+        self
     }
 
     /// Returns the stable model identity.
@@ -705,6 +810,12 @@ impl ModelMetadata {
     #[must_use]
     pub const fn training_run_hash(&self) -> Sha256Digest {
         self.training_run_hash
+    }
+
+    /// First-class admitted calibration members, absent on non-forecast bundles.
+    #[must_use]
+    pub const fn forecast_calibration(&self) -> Option<&ForecastCalibrationArtifacts> {
+        self.forecast_calibration.as_ref()
     }
 
     /// Returns the closed native format.
@@ -828,6 +939,9 @@ impl ModelMetadata {
         }
         for limitation in &self.limitations {
             retained = retained.checked_add(limitation.len())?;
+        }
+        if let Some(calibration) = &self.forecast_calibration {
+            retained = retained.checked_add(calibration.retained_bytes())?;
         }
         Some(retained)
     }

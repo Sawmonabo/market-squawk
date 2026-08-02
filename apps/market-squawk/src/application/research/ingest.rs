@@ -11,8 +11,8 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_data::{
-    DatasetId, IngestError, RightsBasis, RightsDecisionInput, SourceOperation,
-    extraction_provider_payload_digest,
+    DatasetId, IngestError, IngestPrecommitAuthority, RightsBasis, RightsDecisionInput,
+    SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{EvidenceDigest, SourceId, SourceIdentifier, Timestamp};
 use market_squawk_services::{
@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ResearchIngestCoordinator, ResearchSourceDiscoveryCoordinator, encode_hex, manifest_value,
+    ResearchIngestCommitAuthority, ResearchIngestCoordinator, ResearchSourceDiscoveryCoordinator,
+    encode_hex, manifest_value,
 };
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
@@ -1291,13 +1292,35 @@ struct AuthorizedExtraction {
     admission: ResearchProviderAdmission,
 }
 
-#[async_trait]
-impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
-    async fn ingest(
+struct ChainedIngestPrecommitAuthority {
+    provider: Arc<dyn IngestPrecommitAuthority>,
+    additional: Arc<dyn ResearchIngestCommitAuthority>,
+}
+
+impl fmt::Debug for ChainedIngestPrecommitAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChainedIngestPrecommitAuthority")
+            .field("provider", &"[PROVIDER PUBLICATION AUTHORITY]")
+            .field("additional", &"[ADDITIONAL COMMIT AUTHORITY]")
+            .finish()
+    }
+}
+
+impl IngestPrecommitAuthority for ChainedIngestPrecommitAuthority {
+    fn validate_precommit(&self) -> Result<(), IngestError> {
+        self.provider.validate_precommit()?;
+        self.additional.validate_precommit()
+    }
+}
+
+impl ProductionResearchIngestCoordinator {
+    async fn ingest_inner(
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
         limits: ServiceLimits,
+        additional: Option<Arc<dyn ResearchIngestCommitAuthority>>,
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
         let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
@@ -1326,10 +1349,19 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             rights,
             admission,
         } = extracted;
-        let publication = admission
-            .acquire_publication_lease()
-            .await
-            .map_err(|_error| ServiceError::Unavailable)?;
+        let provider: Arc<dyn IngestPrecommitAuthority> = Arc::new(
+            admission
+                .acquire_publication_lease()
+                .await
+                .map_err(|_error| ServiceError::Unavailable)?,
+        );
+        let precommit: Arc<dyn IngestPrecommitAuthority> = match &additional {
+            Some(additional) => Arc::new(ChainedIngestPrecommitAuthority {
+                provider,
+                additional: Arc::clone(additional),
+            }),
+            None => provider,
+        };
         let ingest = match revisions {
             Some(revisions) => ResearchIngestRequest::with_provider_revisions(
                 source_metadata.clone(),
@@ -1346,7 +1378,7 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             ),
         }
         .map_err(map_research_error)?
-        .with_precommit_authority(Arc::new(publication));
+        .with_precommit_authority(precommit);
         let committed = await_publication(
             self.research.ingest(ingest, operation.clone()),
             context,
@@ -1355,6 +1387,9 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             operation_deadline,
         )
         .await?;
+        if let Some(additional) = &additional {
+            additional.commit_succeeded();
+        }
         let manifest = committed.manifest();
         let plan = committed.pinned().plan();
         let coverage = json!({
@@ -1387,6 +1422,29 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             .ensure_live()
             .map_err(|_error| ServiceError::Unavailable)?;
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
+    async fn ingest(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        self.ingest_inner(request, context, limits, None).await
+    }
+
+    async fn ingest_with_precommit(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+        additional: Arc<dyn ResearchIngestCommitAuthority>,
+    ) -> Result<TypedToolResult, ServiceError> {
+        self.ingest_inner(request, context, limits, Some(additional))
+            .await
     }
 
     fn begin_shutdown(&self) {

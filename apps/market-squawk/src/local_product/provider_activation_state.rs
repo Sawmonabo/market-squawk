@@ -2,6 +2,7 @@
 
 mod evidence;
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ const QUARANTINE_SCHEMA_VERSION: u16 = 2;
 const QUARANTINE_RECORD_KIND: &str = "provider_activation_quarantine";
 const MAXIMUM_RECIPE_EVIDENCE_OBJECTS: usize = 1_024;
 const ACTIVATION_STATE_DIRECTORY: &str = "sources/provider-activation-v1";
+const SOURCE_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
 
 pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 6] = [
     "sec.edgar-public",
@@ -34,6 +36,20 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 6] = [
     "fred-alfred.api-v1-v2",
 ];
 pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
+    "sec.edgar-public",
+    "bls.v1-unregistered",
+    "bls.v2-registered",
+    "treasury.daily-rates-xml",
+    "treasury.fiscal-data",
+    "fred-alfred.api-v1-v2",
+    "local.files",
+    "local.portfolio-imports",
+];
+
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 11] = [
+    "coinbase.public-market-data",
+    "coinbase.exchange-direct-market-data",
+    "kraken.spot-public-market-data",
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -68,6 +84,91 @@ pub(super) enum DurableActivationRecipeState {
     Cutover(DurableActivationRecipe),
     /// Prior state was disabled and requires a new onboarding activation.
     Quarantined(DurableActivationQuarantine),
+}
+
+/// Crash-visible state of one source lifecycle surface.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DurableSourceLifecyclePhase {
+    /// A runtime mutation started but did not publish its final result.
+    Applying,
+    /// Source runtime authority is active.
+    Active,
+    /// Source configuration is retained but runtime authority is stopped.
+    Stopped,
+    /// Source configuration and runtime authority were removed.
+    Removed,
+    /// A prior mutation requires explicit reconciliation.
+    ReconciliationRequired,
+}
+
+/// Validated durable lifecycle record used for compare-and-apply.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DurableSourceLifecycleRecord {
+    revision: NonZeroU64,
+    phase: DurableSourceLifecyclePhase,
+    operation_id: Option<SourceIdentifier>,
+    command_digest: Option<EvidenceDigest>,
+    transition_digest: Option<EvidenceDigest>,
+    session_id: Option<Uuid>,
+    public_configuration_digest: Option<EvidenceDigest>,
+}
+
+impl DurableSourceLifecycleRecord {
+    pub(super) const fn revision(&self) -> NonZeroU64 {
+        self.revision
+    }
+
+    pub(super) const fn phase(&self) -> DurableSourceLifecyclePhase {
+        self.phase
+    }
+
+    pub(super) const fn session_id(&self) -> Option<Uuid> {
+        self.session_id
+    }
+
+    pub(super) const fn public_configuration_digest(&self) -> Option<EvidenceDigest> {
+        self.public_configuration_digest
+    }
+}
+
+/// Admission result for one exact source lifecycle command.
+pub(super) enum DurableSourceLifecycleTransition {
+    /// The caller owns the newly durable in-progress mutation.
+    Apply(DurableSourceLifecycleRecord),
+    /// The same exact command already reached a final durable result.
+    Replay(DurableSourceLifecycleRecord),
+}
+
+impl DurableSourceLifecycleTransition {
+    pub(super) fn transition_digest(&self) -> EvidenceDigest {
+        match self {
+            Self::Apply(record) | Self::Replay(record) => match record.transition_digest {
+                Some(digest) => digest,
+                None => EvidenceDigest::new(DigestAlgorithm::Sha256, [0; 32]),
+            },
+        }
+    }
+
+    pub(super) const fn record(&self) -> &DurableSourceLifecycleRecord {
+        match self {
+            Self::Apply(record) | Self::Replay(record) => record,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceLifecycleWire {
+    schema_version: u16,
+    surface_id: String,
+    revision: u64,
+    phase: DurableSourceLifecyclePhase,
+    operation_id: Option<String>,
+    command_sha256: Option<String>,
+    transition_sha256: Option<String>,
+    session_id: Option<Uuid>,
+    public_configuration_sha256: Option<String>,
 }
 
 /// Secret-free evidence for one disabled activation recipe.
@@ -154,6 +255,176 @@ impl DurableProviderActivationState {
             return Err(DurableProviderActivationStateError::UnknownSurface);
         }
         Ok(Arc::clone(&self.activation_gate).lock_owned().await)
+    }
+
+    /// Serializes lifecycle compare-and-apply for every code-owned source surface.
+    pub(super) async fn acquire_source_lifecycle(
+        &self,
+        surface_id: &str,
+    ) -> Result<OwnedMutexGuard<()>, DurableProviderActivationStateError> {
+        if !SERIALIZED_LIFECYCLE_SURFACES.contains(&surface_id) {
+            return Err(DurableProviderActivationStateError::UnknownSurface);
+        }
+        Ok(Arc::clone(&self.activation_gate).lock_owned().await)
+    }
+
+    /// Loads the durable compare-and-apply record for one code-owned source surface.
+    pub(super) fn source_lifecycle_record(
+        &self,
+        surface_id: &str,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        let key = lifecycle_surface_key(surface_id)?;
+        let store = LocalAuthorityStateStore::try_open(self.lifecycle_root(key))?;
+        let Some(encoded) = store.load()? else {
+            let recipe_exists = surface_key(surface_id)
+                .ok()
+                .map(|recipe_key| {
+                    LocalAuthorityStateStore::try_open(self.recipe_root(recipe_key))?.load()
+                })
+                .transpose()?
+                .flatten()
+                .is_some();
+            return Ok(DurableSourceLifecycleRecord {
+                revision: NonZeroU64::MIN,
+                phase: if recipe_exists {
+                    DurableSourceLifecyclePhase::Active
+                } else {
+                    DurableSourceLifecyclePhase::Stopped
+                },
+                operation_id: None,
+                command_digest: None,
+                transition_digest: None,
+                session_id: None,
+                public_configuration_digest: None,
+            });
+        };
+        decode_source_lifecycle(surface_id, &encoded)
+    }
+
+    /// Durably claims one exact lifecycle transition before mutating runtime authority.
+    pub(super) fn begin_source_lifecycle_transition(
+        &self,
+        surface_id: &str,
+        expected_revision: NonZeroU64,
+        operation_id: SourceIdentifier,
+        command_digest: EvidenceDigest,
+        allow_reconciliation: bool,
+    ) -> Result<DurableSourceLifecycleTransition, DurableProviderActivationStateError> {
+        if command_digest.bytes() == [0; 32] {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        let current = self.source_lifecycle_record(surface_id)?;
+        if current.operation_id.as_ref() == Some(&operation_id)
+            && current.command_digest == Some(command_digest)
+        {
+            return if matches!(
+                current.phase,
+                DurableSourceLifecyclePhase::Applying
+                    | DurableSourceLifecyclePhase::ReconciliationRequired
+            ) {
+                Err(DurableProviderActivationStateError::LifecycleReconciliationRequired)
+            } else {
+                Ok(DurableSourceLifecycleTransition::Replay(current))
+            };
+        }
+        if current.revision != expected_revision {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        if matches!(
+            current.phase,
+            DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+        ) && !allow_reconciliation
+        {
+            return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
+        }
+        let revision = current
+            .revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(DurableProviderActivationStateError::ResourceExhausted)?;
+        let transition_digest = source_lifecycle_transition_digest(
+            surface_id,
+            revision,
+            &operation_id,
+            command_digest,
+        )?;
+        let applying = DurableSourceLifecycleRecord {
+            revision,
+            phase: DurableSourceLifecyclePhase::Applying,
+            operation_id: Some(operation_id),
+            command_digest: Some(command_digest),
+            transition_digest: Some(transition_digest),
+            session_id: current.session_id,
+            public_configuration_digest: current.public_configuration_digest,
+        };
+        self.store_source_lifecycle(surface_id, &applying)?;
+        Ok(DurableSourceLifecycleTransition::Apply(applying))
+    }
+
+    /// Publishes the final result only for the exact in-progress transition.
+    pub(super) fn complete_source_lifecycle_transition(
+        &self,
+        surface_id: &str,
+        expected_transition: EvidenceDigest,
+        phase: DurableSourceLifecyclePhase,
+        session_id: Option<Uuid>,
+        public_configuration_digest: Option<EvidenceDigest>,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        if matches!(
+            phase,
+            DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+        ) {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        let current = self.source_lifecycle_record(surface_id)?;
+        if current.phase != DurableSourceLifecyclePhase::Applying
+            || current.transition_digest != Some(expected_transition)
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let completed = DurableSourceLifecycleRecord {
+            phase,
+            session_id,
+            public_configuration_digest,
+            ..current
+        };
+        self.store_source_lifecycle(surface_id, &completed)?;
+        Ok(completed)
+    }
+
+    /// Converts an interrupted or indeterminate transition into an explicit recovery barrier.
+    pub(super) fn require_source_lifecycle_reconciliation(
+        &self,
+        surface_id: &str,
+        expected_transition: EvidenceDigest,
+    ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+        let current = self.source_lifecycle_record(surface_id)?;
+        if current.phase != DurableSourceLifecyclePhase::Applying
+            || current.transition_digest != Some(expected_transition)
+        {
+            return Err(DurableProviderActivationStateError::StaleState);
+        }
+        let blocked = DurableSourceLifecycleRecord {
+            phase: DurableSourceLifecyclePhase::ReconciliationRequired,
+            ..current
+        };
+        self.store_source_lifecycle(surface_id, &blocked)?;
+        Ok(blocked)
+    }
+
+    fn store_source_lifecycle(
+        &self,
+        surface_id: &str,
+        record: &DurableSourceLifecycleRecord,
+    ) -> Result<(), DurableProviderActivationStateError> {
+        let key = lifecycle_surface_key(surface_id)?;
+        let encoded = encode_source_lifecycle(surface_id, record)?;
+        LocalAuthorityStateStore::try_open(self.lifecycle_root(key))?
+            .store(&encoded)
+            .map_err(Into::into)
     }
 
     pub(super) fn load_evidence(
@@ -287,7 +558,9 @@ impl DurableProviderActivationState {
         surface_id: &str,
         expected_staged_digest: EvidenceDigest,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
-        let DurableActivationRecipeState::Staged(staged) = self.load_recipe(surface_id)? else {
+        let DurableActivationRecipeState::Staged(staged) =
+            self.load_recipe_for_lifecycle(surface_id)?
+        else {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         };
         if staged.state_digest != expected_staged_digest {
@@ -314,7 +587,9 @@ impl DurableProviderActivationState {
         surface_id: &str,
         expected_staged_digest: EvidenceDigest,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
-        let DurableActivationRecipeState::Staged(recipe) = self.load_recipe(surface_id)? else {
+        let DurableActivationRecipeState::Staged(recipe) =
+            self.load_recipe_for_lifecycle(surface_id)?
+        else {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         };
         if recipe.state_digest != expected_staged_digest {
@@ -387,7 +662,9 @@ impl DurableProviderActivationState {
         surface_id: &str,
         expected_staged_digest: EvidenceDigest,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
-        let DurableActivationRecipeState::Staged(recipe) = self.load_recipe(surface_id)? else {
+        let DurableActivationRecipeState::Staged(recipe) =
+            self.load_recipe_for_lifecycle(surface_id)?
+        else {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         };
         if recipe.state_digest != expected_staged_digest || recipe.staged_predecessor.is_some() {
@@ -421,7 +698,9 @@ impl DurableProviderActivationState {
         surface_id: &str,
         expected_cutover_digest: EvidenceDigest,
     ) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
-        let DurableActivationRecipeState::Cutover(recipe) = self.load_recipe(surface_id)? else {
+        let DurableActivationRecipeState::Cutover(recipe) =
+            self.load_recipe_for_lifecycle(surface_id)?
+        else {
             return Err(DurableProviderActivationStateError::InvalidRecipe);
         };
         if recipe.state_digest != expected_cutover_digest || recipe.staged_predecessor.is_none() {
@@ -486,6 +765,23 @@ impl DurableProviderActivationState {
     }
 
     pub(super) fn load_recipe(
+        &self,
+        surface_id: &str,
+    ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
+        if matches!(
+            self.source_lifecycle_record(surface_id)?.phase(),
+            DurableSourceLifecyclePhase::Stopped
+                | DurableSourceLifecyclePhase::Removed
+                | DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+        ) {
+            return Ok(DurableActivationRecipeState::Missing);
+        }
+        self.load_recipe_for_lifecycle(surface_id)
+    }
+
+    /// Loads retained recipe authority even while lifecycle policy keeps it non-callable.
+    pub(super) fn load_recipe_for_lifecycle(
         &self,
         surface_id: &str,
     ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
@@ -563,12 +859,16 @@ impl DurableProviderActivationState {
         self.root.join("recipes").join(key)
     }
 
+    fn lifecycle_root(&self, key: &str) -> PathBuf {
+        self.root.join("lifecycle").join(key)
+    }
+
     pub(super) fn referenced_evidence_digests(
         &self,
     ) -> Result<std::collections::BTreeSet<String>, DurableProviderActivationStateError> {
         let mut referenced = std::collections::BTreeSet::new();
         for surface_id in RESTORABLE_RESEARCH_SURFACES {
-            match self.load_recipe(surface_id)? {
+            match self.load_recipe_for_lifecycle(surface_id)? {
                 DurableActivationRecipeState::Missing => {}
                 DurableActivationRecipeState::Desired(recipe)
                 | DurableActivationRecipeState::Staged(recipe)
@@ -585,6 +885,99 @@ impl DurableProviderActivationState {
         }
         Ok(referenced)
     }
+}
+
+fn encode_source_lifecycle(
+    surface_id: &str,
+    record: &DurableSourceLifecycleRecord,
+) -> Result<Vec<u8>, DurableProviderActivationStateError> {
+    let wire = SourceLifecycleWire {
+        schema_version: SOURCE_LIFECYCLE_SCHEMA_VERSION,
+        surface_id: surface_id.to_owned(),
+        revision: record.revision.get(),
+        phase: record.phase,
+        operation_id: record
+            .operation_id
+            .as_ref()
+            .map(|value| value.as_str().to_owned()),
+        command_sha256: record.command_digest.map(|value| lower_hex(&value.bytes())),
+        transition_sha256: record
+            .transition_digest
+            .map(|value| lower_hex(&value.bytes())),
+        session_id: record.session_id,
+        public_configuration_sha256: record
+            .public_configuration_digest
+            .map(|value| lower_hex(&value.bytes())),
+    };
+    serde_json::to_vec(&wire).map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)
+}
+
+fn decode_source_lifecycle(
+    surface_id: &str,
+    encoded: &[u8],
+) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
+    let wire: SourceLifecycleWire = serde_json::from_slice(encoded)
+        .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
+    if wire.schema_version != SOURCE_LIFECYCLE_SCHEMA_VERSION || wire.surface_id != surface_id {
+        return Err(DurableProviderActivationStateError::InvalidLifecycle);
+    }
+    let revision = NonZeroU64::new(wire.revision)
+        .ok_or(DurableProviderActivationStateError::InvalidLifecycle)?;
+    let operation_id = wire
+        .operation_id
+        .map(SourceIdentifier::try_from)
+        .transpose()
+        .map_err(|_| DurableProviderActivationStateError::InvalidLifecycle)?;
+    let command_digest = wire
+        .command_sha256
+        .as_deref()
+        .map(digest_from_lower_hex)
+        .transpose()?;
+    let transition_digest = wire
+        .transition_sha256
+        .as_deref()
+        .map(digest_from_lower_hex)
+        .transpose()?;
+    let public_configuration_digest = wire
+        .public_configuration_sha256
+        .as_deref()
+        .map(digest_from_lower_hex)
+        .transpose()?;
+    let command_identity_valid = operation_id.is_some() == command_digest.is_some()
+        && command_digest.is_some() == transition_digest.is_some();
+    if !command_identity_valid
+        || (wire.phase == DurableSourceLifecyclePhase::Applying && transition_digest.is_none())
+    {
+        return Err(DurableProviderActivationStateError::InvalidLifecycle);
+    }
+    Ok(DurableSourceLifecycleRecord {
+        revision,
+        phase: wire.phase,
+        operation_id,
+        command_digest,
+        transition_digest,
+        session_id: wire.session_id,
+        public_configuration_digest,
+    })
+}
+
+fn source_lifecycle_transition_digest(
+    surface_id: &str,
+    revision: NonZeroU64,
+    operation_id: &SourceIdentifier,
+    command_digest: EvidenceDigest,
+) -> Result<EvidenceDigest, DurableProviderActivationStateError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/source-lifecycle-transition/v1\0");
+    hash_field(&mut hasher, surface_id.as_bytes())?;
+    hasher.update(revision.get().to_be_bytes());
+    hash_field(&mut hasher, operation_id.as_str().as_bytes())?;
+    hasher.update(command_digest.bytes());
+    let bytes: [u8; 32] = hasher.finalize().into();
+    if bytes == [0; 32] {
+        return Err(DurableProviderActivationStateError::InvalidLifecycle);
+    }
+    Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, bytes))
 }
 
 fn quarantine_encoded(
@@ -708,6 +1101,19 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "treasury.fiscal-data" => Ok("treasury-fiscal"),
         "fred-alfred.api-v1-v2" => Ok("fred-alfred"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
+    }
+}
+
+fn lifecycle_surface_key(
+    surface_id: &str,
+) -> Result<&'static str, DurableProviderActivationStateError> {
+    match surface_id {
+        "coinbase.public-market-data" => Ok("coinbase-public"),
+        "coinbase.exchange-direct-market-data" => Ok("coinbase-direct"),
+        "kraken.spot-public-market-data" => Ok("kraken-public"),
+        "local.files" => Ok("local-files"),
+        "local.portfolio-imports" => Ok("local-portfolio-imports"),
+        _ => surface_key(surface_id),
     }
 }
 
@@ -1049,6 +1455,10 @@ pub(super) enum DurableProviderActivationStateError {
     ResourceExhausted,
     #[error("provider activation state changed before exact publication")]
     StaleState,
+    #[error("provider source lifecycle state is invalid")]
+    InvalidLifecycle,
+    #[error("provider source lifecycle requires reconciliation")]
+    LifecycleReconciliationRequired,
     #[error("provider activation evidence reclamation failed")]
     EvidenceReclamation(#[source] std::io::Error),
     #[error(transparent)]
@@ -1059,6 +1469,7 @@ pub(super) enum DurableProviderActivationStateError {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
 
     use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
@@ -1180,6 +1591,83 @@ mod tests {
             second,
             DurableActivationQuarantineReason::AdapterRejected,
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn source_lifecycle_transition_is_exactly_once_and_crash_visible() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let state = DurableProviderActivationState::new(temporary.path().to_path_buf());
+        let surface_id = "treasury.fiscal-data";
+        let operation_id = SourceIdentifier::try_from("source-stop-operation")?;
+        let command_digest = generation_digest(7);
+
+        let transition = state.begin_source_lifecycle_transition(
+            surface_id,
+            NonZeroU64::MIN,
+            operation_id.clone(),
+            command_digest,
+            false,
+        )?;
+        assert_eq!(
+            transition.record().revision(),
+            NonZeroU64::new(2).ok_or("revision")?
+        );
+        assert!(matches!(
+            state.source_lifecycle_record(surface_id)?.phase(),
+            DurableSourceLifecyclePhase::Applying
+        ));
+
+        let completed = state.complete_source_lifecycle_transition(
+            surface_id,
+            transition.transition_digest(),
+            DurableSourceLifecyclePhase::Stopped,
+            None,
+            None,
+        )?;
+        assert_eq!(completed.revision(), NonZeroU64::new(2).ok_or("revision")?);
+        assert_eq!(completed.phase(), DurableSourceLifecyclePhase::Stopped);
+        assert!(matches!(
+            state.begin_source_lifecycle_transition(
+                surface_id,
+                NonZeroU64::MIN,
+                operation_id,
+                command_digest,
+                false,
+            )?,
+            DurableSourceLifecycleTransition::Replay(_)
+        ));
+        assert!(matches!(
+            state.begin_source_lifecycle_transition(
+                surface_id,
+                NonZeroU64::MIN,
+                SourceIdentifier::try_from("different-stop-operation")?,
+                generation_digest(8),
+                false,
+            ),
+            Err(DurableProviderActivationStateError::StaleState)
+        ));
+
+        let interrupted = state.begin_source_lifecycle_transition(
+            surface_id,
+            completed.revision(),
+            SourceIdentifier::try_from("interrupted-operation")?,
+            generation_digest(9),
+            false,
+        )?;
+        let blocked = state
+            .require_source_lifecycle_reconciliation(surface_id, interrupted.transition_digest())?;
+        let recovery = state.begin_source_lifecycle_transition(
+            surface_id,
+            blocked.revision(),
+            SourceIdentifier::try_from("recovery-operation")?,
+            generation_digest(10),
+            true,
+        )?;
+        assert_eq!(
+            recovery.record().revision().get(),
+            blocked.revision().get() + 1
+        );
         Ok(())
     }
 

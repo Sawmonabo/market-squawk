@@ -9,6 +9,7 @@ mod cli_transport;
 mod executable;
 mod fair_value_producer;
 mod provider_activation_state;
+mod source_lifecycle;
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use market_squawk_analytics::{
 };
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
+use market_squawk_decisions::DecisionRepositoryLimits;
 use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
@@ -45,6 +47,7 @@ use self::executable::{
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::provider_activation_state::DurableProviderActivationState;
+use self::source_lifecycle::ProductionSourceLifecycleAuthority;
 use crate::application::analysis::{
     AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority,
     GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
@@ -52,10 +55,14 @@ use crate::application::analysis::{
     ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
     ProductionGovernedBacktestRepository,
 };
+use crate::application::decision::{DecisionApplication, DecisionApplicationError};
 use crate::application::model::runtime::{
     ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
 };
-use crate::application::model::{ModelDomainService, ModelDomainServiceError};
+use crate::application::model::{
+    ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
+    ModelDomainService, ModelDomainServiceError,
+};
 use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
@@ -64,6 +71,7 @@ use crate::application::{
     PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
+    SourceLifecycleAuthority,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
@@ -88,6 +96,10 @@ const MAXIMUM_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_ROW_GROUP_ROWS: usize = 65_536;
 const ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const MODEL_EVALUATION_RECORDS: usize = 4_096;
+const FORECAST_VINTAGES: usize = 4_096;
+const FORECAST_OUTCOMES: usize = 65_536;
+const FORECAST_INDEX_BYTES: usize = LocalAuthorityStateStore::maximum_payload_bytes();
+const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -129,6 +141,12 @@ pub struct LocalProduct {
     provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
     provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
+    decisions: Arc<DecisionApplication>,
+    research_domain: Arc<dyn ApplicationDomainService>,
+    analysis_domain: Arc<dyn ApplicationDomainService>,
+    model_domain: Arc<dyn ApplicationDomainService>,
+    backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar>,
+    backtests: Arc<dyn GovernedBacktestAuthority>,
     model_runtime: Option<Arc<ProductionModelRuntime>>,
     fair_value_inputs: ProductionFairValueInputAuthority,
 }
@@ -241,6 +259,15 @@ impl LocalProduct {
             provider_rate,
             Arc::clone(&provider_activation),
         );
+        let source_lifecycle: Arc<dyn SourceLifecycleAuthority> =
+            Arc::new(ProductionSourceLifecycleAuthority::new(
+                paths.clone(),
+                Arc::clone(&onboarding),
+                Arc::clone(&provider_activation),
+                Arc::clone(&provider_portal_activation),
+                provider_activation_state.clone(),
+                paper.source_lifecycle_control(),
+            ));
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
@@ -249,6 +276,7 @@ impl LocalProduct {
             source_discovery,
             portal_activation.clone(),
             portal_activation,
+            source_lifecycle,
         )?);
         let research_domains = ResearchApplicationServices::new_with_artifacts(
             Arc::clone(&research),
@@ -259,6 +287,10 @@ impl LocalProduct {
         let portfolio = Arc::new(PortfolioApplicationService::try_new(
             &paths,
             PortfolioApplicationLimits::standard(),
+        )?);
+        let decisions = Arc::new(DecisionApplication::open(
+            paths.control_root()?.decision_database_location(),
+            decision_repository_limits()?,
         )?);
         let executable_sha256 = current_executable_sha256()?;
         let strategies = production_backtest_strategy_registry(executable_sha256)?;
@@ -288,13 +320,27 @@ impl LocalProduct {
                 Arc::new(analysis_catalog()?),
                 research.analytical_reader(),
                 Arc::clone(&artifact_repository),
-                backtest_registrar,
-                backtests,
+                Arc::clone(&backtest_registrar),
+                Arc::clone(&backtests),
             ),
         );
 
         let model_limits = ProductionModelRuntimeLimits::standard()?;
-        let (model_runtime, model) = open_model_domain(&paths, &config, model_limits)?;
+        let forecast_limits = ForecastApplicationLimits::try_new(
+            NonZeroUsize::new(FORECAST_VINTAGES).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+            NonZeroUsize::new(FORECAST_OUTCOMES).ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+            NonZeroUsize::new(FORECAST_INDEX_BYTES)
+                .ok_or(LocalProductError::InvalidCodeOwnedLimit)?,
+        )?;
+        let forecasts = Arc::new(ForecastApplicationService::try_open(
+            paths
+                .control_root()?
+                .root()
+                .join(FORECAST_AUTHORITY_DIRECTORY),
+            Arc::clone(&artifact_repository),
+            forecast_limits,
+        )?);
+        let (model_runtime, model) = open_model_domain(&paths, &config, model_limits, forecasts)?;
 
         let fair_value_inputs =
             ProductionFairValueInputAuthority::try_new(FairValueInputAuthorityLimits::standard())?;
@@ -324,8 +370,8 @@ impl LocalProduct {
             source,
             &research_domains,
             portfolio.clone(),
-            analysis,
-            model,
+            analysis.clone(),
+            model.clone(),
             fair_value,
             &paper,
             config.source_shutdown(),
@@ -341,6 +387,12 @@ impl LocalProduct {
             provider_portal_activation,
             provider_activation_state,
             portfolio,
+            decisions,
+            research_domain: research_domains.research(),
+            analysis_domain: analysis,
+            model_domain: model,
+            backtest_registrar,
+            backtests,
             model_runtime,
             fair_value_inputs,
         })
@@ -450,6 +502,31 @@ impl LocalProduct {
         Arc::clone(&self.portfolio)
     }
 
+    /// Returns the sole durable decision workflow authority.
+    pub fn decisions(&self) -> Arc<DecisionApplication> {
+        Arc::clone(&self.decisions)
+    }
+
+    pub(crate) fn research_domain(&self) -> Arc<dyn ApplicationDomainService> {
+        Arc::clone(&self.research_domain)
+    }
+
+    pub(crate) fn analysis_domain(&self) -> Arc<dyn ApplicationDomainService> {
+        Arc::clone(&self.analysis_domain)
+    }
+
+    pub(crate) fn model_domain(&self) -> Arc<dyn ApplicationDomainService> {
+        Arc::clone(&self.model_domain)
+    }
+
+    pub(crate) fn backtest_registrar(&self) -> Arc<dyn GovernedBacktestInputRegistrar> {
+        Arc::clone(&self.backtest_registrar)
+    }
+
+    pub(crate) fn backtests(&self) -> Arc<dyn GovernedBacktestAuthority> {
+        Arc::clone(&self.backtests)
+    }
+
     /// Returns model-admission authority when a signed training release was configured.
     pub fn model_runtime(&self) -> Option<Arc<ProductionModelRuntime>> {
         self.model_runtime.as_ref().map(Arc::clone)
@@ -477,6 +554,11 @@ impl std::fmt::Debug for LocalProduct {
             )
             .field("provider_activation_state", &"[DURABLE ACTIVATION RECIPES]")
             .field("portfolio", &"[PORTFOLIO AUTHORITY]")
+            .field("decisions", &"[DURABLE DECISION AUTHORITY]")
+            .field(
+                "job_domain_authorities",
+                &"[SHARED APPLICATION AUTHORITIES]",
+            )
             .field("model_runtime_configured", &self.model_runtime.is_some())
             .field("fair_value_inputs", &self.fair_value_inputs)
             .finish()
@@ -533,6 +615,11 @@ fn experiment_limits() -> Result<ExperimentLimits, LocalProductError> {
     .map_err(Into::into)
 }
 
+fn decision_repository_limits() -> Result<DecisionRepositoryLimits, LocalProductError> {
+    DecisionRepositoryLimits::try_new(4_096, 8_192, 64, 8_192, 8_192, 16_384, 8_192)
+        .map_err(|_error| LocalProductError::InvalidCodeOwnedLimit)
+}
+
 fn fair_value_limits() -> Result<FairValueLimits, LocalProductError> {
     FairValueLimits::try_new(FairValueLimitInput {
         max_measurements: 4_096,
@@ -556,6 +643,7 @@ fn open_model_domain(
     paths: &LocalPaths,
     config: &AppConfig,
     limits: ProductionModelRuntimeLimits,
+    forecasts: Arc<ForecastApplicationService>,
 ) -> Result<(Option<Arc<ProductionModelRuntime>>, Arc<ModelDomainService>), LocalProductError> {
     let durable = ProductionModelRuntime::has_durable_admissions(paths, limits)?;
     let (runtime, snapshot) = match config.training_release_root() {
@@ -582,14 +670,15 @@ fn open_model_domain(
             (Some(runtime), snapshot)
         }
     };
-    let (registry, backends) = snapshot.into_parts();
     let evaluation_records = NonZeroUsize::new(MODEL_EVALUATION_RECORDS)
         .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
-    let model = Arc::new(ModelDomainService::try_new(
-        registry,
-        backends,
-        evaluation_records,
-    )?);
+    let model = Arc::new(
+        ModelDomainService::try_from_runtime_snapshot_with_forecasts(
+            snapshot,
+            evaluation_records,
+            forecasts,
+        )?,
+    );
     Ok((runtime, model))
 }
 
@@ -666,6 +755,9 @@ pub enum LocalProductError {
     /// Portfolio authority recovery failed.
     #[error(transparent)]
     Portfolio(#[from] PortfolioApplicationServiceError),
+    /// Durable decision authority recovery failed.
+    #[error(transparent)]
+    Decision(#[from] DecisionApplicationError),
     /// Executable identity or ONNX sibling admission failed.
     #[error(transparent)]
     Executable(#[from] ExecutableIdentityError),
@@ -703,6 +795,9 @@ pub enum LocalProductError {
     /// Model application service construction failed.
     #[error(transparent)]
     ModelDomain(#[from] ModelDomainServiceError),
+    /// Durable forecast authority recovery or publication configuration failed.
+    #[error(transparent)]
+    Forecast(#[from] ForecastApplicationError),
     /// Fair-value input authority construction failed.
     #[error(transparent)]
     FairValueInput(#[from] FairValueInputAuthorityError),

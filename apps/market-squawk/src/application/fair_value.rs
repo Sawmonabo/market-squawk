@@ -5,16 +5,19 @@ use std::{collections::HashSet, fmt, str::FromStr, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use chrono::DateTime;
 use market_squawk_data::DatasetId;
-use market_squawk_domain::{AccountId, Currency, InstrumentId, Money, Timestamp, VenueId};
+use market_squawk_domain::{
+    AccountId, Currency, FairValueHierarchy, InstrumentId, Money, Timestamp, VenueId,
+};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
 };
 use market_squawk_valuation::{
-    ActorId, ApprovedMarketAccess, ClassificationRuleset, DecisionId, EvidenceOrigin,
+    ActorId, ApprovalStatus, ApprovedMarketAccess, AuditEventId, AuditEventKind,
+    ClassificationRuleset, DecisionId, EvidenceOrigin, FairValueAuditCursor, FairValueAuditEvent,
     FairValueError, FairValueService, InputSignificance, MarketAccess, MarketAccessAssessmentId,
-    MarketPriceSelection, MeasurementId, ValuationAmount, ValuationInput, ValuationMeasurement,
-    ValuationMeasurementSpec, ValuationMethod,
+    MarketPriceSelection, MeasurementId, OverrideProposal, ValuationAmount, ValuationApprovalId,
+    ValuationInput, ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
@@ -52,6 +55,9 @@ const CLASSIFY: &str = "FairValue.Classify";
 const APPROVE: &str = "FairValue.Approve";
 const APPROVE_MARKET_ACCESS: &str = "FairValue.ApproveMarketAccess";
 const GET_MARKET_ACCESS: &str = "FairValue.GetMarketAccess";
+const PROPOSE_OVERRIDE: &str = "FairValue.ProposeOverride";
+const REVOKE_APPROVAL: &str = "FairValue.RevokeApproval";
+const LIST_AUDIT_EVENTS: &str = "FairValue.ListAuditEvents";
 
 /// Producer family named by one opaque, application-resolved receipt selector.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -791,6 +797,124 @@ impl FairValueDomainService {
         )
     }
 
+    async fn propose_override(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let measurement_id = admitted_measurement_id(request.arguments())?;
+        let decision_id = admitted_decision_id(request.arguments())?;
+        let requested_hierarchy = match required_string(request.arguments(), "requestedHierarchy")?
+        {
+            "level_2" => FairValueHierarchy::Level2,
+            "level_3" => FairValueHierarchy::Level3,
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        let justification = required_string(request.arguments(), "justification")?;
+        let prepared_by = ActorId::try_from(required_string(request.arguments(), "preparedBy")?)
+            .map_err(map_fair_value_error)?;
+        let prepared_at = admitted_timestamp(request.arguments(), "preparedAt")?;
+        let expires_at = admitted_timestamp(request.arguments(), "expiresAt")?;
+        let mut state = self.lock_state(context).await?;
+        let decision = state.decision(decision_id).ok_or(ServiceError::NotFound)?;
+        if decision.measurement_id() != measurement_id {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let proposal = state
+            .propose_override(
+                decision_id,
+                requested_hierarchy,
+                justification,
+                prepared_by,
+                prepared_at,
+                expires_at,
+            )
+            .map_err(map_fair_value_error)?;
+        drop(state);
+        one_result(override_proposal_value(&proposal), request, context)
+    }
+
+    async fn revoke_approval(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let approval_id =
+            ValuationApprovalId::from_str(required_string(request.arguments(), "approvalId")?)
+                .map_err(|_| ServiceError::InvalidRequest)?;
+        let revoked_by = ActorId::try_from(required_string(request.arguments(), "revokedBy")?)
+            .map_err(map_fair_value_error)?;
+        let revoked_at = admitted_timestamp(request.arguments(), "revokedAt")?;
+        let reason = required_string(request.arguments(), "reason")?;
+        let mut state = self.lock_state(context).await?;
+        let revocation = state
+            .revoke_approval(approval_id, revoked_by, revoked_at, reason)
+            .map_err(map_fair_value_error)?;
+        let approval = state.approval(approval_id).ok_or(ServiceError::Internal)?;
+        let status = state
+            .approval_status(approval_id, revoked_at)
+            .map_err(map_fair_value_error)?;
+        if status != ApprovalStatus::Revoked {
+            return Err(ServiceError::Internal);
+        }
+        drop(state);
+        one_result(
+            json!({
+                "approval": approval_value(&approval, status, Some(&revocation)),
+            }),
+            request,
+            context,
+        )
+    }
+
+    async fn list_audit_events(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let limits = admitted_result_limits(request, context)?;
+        let requested_limit = request
+            .arguments()
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(ServiceError::InvalidRequest)?;
+        if requested_limit == 0 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let limit = requested_limit
+            .min(limits.maximum_result_items())
+            .min(self.maximum_query_results);
+        let after = admitted_audit_cursor(request.arguments())?;
+        let state = self.lock_state(context).await?;
+        let page = state
+            .audit_page(after, limit)
+            .map_err(map_fair_value_error)?;
+        drop(state);
+        let values = page
+            .events()
+            .iter()
+            .map(|event| audit_event_value(event))
+            .collect::<Vec<_>>();
+        let next_cursor = page.next_cursor().map(|cursor| {
+            json!({
+                "sequence": cursor.sequence(),
+                "eventId": cursor.event_id().to_string(),
+            })
+        });
+        let returned = values.len();
+        bounded_result(
+            json!({
+                "events": values,
+                "totalEventCount": page.total_count(),
+                "nextCursor": next_cursor,
+            }),
+            returned,
+            page.available_from_cursor(),
+            limits,
+        )
+    }
+
     async fn approve_market_access(
         &self,
         request: &TypedToolRequest,
@@ -987,6 +1111,9 @@ impl ApplicationDomainService for FairValueDomainService {
             MEASURE => self.measure(&request, &context).await,
             CLASSIFY => self.classify(&request, &context).await,
             APPROVE => self.approve(&request, &context).await,
+            PROPOSE_OVERRIDE => self.propose_override(&request, &context).await,
+            REVOKE_APPROVAL => self.revoke_approval(&request, &context).await,
+            LIST_AUDIT_EVENTS => self.list_audit_events(&request, &context).await,
             APPROVE_MARKET_ACCESS => self.approve_market_access(&request, &context).await,
             GET_MARKET_ACCESS => self.market_access(&request, &context).await,
             _ => Err(ServiceError::NotFound),
@@ -1278,6 +1405,104 @@ fn admitted_decision_id(arguments: &Map<String, Value>) -> Result<DecisionId, Se
         .map_err(|_| ServiceError::InvalidRequest)
 }
 
+fn admitted_audit_cursor(
+    arguments: &Map<String, Value>,
+) -> Result<Option<FairValueAuditCursor>, ServiceError> {
+    let Some(value) = arguments.get("after") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let cursor = value.as_object().ok_or(ServiceError::InvalidRequest)?;
+    let sequence = cursor
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::InvalidRequest)?;
+    let event_id = AuditEventId::from_str(required_string(cursor, "eventId")?)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    FairValueAuditCursor::try_new(sequence, event_id)
+        .map(Some)
+        .map_err(map_fair_value_error)
+}
+
+fn override_proposal_value(proposal: &OverrideProposal) -> Value {
+    let valuation_override = proposal.valuation_override();
+    json!({
+        "override": {
+            "overrideId": valuation_override.id().to_string(),
+            "baseDecisionId": valuation_override.base_decision_id().to_string(),
+            "requestedHierarchy": fair_value_hierarchy_name(
+                valuation_override.requested_hierarchy()
+            ),
+            "justification": valuation_override.justification(),
+            "preparedBy": valuation_override.prepared_by().as_str(),
+            "preparedAt": timestamp_value(valuation_override.prepared_at()),
+            "expiresAt": timestamp_value(valuation_override.expires_at()),
+        },
+        "classification": classification_value(proposal.decision()),
+    })
+}
+
+fn audit_event_value(event: &FairValueAuditEvent) -> Value {
+    let subject = match event.kind() {
+        AuditEventKind::Classified {
+            measurement_id,
+            decision_id,
+        } => json!({
+            "kind": "classified",
+            "measurementId": measurement_id.to_string(),
+            "decisionId": decision_id.to_string(),
+        }),
+        AuditEventKind::OverrideProposed {
+            override_id,
+            decision_id,
+        } => json!({
+            "kind": "override_proposed",
+            "overrideId": override_id.to_string(),
+            "decisionId": decision_id.to_string(),
+        }),
+        AuditEventKind::Approved {
+            approval_id,
+            decision_id,
+        } => json!({
+            "kind": "approved",
+            "approvalId": approval_id.to_string(),
+            "decisionId": decision_id.to_string(),
+        }),
+        AuditEventKind::Revoked {
+            revocation_id,
+            approval_id,
+        } => json!({
+            "kind": "revoked",
+            "revocationId": revocation_id.to_string(),
+            "approvalId": approval_id.to_string(),
+        }),
+        AuditEventKind::MarketAccessApproved { assessment_id } => json!({
+            "kind": "market_access_approved",
+            "assessmentId": assessment_id.to_string(),
+        }),
+    };
+    json!({
+        "auditEventId": event.id().to_string(),
+        "sequence": event.sequence(),
+        "previousEventId": event.previous_event_id().map(|value| value.to_string()),
+        "subject": subject,
+        "actor": event.actor().as_str(),
+        "businessAt": timestamp_value(event.business_at()),
+        "occurredAt": timestamp_value(event.occurred_at()),
+    })
+}
+
+const fn fair_value_hierarchy_name(hierarchy: FairValueHierarchy) -> &'static str {
+    match hierarchy {
+        FairValueHierarchy::Level1 => "level_1",
+        FairValueHierarchy::Level2 => "level_2",
+        FairValueHierarchy::Level3 => "level_3",
+        FairValueHierarchy::Unclassified => "unclassified",
+    }
+}
+
 fn admitted_timestamp(
     arguments: &Map<String, Value>,
     field: &str,
@@ -1417,6 +1642,7 @@ fn map_fair_value_error(error: FairValueError) -> ServiceError {
         | FairValueError::InvalidOverride
         | FairValueError::InvalidApprovalWindow
         | FairValueError::AlreadyRevoked
-        | FairValueError::InvalidRevocationTime => ServiceError::InvalidRequest,
+        | FairValueError::InvalidRevocationTime
+        | FairValueError::InvalidAuditCursor => ServiceError::InvalidRequest,
     }
 }

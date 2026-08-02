@@ -8,28 +8,26 @@ use market_squawk_runtime::{
     AppRequestEnvelope, ApplicationDispatcher, ClientCredentialRegistration, CredentialRegistry,
     DispatchError, NamedClient, OperationEffect,
 };
-use market_squawk_services::{ServiceError, ServiceErrorClass, ToolAuthorization};
+use market_squawk_services::{ServiceError, ServiceErrorClass, ToolAuthorization, ToolServices};
 use serde_json::{Value, json};
 
-use crate::{LocalProduct, application::Application, jobs::InstalledJobAuthority};
+use crate::LocalProduct;
 
-use super::jobs::InstalledJobOperations;
+use super::tool_services::InstalledToolServices;
 
 /// Runtime dispatch adapter over the sole transport-neutral application authority.
 pub(super) struct InstalledApplicationDispatcher {
-    application: Arc<Application>,
-    jobs: InstalledJobOperations,
+    services: Arc<InstalledToolServices>,
     bootstrap: Value,
 }
 
 impl InstalledApplicationDispatcher {
     pub(super) fn try_new(
-        application: Arc<Application>,
+        services: Arc<InstalledToolServices>,
         product: &LocalProduct,
-        jobs: &InstalledJobAuthority,
         runtime: market_squawk_runtime::RuntimeIdentity,
     ) -> Result<Self, DispatchError> {
-        let operations = application
+        let operations = services
             .capabilities()
             .tools()
             .iter()
@@ -70,7 +68,6 @@ impl InstalledApplicationDispatcher {
                 "contractVersion": crate::application::APPLICATION_CONTRACT_VERSION,
                 "operations": operations,
             },
-            "jobOperations": super::jobs::OPERATIONS,
             "sources": {
                 "profiles": profiles,
                 "encryptedFileFallback": encrypted_fallback,
@@ -84,8 +81,7 @@ impl InstalledApplicationDispatcher {
             },
         });
         Ok(Self {
-            application,
-            jobs: InstalledJobOperations::new(jobs),
+            services,
             bootstrap,
         })
     }
@@ -95,8 +91,7 @@ impl fmt::Debug for InstalledApplicationDispatcher {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InstalledApplicationDispatcher")
-            .field("application", &"[APPLICATION AUTHORITY]")
-            .field("jobs", &self.jobs)
+            .field("services", &"[INSTALLED TOOL SERVICES]")
             .field("bootstrap", &"[NON-SECRET PRODUCT SNAPSHOT]")
             .finish()
     }
@@ -112,11 +107,8 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         &self,
         operation: &market_squawk_domain::SourceIdentifier,
     ) -> Result<OperationEffect, DispatchError> {
-        if let Some(effect) = InstalledJobOperations::effect(operation.as_str()) {
-            return Ok(effect);
-        }
         let descriptor = self
-            .application
+            .services
             .capabilities()
             .find(operation.as_str())
             .cloned()
@@ -138,17 +130,20 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         request: &AppRequestEnvelope,
         context: market_squawk_services::RequestContext,
     ) -> Result<Value, DispatchError> {
-        if InstalledJobOperations::effect(request.operation().as_str()).is_some() {
-            return self
-                .jobs
-                .dispatch(request.operation().as_str(), request.arguments(), &context)
-                .await;
-        }
         let Value::Object(arguments) = request.arguments() else {
             return Err(DispatchError::Rejected);
         };
-        self.application
-            .invoke(request.operation().as_str(), arguments.clone(), context)
+        let descriptor = self
+            .services
+            .capabilities()
+            .find(request.operation().as_str())
+            .cloned()
+            .ok_or(DispatchError::Rejected)?;
+        let request = descriptor
+            .admit(arguments.clone())
+            .map_err(map_service_error)?;
+        self.services
+            .call(request, context)
             .await
             .map(market_squawk_services::TypedToolResult::into_envelope)
             .map_err(map_service_error)

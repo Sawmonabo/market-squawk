@@ -19,8 +19,10 @@ use thiserror::Error;
 
 pub mod analysis;
 mod contracts;
+pub mod decision;
 mod domain_support;
 pub mod fair_value;
+pub mod job;
 mod live_fair_value;
 pub mod model;
 mod paper;
@@ -40,12 +42,13 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub use paper::PaperApplicationServices;
+pub(crate) use paper::PaperSourceLifecycleControl;
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
-    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscovery,
-    ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
+    ResearchIngestCommitAuthority, ResearchIngestCompositionError, ResearchIngestCoordinator,
+    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
     ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
 };
 pub(crate) use research::{
@@ -54,7 +57,8 @@ pub(crate) use research::{
 pub use source::{
     EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
     EphemeralSourceInspectionResult, SourceApplicationError, SourceDomainService,
-    SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
+    SourceLifecycleAuthority, SourceLifecycleCommand, SourceLifecycleError, SourceLifecycleReceipt,
+    SourceLifecycleStatus, SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
     SourceRuntimeSnapshotError, SourceRuntimeView, SourceRuntimeViewError,
 };
 
@@ -178,8 +182,8 @@ impl ApplicationDomainServices {
     }
 
     fn service(&self, domain: ServiceDomain) -> Option<&Arc<dyn ApplicationDomainService>> {
-        self.services
-            .get(domain_index(domain))
+        domain_index(domain)
+            .and_then(|index| self.services.get(index))
             .filter(|service| service.domain() == domain)
     }
 }
@@ -334,7 +338,9 @@ impl Application {
                 tokio::time::timeout_at(deadline, service.finish_shutdown(deadline.into_std()))
                     .await
                     .unwrap_or(Err(ServiceError::DeadlineExceeded));
-            report.failures[domain_index(service.domain())] = outcome.err();
+            if let Some(index) = domain_index(service.domain()) {
+                report.failures[index] = outcome.err();
+            }
         }
         *retained = Some(report);
         report
@@ -479,7 +485,10 @@ impl ApplicationShutdownReport {
     /// Returns the terminal failure for one domain, if any.
     #[must_use]
     pub const fn failure(self, domain: ServiceDomain) -> Option<ServiceError> {
-        self.failures[domain_index(domain)]
+        match domain_index(domain) {
+            Some(index) => self.failures[index],
+            None => None,
+        }
     }
 }
 
@@ -524,19 +533,20 @@ fn effective_service_limits(
     .map_err(|_error| ServiceError::InvalidRequest)
 }
 
-const fn domain_index(domain: ServiceDomain) -> usize {
+const fn domain_index(domain: ServiceDomain) -> Option<usize> {
     match domain {
-        ServiceDomain::Source => 0,
-        ServiceDomain::Market => 1,
-        ServiceDomain::Research => 2,
-        ServiceDomain::Fundamental => 3,
-        ServiceDomain::Macro => 4,
-        ServiceDomain::Portfolio => 5,
-        ServiceDomain::Analysis => 6,
-        ServiceDomain::Model => 7,
-        ServiceDomain::FairValue => 8,
-        ServiceDomain::Bot => 9,
-        ServiceDomain::Execution => 10,
+        ServiceDomain::Job | ServiceDomain::Decision => None,
+        ServiceDomain::Source => Some(0),
+        ServiceDomain::Market => Some(1),
+        ServiceDomain::Research => Some(2),
+        ServiceDomain::Fundamental => Some(3),
+        ServiceDomain::Macro => Some(4),
+        ServiceDomain::Portfolio => Some(5),
+        ServiceDomain::Analysis => Some(6),
+        ServiceDomain::Model => Some(7),
+        ServiceDomain::FairValue => Some(8),
+        ServiceDomain::Bot => Some(9),
+        ServiceDomain::Execution => Some(10),
     }
 }
 
