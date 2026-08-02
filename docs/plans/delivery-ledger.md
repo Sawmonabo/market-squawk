@@ -6,6 +6,54 @@ This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
+## Active installed-product V1 execution
+
+- Active branch: `feature/v1-installed-product-experience`, based on
+  `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
+  release-branch integration is authorized in this execution scope.
+- Wave 3 implementation is frozen and pushed at commit
+  `e0b21e08f31c94d134d0becedca00c8173d1c7d3`, tree
+  `960c56566858d25080c47c9b0446c17b3e277b21`. It replaces generic state projections with real
+  installed-service workspaces for Overview and lookup, Markets, Sources, Research, Operations,
+  Portfolio, Models and forecasts, Decisions and targets, Backtests, Paper Execution, Risk, and
+  Fair Value.
+- The native desktop boundary now exposes closed, typed application operations; preserves integers
+  outside JavaScript's exact range as decimal strings; stages training inputs through native file
+  custody; and starts governed backtests from canonical JSON selected and parsed entirely in Rust.
+  The WebView does not receive an ambient path or approximate point-in-time cutoff.
+- Fresh implementation evidence before freezing the commit:
+
+  - Desktop production build and TypeScript type check passed.
+  - The existing three critical desktop journeys passed; no additional broad UI suite was added.
+  - Locked offline `cargo check -p market-squawk-desktop` passed from a clean generated cache in
+    1 minute 59 seconds.
+  - The desktop library's three focused tests passed, including exact WebView integer transport.
+  - Rust formatting, diff integrity, and workspace-boundary policy passed.
+  - Route-level loading reduced the common JavaScript entry from about 641 kB to about 491 kB;
+    product workspaces are emitted as separate chunks.
+- Generated build state reached the agreed 20 GiB ceiling during concurrent verification. The
+  active worktree's `target/` was safely cleared without touching source or Git state, reclaiming
+  19.4 GiB; the clean focused Rust gates then rebuilt only the required dependency graph.
+- Wave 3 is not yet an accepted checkpoint. Task 20 still requires exact-head focused gates and the
+  grouped integration review with no unresolved substantiated finding.
+- Remaining implementation after Task 20 is the Stage 4 barrier:
+
+  1. Product backup, restore, updates, structured logs, typed settings, and workspace coordination.
+  2. Per-user service/relay registration and trusted update admission on every supported platform.
+  3. Real Claude Code and Codex MCP discovery, idempotent registration, protocol verification, and
+     repair over the one shared installed service.
+  4. Durable first-run setup plus complete Updates, Backup & Recovery, Logs, Settings, and MCP
+     desktop workflows.
+  5. Identical owner-testable packages, truthful maintained documentation, source-lock refresh,
+     clean-machine/package verification, final Quarter 4 review, and owner handoff without public
+     publication.
+- Release-relevant data gaps found during Wave 3 are retained as work, not silently deferred:
+  detailed paper balances/P&L and central risk evidence; per-holding mark provenance and exact
+  reconciliation values; model drift/admission/split evidence and observed-history forecast
+  context; decision run/dossier/target discovery and guided review authority; complete backtest
+  assumption/cohort evidence and controlled report retrieval; service/storage diagnostics; and
+  bounded fair-value override/revocation workflows.
+
 ## Current v1.0.0 release state
 
 - The accepted desktop and installer product candidate is
