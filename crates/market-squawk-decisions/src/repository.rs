@@ -617,13 +617,12 @@ impl DecisionRepository {
             DecisionRecord::ScreenExecution(execution) => Some(execution),
             _ => None,
         });
-        if let Some(after) = after {
-            if executions
+        if let Some(after) = after
+            && executions
                 .position(|execution| execution.run().id() == after)
                 .is_none()
-            {
-                return Err(DecisionRepositoryError::NotFound);
-            }
+        {
+            return Err(DecisionRepositoryError::NotFound);
         }
         result.extend(executions.take(maximum).map(|execution| {
             ScreenRunIndexEntry::new(execution.run().clone(), execution.candidates().len())
@@ -685,13 +684,12 @@ impl DecisionRepository {
             }
             _ => None,
         });
-        if let Some(after) = after {
-            if dossiers
+        if let Some(after) = after
+            && dossiers
                 .position(|dossier| dossier.dossier().id() == after)
                 .is_none()
-            {
-                return Err(DecisionRepositoryError::NotFound);
-            }
+        {
+            return Err(DecisionRepositoryError::NotFound);
         }
         result.extend(dossiers.take(maximum).cloned());
         Ok(result)
@@ -845,10 +843,10 @@ impl DecisionRepository {
             .try_reserve_exact(count)
             .map_err(|_error| DecisionRepositoryError::Allocation)?;
         let mut entries = self.target_index.iter();
-        if let Some(after) = after {
-            if entries.position(|entry| entry.id() == after).is_none() {
-                return Err(DecisionRepositoryError::NotFound);
-            }
+        if let Some(after) = after
+            && entries.position(|entry| entry.id() == after).is_none()
+        {
+            return Err(DecisionRepositoryError::NotFound);
         }
         result.extend(entries.take(maximum).cloned());
         Ok(result)
