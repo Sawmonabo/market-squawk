@@ -14,6 +14,8 @@ use super::runtime::{WriterFixedStorageOwner, WriterFixedStorageReceipt};
 use super::sink::CaptureIoContext;
 use super::{CaptureWriterOutcome, deadline_after, writer_failed};
 
+const TERMINATION_OBSERVATION_INTERVAL: Duration = Duration::from_millis(1);
+
 #[derive(Debug)]
 pub(in crate::capture) struct WriterLifecycleCore {
     pub(super) shutdown_requested: AtomicBool,
@@ -285,7 +287,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
             let remaining = self.deadline.saturating_duration_since(now);
             tokio::select! {
                 () = self.io_context.lifecycle.completion.notified() => {}
-                () = tokio::time::sleep(remaining) => {}
+                () = tokio::time::sleep(remaining.min(TERMINATION_OBSERVATION_INTERVAL)) => {}
             }
         }
     }
@@ -297,7 +299,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
         while !self.is_worker_terminated() {
             tokio::select! {
                 () = self.io_context.lifecycle.completion.notified() => {}
-                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                () = tokio::time::sleep(TERMINATION_OBSERVATION_INTERVAL) => {}
             }
         }
     }
