@@ -18,6 +18,7 @@ mod native;
 mod onnx;
 mod registry;
 mod training_environment;
+mod training_protocol;
 
 pub use admission::{
     BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
@@ -64,8 +65,15 @@ pub use registry::{
     ModelRegistry, ModelRegistryError,
 };
 pub use training_environment::{
-    TrainingEnvironmentError, VerifiedTrainingEnvironment, verify_application_training_environment,
-    verify_python_training_environment, verify_validator_training_environment,
+    TrainingEnvironmentError, VerifiedTrainingEnvironment, VerifiedTrainingWorkerProgram,
+    verify_application_training_environment, verify_python_training_environment,
+    verify_validator_training_environment,
+};
+pub use training_protocol::{
+    MAX_TRAINING_WORKER_EVENT_BYTES, MAX_TRAINING_WORKER_EVENTS, MAX_TRAINING_WORKER_STDERR_BYTES,
+    MAX_TRAINING_WORKER_STREAM_BYTES, TRAINING_WORKER_SCHEMA_VERSION, TrainingWorkerCandidate,
+    TrainingWorkerEvent, TrainingWorkerPhase, TrainingWorkerProgress, TrainingWorkerProtocolError,
+    TrainingWorkerProtocolSession, TrainingWorkerStderrEvidence,
 };
 
 /// Exact typed model failure before an execution strategy can create an order intent.

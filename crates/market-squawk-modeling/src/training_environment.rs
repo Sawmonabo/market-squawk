@@ -63,6 +63,35 @@ pub struct VerifiedTrainingEnvironment {
     python_tag: Box<str>,
     python_version: Box<str>,
     training_code_revision: Box<str>,
+    training_worker: VerifiedTrainingWorkerProgram,
+}
+
+/// Exact installed launcher identity for process-supervised candidate production.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedTrainingWorkerProgram {
+    path: PathBuf,
+    sha256: [u8; 32],
+    size_bytes: u64,
+}
+
+impl VerifiedTrainingWorkerProgram {
+    /// Returns the canonical installed launcher path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the signed launcher digest rechecked by training-environment verification.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    /// Returns the signed launcher byte length.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 impl VerifiedTrainingEnvironment {
@@ -112,6 +141,12 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the exact launcher evidence for the process-tree supervisor.
+    #[must_use]
+    pub const fn training_worker(&self) -> &VerifiedTrainingWorkerProgram {
+        &self.training_worker
     }
 }
 
@@ -242,6 +277,8 @@ struct VerifiedFiles {
     onnx_worker_sha256: [u8; 32],
     onnx_worker_size_bytes: u64,
     validator_sha256: [u8; 32],
+    training_driver_sha256: [u8; 32],
+    training_driver_size_bytes: u64,
     root: PathBuf,
 }
 
@@ -342,6 +379,11 @@ impl VerifiedFiles {
             python_tag: self.environment.interpreter.python_tag.into(),
             python_version: self.environment.interpreter.version.into(),
             training_code_revision: self.environment.training_code_revision.into(),
+            training_worker: VerifiedTrainingWorkerProgram {
+                path: self.root.join(training_driver_relative_path()),
+                sha256: self.training_driver_sha256,
+                size_bytes: self.training_driver_size_bytes,
+            },
         })
     }
 }
@@ -511,6 +553,8 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         onnx_worker_sha256: onnx_worker.sha256,
         onnx_worker_size_bytes: onnx_worker.size_bytes,
         validator_sha256: validator.sha256,
+        training_driver_sha256: training_driver.sha256,
+        training_driver_size_bytes: training_driver.size_bytes,
         root: canonical_root,
     })
 }

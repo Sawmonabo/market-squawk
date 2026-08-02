@@ -6,7 +6,6 @@ from dataclasses import replace
 import hashlib
 import io
 import json
-import math
 from pathlib import Path
 import stat
 import subprocess
@@ -29,9 +28,13 @@ from market_squawk.finance import OperationContext
 from market_squawk.training import TrainingRun, TrainingValidationError
 from market_squawk.training_driver import (
     _strict_regular_file_coordinate,
-    admit_candidate,
     finalize_candidate,
     write_proposal,
+)
+from market_squawk.worker_protocol import (
+    MAX_EVENT_BYTES,
+    CandidateEvidence,
+    WorkerProtocolWriter,
 )
 from test_data import _fixture
 
@@ -115,13 +118,13 @@ def _driver_config(
     }
 
 
-def _signed_prediction(
+def _signed_prediction_attempt(
     data_root: Path,
     request_root: Path,
     *,
     model_id: str,
     bundle_id: str,
-) -> float:
+) -> subprocess.CompletedProcess[bytes]:
     request = request_root / "prediction.json"
     _write_json(
         request,
@@ -135,29 +138,26 @@ def _signed_prediction(
         },
     )
     request = _strict_regular_file_coordinate(request, "signed prediction request")
-    release_root = Path(sys.prefix).resolve(strict=True)
-    application = _native_release_executable("market-squawk")
-    completed = subprocess.run(
+    return subprocess.run(
         [
-            str(application),
+            str(_native_release_executable("market-squawk")),
             "--data-dir",
             str(data_root),
             "--training-release-root",
-            str(release_root),
+            str(Path(sys.prefix).resolve(strict=True)),
             "--output",
             "json",
             "model",
             "predict",
             str(request),
         ],
-        check=True,
+        check=False,
         stdin=subprocess.DEVNULL,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         timeout=70,
         env=_native_subprocess_environment(),
     )
-    value = json.loads(completed.stdout.decode("ascii"))
-    return value["data"]["score"]
 
 
 def _initialize_signed_data_root(data_root: Path) -> None:
@@ -184,6 +184,86 @@ def _initialize_signed_data_root(data_root: Path) -> None:
 
 
 class TrainingBundleContracts(unittest.TestCase):
+    def test_worker_protocol_is_ordered_bounded_and_terminal_once(self) -> None:
+        stream = io.BytesIO()
+        worker = WorkerProtocolWriter(
+            stream,
+            run_id="018f3c2a-91ab-7ccd-b3de-123456789abc",
+            generation=7,
+        )
+        worker.progress("validation", "Training request validated.", 1, 2)
+        worker.result(
+            "complete",
+            "Model candidate produced for Rust validation.",
+            CandidateEvidence(
+                admission_request_sha256="99" * 32,
+                candidate_directory="models/fixture-v1/candidate",
+                metadata_sha256="11" * 32,
+                artifact_sha256="22" * 32,
+                training_run_sha256="33" * 32,
+                authority_sha256="44" * 32,
+                dataset_export_sha256="55" * 32,
+                dataset_selection_sha256="66" * 32,
+                catalog_identity_sha256="77" * 32,
+                training_environment_sha256="88" * 32,
+                training_code_revision="fixture-revision",
+            ),
+            completed_units=2,
+            total_units=2,
+        )
+        frames = stream.getvalue().splitlines()
+        self.assertEqual([json.loads(frame)["sequence"] for frame in frames], [0, 1])
+        self.assertTrue(all(0 < len(frame) <= MAX_EVENT_BYTES for frame in frames))
+        self.assertEqual([json.loads(frame)["kind"] for frame in frames], ["progress", "result"])
+        with self.assertRaises(ValueError):
+            worker.progress("complete", "Late event.", 2, 2)
+
+    def test_worker_cancellation_is_terminal_and_never_returns_candidate(self) -> None:
+        stream = io.BytesIO()
+        worker = WorkerProtocolWriter(
+            stream,
+            run_id="018f3c2a-91ab-7ccd-b3de-123456789abc",
+            generation=9,
+        )
+        worker.progress("training", "Training candidate.", 1, 4)
+        worker.error("cancelled", "Training was cancelled.", "TRAINING_CANCELLED", 1, 4)
+        frames = [json.loads(frame) for frame in stream.getvalue().splitlines()]
+        self.assertEqual([frame["kind"] for frame in frames], ["progress", "error"])
+        self.assertTrue(all(frame["result"] is None for frame in frames))
+        with self.assertRaises(ValueError):
+            worker.error("cancelled", "Training was cancelled.", "TRAINING_CANCELLED", 1, 4)
+
+    def test_worker_candidate_contains_only_rust_revalidation_evidence(self) -> None:
+        evidence = CandidateEvidence(
+            admission_request_sha256="99" * 32,
+            candidate_directory="models/fixture-v1/candidate",
+            metadata_sha256="11" * 32,
+            artifact_sha256="22" * 32,
+            training_run_sha256="33" * 32,
+            authority_sha256="44" * 32,
+            dataset_export_sha256="55" * 32,
+            dataset_selection_sha256="66" * 32,
+            catalog_identity_sha256="77" * 32,
+            training_environment_sha256="88" * 32,
+            training_code_revision="fixture-revision",
+        )
+        self.assertEqual(
+            set(evidence.as_mapping()),
+            {
+                "admissionRequestSha256",
+                "candidateDirectory",
+                "metadataSha256",
+                "artifactSha256",
+                "trainingRunSha256",
+                "authoritySha256",
+                "datasetExportSha256",
+                "datasetSelectionSha256",
+                "catalogIdentitySha256",
+                "trainingEnvironmentSha256",
+                "trainingCodeRevision",
+            },
+        )
+
     def test_signed_environment_rejects_regenerated_record_and_receipt(self) -> None:
         baseline = training_environment_receipt().sha256
         self.assertEqual(len(baseline), 64)
@@ -533,11 +613,15 @@ class TrainingBundleContracts(unittest.TestCase):
                     authority_path = authority_root / "bundle-authority.json"
                     authority_path.write_bytes(proposal_path.read_bytes())
                     request_path = request_root / "admission.json"
-                    finalize_candidate(
+                    finalized = finalize_candidate(
                         config_path,
                         authority_path,
                         f"models/{bundle_id}-v1",
                         request_path,
+                    )
+                    self.assertEqual(
+                        finalized["admissionRequestSha256"],
+                        hashlib.sha256(request_path.read_bytes()).hexdigest(),
                     )
                     request = json.loads(request_path.read_text(encoding="ascii"))
                     self.assertEqual(
@@ -555,22 +639,15 @@ class TrainingBundleContracts(unittest.TestCase):
                         first.candidate.artifact_sha256,
                     )
 
-                    admitted = admit_candidate(config_path, request_path)
-                    self.assertIn(
-                        admitted["data"]["disposition"],
-                        {"inserted", "already_admitted"},
+                    self.assertNotIn("admitted", request)
+                    self.assertNotIn("disposition", request)
+                    rejected = _signed_prediction_attempt(
+                        data_root,
+                        request_root,
+                        model_id=model_id,
+                        bundle_id=bundle_id,
                     )
-
-                    if model_kind == "logistic":
-                        score = _signed_prediction(
-                            data_root,
-                            request_root,
-                            model_id=model_id,
-                            bundle_id=bundle_id,
-                        )
-                        self.assertNotIsInstance(score, bool)
-                        self.assertTrue(math.isfinite(score))
-                        self.assertTrue(0.0 <= score <= 1.0)
+                    self.assertNotEqual(rejected.returncode, 0)
 
 
 if __name__ == "__main__":
