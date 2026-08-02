@@ -362,42 +362,7 @@ pub(crate) enum DashboardQueryCommand {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum ResearchControlCommand {
-    StartIngest {
-        provider: String,
-        object: String,
-        dataset: String,
-        discovery_receipt: String,
-    },
-    StartDatasetBuild {
-        registration: Map<String, Value>,
-    },
-    StartExport {
-        dataset: String,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
-pub(crate) enum DecisionControlCommand {
-    SaveScreen {
-        expected_revision: Option<u32>,
-        screen: Map<String, Value>,
-    },
-    RunScreen {
-        run: Map<String, Value>,
-        candidates: Vec<Value>,
-        selected_at: String,
-    },
-    CreateTarget {
-        target: Map<String, Value>,
-    },
-    ReviewTarget {
-        review: Map<String, Value>,
-    },
-    ReevaluateTarget {
-        expected_revision: u32,
-        successor: Map<String, Value>,
-    },
+    StartExport { dataset: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,56 +376,12 @@ pub(crate) enum ModelControlCommand {
         config_ticket_id: Uuid,
         authority_ticket_id: Uuid,
     },
-    StartForecast {
-        model_id: String,
-        request: Map<String, Value>,
-    },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum FairValueControlCommand {
-    Measure {
-        measurement: Map<String, Value>,
-    },
-    Classify {
-        measurement_id: String,
-    },
-    Approve {
-        measurement_id: String,
-        decision_id: String,
-        approved_by: String,
-        approved_at: String,
-        expires_at: String,
-    },
-    ApproveMarketAccess {
-        account_id: String,
-        venue_id: String,
-        instrument_id: String,
-        conclusion: String,
-        effective_from: String,
-        effective_until: String,
-        rationale: String,
-        prepared_by: String,
-        prepared_at: String,
-        approved_by: String,
-        approved_at: String,
-    },
-    ProposeOverride {
-        measurement_id: String,
-        decision_id: String,
-        requested_hierarchy: String,
-        justification: String,
-        prepared_by: String,
-        prepared_at: String,
-        expires_at: String,
-    },
-    RevokeApproval {
-        approval_id: String,
-        revoked_by: String,
-        revoked_at: String,
-        reason: String,
-    },
+    Classify { measurement_id: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,15 +402,6 @@ pub(crate) enum PaperControlCommand {
     Reconcile,
     TriggerKillSwitch {
         reason: String,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
-pub(crate) enum PortfolioControlCommand {
-    Import {
-        account_id: String,
-        artifact_id: String,
     },
 }
 

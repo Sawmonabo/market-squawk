@@ -177,16 +177,12 @@ function transport(
       query({ query: "researchDatasets" }),
     startBacktestFromFile: async () =>
       query({ query: "jobs", limit: 25 }),
-    decisionControl: async () =>
-      query({ query: "overview" }),
     modelControl: async () =>
       query({ query: "jobs", limit: 25 }),
     fairValueControl: async () =>
       query({ query: "fairValueMeasurements" }),
     paperControl: async () =>
       query({ query: "paperStatus" }),
-    portfolioControl: async () =>
-      query({ query: "portfolioAccounts" }),
     jobControl: async (request) =>
       query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
     sourceControl: async (_action, _request) =>

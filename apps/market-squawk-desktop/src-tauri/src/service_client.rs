@@ -6,10 +6,9 @@ use tauri::State;
 use crate::{
     bridge::{DesktopState, InvocationAuthority, invoke_application},
     contracts::{
-        ApplicationInvocation, DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
-        FairValueControlCommand, JobControlCommand, ModelControlCommand, PaperControlCommand,
-        PortfolioControlCommand, ResearchControlCommand, SourceLifecycleAction,
-        SourceLifecycleInput,
+        ApplicationInvocation, DashboardQueryCommand, DesktopCommandError, FairValueControlCommand,
+        JobControlCommand, ModelControlCommand, PaperControlCommand, ResearchControlCommand,
+        SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
@@ -249,8 +248,15 @@ pub(crate) async fn fair_value_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    let (operation, arguments) = fair_value_request(request);
-    invoke_narrow(operation, arguments, true, confirmed, &state).await
+    let FairValueControlCommand::Classify { measurement_id } = request;
+    invoke_narrow(
+        "FairValue.Classify",
+        measurement_arguments(measurement_id),
+        true,
+        confirmed,
+        &state,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -307,106 +313,6 @@ pub(crate) async fn paper_control(
 }
 
 #[tauri::command]
-pub(crate) async fn portfolio_control(
-    request: PortfolioControlCommand,
-    confirmed: bool,
-    state: State<'_, DesktopState>,
-) -> Result<Value, DesktopCommandError> {
-    let PortfolioControlCommand::Import {
-        account_id,
-        artifact_id,
-    } = request;
-    let mut arguments = account_arguments(account_id);
-    arguments.insert("artifactId".to_owned(), json!(artifact_id));
-    invoke_narrow("Portfolio.Import", arguments, true, confirmed, &state).await
-}
-
-fn fair_value_request(request: FairValueControlCommand) -> (&'static str, Map<String, Value>) {
-    match request {
-        FairValueControlCommand::Measure { measurement } => {
-            let mut arguments = Map::new();
-            arguments.insert("measurement".to_owned(), Value::Object(measurement));
-            ("FairValue.Measure", arguments)
-        }
-        FairValueControlCommand::Classify { measurement_id } => {
-            ("FairValue.Classify", measurement_arguments(measurement_id))
-        }
-        FairValueControlCommand::Approve {
-            measurement_id,
-            decision_id,
-            approved_by,
-            approved_at,
-            expires_at,
-        } => {
-            let mut arguments = measurement_arguments(measurement_id);
-            arguments.insert("decisionId".to_owned(), json!(decision_id));
-            arguments.insert("approvedBy".to_owned(), json!(approved_by));
-            arguments.insert("approvedAt".to_owned(), json!(approved_at));
-            arguments.insert("expiresAt".to_owned(), json!(expires_at));
-            ("FairValue.Approve", arguments)
-        }
-        FairValueControlCommand::ProposeOverride {
-            measurement_id,
-            decision_id,
-            requested_hierarchy,
-            justification,
-            prepared_by,
-            prepared_at,
-            expires_at,
-        } => {
-            let mut arguments = measurement_arguments(measurement_id);
-            arguments.insert("decisionId".to_owned(), json!(decision_id));
-            arguments.insert("requestedHierarchy".to_owned(), json!(requested_hierarchy));
-            arguments.insert("justification".to_owned(), json!(justification));
-            arguments.insert("preparedBy".to_owned(), json!(prepared_by));
-            arguments.insert("preparedAt".to_owned(), json!(prepared_at));
-            arguments.insert("expiresAt".to_owned(), json!(expires_at));
-            ("FairValue.ProposeOverride", arguments)
-        }
-        FairValueControlCommand::RevokeApproval {
-            approval_id,
-            revoked_by,
-            revoked_at,
-            reason,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert("approvalId".to_owned(), json!(approval_id));
-            arguments.insert("revokedBy".to_owned(), json!(revoked_by));
-            arguments.insert("revokedAt".to_owned(), json!(revoked_at));
-            arguments.insert("reason".to_owned(), json!(reason));
-            ("FairValue.RevokeApproval", arguments)
-        }
-        FairValueControlCommand::ApproveMarketAccess {
-            account_id,
-            venue_id,
-            instrument_id,
-            conclusion,
-            effective_from,
-            effective_until,
-            rationale,
-            prepared_by,
-            prepared_at,
-            approved_by,
-            approved_at,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert("accountId".to_owned(), json!(account_id));
-            arguments.insert("venueId".to_owned(), json!(venue_id));
-            arguments.insert("instrumentId".to_owned(), json!(instrument_id));
-            arguments.insert("conclusion".to_owned(), json!(conclusion));
-            arguments.insert("effectiveFrom".to_owned(), json!(effective_from));
-            arguments.insert("effectiveUntil".to_owned(), json!(effective_until));
-            arguments.insert("rationale".to_owned(), json!(rationale));
-            arguments.insert("preparedBy".to_owned(), json!(prepared_by));
-            arguments.insert("preparedAt".to_owned(), json!(prepared_at));
-            arguments.insert("approvedBy".to_owned(), json!(approved_by));
-            arguments.insert("approvedAt".to_owned(), json!(approved_at));
-            ("FairValue.ApproveMarketAccess", arguments)
-        }
-    }
-}
-
-#[tauri::command]
 pub(crate) async fn model_control(
     request: ModelControlCommand,
     confirmed: bool,
@@ -427,61 +333,6 @@ pub(crate) async fn model_control(
             arguments.insert("authorityTicketId".to_owned(), json!(authority_ticket_id));
             ("Model.StartTraining", arguments)
         }
-        ModelControlCommand::StartForecast { model_id, request } => {
-            let mut arguments = model_arguments(model_id);
-            arguments.insert("request".to_owned(), Value::Object(request));
-            ("Model.StartForecast", arguments)
-        }
-    };
-    invoke_narrow(operation, arguments, true, confirmed, &state).await
-}
-
-#[tauri::command]
-pub(crate) async fn decision_control(
-    request: DecisionControlCommand,
-    confirmed: bool,
-    state: State<'_, DesktopState>,
-) -> Result<Value, DesktopCommandError> {
-    let (operation, arguments) = match request {
-        DecisionControlCommand::SaveScreen {
-            expected_revision,
-            screen,
-        } => {
-            let mut arguments = Map::new();
-            insert_optional(&mut arguments, "expectedRevision", expected_revision);
-            arguments.insert("screen".to_owned(), Value::Object(screen));
-            ("Decision.SaveScreen", arguments)
-        }
-        DecisionControlCommand::RunScreen {
-            run,
-            candidates,
-            selected_at,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert("run".to_owned(), Value::Object(run));
-            arguments.insert("candidates".to_owned(), Value::Array(candidates));
-            arguments.insert("selectedAt".to_owned(), json!(selected_at));
-            ("Decision.RunScreen", arguments)
-        }
-        DecisionControlCommand::CreateTarget { target } => {
-            let mut arguments = Map::new();
-            arguments.insert("target".to_owned(), Value::Object(target));
-            ("Decision.CreateTargetSet", arguments)
-        }
-        DecisionControlCommand::ReviewTarget { review } => {
-            let mut arguments = Map::new();
-            arguments.insert("review".to_owned(), Value::Object(review));
-            ("Decision.ReviewTargetSet", arguments)
-        }
-        DecisionControlCommand::ReevaluateTarget {
-            expected_revision,
-            successor,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert("expectedRevision".to_owned(), json!(expected_revision));
-            arguments.insert("successor".to_owned(), Value::Object(successor));
-            ("Decision.ReevaluateTargetSet", arguments)
-        }
     };
     invoke_narrow(operation, arguments, true, confirmed, &state).await
 }
@@ -493,23 +344,6 @@ pub(crate) async fn research_control(
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let (operation, arguments) = match request {
-        ResearchControlCommand::StartIngest {
-            provider,
-            object,
-            dataset,
-            discovery_receipt,
-        } => {
-            let mut arguments = dataset_arguments(dataset);
-            arguments.insert("provider".to_owned(), json!(provider));
-            arguments.insert("object".to_owned(), json!(object));
-            arguments.insert("discoveryReceipt".to_owned(), json!(discovery_receipt));
-            ("Research.StartIngestSource", arguments)
-        }
-        ResearchControlCommand::StartDatasetBuild { registration } => {
-            let mut arguments = Map::new();
-            arguments.insert("registration".to_owned(), Value::Object(registration));
-            ("Research.StartDatasetBuild", arguments)
-        }
         ResearchControlCommand::StartExport { dataset } => {
             ("Research.StartExport", dataset_arguments(dataset))
         }

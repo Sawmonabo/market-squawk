@@ -32,8 +32,8 @@ use events::subscribe_service_events;
 use input_staging::{stage_training_input, start_backtest_from_file};
 use mcp_clients::mcp_status;
 use service_client::{
-    dashboard_query, decision_control, fair_value_control, job_control, model_control,
-    paper_control, portfolio_control, research_control, source_control,
+    dashboard_query, fair_value_control, job_control, model_control, paper_control,
+    research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -192,7 +192,6 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             dashboard_query,
-            decision_control,
             desktop_bootstrap,
             fair_value_control,
             job_control,
@@ -202,7 +201,6 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             open_official_provider_page,
             open_protected_provider_setup,
             paper_control,
-            portfolio_control,
             provider_onboarding,
             research_control,
             source_control,

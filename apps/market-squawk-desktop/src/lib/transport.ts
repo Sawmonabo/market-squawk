@@ -168,10 +168,6 @@ export interface ProductTransport {
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   startBacktestFromFile(confirmed?: boolean): Promise<ApplicationResult | null>
-  decisionControl(
-    request: DecisionControlRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
   modelControl(
     request: ModelControlRequest,
     confirmed?: boolean,
@@ -182,10 +178,6 @@ export interface ProductTransport {
   ): Promise<ApplicationResult>
   paperControl(
     request: PaperControlRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
-  portfolioControl(
-    request: PortfolioControlRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   jobControl(request: JobControlRequest, confirmed?: boolean): Promise<ApplicationResult>
@@ -206,36 +198,7 @@ export interface ProductTransport {
 
 export type TrainingInputKind = "configuration" | "model_authority"
 
-export type ResearchControlRequest =
-  | {
-      action: "startIngest"
-      provider: string
-      object: string
-      dataset: string
-      discoveryReceipt: string
-    }
-  | { action: "startDatasetBuild"; registration: Record<string, unknown> }
-  | { action: "startExport"; dataset: string }
-
-export type DecisionControlRequest =
-  | {
-      action: "saveScreen"
-      expectedRevision?: number
-      screen: Record<string, unknown>
-    }
-  | {
-      action: "runScreen"
-      run: Record<string, unknown>
-      candidates: unknown[]
-      selectedAt: string
-    }
-  | { action: "createTarget"; target: Record<string, unknown> }
-  | { action: "reviewTarget"; review: Record<string, unknown> }
-  | {
-      action: "reevaluateTarget"
-      expectedRevision: number
-      successor: Record<string, unknown>
-    }
+export type ResearchControlRequest = { action: "startExport"; dataset: string }
 
 export type ModelControlRequest =
   | {
@@ -248,54 +211,11 @@ export type ModelControlRequest =
       configTicketId: string
       authorityTicketId: string
     }
-  | {
-      action: "startForecast"
-      modelId: string
-      request: Record<string, unknown>
-    }
 
-export type FairValueControlRequest =
-  | { action: "measure"; measurement: Record<string, unknown> }
-  | { action: "classify"; measurementId: string }
-  | {
-      action: "approve"
-      measurementId: string
-      decisionId: string
-      approvedBy: string
-      approvedAt: string
-      expiresAt: string
-    }
-  | {
-      action: "approveMarketAccess"
-      accountId: string
-      venueId: string
-      instrumentId: string
-      conclusion: "accessible" | "inaccessible"
-      effectiveFrom: string
-      effectiveUntil: string
-      rationale: string
-      preparedBy: string
-      preparedAt: string
-      approvedBy: string
-      approvedAt: string
-    }
-  | {
-      action: "proposeOverride"
-      measurementId: string
-      decisionId: string
-      requestedHierarchy: "level_2" | "level_3"
-      justification: string
-      preparedBy: string
-      preparedAt: string
-      expiresAt: string
-    }
-  | {
-      action: "revokeApproval"
-      approvalId: string
-      revokedBy: string
-      revokedAt: string
-      reason: string
-    }
+export type FairValueControlRequest = {
+  action: "classify"
+  measurementId: string
+}
 
 export type PaperControlRequest =
   | {
@@ -308,12 +228,6 @@ export type PaperControlRequest =
   | { action: "stop" | "triggerKillSwitch"; reason: string }
   | { action: "cancel"; orderId: string }
   | { action: "reconcile" }
-
-export type PortfolioControlRequest = {
-  action: "import"
-  accountId: string
-  artifactId: string
-}
 
 export type JobControlRequest =
   | { action: "list"; afterJobId?: string; limit: number }

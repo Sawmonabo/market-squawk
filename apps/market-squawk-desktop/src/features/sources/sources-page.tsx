@@ -12,6 +12,14 @@ import {
 import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
@@ -171,17 +179,13 @@ function SourceCard({
 }) {
   const [pending, setPending] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const [confirming, setConfirming] = React.useState<LifecycleControl | null>(null)
   const controls = lifecycleControls(source)
   const setupReady = source.nextAction === "active"
   const runtimeActive = source.runtimeState === "active"
 
   const run = async (control: LifecycleControl) => {
-    if (
-      control.destructive &&
-      !window.confirm(`${control.label} ${source.name}? The runtime state will change.`)
-    ) {
-      return
-    }
+    setConfirming(null)
     setPending(control.action)
     setError(null)
     try {
@@ -259,7 +263,10 @@ function SourceCard({
               size="sm"
               variant={control.destructive ? "outline" : "default"}
               disabled={pending !== null}
-              onClick={() => run(control)}
+              onClick={() => {
+                if (control.destructive) setConfirming(control)
+                else void run(control)
+              }}
             >
               {pending === control.action ? "Working…" : control.label}
             </Button>
@@ -275,6 +282,36 @@ function SourceCard({
           {error}
         </p>
       ) : null}
+      <Dialog
+        open={confirming !== null}
+        onOpenChange={(open) => {
+          if (!open && pending === null) setConfirming(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{confirming?.label ?? "Change source state"}?</DialogTitle>
+            <DialogDescription>
+              This changes the runtime state for {source.name} using lifecycle revision{" "}
+              {source.lifecycle?.stateRevision}. Market Squawk will reject the request if that
+              source state has changed since this evidence was loaded.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={pending !== null} onClick={() => setConfirming(null)}>
+              Keep current state
+            </Button>
+            <Button
+              disabled={pending !== null || confirming === null}
+              onClick={() => {
+                if (confirming) void run(confirming)
+              }}
+            >
+              {pending !== null ? "Working…" : "Confirm change"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </article>
   )
 }

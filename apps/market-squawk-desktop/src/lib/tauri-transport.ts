@@ -14,13 +14,11 @@ import {
 } from "@/lib/schemas"
 import type {
   DashboardQuery,
-  DecisionControlRequest,
   FairValueControlRequest,
   JobControlRequest,
   InstallationControlRequest,
   ModelControlRequest,
   PaperControlRequest,
-  PortfolioControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
@@ -66,11 +64,6 @@ class TauriTransport implements ProductTransport {
     return value === null ? null : applicationResultSchema.parse(value)
   }
 
-  async decisionControl(request: DecisionControlRequest, confirmed = false) {
-    const value = await invoke("decision_control", { request, confirmed })
-    return applicationResultSchema.parse(value)
-  }
-
   async modelControl(request: ModelControlRequest, confirmed = false) {
     const value = await invoke("model_control", { request, confirmed })
     return applicationResultSchema.parse(value)
@@ -83,11 +76,6 @@ class TauriTransport implements ProductTransport {
 
   async paperControl(request: PaperControlRequest, confirmed = false) {
     const value = await invoke("paper_control", { request, confirmed })
-    return applicationResultSchema.parse(value)
-  }
-
-  async portfolioControl(request: PortfolioControlRequest, confirmed = false) {
-    const value = await invoke("portfolio_control", { request, confirmed })
     return applicationResultSchema.parse(value)
   }
 
@@ -188,10 +176,6 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  decisionControl(): Promise<never> {
-    return Promise.reject(new Error("The local application is not connected."))
-  }
-
   modelControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
@@ -201,10 +185,6 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   paperControl(): Promise<never> {
-    return Promise.reject(new Error("The local application is not connected."))
-  }
-
-  portfolioControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
