@@ -274,8 +274,6 @@ fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupErro
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct AppImageMcpLauncher {
-    pub(crate) program: PathBuf,
-    #[cfg(target_os = "linux")]
     cli_program: PathBuf,
 }
 
@@ -344,8 +342,5 @@ pub(crate) fn appimage_mcp_launcher(
     if current != expected_current || cli_program != expected_cli || current == program {
         return Err(AppImageMcpLauncherError);
     }
-    Ok(Some(AppImageMcpLauncher {
-        program,
-        cli_program,
-    }))
+    Ok(Some(AppImageMcpLauncher { cli_program }))
 }

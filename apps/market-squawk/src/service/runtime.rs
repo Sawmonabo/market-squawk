@@ -35,7 +35,7 @@ const IDENTITY_DIRECTORY: &str = "identity";
 const RENDEZVOUS_DIRECTORY: &str = "rendezvous";
 const SIGNING_SECRET_SCOPE: &str = "runtime-service";
 const SIGNING_SECRET_NAME: &str = "rendezvous-signing";
-const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGNING_SECRET_BYTES: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
