@@ -8,6 +8,7 @@
 | Audience | Product, desktop, frontend, platform, data, modeling, MCP, security, and release reviewers |
 | Status | Approved product design; implementation governed by the linked plan |
 | Design date | 2026-08-01 |
+| Implementation refresh | 2026-08-01 against commit `f43da3aa5cbd887a35c9ef25c748b722c9d5c028` |
 | Audit commit | `f35d67247c93c3ab253aedbf663f6cb4c1f80b3e` |
 | Audit tree | `c958ff21cf11a67c6a9a189271e493c64ef26150` |
 | Release boundary | Required V1 feature experience before owner testing and release preparation |
@@ -1029,23 +1030,40 @@ active workspace.
 
 Platform integration uses the operating system's established per-user lifecycle:
 
-- a macOS LaunchAgent, following Apple's distinction between per-user agents and system daemons;
-- `systemd --user` in supported Ubuntu sessions; and
-- current-user Windows startup/task or the final native-package equivalent.
+- an owner-scoped macOS LaunchAgent in `~/Library/LaunchAgents` across the macOS 12+ floor;
+- `systemd --user` in supported Ubuntu sessions without mandatory linger; and
+- a Task Scheduler 2.0 logon task bound to the exact current-user SID, interactive token, and
+  least-privilege run level on Windows.
 
 Relevant platform references are
 [Apple's launchd guidance](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html),
 [`systemd` project guidance](https://www.freedesktop.org/wiki/Software/systemd/),
-[`pam_systemd` user-manager behavior](https://www.freedesktop.org/software/systemd/man/251/pam_systemd.html),
-and Microsoft's [logon-trigger documentation](https://learn.microsoft.com/en-us/windows/win32/taskschd/logon-trigger-example--scripting-).
+[`pam_systemd` user-manager behavior](https://www.freedesktop.org/software/systemd/man/252/pam_systemd.html),
+and Microsoft's [logon-trigger documentation](https://learn.microsoft.com/en-us/windows/win32/taskschd/starting-an-executable-when-a-user-logs-on) and [least-privilege run-level documentation](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-runlevel).
+
+The macOS 12 floor is retained: registering an unprivileged per-user LaunchAgent does not require a
+paid Apple credential. `SMAppService` starts at macOS 13 and therefore cannot be the only path.
+Paid Developer ID/notarization affects distribution trust and user friction, not whether the
+signed-in user may register the LaunchAgent.
 
 ### Transport and authentication
 
-The shared endpoint is MCP Streamable HTTP bound only to `127.0.0.1` on an install-selected stable
-port. This follows the current stable MCP transport model, which requires applicable servers to
-validate `Origin` and recommends local binding plus authentication for local deployments. Market
-Squawk adopts all three as requirements for this product. See the
-[MCP 2025-11-25 transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+The shared endpoint is modern MCP Streamable HTTP bound only to `127.0.0.1` on an install-selected
+stable port. Market Squawk explicitly selects the stable `2026-07-28` protocol and its stateless,
+per-request discovery and metadata model. The service accepts POST only, does not mint or require
+`Mcp-Session-Id`, and does not implement standalone GET/DELETE or `Last-Event-ID` replay on its
+primary path. See the stable [MCP base
+protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic), [versioning
+rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), and [Streamable
+HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+
+RMCP 3.1 is used behind a narrow Market Squawk protocol facade. The facade explicitly selects
+`V_2026_07_28`, advertises only the admitted versions, disables legacy HTTP session mode, requires
+modern stateless metadata, and closes Host, Origin, authorization, body, deadline, and admission
+policy before handler dispatch. It does not rely on RMCP's `LATEST`, all-known-version, legacy
+client, or automatic-fallback defaults. A named client compatibility path may accept the legacy
+`2025-11-25` lifecycle only at its stateless stdio relay boundary; legacy protocol state never
+becomes shared-service authority.
 
 A single-instance guard and owner-only rendezvous record contain the active service generation,
 endpoint, protocol range, installation identity, workspace identity and process identity. A second
@@ -1058,29 +1076,29 @@ Each client registration receives a separate high-entropy bearer credential. Cre
 stored through protected per-user facilities, hashed or otherwise non-recoverably represented by
 the service where possible, scoped, revocable and rotatable. Claude Code and Codex do not share a
 single plaintext token. The service validates `Origin`, host, method, content type, protocol
-version, token, client identity, bounded request size and session limits before dispatch.
+version, per-request metadata, token, client identity, bounded request size and client limits before
+dispatch. A present non-allowlisted Origin is rejected; a non-browser client may omit Origin.
 
-The authorization model follows current stable MCP authorization concepts without requiring a
-remote authorization server for a private loopback service. See the
-[MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
-
-The July 28, 2026 MCP publication described the next revision as a release candidate rather than
-the stable base. Its task and protocol changes are refresh-gate inputs, not silent V1 dependencies.
-See the [MCP release-candidate announcement](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+The authorization model follows the stable MCP security boundary without requiring a remote
+authorization server for this private loopback service. Product credentials, scopes, explicit
+handles, job ownership, limits, and audit remain Market Squawk authorities on every request; no
+connection or prior request conveys implicit authority.
 
 ### Client registration and discovery
 
 Setup discovers supported Claude Code and Codex installations and offers an explicit, previewable,
-idempotent **Connect** action. It writes one user-level Market Squawk registration through each
-client's supported configuration mechanism, records an ownership marker and verifies an actual MCP
-handshake. Re-running setup updates the owned entry instead of creating duplicates. Disconnect
-removes only configuration owned by Market Squawk.
+idempotent **Connect** action. It invokes each installed client's official CLI to create one
+user-level stdio registration pointing at the stable Market Squawk relay, records an owner-only
+receipt, and verifies a real MCP exchange. It does not edit client configuration files directly.
+Re-running setup updates the owned entry instead of creating duplicates. Disconnect removes only
+configuration owned by Market Squawk.
 
 The stable logical server name is `market-squawk`. Setup never creates suffixes such as
 `market-squawk-1`. It preserves unrelated client settings and refuses to overwrite a same-name
 user-owned entry; instead it shows the exact scope/location conflict and offers a minimal reviewed
 repair. The registration receipt records client, logical name, endpoint identity, credential
-identity, configuration location, pre-change backup identity and registration-format version.
+identity, normalized relay command and arguments, observed registration and receipt version. It
+stores no secret.
 
 Codex registration uses the effective user configuration so its supported local surfaces see one
 entry. Claude Code registration uses user scope so the service is available across projects and
@@ -1091,31 +1109,34 @@ MCP itself is always installed. If the user skips client connection, the MCP pag
 Code or Codex as **Ready to connect** when detected—not **Not installed**—and connection can be
 completed later without reinstalling Market Squawk.
 
-Codex currently supports MCP server configuration shared between its CLI and IDE extension, with
-Streamable HTTP and bearer-token configuration. Claude Code supports local/HTTP MCP registration at
-user scope. The implementation refresh gate must verify exact current commands and schemas using
-the official [Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp.md) and
-[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp) before writing client config.
+The implementation refresh gate verifies exact current `add`, `get`, `list`, and `remove` commands
+through the official [Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp) and [Claude Code
+MCP documentation](https://code.claude.com/docs/en/mcp).
 
-A stateless stdio relay is provided only for a client/environment that cannot connect directly to
-the loopback HTTP endpoint. The relay performs no catalog, model, source or job work; it
-authenticates to and forwards framed messages to the shared service.
+The default installed integration is a stateless stdio relay because it keeps bearer credentials
+out of client configuration and command arguments. The relay performs no catalog, model, source,
+job, or application work; it resolves the admitted active service, reads only its named client's
+credential through native secret authority, and adapts bounded MCP stdio requests to the shared
+service. It accepts a named client's legacy lifecycle only when current client evidence requires
+it, translates no implicit protocol session into product authority, and terminates without stopping
+the shared service. Direct HTTP registration remains an advanced path only when the client can
+protect and inject its distinct credential.
 
 ### Concurrency and resource boundaries
 
-The service shares read-only caches and heavy runtimes but isolates protocol sessions, cancellation,
-request limits, subscriptions and audit identity per client. It enforces:
+The service shares read-only caches and heavy runtimes but isolates credentials, requests,
+cancellation, explicit product handles, subscriptions and audit identity per client. It enforces:
 
 - bounded concurrent requests and jobs by class;
 - per-client and global output, artifact, time and memory budgets;
 - cancellation and disconnect cleanup;
-- fair scheduling so one AI session cannot starve the desktop or another client;
+- fair scheduling so one AI client cannot starve the desktop or another client;
 - one writer for authority-critical state;
 - explicit conflicts for workspace switching, update, restore and paper-operation boundaries; and
 - no unbounded response retention or implicit sharing of conversation histories.
 
 Claude Code and Codex may see the same underlying Market Squawk data and durable application
-artifacts. Their prompts, conversation memory, protocol sessions and private client state are not
+artifacts. Their prompts, conversation memory, request state and private client state are not
 merged. If a durable research note or target should be shared, it is saved explicitly as a Market
 Squawk domain artifact with provenance and permissions.
 
@@ -1131,9 +1152,9 @@ The dashboard MCP page shows:
 
 - service version, endpoint, active workspace, health and resource use;
 - Claude Code and Codex discovered/connected/verified state;
-- active sessions, request/job counts and last activity without conversation contents;
+- active clients/relays, request/job counts and last activity without conversation contents;
 - negotiated MCP version, available tool/resource domains and result limits;
-- a real test action that performs initialize/capability discovery and a safe read;
+- a real test action that performs current discovery, tool/resource listing and a safe read;
 - credential rotation, revoke, reconnect and owned-config repair;
 - blocked or rate-limited requests and typed reasons; and
 - links to logs and audit records.
@@ -1148,15 +1169,15 @@ sequenceDiagram
     participant Jobs as Durable jobs
 
     Desktop->>Service: Typed dashboard request
-    Claude->>MCP: Authenticated MCP session A
-    Codex->>MCP: Authenticated MCP session B
+    Claude->>MCP: Authenticated client A request
+    Codex->>MCP: Authenticated client B request
     MCP->>Service: Bounded request as client A/B
     Service->>Jobs: Start or observe durable work
     Jobs-->>Service: Progress/result with provenance
     Service-->>Desktop: Window-scoped typed events
     Service-->>MCP: Bounded result/artifact reference
-    MCP-->>Claude: Session A response
-    MCP-->>Codex: Session B response
+    MCP-->>Claude: Client A response
+    MCP-->>Codex: Client B response
 ```
 
 MCP remains outside the live market event-to-action path. An AI request cannot block socket
@@ -1174,7 +1195,7 @@ flowchart TD
     Check["Check signed release metadata"] --> Download["Download inactive immutable release"]
     Download --> Verify["Verify manifest, hashes,<br/>provenance and compatibility"]
     Verify --> Preflight["Check disk, workspace schema,<br/>jobs, paper activity and recovery"]
-    Preflight --> Drain["Drain service sessions and<br/>reach safe checkpoints"]
+    Preflight --> Drain["Drain client requests and<br/>reach safe checkpoints"]
     Drain --> Activate["Atomically activate release"]
     Activate --> Health{"Startup and data<br/>health pass?"}
     Health -- Yes --> Complete["Record success and retain<br/>bounded rollback release"]
@@ -1277,7 +1298,7 @@ meeting the success/failure/recovery definition above, not a placeholder page.
 | Portfolio accounting and analytics | Overview, Portfolios, target portfolio-fit and scenarios | Holdings/transactions/performance/exposure/risk |
 | Strategies, risk and paper execution | Paper Execution, Risk, order drafts, positions, fills and outcomes | Controlled operation; never risk bypass |
 | Fair-value analysis | Fair Value and linked research evidence, kept distinct from market quality | Measurements/classification/explanation/evidence |
-| MCP | Setup and MCP pages with real client verification, sessions, capabilities and repair | The external typed AI-client interface itself |
+| MCP | Setup and MCP pages with real client verification, request/handle isolation, capabilities and repair | The external typed AI-client interface itself |
 | Job authority | Global activity, page progress, notifications and recovery | Start/get/watch/cancel/list |
 | Install/update/backup/log/settings | Setup, Updates, Backup & Recovery, Logs and Settings | Advanced lifecycle and diagnostics |
 
@@ -1343,9 +1364,11 @@ Screenshots, mocks, contracts and synthetic-only adapters are not production cap
 
 - Desktop, CLI, Claude Code and Codex concurrently use one per-user service and active workspace
   without duplicate stateful servers.
-- Claude Code and Codex have distinct revocable credentials and isolated sessions.
+- Claude Code and Codex have distinct revocable credentials and isolated request/handle state.
 - Setup registration is idempotent; repeated repair produces one owned entry per client.
-- A real initialize, capability discovery and safe read succeeds from both clients.
+- A real client-compatible handshake/discovery, capability listing and safe read succeeds from both
+  clients, while the shared HTTP service proves stable `2026-07-28` discovery and stateless request
+  metadata.
 - Bounded concurrency, cancellation, disconnect cleanup and resource budgets are demonstrated.
 
 ### Lifecycle and security
@@ -1365,9 +1388,9 @@ workspace/release gates only at the defined delivery-quarter checkpoints and fin
 ### One backend per desktop or AI session — rejected
 
 This superficially follows stdio MCP examples but duplicates catalogs, source connections, models,
-jobs and memory; creates write conflicts; prevents a coherent desktop/session view; and makes
-updates and recovery unsafe. Per-session protocol state remains isolated, but heavy product state
-is shared once.
+jobs and memory; creates write conflicts; prevents a coherent desktop/client view; and makes
+updates and recovery unsafe. Per-client request/handle state remains isolated, but heavy product
+state is shared once.
 
 ### One machine-wide privileged daemon — rejected
 
@@ -1495,10 +1518,10 @@ exists. The repository must remain runnable at the end of each integration wave.
 | UI foundation | [shadcn/ui sidebar-07](https://ui.shadcn.com/view/new-york-v4/sidebar-07), [cmdk](https://github.com/pacocoursey/cmdk), [Recharts](https://recharts.github.io/en-US/) |
 | Financial charts | [Lightweight Charts API](https://tradingview.github.io/lightweight-charts/docs/api), [markers](https://tradingview.github.io/lightweight-charts/tutorials/how_to/series-markers), [primitives](https://tradingview.github.io/lightweight-charts/docs/plugins/series-primitives) |
 | Accessibility | [WCAG 2.2 Quick Reference](https://www.w3.org/WAI/WCAG22/quickref/), [status messages](https://www.w3.org/WAI/WCAG22/Understanding/status-messages.html), [multi-page forms](https://www.w3.org/WAI/tutorials/forms/multi-page/) and [GOV.UK task-list pattern](https://design-system.service.gov.uk/patterns/task-list-pages/) |
-| MCP transport and auth | [MCP 2025-11-25 transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports), [authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) and [2026 release candidate](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) |
+| MCP transport and auth | Stable [MCP 2026-07-28 base protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic), [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio), [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), and [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog) |
 | MCP clients | [Claude Code MCP](https://code.claude.com/docs/en/mcp) and [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp.md) |
 | Per-user services | [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html), [`systemd`](https://www.freedesktop.org/wiki/Software/systemd/), [`pam_systemd`](https://www.freedesktop.org/software/systemd/man/251/pam_systemd.html) and [Windows logon trigger](https://learn.microsoft.com/en-us/windows/win32/taskschd/logon-trigger-example--scripting-) |
-| Private desktop/CLI transport | [Windows IPC and packaged-loopback guidance](https://learn.microsoft.com/en-us/windows/apps/develop/communication/interprocess-communication), [MCP loopback security requirements](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) and the repository's admitted Hyper transport; [XDG runtime directories](https://specifications.freedesktop.org/basedir-spec/latest/), [Tokio Unix sockets](https://docs.rs/tokio/latest/tokio/net/struct.UnixListener.html), [Tokio named pipes](https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/) and [Windows pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights) document the native-IPC alternative reviewed but not selected |
+| Private desktop/CLI transport | [Windows IPC and packaged-loopback guidance](https://learn.microsoft.com/en-us/windows/apps/develop/communication/interprocess-communication), stable [MCP loopback security requirements](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), and the repository's admitted Hyper transport; [XDG runtime directories](https://specifications.freedesktop.org/basedir-spec/latest/), [Tokio Unix sockets](https://docs.rs/tokio/latest/tokio/net/struct.UnixListener.html), [Tokio named pipes](https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/) and [Windows pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights) document the native-IPC alternative reviewed but not selected |
 | Managed Python | [uv Python management](https://docs.astral.sh/uv/concepts/python-versions/) and [Python 3.14 documentation](https://docs.python.org/3.14/) |
 | Model governance | [Federal Reserve SR 11-7](https://www.federalreserve.gov/supervisionreg/srletters/sr1107.htm) and [NIST AI RMF](https://www.nist.gov/itl/ai-risk-management-framework) |
 | Update security | [The Update Framework specification](https://theupdateframework.github.io/specification/latest/) |

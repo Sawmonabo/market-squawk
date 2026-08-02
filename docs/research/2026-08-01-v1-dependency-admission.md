@@ -1,0 +1,284 @@
+# V1 Installed-Product Dependency Admission
+
+## Document control
+
+| Field | Value |
+| --- | --- |
+| Document type | Implementation dependency and platform admission record |
+| Audience | Runtime, MCP, desktop, modeling, installer, security, and release owners |
+| Status | Task 0 decision baseline; exact locks and artifact identities remain Task 1/7/14 evidence |
+| Research date | 2026-08-01 |
+| Audited commit | `f43da3aa5cbd887a35c9ef25c748b722c9d5c028` |
+| Audited tree | `7387a1db499cf3fc6afb58792a28adfb7e5e4d84` |
+| Governing design | [V1 installed-product design](../superpowers/specs/2026-08-01-market-squawk-v1-installed-product-experience-design.md) |
+| Implementation plan | [V1 implementation plan](../superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md) |
+
+This record persists the implementation-head refresh that supersedes stale dependency and platform
+assumptions in the original plan. It is not a lockfile, release approval, or claim that the named
+capability is already implemented. Refresh volatile versions, advisories, yanks, licenses, wheels,
+and protocol facts immediately before each serialized lock mutation.
+
+## Contents
+
+- [Decision summary](#decision-summary)
+- [Rust runtime and HTTP](#rust-runtime-and-http)
+- [MCP protocol and RMCP](#mcp-protocol-and-rmcp)
+- [Python, forecasting, and wheel admission](#python-forecasting-and-wheel-admission)
+- [Frontend and native desktop](#frontend-and-native-desktop)
+- [Per-user service lifecycle](#per-user-service-lifecycle)
+- [Lock and acceptance gates](#lock-and-acceptance-gates)
+- [Primary sources](#primary-sources)
+
+## Decision summary
+
+| Area | Decision | Status at the audited head |
+| --- | --- | --- |
+| Rust | Retain exact 1.97.1 | Already configured; 1.97.0 is rejected because 1.97.1 corrected its LLVM miscompilation |
+| Async runtime | Pin Tokio 1.53.1 and Tokio-util 0.7.19 with explicit direct features | Lock/update required |
+| HTTP | Admit Axum 0.8.9, Tower 0.5.3, and Tower HTTP 0.7.0 only for layers installed by production code; retain exact Hyper 1.11.0, Hyper-util 0.1.20, and http-body-util 0.1.4 | Manifest/lock required |
+| MCP SDK | Upgrade RMCP 2.2.0 to 3.1.0 behind a Market Squawk protocol facade | Breaking source migration and lock required |
+| MCP wire protocol | Use stable 2026-07-28 as the shared service's only primary protocol | Design/plan refreshed; implementation/conformance required |
+| Forecast reduction | Use scikit-learn 1.9.0 primitives behind a bounded Market Squawk horizon adapter | Python lock and implementation required |
+| Conformal evidence | Add MAPIE 1.4.1 for the explicitly approved time-series conformal path | Python lock and method-evidence implementation required |
+| Rejected forecast package | Do not admit skforecast 0.23.0 | Rejected: no CPython 3.14 Intel-macOS Numba/llvmlite closure |
+| Model export | Keep skl2onnx 1.20.0 and ONNX 1.22.0 only behind exact estimator/export/tract parity | Builder fix and exact matrix required |
+| Wheel policy | Use packaging 26.2 public tag/parser/marker APIs | Builder implementation required |
+| Python toolchain | Keep CPython 3.14.6 and PyArrow 25.0.0; refresh uv 0.12.0 to 0.12.1 | Four-target artifact identities required |
+| Frontend | Admit the exact planned TanStack, chart, React peer, and dialog versions | Frontend/native locks and notices required |
+| macOS service | Keep macOS 12+ and use a per-user LaunchAgent | Installer implementation and exact-floor evidence required |
+| Windows service | Use Task Scheduler 2.0 at the exact current-user SID and least privilege | Installer implementation and exact-floor evidence required |
+| Linux service | Use `systemd --user` without mandatory linger | Installer implementation and Ubuntu 24.04 evidence required |
+
+## Rust runtime and HTTP
+
+| Package | Selected version | Direct feature boundary | License / support note |
+| --- | ---: | --- | --- |
+| Tokio | 1.53.1 | `io-std`, `io-util`, `macros`, `net`, `rt-multi-thread`, `signal`, `sync`, `time` where directly used; never `full` | MIT; MSRV 1.71 |
+| Tokio-util | 0.7.19 | `rt`; add `codec` only where direct code uses it | MIT; MSRV 1.71 |
+| Axum | 0.8.9 | Start with `http1`, `json`, `tokio`; retain `matched-path`, `query`, or `tracing` only when production code proves use | MIT; MSRV 1.80 |
+| Tower | 0.5.3 | Only installed `limit`, `load-shed`, `timeout`, and `util` layers | MIT; MSRV 1.64 |
+| Tower HTTP | 0.7.0 | Only installed body-limit, request-ID, sensitive-header, timeout, trace, and validation layers | MIT; direct 0.7 API review required |
+| Hyper | 1.11.0 | Existing `http1` and `server` boundary | MIT; retain exact line |
+| Hyper-util | 0.1.20 | Existing Tokio integration only unless direct code proves more | MIT; retain exact line |
+| http-body-util | 0.1.4 | No package features required | MIT; retain exact line |
+| Schemars | 1.2.2 | Existing derive/schema needs only | MIT; refresh from 1.2.1 with schema evidence |
+
+Do not enable default/full feature sets merely to make a compile pass. Task 1 performs one
+serialized resolution, inspects `cargo tree -e features`, duplicate versions, advisories, licenses,
+and the lock diff, then uses `--locked` for every later command.
+
+## MCP protocol and RMCP
+
+The stable MCP release at the research cutoff is `2026-07-28`. It is stateless and uses
+per-request discovery/version/capability metadata. The shared service therefore:
+
+- explicitly selects `ProtocolVersion::V_2026_07_28`;
+- advertises a singleton admitted-version set unless named-client evidence authorizes a separate
+  compatibility boundary;
+- requires modern stateless metadata and exact HTTP header/body agreement;
+- accepts POST only on the modern HTTP endpoint;
+- does not mint or require `Mcp-Session-Id`;
+- does not implement standalone GET/DELETE or `Last-Event-ID` replay; and
+- keeps cross-call state only in explicit authenticated product handles and durable Job resources.
+
+RMCP 3.1.0 is accepted conditionally behind a narrow facade. A bare version bump is rejected
+because RMCP's tagged defaults can advertise every known version, retain legacy lifecycle behavior,
+and use a `LATEST` constant that does not express Market Squawk's product decision. The facade owns
+exact version selection, stateless configuration, closed Host/Origin/auth/limit policy, and
+negative conformance tests. RMCP continues to own MCP framing and transport mechanics; Market
+Squawk owns credentials, authorization, bounds, audit, jobs, artifacts, and product handles.
+
+The candidate RMCP feature set is limited to the server, client, stdio, Streamable HTTP server, and
+loopback HTTP client needed by the shared endpoint and relay. Do not admit OAuth, native TLS,
+child-process, WebSocket, HTTP/2, macros, elicitation, or request-state features without a separate
+implemented use and admission decision.
+
+Claude Code and Codex use installer-owned stdio relay registrations by default so credentials do
+not appear in their configuration or command arguments. Each relay is a small adapter to the one
+shared service; it is not a second product daemon. A client-facing legacy lifecycle may be admitted
+only when current evidence for that named client requires it. The relay cannot transfer implicit
+legacy connection/session authority to the modern service.
+
+## Python, forecasting, and wheel admission
+
+### Forecast dependency decision
+
+`skforecast==0.23.0` is inadmissible. Its top-level universal wheel requires Numba/llvmlite, and no
+stable dependency line provides both CPython 3.14 and Intel-macOS wheels. Dropping Intel macOS,
+building LLVM/Numba during installation, using a prerelease wheel, or patching upstream metadata
+would violate the approved product contract.
+
+The V1 closure instead uses:
+
+- scikit-learn 1.9.0 for maintained estimators, direct/multi-output/chained reductions,
+  `TimeSeriesSplit`, and quantile regressors;
+- MAPIE 1.4.1 for the approved time-series conformal methods;
+- skl2onnx 1.20.0 and ONNX 1.22.0 for the admitted central-model export path; and
+- packaging 26.2 for wheel, requirement, specifier, marker, and compatibility-tag admission.
+
+MLForecast 1.1.0 is the best ready-made reduction alternative, but its 26-28-distribution graph and
+mandatory Optuna/Tqdm edge add runtime and license/notice surface that the focused adapter does not
+need. Reconsider it only if measured implementation growth exceeds lag construction, ordered
+horizon estimators, a bounded recursive loop, temporal fold orchestration, and calibration
+coordination. MAPIE is admitted because conformal evidence is an explicit V1 requirement and adds
+only one pure-Python package beyond the scikit-learn graph; its method assumptions, calibration
+window, target coverage, and realized coverage must remain visible. Quantile bands and conformal
+intervals are distinct typed results and neither is presented as certainty.
+
+Python estimator objects remain contained worker state. They are never a trusted serialized model
+format because pickle/joblib loading can execute code. Rust admits only the closed native/ONNX
+bundle boundary.
+
+### Wheel compatibility correction
+
+The current builder's filename substring checks are not sufficient. They reject valid ABI3 wheels
+such as ONNX 1.22.0's `cp312-abi3` artifacts and can admit free-threaded `cp314t`, too-new macOS,
+wrong-architecture, generic Linux, or otherwise unsupported artifacts.
+
+Use packaging 26.2 public APIs:
+
+- `parse_wheel_filename` for normalized identity, version, build, and expanded tags;
+- `Requirement`, `SpecifierSet`, and `Marker.evaluate` for dependency and target-marker replay;
+- `cpython_tags` and `compatible_tags` for ordinary CPython 3.14 plus valid ABI3/pure tags; and
+- `mac_platforms((12, 0), arch)` for the declared macOS floor and architecture ordering.
+
+Generate foreign-target tags explicitly; never use a developer host's `sys_tags()` as proof for
+another target. Derive the Linux ordered manylinux tags inside the exact admitted glibc-2.28
+release-builder image and compare them in the native lane. Reject sdists, free-threaded ABI tags,
+musllinux, generic Linux, too-new floors, wrong architectures, yanked/prerelease artifacts,
+mutable/VCS/local URLs, missing hashes/sizes, and ambiguous equal-rank candidates.
+
+Every target lock binds the selected wheel's filename, normalized name/version, complete tags,
+URL, SHA-256, size, yanked state, `Requires-Python`, metadata digest, and target selection. Inspect
+the exact wheel archive for repeatable `License-File` entries, SPDX expressions, `RECORD` coverage,
+and bundled native-library notices. Requirements, master wheel lock, target inventory, offline
+installed distributions, and bundled native libraries must agree exactly.
+
+### Model export parity
+
+For every admitted estimator/preprocessor combination:
+
+1. fit and predict in the exact Python environment;
+2. convert with an explicit input schema and target opset;
+3. run `onnx.checker.check_model(..., full_check=True)`;
+4. record IR/opset/operator/type/shape/external-data/size/hash facts; and
+5. compare output with the exact locked Rust tract runtime across representative and boundary data.
+
+An unsupported conversion excludes that estimator from the live ONNX path. Research-only
+interval computation may remain in the contained Python worker and must not be described as a live
+ONNX output.
+
+## Frontend and native desktop
+
+| Package | Version | Purpose and admission condition |
+| --- | ---: | --- |
+| `@tanstack/react-query` | 5.101.4 | Bounded server-state request, cache, mutation, and reconnect lifecycle; no second product authority |
+| `@tanstack/react-table` | 8.21.3 | Headless accessible table state over bounded server-side results |
+| `lightweight-charts` | 5.2.0 | Dense financial and predictive time series; TradingView attribution and NOTICE are mandatory |
+| `recharts` | 3.10.1 | Portfolio, risk, attribution, scenario, and analytical charts; measured route-level bundle gate |
+| `react-is` | 19.2.8 | Exact React 19.2.8 peer for Recharts |
+| Rust `tauri-plugin-dialog` | 2.7.2 | Rust-only controlled file selection; no JavaScript binding or WebView dialog/filesystem authority |
+
+The frontend lock gate must inspect integrity, peer resolution, lifecycle scripts, exact licenses
+and notices, duplicate modules, and the clean production Vite bundle delta. Lightweight Charts'
+required TradingView attribution must appear in the product and packaged notices. Lazy-load chart
+routes and measure actual raw/compressed chunks rather than using registry unpacked size as a
+claim.
+
+Task 1 owns the Rust dialog dependency manifest/lock once. Task 14 owns plugin registration,
+generated permissions/capabilities, frontend dependencies, and the pnpm lock; it does not resolve
+the Rust dependency a second time. The WebView receives only an opaque staged input ticket and
+validated metadata, never an ambient file path or service credential.
+
+## Per-user service lifecycle
+
+The platform mechanisms preserve all supported floors without paid credentials:
+
+- **macOS 12+:** one owner-scoped LaunchAgent in `~/Library/LaunchAgents`, launched in the
+  foreground with exact immutable executable arguments and bounded restart behavior. Developer ID
+  and notarization affect Gatekeeper trust, not LaunchAgent registration. `SMAppService` is macOS
+  13+ and cannot be the only implementation.
+- **Windows 10 1809+:** Task Scheduler 2.0 through its API, bound to the exact current-user SID,
+  interactive token, and least-privilege/LUA run level. Store no password and use no SYSTEM,
+  service account, or elevation. Prove current-user MSI behavior or do not claim the MSI conforms.
+- **Ubuntu 24.04-compatible:** one `systemd --user` unit with no mandatory linger. Availability
+  follows the signed-in user's manager/session and returns at login.
+
+The service registration points to the exact immutable active version. Stable installer-owned
+entrypoints serve the CLI, installer, and MCP relay. Install, update, repair, rollback, and uninstall
+form one recoverable transaction over the release selector, stable entrypoints, native service
+definition, authenticated health, and owned client-registration receipts.
+
+## Lock and acceptance gates
+
+Before a serialized dependency boundary is committed:
+
+1. refresh releases, yanks, advisories, licenses, supported floors, and exact package artifacts at
+   the current clean head;
+2. update the governing design/plan and this record when the accepted decision changes;
+3. perform one unlocked resolution, inspect the complete manifest/lock/feature/duplicate diff, and
+   then use `--locked` only;
+4. run the focused package/protocol/builder/frontend gates named in the implementation plan;
+5. reconcile exact licenses/notices and complete-release inputs rather than project-page labels;
+6. record clean head/tree and feature/origin equality before a Wave freeze; and
+7. retain exact platform/package/conformance evidence for the grouped review rather than treating a
+   focused compile as release approval.
+
+MCP approval additionally requires stable-2026 discovery and metadata, negative version and
+Host/Origin/auth tests, no leaked optional capabilities, two-client isolation, bounded request/SSE
+resources, exact stdio behavior, and pinned official conformance evidence supplemented by
+repository-owned security tests.
+
+Python approval additionally requires four target-specific wheel-only closures, offline native
+installation, exact imports, deterministic direct/recursive/exogenous/temporal/interval behavior,
+model parity, license/notice reconciliation, and no runtime download or source build.
+
+Frontend approval additionally requires frozen installation, peer and lifecycle-script proof,
+license/NOTICE inventory, measured production chunks, exact capabilities, and packaged WebView
+smokes on all four targets.
+
+## Primary sources
+
+Sources were checked on 2026-08-01.
+
+- Rust and runtime: [Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/),
+  [Tokio releases](https://github.com/tokio-rs/tokio/releases), [Axum
+  0.8.9](https://github.com/tokio-rs/axum/releases/tag/axum-v0.8.9), [Tower
+  0.5.3](https://github.com/tower-rs/tower/releases/tag/tower-0.5.3), and [Tower HTTP
+  0.7.0](https://github.com/tower-rs/tower-http/releases/tag/tower-http-v0.7.0).
+- MCP: [stable 2026-07-28 protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic),
+  [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+  [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),
+  [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http),
+  [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog), and [RMCP
+  3.1.0](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.1.0).
+- Python: [Python 3.14](https://www.python.org/downloads/), [uv
+  0.12.1](https://github.com/astral-sh/uv/releases/tag/0.12.1), [PyArrow
+  installation](https://arrow.apache.org/docs/python/install.html), [scikit-learn
+  1.9.0](https://pypi.org/project/scikit-learn/), [MAPIE
+  1.4.1](https://pypi.org/project/mapie/), [skl2onnx
+  1.20.0](https://pypi.org/project/skl2onnx/), [ONNX
+  1.22.0](https://pypi.org/project/onnx/), and [packaging
+  26.2](https://pypi.org/project/packaging/).
+- Forecast methods: [scikit-learn lagged forecasting and
+  quantiles](https://scikit-learn.org/stable/auto_examples/applications/plot_time_series_lagged_features.html),
+  [`TimeSeriesSplit`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html),
+  [`MultiOutputRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.MultiOutputRegressor.html),
+  [MAPIE `TimeSeriesRegressor`](https://mapie.readthedocs.io/en/v1.4/generated/mapie.regression.TimeSeriesRegressor.html),
+  and [EnbPI research](https://proceedings.mlr.press/v139/xu21h.html).
+- Packaging: [wheel tags](https://packaging.pypa.io/en/stable/tags.html), [utility
+  APIs](https://packaging.pypa.io/en/stable/utils.html), [platform tag
+  specification](https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/),
+  [Core Metadata](https://packaging.python.org/en/latest/specifications/core-metadata/), [PEP
+  639](https://peps.python.org/pep-0639/), and [SPDX expressions](https://spdx.github.io/spdx-spec/v3.0.1/annexes/spdx-license-expressions/).
+- Frontend/native: [TanStack Query](https://tanstack.com/query/v5/docs/framework/react/guides/queries),
+  [TanStack Table](https://tanstack.com/table/latest/docs/introduction), [Lightweight Charts
+  attribution](https://tradingview.github.io/lightweight-charts/docs/5.0), [Recharts](https://recharts.github.io/),
+  [Tauri dialog](https://v2.tauri.app/plugin/dialog/), and [Tauri
+  capabilities](https://v2.tauri.app/security/capabilities/).
+- Platform lifecycle: [Apple LaunchAgents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatinglaunchdJobs.html),
+  [Microsoft logon task](https://learn.microsoft.com/en-us/windows/win32/taskschd/starting-an-executable-when-a-user-logs-on),
+  [Microsoft run level](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-runlevel),
+  [Ubuntu 24.04 release notes](https://documentation.ubuntu.com/release-notes/24.04/), and
+  [`pam_systemd`](https://www.freedesktop.org/software/systemd/man/252/pam_systemd.html).
+
