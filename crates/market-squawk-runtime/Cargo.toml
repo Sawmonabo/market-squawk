@@ -1,0 +1,26 @@
+[package]
+name = "market-squawk-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-neutral installed service and native client contracts for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-jobs.workspace = true
+market-squawk-services.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

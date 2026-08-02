@@ -81,11 +81,13 @@ market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", v
 market-squawk-data = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }
+market-squawk-jobs = { workspace = true }
 market-squawk-mcp = { workspace = true }
 market-squawk-modeling = { workspace = true, features = ["onnx-tract"] }
 market-squawk-installer = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-portfolio = { workspace = true }
+market-squawk-runtime = { workspace = true }
 market-squawk-services = { workspace = true }
 market-squawk-sources = { workspace = true }
 market-squawk-valuation = { workspace = true }

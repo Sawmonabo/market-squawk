@@ -26,6 +26,7 @@ clap.workspace = true
 directories.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
+market-squawk-runtime.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 semver.workspace = true

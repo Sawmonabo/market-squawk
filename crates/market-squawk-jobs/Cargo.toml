@@ -1,0 +1,21 @@
+[package]
+name = "market-squawk-jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-neutral durable job lifecycle contracts for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-services.workspace = true
+serde = { workspace = true, features = ["rc"] }
+thiserror.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

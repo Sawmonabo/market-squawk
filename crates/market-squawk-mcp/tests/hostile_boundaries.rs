@@ -758,7 +758,7 @@ async fn initialized_mutation_session(
         json!({
             "jsonrpc":"2.0","id":"initialize","method":"initialize",
             "params":{
-                "protocolVersion":"2025-11-25","capabilities":{},
+                "protocolVersion":"2026-07-28","capabilities":{},
                 "clientInfo":{"name":"tests","version":"1"}
             }
         }),
@@ -851,7 +851,7 @@ where
             "id":1,
             "method":"initialize",
             "params":{
-                "protocolVersion":"2025-11-25",
+                "protocolVersion":"2026-07-28",
                 "capabilities":{},
                 "clientInfo":{"name":"tests","version":"1"}
             }
@@ -1089,7 +1089,7 @@ async fn exact_limit_crlf_survives_a_fragmented_delimiter() -> Result<(), Box<dy
     let mut initialize = serde_json::to_vec(&json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{
-            "protocolVersion":"2025-11-25","capabilities":{},
+            "protocolVersion":"2026-07-28","capabilities":{},
             "clientInfo":{"name":"tests","version":"1"}
         }
     }))?;
@@ -1141,7 +1141,7 @@ async fn rejected_completion_audit_releases_no_response_bytes() -> Result<(), Bo
     let mut initialize = serde_json::to_vec(&json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{
-            "protocolVersion":"2025-11-25","capabilities":{},
+            "protocolVersion":"2026-07-28","capabilities":{},
             "clientInfo":{"name":"tests","version":"1"}
         }
     }))?;
@@ -1190,7 +1190,7 @@ async fn dispatched_service_failure_is_a_redacted_tool_error_and_audited_as_fail
         json!({
             "jsonrpc":"2.0","id":1,"method":"initialize",
             "params":{
-                "protocolVersion":"2025-11-25",
+                "protocolVersion":"2026-07-28",
                 "capabilities":{},
                 "clientInfo":{"name":"tests","version":"1"}
             }
@@ -1528,7 +1528,7 @@ async fn sdk_tracing_cannot_emit_protocol_payloads_to_the_host_subscriber()
         json!({
             "jsonrpc":"2.0","id":1,"method":"initialize",
             "params":{
-                "protocolVersion":"2025-11-25","capabilities":{},
+                "protocolVersion":"2026-07-28","capabilities":{},
                 "clientInfo":{"name":"tests","version":"1"}
             }
         }),
@@ -1895,7 +1895,7 @@ async fn stalled_output_hits_the_write_deadline_instead_of_growing_unbounded()
     let input = serde_json::to_vec(&json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{
-            "protocolVersion":"2025-11-25","capabilities":{},
+            "protocolVersion":"2026-07-28","capabilities":{},
             "clientInfo":{"name":"tests","version":"1"}
         }
     }))?;

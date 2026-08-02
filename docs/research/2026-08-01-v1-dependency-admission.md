@@ -61,7 +61,7 @@ and protocol facts immediately before each serialized lock mutation.
 | Hyper | 1.11.0 | Existing `http1` and `server` boundary | MIT; retain exact line |
 | Hyper-util | 0.1.20 | Existing Tokio integration only unless direct code proves more | MIT; retain exact line |
 | http-body-util | 0.1.4 | No package features required | MIT; retain exact line |
-| Schemars | 1.2.2 | Existing derive/schema needs only | MIT; refresh from 1.2.1 with schema evidence |
+| Schemars | RMCP-owned 1.2.1 | No direct Market Squawk dependency; RMCP uses it for protocol schemas | MIT; do not force a duplicate 1.2.2 graph without direct production use |
 
 Do not enable default/full feature sets merely to make a compile pass. Task 1 performs one
 serialized resolution, inspects `cargo tree -e features`, duplicate versions, advisories, licenses,
@@ -88,10 +88,11 @@ exact version selection, stateless configuration, closed Host/Origin/auth/limit 
 negative conformance tests. RMCP continues to own MCP framing and transport mechanics; Market
 Squawk owns credentials, authorization, bounds, audit, jobs, artifacts, and product handles.
 
-The candidate RMCP feature set is limited to the server, client, stdio, Streamable HTTP server, and
-loopback HTTP client needed by the shared endpoint and relay. Do not admit OAuth, native TLS,
-child-process, WebSocket, HTTP/2, macros, elicitation, or request-state features without a separate
-implemented use and admission decision.
+The candidate RMCP feature set is limited to the server, stdio, and Streamable HTTP server needed
+by the shared endpoint and relay-facing protocol handler. The relay reuses the authenticated
+`ApplicationClient` rather than adding RMCP's Reqwest HTTP-client edge. Do not admit RMCP client,
+OAuth, native TLS, child-process, WebSocket, HTTP/2, macros, elicitation, or request-state features
+without a separate implemented use and admission decision.
 
 Claude Code and Codex use installer-owned stdio relay registrations by default so credentials do
 not appear in their configuration or command arguments. Each relay is a small adapter to the one
@@ -281,4 +282,3 @@ Sources were checked on 2026-08-01.
   [Microsoft run level](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-runlevel),
   [Ubuntu 24.04 release notes](https://documentation.ubuntu.com/release-notes/24.04/), and
   [`pam_systemd`](https://www.freedesktop.org/software/systemd/man/252/pam_systemd.html).
-

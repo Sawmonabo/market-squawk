@@ -30,6 +30,11 @@ arrow = { version = "=58.3.0", default-features = false, features = [
 ] }
 async-trait = "0.1"
 atomicwrites = "=0.4.4"
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
 base64 = "=0.22.1"
 bs58 = "0.5"
 bytes = "1.10"
@@ -82,10 +87,12 @@ market-squawk-data = { path = "crates/market-squawk-data", version = "=1.0.0" }
 market-squawk-domain = { path = "crates/market-squawk-domain", version = "=1.0.0" }
 market-squawk-execution = { path = "crates/market-squawk-execution", version = "=1.0.0" }
 market-squawk-live = { path = "crates/market-squawk-live", version = "=1.0.0" }
+market-squawk-jobs = { path = "crates/market-squawk-jobs", version = "=1.0.0" }
 market-squawk-mcp = { path = "crates/market-squawk-mcp", version = "=1.0.0" }
 market-squawk-modeling = { path = "crates/market-squawk-modeling", version = "=1.0.0" }
 market-squawk-platform = { path = "crates/market-squawk-platform", version = "=1.0.0" }
 market-squawk-portfolio = { path = "crates/market-squawk-portfolio", version = "=1.0.0" }
+market-squawk-runtime = { path = "crates/market-squawk-runtime", version = "=1.0.0" }
 market-squawk-services = { path = "crates/market-squawk-services", version = "=1.0.0" }
 market-squawk-sources = { path = "crates/market-squawk-sources", version = "=1.0.0" }
 market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=1.0.0" }
@@ -116,9 +123,10 @@ rand_chacha = "=0.9.0"
 rand_core = "=0.9.5"
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
-rmcp = { version = "=2.2.0", default-features = false, features = [
+rmcp = { version = "=3.1.0", default-features = false, features = [
     "server",
     "transport-io",
+    "transport-streamable-http-server",
 ] }
 rusqlite = { version = "=0.40.1", default-features = false, features = [
     "backup",
@@ -126,10 +134,6 @@ rusqlite = { version = "=0.40.1", default-features = false, features = [
     "hooks",
     "limits",
     "serialize",
-] }
-schemars = { version = "=1.2.1", default-features = false, features = [
-    "derive",
-    "std",
 ] }
 semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -141,11 +145,12 @@ static_assertions = "1.1"
 subtle = "=2.6.1"
 tauri = { version = "=2.11.5", default-features = false, features = ["wry"] }
 tauri-build = { version = "=2.6.3", default-features = false }
+tauri-plugin-dialog = { version = "=2.7.2", default-features = false }
 tauri-plugin-opener = { version = "=2.5.4", default-features = false }
 tempfile = "3.15"
 thiserror = "2.0"
 trybuild = "1.0"
-tokio = { version = "1.43", features = [
+tokio = { version = "=1.53.1", features = [
     "io-std",
     "io-util",
     "macros",
@@ -155,11 +160,17 @@ tokio = { version = "1.43", features = [
     "sync",
     "time",
 ] }
-tokio-util = "0.7"
+tokio-util = { version = "=0.7.19", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tower = { version = "=0.5.3", default-features = false, features = [
+    "limit",
+    "load-shed",
+    "timeout",
+    "util",
+] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
 url = "2.5"
 webbrowser = { version = "=1.2.1", features = ["hardened"] }

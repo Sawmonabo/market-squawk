@@ -485,7 +485,8 @@ product commit scope and repeats the affected barrier or final candidate gate.
 - [ ] **Step 2: Add crate/package identities and exact dependency features**
 
   Add `market-squawk-jobs` and `market-squawk-runtime` as workspace dependencies. Upgrade RMCP to
-  exact 3.1.0 and enable only the server, client, stdio, and Streamable HTTP features actually used.
+  exact 3.1.0 and enable only the server, stdio, and Streamable HTTP server features actually used.
+  The relay reuses `ApplicationClient`; do not add RMCP HTTP-client/Reqwest, OAuth, or TLS features.
   Add Axum/Tower/Tower HTTP features required for typed JSON, body limits, SSE, trace-safe request
   IDs, closed request validation, and graceful shutdown. Add the official
   Tauri dialog plugin without filesystem/shell plugins. Keep all workspace metadata/lints inherited.

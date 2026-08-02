@@ -17,11 +17,11 @@ use market_squawk_services::{
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock, ErrorCode,
-        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, Meta,
-        NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId,
-        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
-        ToolAnnotations, ToolExecution,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+        ContentBlock, ErrorCode, Implementation, InitializeRequestParams, InitializeResult,
+        ListToolsResult, MetaObject, NumberOrString, PaginatedRequestParams, ProgressToken,
+        ProtocolVersion, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult, Tool, ToolAnnotations,
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
@@ -507,7 +507,7 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
             ServerCapabilities::default()
         };
         InitializeResult::new(capabilities)
-            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
                 "market-squawk",
                 env!("CARGO_PKG_VERSION"),
@@ -522,11 +522,16 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
             })
     }
 
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+    }
+
     async fn initialize(
         &self,
-        _request: InitializeRequestParams,
-        _context: McpRequestContext<RoleServer>,
+        request: InitializeRequestParams,
+        context: McpRequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request);
         self.initialization_state
             .compare_exchange(
                 STATE_AWAIT_INITIALIZE,
@@ -601,8 +606,8 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
         &self,
         request: CallToolRequestParams,
         context: McpRequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.execute_tool(request, context).await
+    ) -> Result<CallToolResponse, McpError> {
+        self.execute_tool(request, context).await.map(Into::into)
     }
 }
 
@@ -688,10 +693,9 @@ fn to_rmcp_tool(descriptor: &ToolDescriptor) -> Tool {
             .idempotent(effects.idempotent())
             .open_world(effects.open_world()),
     )
-    .with_raw_output_schema(Arc::new(descriptor.output_schema().clone()))
-    .with_execution(ToolExecution::new().with_task_support(TaskSupport::Forbidden));
+    .with_raw_output_schema(Arc::new(descriptor.output_schema().clone()));
     if !descriptor.metadata().is_empty() {
-        tool = tool.with_meta(Meta(descriptor.metadata().clone()));
+        tool = tool.with_meta(MetaObject(descriptor.metadata().clone()));
     }
     tool
 }

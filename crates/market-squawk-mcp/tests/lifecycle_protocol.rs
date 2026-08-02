@@ -299,13 +299,13 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
 
     let initialized = harness.initialize(json!(17)).await?;
     assert_eq!(initialized["id"], 17);
-    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
     assert!(initialized["result"]["capabilities"].get("tools").is_none());
 
     harness
         .send(json!({"jsonrpc":"2.0","id":"early","method":"tools/list"}))
         .await?;
-    assert_eq!(harness.receive().await?["error"]["code"], -32002);
+    assert_eq!(harness.receive().await?["error"]["code"], -32602);
 
     harness.initialized().await?;
     harness
@@ -313,7 +313,7 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
         .await?;
     let empty_id = harness.receive().await?;
     assert_eq!(empty_id["id"], "");
-    assert_eq!(empty_id["result"], json!({}));
+    assert_eq!(empty_id["result"], Value::Null);
 
     harness
         .send(json!({
@@ -340,7 +340,7 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
         .await?;
     let ping = harness.receive().await?;
     assert_eq!(ping["id"], "ping-1");
-    assert_eq!(ping["result"], json!({}));
+    assert_eq!(ping["result"], Value::Null);
 
     harness
         .send(json!({"jsonrpc":"2.0","id":18,"method":"tools/list"}))
@@ -1032,7 +1032,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
     harness
         .send(json!({"jsonrpc":"2.0","id":"after-release","method":"ping"}))
         .await?;
-    assert_eq!(harness.receive().await?["result"], json!({}));
+    assert_eq!(harness.receive().await?["result"], Value::Null);
     for cycle in 0..3 {
         let started = service.started.notified();
         let id = format!("cancel-cycle-{cycle}");

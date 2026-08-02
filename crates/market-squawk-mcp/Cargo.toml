@@ -14,6 +14,7 @@ fuzzing = []
 
 [dependencies]
 async-trait.workspace = true
+market-squawk-runtime = { path = "../market-squawk-runtime", version = "=1.0.0" }
 market-squawk-services = { path = "../market-squawk-services", version = "=1.0.0" }
 rmcp.workspace = true
 serde.workspace = true
