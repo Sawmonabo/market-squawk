@@ -11,6 +11,15 @@ use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest as _, Sha256};
 
 use super::PathError;
+use super::sqlite::{
+    PreparedSqliteLocation, acquire_writer_file,
+    configure_private_file_creation as configure_sqlite_file_creation, open_private_file,
+    validate_for_open as validate_sqlite_root,
+    validate_optional_sqlite_sidecar as validate_shared_sqlite_sidecar,
+    validate_private_file_identity as validate_shared_file_identity,
+    validate_private_file_identity_with_links as validate_shared_file_identity_with_links,
+    validate_private_file_metadata,
+};
 
 mod restore;
 
@@ -299,40 +308,7 @@ fn validate_optional_sqlite_sidecar(
     name: &str,
     require_empty: bool,
 ) -> Result<(), PathError> {
-    let named = match location.root_capability.symlink_metadata(name) {
-        Ok(named) => named,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(PathError::io(
-                "failed to inspect SQLite catalog sidecar",
-                source,
-            ));
-        }
-    };
-    validate_private_file_metadata(&named)?;
-    if require_empty && named.len() != 0 {
-        return Err(PathError::PreparedRootChanged);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    options.follow(FollowSymlinks::No);
-    configure_private_catalog_creation(&mut options);
-    let opened = location
-        .root_capability
-        .open_with(name, &options)
-        .map_err(|source| PathError::io("failed to open SQLite catalog sidecar", source))?
-        .into_std();
-    validate_private_file_identity(location, name, &opened)?;
-    if require_empty
-        && opened
-            .metadata()
-            .map_err(|source| PathError::io("failed to reinspect SQLite catalog sidecar", source))?
-            .len()
-            != 0
-    {
-        return Err(PathError::PreparedRootChanged);
-    }
-    Ok(())
+    validate_shared_sqlite_sidecar(location, name, require_empty)
 }
 
 impl fmt::Debug for CatalogFileGuard {
@@ -386,25 +362,15 @@ impl CatalogLocation {
     /// Catalogs must have exactly one hard link. Unix files must also be owner-only. Windows opens
     /// retain no-delete sharing and reject reparse points; POSIX permission claims are not made.
     pub fn prepare_catalog_file(&self) -> Result<CatalogFileGuard, PathError> {
-        self.validate_for_open()?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        options.follow(FollowSymlinks::No);
-        configure_private_catalog_creation(&mut options);
-        let file = self
-            .root_capability
-            .open_with(CATALOG_FILE, &options)
-            .map_err(|source| PathError::io("failed to open private catalog", source))?;
-        let named = self
-            .root_capability
-            .symlink_metadata(CATALOG_FILE)
-            .map_err(|source| PathError::io("failed to inspect private catalog", source))?;
-        if !named.is_file() {
-            return Err(PathError::PreparedRootChanged);
-        }
-        validate_private_file_metadata(&named)?;
+        let file = open_private_file(
+            self,
+            CATALOG_FILE,
+            true,
+            true,
+            "failed to open private catalog",
+        )?;
         let guard = CatalogFileGuard {
-            file: file.into_std(),
+            file,
             location: self.clone(),
         };
         guard.validate_identity()?;
@@ -413,25 +379,15 @@ impl CatalogLocation {
 
     /// Opens the existing fixed catalog capability-relative and without following links.
     pub fn open_catalog_file(&self) -> Result<CatalogFileGuard, PathError> {
-        self.validate_for_open()?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        options.follow(FollowSymlinks::No);
-        configure_private_catalog_creation(&mut options);
-        let file = self
-            .root_capability
-            .open_with(CATALOG_FILE, &options)
-            .map_err(|source| PathError::io("failed to open existing catalog", source))?;
-        let named = self
-            .root_capability
-            .symlink_metadata(CATALOG_FILE)
-            .map_err(|source| PathError::io("failed to inspect existing catalog", source))?;
-        if !named.is_file() {
-            return Err(PathError::PreparedRootChanged);
-        }
-        validate_private_file_metadata(&named)?;
+        let file = open_private_file(
+            self,
+            CATALOG_FILE,
+            false,
+            false,
+            "failed to open existing catalog",
+        )?;
         let guard = CatalogFileGuard {
-            file: file.into_std(),
+            file,
             location: self.clone(),
         };
         guard.validate_identity()?;
@@ -443,20 +399,7 @@ impl CatalogLocation {
     /// Callers must invoke this immediately before and after opening the SQLite path. The retained
     /// directory is the identity authority; this check rejects ambient rename or substitution.
     pub fn validate_for_open(&self) -> Result<(), PathError> {
-        use cap_fs_ext::MetadataExt as _;
-
-        let expected = self
-            .root_capability
-            .dir_metadata()
-            .map_err(|source| PathError::io("failed to inspect prepared root", source))?;
-        let reopened = open_prepared_root(&self.root)?;
-        let actual = reopened
-            .dir_metadata()
-            .map_err(|source| PathError::io("failed to reinspect prepared root", source))?;
-        if (expected.dev(), expected.ino()) != (actual.dev(), actual.ino()) {
-            return Err(PathError::PreparedRootChanged);
-        }
-        Ok(())
+        validate_sqlite_root(self)
     }
 
     /// Acquires the no-follow cross-process writer lock relative to the prepared root capability.
@@ -478,32 +421,25 @@ impl CatalogLocation {
     }
 
     fn acquire_writer_lock(&self, create: bool) -> Result<CatalogWriterGuard, PathError> {
-        self.validate_for_open()?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(create);
-        options.follow(FollowSymlinks::No);
-        configure_private_lock_creation(&mut options);
-        let file = self
-            .root_capability
-            .open_with(WRITER_LOCK_FILE, &options)
-            .map_err(|source| PathError::io("failed to open catalog writer lock", source))?;
-        let file = file.into_std();
-        validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(PathError::CatalogAlreadyLocked);
-            }
-            Err(std::fs::TryLockError::Error(source)) => {
-                return Err(PathError::io(
-                    "failed to acquire catalog writer lock",
-                    source,
-                ));
-            }
-        }
-        let guard = CatalogWriterGuard { file };
-        validate_private_file_identity(self, WRITER_LOCK_FILE, &guard.file)?;
-        Ok(guard)
+        acquire_writer_file(
+            self,
+            WRITER_LOCK_FILE,
+            create,
+            || PathError::CatalogAlreadyLocked,
+            "failed to open catalog writer lock",
+            "failed to acquire catalog writer lock",
+        )
+        .map(|file| CatalogWriterGuard { file })
+    }
+}
+
+impl PreparedSqliteLocation for CatalogLocation {
+    fn display_root(&self) -> &Path {
+        &self.root
+    }
+
+    fn directory(&self) -> &Arc<Dir> {
+        &self.root_capability
     }
 }
 
@@ -512,7 +448,7 @@ fn validate_private_file_identity(
     name: &str,
     file: &File,
 ) -> Result<(), PathError> {
-    validate_private_file_identity_with_links(location, name, file, 1)
+    validate_shared_file_identity(location, name, file)
 }
 
 fn validate_private_file_identity_with_links(
@@ -521,178 +457,15 @@ fn validate_private_file_identity_with_links(
     file: &File,
     expected_links: u64,
 ) -> Result<(), PathError> {
-    use cap_fs_ext::MetadataExt as _;
-
-    location.validate_for_open()?;
-    let opened = cap_std::fs::File::from_std(
-        file.try_clone()
-            .map_err(|source| PathError::io("failed to clone catalog control file", source))?,
-    )
-    .metadata()
-    .map_err(|source| PathError::io("failed to inspect opened catalog control file", source))?;
-    let named = location
-        .root_capability
-        .symlink_metadata(name)
-        .map_err(|source| PathError::io("failed to inspect named catalog control file", source))?;
-    if !opened.is_file()
-        || !named.is_file()
-        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
-    {
-        return Err(PathError::PreparedRootChanged);
-    }
-    validate_file_link_count(&opened, expected_links)?;
-    validate_private_file_metadata_with_links(&named, expected_links)
+    validate_shared_file_identity_with_links(location, name, file, expected_links)
 }
 
-fn validate_file_link_count(
-    metadata: &cap_std::fs::Metadata,
-    expected_links: u64,
-) -> Result<(), PathError> {
-    use cap_fs_ext::MetadataExt as _;
-
-    if metadata.nlink() != expected_links {
-        return Err(PathError::PreparedRootChanged);
-    }
-    Ok(())
+pub(super) fn configure_private_catalog_creation(options: &mut OpenOptions) {
+    configure_sqlite_file_creation(options);
 }
-
-#[cfg(unix)]
-fn configure_private_lock_creation(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    options.mode(0o600);
-}
-
-#[cfg(unix)]
-fn configure_private_catalog_creation(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    options.mode(0o600);
-}
-
-#[cfg(windows)]
-fn configure_private_catalog_creation(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    options
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_private_catalog_creation(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
-    validate_private_file_metadata_with_links(metadata, 1)
-}
-
-#[cfg(unix)]
-fn validate_private_file_metadata_with_links(
-    metadata: &cap_std::fs::Metadata,
-    expected_links: u64,
-) -> Result<(), PathError> {
-    use cap_std::fs::PermissionsExt as _;
-
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(PathError::PreparedRootChanged);
-    }
-    validate_file_link_count(metadata, expected_links)
-}
-
-#[cfg(windows)]
-fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
-    validate_private_file_metadata_with_links(metadata, 1)
-}
-
-#[cfg(windows)]
-fn validate_private_file_metadata_with_links(
-    metadata: &cap_std::fs::Metadata,
-    expected_links: u64,
-) -> Result<(), PathError> {
-    use cap_std::fs::MetadataExt as _;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(PathError::PreparedRootChanged);
-    }
-    validate_file_link_count(metadata, expected_links)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_private_file_metadata(_metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
-    Err(PathError::PreparedRootChanged)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_private_file_metadata_with_links(
-    _metadata: &cap_std::fs::Metadata,
-    _expected_links: u64,
-) -> Result<(), PathError> {
-    Err(PathError::PreparedRootChanged)
-}
-
-#[cfg(windows)]
-fn configure_private_lock_creation(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    options
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_private_lock_creation(_options: &mut OpenOptions) {}
 
 impl fmt::Debug for CatalogLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CatalogLocation([PREPARED LOCAL CAPABILITY])")
     }
-}
-
-#[cfg(unix)]
-pub(super) fn open_prepared_root(root: &Path) -> Result<Dir, PathError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)
-        .map_err(|source| PathError::io("failed to open prepared root", source))?;
-    Ok(Dir::from_std_file(file))
-}
-
-#[cfg(windows)]
-pub(super) fn open_prepared_root(root: &Path) -> Result<Dir, PathError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(root)
-        .map_err(|source| PathError::io("failed to open prepared root", source))?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| PathError::io("failed to inspect prepared root handle", source))?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(PathError::PreparedRootChanged);
-    }
-    Ok(Dir::from_std_file(file))
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(super) fn open_prepared_root(_root: &Path) -> Result<Dir, PathError> {
-    Err(PathError::PreparedRootChanged)
 }

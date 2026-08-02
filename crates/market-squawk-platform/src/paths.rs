@@ -1,6 +1,8 @@
 //! Local directory layout and capability-confined artifact publication.
 
 mod catalog;
+mod jobs;
+mod sqlite;
 
 use std::{
     fmt,
@@ -18,11 +20,12 @@ use crate::{
     JournalError, JournalReader, JournalSinkConstructionError, JournalSinkLimits, JournalWriter,
 };
 
-use self::catalog::open_prepared_root;
 pub use self::catalog::{
     CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard, CatalogWriterGuard,
 };
 pub use self::catalog::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
+pub use self::jobs::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatabaseWriterGuard};
+use self::sqlite::open_prepared_root;
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
 const MAX_ARTIFACT_DEPTH: usize = 32;
@@ -58,6 +61,9 @@ pub enum PathError {
     /// Another process owns the prepared catalog writer lock.
     #[error("prepared catalog already has an active writer")]
     CatalogAlreadyLocked,
+    /// Another process owns the prepared job-database writer lock.
+    #[error("prepared job database already has an active writer")]
+    JobDatabaseAlreadyLocked,
     /// A catalog restore stage or final target contains different immutable bytes.
     #[error("prepared catalog restore target conflicts with retained state")]
     CatalogRestoreConflict,
