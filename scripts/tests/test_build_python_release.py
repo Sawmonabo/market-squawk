@@ -92,7 +92,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             packaging = None
         if packaging is None or packaging.__version__ != "26.2":
             with self.assertRaisesRegex(
-                builder.ReleaseBuildError, "packaging 26.2 is required"
+                builder.ReleaseBuildError, r"packaging 26\.2"
             ):
                 builder._compatible(
                     "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
