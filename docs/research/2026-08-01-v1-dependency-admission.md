@@ -6,7 +6,7 @@
 | --- | --- |
 | Document type | Implementation dependency and platform admission record |
 | Audience | Runtime, MCP, desktop, modeling, installer, security, and release owners |
-| Status | Task 0 decision baseline with Task 7 Python artifact admission recorded; release approval remains pending |
+| Status | Task 0 decision baseline with Task 7 Python artifacts and Task 14 desktop dependencies admitted; release approval remains pending |
 | Research date | 2026-08-01 |
 | Last substantive review | 2026-08-02 |
 | Audited commit | `f43da3aa5cbd887a35c9ef25c748b722c9d5c028` |
@@ -255,6 +255,33 @@ ONNX output.
 | `recharts` | 3.10.1 | Portfolio, risk, attribution, scenario, and analytical charts; measured route-level bundle gate |
 | `react-is` | 19.2.8 | Exact React 19.2.8 peer for Recharts |
 | Rust `tauri-plugin-dialog` | 2.7.2 | Rust-only controlled file selection with the plugin's supported GTK3 Linux backend; no JavaScript binding or WebView dialog/filesystem authority |
+
+### Task 14 exact refresh and alternatives
+
+The 2026-08-02 serialized refresh reconfirmed every selected version against its primary registry
+record before changing `package.json` and `pnpm-lock.yaml`. All five JavaScript packages are the
+current stable `latest` tag; TanStack Table 9 remains prerelease-only and is not admitted. React,
+React DOM, and `react-is` remain exactly 19.2.8. Recharts explicitly requires a matching React-line
+`react-is` peer. The Rust dialog crate remains the current stable 2.7.2 release.
+
+| Package | Registry unpacked size | License | Maintenance evidence at refresh | Rejected replacement |
+| --- | ---: | --- | --- | --- |
+| `@tanstack/react-query` 5.101.4 | 858,903 bytes | MIT | Published 2026-07-21; React 18/19 peer; millions of weekly downloads | Repository-owned cache/retry/event state, because it would duplicate a maintained request lifecycle |
+| `@tanstack/react-table` 8.21.3 | 761,890 bytes | MIT | Stable V8 line current on 2026-08-02; React/DOM 16.8+ peers | V9 beta and a full component table suite; neither is needed for bounded headless tables |
+| `lightweight-charts` 5.2.0 | 3,066,492 bytes | Apache-2.0 | Current stable; maintained financial-chart-specific API | Repository-owned canvas/SVG financial charting; it would recreate time scale, series, and interaction code |
+| `recharts` 3.10.1 | 7,452,998 bytes | MIT | Published 2026-07-25; React 19 admitted | A second general chart suite or custom D3 layer; one declarative analytical suite is sufficient |
+| `react-is` 19.2.8 | 13,526 bytes | MIT | Current React stable peer, published 2026-07-31 | Mismatched peer or compatibility override |
+| Rust `tauri-plugin-dialog` 2.7.2 | Cargo-owned | MIT/Apache-2.0 | Current stable; official Tauri 2 plugin supports Rust-side file selection on Linux, macOS, and Windows | JavaScript dialog/filesystem authority or a repository-owned native-dialog abstraction |
+
+Primary records: [TanStack Query on npm](https://www.npmjs.com/package/@tanstack/react-query),
+[TanStack Table on npm](https://www.npmjs.com/package/@tanstack/react-table),
+[Lightweight Charts on npm](https://www.npmjs.com/package/lightweight-charts),
+[Recharts on npm](https://www.npmjs.com/package/recharts),
+[`react-is` on npm](https://www.npmjs.com/package/react-is), and the
+[official Tauri dialog plugin guide](https://v2.tauri.app/plugin/dialog/). The Tauri guide confirms
+that Rust-side selection is supported without installing the JavaScript binding. Market Squawk
+therefore initializes the Rust plugin but grants no `dialog:*` permission to the WebView; the
+window receives only later application-owned typed staging commands.
 
 The frontend lock gate must inspect integrity, peer resolution, lifecycle scripts, exact licenses
 and notices, duplicate modules, and the clean production Vite bundle delta. Lightweight Charts'

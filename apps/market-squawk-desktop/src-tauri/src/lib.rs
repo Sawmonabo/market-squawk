@@ -178,6 +178,7 @@ fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             application_invoke,
             desktop_bootstrap,
