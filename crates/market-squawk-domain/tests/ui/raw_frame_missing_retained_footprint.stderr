@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `checked_retained_footprint`
+  --> tests/ui/raw_frame_missing_retained_footprint.rs:11:1
+   |
+11 | impl RawCaptureFrameView for MissingRetainedFootprint {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `checked_retained_footprint` in implementation
+   |
+   = help: implement the missing item: `fn checked_retained_footprint(&self) -> Result<CaptureFrameFootprint, CaptureRetainedSizeError> { todo!() }`

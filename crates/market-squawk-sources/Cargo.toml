@@ -1,0 +1,47 @@
+[package]
+name = "market-squawk-sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded source contracts, authority registry, and network policy for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+blake3 = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+futures-util = { workspace = true }
+httpdate = { workspace = true }
+market-squawk-domain = { workspace = true }
+market-squawk-platform = { workspace = true }
+rust_decimal = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+market-squawk-platform = { workspace = true, features = ["capture-test"] }
+proptest = { workspace = true }
+static_assertions = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(market_squawk_loom)'.dev-dependencies]
+loom = { workspace = true }
+
+[[test]]
+name = "decode_contracts"
+path = "tests/decode_contracts.rs"
+
+[[test]]
+name = "authority_capture"
+path = "tests/authority_capture.rs"
+
+[lints]
+workspace = true

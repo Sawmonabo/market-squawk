@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "authoritative_url": "https://docs.cdp.coinbase.com/exchange/websocket-feed/channels",
+  "retrieved_at": "2026-07-21",
+  "derivation": "Minimal deterministic fixtures transcribed from the documented unauthenticated level2_batch snapshot/update, match, heartbeat, and subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
+  "protocol_revision": "Coinbase Exchange WebSocket Feed documentation (unversioned; retrieved 2026-07-21)",
+  "terms_url": "https://www.coinbase.com/legal/market_data",
+  "fixtures": [
+    {"path": "snapshot.json", "sha256": "8f7fc9c411d4c54fa5ac373169b97a38f101e7908a10a74c2db9e22499382e7b"},
+    {"path": "l2update.json", "sha256": "090882dfcf82066746bb09ce08d910a744d2a2d57a9de42201e247fb664ab2c7"},
+    {"path": "match.json", "sha256": "3ab1ddcf4bc38009b705088653767f3fc04694fbae1c2a286a0acdde35d25640"},
+    {"path": "heartbeat.json", "sha256": "7c810ed763a1722a65e2178ee78343f074f6f32faed39069149d5f3be90d72ad"},
+    {"path": "subscriptions.json", "sha256": "1a055a2dc32847efd1f488923b5df378845d79b114a5ac38b28f62d08aa5b13e"}
+  ]
+}

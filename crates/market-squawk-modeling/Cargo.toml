@@ -1,0 +1,71 @@
+[package]
+name = "market-squawk-modeling"
+description = "Closed model bundles, immutable generations, and bounded native or ONNX inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[features]
+default = []
+fuzzing = []
+onnx-tract = ["dep:tract-onnx"]
+onnx-runtime = ["onnx-tract", "dep:ort"]
+release-evidence = ["onnx-tract"]
+
+[dependencies]
+cap-std.workspace = true
+csv.workspace = true
+ed25519-dalek = { version = "=3.0.0", features = ["signature"] }
+market-squawk-analytics.workspace = true
+market-squawk-data.workspace = true
+market-squawk-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tract-onnx = { version = "=0.23.4", default-features = false, optional = true }
+zeroize.workspace = true
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "api-24",
+    "load-dynamic",
+    "std",
+], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+win32job = "=2.0.3"
+
+[dev-dependencies]
+prost = "=0.14.3"
+
+[[test]]
+name = "modeling_contracts"
+path = "tests/modeling_contracts.rs"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "market-squawk-model-validator"
+path = "src/bin/market_squawk_model_validator.rs"
+
+[[bin]]
+name = "market-squawk-release-signer"
+path = "src/bin/market_squawk_release_signer.rs"
+
+[[bin]]
+name = "market-squawk-onnx-worker"
+path = "src/bin/market_squawk_onnx_worker.rs"
+required-features = ["onnx-tract"]
+
+[[bin]]
+name = "market-squawk-train"
+path = "src/bin/market_squawk_train.rs"

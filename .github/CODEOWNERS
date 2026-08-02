@@ -1,0 +1,5 @@
+# Default ownership keeps every change in the repository's human review path.
+* @Sawmonabo
+
+# Keep collaboration policy, workflows, and this ownership file explicitly owned.
+/.github/ @Sawmonabo

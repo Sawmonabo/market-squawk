@@ -1,11 +1,127 @@
+# Temporary scratch space in any directory
+tmp/
+.tmp/
+
+# Docs program scratch space
+docs/tmp/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.mobileprovision
+
+# Cloudflare Workers local-development secrets — never commit live values
+# (per Cloudflare Workers Secrets docs: ".dev.vars and .env should not be committed to git")
+.dev.vars
+.dev.vars.*
+# Exempt the committed example template from the wildcard above
+!.dev.vars.example
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+*.log.*
+temp/
+
+# Node / JS / TS
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.turbo/
+.next/
+.nuxt/
+.svelte-kit/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+vite.svg
+apps/market-squawk-desktop/src-tauri/binaries/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Misc tool caches
+.cache/
+.eslintcache
+
+# Playwright MCP
+.playwright-mcp/
+
+# Explicitly track repo-local AI config and skills
+!.claude/
+!.claude/**
+!.codex/
+!.codex/**
+
+# Still exclude tmp directories inside tracked trees
+tmp/
+.tmp/
+
+# Session-local Claude scratch space (research synthesis, ephemeral notes)
+.claude/scratch/
+
+# Claude Code scheduled-wakeup runtime lockfile (ephemeral; per-session)
+.claude/scheduled_tasks.lock
+
+# Per-project + per-machine Claude settings (autoMemoryDirectory pointer for agent-brain)
+.claude/settings.local.json
+
+# Per-machine Claude Code settings (e.g. agent-brain autoMemoryDirectory opt-in)
+.claude/settings.local.json
+
+# Cross-tool agent transient artifacts (provider-neutral; convention documented in AGENTS.md)
+# Subagent findings + other transient agent scratch drafted under .agents/tmp/<category>/, citations surfaced forward into consuming docs, files deleted before commit.
+.agents/tmp/
+.agents/cache/
+
+# Local git worktrees (per-session isolated workspaces; never shared via origin)
+.worktrees/
+
+# Rust build artifacts — Plan-024 sidecar crate (per cargo workspace at repo root)
+target/
+apps/market-squawk-desktop/src-tauri/generated-release/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+/fuzz/target/
+
 /target/
-/.market-engine/
+/.market-squawk/
 /data/
 *.log
 *.tmp
 .DS_Store
 .idea/
-.vscode/
 .env
 __pycache__/
 *.py[cod]

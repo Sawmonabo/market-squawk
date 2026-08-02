@@ -1,0 +1,54 @@
+{
+  "cik": 320193,
+  "entityName": "APPLE INC",
+  "facts": {
+    "us-gaap": {
+      "Assets": {
+        "label": "Assets",
+        "description": "Sum of the carrying amounts as of the balance sheet date.",
+        "units": {
+          "USD": [
+            {
+              "end": "2025-06-28",
+              "val": 331495000000,
+              "accn": "0000320193-25-000079",
+              "fy": 2025,
+              "fp": "Q3",
+              "form": "10-Q",
+              "filed": "2025-07-31",
+              "frame": "CY2025Q2I"
+            },
+            {
+              "end": "2025-06-28",
+              "val": 331495000000,
+              "accn": "0000320193-25-000080",
+              "fy": 2025,
+              "fp": "Q3",
+              "form": "10-Q/A",
+              "filed": "2025-08-01"
+            }
+          ]
+        }
+      },
+      "NetIncomeLoss": {
+        "label": "Net Income (Loss)",
+        "description": "The portion of profit or loss for the period.",
+        "units": {
+          "USD": [
+            {
+              "start": "2025-03-30",
+              "end": "2025-06-28",
+              "val": -23434000000,
+              "accn": "0000320193-25-000079",
+              "fy": 2025,
+              "fp": "Q3",
+              "form": "10-Q",
+              "filed": "2025-07-31",
+              "frame": "CY2025Q2"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

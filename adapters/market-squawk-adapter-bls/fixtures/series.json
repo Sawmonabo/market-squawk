@@ -1,0 +1,35 @@
+{
+  "status": "REQUEST_SUCCEEDED",
+  "responseTime": 95,
+  "message": ["Series does not exist for Series INVALID_SERIES"],
+  "Results": {
+    "series": [
+      {
+        "seriesID": "LNS14000000",
+        "data": [
+          {
+            "year": "2026",
+            "period": "M06",
+            "periodName": "June",
+            "latest": "true",
+            "value": "4.2",
+            "footnotes": [{"code": "P", "text": "preliminary"}]
+          },
+          {
+            "year": "2025",
+            "period": "M10",
+            "periodName": "October",
+            "value": "-",
+            "footnotes": [
+              {
+                "code": "9",
+                "text": "Data unavailable due to the 2025 lapse in appropriations."
+              }
+            ]
+          }
+        ]
+      },
+      {"seriesID": "INVALID_SERIES", "data": []}
+    ]
+  }
+}

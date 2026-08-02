@@ -1,0 +1,607 @@
+#[cfg(test)]
+mod tests {
+    use std::sync::Condvar;
+    use std::sync::atomic::AtomicUsize;
+
+    use market_squawk_domain::{
+        AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+        ExactPayloadEvidence,
+    };
+
+    use super::*;
+
+    static_assertions::assert_not_impl_any!(UnpublishedAuthoritySession: Clone);
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+    const TEST_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[path = "canonical_envelope.rs"]
+    mod canonical_envelope;
+    #[path = "terminalization.rs"]
+    mod terminalization;
+
+    #[test]
+    fn unsupported_platform_capabilities_map_to_store_unavailability() {
+        use market_squawk_platform::LocalAuthorityStateStoreError;
+
+        for error in [
+            LocalAuthorityStateStoreError::AtomicReplaceUnsupported,
+            LocalAuthorityStateStoreError::SecureRootUnsupported,
+        ] {
+            assert_eq!(
+                map_local_store_error(error),
+                AuthorityStateStoreError::Unavailable
+            );
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemoryStore {
+        payload: Mutex<Option<Vec<u8>>>,
+        reject_stores: AtomicBool,
+        store_calls: AtomicUsize,
+    }
+
+    impl MemoryStore {
+        fn payload(&self) -> TestResult<Vec<u8>> {
+            self.payload
+                .lock()
+                .map_err(|_| "memory store lock poisoned".into())
+                .and_then(|payload| payload.clone().ok_or_else(|| "payload missing".into()))
+        }
+
+        fn replace(&self, payload: Vec<u8>) -> TestResult {
+            *self
+                .payload
+                .lock()
+                .map_err(|_| "memory store lock poisoned")? = Some(payload);
+            Ok(())
+        }
+    }
+
+    impl AuthorityStateStore for MemoryStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
+            self.payload
+                .lock()
+                .map(|payload| payload.clone())
+                .map_err(|_| AuthorityStateStoreError::Unavailable)
+        }
+
+        fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            self.store_calls.fetch_add(1, Ordering::AcqRel);
+            if self.reject_stores.load(Ordering::Acquire) {
+                return Err(AuthorityStateStoreError::Unavailable);
+            }
+            self.payload
+                .lock()
+                .map_err(|_| AuthorityStateStoreError::Unavailable)?
+                .replace(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingStore {
+        payload: Mutex<Option<Vec<u8>>>,
+        block_next: AtomicBool,
+        store_calls: AtomicUsize,
+        rejected_call: AtomicUsize,
+        entered: (Mutex<bool>, Condvar),
+        released: (Mutex<bool>, Condvar),
+    }
+
+    #[derive(Debug)]
+    struct BlockedStoreRelease<'a> {
+        store: &'a BlockingStore,
+        released: bool,
+    }
+
+    impl BlockedStoreRelease<'_> {
+        fn release(mut self) -> TestResult {
+            self.store.signal_release()?;
+            self.released = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for BlockedStoreRelease<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                let _release_result = self.store.signal_release();
+            }
+        }
+    }
+
+    impl BlockingStore {
+        fn block_next_store(&self) {
+            self.block_next.store(true, Ordering::Release);
+        }
+
+        fn reject_store_call(&self, call: usize) {
+            self.rejected_call.store(call, Ordering::Release);
+        }
+
+        fn wait_until_blocked(&self) -> TestResult<BlockedStoreRelease<'_>> {
+            self.wait_until_blocked_with_timeout(TEST_WATCHDOG_TIMEOUT)
+        }
+
+        fn wait_until_blocked_with_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> TestResult<BlockedStoreRelease<'_>> {
+            let release = BlockedStoreRelease {
+                store: self,
+                released: false,
+            };
+            let (entered, signal) = &self.entered;
+            let entered = entered.lock().map_err(|_| "entered lock poisoned")?;
+            let (entered, wait) = signal
+                .wait_timeout_while(entered, timeout, |entered| !*entered)
+                .map_err(|_| "entered wait poisoned")?;
+            if !*entered {
+                let message = if wait.timed_out() {
+                    "timed out waiting for blocked store"
+                } else {
+                    "blocked-store wait woke without entry"
+                };
+                return Err(message.into());
+            }
+            Ok(release)
+        }
+
+        fn signal_release(&self) -> TestResult {
+            let (released, signal) = &self.released;
+            *released.lock().map_err(|_| "release lock poisoned")? = true;
+            signal.notify_all();
+            Ok(())
+        }
+    }
+
+    impl AuthorityStateStore for BlockingStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
+            self.payload
+                .lock()
+                .map(|payload| payload.clone())
+                .map_err(|_| AuthorityStateStoreError::Unavailable)
+        }
+
+        fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            let call = self.store_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if self.block_next.swap(false, Ordering::AcqRel) {
+                let (entered, entered_signal) = &self.entered;
+                *entered
+                    .lock()
+                    .map_err(|_| AuthorityStateStoreError::Unavailable)? = true;
+                entered_signal.notify_all();
+
+                let (released, release_signal) = &self.released;
+                let mut released = released
+                    .lock()
+                    .map_err(|_| AuthorityStateStoreError::Unavailable)?;
+                while !*released {
+                    released = release_signal
+                        .wait(released)
+                        .map_err(|_| AuthorityStateStoreError::Unavailable)?;
+                }
+            }
+            if self.rejected_call.load(Ordering::Acquire) == call {
+                return Err(AuthorityStateStoreError::Unavailable);
+            }
+            self.payload
+                .lock()
+                .map_err(|_| AuthorityStateStoreError::Unavailable)?
+                .replace(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn observer_timeout_releases_a_store_call_that_enters_late() -> TestResult {
+        let store = Arc::new(BlockingStore::default());
+        store.block_next_store();
+        assert!(
+            store
+                .wait_until_blocked_with_timeout(std::time::Duration::ZERO)
+                .is_err()
+        );
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let late_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            result_tx
+                .send(AuthorityStateStore::store(late_store.as_ref(), b"late"))
+                .is_ok()
+        });
+        assert_eq!(result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?, Ok(()));
+        assert!(writer.join().map_err(|_| "late writer panicked")?);
+        Ok(())
+    }
+
+    fn declaration(index: u8) -> TestResult<PersistedProviderBudgetPolicy> {
+        let provider = SourceIdentifier::try_from(format!("provider-{index}"))?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::new(provider),
+            NonZeroU32::new(10).ok_or("request limit must be nonzero")?,
+            NonZeroU64::new(60_000_000_000).ok_or("window must be nonzero")?,
+            NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("backoff must be nonzero")?,
+                NonZeroU64::new(60_000_000_000).ok_or("backoff cap must be nonzero")?,
+                0,
+            )?,
+        )?;
+        let authorization = crate::AuthorizationGrant::new(
+            crate::AuthorizationMode::PublicInterface,
+            AuthorizationBasis::new(SourceIdentifier::try_from("public-terms")?),
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [index; 32],
+            )),
+            EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        );
+        Ok(PersistedProviderBudgetPolicy::try_new(
+            policy,
+            EndpointPolicy::try_new([format!("https://provider-{index}.example.test")])?,
+            authorization,
+            None,
+        )?)
+    }
+
+    fn checkpoint(index: u8) -> BudgetCheckpointState {
+        BudgetCheckpointState {
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(i64::from(index)),
+                window_ends_wall: Timestamp::from_unix_nanos(
+                    60_000_000_000 + i64::from(index),
+                ),
+                requests_used: u32::from(index),
+            }),
+            in_flight: 0,
+            unavailable_until_wall: None,
+            disabled: false,
+            consecutive_refusals: 0,
+            availability_generation: 1,
+            terminal: false,
+            poisoned: false,
+        }
+    }
+
+    #[test]
+    fn canonical_v1_migrates_without_quota_reset_and_in_use_remains_unclean() -> TestResult {
+        let legacy_checkpoint = BudgetCheckpointStateV1 {
+            window_started_wall: Timestamp::from_unix_nanos(0),
+            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_000),
+            requests_used: 7,
+            in_flight: 0,
+            unavailable_until_wall: None,
+            disabled: false,
+            consecutive_refusals: 0,
+            availability_generation: 3,
+            terminal: false,
+            poisoned: false,
+        };
+        let declaration = PersistedProviderBudgetPolicyV1::try_from_current(declaration(1)?)?;
+        let envelope = DurableAuthorityEnvelopeV1 {
+            format_version: 1,
+            run_generation: 4,
+            run_state: DurableRunState::Clean,
+            saved_at_wall: Timestamp::from_unix_nanos(100),
+            wall_high_water: Timestamp::from_unix_nanos(100),
+            registry: crate::RegistryAuthorityState::empty(),
+            budgets: BoundedVec::singleton(DurableBudgetGroupV1 {
+                declarations: BoundedVec::singleton(declaration.clone()),
+                checkpoint: legacy_checkpoint.clone(),
+            }),
+        };
+        let store = Arc::new(MemoryStore::default());
+        store.replace(serialize_canonical_envelope_v1(&envelope)?)?;
+        let session = AuthorityDurabilitySession::open(
+            store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let migrated = session
+            .budget_groups()?
+            .into_iter()
+            .next()
+            .ok_or("migrated budget missing")?;
+        assert_eq!(migrated.checkpoint().request_count(0), Some(7));
+        assert_eq!(
+            deserialize_canonical_envelope(&store.payload()?)?.format_version,
+            DURABLE_AUTHORITY_FORMAT_VERSION
+        );
+
+        let unclean = DurableAuthorityEnvelopeV1 {
+            run_state: DurableRunState::InUse,
+            ..envelope
+        };
+        let unclean_store = Arc::new(MemoryStore::default());
+        unclean_store.replace(serialize_canonical_envelope_v1(&unclean)?)?;
+        let recovered = AuthorityDurabilitySession::open(
+            unclean_store,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        assert!(recovered.recovered_unclean());
+        assert!(!recovered.is_available());
+        assert!(
+            recovered
+                .budget_groups()?
+                .into_iter()
+                .all(|group| group.checkpoint().terminal && group.checkpoint().poisoned)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_serialization_is_identical_across_one_hundred_group_permutations() -> TestResult {
+        let mut groups = Vec::new();
+        for index in 1_u8..=6 {
+            groups.push(DurableBudgetGroup::try_new(
+                declaration(index)?,
+                checkpoint(index),
+            )?);
+        }
+        let base = DurableAuthorityEnvelope {
+            format_version: DURABLE_AUTHORITY_FORMAT_VERSION,
+            run_generation: 7,
+            run_state: DurableRunState::InUse,
+            saved_at_wall: Timestamp::from_unix_nanos(100),
+            wall_high_water: Timestamp::from_unix_nanos(100),
+            registry: crate::RegistryAuthorityState::empty(),
+            budgets: BoundedVec::try_new(groups.clone())?,
+        };
+        let expected = serialize_canonical_envelope(&base)?;
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        for _ in 0..100 {
+            let mut permuted = groups.clone();
+            for index in (1..permuted.len()).rev() {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bound = u64::try_from(index.checked_add(1).ok_or("shuffle overflow")?)?;
+                let selected = usize::try_from(seed % bound)?;
+                permuted.swap(index, selected);
+            }
+            let candidate = DurableAuthorityEnvelope {
+                budgets: BoundedVec::try_new(permuted)?,
+                ..base.clone()
+            };
+            assert_eq!(serialize_canonical_envelope(&candidate)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn load_rejects_truncation_noncanonical_bytes_and_temporal_ambiguity() -> TestResult {
+        let store = Arc::new(MemoryStore::default());
+        store.replace(b"{\"format_version\":".to_vec())?;
+        assert!(matches!(
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100)),
+            Err(AuthorityPersistenceError::InvalidState)
+        ));
+
+        let envelope = DurableAuthorityEnvelope {
+            run_generation: 1,
+            ..DurableAuthorityEnvelope::empty(Timestamp::from_unix_nanos(100))
+        };
+        store.replace(serde_json::to_vec_pretty(&envelope)?)?;
+        assert!(matches!(
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100)),
+            Err(AuthorityPersistenceError::InvalidState)
+        ));
+
+        store.replace(serialize_canonical_envelope(&envelope)?)?;
+        assert!(matches!(
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(99)),
+            Err(AuthorityPersistenceError::WallRollback)
+        ));
+
+        let future_checkpoint = BudgetCheckpointState {
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(151),
+                window_ends_wall: Timestamp::from_unix_nanos(60_000_000_151),
+                requests_used: 1,
+            }),
+            ..checkpoint(1)
+        };
+        let future = DurableAuthorityEnvelope {
+            budgets: BoundedVec::singleton(DurableBudgetGroup::try_new(
+                declaration(1)?,
+                future_checkpoint,
+            )?),
+            ..envelope.clone()
+        };
+        store.replace(serialize_canonical_envelope(&future)?)?;
+        assert!(matches!(
+            AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(150)),
+            Err(AuthorityPersistenceError::FutureState)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn run_generation_exhaustion_and_store_failure_fail_before_session_publication() -> TestResult {
+        let exhausted = DurableAuthorityEnvelope {
+            run_generation: u64::MAX,
+            ..DurableAuthorityEnvelope::empty(Timestamp::from_unix_nanos(100))
+        };
+        let store = Arc::new(MemoryStore::default());
+        store.replace(serialize_canonical_envelope(&exhausted)?)?;
+        assert!(matches!(
+            AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100)),
+            Err(AuthorityPersistenceError::GenerationExhausted)
+        ));
+
+        let failing = Arc::new(MemoryStore::default());
+        failing.reject_stores.store(true, Ordering::Release);
+        assert!(matches!(
+            AuthorityDurabilitySession::open(failing.clone(), Timestamp::from_unix_nanos(100)),
+            Err(AuthorityPersistenceError::Store)
+        ));
+        assert!(failing.load()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_is_rejected_after_an_unclean_predecessor() -> TestResult {
+        let mut envelope = DurableAuthorityEnvelope::empty(Timestamp::from_unix_nanos(100));
+        envelope.run_generation = 1;
+        envelope.run_state = DurableRunState::InUse;
+        let store = Arc::new(MemoryStore::default());
+        store.replace(serialize_canonical_envelope(&envelope)?)?;
+        let session = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+        assert!(session.recovered_unclean());
+        assert!(matches!(
+            session.close_clean_for_test(
+                crate::RegistryAuthorityState::empty(),
+                Timestamp::from_unix_nanos(100)
+            ),
+            Err(AuthorityPersistenceError::SessionUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_unpublished_open_cannot_publish_a_clean_run() -> TestResult {
+        let store = Arc::new(MemoryStore::default());
+        let unpublished = AuthorityDurabilitySession::open_unpublished(
+            store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        drop(unpublished);
+
+        let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+        assert!(restarted.recovered_unclean());
+        assert!(!restarted.is_available());
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_rollback_capability_is_bound_to_its_opened_session() -> TestResult {
+        let rolled_back_store = Arc::new(MemoryStore::default());
+        let abandoned_store = Arc::new(MemoryStore::default());
+        let rolled_back = AuthorityDurabilitySession::open_unpublished(
+            rolled_back_store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let abandoned = AuthorityDurabilitySession::open_unpublished(
+            abandoned_store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+
+        rolled_back.rollback()?;
+        drop(abandoned);
+
+        let clean_restart =
+            AuthorityDurabilitySession::open(rolled_back_store, Timestamp::from_unix_nanos(100))?;
+        assert!(!clean_restart.recovered_unclean());
+        assert!(clean_restart.is_available());
+
+        let unclean_restart =
+            AuthorityDurabilitySession::open(abandoned_store, Timestamp::from_unix_nanos(100))?;
+        assert!(unclean_restart.recovered_unclean());
+        assert!(!unclean_restart.is_available());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_concurrent_observation_preserves_deadline_distance_from_wall_high_water() -> TestResult
+    {
+        let store = Arc::new(MemoryStore::default());
+        let session = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+        let slot = session.register_budget_group(
+            crate::RegistryAuthorityState::empty(),
+            declaration(1)?,
+            checkpoint(1),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let stale = BudgetCheckpointState {
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(90),
+                window_ends_wall: Timestamp::from_unix_nanos(60_000_000_090),
+                requests_used: 2,
+            }),
+            in_flight: 0,
+            unavailable_until_wall: Some(Timestamp::from_unix_nanos(190)),
+            disabled: false,
+            consecutive_refusals: 1,
+            availability_generation: 2,
+            terminal: false,
+            poisoned: false,
+        };
+        session.update_budget(slot, stale, Timestamp::from_unix_nanos(90))?;
+        let restored = session.budget_groups()?;
+        let anchored = restored
+            .get(slot)
+            .ok_or("anchored budget group missing")?
+            .checkpoint();
+        let BudgetWindowCheckpointState::Tumbling {
+            window_started_wall,
+            window_ends_wall,
+            requests_used: _,
+        } = anchored.windows.as_slice().first().ok_or("window missing")?
+        else {
+            return Err("expected tumbling window".into());
+        };
+        assert_eq!(*window_started_wall, Timestamp::from_unix_nanos(100));
+        assert_eq!(*window_ends_wall, Timestamp::from_unix_nanos(60_000_000_100));
+        assert_eq!(
+            anchored.unavailable_until_wall,
+            Some(Timestamp::from_unix_nanos(200))
+        );
+        assert!(session.is_available());
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_serializes_against_and_rejects_a_waiting_budget_update() -> TestResult {
+        let store = Arc::new(BlockingStore::default());
+        let session =
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
+        let slot = session.register_budget_group(
+            crate::RegistryAuthorityState::empty(),
+            declaration(1)?,
+            checkpoint(1),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        store.block_next_store();
+
+        let closing = session.clone();
+        let close = std::thread::spawn(move || {
+            closing.close_clean_for_test(
+                crate::RegistryAuthorityState::empty(),
+                Timestamp::from_unix_nanos(100),
+            )
+        });
+        let blocked_store = store.wait_until_blocked()?;
+
+        let updating = session.clone();
+        let update = std::thread::spawn(move || {
+            updating.update_budget(slot, checkpoint(2), Timestamp::from_unix_nanos(100))
+        });
+        blocked_store.release()?;
+
+        assert_eq!(close.join().map_err(|_| "close thread panicked")?, Ok(()));
+        assert_eq!(
+            update.join().map_err(|_| "update thread panicked")?,
+            Err(AuthorityPersistenceError::SessionUnavailable)
+        );
+        assert!(!session.is_available());
+        assert!(
+            session
+                .store
+                .lock()
+                .map_err(|_| "session store lock poisoned")?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_store_test_fixture_exposes_last_payload() -> TestResult {
+        let store = Arc::new(MemoryStore::default());
+        let _session =
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
+        assert!(!store.payload()?.is_empty());
+        Ok(())
+    }
+}

@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/snapshot_dtos_are_not_clone.rs:4:5
+  |
+3 | fn retain_without_reader_permit(snapshot: &ShardSnapshot) -> ShardSnapshot {
+  |                                                              ------------- expected `ShardSnapshot` because of return type
+4 |     snapshot.clone()
+  |     ^^^^^^^^^^^^^^^^ expected `ShardSnapshot`, found `&ShardSnapshot`
+  |
+note: `ShardSnapshot` does not implement `Clone`, so `&ShardSnapshot` was cloned instead
+ --> tests/ui/snapshot_dtos_are_not_clone.rs:4:5
+  |
+4 |     snapshot.clone()
+  |     ^^^^^^^^

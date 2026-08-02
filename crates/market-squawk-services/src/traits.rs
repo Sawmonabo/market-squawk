@@ -1,0 +1,784 @@
+//! Application-service capability and dispatch contracts.
+
+use std::{collections::HashSet, fmt, sync::Arc};
+
+use async_trait::async_trait;
+use serde_json::{Map, Value};
+use thiserror::Error;
+
+use crate::{
+    JsonStructureLimits, ProgressError, RequestContext, ScopeRequirement, ServiceContractError,
+    TOOL_CONFIRMATION_FIELD, TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD,
+    TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD, ToolAuthorization, ToolContract, ToolScope,
+    TypedToolResult, output_schema, validate_json_contract,
+};
+
+const CONTRACT_METADATA_KEY: &str = "org.market-squawk/tool-contract";
+const MAXIMUM_TOOL_NAME_BYTES: usize = 128;
+const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
+const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
+const MAXIMUM_TOOLS: usize = 256;
+const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 64 * 1024;
+const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 32;
+const MAXIMUM_DESCRIPTOR_METADATA_BYTES: usize = 8 * 1024;
+const MAXIMUM_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
+/// Versioned, schema-bearing description of one application-service operation.
+#[derive(Clone)]
+pub struct ToolDescriptor {
+    name: Arc<str>,
+    version: Arc<str>,
+    description: Arc<str>,
+    input_schema: Map<String, Value>,
+    input_schema_bytes: usize,
+    output_data_schema: Value,
+    output_schema: Map<String, Value>,
+    output_schema_bytes: usize,
+    contract: ToolContract,
+    metadata: Map<String, Value>,
+    effects: ToolEffects,
+    input_admission: Arc<dyn ToolInputAdmission>,
+}
+
+impl fmt::Debug for ToolDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolDescriptor")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("description", &self.description)
+            .field("input_schema", &"[INPUT SCHEMA REDACTED]")
+            .field("input_schema_bytes", &self.input_schema_bytes)
+            .field("output_data_schema", &"[OUTPUT DATA SCHEMA REDACTED]")
+            .field("output_schema", &"[OUTPUT SCHEMA REDACTED]")
+            .field("output_schema_bytes", &self.output_schema_bytes)
+            .field("contract", &self.contract)
+            .field("metadata", &"[PUBLIC METADATA REDACTED]")
+            .field("effects", &self.effects)
+            .field("input_admission", &"[TYPED ADMISSION REDACTED]")
+            .finish()
+    }
+}
+
+impl ToolDescriptor {
+    /// Creates a descriptor whose input schema is a closed JSON object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError`] when text or schema invariants are violated.
+    pub fn try_new<A>(
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+        description: impl Into<Arc<str>>,
+        input_schema: Value,
+        contract: ToolContract,
+        effects: ToolEffects,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        Self::try_new_inner(
+            name,
+            version,
+            description,
+            input_schema,
+            Value::Bool(true),
+            false,
+            contract,
+            effects,
+            input_admission,
+        )
+    }
+
+    /// Creates a descriptor with a closed input schema and a specific structured-result schema.
+    ///
+    /// `output_data_schema` describes the operation-owned value under the canonical inline
+    /// envelope's `data` field. The descriptor composes and owns the complete MCP output schema,
+    /// including canonical metadata and the path-free artifact variant when the result policy
+    /// permits overflow publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError`] when text, input, output, or contract invariants are
+    /// violated.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor keeps every immutable transport contract explicit at admission"
+    )]
+    pub fn try_new_with_output<A>(
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+        description: impl Into<Arc<str>>,
+        input_schema: Value,
+        output_data_schema: Value,
+        contract: ToolContract,
+        effects: ToolEffects,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        Self::try_new_inner(
+            name,
+            version,
+            description,
+            input_schema,
+            output_data_schema,
+            true,
+            contract,
+            effects,
+            input_admission,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared validator receives the complete immutable descriptor contract"
+    )]
+    fn try_new_inner<A>(
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+        description: impl Into<Arc<str>>,
+        input_schema: Value,
+        output_data_schema: Value,
+        require_specific_output: bool,
+        contract: ToolContract,
+        effects: ToolEffects,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        let name = name.into();
+        let version = version.into();
+        let description = description.into();
+        if !valid_tool_name(&name) {
+            return Err(ServiceCapabilityError::InvalidName);
+        }
+        if version.is_empty() || version.len() > MAXIMUM_TOOL_VERSION_BYTES {
+            return Err(ServiceCapabilityError::InvalidVersion);
+        }
+        if description.is_empty() || description.len() > MAXIMUM_TOOL_DESCRIPTION_BYTES {
+            return Err(ServiceCapabilityError::InvalidDescription);
+        }
+        let Value::Object(input_schema) = input_schema else {
+            return Err(ServiceCapabilityError::InvalidSchema);
+        };
+        if input_schema.get("type").and_then(Value::as_str) != Some("object")
+            || input_schema
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(ServiceCapabilityError::InvalidSchema);
+        }
+        let schema_limits =
+            JsonStructureLimits::try_new(MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH, 8 * 1024, 1_000, 1_000)
+                .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
+        let bounded_schema = Value::Object(input_schema);
+        let input_schema_bytes = validate_json_contract(
+            &bounded_schema,
+            schema_limits,
+            MAXIMUM_DESCRIPTOR_SCHEMA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
+        let Value::Object(input_schema) = bounded_schema else {
+            return Err(ServiceCapabilityError::InvalidSchema);
+        };
+        if require_specific_output && !output_schema::validate_data_schema(&output_data_schema) {
+            return Err(ServiceCapabilityError::InvalidOutputSchema);
+        }
+        let output_schema =
+            output_schema::output_schema(&output_data_schema, contract.result().artifact());
+        let output_schema_bytes = validate_json_contract(
+            &Value::Object(output_schema.clone()),
+            schema_limits,
+            MAXIMUM_DESCRIPTOR_SCHEMA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidOutputSchema)?;
+        if !contract.is_compatible_with_effects(effects.read_only())
+            || !schema_matches_scope(&input_schema, contract.scope())
+            || (!matches!(contract.authorization(), ToolAuthorization::ReadOnly)
+                && !schema_requires_confirmation(&input_schema))
+        {
+            return Err(ServiceCapabilityError::InvalidContract);
+        }
+        let contract_metadata = contract
+            .metadata_value()
+            .map_err(|_| ServiceCapabilityError::InvalidContract)?;
+        if !contract_metadata.is_object() {
+            return Err(ServiceCapabilityError::InvalidContract);
+        }
+        let mut metadata = Map::new();
+        metadata.insert(CONTRACT_METADATA_KEY.to_owned(), contract_metadata);
+        let metadata_limits = JsonStructureLimits::try_new(8, 4 * 1024, 128, 128)
+            .map_err(|_| ServiceCapabilityError::InvalidContract)?;
+        validate_json_contract(
+            &Value::Object(metadata.clone()),
+            metadata_limits,
+            MAXIMUM_DESCRIPTOR_METADATA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidContract)?;
+        Ok(Self {
+            name,
+            version,
+            description,
+            input_schema,
+            input_schema_bytes,
+            output_data_schema,
+            output_schema,
+            output_schema_bytes,
+            contract,
+            metadata,
+            effects,
+            input_admission: Arc::new(input_admission),
+        })
+    }
+
+    /// Adds bounded public extension metadata advertised with this operation.
+    ///
+    /// The code-owned operation contract remains reserved and cannot be replaced by callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError::InvalidMetadata`] when the value is not an object or
+    /// exceeds the descriptor metadata limits.
+    pub fn try_with_metadata(mut self, metadata: Value) -> Result<Self, ServiceCapabilityError> {
+        let metadata_limits = JsonStructureLimits::try_new(8, 4 * 1024, 128, 128)
+            .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
+        let Value::Object(metadata) = metadata else {
+            return Err(ServiceCapabilityError::InvalidMetadata);
+        };
+        if metadata.contains_key(CONTRACT_METADATA_KEY) {
+            return Err(ServiceCapabilityError::ReservedMetadata);
+        }
+        self.metadata.extend(metadata);
+        validate_json_contract(
+            &Value::Object(self.metadata.clone()),
+            metadata_limits,
+            MAXIMUM_DESCRIPTOR_METADATA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
+        Ok(self)
+    }
+
+    /// Stable operation name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Operation contract version.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Concise public description.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Closed JSON object input schema.
+    #[must_use]
+    pub const fn input_schema(&self) -> &Map<String, Value> {
+        &self.input_schema
+    }
+
+    /// Complete JSON Schema for the exact structured-content envelope advertised to MCP clients.
+    #[must_use]
+    pub const fn output_schema(&self) -> &Map<String, Value> {
+        &self.output_schema
+    }
+
+    /// Validates operation-owned result data before any transport may publish it.
+    #[must_use]
+    pub(crate) fn validates_output_data(&self, data: &Value) -> bool {
+        output_schema::validate_data(&self.output_data_schema, data)
+    }
+
+    /// Complete typed operation contract carried into dispatch.
+    #[must_use]
+    pub const fn contract(&self) -> ToolContract {
+        self.contract
+    }
+
+    /// Bounded public extension metadata for transport capability discovery.
+    #[must_use]
+    pub const fn metadata(&self) -> &Map<String, Value> {
+        &self.metadata
+    }
+
+    /// Explicit operation side-effect annotations advertised to MCP clients.
+    #[must_use]
+    pub const fn effects(&self) -> ToolEffects {
+        self.effects
+    }
+
+    /// Atomically validates arguments and creates the only dispatchable request type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InvalidRequest`] when descriptor-owned typed admission rejects the
+    /// arguments.
+    pub fn admit(&self, arguments: Map<String, Value>) -> Result<TypedToolRequest, ServiceError> {
+        let bounded_arguments = Value::Object(arguments);
+        let argument_limits = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
+            .map_err(|_| ServiceError::Internal)?;
+        validate_json_contract(
+            &bounded_arguments,
+            argument_limits,
+            MAXIMUM_TOOL_ARGUMENT_BYTES,
+        )
+        .map_err(|_| ServiceError::InvalidRequest)?;
+        let Value::Object(arguments) = bounded_arguments else {
+            return Err(ServiceError::Internal);
+        };
+        if !matches!(self.contract.authorization(), ToolAuthorization::ReadOnly)
+            && arguments.get(TOOL_CONFIRMATION_FIELD) != Some(&Value::Bool(true))
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.input_admission
+            .admit(&arguments)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        Ok(TypedToolRequest {
+            name: Arc::clone(&self.name),
+            version: Arc::clone(&self.version),
+            contract: self.contract,
+            arguments,
+        })
+    }
+}
+
+/// Descriptor-owned typed argument admission shared by every transport.
+///
+/// Implementations should deserialize into the operation's typed request or perform equivalent
+/// domain validation. Dynamic provider details must not be returned through this boundary.
+pub trait ToolInputAdmission: Send + Sync + 'static {
+    /// Validates one structurally bounded JSON object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolInputError::Invalid`] for any caller-invalid input.
+    fn admit(&self, arguments: &Map<String, Value>) -> Result<(), ToolInputError>;
+}
+
+impl<F> ToolInputAdmission for F
+where
+    F: Fn(&Map<String, Value>) -> Result<(), ToolInputError> + Send + Sync + 'static,
+{
+    fn admit(&self, arguments: &Map<String, Value>) -> Result<(), ToolInputError> {
+        self(arguments)
+    }
+}
+
+/// Deliberately opaque typed-admission failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ToolInputError {
+    /// Arguments do not satisfy the operation's typed contract.
+    #[error("tool arguments are invalid")]
+    Invalid,
+}
+
+/// Explicit MCP side-effect hints for one registered operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolEffects {
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
+}
+
+impl ToolEffects {
+    /// Creates internally consistent effect annotations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError::InvalidEffects`] when an operation is simultaneously
+    /// read-only and destructive.
+    pub const fn try_new(
+        read_only: bool,
+        destructive: bool,
+        idempotent: bool,
+        open_world: bool,
+    ) -> Result<Self, ServiceCapabilityError> {
+        if read_only && destructive {
+            return Err(ServiceCapabilityError::InvalidEffects);
+        }
+        Ok(Self {
+            read_only,
+            destructive,
+            idempotent,
+            open_world,
+        })
+    }
+
+    /// Explicit read-only, non-destructive, idempotent, closed-world operation.
+    #[must_use]
+    pub const fn read_only_closed_world() -> Self {
+        Self {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        }
+    }
+
+    /// Read-only hint.
+    #[must_use]
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
+
+    /// Destructive hint.
+    #[must_use]
+    pub const fn destructive(self) -> bool {
+        self.destructive
+    }
+
+    /// Idempotency hint.
+    #[must_use]
+    pub const fn idempotent(self) -> bool {
+        self.idempotent
+    }
+
+    /// Open-world interaction hint.
+    #[must_use]
+    pub const fn open_world(self) -> bool {
+        self.open_world
+    }
+}
+
+fn valid_tool_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    name.len() <= MAXIMUM_TOOL_NAME_BYTES
+        && first.is_ascii_alphabetic()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn schema_requires_confirmation(schema: &Map<String, Value>) -> bool {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field == TOOL_CONFIRMATION_FIELD)
+        });
+    let confirms_true = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(TOOL_CONFIRMATION_FIELD))
+        .and_then(Value::as_object)
+        .and_then(|confirmation| confirmation.get("const"))
+        == Some(&Value::Bool(true));
+    required && confirms_true
+}
+
+fn schema_matches_scope(schema: &Map<String, Value>, scope: ToolScope) -> bool {
+    let properties = match schema.get("properties") {
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+        None => None,
+    };
+    let mut required_fields = HashSet::new();
+    match schema.get("required") {
+        Some(Value::Array(required)) => {
+            for field in required {
+                let Some(field) = field.as_str() else {
+                    return false;
+                };
+                if !required_fields.insert(field)
+                    || !properties.is_some_and(|properties| properties.contains_key(field))
+                {
+                    return false;
+                }
+            }
+        }
+        Some(_) => return false,
+        None => {}
+    }
+
+    [
+        (TOOL_INSTRUMENT_IDS_FIELD, scope.instruments()),
+        (TOOL_TIME_RANGE_FIELD, scope.time_range()),
+        (TOOL_RESULT_LIMITS_FIELD, scope.result_limits()),
+        (TOOL_SOURCE_COVERAGE_FIELD, scope.source_coverage()),
+    ]
+    .into_iter()
+    .all(|(field, requirement)| {
+        let declared = properties.is_some_and(|properties| properties.contains_key(field));
+        let required = required_fields.contains(field);
+        match requirement {
+            ScopeRequirement::Required => declared && required,
+            ScopeRequirement::Optional => declared && !required,
+            ScopeRequirement::NotApplicable => !declared,
+        }
+    })
+}
+
+/// Validated, deterministic application-service capability set.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceCapabilities {
+    tools: Arc<[ToolDescriptor]>,
+}
+
+impl ServiceCapabilities {
+    /// Creates an empty capability set. No tools capability may be advertised for this value.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Validates uniqueness and returns a deterministic name-sorted capability set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError`] for duplicate names or more than 256 operations.
+    pub fn try_new(mut tools: Vec<ToolDescriptor>) -> Result<Self, ServiceCapabilityError> {
+        if tools.len() > MAXIMUM_TOOLS {
+            return Err(ServiceCapabilityError::TooManyTools {
+                maximum: MAXIMUM_TOOLS,
+            });
+        }
+        tools.sort_unstable_by(|left, right| left.name().cmp(right.name()));
+        let mut names = HashSet::with_capacity(tools.len());
+        if tools.iter().any(|tool| !names.insert(tool.name())) {
+            return Err(ServiceCapabilityError::DuplicateName);
+        }
+        Ok(Self {
+            tools: tools.into(),
+        })
+    }
+
+    /// Registered operations in deterministic order.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolDescriptor] {
+        &self.tools
+    }
+
+    /// Returns the registered descriptor for an exact operation name.
+    #[must_use]
+    pub fn find(&self, name: &str) -> Option<&ToolDescriptor> {
+        self.tools
+            .binary_search_by(|tool| tool.name().cmp(name))
+            .ok()
+            .and_then(|index| self.tools.get(index))
+    }
+
+    /// True when at least one operation is registered.
+    #[must_use]
+    pub fn has_tools(&self) -> bool {
+        !self.tools.is_empty()
+    }
+}
+
+/// Invalid service capability definition.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ServiceCapabilityError {
+    /// Tool name is empty, oversized, or outside the portable grammar.
+    #[error("invalid service tool name")]
+    InvalidName,
+    /// Version is empty or oversized.
+    #[error("invalid service tool version")]
+    InvalidVersion,
+    /// Description is empty or oversized.
+    #[error("invalid service tool description")]
+    InvalidDescription,
+    /// Input schema is not a closed JSON object schema.
+    #[error("service tool input schema must be a closed object")]
+    InvalidSchema,
+    /// Output schema is not a supported, operation-specific structured-result schema.
+    #[error("service tool output schema must be specific and supported")]
+    InvalidOutputSchema,
+    /// Public descriptor metadata is not a bounded JSON object.
+    #[error("service tool metadata must be a bounded object")]
+    InvalidMetadata,
+    /// Public metadata attempted to replace the code-owned operation contract.
+    #[error("service tool contract metadata is reserved")]
+    ReservedMetadata,
+    /// Contract authority or typed confirmation contradicts the operation effects or schema.
+    #[error("service tool contract is inconsistent")]
+    InvalidContract,
+    /// Side-effect annotations contradict each other.
+    #[error("service tool effect annotations are inconsistent")]
+    InvalidEffects,
+    /// Tool names must be unique.
+    #[error("service capability contains a duplicate tool name")]
+    DuplicateName,
+    /// Capability set exceeded its hard ceiling.
+    #[error("service capability exceeds {maximum} tools")]
+    TooManyTools {
+        /// Maximum operations in one local service.
+        maximum: usize,
+    },
+}
+
+/// Validated generic request dispatched to a registered typed domain service.
+#[derive(Clone)]
+pub struct TypedToolRequest {
+    name: Arc<str>,
+    version: Arc<str>,
+    contract: ToolContract,
+    arguments: Map<String, Value>,
+}
+
+impl TypedToolRequest {
+    /// Registered operation name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Exact descriptor version admitted with this request.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Complete operation contract admitted with this request.
+    #[must_use]
+    pub const fn contract(&self) -> ToolContract {
+        self.contract
+    }
+
+    /// Schema-admitted argument object.
+    #[must_use]
+    pub const fn arguments(&self) -> &Map<String, Value> {
+        &self.arguments
+    }
+}
+
+impl fmt::Debug for TypedToolRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypedToolRequest")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("contract", &self.contract)
+            .field("arguments", &"[ARGUMENTS REDACTED]")
+            .finish()
+    }
+}
+
+/// Stable service-error class used by transports and audit records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceErrorClass {
+    /// Request failed validation.
+    InvalidRequest,
+    /// Requested operation or object does not exist.
+    NotFound,
+    /// Authority is absent or insufficient.
+    Unauthorized,
+    /// Bounded resource ceiling was reached.
+    ResourceExhausted,
+    /// Request cancellation won the lifecycle race.
+    Cancelled,
+    /// Request deadline elapsed.
+    DeadlineExceeded,
+    /// Required local service is unavailable.
+    Unavailable,
+    /// Service returned a contract-invalid result.
+    InvalidResult,
+    /// Internal failure with no caller-safe detail.
+    Internal,
+}
+
+/// Typed application-service failure with deliberately bounded, non-secret display text.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ServiceError {
+    /// Invalid request.
+    #[error("service request is invalid")]
+    InvalidRequest,
+    /// Operation not found.
+    #[error("service operation was not found")]
+    NotFound,
+    /// Missing authority.
+    #[error("service request is not authorized")]
+    Unauthorized,
+    /// Resource ceiling reached.
+    #[error("service resource limit exceeded")]
+    ResourceExhausted,
+    /// Request cancelled.
+    #[error("service request was cancelled")]
+    Cancelled,
+    /// Request deadline elapsed.
+    #[error("service request deadline exceeded")]
+    DeadlineExceeded,
+    /// Required local dependency unavailable.
+    #[error("service is unavailable")]
+    Unavailable,
+    /// Result violated its transport-neutral contract.
+    #[error("service returned an invalid result")]
+    InvalidResult,
+    /// Internal failure with no dynamic payload.
+    #[error("service failed internally")]
+    Internal,
+}
+
+impl ServiceError {
+    /// Stable classification without provider or secret payloads.
+    #[must_use]
+    pub const fn class(self) -> ServiceErrorClass {
+        match self {
+            Self::InvalidRequest => ServiceErrorClass::InvalidRequest,
+            Self::NotFound => ServiceErrorClass::NotFound,
+            Self::Unauthorized => ServiceErrorClass::Unauthorized,
+            Self::ResourceExhausted => ServiceErrorClass::ResourceExhausted,
+            Self::Cancelled => ServiceErrorClass::Cancelled,
+            Self::DeadlineExceeded => ServiceErrorClass::DeadlineExceeded,
+            Self::Unavailable => ServiceErrorClass::Unavailable,
+            Self::InvalidResult => ServiceErrorClass::InvalidResult,
+            Self::Internal => ServiceErrorClass::Internal,
+        }
+    }
+}
+
+impl From<ServiceContractError> for ServiceError {
+    fn from(_source: ServiceContractError) -> Self {
+        Self::InvalidResult
+    }
+}
+
+impl From<ProgressError> for ServiceError {
+    fn from(source: ProgressError) -> Self {
+        match source {
+            ProgressError::Cancelled => Self::Cancelled,
+            ProgressError::DeadlineExceeded => Self::DeadlineExceeded,
+            ProgressError::TooManyUpdates | ProgressError::MessageTooLong => {
+                Self::ResourceExhausted
+            }
+            ProgressError::NonMonotonic | ProgressError::InvalidValue => Self::InvalidRequest,
+            ProgressError::Unavailable | ProgressError::Delivery => Self::Unavailable,
+            ProgressError::State => Self::Internal,
+        }
+    }
+}
+
+/// Application-service surface shared by CLI and protocol transports.
+#[async_trait]
+pub trait ToolServices: Send + Sync + 'static {
+    /// Returns the complete validated capability set for this service instance.
+    fn capabilities(&self) -> ServiceCapabilities;
+
+    /// Executes one schema-admitted operation under the supplied cancellation, deadline, and
+    /// result limits.
+    ///
+    /// Implementations must observe [`RequestContext::cancellation`] and
+    /// [`RequestContext::deadline`] before authoritative mutation and at safe interruption
+    /// boundaries. Once the request cancellation token is cancelled, the returned future must be
+    /// immediately safe to drop; the bounded session-shutdown timeout is only best-effort
+    /// operational grace and is not a prerequisite for Drop safety. Externally visible mutation
+    /// must remain committed or rolled back according to the operation's atomicity contract.
+    async fn call(
+        &self,
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError>;
+}

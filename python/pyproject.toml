@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin==1.14.1"]
+build-backend = "maturin"
+
+[project]
+name = "market-squawk"
+version = "1.0.0"
+description = "Local point-in-time financial research and deterministic model training"
+requires-python = "==3.14.*"
+license = "Apache-2.0 OR MIT"
+dependencies = ["pyarrow==25.0.0"]
+
+[project.scripts]
+market-squawk-train = "market_squawk.training_driver:main"
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+
+[tool.maturin]
+manifest-path = "../crates/market-squawk-python/Cargo.toml"
+python-source = "."
+module-name = "market_squawk.market_squawk"
+bindings = "pyo3"
+strip = true

@@ -1,0 +1,16 @@
+{
+  "artifacts": [
+    "colorama-0.4.6-py2.py3-none-any.whl",
+    "iniconfig-2.3.0-py3-none-any.whl",
+    "maturin-1.14.1-py3-none-win_amd64.whl",
+    "packaging-26.2-py3-none-any.whl",
+    "pluggy-1.6.0-py3-none-any.whl",
+    "pyarrow-25.0.0-cp314-cp314-win_amd64.whl",
+    "pygments-2.20.0-py3-none-any.whl",
+    "pytest-9.1.1-py3-none-any.whl"
+  ],
+  "minimum_system": "Windows 10 1809",
+  "schema_version": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "wheel_platform_tag": "win_amd64"
+}

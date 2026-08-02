@@ -1,0 +1,5 @@
+error: cannot construct `LiveExecutionCapability` with struct literal syntax due to private fields
+ --> tests/ui/current_capability_is_opaque.rs:4:19
+  |
+4 |     let _forged = LiveExecutionCapability {};
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^

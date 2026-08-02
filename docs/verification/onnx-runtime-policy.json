@@ -1,0 +1,27 @@
+{
+  "environment": {
+    "evidence_path": "MARKET_SQUAWK_ONNX_RUNTIME_EVIDENCE",
+    "expected_sha256": "MARKET_SQUAWK_ONNX_RUNTIME_SHA256",
+    "runtime_root": "MARKET_SQUAWK_ONNX_RUNTIME_ROOT"
+  },
+  "evidence_schema_version": 1,
+  "notice": {
+    "path": "docs/licenses/onnx-runtime-notice.md",
+    "sha256": "a86d5ba1e5d829a2bbded63d70bd486e1746c348229f4dc6f9f64a2f46a80e36"
+  },
+  "platforms": [
+    "linux-arm64-elf",
+    "linux-x86_64-elf"
+  ],
+  "runtime": {
+    "api_version": 24,
+    "max_library_bytes": 536870912,
+    "version": "1.24.4"
+  },
+  "schema_version": 1,
+  "sources": [
+    "https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4",
+    "https://github.com/microsoft/onnxruntime/blob/v1.24.4/LICENSE",
+    "https://onnxruntime.ai/docs/build/inferencing.html"
+  ]
+}

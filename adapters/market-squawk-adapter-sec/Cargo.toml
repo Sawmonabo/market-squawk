@@ -1,0 +1,45 @@
+[package]
+name = "market-squawk-adapter-sec"
+description = "Bounded SEC EDGAR submissions, filing, and XBRL extraction adapter"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+bytes.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-sources.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "filings"
+path = "tests/filings.rs"
+
+[[test]]
+name = "xbrl_point_in_time"
+path = "tests/xbrl_point_in_time.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+allow-dirty = ["ci"]
+packages = ["market-squawk-installer"]
+version = "1.0.0"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+checksum = "sha256"
+source-tarball = true
+installers = []
+# The custom stable-release transaction composes cargo-dist planning with the sealed Python,
+# complete-bundle, Tauri signing, and native smoke gates that generated cargo-dist CI cannot own.
+ci = []
+hosting = ["github"]
+# `.github/workflows/release.yml` attests the final cross-platform asset closure in one operation.
+github-attestations = false
+fail-fast = false
+merge-tasks = false
+cache-builds = false

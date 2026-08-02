@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "provider": "U.S. Bureau of Labor Statistics",
+  "fixtures": [
+    {
+      "path": "series.json",
+      "sha256": "392cacf5eac32cbbfd17520aae87833dd472bfd29ff2d460cd019e82aeac4eb8",
+      "source_url": "https://api.bls.gov/publicAPI/v1/timeseries/data/",
+      "documentation_url": "https://www.bls.gov/developers/api_signature.htm",
+      "accessed_on": "2026-07-21",
+      "evidence_class": "provider_response_reduced_fixture",
+      "note": "Deterministic structural reduction of an authorized v1 response plus the documented preliminary footnote signal; exact values are parser test evidence, not a raw archival response."
+    }
+  ]
+}

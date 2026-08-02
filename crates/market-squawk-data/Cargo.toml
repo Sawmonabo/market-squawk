@@ -1,0 +1,48 @@
+[package]
+name = "market-squawk-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable local control and analytical catalog for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[features]
+default = []
+release-evidence = []
+
+[dependencies]
+async-trait = { workspace = true }
+arrow = { workspace = true }
+bytes = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+chrono = { workspace = true }
+datafusion = { workspace = true }
+futures-util = { workspace = true }
+libc = { workspace = true }
+market-squawk-domain = { workspace = true }
+market-squawk-platform = { workspace = true }
+market-squawk-sources = { workspace = true }
+parquet = { workspace = true }
+rust_decimal = { workspace = true }
+rustix = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+atomicwrites = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

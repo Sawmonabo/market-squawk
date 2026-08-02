@@ -1,0 +1,207 @@
+//! Execution-owned live action hook with mandatory market, risk, and dispatch ordering.
+
+use std::sync::Arc;
+
+use market_squawk_live::{
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
+    LiveActionHook, LiveActionHookError,
+};
+use thiserror::Error;
+
+use crate::{
+    ExecutionAuditError, ExecutionAuditWriter, ExecutionDispatcherConfig, ExecutionDispatcherError,
+    ExecutionDispatcherHandle, ExecutionMarketReference, ExecutionMarketSink,
+    ExecutionMarketUpdate, RiskLimits, RiskOutcome, RiskService, RiskServiceError, Strategy,
+    StrategyContext,
+};
+
+/// Route-owned execution graph invoked synchronously at the committed actor point.
+#[derive(Debug)]
+pub struct ExecutionLiveActionHook {
+    strategy: Box<dyn Strategy>,
+    risk: RiskService,
+    dispatcher: ExecutionDispatcherHandle,
+    market_sink: Arc<dyn ExecutionMarketSink>,
+    audit: ExecutionAuditWriter,
+    maximum_intents: ActionAuthorityIssueLimit,
+    declared_retained_bytes: usize,
+}
+
+impl ExecutionLiveActionHook {
+    /// Returns the exact route-hook graph charge before worker ownership transfer.
+    ///
+    /// Runtime construction and [`LiveActionHook::retained_bytes`] use the same checked summation,
+    /// so a strategy declaration that drifts after composition fails closed.
+    pub fn retained_bytes_for_composition(
+        strategy: &dyn Strategy,
+        risk_limits: &RiskLimits,
+        dispatcher: ExecutionDispatcherConfig,
+        market_sink_retained_bytes: usize,
+    ) -> Result<usize, ExecutionLiveActionHookError> {
+        checked_hook_retained_bytes(
+            strategy.retained_bytes()?,
+            RiskService::retained_bytes_for_limits(risk_limits)?,
+            dispatcher.handle_retained_bytes()?,
+            market_sink_retained_bytes,
+        )
+    }
+
+    /// Validates one bounded route graph and fixes its exact per-observation authority ceiling.
+    pub fn try_new(
+        strategy: Box<dyn Strategy>,
+        risk: RiskService,
+        dispatcher: ExecutionDispatcherHandle,
+        market_sink: Arc<dyn ExecutionMarketSink>,
+        maximum_intents: ActionAuthorityIssueLimit,
+    ) -> Result<Self, ExecutionLiveActionHookError> {
+        let declared_retained_bytes =
+            hook_retained_bytes(strategy.as_ref(), &risk, &dispatcher, market_sink.as_ref())?;
+        let audit = risk.audit_writer();
+        Ok(Self {
+            strategy,
+            risk,
+            dispatcher,
+            market_sink,
+            audit,
+            maximum_intents,
+            declared_retained_bytes,
+        })
+    }
+}
+
+impl LiveActionHook for ExecutionLiveActionHook {
+    fn on_committed(
+        &mut self,
+        context: CommittedActionContext<'_>,
+        authority: &mut CurrentAuthorityGate<'_>,
+    ) -> ActionHookDisposition {
+        let market = ExecutionMarketReference::from_committed_context(&context);
+        let update = ExecutionMarketUpdate::from_committed_context(&context, market);
+        if self.market_sink.try_publish(update).is_err() {
+            return ActionHookDisposition::Failed;
+        }
+        let strategy_context = StrategyContext::from_committed(
+            context.route(),
+            context.assessment_id(),
+            market,
+            context.features(),
+        );
+        let intents = match self
+            .strategy
+            .on_market_event(&strategy_context, context.event())
+        {
+            Ok(intents) => intents,
+            Err(_) => return ActionHookDisposition::Failed,
+        };
+        match record_audited_no_action(&self.audit, &intents, context.received_at()) {
+            Ok(Some(disposition)) => return disposition,
+            Ok(None) => {}
+            Err(_) => return ActionHookDisposition::Failed,
+        }
+        if intents.is_empty() {
+            return ActionHookDisposition::NoAction;
+        }
+        if intents.len() > self.maximum_intents.get() {
+            return ActionHookDisposition::Failed;
+        }
+
+        let mut dispatched = false;
+        let mut suppressed = false;
+        for intent in intents {
+            let capability = match authority.issue() {
+                Ok(capability) => capability,
+                Err(_) => return ActionHookDisposition::Failed,
+            };
+            match self.risk.evaluate(authority, capability, intent, &market) {
+                RiskOutcome::Rejected(_) => suppressed = true,
+                RiskOutcome::Approved(approval) => {
+                    if self.dispatcher.try_submit(approval).is_ok() {
+                        dispatched = true;
+                    } else {
+                        suppressed = true;
+                    }
+                }
+            }
+        }
+        if dispatched {
+            ActionHookDisposition::Dispatched
+        } else if suppressed {
+            ActionHookDisposition::Suppressed
+        } else {
+            ActionHookDisposition::NoAction
+        }
+    }
+
+    fn retained_bytes(&self) -> Result<usize, LiveActionHookError> {
+        let observed = hook_retained_bytes(
+            self.strategy.as_ref(),
+            &self.risk,
+            &self.dispatcher,
+            self.market_sink.as_ref(),
+        )
+        .map_err(|_| LiveActionHookError::RetainedSizeOverflow)?;
+        if observed != self.declared_retained_bytes {
+            return Err(LiveActionHookError::RetainedSizeOverflow);
+        }
+        Ok(observed)
+    }
+
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
+        self.maximum_intents
+    }
+}
+
+pub(crate) fn record_audited_no_action(
+    audit: &ExecutionAuditWriter,
+    intents: &crate::BoundedOrderIntents,
+    observed_at: market_squawk_domain::Timestamp,
+) -> Result<Option<ActionHookDisposition>, ExecutionAuditError> {
+    let Some(no_action) = intents.no_action() else {
+        return Ok(None);
+    };
+    audit.try_record_strategy_no_action(no_action, observed_at)?;
+    Ok(Some(ActionHookDisposition::NoAction))
+}
+
+fn hook_retained_bytes(
+    strategy: &dyn Strategy,
+    risk: &RiskService,
+    dispatcher: &ExecutionDispatcherHandle,
+    market_sink: &dyn ExecutionMarketSink,
+) -> Result<usize, ExecutionLiveActionHookError> {
+    checked_hook_retained_bytes(
+        strategy.retained_bytes()?,
+        risk.retained_bytes(),
+        dispatcher.retained_bytes(),
+        market_sink
+            .retained_bytes()
+            .map_err(|_| ExecutionLiveActionHookError::RetainedSize)?,
+    )
+}
+
+fn checked_hook_retained_bytes(
+    strategy_retained_bytes: usize,
+    risk_retained_bytes: usize,
+    dispatcher_retained_bytes: usize,
+    market_sink_retained_bytes: usize,
+) -> Result<usize, ExecutionLiveActionHookError> {
+    std::mem::size_of::<ExecutionLiveActionHook>()
+        .checked_add(strategy_retained_bytes)
+        .and_then(|value| value.checked_add(risk_retained_bytes))
+        .and_then(|value| value.checked_add(dispatcher_retained_bytes))
+        .and_then(|value| value.checked_add(market_sink_retained_bytes))
+        .ok_or(ExecutionLiveActionHookError::RetainedSize)
+}
+
+/// Hook construction failure before live runtime ownership transfer.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ExecutionLiveActionHookError {
+    #[error(transparent)]
+    Strategy(#[from] crate::StrategyError),
+    #[error(transparent)]
+    Dispatcher(#[from] ExecutionDispatcherError),
+    #[error(transparent)]
+    Risk(#[from] RiskServiceError),
+    #[error("execution action-hook retained-size accounting failed")]
+    RetainedSize,
+}

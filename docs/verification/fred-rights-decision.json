@@ -1,0 +1,78 @@
+{
+  "schema_version": 5,
+  "series_scope": "exact_service_and_series_grants",
+  "terms_bundle_digest": "0ee7743ee752726ee66464dbc23b13cf34d1d30e334607e3490217dc3fb3f292",
+  "terms_documents": [
+    {
+      "role": "api_terms",
+      "representation": "exact_raw",
+      "url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+      "sha256": "d6748787c8e2e0f9b8746c212b4d06cfa94d594b26bce05647ad10392f8a1907",
+      "byte_length": 48783
+    },
+    {
+      "role": "fred_services_legal_terms",
+      "representation": "exact_raw",
+      "url": "https://fred.stlouisfed.org/legal/",
+      "sha256": "3b7c6e1e7cded4a55b3a2469f44594ce10dad30b30002175ffdccaa0f945f447",
+      "byte_length": 116858
+    },
+    {
+      "role": "privacy_policy",
+      "representation": "privacy_sxa_search_item_canonical_v1",
+      "url": "https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+      "sha256": "f022e68d07750c621f309eaa879fac32729d0974a2be4a58bd5fbfe5c7258404",
+      "byte_length": 246317
+    }
+  ],
+  "assessed_at_unix_nanos": 1785024000000000000,
+  "review_required_by_unix_nanos": 1785628800000000000,
+  "operations": ["display", "persist", "cache", "archive", "train"],
+  "disposition": "service_permission_required",
+  "confirmed_facts": [
+    "The three required terms documents were reacquired as exact bounded HTTPS response bodies on 2026-07-26.",
+    "Repeated acquisitions produced stable exact raw identities for the API terms and FRED Services legal terms.",
+    "Repeated privacy-notice acquisitions changed only one context-bound Sitecore SXA search item identifier; the narrowly canonicalized reviewed representation remained stable.",
+    "The FRED Services terms prohibit using FRED Services or Content for software or model training.",
+    "The FRED Services terms prohibit storing, caching, archiving, or incorporating FRED Content in another database or medium.",
+    "The FRED API-specific terms repeat the separate training and durable-storage prohibitions.",
+    "FRED API access does not override the underlying series owner's rights or restrictions.",
+    "The official FRED contact form exposes a permissions topic, but submitting a request is not written permission."
+  ],
+  "engineering_inferences": [
+    "Registered ephemeral retrieval may proceed within current provider terms and shared budgets.",
+    "Display additionally requires exact public-domain or series-owner evidence for the selected series.",
+    "Persistence, caching, archival storage, database incorporation, and training require exact written Federal Reserve Bank of St. Louis permission for Market Squawk and every requested operation.",
+    "Every selected series independently requires exact public-domain or series-owner permission evidence for the same operation scope.",
+    "Neither an API key, a contact request, nor public-domain series status satisfies the separate Bank service-permission gate.",
+    "The review-required timestamp is a local fail-closed revalidation deadline, not a provider-declared terms expiration."
+  ],
+  "sources": [
+    {
+      "url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+      "accessed_on": "2026-07-26",
+      "sha256": "d6748787c8e2e0f9b8746c212b4d06cfa94d594b26bce05647ad10392f8a1907",
+      "byte_length": 48783,
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://fred.stlouisfed.org/legal/",
+      "accessed_on": "2026-07-26",
+      "sha256": "3b7c6e1e7cded4a55b3a2469f44594ce10dad30b30002175ffdccaa0f945f447",
+      "byte_length": 116858,
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+      "accessed_on": "2026-07-26",
+      "sha256": "0126968b6691806671ead0b8af017119e6e5e6c142d0e69453aaff676b5a56",
+      "byte_length": 246325,
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://fred.stlouisfed.org/contactus/",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "confirmed"
+    }
+  ]
+}

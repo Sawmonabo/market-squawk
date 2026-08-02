@@ -1,0 +1,263 @@
+# CI verification runtime research evidence audit
+
+Purpose: record the evidence review of the CI runtime diagnosis and its subsequent correctness
+follow-up in the maintained research documentation.
+
+| Metadata | Value |
+| --- | --- |
+| Document type | Evidence audit |
+| Audience | Maintainers, CI owners, release reviewers |
+| Verdict | `PASS_WITH_NOTES` |
+| Evidence cutoff | 2026-07-29 |
+| Last substantive review | 2026-07-29 |
+| Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
+| Latest completed correctness candidate | `f8c2569ee4addcfbd8d93553d6b4c541dbdb00ae` |
+| Current release-packaging measurement | Rejected candidate `775e21da52a8eb08d812bee01e172f55ad93e7ef` |
+| Audited report | [CI verification runtime diagnosis](../research/2026-07-27-ci-verification-runtime.md) |
+
+## Table of Contents
+
+- [Audit scope](#audit-scope)
+- [Findings](#findings)
+- [Verified claims](#verified-claims)
+- [Source coverage](#source-coverage)
+- [Notes](#notes)
+- [Conclusion](#conclusion)
+
+## Audit scope
+
+The audit compared the research report with:
+
+- the initial 21-source research inventory and subsequent primary-source correctness follow-ups;
+- four source-category syntheses and four bounded batch reports;
+- the repository workflow, verification scripts, Loom wrapper, and platform build script;
+- GitHub Actions run and job metadata;
+- retained Linux, macOS, and Windows job logs;
+- a two-pass Cargo fingerprint reproduction;
+- the Linux authority-lock, Windows analytical-backup, and manifest-allocation implementations;
+- the unchanged Windows job rerun and file-adapter clock/deadline fixture;
+- the Windows ONNX worker's resource profile and pinned Job Object dependency;
+- the Kraken vertical runtime topology and paper-recovery sequence handoff;
+- complete-product candidate `775e21d`, including every job duration, completed step duration,
+  failure annotation, and retained failure log;
+- the relevant Linux, Windows, Rust, and SQLite platform contracts.
+
+## Findings
+
+| Severity | Finding |
+| --- | --- |
+| Critical | None |
+| Important | None |
+| Minor | None requiring correction before use as decision input |
+
+The report does not recommend removing a required verification surface, weakening the release
+profile, adopting a paid runner, treating a cache as approval evidence, or claiming an unmeasured
+speedup.
+
+## Verified claims
+
+- The successful Linux verification job in
+  [run 30329093586](https://github.com/Sawmonabo/market-squawk/actions/runs/30329093586/job/90180354327)
+  took approximately 60 minutes and its phase totals support the report's breakdown.
+- The current workflow's `save-if` expression prevents pull-request cache writes, the retained job
+  records `save-if: false` and `No cache found`, and the repository cache inventory was empty at the
+  audit time.
+- The platform build script passes Git-relative metadata paths to `cargo:rerun-if-changed`; the
+  second identical fingerprint diagnostic recorded the resulting missing package-relative
+  `.git/HEAD` path and rebuilt the package.
+- The exact Loom wrapper retains an inventory comparison but invokes Cargo once per declared model.
+  The successful job log shows repeated platform builds during those invocations.
+- The most recent 20 release-branch runs at the audit time consisted of 13 failures and 7
+  cancellations with 8.236 hours in summed run duration.
+- The proposed 28–32 minute cold wall time is explicitly labeled a planning projection. It is not
+  presented as measured evidence.
+- The Linux authority failure follows Linux's documented open-file-description `flock` lifetime;
+  the explicit-unlock guard corrects that lifecycle without accepting real contention. Exact
+  candidate `c7b045f` subsequently passed the complete hosted Linux verify job in 58m54s.
+- The former Windows URI builder incorrectly rejected canonical local `VerbatimDisk` paths. Prefix
+  classification and SQLite's documented `/D:/...` URI form support that correction, but exact
+  candidate `c7b045f` reproduced all four coarsened backup failures and proved the path-only causal
+  conclusion incomplete.
+- The remaining backup failure is a deterministic Windows `LockFileEx` self-conflict: retained
+  verification exclusively byte-locked the database and then read the same range through a second
+  handle. Microsoft's contract directly describes that denied access. An existing, noncreating
+  private writer-sidecar lease preserves exclusivity without blocking receipt and SQLite reads.
+- The unchanged Windows rerun failed earlier in the file-adapter harness because a one-second
+  synthetic fixture deadline competed with its intended injected clock failure. Source, runner
+  image, toolchain, and test executable were unchanged, and the production deadline result was
+  correct.
+- The fifth Windows failure repeated at `c7b045f`. Rust 1.97.1's `Result<Vec<_>, _>` collection
+  produced spare capacity; `into_boxed_slice` then shrank it through Windows `HeapReAlloc`, which
+  may move the block. The manifest's pointer-identity guard consequently rejected valid evidence.
+  Exact-capacity normalization at the central manifest boundary removes that allocator dependency
+  without weakening evidence semantics.
+- Exact candidate `05b406f` passed macOS. Its Windows job passed all four corrected backup cases,
+  the allocator-sensitive derived-evidence case, and the file-adapter clock case before exposing a
+  later catalog contention-classification defect.
+- The Windows catalog remained exclusively owned. `fs2 0.4.3` returned raw
+  `ERROR_LOCK_VIOLATION` 33, Rust 1.97.1 classified that general I/O error as `Uncategorized`, and
+  the old `WouldBlock` comparison converted expected contention into public `UnsafePath`. Rust's
+  stable `File::try_lock` API provides the exact typed contention boundary without changing the
+  operating-system locking primitive.
+- The Linux MCP failure is a production session-isolation defect: an individual session drained
+  one process-global reaper and could therefore inherit an unrelated session's pending SDK thread
+  or failure. Exact per-transfer join receipts preserve bounded reaper ownership while making each
+  session wait only for its own worker.
+- Exact candidate `f7c7712` passed the complete Linux and macOS jobs. Its Windows job passed the
+  previously failing boundaries reached before modeling, then became the first retained Windows
+  run to execute the modeling harness. It stopped at modeling before the later platform
+  `configuration_security` harness and therefore did not prove those platform cases.
+- The Windows ONNX worker configured `limit_working_memory(0, 3 GiB)`, which violates Microsoft's
+  requirement that a nonzero maximum working set have a nonzero minimum. `win32job 2.0.3` applied
+  the invalid profile before process assignment, so each helper exited before protocol
+  initialization and the parent consistently mapped EOF to public `WarmUp`.
+- A valid nonzero working-set minimum would not cap committed memory. The correction instead
+  binds both per-process and job-wide 3 GiB committed-memory limits plus kill-on-close through an
+  audited local patch of the exact licensed dependency. The patch source is now included in the
+  Python release source closure, and runtime resource evidence advances to version 2.
+- Exact candidate `605362c` passed its complete macOS job. Its Windows modeling harness passed all
+  13 contracts, providing hosted evidence for the committed-memory correction, and then the later
+  platform `configuration_security` harness exposed four previously unreached failures.
+- Windows authority publication uses rename rather than Unix's hard-link installation proof.
+  Open-time reserved temporary state cannot therefore be proven as legitimate on Windows and must
+  be classified fail-closed as `UnsafeFileType`, not recoverable state.
+- The pinned `atomicwrites 0.4.4` Windows replacement path uses `MoveFileExW` only. Rust 1.97.1's
+  rename implementation adds a `FileRenameInfoEx` POSIX-semantics fallback on access denied, which
+  is the supported replacement path when the destination remains open with delete sharing.
+- The old non-Unix build-input identity fallback did not enforce a single hard link and could miss
+  a same-length rewrite. Capability-handle metadata from `cap-fs-ext 4.0.2`, a second no-follow
+  open, a second bounded hash, and retained root-directory identity make the Windows boundary
+  content- and identity-based rather than timestamp-dependent.
+- Exact candidate `0039429` passed the complete Linux and macOS jobs. Windows stopped in the
+  application library's Kraken vertical before reaching the platform configuration/security
+  harness, so it did not provide Windows acceptance evidence for the platform corrections.
+- Tokio 1.53.1 documents that plain `#[tokio::test]` uses a separate current-thread runtime while
+  the explicit multi-thread flavor is equivalent to a multi-thread runtime builder. Exact
+  candidate `d02a2f1` passed the complete Windows job after the two Kraken production verticals
+  adopted the representative two-worker topology; all 48 platform configuration/security tests
+  also passed.
+- The same `d02a2f1` candidate passed macOS but failed Linux when paper recovery returned
+  `NotAttemptedBusy`. The producer still held the shared event-sequence mutex while enqueueing
+  recovery, and the multi-thread worker could receive the command before that guard dropped. This
+  is a production handoff race, not queue saturation or a deadline failure.
+- The bounded correction keeps live producer acquisition nonblocking while allowing only startup
+  recovery to await the sequence mutex under its existing cancellation and deadline. Tokio's
+  mutex and `select!` contracts support that design. The unchanged paper and application library
+  surfaces pass locally.
+- Exact candidate `f8c2569` passed unchanged in
+  [run 30366976240](https://github.com/Sawmonabo/market-squawk/actions/runs/30366976240):
+  Linux `scripts/verify.sh` completed in 49m20s, Windows completed in 15m19s, and macOS completed
+  in 25m50s. Both Kraken production verticals passed on Windows and macOS, and the Linux complete
+  gate passed the corrected paper adapter and application surfaces. This is the required hosted
+  cross-platform correctness evidence for the sequence handoff; it is not terminal release
+  approval or post-redesign runtime evidence.
+- Exact candidate `775e21d` completed in
+  [run 30487393236](https://github.com/Sawmonabo/market-squawk/actions/runs/30487393236).
+  Windows and macOS workspace proof passed in 17m11s and 25m35s, while the serial Linux release
+  verification passed in 69m10s. Complete packaging then exposed three late deterministic
+  boundary failures after 61–97 minutes and one Intel macOS runner-communication failure after
+  81m07s. The jobs began within seconds of classification, so queueing did not cause the observed
+  duration.
+- The 2026 CircleCI benchmark is based on 28,738,317 workflows and reports a 2.2-minute median and
+  9.9-minute mean. DORA places the ordinary test-feedback upper limit at about ten minutes and
+  recommends separating longer work. These values are ecosystem context, not Market Squawk
+  release-package performance claims.
+- The earlier 28–32 minute cold projection was not achieved. The maintained report now labels it
+  historical planning evidence and records separate proposed targets for ordinary pull-request
+  feedback, platform proof, and complete frozen-release packaging.
+
+The retained diagnostic log identities were:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Successful Linux job `90180354327` | `1e26fb7eb46fd4d9d11cb607d9b2f61603dd7329c2a5618320f667df6976ce27` |
+| Current Linux job `90189278958` | `4c3ee09f3143e425dd93371b7a83e1a4f494e13be177c142426345e3591463c4` |
+| Current Windows job `90189278913` | `eab9f3c4fc4868bf0d1e5eba22ae4d9263a49980a199032a208652078e737bc7` |
+| Current macOS job `90189278954` | `a20deae2bee0c04774b7e450bcaa67f71284f400f9887681d73c73d96237c1c9` |
+| Windows rerun job `90209089614` | `387e6aea41dbe4606d92efb72b104134e62fcd77e962a97410027905c695a8b9` |
+| Candidate `c7b045f` Windows job `90214783655` | `db7140c27c4a0fcfb1eeeeaece9e6b3de5b6d00dea2db7ce943b49a3559fde61` |
+| Candidate `05b406f` Linux job `90227935404` | `e00fb737ab040a38697db0172cd9456cfd9e461b7f20ac845745419f18769d1a` |
+| Candidate `05b406f` Windows job `90227935382` | `5528931b286af7a140be0f697e6961aacdcb011597534edf9fca2296bab5c2a2` |
+| Candidate `05b406f` macOS job `90227935405` | `b7910509c67325af7e547d219eb480e906a72211bc9994ed196ffa23097ad8da` |
+| Candidate `f7c7712` Linux job `90241570286` | `78bbb617c584f51567afc42ce62392f9b9822f38fd765cbec111f4a0839f3a57` |
+| Candidate `f7c7712` Windows job `90241570389` | `9234b45044e1d2959cba1e54f4be507989631dcb952745127096d982a8317efb` |
+| Candidate `f7c7712` macOS job `90241570407` | `e412fcdee3c80d849e25410f18bd41f4c1d65eec255080dbfc3250cccd52f403` |
+| Candidate `605362c` Windows job `90260430186` | `33bf821efd984f0646afe8bde79fb23f34e3d1182bd2c046764ab48ec31886af` |
+| Candidate `605362c` macOS job `90260430125` | `5c44cf3d3c4f4968a0ce3d7221c45261f902f2e0e2570c468f2074cc74c628e3` |
+| Candidate `605362c` Linux job `90260430159` | `93e2345ba46d5d54a368e57b045179891ed6be5d6ee47d1449d38b63c63045cf` |
+| Candidate `0039429` Windows job `90275079128` | `f1c3394edb1ac14b215acbc99b25e01c7fcb23bafd7b524981fb64bbdff0fe8f` |
+| Candidate `0039429` macOS job `90275079124` | `5576172b03fab14bdd48aa86f6269bd14cc4fa7f5e179052b6f0f7af7711109d` |
+| Candidate `0039429` Linux job `90275079203` | `8648a47dd706ce02530ea21f40108be1b472dda8c83e77ce630ad9aad9db3723` |
+| Candidate `d02a2f1` Windows job `90289414559` | `d55d41d1756751d10ecff1432369dca192837ecacaab2a47e1a34997ec62f697` |
+| Candidate `d02a2f1` macOS job `90289414582` | `8ef872ed2fa60f608c2fcf393e5bd62f5eb2fc79a5d587e50064e65fab29a5f4` |
+| Candidate `d02a2f1` Linux job `90289414652` | `7e5f3677549a5b3432592a27d2a5e6cec2d9fe5b14f98cb50b5a0a7da4e13304` |
+| Candidate `f8c2569` run metadata | `25b4d876a1d3afab388979e3f5e72c182a8bd5039ed252caa03f668144b860dd` |
+| Candidate `f8c2569` Linux job `90300620390` | `cd099473c99177d1b56126def9c57bb1ff6395d93bd7e80a23d4f60edd1dfc45` |
+| Candidate `f8c2569` Windows job `90300620276` | `2ebd8dee2601a747ebfc823887d2a77485c5945761f57d6980e8d15f3bb5b0ce` |
+| Candidate `f8c2569` macOS job `90300620453` | `9ff06329b7ecbc7193e82dda32b919b6d067f5e60ac630561093fc0682058004` |
+| Fingerprint pass 1 | `ed761532181b39a3ba187cca4e9d6702bfbb4593c2f82bfbf6ea58255dc5628f` |
+| Fingerprint pass 2 | `8968e6a24f28e05a44544d972178b727d70ed7037048113422adeefc3b0ec062` |
+
+The hashes identify the working evidence used during the audit. The large transient logs are not
+tracked project artifacts; the report retains the durable GitHub run links and relevant excerpts.
+
+## Source coverage
+
+| Category | Listed sources | Audit result |
+| --- | ---: | --- |
+| Cargo, Rust, and toolchain documentation, including exact source | 26 | Covered |
+| Operating-system, storage, and locked-dependency contracts | 20 | Covered |
+| Official GitHub documentation and maintained CI tools | 10 | Covered |
+| Delivery-performance benchmarks | 2 | Covered; not treated as repository-specific performance proof |
+| Academic papers | 4 | Covered; repository-transfer limits are explicit |
+
+The report cites sources beside its material claims and distinguishes source-backed facts from
+Market Squawk design inferences. It does not rely on academic evidence for a repository-specific
+numerical forecast.
+
+## Notes
+
+- Cache size, restore time, save time, and warm-run benefit remain open measurements. Cache
+  population must be a bounded experiment and retained only after demonstrating a net benefit.
+- The complete discovery and batch reports remain temporary working papers because they repeat the
+  reviewed report and are not required for day-to-day maintenance.
+- The Linux lock defect, Windows URI boundary, Windows retained-backup lock conflict, Windows
+  manifest-allocation dependency, file-adapter fixture race, Windows lock-contention
+  classification, MCP cross-session reaper dependency, and Windows ONNX Job Object profile now
+  have bounded causal explanations.
+- The corrected backup and manifest designs use the existing failing tests as focused proof; no
+  retry, sleep, serialization, fixture rewrite, new test target, or weakened evidence rule was
+  introduced.
+- Exact candidate `c7b045f` completed without cancellation: Linux and macOS passed, while Windows
+  repeated five failures.
+- Exact candidate `05b406f` completed without cancellation: macOS passed; Windows passed those five
+  corrections and exposed catalog lock classification; Linux exposed MCP session/global-reaper
+  coupling.
+- Exact candidate `f7c7712` completed without cancellation: Linux and macOS passed; Windows passed
+  the prior corrections and exposed the invalid ONNX Job Object profile in the first retained
+  Windows execution of that harness. It did not reach the later platform configuration/security
+  cases.
+- Exact candidate `605362c` passed the complete Linux and macOS jobs. Windows passed all 13
+  modeling contracts, then exposed four platform authority and build-input cases.
+- Exact candidate `0039429` passed Linux and macOS but stopped in the Windows Kraken vertical
+  before reaching the platform corrections.
+- Exact candidate `d02a2f1` passed complete Windows and macOS jobs. Windows established the
+  platform corrections; Linux exposed the paper-recovery sequence handoff under the representative
+  multi-thread runtime.
+- Exact candidate `f8c2569` passed Linux, macOS, and Windows unchanged. The paper-recovery
+  correction and the preceding cross-platform correctness fixes are therefore accepted at that
+  exact code head.
+- Exact candidate `775e21d` completed without cancellation. It establishes the current
+  complete-product runtime baseline and all four package-lane outcomes; it is rejected as release
+  evidence because no package lane passed.
+- The audit verdict approves this report as decision input. It is not release approval and not
+  post-change performance evidence.
+
+## Conclusion
+
+The report is fit to preserve as a date-anchored diagnostic and implementation-decision input. Its
+two repository-specific runtime root causes are directly reproduced, its workflow-shape diagnosis
+is supported by run evidence and official documentation, its cross-platform correctness follow-up
+passed unchanged, and its 2026-07-29 complete-product measurement disproves the earlier runtime
+projection without weakening any gate. The redesigned runtime remains pending implementation and
+post-change measurement.

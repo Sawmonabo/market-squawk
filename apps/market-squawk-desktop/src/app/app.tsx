@@ -1,0 +1,36 @@
+import { AppHeader } from "@/components/app-header"
+import { AppSidebar } from "@/components/app-sidebar"
+import { StatusRail } from "@/components/status-rail"
+import {
+  SidebarInset,
+  SidebarProvider,
+} from "@/components/ui/sidebar"
+import type { ProductTransport } from "@/lib/transport"
+
+import { ProductProvider } from "./product-context"
+import { AppRoutes } from "./routes"
+
+export function App({ transport }: { transport: ProductTransport }) {
+  return (
+    <ProductProvider transport={transport}>
+      <SidebarProvider
+        style={
+          {
+            "--sidebar-width": "16.125rem",
+            "--sidebar-width-icon": "4.875rem",
+          } as React.CSSProperties
+        }
+      >
+        <AppSidebar />
+        <SidebarInset className="min-w-0">
+          <AppHeader />
+          <StatusRail />
+          <div className="min-h-0 flex-1 overflow-auto">
+            <AppRoutes />
+          </div>
+        </SidebarInset>
+      </SidebarProvider>
+    </ProductProvider>
+  )
+}
+

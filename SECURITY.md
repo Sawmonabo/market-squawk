@@ -2,11 +2,20 @@
 
 ## Supported release
 
-The `main` branch and the latest tagged `0.x` release receive security fixes. This is research infrastructure and not a production brokerage or execution system.
+Security support begins with `v1.0.0`. The latest published stable `1.0.x` release receives
+security corrections. Development branches, pull-request artifacts, historical snapshots, and
+older tags are not supported releases unless a repository security advisory says otherwise.
+
+Market Squawk is self-hosted financial research and paper-execution infrastructure. It is not a
+brokerage, and v1.0.0 does not enable live-money order submission.
 
 ## Reporting
 
-Report suspected vulnerabilities privately through GitHub Security Advisories for the repository. Do not include live credentials, private portfolio data, exchange secrets, or proprietary datasets in an issue.
+Use the private vulnerability-reporting option on the repository's Security page when GitHub shows
+it. If no private reporting option is visible, contact `@Sawmonabo` through an already established
+private channel and request a reporting route without disclosing vulnerability details. Never open
+a public issue or pull request containing a suspected vulnerability, live credential, private
+portfolio data, exchange secret, proprietary dataset, or unredacted sensitive log.
 
 ## Security boundaries
 
@@ -22,8 +31,11 @@ Report suspected vulnerabilities privately through GitHub Security Advisories fo
 
 ## Secrets
 
-Version 0.1 does not require credentials. Future credentialed adapters must use operating-system secret storage or encrypted local configuration, redact secrets from logs and MCP responses, and receive a separate threat-model review before merge.
-
-## Non-goals
-
-This project does not support quota evasion, identity rotation, anti-bot bypassing, stealth scraping, or circumvention of provider access controls.
+Core local operation and public-source adapters require no paid service and no mandatory
+credential. Authenticated Coinbase Direct and registered provider modes use explicit user-owned
+accounts where required. The shipping onboarding authority stores secret material in the operating
+system keyring when available and otherwise in the encrypted local fallback; configuration,
+tracing, CLI, MCP, provider evidence, and release evidence expose only redacted locators or
+credential-free digests. Provider activation is generation-bound, and credential replacement is
+transactional and recoverable. Never place a credential in a configuration file, command line,
+issue, pull request, log excerpt, or evidence artifact.

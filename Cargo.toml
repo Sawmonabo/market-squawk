@@ -1,49 +1,228 @@
-[package]
-name = "market-engine"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = [
+    "apps/market-squawk",
+    "apps/market-squawk-desktop/src-tauri",
+    "apps/market-squawk-installer",
+    "crates/*",
+    "adapters/*",
+]
+exclude = ["vendor/win32job"]
+default-members = ["apps/market-squawk"]
+
+[workspace.package]
 edition = "2024"
-rust-version = "1.85"
-description = "Local-first, event-sourced live market-data engine with deterministic replay and MCP access"
-repository = "https://github.com/Sawmonabo/market-engine"
-publish = false
+rust-version = "1.97.1"
+version = "1.0.0"
+license = "Apache-2.0 OR MIT"
 
-[lib]
-name = "market_engine"
-path = "src/lib.rs"
-
-[[bin]]
-name = "market-engine"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0"
+arc-swap = "=1.9.2"
+argon2 = { version = "=0.5.3", default-features = false, features = [
+    "alloc",
+    "zeroize",
+] }
+arrow = { version = "=58.3.0", default-features = false, features = [
+    "canonical_extension_types",
+    "ipc",
+    "json",
+] }
 async-trait = "0.1"
+atomicwrites = "=0.4.4"
+base64 = "=0.22.1"
+bs58 = "0.5"
+bytes = "1.10"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+blake3 = "=1.8.5"
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
+    "alloc",
+    "getrandom",
+    "zeroize",
+] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
+chrono-tz = "=0.10.4"
 clap = { version = "4.5", features = ["derive", "env"] }
+criterion = "=0.8.2"
 crc32fast = "1.4"
-futures-util = "0.3"
+csv = "=1.4.0"
+encoding_rs = "=0.8.35"
+datafusion = { version = "=54.0.0", default-features = false, features = [
+    "parquet",
+    "recursive_protection",
+    "sql",
+] }
+directories = "=6.0.0"
 fs2 = "0.4"
+futures-util = "0.3"
+getrandom = "=0.3.4"
+httpdate = { version = "=1.0.3", default-features = false }
+# The loopback onboarding portal uses Hyper's bounded HTTP/1 server primitives directly.
+http-body-util = "=0.1.4"
+hyper = { version = "=1.11.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
+hmac = "=0.12.1"
+keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
+libc = "0.2"
+market-squawk = { path = "apps/market-squawk", version = "=1.0.0" }
+market-squawk-installer = { path = "apps/market-squawk-installer", version = "=1.0.0" }
+market-squawk-adapter-bls = { path = "adapters/market-squawk-adapter-bls", version = "=1.0.0" }
+market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=1.0.0" }
+market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", version = "=1.0.0" }
+market-squawk-adapter-fred = { path = "adapters/market-squawk-adapter-fred", version = "=1.0.0" }
+market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=1.0.0" }
+market-squawk-adapter-paper = { path = "adapters/market-squawk-adapter-paper", version = "=1.0.0" }
+market-squawk-adapter-portfolio = { path = "adapters/market-squawk-adapter-portfolio", version = "=1.0.0" }
+market-squawk-adapter-sec = { path = "adapters/market-squawk-adapter-sec", version = "=1.0.0" }
+market-squawk-adapter-treasury = { path = "adapters/market-squawk-adapter-treasury", version = "=1.0.0" }
+market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "=1.0.0" }
+market-squawk-data = { path = "crates/market-squawk-data", version = "=1.0.0" }
+market-squawk-domain = { path = "crates/market-squawk-domain", version = "=1.0.0" }
+market-squawk-execution = { path = "crates/market-squawk-execution", version = "=1.0.0" }
+market-squawk-live = { path = "crates/market-squawk-live", version = "=1.0.0" }
+market-squawk-mcp = { path = "crates/market-squawk-mcp", version = "=1.0.0" }
+market-squawk-modeling = { path = "crates/market-squawk-modeling", version = "=1.0.0" }
+market-squawk-platform = { path = "crates/market-squawk-platform", version = "=1.0.0" }
+market-squawk-portfolio = { path = "crates/market-squawk-portfolio", version = "=1.0.0" }
+market-squawk-services = { path = "crates/market-squawk-services", version = "=1.0.0" }
+market-squawk-sources = { path = "crates/market-squawk-sources", version = "=1.0.0" }
+market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=1.0.0" }
+memory-stats = "=1.2.0"
+num-bigint = "0.4"
 parking_lot = "0.12"
+parquet = { version = "=58.3.0", default-features = false, features = [
+    "arrow",
+    "async",
+    "crc",
+    "zstd",
+] }
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+    "job-object",
+    "std",
+] }
+quick-xml = { version = "=0.41.0", default-features = false, features = ["encoding"] }
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "gzip",
+    "json",
+    "rustls-no-provider",
+    "stream",
+] }
+loom = "=0.7.2"
+proptest = "1.7"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rand_chacha = "=0.9.0"
+rand_core = "=0.9.5"
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rmcp = { version = "=2.2.0", default-features = false, features = [
+    "server",
+    "transport-io",
+] }
+rusqlite = { version = "=0.40.1", default-features = false, features = [
+    "backup",
+    "bundled",
+    "hooks",
+    "limits",
+    "serialize",
+] }
+schemars = { version = "=1.2.1", default-features = false, features = [
+    "derive",
+    "std",
+] }
+semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.43", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+sha3 = "0.10"
+static_assertions = "1.1"
+# Authentication tokens and secret readback are compared without data-dependent early exits.
+subtle = "=2.6.1"
+tauri = { version = "=2.11.5", default-features = false, features = ["wry"] }
+tauri-build = { version = "=2.6.3", default-features = false }
+tauri-plugin-opener = { version = "=2.5.4", default-features = false }
+tempfile = "3.15"
+thiserror = "2.0"
+trybuild = "1.0"
+tokio = { version = "1.43", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = "0.7"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
+url = "2.5"
+webbrowser = { version = "=1.2.1", features = ["hardened"] }
+win-security-identifier = "=0.1.1"
+windows-permissions = "=0.2.4"
+zeroize = "1.8"
+zip = { version = "=8.6.0", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+] }
 
-[dev-dependencies]
-tempfile = "3.15"
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(market_squawk_loom)"] }
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Transitive platform and protocol stacks can legitimately resolve independent major versions.
+# Cargo Deny remains authoritative for security, license, source, and crate bans.
+multiple_crate_versions = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package.argon2]
+debug = false
+opt-level = 3
+
+[profile.dev.package.sha2]
+debug = false
+opt-level = 3
+
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test.package."*"]
+debug = false
+
+[profile.test.package.argon2]
+debug = false
+opt-level = 3
+
+[profile.test.package.sha2]
+debug = false
+opt-level = 3
+
+[profile.debugging]
+inherits = "dev"
+debug = "full"
+incremental = false
 
 [profile.release]
 opt-level = 3
@@ -51,3 +230,10 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# win32job 2.0.3 does not expose the committed-memory limits required by the
+# Windows ONNX worker. Keep the audited upstream source local until
+# https://github.com/ohadravid/win32job-rs/issues/6 is resolved and released.
+[patch.crates-io]
+glib = { path = "vendor/glib-0.18.5" }
+win32job = { path = "vendor/win32job" }

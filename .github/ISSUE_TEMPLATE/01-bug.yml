@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a reproducible defect in Market Squawk.
+title: "[Bug]: "
+labels: ["bug"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a defect. Do not report security vulnerabilities here; follow
+        [SECURITY.md](https://github.com/Sawmonabo/market-squawk/blob/main/SECURITY.md) instead. Do
+        not include credentials, private portfolio data, exchange secrets, proprietary datasets,
+        or unredacted logs.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Select the narrowest affected subsystem.
+      options:
+        - CLI or local configuration
+        - Live source or order book
+        - Research ingestion or storage
+        - Analytics or modeling
+        - Portfolio, risk, or execution
+        - Fair value or MCP
+        - Build, test, documentation, or governance
+        - Unsure
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Version or exact commit
+      description: Provide a release tag or full commit hash.
+      placeholder: 1.0.0 or 40-character commit hash
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and architecture
+      description: Include the OS version, architecture, and Rust version when relevant.
+      placeholder: macOS 26 arm64; rustc 1.97.1
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the invariant or documented behavior you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: State what happened, including exact typed errors where safe to share.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Provide deterministic steps, bounded fixtures, and the smallest safe command.
+      placeholder: |
+        1. Start from...
+        2. Run...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Paste only sanitized logs, stack traces, checksums, or screenshots.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight confirmation
+      options:
+        - label: I searched existing issues and current documentation for this defect.
+          required: true
+        - label: This report contains no secret, private data, or proprietary dataset.
+          required: true
+        - label: This is not a security vulnerability or confidential report.
+          required: true

@@ -1,0 +1,122 @@
+[package]
+name = "market-squawk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-hosted Market Squawk CLI, live capture engine, diagnostic replay, and MCP server"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[features]
+default = []
+release-evidence = [
+    "dep:memory-stats",
+    "dep:tempfile",
+    "market-squawk-backtesting/release-evidence",
+    "market-squawk-data/release-evidence",
+    "market-squawk-modeling/release-evidence",
+    "market-squawk-platform/capture-benchmark",
+]
+
+[[test]]
+name = "live_pipeline"
+path = "tests/harnesses/live_pipeline.rs"
+
+[[test]]
+name = "risk_execution"
+path = "tests/harnesses/risk_execution.rs"
+
+[[test]]
+name = "control_plane"
+path = "tests/harnesses/control_plane.rs"
+
+[lib]
+name = "market_squawk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "market-squawk"
+path = "src/main.rs"
+
+[[bin]]
+name = "market-squawk-capture-helper"
+path = "src/bin/market-squawk-capture-helper.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+arrow = { workspace = true }
+atomicwrites = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+crc32fast = { workspace = true }
+fs2 = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+libc = { workspace = true }
+memory-stats = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+market-squawk-domain = { workspace = true }
+market-squawk-adapter-bls = { workspace = true }
+market-squawk-adapter-coinbase = { workspace = true }
+market-squawk-adapter-files = { workspace = true }
+market-squawk-adapter-fred = { workspace = true }
+market-squawk-adapter-kraken = { workspace = true }
+market-squawk-adapter-paper = { workspace = true }
+market-squawk-adapter-portfolio = { workspace = true }
+market-squawk-adapter-sec = { workspace = true }
+market-squawk-adapter-treasury = { workspace = true }
+market-squawk-analytics = { workspace = true }
+market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", version = "=1.0.0" }
+market-squawk-data = { workspace = true }
+market-squawk-execution = { workspace = true }
+market-squawk-live = { workspace = true }
+market-squawk-mcp = { workspace = true }
+market-squawk-modeling = { workspace = true, features = ["onnx-tract"] }
+market-squawk-installer = { workspace = true }
+market-squawk-platform = { workspace = true }
+market-squawk-portfolio = { workspace = true }
+market-squawk-services = { workspace = true }
+market-squawk-sources = { workspace = true }
+market-squawk-valuation = { workspace = true }
+rust_decimal = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true, optional = true }
+uuid = { workspace = true }
+url = { workspace = true }
+webbrowser = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+win-security-identifier = { workspace = true }
+windows-permissions = { workspace = true }
+
+[dev-dependencies]
+market-squawk-adapter-kraken = { workspace = true, features = ["loopback-fixture"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+[package]
+name = "market-squawk-execution"
+description = "Bounded order intent, account reservation, and deterministic risk contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+arc-swap.workspace = true
+market-squawk-analytics.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-live.workspace = true
+market-squawk-modeling.workspace = true
+market-squawk-portfolio.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+market-squawk-data.workspace = true
+proptest.workspace = true
+static_assertions.workspace = true
+trybuild.workspace = true
+
+[[test]]
+name = "orders_risk"
+path = "tests/orders_risk.rs"
+
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
+test = false
+
+[lints]
+workspace = true

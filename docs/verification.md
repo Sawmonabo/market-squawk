@@ -1,8 +1,9 @@
-# Verification Record
+# Verification Records
 
-## Verified with Rust 1.85.0
+## Historical pre-workspace record: Rust 1.85.0
 
-The following completed successfully in the artifact environment on July 15, 2026:
+The following completed successfully in the original single-package artifact environment on July
+15, 2026. It is retained as historical evidence and does not describe the current workspace gate:
 
 ```bash
 cargo fmt --all -- --check
@@ -10,9 +11,9 @@ cargo check --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ./scripts/verify.sh
-python3 scripts/smoke_mcp.py ./target/debug/market-engine
+python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 cargo build --release --locked
-python3 scripts/smoke_mcp.py ./target/release/market-engine
+python3 scripts/smoke_mcp.py ./target/release/market-squawk
 ```
 
 Results:
@@ -32,10 +33,40 @@ Results:
 The sandbox could not contact the public Coinbase endpoint, so an external live capture was not claimed. The adapter was verified end to end against a local WebSocket server using Coinbase-format messages. A normal local machine with outbound network access should run this final source check:
 
 ```bash
-market-engine capture --products BTC-USD --seconds 10
-market-engine replay --source coinbase-exchange
+market-squawk capture --products BTC-USD --seconds 10
+market-squawk replay --source coinbase-exchange
 ```
 
 ## Reproducibility
 
 `Cargo.lock` is committed. Local and CI verification use `--locked` so dependency resolution cannot silently drift during a build.
+
+## Current Rust 1.97 workspace gate
+
+The repository now pins Rust 1.97.1 and runs one fail-fast local/CI entry point. Rust 1.97.0 is
+explicitly ineligible for release or performance evidence because of its critical LLVM
+miscompilation:
+
+```bash
+./scripts/verify.sh
+```
+
+That entry point runs focused behavioral support tests, workspace inheritance and repository-input
+hygiene checks, workspace formatting, strict all-target/all-feature Clippy, the ordinary locked
+all-feature workspace suite (including Cargo's default doctest run), the explicitly isolated domain,
+live, and execution Trybuild UI targets, a release build, rustdoc with warnings denied, CLI help, the
+deterministic 101-event offline mock, and a timeout-bounded local stdio MCP interaction. Cargo Deny,
+Cargo Audit, and Gitleaks run directly in the same local and CI entry point rather than through
+configuration-shape unit tests. `cargo doc` remains a separate warning-denied documentation build;
+it is not treated as a substitute for running doctests.
+
+The wrapper rejects nonempty `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, exports
+`CARGO_INCREMENTAL=0`, and checks the default worktree-local `target/` against a 20 GiB hard ceiling
+before and after verification. Run it from the repository root without an external target or build
+directory. Ordinary `dev` and `test` work remains incremental with line-table debug information;
+use `cargo build --profile debugging` only when full workspace debug information is required.
+
+The historical 24-test count above applies only to the pre-workspace artifact. Current harness and
+doctest counts are read from the fresh release-gate transcript and will be recorded in the
+commit-specific verification record after the current correction review. This living
+overview intentionally does not copy a count across commits whose test corpus changed.

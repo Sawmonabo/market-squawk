@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    "iniconfig-2.3.0-py3-none-any.whl",
+    "maturin-1.14.1-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
+    "packaging-26.2-py3-none-any.whl",
+    "pluggy-1.6.0-py3-none-any.whl",
+    "pyarrow-25.0.0-cp314-cp314-macosx_12_0_x86_64.whl",
+    "pygments-2.20.0-py3-none-any.whl",
+    "pytest-9.1.1-py3-none-any.whl"
+  ],
+  "minimum_system": "macOS 12",
+  "schema_version": 1,
+  "target": "x86_64-apple-darwin",
+  "wheel_platform_tag": "macosx_12_0_x86_64"
+}

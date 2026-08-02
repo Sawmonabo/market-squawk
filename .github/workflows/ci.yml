@@ -4,18 +4,677 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      platform_verification:
+        description: Run complete platform verification on a frozen release branch
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+      platform: ${{ steps.release_scope.outputs.platform }}
+    steps:
+      - id: release_scope
+        name: Admit explicit release platform verification
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLATFORM_VERIFICATION: ${{ inputs.platform_verification || false }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          platform=false
+          if [[ "$PLATFORM_VERIFICATION" == "true" ]]; then
+            if [[ "$EVENT_NAME" != "workflow_dispatch" \
+              || "$WORKFLOW_REF" != refs/heads/release/* ]]; then
+              echo "Complete platform verification requires an explicit release-branch dispatch." \
+                >&2
+              exit 1
+            fi
+            platform=true
+          fi
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        name: Classify the exact change set
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ env.CANDIDATE_SHA }}
+        run: |
+          set -euo pipefail
+
+          code=false
+          resolved=true
+
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+            || ! git cat-file -e "${BASE_SHA}^{commit}" \
+            || ! git cat-file -e "${HEAD_SHA}^{commit}"; then
+            resolved=false
+          fi
+
+          if "$resolved"; then
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                LICENSE-APACHE|LICENSE-MIT|\
+                docs/licenses/geist-ofl-license.txt|\
+                docs/licenses/geist-mono-ofl-license.txt|\
+                docs/licenses/tauri-mpl-notice.md|\
+                docs/licenses/tract-onnx-notice.md)
+                  code=true
+                  ;;
+                docs/*|*.md)
+                  ;;
+                *)
+                  code=true
+                  ;;
+              esac
+            done < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
+          else
+            # An unresolved comparison is never treated as documentation-only.
+            code=true
+          fi
+
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  policy:
+    name: Policy and security
+    needs: classify
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: Install pinned Gitleaks CLI
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          binary_dir="$RUNNER_TEMP/gitleaks-bin"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" \
+            | sha256sum --check --strict
+          mkdir -p "$binary_dir"
+          tar -xzf "$archive" -C "$binary_dir" gitleaks
+          echo "$binary_dir" >> "$GITHUB_PATH"
+      - run: ./scripts/verify.sh --policy-only
+
+  linux:
+    name: Linux ${{ matrix.name }}
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: script contracts
+            lane: scripts
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 20
+          - name: frontend
+            lane: frontend
+            rust: false
+            frontend: true
+            system_dependencies: false
+            timeout: 20
+          - name: Clippy
+            lane: clippy
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
+          - name: workspace tests
+            lane: tests
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
+          - name: UI and Trybuild
+            lane: ui
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 45
+          - name: exact Loom inventories
+            lane: loom
+            rust: true
+            frontend: false
+            system_dependencies: false
+            timeout: 60
+          - name: release and Rustdoc
+            lane: release
+            rust: true
+            frontend: false
+            system_dependencies: true
+            timeout: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Tauri system prerequisites
+        if: matrix.system_dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        if: matrix.frontend
+        with:
+          package_json_file: apps/market-squawk-desktop/package.json
+      # actions/setup-node v7.0.0, verified release commit (2026-07-21).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: matrix.frontend
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        if: matrix.rust
+        with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: ./scripts/verify.sh
+      - name: Report the pinned Rust toolchain
+        if: matrix.rust
+        run: |
+          rustc --version
+          cargo --version
+      - name: Run ${{ matrix.name }}
+        run: ./scripts/verify.sh --lane "${{ matrix.lane }}"
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: matrix.lane == 'release'
+        with:
+          name: cargo-timings-${{ env.CANDIDATE_SHA }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS workspace
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
+      - run: rustc --version
+      - run: cargo --version
+      - run: cargo test --workspace --all-features --locked --no-fail-fast
+
+  windows:
+    name: Windows workspace
+    needs: classify
+    if: needs.classify.outputs.code == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
+      - run: rustc --version
+      - run: cargo --version
+      # The optional capture-benchmark evidence runner requires Linux/macOS process-group
+      # containment. Windows validates the complete shipping/default workspace instead.
+      - run: cargo test --workspace --locked --no-fail-fast
+
+  desktop-packages:
+    name: Desktop package (${{ matrix.name }})
+    needs: classify
+    if: needs.classify.outputs.platform == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            uv_relative: uv-x86_64-unknown-linux-gnu/uv
+            bundles: deb,appimage
+            reclaim_before_dmg: false
+            timeout: 180
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-aarch64-apple-darwin/uv
+            bundles: app,dmg
+            reclaim_before_dmg: false
+            timeout: 210
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ""
+            uv_relative: uv-x86_64-apple-darwin/uv
+            bundles: app
+            reclaim_before_dmg: true
+            timeout: 240
+          - name: Windows x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            uv_relative: uv.exe
+            bundles: nsis,msi
+            reclaim_before_dmg: false
+            timeout: 240
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      - name: Install Tauri system prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          package_json_file: apps/market-squawk-desktop/package.json
+      # actions/setup-node v7.0.0, verified release commit (2026-07-21).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: apps/market-squawk-desktop/pnpm-lock.yaml
+      # actions/setup-python v7.0.0, verified release commit (2026-07-13).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: 3.14.6
+      # TheMrMilchmann/setup-msvc-dev v4.1.0, reviewed Node 24 release commit (2026-07-22).
+      - uses: TheMrMilchmann/setup-msvc-dev@368ef7d1ee4d1171b31d4a7f67f4d954f903f5a9
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Pin the exact MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "The configured MSVC linker is unavailable: $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
+      # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: >-
+            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' &&
+                 github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Build the sealed Python 3.14 product
+        shell: bash
+        env:
+          MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK: "1"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          artifact_root="$RUNNER_TEMP/python-product"
+          component_root="$RUNNER_TEMP/release-components"
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --prepare-cache-only
+          unset MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK
+          python3 scripts/build_python_release.py \
+            --lock python/wheelhouse-lock.json \
+            --target "$TARGET" \
+            --artifact-root "$artifact_root" \
+            --component-root "$component_root" \
+            --offline
+
+          {
+            echo "CARGO_BUILD_TARGET=$TARGET"
+            echo "CARGO_HOME=$artifact_root/cargo-home"
+            echo "CARGO_NET_OFFLINE=true"
+            echo "MARKET_SQUAWK_PYTHON_PRODUCT=$artifact_root/release-cp314"
+            echo "MARKET_SQUAWK_COMPONENT_ROOT=$component_root"
+          } >> "$GITHUB_ENV"
+          foundation="$(cat "$artifact_root/training-foundation.json")"
+          [[ -n "$foundation" && "$foundation" != *$'\n'* && "$foundation" != *$'\r'* ]]
+          printf 'MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT=%s\n' "$foundation" \
+            >> "$GITHUB_ENV"
+      - name: Build the production desktop frontend
+        run: |
+          pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
+          pnpm --dir apps/market-squawk-desktop build
+      - name: Build complete native inputs
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+          UV_RELATIVE: ${{ matrix.uv_relative }}
+        run: |
+          set -euo pipefail
+
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-desktop --features tauri/custom-protocol
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk --bin market-squawk-capture-helper
+          cargo build --release --locked --offline --target "$TARGET" \
+            -p market-squawk-installer
+          version="$(cargo metadata --format-version 1 --no-deps --locked --offline \
+            | jq -er \
+              '[.packages[] | select(.name == "market-squawk") | .version]
+               | if length == 1 then .[0] else error("application version is not unique") end')"
+
+          native="$RUNNER_TEMP/native-input"
+          umask 077
+          mkdir -p "$native"
+          cp "target/$TARGET/release/market-squawk-desktop$EXE" \
+            "$native/market-squawk-desktop$EXE"
+          cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \
+            "$native/market-squawk-capture-helper$EXE"
+          cp "target/$TARGET/release/market-squawk-installer$EXE" \
+            "$native/market-squawk-installer$EXE"
+          cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
+            "$native/uv$EXE"
+
+          python3 scripts/build_complete_release.py \
+            --target "$TARGET" \
+            --native-trust-mode provenance-only \
+            --version "$version" \
+            --commit "$CANDIDATE_SHA" \
+            --tree "$(git rev-parse 'HEAD^{tree}')" \
+            --python-release "$MARKET_SQUAWK_PYTHON_PRODUCT" \
+            --native-bundle "$native" \
+            --output "$RUNNER_TEMP/complete-release"
+          {
+            echo "MARKET_SQUAWK_RELEASE_OUTPUT=$RUNNER_TEMP/complete-release"
+            echo "MARKET_SQUAWK_RELEASE_VERSION=$version"
+          } >> "$GITHUB_ENV"
+      - run: pnpm --dir apps/market-squawk-desktop test --run
+      # tauri-apps/tauri-action action-v1.0.0, verified release commit (2026-07-27).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        with:
+          projectPath: apps/market-squawk-desktop
+          args: >-
+            --config src-tauri/tauri.bundle.conf.json
+            --target ${{ matrix.target }}
+            --ci
+            --no-sign
+            --bundles ${{ matrix.bundles }}
+      - name: Reclaim Intel build storage and finish macOS bundles
+        if: matrix.reclaim_before_dmg
+        shell: bash
+        env:
+          CI: "true"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "false"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          built_binary="target/$TARGET/release/market-squawk-desktop"
+          saved_binary="$RUNNER_TEMP/market-squawk-desktop"
+          install -m 755 "$built_binary" "$saved_binary"
+          df -h .
+          cargo clean --release --target "$TARGET"
+          mkdir -p "$(dirname "$built_binary")"
+          install -m 755 "$saved_binary" "$built_binary"
+          df -h .
+
+          pnpm --dir apps/market-squawk-desktop tauri bundle \
+            --config src-tauri/tauri.bundle.conf.json \
+            --target "$TARGET" \
+            --ci \
+            --no-sign \
+            --bundles app,dmg \
+            --verbose
+      - name: Verify the installed complete product
+        shell: bash
+        env:
+          EXE: ${{ matrix.executable_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          bootstrap="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-bootstrap-$TARGET$EXE"
+          bundle="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-$MARKET_SQUAWK_RELEASE_VERSION-$TARGET.zip"
+          manifest="$MARKET_SQUAWK_RELEASE_OUTPUT/market-squawk-release.json"
+          # Windows runner temp has runner-managed ACLs; exercise the per-user install boundary.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            install_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/ci-verification/program"
+          else
+            install_root="$RUNNER_TEMP/installed-product"
+          fi
+          unset \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
+          "$bootstrap" --root "$install_root" install \
+            --manifest "$manifest" \
+            --bundle "$bundle"
+          "$bootstrap" --root "$install_root" status --json
+          "$bootstrap" --root "$install_root" repair
+
+          application="$(find "$install_root/versions" -type f \
+            -name "market-squawk$EXE" -print)"
+          runtime="$(find "$install_root/versions" -type f \
+            \( -path '*/bin/python' -o -path '*/python.exe' \) -print)"
+          [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          "$application" doctor \
+            --data-dir "$RUNNER_TEMP/doctor-data" \
+            --output json
+          "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          python3 scripts/smoke_mcp.py "$application"
+          "$bootstrap" --root "$install_root" uninstall
+      - name: Collect the closed platform artifact set
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          python3 scripts/build_complete_release.py collect \
+            --target "$TARGET" \
+            --version "$MARKET_SQUAWK_RELEASE_VERSION" \
+            --release-output "$MARKET_SQUAWK_RELEASE_OUTPUT" \
+            --native-bundle "target/$TARGET/release/bundle" \
+            --native-package-trust-mode provenance-only \
+            --output "$RUNNER_TEMP/platform-publish"
+      - name: Verify Linux AppImage MCP dispatch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unset \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
+          mapfile -d '' appimages \
+            < <(find "target/${{ matrix.target }}/release/bundle/appimage" -maxdepth 1 \
+              -type f -name '*.AppImage' -print0)
+          [[ "${#appimages[@]}" -eq 1 ]]
+          appimage="${appimages[0]}"
+          chmod u+x "$appimage"
+
+          help="$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help)"
+          if grep -F -- '--stdio-mcp' <<<"$help"; then
+            echo "hidden AppImage MCP transport appeared in ordinary help" >&2
+            exit 1
+          fi
+
+          stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
+          stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
+          if "target/${{ matrix.target }}/release/market-squawk-desktop" \
+            --stdio-mcp \
+            --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
+            >"$stdout" 2>"$stderr"; then
+            echo "hidden MCP transport ran outside a verified AppImage" >&2
+            exit 1
+          fi
+          [[ ! -s "$stdout" ]]
+          grep -F 'installed MCP transport is unavailable' "$stderr"
+
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            python3 scripts/smoke_mcp.py --desktop-appimage "$appimage"
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: market-squawk-${{ matrix.target }}-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/platform-publish/*
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - classify
+      - policy
+      - linux
+      - macos
+      - windows
+      - desktop-packages
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every scheduled lane
+        shell: bash
+        env:
+          CODE: ${{ needs.classify.outputs.code }}
+          PLATFORM: ${{ needs.classify.outputs.platform }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          DESKTOP_RESULT: ${{ needs.desktop-packages.result }}
+        run: |
+          set -euo pipefail
+
+          [[ "$CLASSIFY_RESULT" == "success" ]]
+          [[ "$POLICY_RESULT" == "success" ]]
+
+          if [[ "$CODE" == "true" ]]; then
+            [[ "$LINUX_RESULT" == "success" ]]
+            [[ "$MACOS_RESULT" == "success" ]]
+            [[ "$WINDOWS_RESULT" == "success" ]]
+          else
+            [[ "$LINUX_RESULT" == "skipped" ]]
+            [[ "$MACOS_RESULT" == "skipped" ]]
+            [[ "$WINDOWS_RESULT" == "skipped" ]]
+          fi
+
+          if [[ "$PLATFORM" == "true" ]]; then
+            [[ "$DESKTOP_RESULT" == "success" ]]
+          else
+            [[ "$DESKTOP_RESULT" == "skipped" ]]
+          fi

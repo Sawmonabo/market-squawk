@@ -1,0 +1,1364 @@
+//! Parent-owned supervision for resource-bounded ONNX helper processes.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+use thiserror::Error;
+
+mod process;
+mod protocol;
+mod resources;
+
+pub use process::run_onnx_worker_process;
+use protocol::{WorkerInitialization, response_loop};
+
+const MAX_WORKER_PROGRAM_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_GENERATION_STARTUP: Duration = Duration::from_secs(15);
+const MAX_GENERATION_CLEANUP_OWNERS: usize = 16;
+const RESPONSE_QUEUE_CAPACITY: usize = 1;
+const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const CLEANUP_WAIT_RETRY: Duration = Duration::from_millis(10);
+const WORKER_RUNTIME_REVISION: u32 = 2;
+
+static ACTIVE_GENERATION_CLEANUP_OWNERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Exact private helper executable admitted by application composition.
+#[derive(Clone, Debug)]
+pub struct OnnxWorkerProgram {
+    inner: Arc<WorkerProgramInner>,
+}
+
+#[derive(Debug)]
+struct WorkerProgramInner {
+    executable: PathBuf,
+    digest: [u8; 32],
+    active_generations: AtomicUsize,
+    _private_generation: TempDir,
+}
+
+impl OnnxWorkerProgram {
+    /// Copies one exact helper executable into a private, content-addressed generation.
+    ///
+    /// The helper is always spawned by this absolute sealed path; `PATH` lookup is never used.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a symlink, non-file, oversized, unreadable, changed, or digest-mismatched helper.
+    pub fn admit(
+        executable: impl AsRef<Path>,
+        expected_digest: [u8; 32],
+    ) -> Result<Self, OnnxWorkerProgramError> {
+        if expected_digest == [0; 32]
+            || fs::symlink_metadata(executable.as_ref())
+                .map_err(|_| OnnxWorkerProgramError::Unavailable)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(OnnxWorkerProgramError::Invalid);
+        }
+        let source_path =
+            fs::canonicalize(executable).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if !source_path.is_absolute() {
+            return Err(OnnxWorkerProgramError::Invalid);
+        }
+        let mut source =
+            File::open(&source_path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let metadata = source
+            .metadata()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_WORKER_PROGRAM_BYTES {
+            return Err(OnnxWorkerProgramError::Invalid);
+        }
+        let actual_digest = hash_open_file(&mut source, MAX_WORKER_PROGRAM_BYTES)
+            .map_err(|_| OnnxWorkerProgramError::Changed)?;
+        if actual_digest != expected_digest
+            || source
+                .metadata()
+                .map_err(|_| OnnxWorkerProgramError::Changed)?
+                .len()
+                != metadata.len()
+        {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let private_generation = tempfile::Builder::new()
+            .prefix("market-squawk-onnx-worker-")
+            .tempdir()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        let file_name = source_path
+            .file_name()
+            .ok_or(OnnxWorkerProgramError::Invalid)?;
+        let sealed_name = format!(
+            "{}-{}",
+            encode_digest(expected_digest),
+            file_name.to_string_lossy()
+        );
+        let sealed_path = private_generation.path().join(sealed_name);
+        let mut sealed = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sealed_path)
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        io::copy(&mut source.take(MAX_WORKER_PROGRAM_BYTES + 1), &mut sealed)
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        sealed
+            .sync_all()
+            .map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        set_worker_permissions(&sealed_path)?;
+        let mut sealed =
+            File::open(&sealed_path).map_err(|_| OnnxWorkerProgramError::Unavailable)?;
+        if hash_open_file(&mut sealed, MAX_WORKER_PROGRAM_BYTES)
+            .map_err(|_| OnnxWorkerProgramError::Changed)?
+            != expected_digest
+        {
+            return Err(OnnxWorkerProgramError::Changed);
+        }
+        Ok(Self {
+            inner: Arc::new(WorkerProgramInner {
+                executable: sealed_path,
+                digest: expected_digest,
+                active_generations: AtomicUsize::new(0),
+                _private_generation: private_generation,
+            }),
+        })
+    }
+
+    /// Returns the number of owned helper processes that have not yet been reaped.
+    #[must_use]
+    pub fn active_generations(&self) -> usize {
+        self.inner.active_generations.load(Ordering::Acquire)
+    }
+
+    /// Returns the exact admitted helper executable digest.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        self.inner.digest
+    }
+
+    fn verify(&self) -> Result<(), WorkerError> {
+        let mut executable = File::open(&self.inner.executable).map_err(|_| WorkerError::Load)?;
+        let digest = hash_open_file(&mut executable, MAX_WORKER_PROGRAM_BYTES)
+            .map_err(|_| WorkerError::Load)?;
+        (digest == self.inner.digest)
+            .then_some(())
+            .ok_or(WorkerError::Load)
+    }
+}
+
+/// Helper-program admission failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum OnnxWorkerProgramError {
+    #[error("ONNX worker executable reference is invalid")]
+    Invalid,
+    #[error("ONNX worker executable is unavailable")]
+    Unavailable,
+    #[error("ONNX worker executable changed or its digest differs")]
+    Changed,
+}
+
+#[cfg(unix)]
+fn set_worker_permissions(path: &Path) -> Result<(), OnnxWorkerProgramError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+        .map_err(|_| OnnxWorkerProgramError::Unavailable)
+}
+
+#[cfg(not(unix))]
+fn set_worker_permissions(_path: &Path) -> Result<(), OnnxWorkerProgramError> {
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct OnnxWorker {
+    #[cfg(feature = "onnx-runtime")]
+    program: OnnxWorkerProgram,
+    generation: Mutex<Option<OwnedGeneration>>,
+    deadline: Duration,
+    runtime_semantics_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct Generation {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    responses: Receiver<Result<f32, WorkerError>>,
+    reader: Option<JoinHandle<()>>,
+    active_generations: Arc<WorkerProgramInner>,
+}
+
+type WriterHandle = JoinHandle<Result<ChildStdin, WorkerError>>;
+
+#[derive(Debug)]
+struct OwnedGeneration {
+    state: Option<OwnedGenerationState>,
+}
+
+#[derive(Debug)]
+struct OwnedGenerationState {
+    generation: Generation,
+    cleanup: GenerationCleanupOwner,
+}
+
+impl OwnedGeneration {
+    fn new(generation: Generation, cleanup: GenerationCleanupOwner) -> Self {
+        Self {
+            state: Some(OwnedGenerationState {
+                generation,
+                cleanup,
+            }),
+        }
+    }
+
+    fn generation(&self) -> Result<&Generation, WorkerError> {
+        self.state
+            .as_ref()
+            .map(|state| &state.generation)
+            .ok_or(WorkerError::Unavailable)
+    }
+
+    fn generation_mut(&mut self) -> Result<&mut Generation, WorkerError> {
+        self.state
+            .as_mut()
+            .map(|state| &mut state.generation)
+            .ok_or(WorkerError::Unavailable)
+    }
+
+    fn handoff(mut self, writer: Option<WriterHandle>) -> TerminationDisposition {
+        let Some(state) = self.state.take() else {
+            return TerminationDisposition::Uncertain;
+        };
+        state.cleanup.handoff(ReapRequest {
+            generation: state.generation,
+            writer,
+        })
+    }
+}
+
+impl Drop for OwnedGeneration {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            match state.cleanup.handoff(ReapRequest {
+                generation: state.generation,
+                writer: None,
+            }) {
+                TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReapRequest {
+    generation: Generation,
+    writer: Option<WriterHandle>,
+}
+
+impl ReapRequest {
+    fn request_termination(&mut self) -> TerminationDisposition {
+        self.generation.stdin.take();
+        match self.generation.child.kill() {
+            Ok(()) => TerminationDisposition::Confirmed,
+            Err(_) => match self.generation.child.try_wait() {
+                Ok(Some(_)) => TerminationDisposition::Confirmed,
+                Ok(None) | Err(_) => TerminationDisposition::Uncertain,
+            },
+        }
+    }
+
+    fn reap(mut self) {
+        match self.request_termination() {
+            TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+        }
+        wait_until_reaped(&mut self.generation.child);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+        if let Some(reader) = self.generation.reader.take() {
+            let _ = reader.join();
+        }
+        self.generation
+            .active_generations
+            .active_generations
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[must_use = "termination disposition governs whether inference fallback is safe"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminationDisposition {
+    Confirmed,
+    Uncertain,
+}
+
+#[derive(Debug)]
+struct GenerationCleanupOwner {
+    state: Arc<GenerationCleanupState>,
+    armed: bool,
+}
+
+#[derive(Debug)]
+struct GenerationCleanupState {
+    command: Mutex<GenerationCleanupCommand>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct GenerationCleanupCommand {
+    request: Option<ReapRequest>,
+    cancelled: bool,
+}
+
+impl GenerationCleanupOwner {
+    fn start() -> Result<Self, WorkerError> {
+        reserve_generation_cleanup_owner()?;
+        let state = Arc::new(GenerationCleanupState {
+            command: Mutex::new(GenerationCleanupCommand {
+                request: None,
+                cancelled: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let observer_state = Arc::clone(&state);
+        let observer = match thread::Builder::new()
+            .name("market-squawk-onnx-cleanup".to_owned())
+            .spawn(move || run_generation_cleanup_owner(&observer_state))
+        {
+            Ok(observer) => observer,
+            Err(_) => {
+                ACTIVE_GENERATION_CLEANUP_OWNERS.fetch_sub(1, Ordering::AcqRel);
+                return Err(WorkerError::Unavailable);
+            }
+        };
+        drop(observer);
+        Ok(Self { state, armed: true })
+    }
+
+    fn handoff(mut self, mut request: ReapRequest) -> TerminationDisposition {
+        let disposition = request.request_termination();
+        let mut command = match self.state.command.lock() {
+            Ok(command) => command,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        command.request = Some(request);
+        drop(command);
+        self.armed = false;
+        self.state.ready.notify_one();
+        disposition
+    }
+}
+
+impl Drop for GenerationCleanupOwner {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut command = match self.state.command.lock() {
+            Ok(command) => command,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        command.cancelled = true;
+        drop(command);
+        self.state.ready.notify_one();
+    }
+}
+
+fn reserve_generation_cleanup_owner() -> Result<(), WorkerError> {
+    ACTIVE_GENERATION_CLEANUP_OWNERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_GENERATION_CLEANUP_OWNERS).then_some(active + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| WorkerError::Unavailable)
+}
+
+fn run_generation_cleanup_owner(state: &GenerationCleanupState) {
+    let request = {
+        let mut command = match state.command.lock() {
+            Ok(command) => command,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while command.request.is_none() && !command.cancelled {
+            command = match state.ready.wait(command) {
+                Ok(command) => command,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        command.request.take()
+    };
+    if let Some(request) = request {
+        request.reap();
+    }
+    ACTIVE_GENERATION_CLEANUP_OWNERS.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn wait_until_reaped(child: &mut Child) {
+    loop {
+        match child.wait() {
+            Ok(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) | Err(_) => thread::park_timeout(CLEANUP_WAIT_RETRY),
+            },
+        }
+    }
+}
+
+fn handoff_generation_failure(
+    generation: OwnedGeneration,
+    writer: Option<WriterHandle>,
+    error: WorkerError,
+) -> WorkerError {
+    match generation.handoff(writer) {
+        TerminationDisposition::Confirmed => error,
+        TerminationDisposition::Uncertain => WorkerError::TerminationUncertain,
+    }
+}
+
+#[derive(Debug)]
+enum GenerationExecution {
+    Complete(f32),
+    RetainedFailure(WorkerError),
+    TerminalFailure {
+        error: WorkerError,
+        writer: Option<WriterHandle>,
+    },
+}
+
+#[derive(Debug)]
+enum DeadlineJoin<T> {
+    Complete(T),
+    Failed(WorkerError),
+    Deadline(JoinHandle<Result<T, WorkerError>>),
+}
+
+impl OnnxWorker {
+    pub(crate) fn start_tract(
+        program: &OnnxWorkerProgram,
+        model_bytes: &[u8],
+        input_shape: &[usize],
+        input_elements: usize,
+        deadline: Duration,
+    ) -> Result<(Self, f32), WorkerError> {
+        Self::start(
+            program,
+            WorkerInitialization::tract(model_bytes, input_shape, input_elements)?,
+            deadline,
+        )
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact external runtime identity remains explicit at the process boundary"
+    )]
+    pub(crate) fn start_external(
+        program: &OnnxWorkerProgram,
+        model_bytes: &[u8],
+        input_shape: &[usize],
+        input_elements: usize,
+        deadline: Duration,
+        runtime_path: &Path,
+        runtime_digest: [u8; 32],
+        runtime_version: &str,
+        runtime_platform: u8,
+    ) -> Result<(Self, f32), WorkerError> {
+        Self::start(
+            program,
+            WorkerInitialization::external(
+                model_bytes,
+                input_shape,
+                input_elements,
+                runtime_path,
+                runtime_digest,
+                runtime_version,
+                runtime_platform,
+            )?,
+            deadline,
+        )
+    }
+
+    fn start(
+        program: &OnnxWorkerProgram,
+        initialization: WorkerInitialization,
+        deadline: Duration,
+    ) -> Result<(Self, f32), WorkerError> {
+        let startup_deadline = Instant::now()
+            .checked_add(MAX_GENERATION_STARTUP)
+            .ok_or(WorkerError::Deadline)?;
+        let input_elements = initialization.input_elements;
+        program.verify()?;
+        let runtime_semantics_digest = worker_runtime_semantics_digest(program, deadline);
+        if Instant::now() >= startup_deadline {
+            return Err(WorkerError::Deadline);
+        }
+        let cleanup = GenerationCleanupOwner::start()?;
+        if Instant::now() >= startup_deadline {
+            return Err(WorkerError::Deadline);
+        }
+        let active_generations = Arc::clone(&program.inner);
+        let (responses_sender, responses) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
+        let child = Command::new(&program.inner.executable)
+            .arg("--stdio-worker")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| WorkerError::Load)?;
+        active_generations
+            .active_generations
+            .fetch_add(1, Ordering::AcqRel);
+        let mut generation = OwnedGeneration::new(
+            Generation {
+                child,
+                stdin: None,
+                responses,
+                reader: None,
+                active_generations,
+            },
+            cleanup,
+        );
+        let stdin = {
+            let generation = generation.generation_mut()?;
+            generation.child.stdin.take()
+        };
+        let Some(stdin) = stdin else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
+        };
+        {
+            let generation = generation.generation_mut()?;
+            generation.stdin = Some(stdin);
+        }
+        let stdout = {
+            let generation = generation.generation_mut()?;
+            generation.child.stdout.take()
+        };
+        let Some(stdout) = stdout else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
+        };
+        let reader = match thread::Builder::new()
+            .name("market-squawk-onnx-response".to_owned())
+            .spawn(move || response_loop(stdout, responses_sender))
+        {
+            Ok(reader) => reader,
+            Err(_) => {
+                return Err(handoff_generation_failure(
+                    generation,
+                    None,
+                    WorkerError::Load,
+                ));
+            }
+        };
+        {
+            let generation = generation.generation_mut()?;
+            generation.reader = Some(reader);
+        }
+        let stdin = {
+            let generation = generation.generation_mut()?;
+            generation.stdin.take()
+        };
+        let Some(stdin) = stdin else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
+        };
+        let writer = match spawn_writer(stdin, initialization.bytes) {
+            Ok(writer) => writer,
+            Err(error) => {
+                return Err(handoff_generation_failure(generation, None, error));
+            }
+        };
+        let mut now = Instant::now;
+        let response = {
+            let generation = generation.generation()?;
+            receive_until_with_time_source(&generation.responses, startup_deadline, &mut now)
+        };
+        match response {
+            Ok(_) => {
+                let stdin = match join_writer_until(writer, startup_deadline, &mut now) {
+                    DeadlineJoin::Complete(stdin) => stdin,
+                    DeadlineJoin::Failed(error) => {
+                        return Err(handoff_generation_failure(generation, None, error));
+                    }
+                    DeadlineJoin::Deadline(writer) => {
+                        return Err(handoff_generation_failure(
+                            generation,
+                            Some(writer),
+                            WorkerError::Deadline,
+                        ));
+                    }
+                };
+                {
+                    let generation = generation.generation_mut()?;
+                    generation.stdin = Some(stdin);
+                }
+                if now() >= startup_deadline {
+                    return Err(handoff_generation_failure(
+                        generation,
+                        None,
+                        WorkerError::Deadline,
+                    ));
+                }
+                let worker = Self {
+                    #[cfg(feature = "onnx-runtime")]
+                    program: program.clone(),
+                    generation: Mutex::new(Some(generation)),
+                    deadline,
+                    runtime_semantics_digest,
+                };
+                let warm_up_values = vec![0.0; input_elements];
+                let Some(warm_up_deadline) = Instant::now().checked_add(deadline) else {
+                    return Err(worker.stop_after_failure(WorkerError::Deadline));
+                };
+                let warm_up = match worker.execute_until(warm_up_values, warm_up_deadline) {
+                    Ok(warm_up) => warm_up,
+                    Err(error) => return Err(worker.stop_after_failure(error)),
+                };
+                Ok((worker, warm_up))
+            }
+            Err(error) => Err(handoff_generation_failure(generation, Some(writer), error)),
+        }
+    }
+
+    pub(crate) fn execute_until(
+        &self,
+        values: Vec<f32>,
+        absolute_deadline: Instant,
+    ) -> Result<f32, WorkerError> {
+        self.execute_until_with_time_source(values, absolute_deadline, Instant::now)
+    }
+
+    fn execute_until_with_time_source<F>(
+        &self,
+        values: Vec<f32>,
+        absolute_deadline: Instant,
+        mut now: F,
+    ) -> Result<f32, WorkerError>
+    where
+        F: FnMut() -> Instant,
+    {
+        if values.len() > super::MAX_ONNX_REQUEST_ELEMENTS {
+            return Err(WorkerError::Resource);
+        }
+        let mut generation = {
+            let mut state = match self.generation.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if now() >= absolute_deadline {
+                return Err(WorkerError::Deadline);
+            }
+            state.take().ok_or(WorkerError::Unavailable)?
+        };
+        let execution = {
+            let inner = generation.generation_mut()?;
+            execute_generation(inner, values, absolute_deadline, &mut now)
+        };
+        match execution {
+            GenerationExecution::Complete(score) => {
+                if now() >= absolute_deadline {
+                    Err(handoff_generation_failure(
+                        generation,
+                        None,
+                        WorkerError::Deadline,
+                    ))
+                } else {
+                    self.restore_generation(generation)?;
+                    Ok(score)
+                }
+            }
+            GenerationExecution::RetainedFailure(error) => {
+                match self.restore_generation(generation) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                }
+            }
+            GenerationExecution::TerminalFailure { error, writer } => {
+                Err(handoff_generation_failure(generation, writer, error))
+            }
+        }
+    }
+
+    fn restore_generation(&self, generation: OwnedGeneration) -> Result<(), WorkerError> {
+        let mut state = match self.generation.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let displaced = state.replace(generation);
+        drop(state);
+        if let Some(generation) = displaced {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Unavailable,
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop_after_failure(&self, error: WorkerError) -> WorkerError {
+        let generation = {
+            let mut state = match self.generation.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.take()
+        };
+        generation.map_or(error, |generation| {
+            handoff_generation_failure(generation, None, error)
+        })
+    }
+
+    pub(crate) const fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    pub(crate) const fn runtime_semantics_digest(&self) -> [u8; 32] {
+        self.runtime_semantics_digest
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    pub(crate) fn program(&self) -> &OnnxWorkerProgram {
+        &self.program
+    }
+}
+
+impl Drop for OnnxWorker {
+    fn drop(&mut self) {
+        let state = match self.generation.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(generation) = state.take() {
+            match generation.handoff(None) {
+                TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+            }
+        }
+    }
+}
+
+fn execute_generation<F>(
+    generation: &mut Generation,
+    values: Vec<f32>,
+    deadline: Instant,
+    now: &mut F,
+) -> GenerationExecution
+where
+    F: FnMut() -> Instant,
+{
+    let mut bytes = Vec::new();
+    if bytes
+        .try_reserve_exact(5_usize.saturating_add(values.len().saturating_mul(4)))
+        .is_err()
+    {
+        return GenerationExecution::RetainedFailure(WorkerError::Resource);
+    }
+    bytes.push(protocol::REQUEST_INFER);
+    let Ok(value_count) = u32::try_from(values.len()) else {
+        return GenerationExecution::RetainedFailure(WorkerError::Resource);
+    };
+    bytes.extend_from_slice(&value_count.to_be_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+    }
+    if now() >= deadline {
+        return GenerationExecution::RetainedFailure(WorkerError::Deadline);
+    }
+    let Some(stdin) = generation.stdin.take() else {
+        return GenerationExecution::TerminalFailure {
+            error: WorkerError::Unavailable,
+            writer: None,
+        };
+    };
+    let writer = match spawn_writer(stdin, bytes) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return GenerationExecution::TerminalFailure {
+                error,
+                writer: None,
+            };
+        }
+    };
+    let response = receive_until_with_time_source(&generation.responses, deadline, now);
+    match response {
+        Ok(score) => match join_writer_until(writer, deadline, now) {
+            DeadlineJoin::Complete(stdin) => {
+                generation.stdin = Some(stdin);
+                if now() >= deadline {
+                    GenerationExecution::TerminalFailure {
+                        error: WorkerError::Deadline,
+                        writer: None,
+                    }
+                } else {
+                    GenerationExecution::Complete(score)
+                }
+            }
+            DeadlineJoin::Failed(error) => GenerationExecution::TerminalFailure {
+                error,
+                writer: None,
+            },
+            DeadlineJoin::Deadline(writer) => GenerationExecution::TerminalFailure {
+                error: WorkerError::Deadline,
+                writer: Some(writer),
+            },
+        },
+        Err(error) => GenerationExecution::TerminalFailure {
+            error,
+            writer: Some(writer),
+        },
+    }
+}
+
+fn spawn_writer(stdin: ChildStdin, bytes: Vec<u8>) -> Result<WriterHandle, WorkerError> {
+    thread::Builder::new()
+        .name("market-squawk-onnx-request".to_owned())
+        .spawn(move || {
+            let mut writer = BufWriter::new(stdin);
+            writer
+                .write_all(&bytes)
+                .map_err(|_| WorkerError::Unavailable)?;
+            writer.flush().map_err(|_| WorkerError::Unavailable)?;
+            writer.into_inner().map_err(|_| WorkerError::Unavailable)
+        })
+        .map_err(|_| WorkerError::Unavailable)
+}
+
+fn join_writer_until<T, F>(
+    writer: JoinHandle<Result<T, WorkerError>>,
+    deadline: Instant,
+    now: &mut F,
+) -> DeadlineJoin<T>
+where
+    T: Send + 'static,
+    F: FnMut() -> Instant,
+{
+    loop {
+        let observed_at = now();
+        if observed_at >= deadline {
+            return DeadlineJoin::Deadline(writer);
+        }
+        if writer.is_finished() {
+            if now() >= deadline {
+                return DeadlineJoin::Deadline(writer);
+            }
+            let result = match writer.join() {
+                Ok(result) => result,
+                Err(_) => return DeadlineJoin::Failed(WorkerError::Unavailable),
+            };
+            if now() >= deadline {
+                return DeadlineJoin::Failed(WorkerError::Deadline);
+            }
+            return match result {
+                Ok(value) => DeadlineJoin::Complete(value),
+                Err(error) => DeadlineJoin::Failed(error),
+            };
+        }
+        let remaining = deadline.saturating_duration_since(observed_at);
+        thread::park_timeout(remaining.min(WRITER_POLL_INTERVAL));
+    }
+}
+
+fn receive_until_with_time_source<F>(
+    responses: &Receiver<Result<f32, WorkerError>>,
+    deadline: Instant,
+    now: &mut F,
+) -> Result<f32, WorkerError>
+where
+    F: FnMut() -> Instant,
+{
+    let remaining = deadline
+        .checked_duration_since(now())
+        .ok_or(WorkerError::Deadline)?;
+    let outcome = responses.recv_timeout(remaining);
+    if now() >= deadline {
+        return Err(WorkerError::Deadline);
+    }
+    match outcome {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkerError::Deadline),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkerError::Unavailable),
+    }
+}
+
+fn worker_runtime_semantics_digest(
+    program: &OnnxWorkerProgram,
+    inference_deadline: Duration,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    bind_runtime_bytes(
+        &mut digest,
+        b"namespace",
+        b"market-squawk/onnx-worker-runtime/v2",
+    );
+    bind_runtime_u128(
+        &mut digest,
+        b"runtime-revision",
+        u128::from(WORKER_RUNTIME_REVISION),
+    );
+    bind_runtime_bytes(&mut digest, b"admitted-helper-digest", &program.digest());
+    bind_runtime_bytes(
+        &mut digest,
+        b"protocol-semantics",
+        &protocol::semantics_digest(),
+    );
+    bind_runtime_bytes(
+        &mut digest,
+        b"compute-semantics",
+        &process::compute_semantics_digest(),
+    );
+    bind_runtime_bytes(
+        &mut digest,
+        b"resource-semantics",
+        &resources::semantics_digest(),
+    );
+    for (name, value) in [
+        (
+            b"maximum-worker-program-bytes".as_slice(),
+            u128::from(MAX_WORKER_PROGRAM_BYTES),
+        ),
+        (
+            b"maximum-generation-startup-nanoseconds".as_slice(),
+            MAX_GENERATION_STARTUP.as_nanos(),
+        ),
+        (
+            b"inference-deadline-nanoseconds".as_slice(),
+            inference_deadline.as_nanos(),
+        ),
+        (
+            b"maximum-generation-cleanup-owners".as_slice(),
+            MAX_GENERATION_CLEANUP_OWNERS as u128,
+        ),
+        (
+            b"response-queue-capacity".as_slice(),
+            RESPONSE_QUEUE_CAPACITY as u128,
+        ),
+        (
+            b"writer-poll-nanoseconds".as_slice(),
+            WRITER_POLL_INTERVAL.as_nanos(),
+        ),
+        (
+            b"cleanup-wait-retry-nanoseconds".as_slice(),
+            CLEANUP_WAIT_RETRY.as_nanos(),
+        ),
+    ] {
+        bind_runtime_u128(&mut digest, name, value);
+    }
+    bind_runtime_bytes(
+        &mut digest,
+        b"startup-deadline-semantics",
+        b"absolute-monotonic/post-response/post-writer/pre-publication/v1",
+    );
+    bind_runtime_bytes(
+        &mut digest,
+        b"request-deadline-semantics",
+        b"absolute-monotonic/pre-dispatch/post-response/post-writer/pre-publication/v1",
+    );
+    bind_runtime_bytes(
+        &mut digest,
+        b"cleanup-semantics",
+        b"bounded-owner-before-spawn/drop-generation-stdin/kill-or-confirm-exited/async-wait-and-join/uncertain-denies-fallback/v2",
+    );
+    digest.finalize().into()
+}
+
+fn bind_runtime_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_runtime_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_runtime_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update((name.len() as u128).to_be_bytes());
+    digest.update(name);
+    digest.update((value.len() as u128).to_be_bytes());
+    digest.update(value);
+}
+
+fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(0))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded file size",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(io::Error::other)?)
+            .filter(|value| *value <= limit)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bounded file size"))?;
+        digest.update(&buffer[..read]);
+    }
+    if total != metadata.len() || file.metadata()?.len() != metadata.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file changed"));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn encode_digest(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerError {
+    Load,
+    Resource,
+    Unavailable,
+    Deadline,
+    Runtime,
+    TerminationUncertain,
+}
+
+/// Private helper startup or protocol failure.
+#[derive(Debug, Error)]
+pub enum OnnxWorkerProcessError {
+    #[error("ONNX worker process protocol failed")]
+    Protocol,
+    #[error("ONNX worker process resource containment failed")]
+    Resource,
+    #[error("ONNX worker process runtime failed")]
+    Runtime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_take_expiry_preserves_the_retained_generation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
+        let private_generation = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: private_generation,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let worker = OnnxWorker {
+            #[cfg(feature = "onnx-runtime")]
+            program: OnnxWorkerProgram {
+                inner: Arc::clone(&program_inner),
+            },
+            generation: Mutex::new(Some(OwnedGeneration::new(
+                Generation {
+                    child,
+                    stdin,
+                    responses,
+                    reader: None,
+                    active_generations: program_inner,
+                },
+                cleanup,
+            ))),
+            deadline: Duration::from_millis(10),
+            runtime_semantics_digest: [1; 32],
+        };
+
+        let before_deadline = Instant::now();
+        let deadline = before_deadline + Duration::from_millis(1);
+        let after_deadline = deadline + Duration::from_millis(1);
+        let mut times = [before_deadline, after_deadline].into_iter();
+
+        assert_eq!(
+            worker.execute_until_with_time_source(Vec::new(), deadline, || {
+                times.next().map_or(after_deadline, |now| now)
+            }),
+            Err(WorkerError::Deadline)
+        );
+        assert!(
+            worker
+                .generation
+                .lock()
+                .map_err(|_| "worker generation lock poisoned")?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_failure_hands_cleanup_off_before_reader_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
+        let private_generation = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: private_generation,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let (cleanup_release, cleanup_wait) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let _ = cleanup_wait.recv();
+        });
+        let worker = Arc::new(OnnxWorker {
+            #[cfg(feature = "onnx-runtime")]
+            program: OnnxWorkerProgram {
+                inner: Arc::clone(&program_inner),
+            },
+            generation: Mutex::new(Some(OwnedGeneration::new(
+                Generation {
+                    child,
+                    stdin,
+                    responses,
+                    reader: Some(reader),
+                    active_generations: Arc::clone(&program_inner),
+                },
+                cleanup,
+            ))),
+            deadline: Duration::from_secs(1),
+            runtime_semantics_digest: [1; 32],
+        });
+
+        let request_worker = Arc::clone(&worker);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let request = thread::spawn(move || {
+            let result =
+                request_worker.execute_until(Vec::new(), Instant::now() + Duration::from_secs(1));
+            let _ = result_sender.send(result);
+        });
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(1))?,
+            Err(WorkerError::Unavailable)
+        );
+        cleanup_release.send(())?;
+        request.join().map_err(|_| "request thread panicked")?;
+        drop(worker);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_failure_returns_while_reader_cleanup_remains_owned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable: std::env::current_exe()?,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: tempfile::tempdir()?,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let (cleanup_release, cleanup_wait) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let _ = cleanup_wait.recv();
+        });
+        let owned = OwnedGeneration::new(
+            Generation {
+                child,
+                stdin,
+                responses,
+                reader: Some(reader),
+                active_generations: Arc::clone(&program_inner),
+            },
+            cleanup,
+        );
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let startup = thread::spawn(move || {
+            let result = handoff_generation_failure(owned, None, WorkerError::Deadline);
+            let _ = result_sender.send(result);
+        });
+
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(1))?,
+            WorkerError::Deadline
+        );
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 1);
+        cleanup_release.send(())?;
+        startup.join().map_err(|_| "startup thread panicked")?;
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn response_wakeup_at_the_deadline_has_no_authority() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (sender, responses) = mpsc::sync_channel(1);
+        sender.send(Ok(1.0))?;
+        let before_deadline = Instant::now();
+        let deadline = before_deadline + Duration::from_millis(1);
+        let after_deadline = deadline + Duration::from_millis(1);
+        let mut times = [before_deadline, after_deadline].into_iter();
+
+        assert_eq!(
+            receive_until_with_time_source(&responses, deadline, &mut || {
+                times.next().map_or(after_deadline, |now| now)
+            }),
+            Err(WorkerError::Deadline)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_writer_is_not_joined_after_its_deadline() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let writer = thread::spawn(|| Ok::<_, WorkerError>(7_u8));
+        while !writer.is_finished() {
+            thread::yield_now();
+        }
+        let deadline = Instant::now();
+        let after_deadline = deadline + Duration::from_millis(1);
+
+        let DeadlineJoin::Deadline(writer) =
+            join_writer_until(writer, deadline, &mut || after_deadline)
+        else {
+            return Err("late writer completion was accepted".into());
+        };
+        assert_eq!(
+            writer
+                .join()
+                .map_err(|_| "writer panicked")?
+                .map_err(|_| "writer failed")?,
+            7
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_handoff_confirms_termination_before_return() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
+        let private_generation = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: private_generation,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let disposition = OwnedGeneration::new(
+            Generation {
+                child,
+                stdin,
+                responses,
+                reader: None,
+                active_generations: Arc::clone(&program_inner),
+            },
+            cleanup,
+        )
+        .handoff(None);
+
+        assert_eq!(disposition, TerminationDisposition::Confirmed);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_semantics_bind_the_helper_and_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let executable = std::env::current_exe()?;
+        let first = OnnxWorkerProgram {
+            inner: Arc::new(WorkerProgramInner {
+                executable: executable.clone(),
+                digest: [1; 32],
+                active_generations: AtomicUsize::new(0),
+                _private_generation: tempfile::tempdir()?,
+            }),
+        };
+        let second = OnnxWorkerProgram {
+            inner: Arc::new(WorkerProgramInner {
+                executable,
+                digest: [2; 32],
+                active_generations: AtomicUsize::new(0),
+                _private_generation: tempfile::tempdir()?,
+            }),
+        };
+        let deadline = Duration::from_millis(10);
+        let evidence = worker_runtime_semantics_digest(&first, deadline);
+
+        assert_ne!(evidence, worker_runtime_semantics_digest(&second, deadline));
+        assert_ne!(
+            evidence,
+            worker_runtime_semantics_digest(&first, Duration::from_millis(11))
+        );
+        Ok(())
+    }
+}

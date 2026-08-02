@@ -1,0 +1,48 @@
+# Extend every built-in detector. Exclusions are restricted to generated build output and isolated
+# worktrees; tracked/untracked root inputs and Git history remain in scope.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "ASVS authorization-control prose is not a credential"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''selected Level 3 controls for credential storage, execution/risk authorization,''']
+paths = ['''^docs/research/2026-07-15-market-squawk/reports/reputable-sources/batch-001\.md$''']
+
+[[rules.allowlists]]
+description = "Fixed Base64 test secret used only by Coinbase credential-boundary fixtures"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^dGVzdC1zZWNyZXQ=$''']
+paths = [
+  '''^adapters/market-squawk-adapter-coinbase/src/direct\.rs$''',
+  '''^apps/market-squawk/src/provider_onboarding/service\.rs$''',
+]
+
+[[rules.allowlists]]
+description = "Fixed hexadecimal placeholder used only by FRED endpoint-policy fixtures"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef0123456789abcdef$''']
+paths = ['''^crates/market-squawk-sources/src/onboarding/tests\.rs$''']
+
+[[allowlists]]
+description = "Exclude generated Rust build outputs"
+paths = ['''(^|/)target(/|$)''']
+
+[[allowlists]]
+description = "Exclude generated Python bytecode caches"
+paths = ['''(^|/)__pycache__(/|$)''']
+
+[[allowlists]]
+description = "Exclude independently reviewed Git worktrees"
+paths = ['''(^|/)\.worktrees(/|$)''']
+
+[[allowlists]]
+description = "Exclude ignored transient agent research scratch"
+paths = ['''(^|/)\.agents/tmp(/|$)''']

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "series": "UNRATE",
+  "display_name": "Unemployment Rate",
+  "owner": "U.S. Bureau of Labor Statistics",
+  "owner_series": "LNS14000000",
+  "rights_basis": "public_domain",
+  "canonical_fred_citation": "https://fred.stlouisfed.org/series/UNRATE",
+  "owner_evidence_url": "https://www.bls.gov/opub/copyright-information.htm",
+  "assessed_at_unix_nanos": 1785024000000000000,
+  "review_required_by_unix_nanos": 1785196800000000000,
+  "operations": ["display", "persist", "cache", "archive", "train"],
+  "confirmed_facts": [
+    "The FRED UNRATE series page identifies the source as the U.S. Bureau of Labor Statistics and the source code as LNS14000000.",
+    "The FRED UNRATE series page classifies the series as Public Domain: Citation Requested.",
+    "The BLS copyright page states that BLS hard-copy and electronic publications are public domain except for previously copyrighted photographs and illustrations.",
+    "The BLS copyright page asks users to cite the Bureau of Labor Statistics as the source."
+  ],
+  "engineering_decision": "This evidence satisfies only the underlying series-owner gate for the listed operations. It does not authorize storage, caching, archiving, database incorporation, or training through the FRED API; those operations separately require exact written Federal Reserve Bank of St. Louis service permission. The evidence does not authorize another series or redistribution.",
+  "sources": [
+    {
+      "url": "https://fred.stlouisfed.org/series/UNRATE",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://www.bls.gov/opub/copyright-information.htm",
+      "accessed_on": "2026-07-26",
+      "evidence_class": "confirmed"
+    }
+  ]
+}

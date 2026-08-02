@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+      xmlns:xbrli="http://www.xbrl.org/2003/instance"
+      xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+      xmlns:us-gaap="http://fasb.org/us-gaap/2025"
+      xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+      xmlns:ixt="http://www.xbrl.org/inlineXBRL/transformation/2020-02-12">
+  <body>
+    <ix:resources>
+      <xbrli:context id="D2025Q2">
+        <xbrli:entity>
+          <xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier>
+          <xbrli:segment>
+            <xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis">us-gaap:AmericasSegmentMember</xbrldi:explicitMember>
+          </xbrli:segment>
+        </xbrli:entity>
+        <xbrli:period>
+          <xbrli:startDate>2025-03-30</xbrli:startDate>
+          <xbrli:endDate>2025-06-28</xbrli:endDate>
+        </xbrli:period>
+      </xbrli:context>
+      <xbrli:unit id="USD"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>
+    </ix:resources>
+    <ix:nonFraction id="fact-1" name="us-gaap:NetIncomeLoss" contextRef="D2025Q2"
+                    unitRef="USD" decimals="-6" scale="3" sign="-"
+                    format="ixt:num-dot-decimal" continuedAt="fact-1-continuation">23,<ix:exclude>not-a-number</ix:exclude>434</ix:nonFraction>
+    <ix:continuation id="fact-1-continuation">,000</ix:continuation>
+    <ix:nonNumeric id="fact-2" name="dei:EntityRegistrantName" contextRef="D2025Q2">APPLE INC</ix:nonNumeric>
+  </body>
+</html>

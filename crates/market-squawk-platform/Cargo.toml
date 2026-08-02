@@ -1,0 +1,100 @@
+[package]
+name = "market-squawk-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local configuration, paths, journals, and asynchronous capture for Market Squawk"
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+autobenches = false
+
+[[test]]
+name = "configuration_security"
+path = "tests/harnesses/configuration_security.rs"
+
+[[test]]
+name = "capture_journal"
+path = "tests/harnesses/capture_journal.rs"
+
+[features]
+default = []
+capture-benchmark = ["dep:memory-stats"]
+capture-test = []
+
+[dependencies]
+arc-swap = { workspace = true }
+argon2 = { workspace = true }
+bytes = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
+chacha20poly1305 = { workspace = true }
+chrono = { workspace = true }
+crc32fast = { workspace = true }
+fs2 = { workspace = true }
+getrandom = { workspace = true }
+keyring = { workspace = true }
+libc = { workspace = true }
+market-squawk-domain = { workspace = true }
+memory-stats = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+rustix = { workspace = true }
+static_assertions = { workspace = true }
+tempfile = { workspace = true }
+
+[build-dependencies]
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
+rustix = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
+process-wrap = { workspace = true }
+
+[target.'cfg(market_squawk_loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+atomicwrites = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+process-wrap = { workspace = true }
+
+[[bin]]
+name = "capture-admission-evidence"
+path = "benches/capture_admission.rs"
+test = false
+bench = false
+doc = false
+required-features = ["capture-benchmark"]
+
+[[bin]]
+name = "market-squawk-platform-capture-helper-test"
+path = "src/bin/market-squawk-platform-capture-helper-test.rs"
+test = false
+bench = false
+doc = false
+required-features = ["capture-test"]
+
+[[bench]]
+name = "capture_admission_criterion"
+path = "benches/capture_admission_criterion.rs"
+harness = false
+test = false
+required-features = ["capture-benchmark"]
+
+[lints]
+workspace = true
