@@ -61,6 +61,9 @@ and protocol facts immediately before each serialized lock mutation.
 | Hyper | 1.11.0 | Existing `http1` and `server` boundary | MIT; retain exact line |
 | Hyper-util | 0.1.20 | Existing Tokio integration only unless direct code proves more | MIT; retain exact line |
 | http-body-util | 0.1.4 | No package features required | MIT; retain exact line |
+| Reqwest | 0.13.4 | Existing minimal JSON/Rustls client reused by the authenticated loopback `ApplicationClient`; no RMCP client feature | MIT/Apache-2.0; already admitted by provider and installer clients |
+| Rusqlite | 0.40.1 | Existing bundled SQLite boundary reused by the durable job repository | MIT; no external database service |
+| Process-wrap | 9.1.0 | Existing `std` wrapper with `process-group` on Unix and `job-object` on Windows | MIT/Apache-2.0; required for bounded worker-tree containment |
 | Schemars | RMCP-owned 1.2.1 | No direct Market Squawk dependency; RMCP uses it for protocol schemas | MIT; do not force a duplicate 1.2.2 graph without direct production use |
 
 Do not enable default/full feature sets merely to make a compile pass. Task 1 performs one
@@ -178,7 +181,7 @@ ONNX output.
 | `lightweight-charts` | 5.2.0 | Dense financial and predictive time series; TradingView attribution and NOTICE are mandatory |
 | `recharts` | 3.10.1 | Portfolio, risk, attribution, scenario, and analytical charts; measured route-level bundle gate |
 | `react-is` | 19.2.8 | Exact React 19.2.8 peer for Recharts |
-| Rust `tauri-plugin-dialog` | 2.7.2 | Rust-only controlled file selection; no JavaScript binding or WebView dialog/filesystem authority |
+| Rust `tauri-plugin-dialog` | 2.7.2 | Rust-only controlled file selection with the plugin's supported GTK3 Linux backend; no JavaScript binding or WebView dialog/filesystem authority |
 
 The frontend lock gate must inspect integrity, peer resolution, lifecycle scripts, exact licenses
 and notices, duplicate modules, and the clean production Vite bundle delta. Lightweight Charts'
@@ -246,7 +249,10 @@ Sources were checked on 2026-08-01.
   [Tokio releases](https://github.com/tokio-rs/tokio/releases), [Axum
   0.8.9](https://github.com/tokio-rs/axum/releases/tag/axum-v0.8.9), [Tower
   0.5.3](https://github.com/tower-rs/tower/releases/tag/tower-0.5.3), and [Tower HTTP
-  0.7.0](https://github.com/tower-rs/tower-http/releases/tag/tower-http-v0.7.0).
+  0.7.0](https://github.com/tower-rs/tower-http/releases/tag/tower-http-v0.7.0);
+  exact package documentation for [Reqwest 0.13.4](https://docs.rs/reqwest/0.13.4/reqwest/),
+  [Rusqlite 0.40.1](https://docs.rs/rusqlite/0.40.1/rusqlite/), and
+  [Process-wrap 9.1.0](https://docs.rs/process-wrap/9.1.0/process_wrap/).
 - MCP: [stable 2026-07-28 protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic),
   [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
   [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),
