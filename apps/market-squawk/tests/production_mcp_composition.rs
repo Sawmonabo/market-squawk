@@ -62,14 +62,14 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
         json!({
             "jsonrpc":"2.0","id":"shipping-init","method":"initialize",
             "params":{
-                "protocolVersion":"2025-11-25","capabilities":{},
+                "protocolVersion":"2026-07-28","capabilities":{},
                 "clientInfo":{"name":"market-squawk-tests","version":"1"}
             }
         }),
     )
     .await?;
     let initialized = read_message(&mut client_reader).await?;
-    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
     assert_eq!(initialized["result"]["serverInfo"]["name"], "market-squawk");
     write_message(
         &mut client_writer,

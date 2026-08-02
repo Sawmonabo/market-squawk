@@ -265,7 +265,7 @@ fn validate_local_application(payload: &Value) -> Result<()> {
     if payload
         .pointer("/local_application/mcp/protocol_version")
         .and_then(Value::as_str)
-        != Some("2025-11-25")
+        != Some("2026-07-28")
         || payload
             .pointer("/local_application/mcp/tool_count")
             .and_then(Value::as_u64)

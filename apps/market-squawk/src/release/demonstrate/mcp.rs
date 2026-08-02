@@ -46,7 +46,7 @@ pub(super) async fn run(product: &LocalProduct, expected_names: &[String]) -> Re
             "id": "release-init",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": "2026-07-28",
                 "capabilities": {},
                 "clientInfo": {"name": "market-squawk-release", "version": "1"}
             }
@@ -57,7 +57,7 @@ pub(super) async fn run(product: &LocalProduct, expected_names: &[String]) -> Re
     if initialized
         .pointer("/result/protocolVersion")
         .and_then(Value::as_str)
-        != Some("2025-11-25")
+        != Some("2026-07-28")
     {
         bail!("shipping MCP initialization returned an unexpected protocol version");
     }
@@ -132,7 +132,7 @@ pub(super) async fn run(product: &LocalProduct, expected_names: &[String]) -> Re
         bail!("shipping MCP durable audit was not written");
     }
     Ok(McpEvidence {
-        protocol_version: "2025-11-25".to_owned(),
+        protocol_version: "2026-07-28".to_owned(),
         tool_count: names.len(),
         tool_names_sha256: ordered_strings_sha256(&names)?,
         descriptor_parity,
