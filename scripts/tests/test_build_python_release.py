@@ -60,6 +60,8 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
         try:
             import packaging
         except ImportError:
+            packaging = None
+        if packaging is None or packaging.__version__ != "26.2":
             with self.assertRaises(builder.ReleaseBuildError):
                 builder._compatible(
                     "colorama-0.4.6-py2.py3-none-any.whl",
@@ -67,7 +69,6 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                     builder.platform_profile("x86_64-pc-windows-msvc"),
                 )
         else:
-            self.assertEqual(packaging.__version__, "26.2")
             self.assertTrue(
                 builder._compatible(
                     "colorama-0.4.6-py2.py3-none-any.whl",
@@ -88,6 +89,8 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
         try:
             import packaging
         except ImportError:
+            packaging = None
+        if packaging is None or packaging.__version__ != "26.2":
             with self.assertRaisesRegex(
                 builder.ReleaseBuildError, "packaging 26.2 is required"
             ):
@@ -97,8 +100,6 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                     mac_arm,
                 )
             return
-        self.assertEqual(packaging.__version__, "26.2")
-
         self.assertTrue(
             builder._compatible(
                 "onnx-1.22.0-cp312-abi3-macosx_12_0_universal2.whl",
