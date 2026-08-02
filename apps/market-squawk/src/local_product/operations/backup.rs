@@ -1,9 +1,9 @@
 //! Concrete installed-product backup materialization and lifecycle authority.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{Read as _, Write as _},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,7 @@ use market_squawk_data::{
     AnalyticalBackupLimits, AnalyticalBackupLocation, AnalyticalBackupService,
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_platform::{ArtifactRoot, ControlRoot, LocalPaths};
+use market_squawk_platform::{ControlRoot, LocalPaths};
 use market_squawk_runtime::InstallationId;
 use market_squawk_services::ServiceError;
 use serde::Serialize;
@@ -27,11 +27,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     application::{
         backup::{
-            BackupBundleRemover, BackupRetentionApproval, MaterializedProductComponents,
-            ProductBackupComponent, ProductBackupComponentKind, ProductBackupComponentWriter,
-            ProductBackupEncryptionEvidence, ProductBackupError, ProductBackupInventory,
-            ProductBackupManifest, ProductBackupOwnership, ProductBackupSensitivity,
-            ProductBackupService,
+            BackupBundleRemover, BackupRetentionApproval, ProductBackupError,
+            ProductBackupInventory, ProductBackupManifest, ProductBackupOwnership,
+            ProductBackupService, ProductBackupSnapshotAuthority,
         },
         lifecycle::WorkspaceRuntimeIdentity,
         operations::{ManagedBackupOperations, PreparedOperation},
@@ -45,70 +43,25 @@ use crate::{
 const REPOSITORY_DIRECTORY: &str = "product-backups";
 const REPOSITORY_LOCK_FILE: &str = ".owner.lock";
 const MANIFEST_FILE: &str = "manifest.json";
-const COMPONENT_DIRECTORY: &str = "product-components";
 const STAGING_PREFIX: &str = "stage-";
 const MAXIMUM_REPOSITORY_ENTRIES: usize = 256;
 const MAXIMUM_MANIFEST_BYTES: usize = 1024 * 1024;
-const MAXIMUM_COMPONENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAXIMUM_TOTAL_COMPONENT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PENDING_OPERATIONS: usize = 256;
 
-const REQUIRED_COMPONENT_KINDS: [ProductBackupComponentKind; 9] = [
-    ProductBackupComponentKind::Configuration,
-    ProductBackupComponentKind::ProviderMetadata,
-    ProductBackupComponentKind::SourceData,
-    ProductBackupComponentKind::Portfolios,
-    ProductBackupComponentKind::Transactions,
-    ProductBackupComponentKind::Models,
-    ProductBackupComponentKind::DecisionTargets,
-    ProductBackupComponentKind::JobsAndReceipts,
-    ProductBackupComponentKind::FairValueEvidence,
-];
-
-/// One exact immutable snapshot endpoint supplied by an existing product authority.
+/// Sealed composition binding for the authority that captures non-analytical product state.
 ///
-/// The source is retained as an open directory capability. The writer opens the named file
-/// without following links, requires private single-link regular-file state, and reads it twice.
-/// A source that changes identity, length, or digest across those reads is rejected instead of
-/// producing a torn component.
+/// The binding deliberately contains no path or pre-selected file. Its authority must issue all
+/// required components for the request's exact snapshot and revalidate their producer leases after
+/// materialization.
 pub struct ManagedBackupComponentSource {
-    kind: ProductBackupComponentKind,
-    root: Arc<Dir>,
-    reference: PathBuf,
-    maximum_bytes: u64,
-    sensitivity: ProductBackupSensitivity,
+    authority: Arc<dyn ProductBackupSnapshotAuthority>,
 }
 
 impl ManagedBackupComponentSource {
-    /// Binds one authority-produced immutable snapshot to one required product component.
-    ///
-    /// `SecretPayload` is deliberately rejected. The installed default writer can retain
-    /// protected state and one-way secret references, but it never copies secret values into its
-    /// unencrypted bundle. An encrypted secret-export authority must be designed and composed
-    /// separately before secret payloads can be admitted.
-    pub fn try_new(
-        kind: ProductBackupComponentKind,
-        root: Dir,
-        reference: impl Into<PathBuf>,
-        maximum_bytes: u64,
-        sensitivity: ProductBackupSensitivity,
-    ) -> Result<Self, ServiceError> {
-        let reference = reference.into();
-        if maximum_bytes == 0
-            || maximum_bytes > MAXIMUM_COMPONENT_BYTES
-            || sensitivity == ProductBackupSensitivity::SecretPayload
-            || !portable_relative_reference(&reference)
-        {
-            return Err(ServiceError::InvalidRequest);
-        }
-        Ok(Self {
-            kind,
-            root: Arc::new(root),
-            reference,
-            maximum_bytes,
-            sensitivity,
-        })
+    /// Retains the sole component-snapshot authority for installed backup composition.
+    #[must_use]
+    pub fn new(authority: Arc<dyn ProductBackupSnapshotAuthority>) -> Self {
+        Self { authority }
     }
 }
 
@@ -116,169 +69,9 @@ impl std::fmt::Debug for ManagedBackupComponentSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedBackupComponentSource")
-            .field("kind", &self.kind)
-            .field("root", &"[RETAINED DIRECTORY CAPABILITY]")
-            .field("reference", &"[CAPABILITY-RELATIVE SNAPSHOT]")
-            .field("maximum_bytes", &self.maximum_bytes)
-            .field("sensitivity", &self.sensitivity)
+            .field("authority", &"[SEALED PRODUCT SNAPSHOT AUTHORITY]")
             .finish()
     }
-}
-
-/// Concrete writer for the closed set of non-analytical product backup components.
-pub struct ManagedProductBackupComponentWriter {
-    sources: Box<[ManagedBackupComponentSource]>,
-}
-
-impl ManagedProductBackupComponentWriter {
-    /// Admits exactly one source for every required component and a checked aggregate byte bound.
-    pub fn try_new(mut sources: Vec<ManagedBackupComponentSource>) -> Result<Self, ServiceError> {
-        sources.sort_by_key(|source| source.kind);
-        let kinds = sources
-            .iter()
-            .map(|source| source.kind)
-            .collect::<BTreeSet<_>>();
-        let total = sources.iter().try_fold(0_u64, |total, source| {
-            total.checked_add(source.maximum_bytes)
-        });
-        if sources.len() != REQUIRED_COMPONENT_KINDS.len()
-            || kinds.len() != sources.len()
-            || REQUIRED_COMPONENT_KINDS
-                .into_iter()
-                .any(|required| !kinds.contains(&required))
-            || total.is_none_or(|total| total > MAXIMUM_TOTAL_COMPONENT_BYTES)
-        {
-            return Err(ServiceError::InvalidRequest);
-        }
-        Ok(Self {
-            sources: sources.into_boxed_slice(),
-        })
-    }
-}
-
-impl std::fmt::Debug for ManagedProductBackupComponentWriter {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ManagedProductBackupComponentWriter")
-            .field("components", &self.sources.len())
-            .field("sources", &"[EXACT AUTHORITY SNAPSHOTS]")
-            .finish()
-    }
-}
-
-#[async_trait]
-impl ProductBackupComponentWriter for ManagedProductBackupComponentWriter {
-    async fn materialize(
-        &self,
-        root: &ArtifactRoot,
-        _cutoff: Timestamp,
-        cancellation: &CancellationToken,
-    ) -> Result<MaterializedProductComponents, ProductBackupError> {
-        let destination = root
-            .try_clone_directory()
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        destination
-            .create_dir_all(COMPONENT_DIRECTORY)
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        let mut components = Vec::new();
-        components
-            .try_reserve_exact(self.sources.len())
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        for source in &self.sources {
-            if cancellation.is_cancelled() {
-                return Err(ProductBackupError::Cancelled);
-            }
-            let target_reference = component_reference(source.kind);
-            root.resolve(target_reference)
-                .map_err(|_| ProductBackupError::InvalidComponent)?;
-            components.push(materialize_component(
-                source,
-                &destination,
-                Path::new(target_reference),
-                cancellation,
-            )?);
-        }
-        synchronize_directory(&destination, Path::new(COMPONENT_DIRECTORY))
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        synchronize_directory(&destination, Path::new("."))
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        MaterializedProductComponents::try_new(
-            components,
-            ProductBackupEncryptionEvidence::UnencryptedNoSecretPayload,
-        )
-    }
-}
-
-fn materialize_component(
-    source: &ManagedBackupComponentSource,
-    destination: &Dir,
-    target: &Path,
-    cancellation: &CancellationToken,
-) -> Result<ProductBackupComponent, ProductBackupError> {
-    let (mut input, initial) = open_private_source(source)?;
-    let mut output_options = OpenOptions::new();
-    output_options.write(true).create_new(true);
-    output_options.follow(FollowSymlinks::No);
-    configure_private_creation(&mut output_options);
-    let mut output = destination
-        .open_with(target, &output_options)
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    let mut digest = Sha256::new();
-    let mut observed = 0_u64;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(ProductBackupError::Cancelled);
-        }
-        let read = input
-            .read(&mut buffer)
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        if read == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(u64::try_from(read).map_err(|_| ProductBackupError::ArtifactMismatch)?)
-            .ok_or(ProductBackupError::ArtifactMismatch)?;
-        if observed > source.maximum_bytes || observed > initial.length {
-            return Err(ProductBackupError::ArtifactMismatch);
-        }
-        digest.update(&buffer[..read]);
-        output
-            .write_all(&buffer[..read])
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    }
-    if observed != initial.length {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    output
-        .sync_all()
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    drop(output);
-    let copied_sha256 = if observed == 0 {
-        [0; 32]
-    } else {
-        digest.finalize().into()
-    };
-    let second = digest_private_source(source, cancellation)?;
-    if second.identity != initial.identity
-        || second.length != initial.length
-        || second.sha256 != copied_sha256
-    {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    let output_metadata = destination
-        .symlink_metadata(target)
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    validate_private_regular(&output_metadata, observed, source.maximum_bytes)?;
-    ProductBackupComponent::try_new(
-        source.kind,
-        target
-            .to_str()
-            .ok_or(ProductBackupError::InvalidComponent)?,
-        observed,
-        copied_sha256,
-        source.sensitivity,
-    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,132 +87,6 @@ impl FileIdentity {
             inode: metadata.ino(),
         }
     }
-}
-
-struct SourceObservation {
-    identity: FileIdentity,
-    length: u64,
-    sha256: [u8; 32],
-}
-
-fn open_private_source(
-    source: &ManagedBackupComponentSource,
-) -> Result<(cap_std::fs::File, SourceObservation), ProductBackupError> {
-    let (parent, name) = open_parent_nofollow(&source.root, &source.reference)?;
-    let named = parent
-        .symlink_metadata(name)
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    validate_private_regular(&named, named.len(), source.maximum_bytes)?;
-    let identity = FileIdentity::from_metadata(&named);
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    configure_nonblocking_read(&mut options);
-    let file = parent
-        .open_with(name, &options)
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    let opened = file
-        .metadata()
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    validate_private_regular(&opened, named.len(), source.maximum_bytes)?;
-    if FileIdentity::from_metadata(&opened) != identity {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    Ok((
-        file,
-        SourceObservation {
-            identity,
-            length: named.len(),
-            sha256: [0; 32],
-        },
-    ))
-}
-
-fn digest_private_source(
-    source: &ManagedBackupComponentSource,
-    cancellation: &CancellationToken,
-) -> Result<SourceObservation, ProductBackupError> {
-    let (mut file, mut observation) = open_private_source(source)?;
-    let mut digest = Sha256::new();
-    let mut observed = 0_u64;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(ProductBackupError::Cancelled);
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        if read == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(u64::try_from(read).map_err(|_| ProductBackupError::ArtifactMismatch)?)
-            .ok_or(ProductBackupError::ArtifactMismatch)?;
-        if observed > observation.length || observed > source.maximum_bytes {
-            return Err(ProductBackupError::ArtifactMismatch);
-        }
-        digest.update(&buffer[..read]);
-    }
-    if observed != observation.length {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    observation.sha256 = if observed == 0 {
-        [0; 32]
-    } else {
-        digest.finalize().into()
-    };
-    let (parent, name) = open_parent_nofollow(&source.root, &source.reference)?;
-    let named_after = parent
-        .symlink_metadata(name)
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    validate_private_regular(&named_after, observation.length, source.maximum_bytes)?;
-    if FileIdentity::from_metadata(&named_after) != observation.identity {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    Ok(observation)
-}
-
-fn open_parent_nofollow<'path>(
-    root: &Dir,
-    reference: &'path Path,
-) -> Result<(Dir, &'path Path), ProductBackupError> {
-    if !portable_relative_reference(reference) {
-        return Err(ProductBackupError::InvalidComponent);
-    }
-    let name = reference
-        .file_name()
-        .map(Path::new)
-        .ok_or(ProductBackupError::InvalidComponent)?;
-    let mut directory = root
-        .try_clone()
-        .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-    if let Some(parent) = reference.parent() {
-        for component in parent.components() {
-            let Component::Normal(component) = component else {
-                return Err(ProductBackupError::InvalidComponent);
-            };
-            directory = directory
-                .open_dir_nofollow(component)
-                .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
-        }
-    }
-    Ok((directory, name))
-}
-
-fn validate_private_regular(
-    metadata: &Metadata,
-    expected_length: u64,
-    maximum_length: u64,
-) -> Result<(), ProductBackupError> {
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.len() != expected_length
-        || metadata.len() > maximum_length
-        || !private_permissions(metadata)
-    {
-        return Err(ProductBackupError::ArtifactMismatch);
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -744,7 +411,7 @@ pub struct InstalledManagedBackupOperations {
 
 impl InstalledManagedBackupOperations {
     /// Constructs the complete installed backup authority from existing analytical, inventory,
-    /// control-root, installation, and exact component-source authorities.
+    /// control-root, installation, and coherent component-snapshot authority.
     #[allow(
         clippy::too_many_arguments,
         reason = "every backup authority and resource ceiling remains explicit at composition"
@@ -754,20 +421,17 @@ impl InstalledManagedBackupOperations {
         inventory: Arc<ProductBackupInventory>,
         control_root: &ControlRoot,
         installation_id: InstallationId,
-        component_sources: Vec<ManagedBackupComponentSource>,
+        component_source: ManagedBackupComponentSource,
         limits: AnalyticalBackupLimits,
         maximum_pending: usize,
     ) -> Result<Self, ServiceError> {
-        if maximum_pending == 0
-            || maximum_pending > MAXIMUM_PENDING_OPERATIONS
-            || component_sources.len() != REQUIRED_COMPONENT_KINDS.len()
-        {
+        if maximum_pending == 0 || maximum_pending > MAXIMUM_PENDING_OPERATIONS {
             return Err(ServiceError::InvalidRequest);
         }
-        let components = Arc::new(ManagedProductBackupComponentWriter::try_new(
-            component_sources,
-        )?);
-        let service = Arc::new(ProductBackupService::new(analytical, components));
+        let service = Arc::new(ProductBackupService::new(
+            analytical,
+            component_source.authority,
+        ));
         let repository = Arc::new(ManagedBackupRepository::try_open(control_root)?);
         Ok(Self {
             installation_id,
@@ -1275,6 +939,8 @@ fn map_backup_service_error(error: ProductBackupError) -> ServiceError {
         ProductBackupError::BackupNotFound => ServiceError::NotFound,
         ProductBackupError::InventoryCapacity => ServiceError::ResourceExhausted,
         ProductBackupError::InvalidComponent
+        | ProductBackupError::InvalidSnapshot
+        | ProductBackupError::InvalidComponentSchema
         | ProductBackupError::IncompleteComponents
         | ProductBackupError::UnencryptedSecretPayload
         | ProductBackupError::InvalidEncryptionEvidence
@@ -1286,6 +952,7 @@ fn map_backup_service_error(error: ProductBackupError) -> ServiceError {
         | ProductBackupError::RetentionEmpty
         | ProductBackupError::StaleRetentionApproval => ServiceError::InvalidRequest,
         ProductBackupError::Encoding
+        | ProductBackupError::SnapshotMismatch
         | ProductBackupError::ArtifactUnavailable
         | ProductBackupError::ArtifactMismatch
         | ProductBackupError::Analytical(_)
@@ -1321,61 +988,6 @@ fn action_name(action: BackupJobAction) -> &'static str {
         BackupJobAction::Verify => "verify",
         BackupJobAction::EnforceRetention => "retention",
     }
-}
-
-fn component_reference(kind: ProductBackupComponentKind) -> &'static str {
-    match kind {
-        ProductBackupComponentKind::Configuration => "product-components/configuration.bin",
-        ProductBackupComponentKind::ProviderMetadata => "product-components/provider-metadata.bin",
-        ProductBackupComponentKind::SourceData => "product-components/source-data.bin",
-        ProductBackupComponentKind::Portfolios => "product-components/portfolios.bin",
-        ProductBackupComponentKind::Transactions => "product-components/transactions.bin",
-        ProductBackupComponentKind::Models => "product-components/models.bin",
-        ProductBackupComponentKind::DecisionTargets => "product-components/decision-targets.bin",
-        ProductBackupComponentKind::JobsAndReceipts => "product-components/jobs-and-receipts.bin",
-        ProductBackupComponentKind::FairValueEvidence => {
-            "product-components/fair-value-evidence.bin"
-        }
-    }
-}
-
-fn portable_relative_reference(path: &Path) -> bool {
-    if path.is_absolute() {
-        return false;
-    }
-    let Some(portable) = path.to_str() else {
-        return false;
-    };
-    if portable.is_empty() || portable.contains('\\') {
-        return false;
-    }
-    let mut platform = path.components();
-    let mut depth = 0_usize;
-    for component in portable.split('/') {
-        depth = depth.saturating_add(1);
-        let mut characters = component.chars();
-        let Some(first) = characters.next() else {
-            return false;
-        };
-        if depth > 32
-            || component.len() > 255
-            || !(first.is_ascii_lowercase() || first.is_ascii_digit())
-            || !characters.all(|character| {
-                character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || matches!(character, '-' | '_' | '.')
-            })
-            || component.ends_with('.')
-            || matches!(component, "." | "..")
-            || !matches!(
-                platform.next(),
-                Some(Component::Normal(observed)) if observed.to_str() == Some(component)
-            )
-        {
-            return false;
-        }
-    }
-    platform.next().is_none()
 }
 
 fn parse_backup_directory_name(name: &str) -> Option<[u8; 32]> {

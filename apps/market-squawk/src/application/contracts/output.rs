@@ -501,7 +501,44 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "pendingDeletions",
             ],
         ),
-        "Operations.GetBackup" | "Operations.GetUpdateStatus" => record(),
+        "Operations.GetBackup" => closed(
+            vec![
+                ("formatVersion", unsigned()),
+                ("backupId", text()),
+                ("snapshot", record()),
+                ("ownership", record()),
+                ("analyticalReceipt", record()),
+                ("components", bounded_array(record(), 9)),
+                ("encryption", one_of(vec![text(), record()])),
+                ("manifestSha256", text()),
+            ],
+            &[
+                "formatVersion",
+                "backupId",
+                "snapshot",
+                "ownership",
+                "analyticalReceipt",
+                "components",
+                "encryption",
+                "manifestSha256",
+            ],
+        ),
+        "Operations.GetUpdateStatus" => closed(
+            vec![
+                ("currentGeneration", unsigned()),
+                ("knownGoodVersion", text()),
+                ("stagedCandidate", nullable(record())),
+                ("lastCheckedAt", nullable(integer())),
+                ("recoveryRequired", boolean()),
+            ],
+            &[
+                "currentGeneration",
+                "knownGoodVersion",
+                "stagedCandidate",
+                "lastCheckedAt",
+                "recoveryRequired",
+            ],
+        ),
         "Operations.StartBackup"
         | "Operations.StartBackupVerification"
         | "Operations.StartBackupRetention"

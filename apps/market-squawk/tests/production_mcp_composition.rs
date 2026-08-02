@@ -9,7 +9,10 @@ use market_squawk::{
     LocalProduct,
     application::application_capabilities,
     mcp::LocalMcpComposition,
-    service::{InstalledService, InstalledServiceConnector, InstalledServiceError},
+    service::{
+        InstalledService, InstalledServiceConnector, InstalledServiceError,
+        InstalledServiceRunOutcome,
+    },
 };
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service_capabilities};
 use market_squawk_platform::{
@@ -110,7 +113,7 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
 
     cli.probe_ready(CancellationToken::new()).await?;
     shutdown.cancel();
-    service_task.await??;
+    assert_eq!(service_task.await??, InstalledServiceRunOutcome::Stopped);
     assert!(connector.connect(NamedClient::Cli, None).is_err());
     Ok(())
 }

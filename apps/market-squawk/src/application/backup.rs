@@ -15,7 +15,7 @@ use market_squawk_data::{
     AnalyticalBackupLocation, AnalyticalBackupService, AnalyticalDataService,
     AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
 };
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{SchemaVersion, SourceIdentifier, Timestamp};
 use market_squawk_platform::ArtifactRoot;
 use market_squawk_runtime::{InstallationId, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -28,11 +28,14 @@ use super::workspace::WorkspaceDescriptor;
 const FORMAT_VERSION: u16 = 1;
 const MAXIMUM_COMPONENTS: usize = 32;
 const MAXIMUM_REFERENCE_BYTES: usize = 256;
+const MAXIMUM_COMPONENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAXIMUM_TOTAL_COMPONENT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const VERIFICATION_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Materialized non-analytical product state returned by the closed component writer set.
+/// Materialized non-analytical state returned by one retained product-snapshot lease.
 #[derive(Debug)]
 pub struct MaterializedProductComponents {
+    snapshot: ProductBackupSnapshot,
     components: Vec<ProductBackupComponent>,
     encryption: ProductBackupEncryptionEvidence,
 }
@@ -40,33 +43,74 @@ pub struct MaterializedProductComponents {
 impl MaterializedProductComponents {
     /// Admits a complete component set before any product manifest can be issued.
     pub fn try_new(
+        snapshot: ProductBackupSnapshot,
         components: Vec<ProductBackupComponent>,
         encryption: ProductBackupEncryptionEvidence,
     ) -> Result<Self, ProductBackupError> {
-        validate_components(&components, &encryption)?;
+        validate_components(snapshot, &components, &encryption)?;
         Ok(Self {
+            snapshot,
             components,
             encryption,
         })
     }
+
+    /// Returns the exact common snapshot bound by every materialized component.
+    #[must_use]
+    pub const fn snapshot(&self) -> ProductBackupSnapshot {
+        self.snapshot
+    }
+
+    /// Returns the authority-issued component evidence for post-write revalidation.
+    #[must_use]
+    pub fn components(&self) -> &[ProductBackupComponent] {
+        &self.components
+    }
 }
 
-/// Application composition boundary that materializes all non-analytical product authorities.
+/// Retained fixed-cutoff lease over every non-analytical product authority.
 #[async_trait]
-pub trait ProductBackupComponentWriter: std::fmt::Debug + Send + Sync {
-    /// Writes exact component artifacts below the retained bundle root and returns their evidence.
+pub trait ProductBackupSnapshotLease: std::fmt::Debug + Send {
+    /// Writes one exact authority-issued snapshot below the retained bundle root.
     async fn materialize(
-        &self,
+        &mut self,
         root: &ArtifactRoot,
-        cutoff: Timestamp,
+        snapshot: ProductBackupSnapshot,
         cancellation: &CancellationToken,
     ) -> Result<MaterializedProductComponents, ProductBackupError>;
+
+    /// Revalidates every producer lease after writes have been durably materialized.
+    ///
+    /// This must fail when a producer's source generation, schema, digest, or common snapshot
+    /// binding changed during materialization. The product service independently rehashes the
+    /// controlled output before and after this call.
+    async fn revalidate(
+        &mut self,
+        root: &ArtifactRoot,
+        snapshot: ProductBackupSnapshot,
+        components: &[ProductBackupComponent],
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProductBackupError>;
+}
+
+/// Application composition boundary that retains every non-analytical product authority.
+#[async_trait]
+pub trait ProductBackupSnapshotAuthority: std::fmt::Debug + Send + Sync {
+    /// Acquires all producer snapshot leases in fixed order before analytical capture begins.
+    ///
+    /// The returned lease must keep source generations stable or retain exact as-of exports until
+    /// post-write revalidation completes. Dropping it abandons the snapshot without publication.
+    async fn retain(
+        &self,
+        cutoff: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn ProductBackupSnapshotLease>, ProductBackupError>;
 }
 
 /// Sealed product backup service over the existing exact analytical backup authority.
 pub struct ProductBackupService {
     analytical: std::sync::Arc<AnalyticalBackupService>,
-    components: std::sync::Arc<dyn ProductBackupComponentWriter>,
+    components: std::sync::Arc<dyn ProductBackupSnapshotAuthority>,
 }
 
 impl ProductBackupService {
@@ -74,7 +118,7 @@ impl ProductBackupService {
     #[must_use]
     pub fn new(
         analytical: std::sync::Arc<AnalyticalBackupService>,
-        components: std::sync::Arc<dyn ProductBackupComponentWriter>,
+        components: std::sync::Arc<dyn ProductBackupSnapshotAuthority>,
     ) -> Self {
         Self {
             analytical,
@@ -92,21 +136,34 @@ impl ProductBackupService {
         cancellation: &CancellationToken,
     ) -> Result<VerifiedProductBackup, ProductBackupError> {
         let product_root = destination.artifacts().clone();
+        let mut retained = self.components.retain(cutoff, cancellation).await?;
         let analytical = self
             .analytical
             .create(destination, cutoff, limits, cancellation)
             .await?;
-        let materialized = self
-            .components
-            .materialize(&product_root, cutoff, cancellation)
+        let snapshot = ProductBackupSnapshot::from_analytical(cutoff, analytical.receipt())?;
+        let materialized = retained
+            .materialize(&product_root, snapshot, cancellation)
             .await?;
+        if materialized.snapshot() != snapshot {
+            return Err(ProductBackupError::SnapshotMismatch);
+        }
         let manifest = ProductBackupManifest::try_new(
-            cutoff,
+            snapshot,
             ownership,
             analytical.receipt(),
-            materialized.components,
-            materialized.encryption,
+            materialized.components.clone(),
+            materialized.encryption.clone(),
         )?;
+        manifest.verify_component_artifacts(&product_root, cancellation)?;
+        retained
+            .revalidate(
+                &product_root,
+                snapshot,
+                materialized.components(),
+                cancellation,
+            )
+            .await?;
         manifest.verify_component_artifacts(&product_root, cancellation)?;
         Ok(VerifiedProductBackup {
             analytical,
@@ -197,6 +254,95 @@ impl ProductBackupComponentKind {
     ];
 }
 
+/// Exact common product snapshot shared by analytical and non-analytical authorities.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProductBackupSnapshot {
+    cutoff: Timestamp,
+    snapshot_id: [u8; 32],
+}
+
+impl ProductBackupSnapshot {
+    /// Admits a nonzero content-derived snapshot identity at one exact cutoff.
+    pub fn try_new(cutoff: Timestamp, snapshot_id: [u8; 32]) -> Result<Self, ProductBackupError> {
+        if snapshot_id == [0; 32] {
+            return Err(ProductBackupError::InvalidSnapshot);
+        }
+        Ok(Self {
+            cutoff,
+            snapshot_id,
+        })
+    }
+
+    fn verify(self) -> Result<(), ProductBackupError> {
+        Self::try_new(self.cutoff, self.snapshot_id).map(|_| ())
+    }
+
+    fn from_analytical(
+        cutoff: Timestamp,
+        receipt: AnalyticalBackupBundleReceipt,
+    ) -> Result<Self, ProductBackupError> {
+        require_analytical_cutoff(cutoff, receipt)?;
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk-product-snapshot-v1");
+        digest.update(cutoff.unix_nanos().to_be_bytes());
+        digest.update(receipt.bundle_sha256());
+        Self::try_new(cutoff, digest.finalize().into())
+    }
+
+    /// Returns the exact point-in-time cutoff all producers must observe.
+    #[must_use]
+    pub const fn cutoff(self) -> Timestamp {
+        self.cutoff
+    }
+
+    /// Returns the content-derived identity shared by every producer lease.
+    #[must_use]
+    pub const fn snapshot_id(self) -> [u8; 32] {
+        self.snapshot_id
+    }
+}
+
+/// Versioned schema identity declared by one component producer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProductBackupComponentSchema {
+    identity: SourceIdentifier,
+    version: SchemaVersion,
+}
+
+impl ProductBackupComponentSchema {
+    /// Admits a currently readable schema identity and version.
+    pub fn try_new(
+        identity: SourceIdentifier,
+        version: SchemaVersion,
+    ) -> Result<Self, ProductBackupError> {
+        version
+            .ensure_supported()
+            .map_err(|_| ProductBackupError::InvalidComponentSchema)?;
+        Ok(Self { identity, version })
+    }
+
+    fn verify(&self) -> Result<(), ProductBackupError> {
+        self.version
+            .ensure_supported()
+            .map(|_| ())
+            .map_err(|_| ProductBackupError::InvalidComponentSchema)
+    }
+
+    /// Returns the producer-owned schema identity.
+    #[must_use]
+    pub const fn identity(&self) -> &SourceIdentifier {
+        &self.identity
+    }
+
+    /// Returns the admitted schema version.
+    #[must_use]
+    pub const fn version(&self) -> SchemaVersion {
+        self.version
+    }
+}
+
 /// Whether a materialized component contains protected bytes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,7 +356,10 @@ pub enum ProductBackupSensitivity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProductBackupComponent {
+    snapshot: ProductBackupSnapshot,
     kind: ProductBackupComponentKind,
+    producer: SourceIdentifier,
+    schema: ProductBackupComponentSchema,
     artifact_reference: String,
     byte_length: u64,
     sha256: [u8; 32],
@@ -220,30 +369,81 @@ pub struct ProductBackupComponent {
 impl ProductBackupComponent {
     /// Binds a controlled artifact reference to exact length, digest, and sensitivity evidence.
     pub fn try_new(
+        snapshot: ProductBackupSnapshot,
         kind: ProductBackupComponentKind,
+        producer: SourceIdentifier,
+        schema: ProductBackupComponentSchema,
         artifact_reference: impl Into<String>,
         byte_length: u64,
         sha256: [u8; 32],
         sensitivity: ProductBackupSensitivity,
     ) -> Result<Self, ProductBackupError> {
         let artifact_reference = artifact_reference.into();
-        if artifact_reference.is_empty()
-            || artifact_reference.len() > MAXIMUM_REFERENCE_BYTES
-            || artifact_reference.starts_with('/')
-            || artifact_reference.contains("..")
-            || artifact_reference.contains('\\')
-            || artifact_reference.chars().any(char::is_control)
-            || (byte_length == 0) != (sha256 == [0; 32])
+        schema.verify()?;
+        if !controlled_component_reference(&artifact_reference)
+            || byte_length > MAXIMUM_COMPONENT_BYTES
+            || sha256 == [0; 32]
         {
             return Err(ProductBackupError::InvalidComponent);
         }
         Ok(Self {
+            snapshot,
             kind,
+            producer,
+            schema,
             artifact_reference,
             byte_length,
             sha256,
             sensitivity,
         })
+    }
+
+    /// Returns the common snapshot this producer certified.
+    #[must_use]
+    pub const fn snapshot(&self) -> ProductBackupSnapshot {
+        self.snapshot
+    }
+
+    /// Returns the closed product-state component kind.
+    #[must_use]
+    pub const fn kind(&self) -> ProductBackupComponentKind {
+        self.kind
+    }
+
+    /// Returns the authority identity that issued this component.
+    #[must_use]
+    pub const fn producer(&self) -> &SourceIdentifier {
+        &self.producer
+    }
+
+    /// Returns the producer-owned schema declaration.
+    #[must_use]
+    pub const fn schema(&self) -> &ProductBackupComponentSchema {
+        &self.schema
+    }
+
+    /// Returns the controlled bundle-relative reference; never an ambient path.
+    #[must_use]
+    pub fn artifact_reference(&self) -> &str {
+        &self.artifact_reference
+    }
+
+    /// Returns the exact admitted artifact byte length.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    /// Returns the exact SHA-256 digest of the materialized artifact.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    /// Returns the producer-declared sensitivity class.
+    #[must_use]
+    pub const fn sensitivity(&self) -> ProductBackupSensitivity {
+        self.sensitivity
     }
 }
 
@@ -283,6 +483,12 @@ impl ProductBackupOwnership {
     pub const fn workspace_id(self) -> WorkspaceId {
         self.workspace_id
     }
+
+    /// Returns the installation that issued the backup.
+    #[must_use]
+    pub const fn installation_id(self) -> InstallationId {
+        self.installation_id
+    }
 }
 
 /// Versioned manifest that binds all product-state contributions to an analytical receipt.
@@ -291,7 +497,7 @@ impl ProductBackupOwnership {
 pub struct ProductBackupManifest {
     format_version: u16,
     backup_id: [u8; 32],
-    created_at: Timestamp,
+    snapshot: ProductBackupSnapshot,
     ownership: ProductBackupOwnership,
     analytical_receipt: AnalyticalBackupBundleReceipt,
     components: Vec<ProductBackupComponent>,
@@ -302,17 +508,22 @@ pub struct ProductBackupManifest {
 impl ProductBackupManifest {
     /// Admits one complete, exact product manifest after all component authorities materialize.
     pub fn try_new(
-        created_at: Timestamp,
+        snapshot: ProductBackupSnapshot,
         ownership: ProductBackupOwnership,
         analytical_receipt: AnalyticalBackupBundleReceipt,
         mut components: Vec<ProductBackupComponent>,
         encryption: ProductBackupEncryptionEvidence,
     ) -> Result<Self, ProductBackupError> {
+        if ProductBackupSnapshot::from_analytical(snapshot.cutoff(), analytical_receipt)?
+            != snapshot
+        {
+            return Err(ProductBackupError::SnapshotMismatch);
+        }
         components.sort_by_key(|component| component.kind);
-        validate_components(&components, &encryption)?;
+        validate_components(snapshot, &components, &encryption)?;
         let manifest_sha256 = manifest_digest(
             FORMAT_VERSION,
-            created_at,
+            snapshot,
             ownership,
             analytical_receipt,
             &components,
@@ -329,7 +540,7 @@ impl ProductBackupManifest {
         Ok(Self {
             format_version: FORMAT_VERSION,
             backup_id,
-            created_at,
+            snapshot,
             ownership,
             analytical_receipt,
             components,
@@ -343,10 +554,15 @@ impl ProductBackupManifest {
         if self.format_version != FORMAT_VERSION {
             return Err(ProductBackupError::UnsupportedVersion);
         }
-        validate_components(&self.components, &self.encryption)?;
+        if ProductBackupSnapshot::from_analytical(self.snapshot.cutoff(), self.analytical_receipt)?
+            != self.snapshot
+        {
+            return Err(ProductBackupError::SnapshotMismatch);
+        }
+        validate_components(self.snapshot, &self.components, &self.encryption)?;
         let expected = manifest_digest(
             self.format_version,
-            self.created_at,
+            self.snapshot,
             self.ownership,
             self.analytical_receipt,
             &self.components,
@@ -375,9 +591,14 @@ impl ProductBackupManifest {
     /// Returns when the source authorities captured this backup.
     #[must_use]
     pub const fn created_at(&self) -> Timestamp {
-        self.created_at
+        self.snapshot.cutoff()
     }
 
+    /// Returns the common analytical and non-analytical snapshot identity.
+    #[must_use]
+    pub const fn snapshot(&self) -> ProductBackupSnapshot {
+        self.snapshot
+    }
     /// Returns the exact analytical bundle receipt required for verification and restore.
     #[must_use]
     pub const fn analytical_receipt(&self) -> AnalyticalBackupBundleReceipt {
@@ -388,6 +609,18 @@ impl ProductBackupManifest {
     #[must_use]
     pub const fn ownership(&self) -> ProductBackupOwnership {
         self.ownership
+    }
+
+    /// Returns the complete ordered producer evidence required for staged restore.
+    #[must_use]
+    pub fn components(&self) -> &[ProductBackupComponent] {
+        &self.components
+    }
+
+    /// Returns the bundle-level encryption evidence covering protected component bytes.
+    #[must_use]
+    pub const fn encryption(&self) -> &ProductBackupEncryptionEvidence {
+        &self.encryption
     }
 
     /// Revalidates every product component through the retained bundle-root capability.
@@ -610,9 +843,11 @@ impl VerifiedProductBackup {
 }
 
 fn validate_components(
+    snapshot: ProductBackupSnapshot,
     components: &[ProductBackupComponent],
     encryption: &ProductBackupEncryptionEvidence,
 ) -> Result<(), ProductBackupError> {
+    snapshot.verify()?;
     if components.len() != ProductBackupComponentKind::REQUIRED.len()
         || components.len() > MAXIMUM_COMPONENTS
     {
@@ -628,6 +863,33 @@ fn validate_components(
             .any(|required| !kinds.contains(&required))
     {
         return Err(ProductBackupError::IncompleteComponents);
+    }
+    let references = components
+        .iter()
+        .map(|component| component.artifact_reference.as_str())
+        .collect::<BTreeSet<_>>();
+    let total_bytes = components.iter().try_fold(0_u64, |total, component| {
+        total.checked_add(component.byte_length)
+    });
+    if references.len() != components.len()
+        || total_bytes.is_none_or(|total| total > MAXIMUM_TOTAL_COMPONENT_BYTES)
+    {
+        return Err(ProductBackupError::InvalidComponent);
+    }
+    if components
+        .iter()
+        .any(|component| component.snapshot != snapshot)
+    {
+        return Err(ProductBackupError::SnapshotMismatch);
+    }
+    for component in components {
+        component.schema.verify()?;
+        if !controlled_component_reference(&component.artifact_reference)
+            || component.byte_length > MAXIMUM_COMPONENT_BYTES
+            || component.sha256 == [0; 32]
+        {
+            return Err(ProductBackupError::InvalidComponent);
+        }
     }
     if matches!(
         encryption,
@@ -652,9 +914,53 @@ fn validate_components(
     Ok(())
 }
 
+fn require_analytical_cutoff(
+    cutoff: Timestamp,
+    receipt: AnalyticalBackupBundleReceipt,
+) -> Result<(), ProductBackupError> {
+    if receipt.cutoff() != cutoff {
+        Err(ProductBackupError::SnapshotMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+fn controlled_component_reference(reference: &str) -> bool {
+    if reference.is_empty()
+        || reference.len() > MAXIMUM_REFERENCE_BYTES
+        || reference.contains('\\')
+        || reference.chars().any(char::is_control)
+        || !reference.starts_with("product-components/")
+    {
+        return false;
+    }
+    let mut depth = 0_usize;
+    for component in reference.split('/') {
+        depth = depth.saturating_add(1);
+        let mut characters = component.chars();
+        let Some(first) = characters.next() else {
+            return false;
+        };
+        if depth > 16
+            || component.len() > 128
+            || !(first.is_ascii_lowercase() || first.is_ascii_digit())
+            || !characters.all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_' | '.')
+            })
+            || component.ends_with('.')
+            || matches!(component, "." | "..")
+        {
+            return false;
+        }
+    }
+    depth >= 2
+}
+
 fn manifest_digest(
     format_version: u16,
-    created_at: Timestamp,
+    snapshot: ProductBackupSnapshot,
     ownership: ProductBackupOwnership,
     analytical_receipt: AnalyticalBackupBundleReceipt,
     components: &[ProductBackupComponent],
@@ -663,7 +969,7 @@ fn manifest_digest(
     serde_json::to_vec(&(
         "market-squawk-product-backup-manifest-v1",
         format_version,
-        created_at,
+        snapshot,
         ownership,
         analytical_receipt,
         components,
@@ -676,6 +982,12 @@ fn manifest_digest(
 /// Typed product-manifest admission failure.
 #[derive(Debug, Error)]
 pub enum ProductBackupError {
+    #[error("product backup snapshot identity is invalid")]
+    InvalidSnapshot,
+    #[error("product backup components do not share the exact requested snapshot")]
+    SnapshotMismatch,
+    #[error("product backup component schema is invalid or unsupported")]
+    InvalidComponentSchema,
     #[error("product backup component is invalid")]
     InvalidComponent,
     #[error("product backup component set is incomplete or duplicated")]
@@ -731,15 +1043,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unencrypted_manifest_rejects_secret_payload_component()
+    fn materialized_components_reject_mixed_snapshot_cutoffs()
     -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = ProductBackupSnapshot::try_new(Timestamp::from_unix_nanos(10), [1; 32])?;
+        let other_snapshot =
+            ProductBackupSnapshot::try_new(Timestamp::from_unix_nanos(11), [2; 32])?;
+        let schema = ProductBackupComponentSchema::try_new(
+            market_squawk_domain::SourceIdentifier::try_from("market-squawk.test-backup")?,
+            market_squawk_domain::SchemaVersion::CURRENT,
+        )?;
         let components = ProductBackupComponentKind::REQUIRED
             .into_iter()
             .enumerate()
             .map(|(index, kind)| {
                 ProductBackupComponent::try_new(
+                    if index == 1 { other_snapshot } else { snapshot },
                     kind,
-                    format!("components/{index}.json"),
+                    market_squawk_domain::SourceIdentifier::try_from(format!(
+                        "test-producer-{index}"
+                    ))?,
+                    schema.clone(),
+                    format!("product-components/component-{index}.json"),
+                    1,
+                    [u8::try_from(index + 1)?; 32],
+                    ProductBackupSensitivity::NonSecret,
+                )
+                .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+        assert!(matches!(
+            MaterializedProductComponents::try_new(
+                snapshot,
+                components,
+                ProductBackupEncryptionEvidence::UnencryptedNoSecretPayload,
+            ),
+            Err(ProductBackupError::SnapshotMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unencrypted_manifest_rejects_secret_payload_component()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = ProductBackupSnapshot::try_new(Timestamp::from_unix_nanos(10), [1; 32])?;
+        let schema = ProductBackupComponentSchema::try_new(
+            SourceIdentifier::try_from("market-squawk.test-backup")?,
+            SchemaVersion::CURRENT,
+        )?;
+        let components = ProductBackupComponentKind::REQUIRED
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                ProductBackupComponent::try_new(
+                    snapshot,
+                    kind,
+                    SourceIdentifier::try_from(format!("test-producer-{index}"))?,
+                    schema.clone(),
+                    format!("product-components/component-{index}.json"),
                     1,
                     [u8::try_from(index + 1)?; 32],
                     if kind == ProductBackupComponentKind::Configuration {
@@ -754,6 +1115,7 @@ mod tests {
 
         assert!(matches!(
             validate_components(
+                snapshot,
                 &components,
                 &ProductBackupEncryptionEvidence::UnencryptedNoSecretPayload,
             ),

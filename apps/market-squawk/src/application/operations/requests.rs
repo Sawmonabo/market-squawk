@@ -171,8 +171,7 @@ pub(super) fn map_lifecycle_error(error: super::super::lifecycle::LifecycleError
         | LifecycleError::AuthorityUnavailable
         | LifecycleError::InvalidTimeout
         | LifecycleError::Encoding
-        | LifecycleError::HealthCheckFailed
-        | LifecycleError::RollbackFailed
+        | LifecycleError::InvalidRestartHandoff
         | LifecycleError::RuntimeIdentity(_) => ServiceError::Internal,
     }
 }

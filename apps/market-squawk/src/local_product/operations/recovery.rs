@@ -16,7 +16,7 @@ use market_squawk_data::{AnalyticalBackupLimits, AnalyticalBackupLocation};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_installer::{RollbackRequest, rollback, status};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
-use market_squawk_runtime::WorkspaceId;
+use market_squawk_runtime::{InstallationId, WorkspaceId};
 use market_squawk_services::ServiceError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -24,14 +24,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     application::{
-        backup::{
-            PreparedProductRestore, ProductBackupManifest, ProductBackupService,
-            ProductRestoreComponentAuthority,
-        },
+        backup::{ProductBackupManifest, ProductBackupService, ProductRestoreComponentAuthority},
         lifecycle::{
             LifecycleError, ProgramGeneration, WorkspaceActivitySnapshot,
-            WorkspaceLifecycleAuthority, WorkspaceRuntimeIdentity, WorkspaceSwitchApproval,
-            WorkspaceSwitchOutcome, WorkspaceTransition,
+            WorkspaceLifecycleAuthority, WorkspaceRestartTransition, WorkspaceRuntimeIdentity,
+            WorkspaceSwitchApproval,
         },
         operations::{
             ManagedRecoveryOperations, PreparedOperation, ProgramRollbackPreviewEvidence,
@@ -50,7 +47,6 @@ const AUTHORITY_DIRECTORY: &str = "installed-recovery-authority";
 const MAXIMUM_PREVIEWS: usize = 64;
 const MAXIMUM_OPERATIONS: usize = 128;
 const MAXIMUM_RECEIPTS: usize = 256;
-const MAXIMUM_WORKSPACE_HANDOFFS: usize = 64;
 
 /// Live, bounded facts published by the sole installed composition owner.
 ///
@@ -104,80 +100,20 @@ impl fmt::Debug for RecoveryRuntimeActivity {
     }
 }
 
-/// Process handoff for an already restored workspace.
-///
-/// The durable workspace component authority remains the restart source of truth. This handoff
-/// only avoids reopening restored authorities when the supervisor keeps the coordinator alive
-/// while replacing the service process.
-#[derive(Default)]
-pub struct RecoveryWorkspaceHandoff {
-    prepared: Mutex<BTreeMap<WorkspaceId, PreparedProductRestore>>,
-}
-
-impl RecoveryWorkspaceHandoff {
-    fn retain(&self, restore: PreparedProductRestore) -> Result<(), ServiceError> {
-        let workspace_id = restore.workspace().workspace_id();
-        let mut prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?;
-        if prepared.len() >= MAXIMUM_WORKSPACE_HANDOFFS
-            || prepared.insert(workspace_id, restore).is_some()
-        {
-            return Err(ServiceError::ResourceExhausted);
-        }
-        Ok(())
-    }
-
-    /// Claims one exact staged workspace for supervisor-started composition.
-    pub fn take(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> Result<Option<PreparedProductRestore>, ServiceError> {
-        self.prepared
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)
-            .map(|mut prepared| prepared.remove(&workspace_id))
-    }
-
-    fn discard(&self, workspace_id: WorkspaceId) -> Result<(), ServiceError> {
-        self.prepared
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?
-            .remove(&workspace_id);
-        Ok(())
-    }
-}
-
-impl fmt::Debug for RecoveryWorkspaceHandoff {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RecoveryWorkspaceHandoff([PREPARED WORKSPACE CAPABILITIES])")
-    }
-}
-
 /// Exact root-composition hooks for a supervisor-restart workspace transition.
 ///
-/// `request_restart` must address the installed per-user service registration. It must not invoke
-/// in-process application recomposition. `health_check` must authenticate readiness and verify the
-/// returned workspace identity, including its generation.
+/// `request_restart` signals the outer service lifecycle only after the durable selector commits.
+/// It must not invoke native service control, in-process recomposition, or same-process health.
 #[async_trait]
 pub trait InstalledServiceRecoveryHooks: fmt::Debug + Send + Sync {
     /// Rejects new mutation work, drains running work and sources, stops paper execution, and
     /// completes execution reconciliation before the selector may change.
     async fn drain_and_reconcile(&self, deadline: Instant) -> Result<(), LifecycleError>;
 
-    /// Requests replacement of the installed service by its per-user supervisor.
-    async fn request_restart(
+    /// Requests orderly shutdown so the installed supervisor starts the replacement process.
+    fn request_restart(
         &self,
-        expected: WorkspaceRuntimeIdentity,
-        deadline: Instant,
-    ) -> Result<(), LifecycleError>;
-
-    /// Proves the supervisor-started service is healthy under the exact selected identity.
-    async fn health_check(
-        &self,
-        expected: WorkspaceRuntimeIdentity,
-        deadline: Instant,
+        expected: market_squawk_runtime::RuntimeIdentity,
     ) -> Result<(), LifecycleError>;
 }
 
@@ -693,11 +629,11 @@ fn upsert_receipt(receipts: &mut Vec<DurableRecoveryReceipt>, receipt: DurableRe
     receipts.push(receipt);
 }
 
-/// Workspace transition that publishes a durable selector and delegates only restart/health work.
+/// Workspace transition that publishes a durable selector and requests outer-process shutdown.
 pub struct SupervisorRestartWorkspaceTransition {
     state: Arc<DurableRecoveryState>,
     hooks: Arc<dyn InstalledServiceRecoveryHooks>,
-    deadline: Mutex<Option<Instant>>,
+    installation_id: InstallationId,
 }
 
 impl SupervisorRestartWorkspaceTransition {
@@ -706,55 +642,40 @@ impl SupervisorRestartWorkspaceTransition {
     pub fn new(
         state: Arc<DurableRecoveryState>,
         hooks: Arc<dyn InstalledServiceRecoveryHooks>,
+        installation_id: InstallationId,
     ) -> Self {
         Self {
             state,
             hooks,
-            deadline: Mutex::new(None),
+            installation_id,
         }
-    }
-
-    fn deadline(&self) -> Result<Instant, LifecycleError> {
-        self.deadline
-            .lock()
-            .map_err(|_| LifecycleError::AuthorityUnavailable)?
-            .ok_or(LifecycleError::AuthorityUnavailable)
     }
 }
 
 #[async_trait]
-impl WorkspaceTransition for SupervisorRestartWorkspaceTransition {
+impl WorkspaceRestartTransition for SupervisorRestartWorkspaceTransition {
     async fn drain_and_reconcile(&self, deadline: Instant) -> Result<(), LifecycleError> {
         if deadline <= Instant::now() {
             return Err(LifecycleError::InvalidTimeout);
         }
-        self.hooks.drain_and_reconcile(deadline).await?;
-        *self
-            .deadline
-            .lock()
-            .map_err(|_| LifecycleError::AuthorityUnavailable)? = Some(deadline);
-        Ok(())
+        self.hooks.drain_and_reconcile(deadline).await
     }
 
-    async fn activate(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError> {
-        let deadline = self.deadline()?;
+    async fn request_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        deadline: Instant,
+    ) -> Result<WorkspaceRuntimeIdentity, LifecycleError> {
+        if deadline <= Instant::now() {
+            return Err(LifecycleError::InvalidTimeout);
+        }
         let selected = self
             .state
             .stage_workspace(workspace_id)
             .map_err(map_service_lifecycle)?;
-        self.hooks.request_restart(selected, deadline).await
-    }
-
-    async fn health_check(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError> {
-        let deadline = self.deadline()?;
-        let selected = self
-            .state
-            .selected_for(workspace_id)
-            .map_err(map_service_lifecycle)?;
-        self.hooks.health_check(selected, deadline).await?;
-        self.state
-            .startup_healthy(selected)
-            .map_err(map_service_lifecycle)
+        let runtime = selected.to_runtime(self.installation_id)?;
+        self.hooks.request_restart(runtime)?;
+        Ok(selected)
     }
 }
 
@@ -847,7 +768,6 @@ pub struct InstalledRecoveryOperations {
     transition: Arc<SupervisorRestartWorkspaceTransition>,
     restore_components: Arc<dyn ProductRestoreComponentAuthority>,
     activity: Arc<RecoveryRuntimeActivity>,
-    handoff: Arc<RecoveryWorkspaceHandoff>,
     durable: Arc<DurableRecoveryState>,
     plans: Mutex<PlanState>,
     sequence: AtomicU64,
@@ -871,7 +791,6 @@ impl InstalledRecoveryOperations {
         transition: Arc<SupervisorRestartWorkspaceTransition>,
         restore_components: Arc<dyn ProductRestoreComponentAuthority>,
         activity: Arc<RecoveryRuntimeActivity>,
-        handoff: Arc<RecoveryWorkspaceHandoff>,
         durable: Arc<DurableRecoveryState>,
     ) -> Result<Self, ServiceError> {
         if minimum_schema_version == 0
@@ -897,7 +816,6 @@ impl InstalledRecoveryOperations {
             transition,
             restore_components,
             activity,
-            handoff,
             durable,
             plans: Mutex::new(PlanState::default()),
             sequence: AtomicU64::new(1),
@@ -956,16 +874,9 @@ impl InstalledRecoveryOperations {
         target: WorkspaceId,
         cancellation: CancellationToken,
         deadline: Instant,
-        publication: Arc<dyn LifecycleJobPublication>,
+        _publication: Arc<dyn LifecycleJobPublication>,
     ) -> Result<(), LifecycleJobExecutionError> {
         pre_mutation_boundary(&cancellation, deadline)?;
-        let result = RecoveryJobRunner::try_result_reference(
-            operation.identity().clone(),
-            operation.evidence_digest(),
-            Vec::new(),
-        )
-        .map_err(|_| execution_failure("recovery-result-invalid", false))?;
-        publication.prepare_and_claim(result)?;
         let original = self
             .lifecycle
             .current()
@@ -975,30 +886,26 @@ impl InstalledRecoveryOperations {
             .map_err(|_| execution_failure("workspace-selector-unavailable", true))?;
         let timeout = remaining(deadline)
             .map_err(|_| execution_failure("workspace-deadline-elapsed", false))?;
-        let outcome = self
+        let handoff = self
             .lifecycle
-            .switch(approval, &*self.transition, timeout)
-            .await;
-        match outcome {
-            Ok(WorkspaceSwitchOutcome::Activated(_))
-                if matches!(
-                    action,
-                    RecoveryJobAction::RestoreWorkspace | RecoveryJobAction::SwitchWorkspace
-                ) => {}
-            Ok(WorkspaceSwitchOutcome::RolledBack(_)) => {}
-            Ok(_) => {
-                return Err(execution_failure("workspace-outcome-invalid", false));
-            }
-            Err(_error) => {
-                let _ignored = self.durable.abandon_unstarted_workspace();
-                return Err(execution_failure("workspace-transition-failed", true));
+            .request_switch(approval, &*self.transition, timeout)
+            .await
+            .map_err(|_| execution_failure("workspace-transition-failed", true))?;
+        if handoff.previous() != original
+            || handoff.candidate().workspace_id() != target
+            || !matches!(
+                action,
+                RecoveryJobAction::RestoreWorkspace | RecoveryJobAction::SwitchWorkspace
+            )
+        {
+            return Err(execution_failure("workspace-outcome-invalid", false));
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => Err(LifecycleJobExecutionError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(execution_failure("workspace-restart-not-observed", true))
             }
         }
-        self.durable
-            .complete_workspace()
-            .map_err(|_| execution_failure("workspace-receipt-unavailable", true))?;
-        publication.commit_succeeded();
-        Ok(())
     }
 
     async fn execute_program(
@@ -1195,7 +1102,7 @@ impl ManagedRecoveryOperations for InstalledRecoveryOperations {
             self.workspaces
                 .register_prepared(workspace)
                 .map_err(|_| ServiceError::Unavailable)?;
-            self.handoff.retain(prepared)?;
+            drop(prepared);
             let retained = {
                 let mut plans = self.plans.lock().map_err(|_| ServiceError::Unavailable)?;
                 if plans.restore_previews.len() >= MAXIMUM_PREVIEWS {
@@ -1213,7 +1120,6 @@ impl ManagedRecoveryOperations for InstalledRecoveryOperations {
                 }
             };
             if !retained {
-                self.handoff.discard(target)?;
                 self.restore_components
                     .abandon(target, &cancellation)
                     .await

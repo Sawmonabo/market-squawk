@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -61,7 +62,7 @@ pub(super) fn resolve_registration(
 
 /// Durable preparation boundary resolved before the runtime credential registry is loaded.
 pub(super) struct PreparedMcpClientAuthority {
-    store: LocalAuthorityStateStore,
+    authority_root: PathBuf,
     document: AuthorityDocument,
 }
 
@@ -69,7 +70,7 @@ impl std::fmt::Debug for PreparedMcpClientAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedMcpClientAuthority")
-            .field("store", &self.store)
+            .field("authority_root", &"[CONTROLLED MCP AUTHORITY ROOT]")
             .field("document", &"[NON-SECRET MCP CLIENT AUTHORITY]")
             .finish()
     }
@@ -83,9 +84,8 @@ impl PreparedMcpClientAuthority {
         secret_store: &Arc<dyn SecretStore>,
         registrations: [ClientCredentialRegistration; 2],
     ) -> Result<Self, McpControlError> {
-        let store = LocalAuthorityStateStore::try_open(
-            paths.control_root()?.root().join(AUTHORITY_DIRECTORY),
-        )?;
+        let authority_root = paths.control_root()?.root().join(AUTHORITY_DIRECTORY);
+        let store = LocalAuthorityStateStore::try_open(&authority_root)?;
         let document = match store.load()? {
             Some(encoded) => serde_json::from_slice::<AuthorityDocument>(&encoded)
                 .map_err(|_error| McpControlError::InvalidState)?
@@ -107,7 +107,11 @@ impl PreparedMcpClientAuthority {
                 return Err(McpControlError::InvalidState);
             }
         }
-        Ok(Self { store, document })
+        drop(store);
+        Ok(Self {
+            authority_root,
+            document,
+        })
     }
 
     /// Effective registrations, including a durably journaled candidate after an interrupted
@@ -134,7 +138,7 @@ impl PreparedMcpClientAuthority {
         {
             return Err(McpControlError::InvalidState);
         }
-        reconcile_pending_cleanup(&self.store, &secret_store, &mut self.document)?;
+        reconcile_pending_cleanup(&self.authority_root, &secret_store, &mut self.document)?;
         let registrations = self.document.effective_registrations()?;
         let entries = registrations
             .into_iter()
@@ -157,7 +161,7 @@ impl PreparedMcpClientAuthority {
         Ok(Arc::new(InstalledMcpControl {
             runtime,
             desktop_client_id,
-            store: self.store,
+            authority_root: self.authority_root,
             credentials,
             limits,
             started_at: Instant::now(),
@@ -185,7 +189,7 @@ struct ControlState {
 pub(super) struct InstalledMcpControl {
     runtime: RuntimeIdentity,
     desktop_client_id: ClientId,
-    store: LocalAuthorityStateStore,
+    authority_root: PathBuf,
     credentials: Arc<CredentialRegistry>,
     limits: McpLimitSpec,
     started_at: Instant,
@@ -200,7 +204,7 @@ impl std::fmt::Debug for InstalledMcpControl {
             .debug_struct("InstalledMcpControl")
             .field("runtime", &self.runtime)
             .field("desktop_client_id", &self.desktop_client_id)
-            .field("store", &self.store)
+            .field("authority_root", &"[CONTROLLED MCP AUTHORITY ROOT]")
             .field("credentials", &"[CREDENTIAL AUTHORITY]")
             .field("state", &"[DYNAMIC MCP CLIENT IDENTITIES]")
             .finish_non_exhaustive()
@@ -363,7 +367,7 @@ impl InstalledMcpControl {
         {
             self.state.write().document = pending_document.clone();
         }
-        if let Err(error) = store_document(&self.store, &pending_document) {
+        if let Err(error) = store_document_at(&self.authority_root, &pending_document) {
             self.state.write().document = prior_document;
             return Err(error);
         }
@@ -385,7 +389,7 @@ impl InstalledMcpControl {
             let mut completed_document = pending_document;
             completed_document.replace_client(candidate.clone())?;
             completed_document.pending = None;
-            store_document(&self.store, &completed_document)?;
+            store_document_at(&self.authority_root, &completed_document)?;
             self.state.write().document = completed_document;
         }
         Ok(CredentialMutationReceipt {
@@ -421,7 +425,7 @@ impl InstalledMcpControl {
             )
         };
         document.set_revoked(client, false);
-        store_document(&self.store, &document)?;
+        store_document_at(&self.authority_root, &document)?;
         self.state.write().document = document;
         Ok(CredentialMutationReceipt {
             client,
@@ -749,7 +753,7 @@ impl From<McpLimitSpec> for RuntimeLimits {
 }
 
 fn reconcile_pending_cleanup(
-    store: &LocalAuthorityStateStore,
+    authority_root: &Path,
     secret_store: &Arc<dyn SecretStore>,
     document: &mut AuthorityDocument,
 ) -> Result<(), McpControlError> {
@@ -763,10 +767,18 @@ fn reconcile_pending_cleanup(
         Ok(()) | Err(LocalSecretStoreError::NotFound) => {
             document.replace_client(pending.candidate)?;
             document.pending = None;
-            store_document(store, document)
+            store_document_at(authority_root, document)
         }
         Err(_error) => Ok(()),
     }
+}
+
+fn store_document_at(
+    authority_root: &Path,
+    document: &AuthorityDocument,
+) -> Result<(), McpControlError> {
+    let store = LocalAuthorityStateStore::try_open(authority_root)?;
+    store_document(&store, document)
 }
 
 fn store_document(

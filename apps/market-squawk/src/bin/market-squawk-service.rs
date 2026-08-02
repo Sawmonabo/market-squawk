@@ -3,16 +3,23 @@
 // enabled because this allowance is restricted to debug-assertion builds.
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use clap::Parser;
-use market_squawk::{AppConfig, service::InstalledService, termination::TerminationSignals};
+use market_squawk::{
+    AppConfig,
+    service::{
+        InstalledService, InstalledServiceLogging, InstalledServiceRunOutcome, TerminalLogFormat,
+    },
+    termination::TerminationSignals,
+};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+const SUPERVISED_RESTART_EXIT_CODE: u8 = 75;
+const LOG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk-service", version)]
@@ -34,32 +41,78 @@ struct ServiceArguments {
     json_logs: bool,
 }
 
-fn main() -> Result<()> {
-    let service = std::thread::Builder::new()
+fn main() -> ExitCode {
+    let service = match std::thread::Builder::new()
         .name("market-squawk-service-main".to_owned())
         .stack_size(APPLICATION_MAIN_STACK_BYTES)
         .spawn(run_service)
-        .context("failed to start the Market Squawk service thread")?;
-    service
-        .join()
-        .map_err(|_| anyhow!("the Market Squawk service thread terminated unexpectedly"))?
+        .context("failed to start the Market Squawk service thread")
+    {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("Market Squawk service failed: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match service.join() {
+        Ok(Ok(InstalledServiceRunOutcome::Stopped)) => ExitCode::SUCCESS,
+        Ok(Ok(InstalledServiceRunOutcome::RestartRequested { .. })) => {
+            ExitCode::from(SUPERVISED_RESTART_EXIT_CODE)
+        }
+        Ok(Err(error)) => {
+            eprintln!("Market Squawk service failed: {error:#}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("Market Squawk service thread terminated unexpectedly");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn run_service() -> Result<()> {
+fn run_service() -> Result<InstalledServiceRunOutcome> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(Box::pin(run()))
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<InstalledServiceRunOutcome> {
     let arguments = ServiceArguments::parse();
-    initialize_logging(&arguments.log, arguments.json_logs)?;
     let config = load_config(
         arguments.config.as_deref(),
         arguments.data_dir,
         arguments.training_release_root,
     )?;
+    let terminal_format = if arguments.json_logs {
+        TerminalLogFormat::Json
+    } else {
+        TerminalLogFormat::Human
+    };
+    let mut logging = InstalledServiceLogging::install(&config, &arguments.log, terminal_format)?;
+    let result = run_installed_service(config).await;
+    let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
+        if evidence.accepted == evidence.persisted
+            && evidence.dropped_overflow == 0
+            && evidence.rejected_unsafe == 0
+            && evidence.write_failures == 0
+        {
+            Ok(evidence)
+        } else {
+            Err(market_squawk::service::InstalledServiceLoggingError::IncompleteDrain)
+        }
+    });
+    match (result, log_shutdown) {
+        (Ok(outcome), Ok(_evidence)) => Ok(outcome),
+        (Err(error), Ok(_evidence)) => Err(error),
+        (Ok(_outcome), Err(error)) => Err(error.into()),
+        (Err(error), Err(log_error)) => {
+            Err(error.context(format!("structured-log shutdown also failed: {log_error}")))
+        }
+    }
+}
+
+async fn run_installed_service(config: AppConfig) -> Result<InstalledServiceRunOutcome> {
     let mut termination = TerminationSignals::install()?;
     let service = InstalledService::start(config).await?;
     let cancellation = CancellationToken::new();
@@ -92,21 +145,4 @@ fn load_config(
             ..ConfigOverrides::default()
         },
     ))?)
-}
-
-fn initialize_logging(filter: &str, json: bool) -> Result<()> {
-    let environment = EnvFilter::try_new(filter).context("invalid tracing filter")?;
-    if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(environment)
-            .json()
-            .try_init()
-            .map_err(|error| anyhow!("failed to initialize JSON tracing: {error}"))?;
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(environment)
-            .try_init()
-            .map_err(|error| anyhow!("failed to initialize tracing: {error}"))?;
-    }
-    Ok(())
 }

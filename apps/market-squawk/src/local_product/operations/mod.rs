@@ -10,7 +10,7 @@ pub(super) use backup::{InstalledManagedBackupOperations, ManagedBackupComponent
 pub(super) use log_artifact::ControlledDiagnosticArtifactPublisher;
 pub(super) use recovery::{
     DurableRecoveryState, InstalledRecoveryOperations, RecoveryRuntimeActivity,
-    RecoveryWorkspaceHandoff, SupervisorRestartWorkspaceTransition,
+    SupervisorRestartWorkspaceTransition,
 };
 pub(super) use settings::{ProductionSettingsOperations, SettingsLifecycleAuthority};
 pub(super) use update::ManagedUpdateOperations;

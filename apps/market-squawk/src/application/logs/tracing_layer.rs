@@ -13,8 +13,14 @@ use std::{
 };
 
 use market_squawk_domain::Timestamp;
+use serde::Serialize;
 use tracing::{Event, Subscriber, field::Visit};
-use tracing_subscriber::{Layer, layer::Context};
+use tracing_subscriber::{
+    Layer,
+    fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
+    layer::Context,
+    registry::LookupSpan,
+};
 
 use super::{LogDomain, LogSeverity, StructuredLogError, StructuredLogEvent, StructuredLogStore};
 
@@ -79,6 +85,36 @@ pub struct StructuredLogWorker {
     sender: SyncSender<WorkerMessage>,
     counters: Arc<LogCounters>,
     join: Option<JoinHandle<()>>,
+}
+
+/// Terminal event formatter that applies the same admission and redaction policy as persistence.
+#[derive(Clone, Copy, Debug)]
+pub struct RedactedEventFormatter {
+    format: TerminalFormat,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalFormat {
+    Human,
+    Json,
+}
+
+impl RedactedEventFormatter {
+    /// Creates the local human-readable terminal formatter.
+    #[must_use]
+    pub const fn human() -> Self {
+        Self {
+            format: TerminalFormat::Human,
+        }
+    }
+
+    /// Creates the machine-readable JSON-lines terminal formatter.
+    #[must_use]
+    pub const fn json() -> Self {
+        Self {
+            format: TerminalFormat::Json,
+        }
+    }
 }
 
 impl StructuredLogLayer {
@@ -176,34 +212,7 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-        let metadata = event.metadata();
-        let mut visitor = BoundedVisitor::default();
-        event.record(&mut visitor);
-        if visitor.overflowed {
-            self.counters
-                .rejected_unsafe
-                .fetch_add(1, Ordering::Release);
-            return;
-        }
-        let message = visitor
-            .message
-            .take()
-            .unwrap_or_else(|| metadata.name().to_owned());
-        let operation = visitor
-            .operation
-            .take()
-            .or_else(|| Some(metadata.name().to_owned()));
-        match StructuredLogEvent::try_new(
-            Timestamp::from_unix_nanos(0),
-            severity(metadata.level()),
-            domain(metadata.target()),
-            operation,
-            visitor.source_id.take(),
-            visitor.job_id.take(),
-            visitor.correlation_id.take(),
-            message,
-            visitor.fields,
-        ) {
+        match redact_event(event) {
             Ok(event) => self.admit(event),
             Err(_) => {
                 self.counters
@@ -212,6 +221,121 @@ where
             }
         }
     }
+}
+
+impl<S, N> FormatEvent<S, N> for RedactedEventFormatter
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        _context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let redacted = match redact_event(event) {
+            Ok(redacted) => redacted,
+            Err(_) => return writer.write_str("[REDACTED UNSAFE LOG EVENT]\n"),
+        };
+        match self.format {
+            TerminalFormat::Human => format_human(&mut writer, event, &redacted),
+            TerminalFormat::Json => format_json(&mut writer, event, &redacted),
+        }
+    }
+}
+
+fn redact_event(event: &Event<'_>) -> Result<StructuredLogEvent, StructuredLogError> {
+    let metadata = event.metadata();
+    let mut visitor = BoundedVisitor::default();
+    event.record(&mut visitor);
+    if visitor.overflowed {
+        return Err(StructuredLogError::UnsafeRecord);
+    }
+    let message = visitor
+        .message
+        .take()
+        .unwrap_or_else(|| metadata.name().to_owned());
+    let operation = visitor
+        .operation
+        .take()
+        .or_else(|| Some(metadata.name().to_owned()));
+    StructuredLogEvent::try_new(
+        Timestamp::from_unix_nanos(0),
+        severity(metadata.level()),
+        domain(metadata.target()),
+        operation,
+        visitor.source_id.take(),
+        visitor.job_id.take(),
+        visitor.correlation_id.take(),
+        message,
+        visitor.fields,
+    )
+}
+
+fn format_human(
+    writer: &mut Writer<'_>,
+    event: &Event<'_>,
+    redacted: &StructuredLogEvent,
+) -> fmt::Result {
+    write!(
+        writer,
+        "{} {}: {:?}",
+        event.metadata().level(),
+        event.metadata().target(),
+        redacted.message
+    )?;
+    if let Some(operation) = redacted.operation.as_deref() {
+        write!(writer, " operation={operation:?}")?;
+    }
+    if let Some(source_id) = redacted.source_id.as_deref() {
+        write!(writer, " source_id={source_id:?}")?;
+    }
+    if let Some(job_id) = redacted.job_id.as_deref() {
+        write!(writer, " job_id={job_id:?}")?;
+    }
+    if let Some(correlation_id) = redacted.correlation_id.as_deref() {
+        write!(writer, " correlation_id={correlation_id:?}")?;
+    }
+    for (name, value) in &redacted.fields {
+        write!(writer, " {name}={value:?}")?;
+    }
+    writer.write_char('\n')
+}
+
+fn format_json(
+    writer: &mut Writer<'_>,
+    event: &Event<'_>,
+    redacted: &StructuredLogEvent,
+) -> fmt::Result {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TerminalEvent<'event> {
+        severity: LogSeverity,
+        domain: LogDomain,
+        target: &'event str,
+        operation: Option<&'event str>,
+        source_id: Option<&'event str>,
+        job_id: Option<&'event str>,
+        correlation_id: Option<&'event str>,
+        message: &'event str,
+        fields: &'event BTreeMap<String, String>,
+    }
+
+    let rendered = serde_json::to_string(&TerminalEvent {
+        severity: redacted.severity,
+        domain: redacted.domain,
+        target: event.metadata().target(),
+        operation: redacted.operation.as_deref(),
+        source_id: redacted.source_id.as_deref(),
+        job_id: redacted.job_id.as_deref(),
+        correlation_id: redacted.correlation_id.as_deref(),
+        message: &redacted.message,
+        fields: &redacted.fields,
+    })
+    .map_err(|_| fmt::Error)?;
+    writer.write_str(&rendered)?;
+    writer.write_char('\n')
 }
 
 fn run_worker(

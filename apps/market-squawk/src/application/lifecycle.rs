@@ -228,18 +228,22 @@ pub struct WorkspaceSwitchApproval {
     preview_sha256: [u8; 32],
 }
 
-/// Composition-owned drain, activation, and health-check boundary.
+/// Composition-owned drain and durable supervisor-handoff boundary.
 #[async_trait]
-pub trait WorkspaceTransition: fmt::Debug + Send + Sync {
+pub trait WorkspaceRestartTransition: fmt::Debug + Send + Sync {
     /// Rejects new work, drains jobs, stops sources and paper execution, and reconciles execution.
     async fn drain_and_reconcile(&self, deadline: std::time::Instant)
     -> Result<(), LifecycleError>;
 
-    /// Changes the process composition to the selected prepared workspace.
-    async fn activate(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError>;
-
-    /// Proves the activated composition is healthy before the fence is reopened.
-    async fn health_check(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError>;
+    /// Persists the selected runtime and asks the outer service to stop for supervisor restart.
+    ///
+    /// Returning means the handoff is durable and shutdown was requested. Only the replacement
+    /// process may establish candidate health.
+    async fn request_restart(
+        &self,
+        workspace_id: WorkspaceId,
+        deadline: std::time::Instant,
+    ) -> Result<WorkspaceRuntimeIdentity, LifecycleError>;
 }
 
 /// Durable audit sink that must commit before a switch result becomes current.
@@ -267,19 +271,32 @@ pub enum WorkspaceTransitionDisposition {
     RolledBack,
 }
 
-/// Client-visible receipt that forces resynchronization under the returned identity.
+/// Durable restart handoff that remains nonterminal until replacement-process health succeeds.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct WorkspaceSwitchReceipt {
-    active: WorkspaceRuntimeIdentity,
-    attempted: WorkspaceRuntimeIdentity,
+pub struct WorkspaceRestartHandoff {
+    previous: WorkspaceRuntimeIdentity,
+    candidate: WorkspaceRuntimeIdentity,
+    preview_sha256: [u8; 32],
 }
 
-impl WorkspaceSwitchReceipt {
-    /// Returns the only workspace/generation current after the transition.
+impl WorkspaceRestartHandoff {
+    /// Returns the runtime that remains current until the old process fully stops.
     #[must_use]
-    pub const fn active(self) -> WorkspaceRuntimeIdentity {
-        self.active
+    pub const fn previous(self) -> WorkspaceRuntimeIdentity {
+        self.previous
+    }
+
+    /// Returns the exact candidate the replacement process must prove.
+    #[must_use]
+    pub const fn candidate(self) -> WorkspaceRuntimeIdentity {
+        self.candidate
+    }
+
+    /// Returns the exact approved preview commitment.
+    #[must_use]
+    pub const fn preview_sha256(self) -> [u8; 32] {
+        self.preview_sha256
     }
 }
 
@@ -301,14 +318,6 @@ impl WorkspaceTransitionRecord {
     pub const fn disposition(&self) -> WorkspaceTransitionDisposition {
         self.disposition
     }
-}
-
-/// Complete outcome of a switch attempt.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceSwitchOutcome {
-    Activated(WorkspaceSwitchReceipt),
-    RolledBack(WorkspaceSwitchReceipt),
 }
 
 #[derive(Debug)]
@@ -398,13 +407,17 @@ impl WorkspaceLifecycleAuthority {
         })
     }
 
-    /// Executes one approved transition while retaining the request fence across all awaits.
-    pub async fn switch(
+    /// Persists and requests one approved cross-process transition while retaining the fence.
+    ///
+    /// This method never reports activation or rollback. Replacement startup must validate the
+    /// durable selector, compose the selected workspace, publish the transition journal, and then
+    /// complete the initiating recovery job.
+    pub async fn request_switch(
         &self,
         approval: WorkspaceSwitchApproval,
-        transition: &dyn WorkspaceTransition,
+        transition: &dyn WorkspaceRestartTransition,
         timeout: Duration,
-    ) -> Result<WorkspaceSwitchOutcome, LifecycleError> {
+    ) -> Result<WorkspaceRestartHandoff, LifecycleError> {
         if timeout.is_zero() || timeout > Duration::from_secs(10 * 60) {
             return Err(LifecycleError::InvalidTimeout);
         }
@@ -415,7 +428,7 @@ impl WorkspaceLifecycleAuthority {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .ok_or(LifecycleError::InvalidTimeout)?;
-        let attempted = WorkspaceRuntimeIdentity {
+        let candidate = WorkspaceRuntimeIdentity {
             workspace_id: approval.target,
             generation: approval.active.generation().advance(1)?,
         };
@@ -424,77 +437,33 @@ impl WorkspaceLifecycleAuthority {
             state.fenced = false;
             return Err(error);
         }
-        let activated = transition.activate(approval.target).await.is_ok()
-            && transition.health_check(approval.target).await.is_ok();
-        if activated {
-            let record = WorkspaceTransitionRecord {
-                previous: approval.active,
-                attempted,
-                active: attempted,
-                preview_sha256: approval.preview_sha256,
-                disposition: WorkspaceTransitionDisposition::Activated,
-            };
-            if let Err(error) = self.journal.append(&record) {
-                return rollback_after_failure(
-                    &mut state,
-                    approval,
-                    attempted,
-                    transition,
-                    &*self.journal,
-                    error,
-                )
-                .await;
-            }
-            state.active = attempted;
-            state.fenced = false;
-            return Ok(WorkspaceSwitchOutcome::Activated(WorkspaceSwitchReceipt {
-                active: attempted,
-                attempted,
-            }));
+        let selected = transition
+            .request_restart(approval.target, deadline)
+            .await?;
+        if selected != candidate {
+            return Err(LifecycleError::InvalidRestartHandoff);
         }
-        rollback_after_failure(
-            &mut state,
-            approval,
-            attempted,
-            transition,
-            &*self.journal,
-            LifecycleError::HealthCheckFailed,
-        )
-        .await
+        Ok(WorkspaceRestartHandoff {
+            previous: approval.active,
+            candidate,
+            preview_sha256: approval.preview_sha256,
+        })
     }
-}
 
-async fn rollback_after_failure(
-    state: &mut LifecycleState,
-    approval: WorkspaceSwitchApproval,
-    attempted: WorkspaceRuntimeIdentity,
-    transition: &dyn WorkspaceTransition,
-    journal: &dyn WorkspaceTransitionJournal,
-    _cause: LifecycleError,
-) -> Result<WorkspaceSwitchOutcome, LifecycleError> {
-    transition.activate(approval.active.workspace_id()).await?;
-    transition
-        .health_check(approval.active.workspace_id())
-        .await
-        .map_err(|_| LifecycleError::RollbackFailed)?;
-    let restored = WorkspaceRuntimeIdentity {
-        workspace_id: approval.active.workspace_id(),
-        generation: attempted.generation().advance(1)?,
-    };
-    let record = WorkspaceTransitionRecord {
-        previous: approval.active,
-        attempted,
-        active: restored,
-        preview_sha256: approval.preview_sha256,
-        disposition: WorkspaceTransitionDisposition::RolledBack,
-    };
-    journal.append(&record)?;
-    state.active = restored;
-    state.fenced = false;
-    Ok(WorkspaceSwitchOutcome::RolledBack(WorkspaceSwitchReceipt {
-        active: restored,
-        attempted,
-    }))
+    /// Publishes one transition only after replacement startup proved the active identity.
+    pub fn publish_startup_transition(
+        &self,
+        record: &WorkspaceTransitionRecord,
+    ) -> Result<(), LifecycleError> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| LifecycleError::AuthorityBusy)?;
+        if state.active != record.active {
+            return Err(LifecycleError::InvalidRestartHandoff);
+        }
+        self.journal.append(record)
+    }
 }
 
 impl fmt::Debug for WorkspaceLifecycleAuthority {
@@ -530,10 +499,8 @@ pub enum LifecycleError {
     InvalidTimeout,
     #[error("workspace lifecycle evidence could not be encoded")]
     Encoding,
-    #[error("activated workspace failed its health check")]
-    HealthCheckFailed,
-    #[error("prior workspace could not be restored and verified")]
-    RollbackFailed,
+    #[error("workspace restart handoff is invalid")]
+    InvalidRestartHandoff,
     #[error("workspace identity cannot be represented by the installed runtime protocol")]
     RuntimeIdentity(#[from] RuntimeContractError),
 }
@@ -547,12 +514,12 @@ mod tests {
 
     #[derive(Debug)]
     struct FixtureTransition {
-        fail_target_health: bool,
-        activated: Mutex<Vec<WorkspaceId>>,
+        current: WorkspaceRuntimeIdentity,
+        requested: Mutex<Vec<WorkspaceId>>,
     }
 
     #[async_trait]
-    impl WorkspaceTransition for FixtureTransition {
+    impl WorkspaceRestartTransition for FixtureTransition {
         async fn drain_and_reconcile(
             &self,
             _deadline: std::time::Instant,
@@ -560,26 +527,23 @@ mod tests {
             Ok(())
         }
 
-        async fn activate(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError> {
-            self.activated
+        async fn request_restart(
+            &self,
+            workspace_id: WorkspaceId,
+            _deadline: std::time::Instant,
+        ) -> Result<WorkspaceRuntimeIdentity, LifecycleError> {
+            self.requested
                 .lock()
                 .map_err(|_| LifecycleError::AuthorityUnavailable)?
                 .push(workspace_id);
-            Ok(())
-        }
-
-        async fn health_check(&self, workspace_id: WorkspaceId) -> Result<(), LifecycleError> {
-            if self.fail_target_health
-                && self
-                    .activated
-                    .lock()
-                    .map_err(|_| LifecycleError::AuthorityUnavailable)?
-                    .first()
-                    == Some(&workspace_id)
-            {
-                return Err(LifecycleError::HealthCheckFailed);
-            }
-            Ok(())
+            WorkspaceRuntimeIdentity::try_new(
+                workspace_id,
+                self.current
+                    .generation()
+                    .get()
+                    .checked_add(1)
+                    .ok_or(LifecycleError::GenerationExhausted)?,
+            )
         }
     }
 
@@ -601,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_switch_restores_prior_workspace_under_strictly_newer_generation()
+    async fn approved_switch_requests_restart_without_claiming_candidate_health()
     -> Result<(), Box<dyn std::error::Error>> {
         let original = workspace(1)?;
         let target = workspace(2)?;
@@ -616,24 +580,22 @@ mod tests {
         )?;
         let approval = preview.try_approve()?;
         let transition = FixtureTransition {
-            fail_target_health: true,
-            activated: Mutex::new(Vec::new()),
+            current: WorkspaceRuntimeIdentity::try_new(original, 7)?,
+            requested: Mutex::new(Vec::new()),
         };
 
-        let outcome = authority
-            .switch(approval, &transition, std::time::Duration::from_secs(1))
+        let handoff = authority
+            .request_switch(approval, &transition, std::time::Duration::from_secs(1))
             .await?;
 
-        let WorkspaceSwitchOutcome::RolledBack(receipt) = outcome else {
-            return Err("expected rollback".into());
-        };
-        assert_eq!(receipt.active().workspace_id(), original);
-        assert_eq!(receipt.active().generation().get(), 9);
-        assert_eq!(authority.current()?, receipt.active());
-        assert_eq!(journal.0.lock().map_err(|_| "journal")?.len(), 1);
+        assert_eq!(handoff.previous().workspace_id(), original);
+        assert_eq!(handoff.candidate().workspace_id(), target);
+        assert_eq!(handoff.candidate().generation().get(), 8);
+        assert_eq!(authority.current()?.workspace_id(), original);
+        assert_eq!(journal.0.lock().map_err(|_| "journal")?.len(), 0);
         assert!(matches!(
             authority.admit_request(WorkspaceRuntimeIdentity::try_new(original, 7)?),
-            Err(LifecycleError::StaleWorkspaceGeneration)
+            Err(LifecycleError::RequestsFenced)
         ));
         Ok(())
     }

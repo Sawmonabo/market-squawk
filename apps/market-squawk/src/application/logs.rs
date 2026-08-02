@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use store::StructuredLogStore;
 pub use tracing_layer::{
-    StructuredLogDrain, StructuredLogDrainEvidence, StructuredLogLayer, StructuredLogWorker,
+    RedactedEventFormatter, StructuredLogDrain, StructuredLogDrainEvidence, StructuredLogLayer,
+    StructuredLogWorker,
 };
 
 pub(super) const FORMAT_VERSION: u16 = 1;
@@ -471,7 +472,44 @@ pub enum StructuredLogError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use market_squawk_platform::LocalPaths;
+    use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt as _};
+
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedTerminal(Arc<Mutex<Vec<u8>>>);
+
+    #[derive(Debug)]
+    struct CapturedTerminalWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'writer> MakeWriter<'writer> for CapturedTerminal {
+        type Writer = CapturedTerminalWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedTerminalWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl io::Write for CapturedTerminalWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("captured terminal lock poisoned"))?;
+            io::Write::write(&mut *output, bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn redacts_structured_secrets_and_rejects_unstructured_credentials()
@@ -554,6 +592,55 @@ mod tests {
             ),
             Err(StructuredLogError::UnsafeRecord)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn one_pipeline_redacts_terminal_and_persists_with_exact_shutdown_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let store = Arc::new(StructuredLogStore::try_open(
+            paths.control_root()?,
+            LogStoragePolicy::default(),
+            Timestamp::from_unix_nanos(0),
+        )?);
+        let (layer, _drain, mut worker) = StructuredLogLayer::try_spawn(Arc::clone(&store), 16)?;
+        let terminal = CapturedTerminal::default();
+        let subscriber = tracing_subscriber::registry().with(layer).with(
+            tracing_subscriber::fmt::layer()
+                .event_format(RedactedEventFormatter::json())
+                .with_writer(terminal.clone()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "market_squawk::source",
+                api_key = "must-not-escape",
+                provider = "coinbase",
+                "source connected"
+            );
+        });
+        let evidence = worker.shutdown(Duration::from_secs(2))?;
+        let rendered = String::from_utf8(
+            terminal
+                .0
+                .lock()
+                .map_err(|_| "captured terminal lock poisoned")?
+                .clone(),
+        )?;
+
+        assert!(!rendered.contains("must-not-escape"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert_eq!(evidence.accepted, 1);
+        assert_eq!(evidence.persisted, 1);
+        assert_eq!(evidence.dropped_overflow, 0);
+        assert_eq!(evidence.rejected_unsafe, 0);
+        assert_eq!(evidence.write_failures, 0);
+        assert_eq!(
+            store.query(&StructuredLogQuery::default())?.records().len(),
+            1
+        );
         Ok(())
     }
 }

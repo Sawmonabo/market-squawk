@@ -6,6 +6,8 @@ mod dispatch;
 mod governance;
 mod governance_persistence;
 mod jobs;
+mod lifecycle;
+mod logging;
 mod mcp_client;
 mod mcp_control;
 mod operations;
@@ -37,6 +39,10 @@ use tool_services::InstalledToolServices;
 use uuid::Uuid;
 
 use mcp_client::InstalledMcpRelayTransport;
+
+use lifecycle::InstalledServiceLifecycle;
+pub use lifecycle::InstalledServiceRunOutcome;
+pub use logging::{InstalledServiceLogging, InstalledServiceLoggingError, TerminalLogFormat};
 
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
@@ -176,6 +182,7 @@ pub struct InstalledService {
     jobs: InstalledJobAuthority,
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     runtime: PreparedRuntime,
+    lifecycle: Arc<InstalledServiceLifecycle>,
 }
 
 impl std::fmt::Debug for InstalledService {
@@ -187,6 +194,7 @@ impl std::fmt::Debug for InstalledService {
             .field("jobs", &self.jobs)
             .field("audit", &"[DURABLE AUDIT AUTHORITY]")
             .field("server", &self.server)
+            .field("lifecycle", &self.lifecycle)
             .finish_non_exhaustive()
     }
 }
@@ -262,28 +270,54 @@ impl InstalledService {
             cleanup_startup(&product, &jobs).await;
             return Err(error);
         }
+        let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
         Ok(Self {
             server,
             product,
             jobs,
             audit,
             runtime,
+            lifecycle,
         })
     }
 
     /// Serves until cancellation, then executes every shutdown phase in authority order.
-    pub async fn run(self, cancellation: CancellationToken) -> Result<(), InstalledServiceError> {
+    pub async fn run(
+        self,
+        cancellation: CancellationToken,
+    ) -> Result<InstalledServiceRunOutcome, InstalledServiceError> {
         let Self {
             server,
             product,
             jobs,
             audit,
             runtime,
+            lifecycle,
         } = self;
-        let transport = server
-            .run_until(cancellation, GRACEFUL_REQUEST_DRAIN, FORCED_REQUEST_DRAIN)
-            .await
-            .is_ok();
+        let transport_cancellation = CancellationToken::new();
+        let mut serving = Box::pin(server.run_until(
+            transport_cancellation.clone(),
+            GRACEFUL_REQUEST_DRAIN,
+            FORCED_REQUEST_DRAIN,
+        ));
+        let (expected_next, transport_stopped_unexpectedly, completed_transport) = tokio::select! {
+            biased;
+            expected_next = lifecycle.wait_for_restart() => {
+                transport_cancellation.cancel();
+                (Some(expected_next), false, None)
+            }
+            () = cancellation.cancelled() => {
+                transport_cancellation.cancel();
+                (None, false, None)
+            }
+            result = &mut serving => {
+                (None, true, Some(result.is_ok()))
+            }
+        };
+        let transport = match completed_transport {
+            Some(transport) => transport,
+            None => serving.await.is_ok(),
+        };
         let jobs_stopped = if let Ok(at) = current_timestamp() {
             jobs.shutdown_authority(at, JOB_RUNNER_DRAIN).await.is_ok()
         } else {
@@ -301,8 +335,14 @@ impl InstalledService {
             jobs_closed,
             rendezvous_retired,
         };
-        if report.is_complete() {
-            Ok(())
+        if report.is_complete() && transport_stopped_unexpectedly {
+            Err(InstalledServiceError::TransportStopped)
+        } else if report.is_complete() {
+            Ok(
+                expected_next.map_or(InstalledServiceRunOutcome::Stopped, |expected_next| {
+                    InstalledServiceRunOutcome::RestartRequested { expected_next }
+                }),
+            )
         } else {
             Err(InstalledServiceError::ShutdownIncomplete(report))
         }
@@ -626,14 +666,17 @@ pub enum InstalledServiceError {
     #[error(transparent)]
     Audit(#[from] crate::mcp::LocalAuditError),
     /// Installed MCP client authority construction or recovery failed.
-    #[error("installed MCP client authority is unavailable")]
-    McpControl,
+    #[error("installed MCP client authority is unavailable: {0}")]
+    McpControl(&'static str),
     /// A code-owned service limit or component contract was invalid.
     #[error("installed-service composition is invalid")]
     InvalidComposition,
     /// The authenticated exact-generation self-probe did not prove readiness.
     #[error("installed-service readiness verification failed")]
     ReadinessFailed,
+    /// The private runtime server stopped without an admitted lifecycle signal.
+    #[error("installed-service transport stopped unexpectedly")]
+    TransportStopped,
     /// No authenticated current installed-service generation is available.
     #[error("the installed Market Squawk service is unavailable")]
     ServiceUnavailable,
@@ -662,7 +705,20 @@ impl From<LocalAuthorityStateStoreError> for InstalledServiceError {
 }
 
 impl From<mcp_control::McpControlError> for InstalledServiceError {
-    fn from(_error: mcp_control::McpControlError) -> Self {
-        Self::McpControl
+    fn from(error: mcp_control::McpControlError) -> Self {
+        use mcp_control::McpControlError;
+        let reason = match error {
+            McpControlError::Path(_) => "controlled-path-unavailable",
+            McpControlError::AuthorityStore(_) => "authority-store-unavailable",
+            McpControlError::Credential(_) => "credential-registry-unavailable",
+            McpControlError::HttpAuthentication(_) => "authenticator-invalid",
+            McpControlError::InvalidState => "authority-state-invalid",
+            McpControlError::InvalidRequest => "request-invalid",
+            McpControlError::Unauthorized => "request-unauthorized",
+            McpControlError::RecoveryPending => "credential-recovery-pending",
+            McpControlError::SecretStore => "secret-store-unavailable",
+            McpControlError::Clock => "system-clock-invalid",
+        };
+        Self::McpControl(reason)
     }
 }
