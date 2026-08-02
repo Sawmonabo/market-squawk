@@ -15,6 +15,7 @@ fuzzing = []
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+http-body-util.workspace = true
 market-squawk-domain = { path = "../market-squawk-domain", version = "=1.0.0" }
 market-squawk-jobs = { path = "../market-squawk-jobs", version = "=1.0.0" }
 market-squawk-runtime = { path = "../market-squawk-runtime", version = "=1.0.0" }

@@ -4759,6 +4759,7 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "axum",
+ "http-body-util",
  "market-squawk-domain",
  "market-squawk-jobs",
  "market-squawk-runtime",
