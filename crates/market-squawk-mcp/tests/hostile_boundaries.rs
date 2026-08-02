@@ -1582,7 +1582,7 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
     let spec = McpLimitSpec {
         maximum_inline_bytes: 64,
         maximum_result_bytes: 4 * 1024,
-        request_timeout: Duration::from_millis(25),
+        request_timeout: Duration::from_secs(1),
         ..McpLimitSpec::default()
     };
     let (mut reader, mut writer, task) =
@@ -1702,18 +1702,35 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
     assert_eq!(receive(&mut reader).await?["error"]["code"], -32010);
     assert_eq!(artifacts.publication_count()?, 1);
 
+    writer.shutdown().await?;
+    assert_eq!(task.await??, ServerExit::EndOfInput);
+
+    let deadline_limits = McpLimits::try_from(McpLimitSpec {
+        request_timeout: Duration::from_millis(25),
+        ..McpLimitSpec::default()
+    })?;
+    let (mut deadline_reader, mut deadline_writer, deadline_task) = ready_server(
+        Arc::new(BoundaryService::default()),
+        Arc::new(RecordingArtifacts::default()),
+        deadline_limits,
+    )
+    .await?;
+
     send(
-        &mut writer,
+        &mut deadline_writer,
         json!({
             "jsonrpc":"2.0","id":"deadline","method":"tools/call",
             "params":{"name":"test.block","arguments":{}}
         }),
     )
     .await?;
-    assert_eq!(receive(&mut reader).await?["error"]["code"], -32008);
+    assert_eq!(
+        receive(&mut deadline_reader).await?["error"]["code"],
+        -32008
+    );
 
-    writer.shutdown().await?;
-    assert_eq!(task.await??, ServerExit::EndOfInput);
+    deadline_writer.shutdown().await?;
+    assert_eq!(deadline_task.await??, ServerExit::EndOfInput);
     Ok(())
 }
 
