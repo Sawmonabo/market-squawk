@@ -5,19 +5,20 @@ use std::{
 };
 
 use async_trait::async_trait;
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ServiceLimits, validate_json_contract,
 };
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::{CredentialGeneration, EventCursor, EventPageLimit, InputAdmission, InputTicket};
+
 const MAXIMUM_REQUEST_LIFETIME_NANOS: i64 = 300_000_000_000;
-const MAXIMUM_EVENT_PAGE_ITEMS: usize = 4_096;
 
 /// Invalid installed-runtime contract input.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -43,6 +44,15 @@ pub enum RuntimeContractError {
     /// Input length must be nonzero.
     #[error("input byte length must be nonzero")]
     EmptyInput,
+    /// Runtime identity did not match the active service authority.
+    #[error("runtime identity is not current")]
+    IdentityMismatch,
+    /// Protocol range is empty or reversed.
+    #[error("application protocol range is invalid")]
+    InvalidProtocolRange,
+    /// A response violated the configured output contract.
+    #[error("response payload exceeds its admitted limits")]
+    InvalidResponse,
 }
 
 macro_rules! uuid_identity {
@@ -68,6 +78,16 @@ macro_rules! uuid_identity {
                 self.0
             }
         }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = Uuid::deserialize(deserializer)?;
+                Self::try_from_uuid(value).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
@@ -79,9 +99,11 @@ uuid_identity!(/// Stable identity for one registered native client.
     ClientId);
 uuid_identity!(/// Opaque identity for one staged native input.
     InputTicketId);
+uuid_identity!(/// Stable correlation identity shared across related application requests.
+    CorrelationId);
 
 /// One-based generation for a running installed service.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ServiceGeneration(NonZeroU64);
 
@@ -101,11 +123,121 @@ impl ServiceGeneration {
 }
 
 /// Exact application protocol revision negotiated by native clients.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplicationProtocolVersion {
     major: u16,
     minor: u16,
+}
+
+/// Closed range of application protocol revisions admitted by one service generation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ApplicationProtocolRange {
+    minimum: ApplicationProtocolVersion,
+    maximum: ApplicationProtocolVersion,
+}
+
+impl ApplicationProtocolRange {
+    /// Creates an inclusive, non-reversed protocol range.
+    pub fn try_new(
+        minimum: ApplicationProtocolVersion,
+        maximum: ApplicationProtocolVersion,
+    ) -> Result<Self, RuntimeContractError> {
+        if minimum > maximum {
+            Err(RuntimeContractError::InvalidProtocolRange)
+        } else {
+            Ok(Self { minimum, maximum })
+        }
+    }
+
+    /// Creates a range containing exactly one protocol revision.
+    #[must_use]
+    pub const fn single(version: ApplicationProtocolVersion) -> Self {
+        Self {
+            minimum: version,
+            maximum: version,
+        }
+    }
+
+    /// Returns whether the supplied revision is admitted.
+    #[must_use]
+    pub const fn contains(self, version: ApplicationProtocolVersion) -> bool {
+        self.minimum.major <= version.major
+            && (self.minimum.major != version.major || self.minimum.minor <= version.minor)
+            && version.major <= self.maximum.major
+            && (version.major != self.maximum.major || version.minor <= self.maximum.minor)
+    }
+}
+
+/// Exact installation, workspace, and running-service authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RuntimeIdentity {
+    installation_id: InstallationId,
+    workspace_id: WorkspaceId,
+    service_generation: ServiceGeneration,
+}
+
+impl RuntimeIdentity {
+    /// Creates an exact runtime identity from validated components.
+    pub const fn try_new(
+        installation_id: InstallationId,
+        workspace_id: WorkspaceId,
+        service_generation: ServiceGeneration,
+    ) -> Result<Self, RuntimeContractError> {
+        Ok(Self {
+            installation_id,
+            workspace_id,
+            service_generation,
+        })
+    }
+
+    /// Admits only requests for this exact runtime authority.
+    pub fn admit(&self, request: &AppRequestEnvelope) -> Result<(), RuntimeAdmissionError> {
+        if self.installation_id != request.installation_id {
+            Err(RuntimeAdmissionError::InstallationMismatch)
+        } else if self.workspace_id != request.workspace_id {
+            Err(RuntimeAdmissionError::WorkspaceMismatch)
+        } else if self.service_generation != request.service_generation {
+            Err(RuntimeAdmissionError::GenerationMismatch)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Installation identity.
+    #[must_use]
+    pub const fn installation_id(self) -> InstallationId {
+        self.installation_id
+    }
+
+    /// Workspace identity.
+    #[must_use]
+    pub const fn workspace_id(self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    /// Running service generation.
+    #[must_use]
+    pub const fn service_generation(self) -> ServiceGeneration {
+        self.service_generation
+    }
+}
+
+/// Request identity does not name the active runtime authority.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RuntimeAdmissionError {
+    /// Installation identity differs.
+    #[error("application request names another installation")]
+    InstallationMismatch,
+    /// Workspace identity differs.
+    #[error("application request names another workspace")]
+    WorkspaceMismatch,
+    /// Running service generation differs.
+    #[error("application request names a stale service generation")]
+    GenerationMismatch,
 }
 
 impl ApplicationProtocolVersion {
@@ -134,10 +266,91 @@ pub struct AppRequestEnvelope {
     workspace_id: WorkspaceId,
     service_generation: ServiceGeneration,
     client_id: ClientId,
+    credential_generation: CredentialGeneration,
+    correlation_id: CorrelationId,
     protocol: ApplicationProtocolVersion,
     deadline: Timestamp,
     operation: SourceIdentifier,
     arguments: Value,
+}
+
+/// Fixed identity and payload limits used by a native client to construct requests.
+#[derive(Clone, Debug)]
+pub struct ApplicationRequestScope {
+    runtime: RuntimeIdentity,
+    client_id: ClientId,
+    credential_generation: CredentialGeneration,
+    correlation_id: CorrelationId,
+    structure_limits: JsonStructureLimits,
+    maximum_encoded_bytes: usize,
+}
+
+impl ApplicationRequestScope {
+    /// Creates a scope for one authenticated named-client generation.
+    pub fn try_new(
+        runtime: RuntimeIdentity,
+        client_id: ClientId,
+        credential_generation: CredentialGeneration,
+        correlation_id: CorrelationId,
+        structure_limits: JsonStructureLimits,
+        maximum_encoded_bytes: usize,
+    ) -> Result<Self, RuntimeContractError> {
+        if maximum_encoded_bytes == 0 {
+            return Err(RuntimeContractError::InvalidPayload);
+        }
+        Ok(Self {
+            runtime,
+            client_id,
+            credential_generation,
+            correlation_id,
+            structure_limits,
+            maximum_encoded_bytes,
+        })
+    }
+
+    /// Constructs one fully bound request without exposing platform secret types.
+    pub fn request(
+        &self,
+        request_id: RequestId,
+        deadline: Timestamp,
+        now: Timestamp,
+        operation: SourceIdentifier,
+        arguments: Value,
+    ) -> Result<AppRequestEnvelope, RuntimeContractError> {
+        AppRequestEnvelope::try_new(
+            request_id,
+            self.runtime.installation_id(),
+            self.runtime.workspace_id(),
+            self.runtime.service_generation(),
+            self.client_id,
+            self.credential_generation,
+            self.correlation_id,
+            deadline,
+            now,
+            operation,
+            arguments,
+            self.structure_limits,
+            self.maximum_encoded_bytes,
+        )
+    }
+
+    /// Exact runtime targeted by this scope.
+    #[must_use]
+    pub const fn runtime(&self) -> RuntimeIdentity {
+        self.runtime
+    }
+
+    /// Exact client identity carried by this scope.
+    #[must_use]
+    pub const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    /// Exact credential generation carried by this scope.
+    #[must_use]
+    pub const fn credential_generation(&self) -> CredentialGeneration {
+        self.credential_generation
+    }
 }
 
 impl AppRequestEnvelope {
@@ -149,6 +362,8 @@ impl AppRequestEnvelope {
         workspace_id: WorkspaceId,
         service_generation: ServiceGeneration,
         client_id: ClientId,
+        credential_generation: CredentialGeneration,
+        correlation_id: CorrelationId,
         deadline: Timestamp,
         now: Timestamp,
         operation: SourceIdentifier,
@@ -169,11 +384,45 @@ impl AppRequestEnvelope {
             workspace_id,
             service_generation,
             client_id,
+            credential_generation,
+            correlation_id,
             protocol: ApplicationProtocolVersion::V1,
             deadline,
             operation,
             arguments,
         })
+    }
+
+    /// Decodes one closed request and reapplies all dynamic admission limits.
+    pub fn decode(
+        encoded: &[u8],
+        now: Timestamp,
+        structure_limits: JsonStructureLimits,
+        maximum_encoded_bytes: usize,
+    ) -> Result<Self, RuntimeContractError> {
+        if encoded.len() > maximum_encoded_bytes {
+            return Err(RuntimeContractError::InvalidPayload);
+        }
+        let wire: AppRequestWire =
+            serde_json::from_slice(encoded).map_err(|_| RuntimeContractError::InvalidPayload)?;
+        if wire.protocol != ApplicationProtocolVersion::V1 {
+            return Err(RuntimeContractError::InvalidPayload);
+        }
+        Self::try_new(
+            wire.request_id.into_request_id()?,
+            wire.installation_id,
+            wire.workspace_id,
+            wire.service_generation,
+            wire.client_id,
+            wire.credential_generation,
+            wire.correlation_id,
+            wire.deadline,
+            now,
+            wire.operation,
+            wire.arguments,
+            structure_limits,
+            maximum_encoded_bytes,
+        )
     }
 
     /// Converts the admitted wall-clock deadline once into a monotonic service context.
@@ -184,6 +433,20 @@ impl AppRequestEnvelope {
         cancellation: CancellationToken,
         limits: ServiceLimits,
     ) -> Result<RequestContext, RuntimeContractError> {
+        let remaining = self.remaining_lifetime(now)?;
+        let deadline = monotonic_now
+            .checked_add(remaining)
+            .ok_or(RuntimeContractError::DeadlineTooDistant)?;
+        Ok(RequestContext::new(
+            self.request_id.clone(),
+            cancellation,
+            deadline,
+            limits,
+        ))
+    }
+
+    /// Returns the validated remaining wall-clock lifetime for transport admission.
+    pub fn remaining_lifetime(&self, now: Timestamp) -> Result<Duration, RuntimeContractError> {
         let remaining = self
             .deadline
             .unix_nanos()
@@ -192,15 +455,7 @@ impl AppRequestEnvelope {
         validate_deadline_delta(remaining)?;
         let nanos =
             u64::try_from(remaining).map_err(|_error| RuntimeContractError::ExpiredDeadline)?;
-        let deadline = monotonic_now
-            .checked_add(Duration::from_nanos(nanos))
-            .ok_or(RuntimeContractError::DeadlineTooDistant)?;
-        Ok(RequestContext::new(
-            self.request_id.clone(),
-            cancellation,
-            deadline,
-            limits,
-        ))
+        Ok(Duration::from_nanos(nanos))
     }
 
     /// Exact installation expected by this request.
@@ -227,6 +482,24 @@ impl AppRequestEnvelope {
         self.client_id
     }
 
+    /// Exact named-client credential generation required by this request.
+    #[must_use]
+    pub const fn credential_generation(&self) -> CredentialGeneration {
+        self.credential_generation
+    }
+
+    /// Correlation identity shared across related work.
+    #[must_use]
+    pub const fn correlation_id(&self) -> CorrelationId {
+        self.correlation_id
+    }
+
+    /// Stable request identity reused by the application service context.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
     /// Selected application protocol revision.
     #[must_use]
     pub const fn protocol(&self) -> ApplicationProtocolVersion {
@@ -246,6 +519,40 @@ impl AppRequestEnvelope {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AppRequestWire {
+    request_id: RequestIdWire,
+    installation_id: InstallationId,
+    workspace_id: WorkspaceId,
+    service_generation: ServiceGeneration,
+    client_id: ClientId,
+    credential_generation: CredentialGeneration,
+    correlation_id: CorrelationId,
+    protocol: ApplicationProtocolVersion,
+    deadline: Timestamp,
+    operation: SourceIdentifier,
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RequestIdWire {
+    Integer(i64),
+    String(String),
+}
+
+impl RequestIdWire {
+    fn into_request_id(self) -> Result<RequestId, RuntimeContractError> {
+        match self {
+            Self::Integer(value) => Ok(RequestId::Integer(value)),
+            Self::String(value) => {
+                RequestId::try_string(value).map_err(|_| RuntimeContractError::InvalidPayload)
+            }
+        }
+    }
+}
+
 fn validate_deadline_delta(remaining: i64) -> Result<(), RuntimeContractError> {
     if remaining <= 0 {
         Err(RuntimeContractError::ExpiredDeadline)
@@ -253,169 +560,6 @@ fn validate_deadline_delta(remaining: i64) -> Result<(), RuntimeContractError> {
         Err(RuntimeContractError::DeadlineTooDistant)
     } else {
         Ok(())
-    }
-}
-
-/// Immutable metadata for one native-streamed input staged by the service.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InputTicket {
-    id: InputTicketId,
-    installation_id: InstallationId,
-    workspace_id: WorkspaceId,
-    generation: ServiceGeneration,
-    media_type: SourceIdentifier,
-    byte_length: u64,
-    digest: EvidenceDigest,
-    expires_at: Timestamp,
-}
-
-impl InputTicket {
-    /// Creates an opaque expiring reference after native streaming and digest verification.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        id: InputTicketId,
-        installation_id: InstallationId,
-        workspace_id: WorkspaceId,
-        generation: ServiceGeneration,
-        media_type: SourceIdentifier,
-        byte_length: u64,
-        digest: EvidenceDigest,
-        expires_at: Timestamp,
-        now: Timestamp,
-    ) -> Result<Self, RuntimeContractError> {
-        if byte_length == 0 {
-            return Err(RuntimeContractError::EmptyInput);
-        }
-        if expires_at <= now {
-            return Err(RuntimeContractError::ExpiredDeadline);
-        }
-        Ok(Self {
-            id,
-            installation_id,
-            workspace_id,
-            generation,
-            media_type,
-            byte_length,
-            digest,
-            expires_at,
-        })
-    }
-
-    /// Returns the opaque input identity.
-    #[must_use]
-    pub const fn id(&self) -> InputTicketId {
-        self.id
-    }
-
-    /// Exact installation that owns the staged bytes.
-    #[must_use]
-    pub const fn installation_id(&self) -> InstallationId {
-        self.installation_id
-    }
-
-    /// Exact workspace that owns the staged bytes.
-    #[must_use]
-    pub const fn workspace_id(&self) -> WorkspaceId {
-        self.workspace_id
-    }
-
-    /// Service generation that created this ticket.
-    #[must_use]
-    pub const fn generation(&self) -> ServiceGeneration {
-        self.generation
-    }
-
-    /// Verified staged byte length.
-    #[must_use]
-    pub const fn byte_length(&self) -> u64 {
-        self.byte_length
-    }
-
-    /// Verified digest of the staged bytes.
-    #[must_use]
-    pub const fn digest(&self) -> EvidenceDigest {
-        self.digest
-    }
-}
-
-/// Reconnect cursor for one bounded service-generation event stream.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventCursor {
-    generation: ServiceGeneration,
-    sequence: u64,
-    expires_at: Timestamp,
-}
-
-impl EventCursor {
-    /// Creates an expiring cursor. Sequence zero means no event observed yet.
-    pub fn try_new(
-        generation: ServiceGeneration,
-        sequence: u64,
-        expires_at: Timestamp,
-    ) -> Result<Self, RuntimeContractError> {
-        if expires_at.unix_nanos() <= 0 {
-            return Err(RuntimeContractError::ExpiredDeadline);
-        }
-        Ok(Self {
-            generation,
-            sequence,
-            expires_at,
-        })
-    }
-
-    /// Ensures this cursor still belongs to the current generation and has not expired.
-    pub fn ensure_current(
-        &self,
-        generation: ServiceGeneration,
-        now: Timestamp,
-    ) -> Result<(), EventCursorError> {
-        if self.generation != generation {
-            Err(EventCursorError::GenerationChanged)
-        } else if self.expires_at <= now {
-            Err(EventCursorError::Expired)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Last observed sequence.
-    #[must_use]
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-/// Event cursor cannot continue without a fresh snapshot.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum EventCursorError {
-    /// The service or workspace switched generations.
-    #[error("event cursor generation changed; snapshot resynchronization is required")]
-    GenerationChanged,
-    /// The bounded cursor retention window elapsed.
-    #[error("event cursor expired; snapshot resynchronization is required")]
-    Expired,
-}
-
-/// Maximum records returned by one application-event page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EventPageLimit(usize);
-
-impl EventPageLimit {
-    /// Creates a positive limit no larger than 4,096 events.
-    pub fn try_new(value: usize) -> Result<Self, RuntimeContractError> {
-        if value == 0 || value > MAXIMUM_EVENT_PAGE_ITEMS {
-            Err(RuntimeContractError::InvalidPageLimit)
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    /// Returns the admitted item count.
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
     }
 }
 
@@ -438,6 +582,7 @@ pub enum ApplicationClientError {
 
 /// Transport-neutral response from the installed application authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct AppResponseEnvelope {
     request_id: RequestId,
@@ -460,6 +605,50 @@ impl AppResponseEnvelope {
         }
     }
 
+    /// Creates a success response after validating its complete encoded result.
+    pub fn try_success(
+        request_id: RequestId,
+        service_generation: ServiceGeneration,
+        result: Value,
+        structure_limits: JsonStructureLimits,
+        maximum_encoded_bytes: usize,
+    ) -> Result<Self, RuntimeContractError> {
+        validate_json_contract(&result, structure_limits, maximum_encoded_bytes)
+            .map_err(|_error| RuntimeContractError::InvalidResponse)?;
+        Ok(Self::new(request_id, service_generation, result))
+    }
+
+    /// Decodes and validates a response for one exact request and service generation.
+    pub fn decode_expected(
+        encoded: &[u8],
+        expected_request: &RequestId,
+        expected_generation: ServiceGeneration,
+        structure_limits: JsonStructureLimits,
+        maximum_encoded_bytes: usize,
+    ) -> Result<Self, RuntimeContractError> {
+        if encoded.len() > maximum_encoded_bytes {
+            return Err(RuntimeContractError::InvalidResponse);
+        }
+        let wire: AppResponseWire =
+            serde_json::from_slice(encoded).map_err(|_| RuntimeContractError::InvalidResponse)?;
+        let response = Self {
+            request_id: wire
+                .request_id
+                .into_request_id()
+                .map_err(|_| RuntimeContractError::InvalidResponse)?,
+            service_generation: wire.service_generation,
+            result: wire.result,
+        };
+        if response.request_id != *expected_request
+            || response.service_generation != expected_generation
+        {
+            return Err(RuntimeContractError::IdentityMismatch);
+        }
+        validate_json_contract(&response.result, structure_limits, maximum_encoded_bytes)
+            .map_err(|_| RuntimeContractError::InvalidResponse)?;
+        Ok(response)
+    }
+
     /// Correlation identity copied from the request.
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
@@ -479,49 +668,12 @@ impl AppResponseEnvelope {
     }
 }
 
-/// Request metadata for native-streamed input staging.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InputAdmission {
-    media_type: SourceIdentifier,
-    expected_bytes: u64,
-    expected_digest: EvidenceDigest,
-}
-
-impl InputAdmission {
-    /// Admits a nonempty byte stream with exact content evidence.
-    pub fn try_new(
-        media_type: SourceIdentifier,
-        expected_bytes: u64,
-        expected_digest: EvidenceDigest,
-    ) -> Result<Self, RuntimeContractError> {
-        if expected_bytes == 0 {
-            Err(RuntimeContractError::EmptyInput)
-        } else {
-            Ok(Self {
-                media_type,
-                expected_bytes,
-                expected_digest,
-            })
-        }
-    }
-
-    /// Declared media type of the staged bytes.
-    #[must_use]
-    pub const fn media_type(&self) -> &SourceIdentifier {
-        &self.media_type
-    }
-
-    /// Exact byte length required from the stream.
-    #[must_use]
-    pub const fn expected_bytes(&self) -> u64 {
-        self.expected_bytes
-    }
-
-    /// Exact digest required from the stream.
-    #[must_use]
-    pub const fn expected_digest(&self) -> EvidenceDigest {
-        self.expected_digest
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AppResponseWire {
+    request_id: RequestIdWire,
+    service_generation: ServiceGeneration,
+    result: Value,
 }
 
 /// Native client for the single installed service authority.
@@ -549,73 +701,4 @@ pub trait ApplicationClient: std::fmt::Debug + Send + Sync {
         limit: EventPageLimit,
         cancellation: CancellationToken,
     ) -> Result<(Arc<[Value]>, EventCursor), ApplicationClientError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_identities_reject_nil_values() {
-        let nil = Uuid::nil();
-        assert_eq!(
-            InstallationId::try_from_uuid(nil),
-            Err(RuntimeContractError::NilIdentity)
-        );
-        assert_eq!(
-            WorkspaceId::try_from_uuid(nil),
-            Err(RuntimeContractError::NilIdentity)
-        );
-        assert_eq!(
-            ClientId::try_from_uuid(nil),
-            Err(RuntimeContractError::NilIdentity)
-        );
-    }
-
-    #[test]
-    fn event_cursor_detects_expiry_and_generation_change() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let generation = ServiceGeneration::try_new(1)?;
-        let next_generation = ServiceGeneration::try_new(2)?;
-        let cursor = EventCursor::try_new(generation, 7, Timestamp::from_unix_nanos(20))?;
-
-        assert_eq!(
-            cursor.ensure_current(next_generation, Timestamp::from_unix_nanos(10)),
-            Err(EventCursorError::GenerationChanged),
-        );
-        assert_eq!(
-            cursor.ensure_current(generation, Timestamp::from_unix_nanos(20)),
-            Err(EventCursorError::Expired),
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn request_deadline_is_admitted_once_and_preserves_request_identity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let structure = JsonStructureLimits::try_new(8, 1_024, 64, 64)?;
-        let service_limits = ServiceLimits::try_new(1_024, 64, 4_096, 256, structure)?;
-        let envelope = AppRequestEnvelope::try_new(
-            RequestId::Integer(7),
-            InstallationId::try_from_uuid(Uuid::from_u128(1))?,
-            WorkspaceId::try_from_uuid(Uuid::from_u128(2))?,
-            ServiceGeneration::try_new(1)?,
-            ClientId::try_from_uuid(Uuid::from_u128(3))?,
-            Timestamp::from_unix_nanos(200),
-            Timestamp::from_unix_nanos(100),
-            SourceIdentifier::try_from("Market.Snapshot")?,
-            serde_json::json!({}),
-            structure,
-            1_024,
-        )?;
-
-        let context = envelope.to_request_context(
-            Timestamp::from_unix_nanos(100),
-            Instant::now(),
-            CancellationToken::new(),
-            service_limits,
-        )?;
-        assert_eq!(context.request_id(), &RequestId::Integer(7));
-        Ok(())
-    }
 }
