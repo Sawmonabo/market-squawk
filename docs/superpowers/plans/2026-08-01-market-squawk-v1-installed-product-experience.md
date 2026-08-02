@@ -507,7 +507,7 @@ product commit scope and repeats the affected barrier or final candidate gate.
   ```text
   domain/platform/services -> jobs
   domain/platform/services/jobs -> runtime
-  domain/platform/services/runtime -> mcp
+  domain/platform/services/jobs/runtime -> mcp
   domain engines/runtime/mcp -> market-squawk application composition
   market-squawk runtime client -> desktop Rust bridge
   ```

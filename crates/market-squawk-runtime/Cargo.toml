@@ -11,16 +11,26 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-jobs.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-services.workspace = true
+reqwest.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
