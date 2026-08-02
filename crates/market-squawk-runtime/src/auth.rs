@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::ClientId;
 
 const CREDENTIAL_BYTES: usize = 32;
-const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SECRET_SCOPE: &str = "runtime-client";
 
 /// Runtime-owned non-secret view of an exact named-client secret generation.
