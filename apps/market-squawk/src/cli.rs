@@ -160,6 +160,20 @@ pub enum Command {
         command: FairValueCommand,
     },
 
+    /// Inspect or start the shared installed application service.
+    Service {
+        /// Installed-service operation.
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+
+    /// Inspect and control durable work owned by the installed service.
+    Job {
+        /// Durable-job operation.
+        #[command(subcommand)]
+        command: JobCommand,
+    },
+
     /// Produce and close exact-head release evidence.
     Release {
         /// Release operation.
@@ -617,7 +631,119 @@ pub enum FairValueCommand {
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
     /// Serve the bounded local stdio protocol.
-    Serve,
+    Serve {
+        /// Installer-owned MCP client credential used by this stateless relay.
+        #[arg(long, value_enum)]
+        client: McpClientArgument,
+    },
+}
+
+/// Named MCP client registration used by the stateless stdio relay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpClientArgument {
+    /// Claude Code user-level MCP registration.
+    ClaudeCode,
+    /// Codex user-level MCP registration.
+    Codex,
+}
+
+impl From<McpClientArgument> for market_squawk_runtime::NamedClient {
+    fn from(value: McpClientArgument) -> Self {
+        match value {
+            McpClientArgument::ClaudeCode => Self::ClaudeCode,
+            McpClientArgument::Codex => Self::Codex,
+        }
+    }
+}
+
+/// Installed-service operation.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Prove authenticated readiness and show the non-secret bootstrap snapshot.
+    Status,
+    /// Start the verified installed service sibling and wait for authenticated readiness.
+    Start,
+}
+
+/// Durable-job operation.
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// List one bounded page of jobs in stable identity order.
+    List {
+        /// Resume strictly after this job identity.
+        #[arg(long)]
+        after_job_id: Option<Uuid>,
+        /// Maximum jobs returned.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Read the latest generation of one job.
+    Get {
+        /// Durable job identity.
+        job_id: Uuid,
+    },
+    /// Read one bounded event page after an exact generation cursor.
+    Watch {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Resume strictly after this event sequence; zero begins at the first event.
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+        /// Maximum events returned.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Request cancellation at the exact observed generation and sequence.
+    Cancel {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Release a confirmation-gated job at the exact observed generation and sequence.
+    Confirm {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Bounded reviewer or approval identity.
+        #[arg(long)]
+        confirmation_identity: String,
+        /// Lowercase SHA-256 of the exact confirmation evidence.
+        #[arg(long)]
+        evidence_sha256: String,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start the next admitted retry generation from the exact terminal observation.
+    Retry {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Exact-head release operation.

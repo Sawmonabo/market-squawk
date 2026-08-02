@@ -7,7 +7,7 @@
 //! use market_squawk::mcp::McpServer;
 //! ```
 
-mod audit;
+pub(crate) mod audit;
 #[cfg(test)]
 mod journal_worker;
 #[cfg(test)]

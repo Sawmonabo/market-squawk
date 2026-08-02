@@ -144,6 +144,7 @@ sha3 = "0.10"
 static_assertions = "1.1"
 # Authentication tokens and secret readback are compared without data-dependent early exits.
 subtle = "=2.6.1"
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 tauri = { version = "=2.11.5", default-features = false, features = ["wry"] }
 tauri-build = { version = "=2.6.3", default-features = false }
 # Tauri's supported GTK dialog backend matches the Linux GTK/WebKit runtime we package.

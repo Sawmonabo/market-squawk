@@ -13,6 +13,7 @@ const MAXIMUM_APPLICATION_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_ONNX_WORKER_BYTES: u64 = 256 * 1024 * 1024;
 const APPLICATION_BASENAME: &str = "market-squawk";
 const DESKTOP_APPLICATION_BASENAME: &str = "market-squawk-desktop";
+const SERVICE_APPLICATION_BASENAME: &str = "market-squawk-service";
 const ONNX_WORKER_BASENAME: &str = "market-squawk-onnx-worker";
 
 /// Returns the two-pass SHA-256 identity of the exact executable opened at startup.
@@ -57,6 +58,22 @@ pub(super) fn installed_application_program() -> Result<PathBuf, ExecutableIdent
     validate_installed_application_permissions(&application)?;
     let _digest = hash_stable_regular_file(&application, MAXIMUM_APPLICATION_BYTES)?;
     Ok(application)
+}
+
+/// Returns the exact installed service sibling after stable-file and permission verification.
+pub(super) fn installed_service_program() -> Result<PathBuf, ExecutableIdentityError> {
+    let executable = std::env::current_exe()
+        .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
+    let directory = executable
+        .parent()
+        .ok_or(ExecutableIdentityError::InvalidExecutablePath)?;
+    let service = directory.join(format!(
+        "{SERVICE_APPLICATION_BASENAME}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    validate_installed_application_permissions(&service)?;
+    let _digest = hash_stable_regular_file(&service, MAXIMUM_APPLICATION_BYTES)?;
+    Ok(service)
 }
 
 #[cfg(unix)]

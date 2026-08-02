@@ -48,6 +48,7 @@ and protocol facts immediately before each serialized lock mutation.
 | macOS service | Keep macOS 12+ and use a per-user LaunchAgent | Installer implementation and exact-floor evidence required |
 | Windows service | Use Task Scheduler 2.0 at the exact current-user SID and least privilege | Installer implementation and exact-floor evidence required |
 | Linux service | Use `systemd --user` without mandatory linger | Installer implementation and Ubuntu 24.04 evidence required |
+| Process identity | Admit sysinfo 0.39.6 with only `system` for PID/start-time verification | Task 5 manifest/lock and supported-platform evidence required |
 
 ## Rust runtime and HTTP
 
@@ -64,11 +65,22 @@ and protocol facts immediately before each serialized lock mutation.
 | Reqwest | 0.13.4 | Existing minimal JSON/Rustls client reused by the authenticated loopback `ApplicationClient`; no RMCP client feature | MIT/Apache-2.0; already admitted by provider and installer clients |
 | Rusqlite | 0.40.1 | Existing bundled SQLite boundary reused by the durable job repository | MIT; no external database service |
 | Process-wrap | 9.1.0 | Existing `std` wrapper with `process-group` on Unix and `job-object` on Windows | MIT/Apache-2.0; required for bounded worker-tree containment |
+| Sysinfo | 0.39.6 | `default-features = false`, `system` only; current-process and exact-PID start time | MIT; MSRV 1.95; supports Linux, macOS, and Windows |
 | Schemars | RMCP-owned 1.2.1 | No direct Market Squawk dependency; RMCP uses it for protocol schemas | MIT; do not force a duplicate 1.2.2 graph without direct production use |
 
 Do not enable default/full feature sets merely to make a compile pass. Task 1 performs one
 serialized resolution, inspects `cargo tree -e features`, duplicate versions, advisories, licenses,
 and the lock diff, then uses `--locked` for every later command.
+
+Task 5 found one missing cross-platform primitive: authenticated rendezvous records bind a PID and
+process-start discriminator, but the application had no supported-platform implementation for
+reading that discriminator. `sysinfo` 0.39.6 is admitted instead of repository-owned OS FFI. Its
+documented `Process::start_time` returns epoch seconds, `ProcessesToUpdate::Some` refreshes only the
+selected PID, and the upstream crate supports Linux, macOS, and Windows with Rust 1.95. Market
+Squawk enables only `system`; component, disk, network, user, serialization, and multithreading
+features remain disabled. PID/start time is one layer in stale-record rejection alongside the
+signed runtime generation, owner-only rendezvous, single-instance lease, and authenticated health
+check; it is not treated as a security credential.
 
 ## MCP protocol and RMCP
 
@@ -252,7 +264,10 @@ Sources were checked on 2026-08-01.
   0.7.0](https://github.com/tower-rs/tower-http/releases/tag/tower-http-v0.7.0);
   exact package documentation for [Reqwest 0.13.4](https://docs.rs/reqwest/0.13.4/reqwest/),
   [Rusqlite 0.40.1](https://docs.rs/rusqlite/0.40.1/rusqlite/), and
-  [Process-wrap 9.1.0](https://docs.rs/process-wrap/9.1.0/process_wrap/).
+  [Process-wrap 9.1.0](https://docs.rs/process-wrap/9.1.0/process_wrap/); [sysinfo 0.39.6
+  supported systems and MSRV](https://github.com/GuillaumeGomez/sysinfo), [process start-time
+  contract](https://docs.rs/sysinfo/0.39.6/sysinfo/struct.Process.html#method.start_time), and
+  [feature manifest](https://docs.rs/crate/sysinfo/0.39.6/source/Cargo.toml).
 - MCP: [stable 2026-07-28 protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic),
   [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
   [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),

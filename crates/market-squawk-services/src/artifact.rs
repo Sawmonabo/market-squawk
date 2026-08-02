@@ -188,15 +188,7 @@ impl ArtifactReference {
         let id = id.into();
         let sha256 = sha256.into();
         let media_type = media_type.into();
-        let valid_id = !id.is_empty()
-            && id.len() <= MAXIMUM_ARTIFACT_ID_BYTES
-            && id
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        let valid_id = valid_artifact_id(&id);
         let valid_digest = sha256.len() == 64
             && sha256
                 .bytes()
@@ -247,6 +239,44 @@ impl ArtifactReference {
     #[must_use]
     pub fn media_type(&self) -> &str {
         &self.media_type
+    }
+}
+
+/// Path-free, caller-bounded request to resolve one published artifact identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactResolveRequest {
+    id: Arc<str>,
+    maximum_bytes: NonZeroUsize,
+}
+
+impl ArtifactResolveRequest {
+    /// Binds an opaque artifact identifier to the maximum complete object the caller can retain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidReference`] when `id` violates the path-free artifact
+    /// identity grammar.
+    pub fn try_new(
+        id: impl Into<Arc<str>>,
+        maximum_bytes: NonZeroUsize,
+    ) -> Result<Self, ArtifactError> {
+        let id = id.into();
+        if !valid_artifact_id(&id) {
+            return Err(ArtifactError::InvalidReference);
+        }
+        Ok(Self { id, maximum_bytes })
+    }
+
+    /// Returns the exact opaque artifact identifier supplied by the caller.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the caller-selected complete-object byte ceiling.
+    #[must_use]
+    pub const fn maximum_bytes(&self) -> NonZeroUsize {
+        self.maximum_bytes
     }
 }
 
@@ -426,6 +456,48 @@ pub trait ArtifactRepository: Send + Sync + 'static {
         request: ArtifactReadRequest,
         context: ArtifactReadContext,
     ) -> Result<ArtifactRead, ArtifactError>;
+}
+
+/// Capability-confined resolver for complete registered artifact references.
+///
+/// Callers provide only an opaque identifier and never construct or receive a filesystem path.
+/// Implementations must resolve within their retained repository capability, verify the complete
+/// object's content identity and size, and observe the caller's cancellation, deadline, and byte
+/// ceiling before returning.
+#[async_trait]
+pub trait ArtifactReferenceResolver: Send + Sync + 'static {
+    /// Resolves one opaque identity into its exact verified repository reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::NotFound`] when no registered object matches `request`,
+    /// [`ArtifactError::ReadLimitExceeded`] when the object exceeds the caller's bound, or another
+    /// typed artifact failure when resolution cannot be verified.
+    async fn resolve(
+        &self,
+        request: ArtifactResolveRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactReference, ArtifactError>;
+}
+
+/// One repository identity that both resolves and reads its own artifact references.
+///
+/// This combined authority prevents callers from resolving a reference through one repository and
+/// accidentally presenting it to a different repository implementation.
+pub trait ArtifactAuthority: ArtifactRepository + ArtifactReferenceResolver {}
+
+impl<T> ArtifactAuthority for T where T: ArtifactRepository + ArtifactReferenceResolver {}
+
+fn valid_artifact_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAXIMUM_ARTIFACT_ID_BYTES
+        && id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 /// Artifact contract or repository failure.

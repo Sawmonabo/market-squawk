@@ -31,8 +31,9 @@ const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const STABLE_PROGRAMS: [ProgramName; 5] = [
+const STABLE_PROGRAMS: [ProgramName; 6] = [
     ProgramName::Desktop,
+    ProgramName::Service,
     ProgramName::Cli,
     ProgramName::CaptureHelper,
     ProgramName::OnnxWorker,

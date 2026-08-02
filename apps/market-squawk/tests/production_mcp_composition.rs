@@ -1,20 +1,142 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use market_squawk::{
-    LocalProduct, application::application_capabilities, mcp::LocalMcpComposition,
+    LocalProduct,
+    application::application_capabilities,
+    mcp::LocalMcpComposition,
+    service::{InstalledService, InstalledServiceConnector, InstalledServiceError},
 };
-use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
-use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
-use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext};
+use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service_capabilities};
+use market_squawk_platform::{
+    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
+};
+use market_squawk_runtime::NamedClient;
+use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext, RequestId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let environment = BTreeMap::<OsString, OsString>::new();
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &environment,
+        ConfigOverrides {
+            data_dir: Some(temporary.path().join("product")),
+            source_shutdown_ms: Some(60_000),
+            ..ConfigOverrides::default()
+        },
+    ))?;
+    let secrets: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
+        temporary.path().join("runtime-secrets"),
+        SecretValue::new("installed-service-test-unlock".to_owned())?,
+    )?);
+    let service =
+        InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await?;
+    assert!(matches!(
+        InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await,
+        Err(InstalledServiceError::AlreadyRunning)
+    ));
+
+    let connector =
+        InstalledServiceConnector::try_new_with_secret_store(&config, Arc::clone(&secrets))?;
+    let desktop = connector.connect(NamedClient::Desktop, Some("tauri://localhost".to_owned()))?;
+    let cli = connector.connect(NamedClient::Cli, None)?;
+    let bootstrap = desktop.bootstrap(CancellationToken::new()).await?;
+    assert_eq!(bootstrap["readiness"]["service"], true);
+    assert!(bootstrap["runtime"]["workspaceId"].is_string());
+
+    let jobs = cli
+        .invoke_operation(
+            RequestId::try_string("installed-job-list")?,
+            "Job.List",
+            json!({"afterJobId": null, "limit": 16}),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(jobs.result()["ok"], true);
+    assert_eq!(jobs.result()["value"]["snapshots"], json!([]));
+
+    let shutdown = CancellationToken::new();
+    let service_task = tokio::spawn(service.run(shutdown.clone()));
+    let claude = exercise_installed_relay(
+        NamedClient::ClaudeCode,
+        connector.connect_mcp_relay(NamedClient::ClaudeCode)?,
+    );
+    let codex = exercise_installed_relay(
+        NamedClient::Codex,
+        connector.connect_mcp_relay(NamedClient::Codex)?,
+    );
+    tokio::try_join!(claude, codex)?;
+
+    cli.probe_ready(CancellationToken::new()).await?;
+    shutdown.cancel();
+    service_task.await??;
+    assert!(connector.connect(NamedClient::Cli, None).is_err());
+    Ok(())
+}
+
+async fn exercise_installed_relay(
+    client: NamedClient,
+    transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
+) -> TestResult {
+    let relay = McpStdioRelay::try_new(
+        client,
+        transport,
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )?;
+    let (peer, relay_io) = tokio::io::duplex(64 * 1024);
+    let (relay_reader, relay_writer) = tokio::io::split(relay_io);
+    let task = tokio::spawn(relay.serve_unverified_io(
+        relay_reader,
+        relay_writer,
+        CancellationToken::new(),
+    ));
+    let (peer_reader, mut peer_writer) = tokio::io::split(peer);
+    let mut peer_reader = BufReader::new(peer_reader);
+    write_message(
+        &mut peer_writer,
+        json!({
+            "jsonrpc":"2.0","id":"installed-init","method":"initialize",
+            "params":{
+                "protocolVersion":"2026-07-28","capabilities":{},
+                "clientInfo":{"name":"market-squawk-tests","version":"1"}
+            }
+        }),
+    )
+    .await?;
+    let initialized = read_message(&mut peer_reader).await?;
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+    write_message(
+        &mut peer_writer,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await?;
+    write_message(
+        &mut peer_writer,
+        json!({"jsonrpc":"2.0","id":"installed-resources","method":"resources/list"}),
+    )
+    .await?;
+    let resources = read_message(&mut peer_reader).await?;
+    assert!(
+        resources["result"]["resources"]
+            .as_array()
+            .is_some_and(|resources| !resources.is_empty())
+    );
+    peer_writer.shutdown().await?;
+    let _exit = task.await??;
+    Ok(())
+}
 
 #[tokio::test]
 async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_controlled_artifacts()

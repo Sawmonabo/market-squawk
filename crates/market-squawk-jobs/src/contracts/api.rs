@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
+use serde::Serialize;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -14,7 +15,8 @@ use super::{
 };
 
 /// Bounded page of accepted events.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobEventPage {
     events: Box<[(JobEventSequence, JobEvent)]>,
     next: Option<JobEventSequence>,
@@ -49,14 +51,16 @@ impl JobEventPage {
 }
 
 /// Bounded page of nonterminal jobs awaiting recovery disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobRecoveryPage {
     snapshots: Box<[JobSnapshot]>,
     next: Option<RecoveryCursor>,
 }
 
 /// Bounded latest-generation job list.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobListPage {
     snapshots: Box<[JobSnapshot]>,
     next: Option<JobListCursor>,
@@ -157,6 +161,8 @@ pub trait JobRepository: Send + Sync {
         id: JobId,
         generation: JobGeneration,
     ) -> Result<JobSnapshot, JobRepositoryError>;
+    /// Reads the latest durable generation for one stable job identity.
+    async fn get_latest(&self, id: JobId) -> Result<JobSnapshot, JobRepositoryError>;
     /// Lists one latest generation per job through a bounded stable cursor.
     async fn list(
         &self,

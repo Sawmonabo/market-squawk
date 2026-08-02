@@ -8,7 +8,6 @@ use std::{
 use clap::Parser;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
-use market_squawk::{LocalProduct, LocalProductError};
 use market_squawk_installer::{
     InstallError, PlatformError, UninstallRequest, default_install_root, uninstall,
 };
@@ -19,6 +18,7 @@ use thiserror::Error;
 mod bridge;
 mod contracts;
 mod installation;
+mod service;
 
 use bridge::{
     DesktopState, application_invoke, desktop_bootstrap, installation_control,
@@ -84,8 +84,10 @@ enum DesktopStartupError {
     Configuration(#[from] ConfigError),
     #[error("complete product installation failed")]
     Installation(#[from] installation::InstallationStartupError),
-    #[error("local product initialization failed")]
-    Product(#[from] LocalProductError),
+    #[error("installed service initialization failed")]
+    Service(#[from] service::DesktopServiceError),
+    #[error("installed service bootstrap is incompatible with this dashboard")]
+    InvalidServiceBootstrap,
     #[error("desktop runtime initialization failed")]
     Tauri(#[from] tauri::Error),
     #[error("desktop state was already installed")]
@@ -214,16 +216,15 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         )
         .with_data_directory_default(desktop_data_directory),
     )?;
-    let product_config = config.clone();
-    let product =
-        tauri::async_runtime::block_on(async move { LocalProduct::try_new(product_config) })?;
-    let state = DesktopState::new(
-        product,
-        config,
-        config_path,
+    let service =
+        tauri::async_runtime::block_on(service::connect_or_start(&config, config_path.as_deref()))?;
+    let state = DesktopState::try_new(
+        service.application,
+        service.bootstrap,
         installation.root,
         installation.status,
-    );
+    )
+    .map_err(|_error| DesktopStartupError::InvalidServiceBootstrap)?;
     if !app.manage(state) {
         return Err(DesktopStartupError::DuplicateState);
     }
@@ -270,6 +271,7 @@ fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupErro
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct AppImageMcpLauncher {
     pub(crate) program: PathBuf,
@@ -277,6 +279,7 @@ pub(crate) struct AppImageMcpLauncher {
     cli_program: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AppImageMcpLauncherError;
 
@@ -345,11 +348,4 @@ pub(crate) fn appimage_mcp_launcher(
         program,
         cli_program,
     }))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) const fn appimage_mcp_launcher(
-    _cli_program: &Path,
-) -> Result<Option<AppImageMcpLauncher>, AppImageMcpLauncherError> {
-    Ok(None)
 }

@@ -3,7 +3,12 @@
 // enabled because this allowance is restricted to debug-assertion builds.
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
-use std::{ffi::OsString, sync::Arc, time::Duration};
+use std::{
+    ffi::OsString,
+    process::{Command as ProcessCommand, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -12,29 +17,32 @@ use market_squawk::{
     ProductionSourceProvider,
     cli::{
         Cli, Command, ConfigCommand, McpCommand, OutputFormat, ProductionSourceArgument,
-        ReleaseCommand, ReleaseEvidenceCommand, SourceCommand,
+        ReleaseCommand, ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
     },
     doctor,
-    local_product::execute_cli_command,
-    mcp::LocalMcpComposition,
+    local_product::{execute_installed_cli_command, verified_installed_service_program},
     paper_bot::local_paper_bot,
     release::execute_release_command,
     replay::replay_coinbase_journal,
+    service::InstalledServiceConnector,
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
         SourceShutdownError, SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
     },
+    termination::TerminationSignals,
 };
 use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_installer::{ProgramName, active_release_root_for_installed_program};
+use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
     ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
+use market_squawk_runtime::NamedClient;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -137,9 +145,22 @@ async fn run() -> Result<()> {
         | Command::Backtest { .. }
         | Command::Bot { .. }
         | Command::Execution { .. }
-        | Command::FairValue { .. }) => {
+        | Command::FairValue { .. }
+        | Command::Job { .. }) => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             run_product_command(config, command, output).await?;
+        }
+        Command::Service { command } => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            run_service_command(
+                command,
+                &config,
+                config_file.as_deref(),
+                &cli.log,
+                cli.json_logs,
+                output,
+            )
+            .await?;
         }
         Command::Doctor => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
@@ -227,18 +248,20 @@ async fn run() -> Result<()> {
             );
         }
         Command::Mcp { command } => {
-            if !matches!(command, None | Some(McpCommand::Serve)) {
-                anyhow::bail!("unsupported MCP operation");
-            }
+            let Some(McpCommand::Serve { client }) = command else {
+                anyhow::bail!("mcp serve requires --client claude-code or --client codex");
+            };
             let termination = TerminationSignals::install()?;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let product = LocalProduct::try_new(config)?;
-            let composition = LocalMcpComposition::try_new(
-                product.paths(),
-                product.application(),
-                product.artifacts(),
+            let client = NamedClient::from(client);
+            let transport =
+                InstalledServiceConnector::try_new(&config)?.connect_mcp_relay(client)?;
+            let relay = McpStdioRelay::try_new(
+                client,
+                transport,
+                McpLimits::try_from(McpLimitSpec::default())?,
             )?;
-            run_mcp_until_termination(composition, termination).await?;
+            run_mcp_until_termination(relay, termination).await?;
         }
         Command::Release { command } => {
             let benchmark_worker = matches!(
@@ -312,11 +335,11 @@ fn finish_with_cleanup<T>(primary: Result<T>, cleanup_failure: Option<anyhow::Er
 }
 
 async fn run_mcp_until_termination(
-    composition: LocalMcpComposition,
+    relay: McpStdioRelay,
     mut termination: TerminationSignals,
 ) -> Result<()> {
     let cancellation = CancellationToken::new();
-    let mut serving = Box::pin(composition.serve_stdio(cancellation.clone()));
+    let mut serving = Box::pin(relay.serve_stdio(cancellation.clone()));
     tokio::select! {
         result = &mut serving => {
             result?;
@@ -327,92 +350,9 @@ async fn run_mcp_until_termination(
             let completion = serving.await.map(|_exit| ()).map_err(anyhow::Error::from);
             match signal {
                 Ok(()) => completion,
-                Err(error) => finish_with_cleanup(Err(error), completion.err()),
+                Err(error) => finish_with_cleanup(Err(error.into()), completion.err()),
             }
         }
-    }
-}
-
-#[cfg(unix)]
-struct TerminationSignals {
-    interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl TerminationSignals {
-    fn install() -> Result<Self> {
-        Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("failed to install the SIGINT listener")?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("failed to install the SIGTERM listener")?,
-        })
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::select! {
-            observed = self.interrupt.recv() => {
-                observed.ok_or_else(|| anyhow!("SIGINT listener closed before observing a signal"))
-            }
-            observed = self.terminate.recv() => {
-                observed.ok_or_else(|| anyhow!("SIGTERM listener closed before observing a signal"))
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-struct TerminationSignals {
-    ctrl_c: tokio::signal::windows::CtrlC,
-    ctrl_break: tokio::signal::windows::CtrlBreak,
-    ctrl_close: tokio::signal::windows::CtrlClose,
-    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
-    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
-}
-
-#[cfg(windows)]
-impl TerminationSignals {
-    fn install() -> Result<Self> {
-        Ok(Self {
-            ctrl_c: tokio::signal::windows::ctrl_c()
-                .context("failed to install the Windows Ctrl-C listener")?,
-            ctrl_break: tokio::signal::windows::ctrl_break()
-                .context("failed to install the Windows Ctrl-Break listener")?,
-            ctrl_close: tokio::signal::windows::ctrl_close()
-                .context("failed to install the Windows Ctrl-Close listener")?,
-            ctrl_logoff: tokio::signal::windows::ctrl_logoff()
-                .context("failed to install the Windows Ctrl-Logoff listener")?,
-            ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()
-                .context("failed to install the Windows Ctrl-Shutdown listener")?,
-        })
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::select! {
-            observed = self.ctrl_c.recv() => observed,
-            observed = self.ctrl_break.recv() => observed,
-            observed = self.ctrl_close.recv() => observed,
-            observed = self.ctrl_logoff.recv() => observed,
-            observed = self.ctrl_shutdown.recv() => observed,
-        }
-        .ok_or_else(|| anyhow!("Windows termination listener closed before observing a signal"))
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct TerminationSignals;
-
-#[cfg(not(any(unix, windows)))]
-impl TerminationSignals {
-    const fn install() -> Result<Self> {
-        Ok(Self)
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to listen for the platform termination signal")
     }
 }
 
@@ -460,9 +400,9 @@ async fn run_product_command(
             command: SourceCommand::Setup { .. }
         }
     );
-    let product = LocalProduct::try_new(config)?;
-    let application = product.application();
-    let result = execute_cli_command(&product, command).await;
+    let connector = InstalledServiceConnector::try_new(&config)?;
+    let client = connector.connect(NamedClient::Cli, None)?;
+    let result = execute_installed_cli_command(&client, command).await;
     let portal_outcome = match &result {
         Ok(result) if opens_onboarding_portal => {
             match emit_result(output, result.summary(), result.value()) {
@@ -472,27 +412,125 @@ async fn run_product_command(
         }
         Ok(_) | Err(_) => Ok(()),
     };
-    let deadline = std::time::Instant::now()
-        .checked_add(application.shutdown_timeout())
-        .ok_or_else(|| anyhow!("application shutdown deadline overflow"));
-    application.begin_shutdown();
-    let cleanup_failure = match deadline {
-        Ok(deadline) => {
-            let shutdown = application.shutdown(deadline).await;
-            (!shutdown.is_complete())
-                .then(|| anyhow!("local application shutdown was incomplete: {shutdown:?}"))
-        }
-        Err(error) => Some(error),
-    };
     let result = match result {
         Ok(result) => portal_outcome.map(|()| result),
         Err(error) => Err(anyhow::Error::from(error)),
     };
-    let result = finish_with_cleanup(result, cleanup_failure)?;
+    let result = result?;
     if opens_onboarding_portal {
         Ok(())
     } else {
         emit_result(output, result.summary(), result.value())
+    }
+}
+
+async fn run_service_command(
+    command: ServiceCommand,
+    config: &AppConfig,
+    config_file: Option<&std::path::Path>,
+    log: &str,
+    json_logs: bool,
+    output: OutputFormat,
+) -> Result<()> {
+    let (summary, value) = match command {
+        ServiceCommand::Status => (
+            "installed service is ready",
+            installed_service_snapshot(config).await?,
+        ),
+        ServiceCommand::Start => {
+            start_installed_service(config, config_file, log, json_logs, Duration::from_secs(15))
+                .await?
+        }
+    };
+    emit_result(output, summary, &value)
+}
+
+async fn installed_service_snapshot(config: &AppConfig) -> Result<serde_json::Value> {
+    let connector = InstalledServiceConnector::try_new(config)?;
+    let client = connector.connect(NamedClient::Cli, None)?;
+    client.probe_ready(CancellationToken::new()).await?;
+    let bootstrap = client.bootstrap(CancellationToken::new()).await?;
+    Ok(serde_json::json!({
+        "status": "ready",
+        "bootstrap": bootstrap,
+    }))
+}
+
+async fn start_installed_service(
+    config: &AppConfig,
+    config_file: Option<&std::path::Path>,
+    log: &str,
+    json_logs: bool,
+    readiness_timeout: Duration,
+) -> Result<(&'static str, serde_json::Value)> {
+    if let Ok(snapshot) = installed_service_snapshot(config).await {
+        return Ok(("installed service was already ready", snapshot));
+    }
+
+    let program = verified_installed_service_program()?;
+    let mut command = ProcessCommand::new(program);
+    command
+        .arg("--data-dir")
+        .arg(config.data_dir())
+        .arg("--log")
+        .arg(log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(config_file) = config_file {
+        command.arg("--config").arg(config_file);
+    }
+    if let Some(training_release_root) = config.training_release_root() {
+        command
+            .arg("--training-release-root")
+            .arg(training_release_root);
+    }
+    if json_logs {
+        command.arg("--json-logs");
+    }
+    let mut child = command
+        .spawn()
+        .context("failed to start the verified installed Market Squawk service")?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(readiness_timeout)
+        .ok_or_else(|| anyhow!("installed-service readiness deadline overflow"))?;
+    loop {
+        if let Ok(snapshot) = installed_service_snapshot(config).await {
+            return Ok(("installed service started", snapshot));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect the installed-service child")?
+        {
+            anyhow::bail!("installed service exited before readiness with status {status}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            child
+                .kill()
+                .context("installed service missed readiness and could not be terminated")?;
+            reap_service_child(&mut child, Duration::from_secs(2)).await?;
+            anyhow::bail!("installed service did not reach authenticated readiness in time");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn reap_service_child(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("installed-service reap deadline overflow"))?;
+    loop {
+        if child
+            .try_wait()
+            .context("failed to inspect the terminating installed service")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("terminated installed service could not be reaped within its deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

@@ -255,6 +255,9 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
             .get(confirmation.id(), confirmation.generation())
             .await
             .map_err(map_repository)?;
+        if !self.runners.contains_key(current.spec().kind()) {
+            return Err(JobAuthorityError::UnknownKind);
+        }
         let pending = current
             .pending_confirmation()
             .ok_or(JobAuthorityError::Contract)?;
@@ -306,6 +309,9 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
             .get(id, generation)
             .await
             .map_err(map_repository)?;
+        if !self.runners.contains_key(failed.spec().kind()) {
+            return Err(JobAuthorityError::UnknownKind);
+        }
         if failed.sequence() != expected {
             return Err(JobAuthorityError::Contract);
         }

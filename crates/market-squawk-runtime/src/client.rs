@@ -8,9 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::{StreamExt as _, stream};
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_platform::SecretValue;
-use market_squawk_services::{JsonStructureLimits, validate_json_contract};
+use market_squawk_services::{JsonStructureLimits, RequestId, validate_json_contract};
 use reqwest::{Client, Method, Response, redirect::Policy};
 use serde::Serialize;
 use serde_json::Value;
@@ -105,6 +105,99 @@ impl LoopbackApplicationClient {
     #[must_use]
     pub const fn request_scope(&self) -> &ApplicationRequestScope {
         &self.scope
+    }
+
+    /// Performs an authenticated application-route readiness probe for the exact runtime
+    /// generation before its rendezvous record is published.
+    pub async fn probe_ready(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<(), ApplicationClientError> {
+        let exchange = async {
+            let response = self
+                .request(Method::GET, "/health")
+                .send()
+                .await
+                .map_err(|_| ApplicationClientError::Unavailable)?;
+            let bytes = self.response_bytes(response, &cancellation).await?;
+            validate_json_contract(
+                &serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|_| ApplicationClientError::InvalidResponse)?,
+                self.response_structure,
+                self.maximum_response_bytes,
+            )
+            .map_err(|_| ApplicationClientError::InvalidResponse)?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApplicationClientError::InvalidResponse)?;
+            let expected_runtime = serde_json::to_value(self.scope.runtime())
+                .map_err(|_| ApplicationClientError::InvalidResponse)?;
+            if value.get("status").and_then(Value::as_str) != Some("ready")
+                || value.get("runtime") != Some(&expected_runtime)
+            {
+                return Err(ApplicationClientError::InvalidResponse);
+            }
+            Ok(())
+        };
+        tokio::select! {
+            () = cancellation.cancelled() => Err(ApplicationClientError::Interrupted),
+            result = tokio::time::timeout(self.transport_timeout, exchange) => {
+                result.map_err(|_| ApplicationClientError::Interrupted)?
+            }
+        }
+    }
+
+    /// Reads the bounded, non-secret installed-product bootstrap snapshot.
+    pub async fn bootstrap(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Value, ApplicationClientError> {
+        let exchange = async {
+            let response = self
+                .request(Method::GET, "/app/v1/bootstrap")
+                .send()
+                .await
+                .map_err(|_| ApplicationClientError::Unavailable)?;
+            let bytes = self.response_bytes(response, &cancellation).await?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ApplicationClientError::InvalidResponse)?;
+            validate_json_contract(&value, self.response_structure, self.maximum_response_bytes)
+                .map_err(|_| ApplicationClientError::InvalidResponse)?;
+            Ok(value)
+        };
+        tokio::select! {
+            () = cancellation.cancelled() => Err(ApplicationClientError::Interrupted),
+            result = tokio::time::timeout(self.transport_timeout, exchange) => {
+                result.map_err(|_| ApplicationClientError::Interrupted)?
+            }
+        }
+    }
+
+    /// Builds and invokes one bounded operation without exposing domain/time construction to a
+    /// native presentation client.
+    pub async fn invoke_operation(
+        &self,
+        request_id: RequestId,
+        operation: &str,
+        arguments: Value,
+        lifetime: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<AppResponseEnvelope, ApplicationClientError> {
+        if lifetime.is_zero() || lifetime > self.transport_timeout {
+            return Err(ApplicationClientError::Rejected);
+        }
+        let now = client_wall_now()?;
+        let nanos = i64::try_from(lifetime.as_nanos())
+            .map_err(|_error| ApplicationClientError::Rejected)?;
+        let deadline = now
+            .checked_add_nanos(nanos)
+            .map_err(|_error| ApplicationClientError::Rejected)?;
+        let operation = SourceIdentifier::try_from(operation)
+            .map_err(|_error| ApplicationClientError::Rejected)?;
+        let request = self
+            .scope
+            .request(request_id, deadline, now, operation, arguments)
+            .map_err(|_error| ApplicationClientError::Rejected)?;
+        self.invoke(request, cancellation).await
     }
 
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {

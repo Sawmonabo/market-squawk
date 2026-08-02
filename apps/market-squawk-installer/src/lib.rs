@@ -133,15 +133,21 @@ mod tests {
         #[cfg(unix)]
         {
             let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
+            let stable_service = stable_program_path(&root, ProgramName::Service)?;
             assert_eq!(
                 active_release_root_for_installed_program(&stable_cli, ProgramName::Cli)?,
                 Some(active_release_root(&root)?)
             );
             let stable_capture = stable_program_path(&root, ProgramName::CaptureHelper)?;
             let stable_worker = stable_program_path(&root, ProgramName::OnnxWorker)?;
+            assert_eq!(stable_service.parent(), stable_cli.parent());
             assert_eq!(stable_capture.parent(), stable_cli.parent());
             assert_eq!(stable_worker.parent(), stable_cli.parent());
             assert_eq!(fs::read(&stable_cli)?, b"0.1.0:bin/market-squawk");
+            assert_eq!(
+                fs::read(stable_service)?,
+                b"0.1.0:bin/market-squawk-service"
+            );
             assert_eq!(
                 fs::read(stable_capture)?,
                 b"0.1.0:bin/market-squawk-capture-helper"

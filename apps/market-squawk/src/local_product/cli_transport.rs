@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use market_squawk_data::{AnalyticalReadError, QueryError};
 use market_squawk_platform::UserAuthorizedInputRoot;
+use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient};
 use market_squawk_services::{
     ArtifactError, JsonStructureLimits, RequestContext, RequestId, ServiceLimits,
     ToolResultMetadata, TypedToolResult,
@@ -16,13 +17,15 @@ use tokio_util::sync::CancellationToken;
 use super::{LocalProduct, cli_backtest, cli_dataset, cli_model, cli_portfolio, cli_provider};
 use crate::cli::{
     BacktestCommand, BotCommand, Command, DatasetCommand, ExecutionCommand, FairValueCommand,
-    FeatureCommand, IngestCommand, ModelCommand, PortfolioCommand, QueryCommand, SourceCommand,
+    FeatureCommand, IngestCommand, JobCommand, ModelCommand, PortfolioCommand, QueryCommand,
+    SourceCommand,
 };
 
 mod files;
 mod query;
 
 const CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CLI_INSTALLED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_JSON_MAXIMUM_BYTES: u64 = 8 * 1024 * 1024;
 const CLI_DEFAULT_MAXIMUM_ITEMS: usize = 10_000;
 const CLI_DEFAULT_MAXIMUM_BYTES: usize = 16 * 1024 * 1024;
@@ -89,6 +92,23 @@ pub enum CliProductError {
     /// The shared application rejected or failed the operation.
     #[error("application operation failed: {0}")]
     Application(#[from] market_squawk_services::ServiceError),
+    /// The installed service client rejected or could not complete the operation.
+    #[error(transparent)]
+    Client(#[from] ApplicationClientError),
+    /// The installed-service request contract could not be constructed.
+    #[error("CLI installed-service request is invalid")]
+    RuntimeRequest,
+    /// A mutation command omitted its explicit operator confirmation.
+    #[error("CLI mutation requires --confirm")]
+    ConfirmationRequired,
+    /// This operation still requires a service-owned staged-input consumer.
+    #[error(
+        "CLI operation `{operation}` requires a service-owned staged-input or specialized workflow"
+    )]
+    StagedInputRequired { operation: &'static str },
+    /// The operation is owned only by the shared installed service.
+    #[error("CLI operation `{operation}` requires the installed application service")]
+    InstalledServiceRequired { operation: &'static str },
     /// The paper command could not observe its requested stop signal.
     #[error("failed to wait for the paper-operation stop condition")]
     Signal,
@@ -99,22 +119,54 @@ pub async fn execute_cli_command(
     product: &LocalProduct,
     command: Command,
 ) -> Result<CliProductResult, CliProductError> {
+    execute(CliAuthority::Local(product), command).await
+}
+
+/// Executes one product command through the authenticated installed-service client.
+pub async fn execute_installed_cli_command(
+    client: &LoopbackApplicationClient,
+    command: Command,
+) -> Result<CliProductResult, CliProductError> {
+    execute(CliAuthority::Installed(client), command).await
+}
+
+#[derive(Clone, Copy)]
+enum CliAuthority<'a> {
+    Local(&'a LocalProduct),
+    Installed(&'a LoopbackApplicationClient),
+}
+
+impl<'a> CliAuthority<'a> {
+    fn local_for(self, operation: &'static str) -> Result<&'a LocalProduct, CliProductError> {
+        match self {
+            Self::Local(product) => Ok(product),
+            Self::Installed(_) => Err(CliProductError::StagedInputRequired { operation }),
+        }
+    }
+}
+
+async fn execute(
+    authority: CliAuthority<'_>,
+    command: Command,
+) -> Result<CliProductResult, CliProductError> {
     match command {
-        Command::Source { command } => source(product, command).await,
-        Command::Ingest { command } => ingest(product, command).await,
-        Command::Dataset { command } => dataset(product, command).await,
-        Command::Query { command } => query(product, command).await,
-        Command::Feature { command } => feature(product, command).await,
-        Command::Model { command } => model(product, command).await,
-        Command::Portfolio { command } => portfolio(product, command).await,
-        Command::Backtest { command } => backtest(product, command).await,
-        Command::Bot { command } => bot(product, command).await,
-        Command::Execution { command } => execution(product, command).await,
-        Command::FairValue { command } => fair_value(product, command).await,
+        Command::Source { command } => source(authority, command).await,
+        Command::Ingest { command } => ingest(authority, command).await,
+        Command::Dataset { command } => dataset(authority, command).await,
+        Command::Query { command } => query(authority, command).await,
+        Command::Feature { command } => feature(authority, command).await,
+        Command::Model { command } => model(authority, command).await,
+        Command::Portfolio { command } => portfolio(authority, command).await,
+        Command::Backtest { command } => backtest(authority, command).await,
+        Command::Bot { command } => bot(authority, command).await,
+        Command::Execution { command } => execution(authority, command).await,
+        Command::FairValue { command } => fair_value(authority, command).await,
+        Command::Job { command } => job(authority, command).await,
         Command::Init
         | Command::Config { .. }
         | Command::Capture(_)
         | Command::Release { .. }
+        | Command::Service { .. }
         | Command::Mcp { .. }
         | Command::Doctor
         | Command::Mock(_)
@@ -124,7 +176,7 @@ pub async fn execute_cli_command(
 }
 
 async fn source(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: SourceCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
@@ -179,7 +231,7 @@ async fn source(
                 "sourceCoverage": [provider],
             }))?;
             return invoke(
-                product,
+                authority,
                 "Source.Inspect",
                 &mut arguments,
                 Some(maximum_items),
@@ -189,7 +241,7 @@ async fn source(
         }
         SourceCommand::Activate { request, confirm } => {
             let value = cli_provider::activate_research_provider(
-                product,
+                authority.local_for("Source.Activate")?,
                 &request,
                 confirm,
                 CancellationToken::new(),
@@ -198,11 +250,11 @@ async fn source(
             return direct_result(value, "source adapter activated");
         }
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn ingest(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: IngestCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -219,7 +271,7 @@ async fn ingest(
                 "sourceCoverage": [provider],
             }))?;
             let discovery = invoke(
-                product,
+                authority,
                 "Source.Discover",
                 &mut discovery_arguments,
                 None,
@@ -237,7 +289,7 @@ async fn ingest(
                 "sourceCoverage": [provider],
             }))?;
             invoke(
-                product,
+                authority,
                 "Research.IngestSource",
                 &mut arguments,
                 None,
@@ -250,7 +302,16 @@ async fn ingest(
             object,
             dataset,
             confirm,
-        } => files::ingest_local_file(product, &manifest, object, dataset, confirm).await,
+        } => {
+            files::ingest_local_file(
+                authority.local_for("Research.IngestFile")?,
+                &manifest,
+                object,
+                dataset,
+                confirm,
+            )
+            .await
+        }
     }
 }
 
@@ -307,7 +368,7 @@ fn exact_discovery_receipt(
 }
 
 async fn dataset(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: DatasetCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -317,7 +378,7 @@ async fn dataset(
                 arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
             }
             invoke(
-                product,
+                authority,
                 "Research.ListDatasets",
                 &mut arguments,
                 None,
@@ -328,7 +389,7 @@ async fn dataset(
         DatasetCommand::Manifest { dataset } => {
             let mut arguments = json_object(json!({"dataset": dataset}))?;
             invoke(
-                product,
+                authority,
                 "Research.GetManifest",
                 &mut arguments,
                 None,
@@ -337,15 +398,19 @@ async fn dataset(
             .await
         }
         DatasetCommand::Build { request, confirm } => {
-            let value =
-                cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
+            let value = cli_dataset::build_point_in_time_dataset(
+                authority.local_for("Research.BuildDataset")?,
+                &request,
+                confirm,
+            )
+            .await?;
             direct_result(value, "point-in-time dataset published")
         }
     }
 }
 
 async fn query(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: QueryCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -366,7 +431,7 @@ async fn query(
                 "maximumBytes": maximum_bytes,
             }))?;
             invoke(
-                product,
+                authority,
                 "Analysis.ReadArtifact",
                 &mut arguments,
                 Some(1),
@@ -380,7 +445,7 @@ async fn query(
         } => {
             let mut arguments = json_object(json!({"dataset": dataset}))?;
             invoke(
-                product,
+                authority,
                 "Research.GetHistory",
                 &mut arguments,
                 Some(maximum_rows),
@@ -392,12 +457,20 @@ async fn query(
             dataset,
             statement,
             maximum_rows,
-        } => query::query_sql(product, &dataset, statement, maximum_rows).await,
+        } => {
+            query::query_sql(
+                authority.local_for("Research.QuerySql")?,
+                &dataset,
+                statement,
+                maximum_rows,
+            )
+            .await
+        }
     }
 }
 
 async fn feature(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: FeatureCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -407,7 +480,7 @@ async fn feature(
                 arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
             }
             invoke(
-                product,
+                authority,
                 "Analysis.GetFeatureDatasets",
                 &mut arguments,
                 None,
@@ -416,21 +489,29 @@ async fn feature(
             .await
         }
         FeatureCommand::Build { request, confirm } => {
-            let value =
-                cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
+            let value = cli_dataset::build_point_in_time_dataset(
+                authority.local_for("Analysis.BuildFeatureDataset")?,
+                &request,
+                confirm,
+            )
+            .await?;
             direct_result(value, "point-in-time feature dataset published")
         }
     }
 }
 
 async fn model(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: ModelCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         ModelCommand::List => ("Model.ListBundles", Map::new(), "model bundles listed"),
         ModelCommand::Admit { request, confirm } => {
-            let value = cli_model::admit_model_bundle(product, &request, confirm)?;
+            let value = cli_model::admit_model_bundle(
+                authority.local_for("Model.Admit")?,
+                &request,
+                confirm,
+            )?;
             return direct_result(value, "model bundle admitted");
         }
         ModelCommand::Metadata { model } => (
@@ -449,11 +530,11 @@ async fn model(
             "model prediction completed",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn portfolio(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: PortfolioCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
@@ -462,8 +543,13 @@ async fn portfolio(
             account,
             confirm,
         } => {
-            let value =
-                cli_portfolio::import_portfolio_manifest(product, &path, account, confirm).await?;
+            let value = cli_portfolio::import_portfolio_manifest(
+                authority.local_for("Portfolio.Import")?,
+                &path,
+                account,
+                confirm,
+            )
+            .await?;
             return Ok(CliProductResult {
                 summary: "portfolio manifest imported",
                 value,
@@ -495,15 +581,16 @@ async fn portfolio(
             "portfolio risk calculated",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn backtest(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: BacktestCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         BacktestCommand::Run { request, confirm } => {
+            authority.local_for("Analysis.RunBacktest")?;
             let value = cli_backtest::register_backtest_input(&request, confirm).await?;
             let arguments = json_object(value)?;
             ("Analysis.RunBacktest", arguments, "backtest completed")
@@ -514,18 +601,18 @@ async fn backtest(
             "backtest result read",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn bot(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: BotCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
         BotCommand::Status => {
             let mut arguments = Map::new();
             invoke(
-                product,
+                authority,
                 "Bot.GetStatus",
                 &mut arguments,
                 None,
@@ -551,7 +638,7 @@ async fn bot(
                 );
             }
             let started = invoke(
-                product,
+                authority,
                 "Bot.Start",
                 &mut start_arguments,
                 None,
@@ -569,7 +656,7 @@ async fn bot(
                 "confirm": true,
             }))?;
             let stopped = invoke(
-                product,
+                authority,
                 "Bot.Stop",
                 &mut stop_arguments,
                 None,
@@ -584,7 +671,7 @@ async fn bot(
         BotCommand::Stop { reason, confirm } => {
             let mut arguments = json_object(json!({"reason": reason, "confirm": confirm}))?;
             invoke(
-                product,
+                authority,
                 "Bot.Stop",
                 &mut arguments,
                 None,
@@ -596,7 +683,7 @@ async fn bot(
 }
 
 async fn execution(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: ExecutionCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
@@ -613,11 +700,11 @@ async fn execution(
             "paper execution reconciled",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn fair_value(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: FairValueCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
@@ -678,11 +765,138 @@ async fn fair_value(
             "fair-value measurement approved",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn job(
+    authority: CliAuthority<'_>,
+    command: JobCommand,
+) -> Result<CliProductResult, CliProductError> {
+    if matches!(authority, CliAuthority::Local(_)) {
+        return Err(CliProductError::InstalledServiceRequired { operation: "Job" });
+    }
+    let (operation, arguments, summary) = match command {
+        JobCommand::List {
+            after_job_id,
+            limit,
+        } => (
+            "Job.List",
+            json!({
+                "afterJobId": after_job_id.map(|value| value.to_string()),
+                "limit": limit,
+            }),
+            "durable jobs listed",
+        ),
+        JobCommand::Get { job_id } => (
+            "Job.Get",
+            json!({"jobId": job_id.to_string()}),
+            "durable job read",
+        ),
+        JobCommand::Watch {
+            job_id,
+            generation,
+            after_sequence,
+            limit,
+        } => (
+            "Job.Watch",
+            json!({
+                "jobId": job_id.to_string(),
+                "generation": generation,
+                "afterSequence": after_sequence,
+                "limit": limit,
+            }),
+            "durable job events read",
+        ),
+        JobCommand::Cancel {
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Cancel",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                }),
+                "durable job cancellation requested",
+            )
+        }
+        JobCommand::Confirm {
+            job_id,
+            generation,
+            expected_sequence,
+            confirmation_identity,
+            evidence_sha256,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Confirm",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "identity": confirmation_identity,
+                    "digest": sha256_digest_json(&evidence_sha256)?,
+                }),
+                "durable job confirmation recorded",
+            )
+        }
+        JobCommand::Retry {
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Retry",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                }),
+                "durable job retry requested",
+            )
+        }
+    };
+    invoke_without_result_limits(authority, operation, arguments, summary).await
+}
+
+fn require_confirmation(confirm: bool) -> Result<(), CliProductError> {
+    if confirm {
+        Ok(())
+    } else {
+        Err(CliProductError::ConfirmationRequired)
+    }
+}
+
+fn sha256_digest_json(value: &str) -> Result<Value, CliProductError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliProductError::RequestShape);
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or(CliProductError::RequestShape)?;
+        let low = hex_nibble(pair[1]).ok_or(CliProductError::RequestShape)?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(json!({"algorithm": "sha256", "bytes": bytes}))
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 async fn invoke(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     operation: &str,
     arguments: &mut Map<String, Value>,
     maximum_items: Option<usize>,
@@ -696,14 +910,68 @@ async fn invoke(
             "maximumBytes": CLI_DEFAULT_MAXIMUM_BYTES,
         }),
     );
-    let application = product.application();
-    let result = application
-        .invoke(operation, std::mem::take(arguments), request_context()?)
-        .await?;
-    Ok(CliProductResult {
+    invoke_without_result_limits(
+        authority,
+        operation,
+        Value::Object(std::mem::take(arguments)),
         summary,
-        value: result_envelope(&result),
-    })
+    )
+    .await
+}
+
+async fn invoke_without_result_limits(
+    authority: CliAuthority<'_>,
+    operation: &str,
+    arguments: Value,
+    summary: &'static str,
+) -> Result<CliProductResult, CliProductError> {
+    let value = match authority {
+        CliAuthority::Local(product) => {
+            let Value::Object(arguments) = arguments else {
+                return Err(CliProductError::RequestShape);
+            };
+            let result = product
+                .application()
+                .invoke(operation, arguments, request_context()?)
+                .await?;
+            result_envelope(&result)
+        }
+        CliAuthority::Installed(client) => {
+            let context = request_context()?;
+            let response = client
+                .invoke_operation(
+                    context.request_id().clone(),
+                    operation,
+                    arguments,
+                    CLI_INSTALLED_REQUEST_TIMEOUT,
+                    CancellationToken::new(),
+                )
+                .await?;
+            unwrap_application_result(response.result())?
+        }
+    };
+    Ok(CliProductResult { summary, value })
+}
+
+fn unwrap_application_result(result: &Value) -> Result<Value, CliProductError> {
+    let object = result.as_object().ok_or(CliProductError::RuntimeRequest)?;
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(true) => object
+            .get("value")
+            .cloned()
+            .ok_or(CliProductError::RuntimeRequest),
+        Some(false) => match object.get("error").and_then(Value::as_str) {
+            Some("rejected") => Err(CliProductError::Client(ApplicationClientError::Rejected)),
+            Some("interrupted") => {
+                Err(CliProductError::Client(ApplicationClientError::Interrupted))
+            }
+            Some("unavailable") => {
+                Err(CliProductError::Client(ApplicationClientError::Unavailable))
+            }
+            _ => Err(CliProductError::RuntimeRequest),
+        },
+        None => Err(CliProductError::RuntimeRequest),
+    }
 }
 
 fn direct_result(value: Value, summary: &'static str) -> Result<CliProductResult, CliProductError> {

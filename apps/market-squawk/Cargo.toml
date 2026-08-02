@@ -44,12 +44,21 @@ path = "src/main.rs"
 name = "market-squawk-capture-helper"
 path = "src/bin/market-squawk-capture-helper.rs"
 
+[[bin]]
+name = "market-squawk-service"
+path = "src/bin/market-squawk-service.rs"
+
+[[bin]]
+name = "market-squawk-mcp-relay"
+path = "src/bin/market-squawk-mcp-relay.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 atomicwrites = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 cap-fs-ext = { workspace = true }
@@ -97,6 +106,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

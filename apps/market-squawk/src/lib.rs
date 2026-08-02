@@ -15,6 +15,7 @@ pub mod diagnostic_engine;
 pub mod doctor;
 mod domain;
 pub mod features;
+pub mod jobs;
 pub mod live_runtime;
 mod live_source;
 pub mod local_product;
@@ -30,8 +31,10 @@ pub mod release;
 pub mod replay;
 pub mod research_service;
 pub mod risk;
+pub mod service;
 pub mod source;
 pub mod source_supervisor;
+pub mod termination;
 
 /// Platform journal compatibility facade retained for existing application imports.
 pub mod journal {
@@ -58,7 +61,8 @@ pub use live_source::{
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
 pub use local_product::{
-    LocalMcpAvailabilityError, LocalProduct, LocalProductError, verified_installed_cli_program,
+    LocalMcpAvailabilityError, LocalProduct, LocalProductError, LocalServiceAvailabilityError,
+    verified_installed_cli_program, verified_installed_service_program,
 };
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,

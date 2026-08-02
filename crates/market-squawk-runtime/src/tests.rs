@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_platform::SecretValue;
+use market_squawk_platform::{EncryptedFileSecretStore, SecretStore, SecretValue};
 use market_squawk_services::{JsonStructureLimits, RequestId};
 use serde_json::json;
 use tempfile::TempDir;
@@ -8,6 +10,33 @@ use uuid::Uuid;
 use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[test]
+fn planned_client_credentials_resume_the_exact_targets_after_restart() -> TestResult {
+    let directory = TempDir::new()?;
+    let unlock = "runtime-test-unlock-material";
+    let first_store: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
+        directory.path(),
+        SecretValue::new(unlock.to_owned())?,
+    )?);
+    let clients = [
+        (client_id(11)?, NamedClient::Desktop),
+        (client_id(12)?, NamedClient::Cli),
+    ];
+    let plans = CredentialRegistry::plan_set(first_store.as_ref(), clients)?;
+    let (first_registry, first) = CredentialRegistry::provision_planned_set(first_store, &plans)?;
+    drop(first_registry);
+
+    let restarted_store: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
+        directory.path(),
+        SecretValue::new(unlock.to_owned())?,
+    )?);
+    let (_restarted_registry, restarted) =
+        CredentialRegistry::provision_planned_set(restarted_store, &plans)?;
+
+    assert_eq!(first, restarted);
+    Ok(())
+}
 
 #[test]
 fn request_identity_mismatches_fail_closed_before_dispatch() -> TestResult {
@@ -133,6 +162,14 @@ fn rendezvous_is_secret_free_authenticated_and_bound_to_process_start() -> TestR
         )?)),
         Err(RendezvousError::StaleProcess)
     );
+    assert!(!authority.remove_if_current(runtime_identity(1, 2, 4)?)?);
+    assert!(authority.remove_if_current(record.runtime())?);
+    assert_eq!(authority.encoded_current()?, None);
+    assert_eq!(
+        authority.load(&FixedProcessVerifier::new(record.process_identity()))?,
+        None
+    );
+    assert!(!authority.remove_if_current(record.runtime())?);
     Ok(())
 }
 

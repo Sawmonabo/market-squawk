@@ -21,9 +21,10 @@ use market_squawk_mcp::{
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
     AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass, McpHandlerFactory,
-    McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec, McpLimits,
+    McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec, McpLimits, McpRelayError,
+    McpRelayExchange, McpRelayResponse, McpRelayTransport, McpRelayTransportError,
     McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest, McpServer,
-    MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
+    McpStdioRelay, MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
 };
 use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient};
 use market_squawk_services::{
@@ -1258,6 +1259,7 @@ impl McpResourceProvider for HttpResources {
 struct FixedHttpAuthenticator {
     alpha: AuthenticatedMcpClient,
     beta: AuthenticatedMcpClient,
+    calls: AtomicUsize,
 }
 
 impl FixedHttpAuthenticator {
@@ -1273,12 +1275,18 @@ impl FixedHttpAuthenticator {
                 1,
             )?,
             beta: AuthenticatedMcpClient::try_new(NamedClient::Codex, beta_id, generation, 1)?,
+            calls: AtomicUsize::new(0),
         })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
 impl McpHttpAuthenticator for FixedHttpAuthenticator {
     fn authenticate(&self, bearer_token: &str) -> Result<AuthenticatedMcpClient, McpHttpAuthError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         match bearer_token {
             "alpha" => Ok(self.alpha.clone()),
             "beta" => Ok(self.beta.clone()),
@@ -1371,9 +1379,10 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         Arc::new(RejectingArtifacts),
         Arc::new(HttpResources),
     )?;
+    let authenticator = Arc::new(FixedHttpAuthenticator::try_new()?);
     let http = McpHttpService::new(
         factory,
-        Arc::new(FixedHttpAuthenticator::try_new()?),
+        authenticator.clone(),
         HttpMcpConfig::try_new(
             ["127.0.0.1:43123"],
             ["http://localhost:43123"],
@@ -1521,6 +1530,7 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
     );
     assert_ne!(http.handle(missing_metadata).await.status(), StatusCode::OK);
 
+    let authenticated_before_transport_rejections = authenticator.call_count();
     let mut wrong_host = stateless_request(
         Method::POST,
         Some("alpha"),
@@ -1530,7 +1540,10 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         header::HOST,
         header::HeaderValue::from_static("example.com"),
     );
-    assert_ne!(http.handle(wrong_host).await.status(), StatusCode::OK);
+    assert_eq!(
+        http.handle(wrong_host).await.status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
 
     let mut wrong_origin = stateless_request(
         Method::POST,
@@ -1541,7 +1554,15 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         header::ORIGIN,
         header::HeaderValue::from_static("https://example.com"),
     );
-    assert_ne!(http.handle(wrong_origin).await.status(), StatusCode::OK);
+    assert_eq!(
+        http.handle(wrong_origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        authenticator.call_count(),
+        authenticated_before_transport_rejections,
+        "Host and Origin must be rejected before credential verification"
+    );
 
     let mut disagreement = stateless_request(
         Method::POST,
@@ -1608,5 +1629,264 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         format!("market-squawk://jobs/{}", job_id.as_uuid())
     );
     assert_eq!(job["result"]["contents"][0]["mimeType"], "application/json");
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct RecordingRelayTransport {
+    exchanges: Mutex<Vec<Value>>,
+    waiting_started: Notify,
+    waiting_cancelled: Notify,
+}
+
+struct RelayCancellationGuard<'a>(&'a Notify);
+
+impl Drop for RelayCancellationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InvalidRelayBoundary {
+    Status,
+    Oversized,
+}
+
+#[derive(Debug)]
+struct InvalidRelayTransport(InvalidRelayBoundary);
+
+#[async_trait]
+impl McpRelayTransport for InvalidRelayTransport {
+    async fn exchange(
+        &self,
+        request: McpRelayExchange,
+        _cancellation: CancellationToken,
+    ) -> Result<McpRelayResponse, McpRelayTransportError> {
+        let value: Value = serde_json::from_slice(request.body())
+            .map_err(|_error| McpRelayTransportError::InvalidRequest)?;
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        if request.method() == "initialize" {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "result":{
+                    "protocolVersion":"2026-07-28",
+                    "capabilities":{},
+                    "serverInfo":{"name":"market-squawk","version":"1.0.0"}
+                }
+            }))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+            return McpRelayResponse::try_new(200, Some("application/json"), body)
+                .map_err(|_error| McpRelayTransportError::InvalidResponse);
+        }
+        match self.0 {
+            InvalidRelayBoundary::Status => McpRelayResponse::try_new(401, None, Vec::new()),
+            InvalidRelayBoundary::Oversized => McpRelayResponse::try_new(
+                200,
+                Some("application/json"),
+                vec![b' '; request.maximum_response_bytes() + 1],
+            ),
+        }
+        .map_err(|_error| McpRelayTransportError::InvalidResponse)
+    }
+}
+
+#[async_trait]
+impl McpRelayTransport for RecordingRelayTransport {
+    async fn exchange(
+        &self,
+        request: McpRelayExchange,
+        _cancellation: CancellationToken,
+    ) -> Result<McpRelayResponse, McpRelayTransportError> {
+        assert!(request.maximum_response_bytes() > 0);
+        let body: Value = serde_json::from_slice(request.body())
+            .map_err(|_error| McpRelayTransportError::InvalidRequest)?;
+        self.exchanges
+            .lock()
+            .map_err(|_error| McpRelayTransportError::Unavailable)?
+            .push(body.clone());
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let result = match request.method() {
+            "initialize" => json!({
+                "protocolVersion":"2026-07-28",
+                "capabilities":{"tools":{},"resources":{}},
+                "serverInfo":{"name":"market-squawk","version":"1.0.0"}
+            }),
+            "tools/list" => json!({"tools":[{"name":"Market.Lookup"}]}),
+            "tools/call" => {
+                assert_eq!(request.name(), Some("Market.Wait"));
+                let _cancelled = RelayCancellationGuard(&self.waiting_cancelled);
+                self.waiting_started.notify_waiters();
+                std::future::pending::<()>().await;
+                return Err(McpRelayTransportError::Interrupted);
+            }
+            "resources/read" => {
+                assert_eq!(request.name(), Some("market-squawk://service"));
+                json!({"contents":[{
+                    "uri":"market-squawk://service",
+                    "mimeType":"application/json",
+                    "text":"{\"service\":\"shared\"}"
+                }]})
+            }
+            _ => return Err(McpRelayTransportError::InvalidRequest),
+        };
+        let encoded = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result}))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+        McpRelayResponse::try_new(200, Some("application/json"), encoded)
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)
+    }
+}
+
+#[tokio::test]
+async fn stdio_relay_proxies_tools_and_resources_to_the_shared_service()
+-> Result<(), Box<dyn Error>> {
+    let transport = Arc::new(RecordingRelayTransport::default());
+    let relay = McpStdioRelay::try_new(
+        NamedClient::Codex,
+        transport.clone(),
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )?;
+    let (client, service) = tokio::io::duplex(64 * 1024);
+    let (service_reader, service_writer) = tokio::io::split(service);
+    let task = tokio::spawn(relay.serve_unverified_io(
+        service_reader,
+        service_writer,
+        CancellationToken::new(),
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut client_reader = BufReader::new(client_reader);
+
+    async fn round_trip(
+        writer: &mut WriteHalf<DuplexStream>,
+        reader: &mut BufReader<ReadHalf<DuplexStream>>,
+        message: Value,
+    ) -> Result<Value, Box<dyn Error>> {
+        writer.write_all(&serde_json::to_vec(&message)?).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    let initialized = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"initialize",
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{},
+                "clientInfo":{"name":"codex","version":"1"}
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+    client_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await?;
+
+    let tools = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({"jsonrpc":"2.0","id":"tools","method":"tools/list","params":{}}),
+    )
+    .await?;
+    assert_eq!(tools["result"]["tools"][0]["name"], "Market.Lookup");
+    let resource = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"resource",
+            "method":"resources/read",
+            "params":{"uri":"market-squawk://service"}
+        }),
+    )
+    .await?;
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"],
+        "market-squawk://service"
+    );
+
+    let waiting_started = transport.waiting_started.notified();
+    tokio::pin!(waiting_started);
+    waiting_started.as_mut().enable();
+    client_writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"waiting\",\"method\":\"tools/call\",\"params\":{\"name\":\"Market.Wait\",\"arguments\":{}}}\n",
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(1), waiting_started).await?;
+    let waiting_cancelled = transport.waiting_cancelled.notified();
+    tokio::pin!(waiting_cancelled);
+    waiting_cancelled.as_mut().enable();
+    client_writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"waiting\"}}\n",
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(1), waiting_cancelled).await?;
+
+    client_writer.shutdown().await?;
+    assert_eq!(task.await??, ServerExit::EndOfInput);
+    let exchanges = transport
+        .exchanges
+        .lock()
+        .map_err(|_error| "relay exchange log was poisoned")?;
+    assert_eq!(exchanges.len(), 4);
+    for exchange in &exchanges[1..] {
+        assert_eq!(
+            exchange.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion"),
+            Some(&json!("2026-07-28"))
+        );
+        assert_eq!(
+            exchange.pointer("/params/_meta/io.modelcontextprotocol~1clientInfo/name"),
+            Some(&json!("codex"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_relay_rejects_invalid_http_status_and_excessive_response()
+-> Result<(), Box<dyn Error>> {
+    for boundary in [
+        InvalidRelayBoundary::Status,
+        InvalidRelayBoundary::Oversized,
+    ] {
+        let relay = McpStdioRelay::try_new(
+            NamedClient::ClaudeCode,
+            Arc::new(InvalidRelayTransport(boundary)),
+            McpLimits::try_from(McpLimitSpec::default())?,
+        )?;
+        let (mut client, service) = tokio::io::duplex(64 * 1024);
+        let (service_reader, service_writer) = tokio::io::split(service);
+        let task = tokio::spawn(relay.serve_unverified_io(
+            service_reader,
+            service_writer,
+            CancellationToken::new(),
+        ));
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1\"}}}\n",
+            )
+            .await?;
+        let mut initialized = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut initialized)
+            .await?;
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"method\":\"tools/list\",\"params\":{}}\n",
+            )
+            .await?;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task).await??;
+        assert!(matches!(outcome, Err(McpRelayError::InvalidResponse)));
+    }
     Ok(())
 }

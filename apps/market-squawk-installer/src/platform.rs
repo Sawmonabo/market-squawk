@@ -125,6 +125,8 @@ impl SupportedTarget {
 pub enum ProgramName {
     /// The permanent desktop application.
     Desktop,
+    /// The permanent installed application service.
+    Service,
     /// The Market Squawk command-line interface and stdio MCP server.
     Cli,
     /// The isolated raw-capture helper.
@@ -146,6 +148,7 @@ impl ProgramName {
         let suffix = target.executable_suffix();
         match self {
             Self::Desktop => PathBuf::from(format!("bin/market-squawk-desktop{suffix}")),
+            Self::Service => PathBuf::from(format!("bin/market-squawk-service{suffix}")),
             Self::Cli => PathBuf::from(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => {
                 PathBuf::from(format!("bin/market-squawk-capture-helper{suffix}"))

@@ -26,7 +26,7 @@ use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
-use market_squawk_services::{ArtifactError, ArtifactRepository};
+use market_squawk_services::{ArtifactAuthority, ArtifactError, ArtifactRepository};
 use market_squawk_sources::{AuthoritativeSourceRegistry, AuthorizationSubjectResolver};
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
@@ -36,10 +36,12 @@ pub use self::cli_dataset::CliDatasetError;
 pub use self::cli_model::CliModelAdmissionError;
 pub use self::cli_portfolio::CliPortfolioImportError;
 pub use self::cli_provider::CliProviderActivationError;
-pub use self::cli_transport::{CliProductError, CliProductResult, execute_cli_command};
+pub use self::cli_transport::{
+    CliProductError, CliProductResult, execute_cli_command, execute_installed_cli_command,
+};
 use self::executable::{
     ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
-    installed_application_program, installed_release_programs,
+    installed_application_program, installed_release_programs, installed_service_program,
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::provider_activation_state::DurableProviderActivationState;
@@ -63,7 +65,7 @@ use crate::application::{
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
 };
-use crate::artifact_repository::controlled_artifact_repository;
+use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
@@ -102,10 +104,23 @@ pub fn verified_installed_cli_program() -> Result<PathBuf, LocalMcpAvailabilityE
     installed_application_program().map_err(|_error| LocalMcpAvailabilityError::InstalledCli)
 }
 
+/// Returns the installed service sibling after stable-file and permission verification.
+///
+/// This is a native process-launch capability. It does not start the service or expose a path to
+/// WebView code.
+///
+/// # Errors
+///
+/// Returns [`LocalServiceAvailabilityError`] when the packaged service is absent, unsafe,
+/// unreadable, or changes during inspection.
+pub fn verified_installed_service_program() -> Result<PathBuf, LocalServiceAvailabilityError> {
+    installed_service_program().map_err(|_error| LocalServiceAvailabilityError::InstalledService)
+}
+
 /// Lifecycle owner for every production local authority required by the product surface.
 pub struct LocalProduct {
     paths: LocalPaths,
-    artifacts: Arc<dyn ArtifactRepository>,
+    artifacts: Arc<ControlledArtifactRepository>,
     application: Arc<Application>,
     research: Arc<ResearchService>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
@@ -153,6 +168,7 @@ impl LocalProduct {
             .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
         let artifacts =
             controlled_artifact_repository(paths.artifacts()?.clone(), maximum_artifact_bytes)?;
+        let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
         let source_store = LocalAuthorityStateStore::try_open(
@@ -237,7 +253,7 @@ impl LocalProduct {
         let research_domains = ResearchApplicationServices::new_with_artifacts(
             Arc::clone(&research),
             Arc::clone(&research_ingest) as Arc<_>,
-            Arc::clone(&artifacts),
+            Arc::clone(&artifact_repository),
         );
 
         let portfolio = Arc::new(PortfolioApplicationService::try_new(
@@ -271,7 +287,7 @@ impl LocalProduct {
             AnalysisDomainService::new_with_feature_reader_and_artifacts(
                 Arc::new(analysis_catalog()?),
                 research.analytical_reader(),
-                Arc::clone(&artifacts),
+                Arc::clone(&artifact_repository),
                 backtest_registrar,
                 backtests,
             ),
@@ -361,7 +377,12 @@ impl LocalProduct {
 
     /// Returns the sole controlled path-free artifact authority shared by local transports.
     pub fn artifacts(&self) -> Arc<dyn ArtifactRepository> {
-        Arc::clone(&self.artifacts)
+        Arc::clone(&self.artifacts) as Arc<dyn ArtifactRepository>
+    }
+
+    /// Returns one authority that resolves and reads its own verified artifact references.
+    pub fn artifact_authority(&self) -> Arc<dyn ArtifactAuthority> {
+        Arc::clone(&self.artifacts) as Arc<dyn ArtifactAuthority>
     }
 
     /// Returns the analytical publication and point-in-time read authority.
@@ -570,6 +591,14 @@ fn open_model_domain(
         evaluation_records,
     )?);
     Ok((runtime, model))
+}
+
+/// Installed service process availability could not be established.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LocalServiceAvailabilityError {
+    /// The packaged service sibling was absent, unsafe, unreadable, or changed during inspection.
+    #[error("installed Market Squawk service is unavailable")]
+    InstalledService,
 }
 
 /// Installed local MCP availability could not be established.

@@ -4,7 +4,10 @@ use std::{
     fmt,
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::limit::ConcurrencyLimitLayer;
 use uuid::Uuid;
@@ -71,6 +75,9 @@ pub enum OperationEffect {
 /// Application-owned dispatch seam mounted behind transport admission.
 #[async_trait]
 pub trait ApplicationDispatcher: fmt::Debug + Send + Sync + 'static {
+    /// Returns the bounded, non-secret installed-product snapshot for native presentation clients.
+    fn bootstrap(&self) -> Result<Value, DispatchError>;
+
     /// Returns the registered operation's effect before execution.
     fn effect(&self, operation: &SourceIdentifier) -> Result<OperationEffect, DispatchError>;
 
@@ -197,6 +204,8 @@ struct RouterState {
     replay: Arc<MutationReplayGuard>,
     events: Arc<EventHub>,
     inputs: Arc<InputStager>,
+    accepting: AtomicBool,
+    request_cancellation: CancellationToken,
 }
 
 impl fmt::Debug for RouterState {
@@ -247,8 +256,16 @@ impl RuntimeRouter {
                 replay,
                 events,
                 inputs,
+                accepting: AtomicBool::new(true),
+                request_cancellation: CancellationToken::new(),
             }),
         })
+    }
+
+    /// Child cancellation shared with same-listener protocol adapters for forced request drain.
+    #[must_use]
+    pub fn request_cancellation(&self) -> CancellationToken {
+        self.state.request_cancellation.child_token()
     }
 
     /// Builds the private routes and optionally merges one separately closed MCP router.
@@ -256,6 +273,7 @@ impl RuntimeRouter {
         let concurrency = self.state.limits.maximum_concurrency.get();
         let mut router = Router::new()
             .route("/health", get(health))
+            .route("/app/v1/bootstrap", get(bootstrap))
             .route("/app/v1/invoke", post(invoke))
             .route("/app/v1/inputs", post(stage_input))
             .route("/app/v1/events", post(read_events))
@@ -267,23 +285,97 @@ impl RuntimeRouter {
         router
     }
 
-    /// Serves only when the caller's bound listener exactly matches the configured loopback endpoint.
-    pub async fn serve(
+    /// Starts one owned server after validating the exact bound loopback listener.
+    pub fn start(
         self,
         listener: TcpListener,
         mcp: Option<Router>,
-        cancellation: CancellationToken,
-    ) -> Result<(), RouterError> {
+    ) -> Result<RuntimeServer, RouterError> {
         let local = listener
             .local_addr()
             .map_err(|_| RouterError::Unavailable)?;
         if local != self.state.endpoint || local.ip() != Ipv4Addr::LOCALHOST {
             return Err(RouterError::NonLoopback);
         }
-        axum::serve(listener, self.into_router(mcp))
-            .with_graceful_shutdown(cancellation.cancelled_owned())
-            .await
-            .map_err(|_| RouterError::Unavailable)
+        let state = Arc::clone(&self.state);
+        let admission = CancellationToken::new();
+        let shutdown = admission.clone();
+        let router = self.into_router(mcp);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .map_err(|_| RouterError::Unavailable)
+        });
+        Ok(RuntimeServer {
+            state,
+            admission,
+            task: Some(task),
+        })
+    }
+}
+
+/// Owned listener task with separate admission, graceful drain, and hard request cancellation.
+#[derive(Debug)]
+pub struct RuntimeServer {
+    state: Arc<RouterState>,
+    admission: CancellationToken,
+    task: Option<JoinHandle<Result<(), RouterError>>>,
+}
+
+impl RuntimeServer {
+    /// True when the listener task has already ended unexpectedly.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Stops accepting new requests without shutting down application/domain authorities.
+    pub fn begin_shutdown(&self) {
+        self.state.accepting.store(false, Ordering::Release);
+        self.admission.cancel();
+    }
+
+    /// Runs until caller cancellation or listener failure, then performs a bounded drain followed
+    /// by hard cancellation of request contexts and task abortion if required.
+    pub async fn run_until(
+        mut self,
+        cancellation: CancellationToken,
+        graceful_drain: Duration,
+        forced_drain: Duration,
+    ) -> Result<(), RouterError> {
+        if graceful_drain.is_zero() || forced_drain.is_zero() {
+            return Err(RouterError::InvalidConfiguration);
+        }
+        let mut task = self.task.take().ok_or(RouterError::Unavailable)?;
+        tokio::select! {
+            result = &mut task => {
+                return result.map_err(|_| RouterError::Unavailable)?;
+            }
+            () = cancellation.cancelled() => {}
+        }
+        self.begin_shutdown();
+        if let Ok(result) = tokio::time::timeout(graceful_drain, &mut task).await {
+            return result.map_err(|_| RouterError::Unavailable)?;
+        }
+        self.state.request_cancellation.cancel();
+        if let Ok(result) = tokio::time::timeout(forced_drain, &mut task).await {
+            return result.map_err(|_| RouterError::Unavailable)?;
+        }
+        task.abort();
+        let _ = task.await;
+        Err(RouterError::Unavailable)
+    }
+}
+
+impl Drop for RuntimeServer {
+    fn drop(&mut self) {
+        self.state.accepting.store(false, Ordering::Release);
+        self.admission.cancel();
+        self.state.request_cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -297,6 +389,19 @@ async fn health(State(state): State<Arc<RouterState>>, request: Request<Body>) -
         "protocol": ApplicationProtocolVersion::V1,
     }))
     .into_response()
+}
+
+async fn bootstrap(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
+    if authenticate_transport(&state, &request, Method::GET, None).is_err() {
+        return rejected(StatusCode::UNAUTHORIZED);
+    }
+    match state.dispatcher.bootstrap() {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(DispatchError::Rejected) => rejected(StatusCode::BAD_REQUEST),
+        Err(DispatchError::Unavailable | DispatchError::Interrupted) => {
+            rejected(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 async fn invoke(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
@@ -332,7 +437,7 @@ async fn invoke(State(state): State<Arc<RouterState>>, request: Request<Body>) -
     let context = match envelope.to_request_context(
         now,
         Instant::now(),
-        CancellationToken::new(),
+        state.request_cancellation.child_token(),
         state.limits.service_limits,
     ) {
         Ok(context) => context,
@@ -411,7 +516,12 @@ async fn stage_input(State(state): State<Arc<RouterState>>, request: Request<Bod
         Err(_) => return rejected(StatusCode::BAD_REQUEST),
     };
     let mut stream = request.into_body().into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::select! {
+        () = state.request_cancellation.cancelled() => {
+            return rejected(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        chunk = stream.next() => chunk,
+    } {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) => return rejected(StatusCode::BAD_REQUEST),
@@ -486,6 +596,9 @@ fn authenticate_transport(
     method: Method,
     content_type: Option<&str>,
 ) -> Result<AuthenticatedClient, StatusCode> {
+    if !state.accepting.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if request.method() != method {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }

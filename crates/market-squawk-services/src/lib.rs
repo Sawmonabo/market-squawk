@@ -12,8 +12,9 @@ mod response;
 mod traits;
 
 pub use artifact::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
-    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
+    ArtifactAuthority, ArtifactError, ArtifactPublication, ArtifactPublicationContext,
+    ArtifactRead, ArtifactReadContext, ArtifactReadRequest, ArtifactReference,
+    ArtifactReferenceResolver, ArtifactRepository, ArtifactResolveRequest,
     PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 pub use contract::{

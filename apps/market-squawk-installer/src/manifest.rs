@@ -285,6 +285,7 @@ impl ComponentIdentity {
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentRole {
     Desktop,
+    Service,
     Cli,
     CaptureHelper,
     OnnxWorker,
@@ -300,8 +301,9 @@ pub enum ComponentRole {
 }
 
 impl ComponentRole {
-    pub(crate) const REQUIRED: [Self; 10] = [
+    pub(crate) const REQUIRED: [Self; 11] = [
         Self::Desktop,
+        Self::Service,
         Self::Cli,
         Self::CaptureHelper,
         Self::OnnxWorker,
@@ -317,6 +319,7 @@ impl ComponentRole {
         matches!(
             self,
             Self::Desktop
+                | Self::Service
                 | Self::Cli
                 | Self::CaptureHelper
                 | Self::OnnxWorker
@@ -332,6 +335,7 @@ impl ComponentRole {
         let suffix = target.executable_suffix();
         match self {
             Self::Desktop => Some(format!("bin/market-squawk-desktop{suffix}")),
+            Self::Service => Some(format!("bin/market-squawk-service{suffix}")),
             Self::Cli => Some(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => Some(format!("bin/market-squawk-capture-helper{suffix}")),
             Self::OnnxWorker => Some(format!("bin/market-squawk-onnx-worker{suffix}")),

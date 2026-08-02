@@ -1,6 +1,6 @@
 //! Bounded, secret-free presentation contracts for the desktop WebView.
 
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 use market_squawk::ProviderPortalActivationRequest;
 use serde::{Deserialize, Serialize};
@@ -102,37 +102,13 @@ impl Readiness {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct McpClientInstruction {
-    program: String,
-    arguments: Vec<String>,
-    environment: BTreeMap<String, String>,
-    requires_desktop_exit: bool,
-}
-
-impl McpClientInstruction {
-    pub(crate) const fn new(
-        program: String,
-        arguments: Vec<String>,
-        environment: BTreeMap<String, String>,
-    ) -> Self {
-        Self {
-            program,
-            arguments,
-            environment,
-            requires_desktop_exit: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OperationSummary {
     name: String,
     description: String,
-    domain: &'static str,
-    authorization: &'static str,
+    domain: String,
+    authorization: String,
     read_only: bool,
     destructive: bool,
     input_schema: Value,
@@ -142,8 +118,8 @@ impl OperationSummary {
     pub(crate) fn new(
         name: String,
         description: String,
-        domain: &'static str,
-        authorization: &'static str,
+        domain: String,
+        authorization: String,
         read_only: bool,
         destructive: bool,
         input_schema: Value,
@@ -172,7 +148,7 @@ pub(crate) struct DesktopBootstrap {
     installation: Readiness,
     model_runtime: Readiness,
     mcp: Readiness,
-    mcp_client: Option<McpClientInstruction>,
+    mcp_client: Option<Value>,
     telemetry_enabled: bool,
     encrypted_file_fallback: Value,
     provider_profiles: Value,
@@ -194,7 +170,7 @@ impl DesktopBootstrap {
         installation: Readiness,
         model_runtime: Readiness,
         mcp: Readiness,
-        mcp_client: Option<McpClientInstruction>,
+        mcp_client: Option<Value>,
         encrypted_file_fallback: Value,
         provider_profiles: Value,
         provider_sessions: Value,

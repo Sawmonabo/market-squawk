@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     http::{
         HeaderMap, Method, Request, Response, StatusCode,
-        header::{ALLOW, AUTHORIZATION},
+        header::{ALLOW, AUTHORIZATION, HOST, ORIGIN},
     },
 };
 use http_body_util::BodyExt;
@@ -186,6 +186,7 @@ pub enum McpHttpConfigError {
 pub struct McpHttpService {
     inner: StreamableHttpService<StatelessMcpHandler, NeverSessionManager>,
     authenticator: Arc<dyn McpHttpAuthenticator>,
+    authority: Arc<HttpAuthority>,
     requests: Arc<Semaphore>,
 }
 
@@ -195,6 +196,7 @@ impl fmt::Debug for McpHttpService {
             .debug_struct("McpHttpService")
             .field("inner", &"[RMCP STREAMABLE HTTP SERVICE]")
             .field("authenticator", &"[CREDENTIAL VERIFIER]")
+            .field("authority", &self.authority)
             .field("requests", &"[GLOBAL REQUEST CEILING]")
             .finish_non_exhaustive()
     }
@@ -209,6 +211,10 @@ impl McpHttpService {
         config: HttpMcpConfig,
     ) -> Self {
         let limits = factory.limits();
+        let authority = Arc::new(HttpAuthority {
+            allowed_hosts: config.allowed_hosts.clone(),
+            allowed_origins: config.allowed_origins.clone(),
+        });
         let rmcp_config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
@@ -228,6 +234,7 @@ impl McpHttpService {
         Self {
             inner,
             authenticator,
+            authority,
             requests: Arc::new(Semaphore::new(limits.maximum_active_requests())),
         }
     }
@@ -242,6 +249,9 @@ impl McpHttpService {
             || request.headers().contains_key(LAST_EVENT_ID)
         {
             return response(StatusCode::BAD_REQUEST, None);
+        }
+        if let Err(status) = self.authority.validate(request.headers()) {
+            return response(status, None);
         }
         let token = match bearer_token(request.headers()) {
             Ok(token) => token,
@@ -277,6 +287,44 @@ impl McpHttpService {
         });
         Response::from_parts(parts, Body::new(body))
     }
+}
+
+#[derive(Debug)]
+struct HttpAuthority {
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+}
+
+impl HttpAuthority {
+    fn validate(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let host = single_header(headers, HOST).ok_or(StatusCode::MISDIRECTED_REQUEST)?;
+        if !self.allowed_hosts.iter().any(|allowed| allowed == host) {
+            return Err(StatusCode::MISDIRECTED_REQUEST);
+        }
+
+        let mut origins = headers.get_all(ORIGIN).iter();
+        let Some(origin) = origins.next() else {
+            return Ok(());
+        };
+        if origins.next().is_some() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let origin = origin.to_str().map_err(|_error| StatusCode::FORBIDDEN)?;
+        if self.allowed_origins.iter().any(|allowed| allowed == origin) {
+            Ok(())
+        } else {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+}
+
+fn single_header(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, McpHttpAuthError> {

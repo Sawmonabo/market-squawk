@@ -16,8 +16,10 @@ use thiserror::Error;
 
 use crate::{ApplicationProtocolRange, RuntimeIdentity};
 
-const RENDEZVOUS_FORMAT_VERSION: u16 = 1;
-const RENDEZVOUS_MAC_DOMAIN: &[u8] = b"market-squawk-rendezvous-v1\0";
+const LEGACY_RENDEZVOUS_FORMAT_VERSION: u16 = 1;
+const RENDEZVOUS_FORMAT_VERSION: u16 = 2;
+const LEGACY_RENDEZVOUS_MAC_DOMAIN: &[u8] = b"market-squawk-rendezvous-v1\0";
+const RENDEZVOUS_MAC_DOMAIN: &[u8] = b"market-squawk-rendezvous-v2\0";
 const MINIMUM_SIGNING_KEY_BYTES: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -113,9 +115,24 @@ impl RendezvousRecord {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, tag = "state", rename_all = "snake_case")]
+enum RendezvousState {
+    Active { record: RendezvousRecord },
+    Vacant { retired_runtime: RuntimeIdentity },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SignedRendezvous {
+    format_version: u16,
+    state: RendezvousState,
+    tag: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacySignedRendezvous {
     format_version: u16,
     record: RendezvousRecord,
     tag: String,
@@ -157,7 +174,12 @@ impl RendezvousAuthority {
 
     /// Atomically publishes an authenticated credential-free record.
     pub fn publish(&self, record: &RendezvousRecord) -> Result<(), RendezvousError> {
-        let encoded = encode_record(record, &self.signing_key)?;
+        let encoded = encode_state(
+            RendezvousState::Active {
+                record: record.clone(),
+            },
+            &self.signing_key,
+        )?;
         let store =
             LocalAuthorityStateStore::try_open(&self.root).map_err(|_| RendezvousError::Storage)?;
         store.store(&encoded).map_err(|_| RendezvousError::Storage)
@@ -168,16 +190,28 @@ impl RendezvousAuthority {
         &self,
         verifier: &dyn ProcessIdentityVerifier,
     ) -> Result<Option<RendezvousRecord>, RendezvousError> {
-        self.encoded_current()?
-            .map(|encoded| self.verify_encoded(&encoded, verifier))
-            .transpose()
+        let store =
+            LocalAuthorityStateStore::try_open(&self.root).map_err(|_| RendezvousError::Storage)?;
+        let Some(encoded) = store.load().map_err(|_| RendezvousError::Storage)? else {
+            return Ok(None);
+        };
+        match decode_authenticated_state(&encoded, &self.signing_key)? {
+            RendezvousState::Active { record } => verify_process(record, verifier).map(Some),
+            RendezvousState::Vacant { .. } => Ok(None),
+        }
     }
 
     /// Returns the current signed bytes for transport to a native client.
     pub fn encoded_current(&self) -> Result<Option<Vec<u8>>, RendezvousError> {
         let store =
             LocalAuthorityStateStore::try_open(&self.root).map_err(|_| RendezvousError::Storage)?;
-        store.load().map_err(|_| RendezvousError::Storage)
+        let Some(encoded) = store.load().map_err(|_| RendezvousError::Storage)? else {
+            return Ok(None);
+        };
+        match decode_authenticated_state(&encoded, &self.signing_key)? {
+            RendezvousState::Active { .. } => Ok(Some(encoded)),
+            RendezvousState::Vacant { .. } => Ok(None),
+        }
     }
 
     /// Authenticates supplied bytes before trusting any discovery field.
@@ -186,40 +220,109 @@ impl RendezvousAuthority {
         encoded: &[u8],
         verifier: &dyn ProcessIdentityVerifier,
     ) -> Result<RendezvousRecord, RendezvousError> {
-        let signed: SignedRendezvous =
-            serde_json::from_slice(encoded).map_err(|_| RendezvousError::Malformed)?;
-        if signed.format_version != RENDEZVOUS_FORMAT_VERSION {
-            return Err(RendezvousError::UnsupportedVersion);
+        match decode_authenticated_state(encoded, &self.signing_key)? {
+            RendezvousState::Active { record } => verify_process(record, verifier),
+            RendezvousState::Vacant { .. } => Err(RendezvousError::Retired),
         }
-        let payload = serde_json::to_vec(&signed.record).map_err(|_| RendezvousError::Malformed)?;
-        let tag = decode_hex_tag(&signed.tag)?;
-        let mut mac = rendezvous_mac(&self.signing_key)?;
-        mac.update(RENDEZVOUS_MAC_DOMAIN);
-        mac.update(&payload);
-        mac.verify_slice(&tag)
-            .map_err(|_| RendezvousError::AuthenticationFailed)?;
-        if !verifier.is_current(signed.record.process)? {
-            return Err(RendezvousError::StaleProcess);
+    }
+
+    /// Retires only the exact active runtime generation through the crash-safe state store.
+    ///
+    /// A signed vacant state is retained instead of deleting the two durable slots. Deleting the
+    /// slots separately could resurrect a stale peer after a crash between removals.
+    pub fn remove_if_current(&self, expected: RuntimeIdentity) -> Result<bool, RendezvousError> {
+        let store =
+            LocalAuthorityStateStore::try_open(&self.root).map_err(|_| RendezvousError::Storage)?;
+        let Some(encoded) = store.load().map_err(|_| RendezvousError::Storage)? else {
+            return Ok(false);
+        };
+        match decode_authenticated_state(&encoded, &self.signing_key)? {
+            RendezvousState::Active { record } if record.runtime() == expected => {
+                let retired = encode_state(
+                    RendezvousState::Vacant {
+                        retired_runtime: expected,
+                    },
+                    &self.signing_key,
+                )?;
+                store
+                    .store(&retired)
+                    .map_err(|_| RendezvousError::Storage)?;
+                Ok(true)
+            }
+            RendezvousState::Active { .. } | RendezvousState::Vacant { .. } => Ok(false),
         }
-        Ok(signed.record)
     }
 }
 
-fn encode_record(
-    record: &RendezvousRecord,
+fn encode_state(
+    state: RendezvousState,
     signing_key: &SecretValue,
 ) -> Result<Vec<u8>, RendezvousError> {
-    let payload = serde_json::to_vec(record).map_err(|_| RendezvousError::Malformed)?;
+    let payload = serde_json::to_vec(&state).map_err(|_| RendezvousError::Malformed)?;
     let mut mac = rendezvous_mac(signing_key)?;
     mac.update(RENDEZVOUS_MAC_DOMAIN);
     mac.update(&payload);
     let tag = encode_hex(&mac.finalize().into_bytes());
     serde_json::to_vec(&SignedRendezvous {
         format_version: RENDEZVOUS_FORMAT_VERSION,
-        record: record.clone(),
+        state,
         tag,
     })
     .map_err(|_| RendezvousError::Malformed)
+}
+
+fn decode_authenticated_state(
+    encoded: &[u8],
+    signing_key: &SecretValue,
+) -> Result<RendezvousState, RendezvousError> {
+    if let Ok(signed) = serde_json::from_slice::<SignedRendezvous>(encoded) {
+        if signed.format_version != RENDEZVOUS_FORMAT_VERSION {
+            return Err(RendezvousError::UnsupportedVersion);
+        }
+        let payload = serde_json::to_vec(&signed.state).map_err(|_| RendezvousError::Malformed)?;
+        verify_tag(signing_key, RENDEZVOUS_MAC_DOMAIN, &payload, &signed.tag)?;
+        return Ok(signed.state);
+    }
+    let legacy: LegacySignedRendezvous =
+        serde_json::from_slice(encoded).map_err(|_| RendezvousError::Malformed)?;
+    if legacy.format_version != LEGACY_RENDEZVOUS_FORMAT_VERSION {
+        return Err(RendezvousError::UnsupportedVersion);
+    }
+    let payload = serde_json::to_vec(&legacy.record).map_err(|_| RendezvousError::Malformed)?;
+    verify_tag(
+        signing_key,
+        LEGACY_RENDEZVOUS_MAC_DOMAIN,
+        &payload,
+        &legacy.tag,
+    )?;
+    Ok(RendezvousState::Active {
+        record: legacy.record,
+    })
+}
+
+fn verify_tag(
+    signing_key: &SecretValue,
+    domain: &[u8],
+    payload: &[u8],
+    encoded_tag: &str,
+) -> Result<(), RendezvousError> {
+    let tag = decode_hex_tag(encoded_tag)?;
+    let mut mac = rendezvous_mac(signing_key)?;
+    mac.update(domain);
+    mac.update(payload);
+    mac.verify_slice(&tag)
+        .map_err(|_| RendezvousError::AuthenticationFailed)
+}
+
+fn verify_process(
+    record: RendezvousRecord,
+    verifier: &dyn ProcessIdentityVerifier,
+) -> Result<RendezvousRecord, RendezvousError> {
+    if verifier.is_current(record.process)? {
+        Ok(record)
+    } else {
+        Err(RendezvousError::StaleProcess)
+    }
 }
 
 fn rendezvous_mac(key: &SecretValue) -> Result<HmacSha256, RendezvousError> {
@@ -282,4 +385,10 @@ pub enum RendezvousError {
     /// PID or process-start identity is no longer current.
     #[error("rendezvous process identity is stale")]
     StaleProcess,
+    /// The operating system could not verify process identity safely.
+    #[error("rendezvous process identity verification is unavailable")]
+    ProcessVerificationUnavailable,
+    /// Authenticated bytes contain a deliberately retired rendezvous state.
+    #[error("rendezvous record has been retired")]
+    Retired,
 }
