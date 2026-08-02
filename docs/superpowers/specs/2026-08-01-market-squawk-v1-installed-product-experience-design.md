@@ -6,13 +6,14 @@
 | --- | --- |
 | Document type | Consolidated V1 product, runtime, and interaction design specification |
 | Audience | Product, desktop, frontend, platform, data, modeling, MCP, security, and release reviewers |
-| Status | Proposed for user review; no implementation authority |
+| Status | Approved product design; implementation governed by the linked plan |
 | Design date | 2026-08-01 |
 | Audit commit | `f35d67247c93c3ab253aedbf663f6cb4c1f80b3e` |
 | Audit tree | `c958ff21cf11a67c6a9a189271e493c64ef26150` |
 | Release boundary | Required V1 feature experience before owner testing and release preparation |
 | Governing memory | [`docs/project-memory.md`](../../project-memory.md) |
 | Delivery authority | [`docs/plans/delivery-ledger.md`](../../plans/delivery-ledger.md) |
+| Implementation plan | [`2026-08-01-market-squawk-v1-installed-product-experience.md`](../plans/2026-08-01-market-squawk-v1-installed-product-experience.md) |
 
 This specification consolidates the approved installation research, Obsidian Signal interface,
 provider onboarding, complete local runtime, shared Model Context Protocol (MCP) service, and the
