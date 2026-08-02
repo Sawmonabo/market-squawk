@@ -1,7 +1,6 @@
 //! Windows current-user, least-privilege Task Scheduler registration.
 
 use std::ffi::OsString;
-use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -316,14 +315,16 @@ fn parse_task_semantics(text: &str) -> Result<TaskSemantics, ServiceRegistration
                 if root_closed || stack.len() >= 32 {
                     return Err(ServiceRegistrationError::NativeDocument);
                 }
-                let name = local_name(start.name().as_ref())?;
+                let qualified_name = start.name();
+                let name = local_name(qualified_name.as_ref())?;
                 let parent = stack.last().map(String::as_str);
                 structures.observe(parent, name)?;
                 values.begin(parent, name)?;
                 stack.push(name.to_owned());
             }
             Event::End(end) => {
-                let name = local_name(end.name().as_ref())?;
+                let qualified_name = end.name();
+                let name = local_name(qualified_name.as_ref())?;
                 if stack.pop().as_deref() != Some(name) {
                     return Err(ServiceRegistrationError::NativeDocument);
                 }

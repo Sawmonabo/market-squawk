@@ -237,7 +237,7 @@ fn screen_run_binds_exact_pit_inputs_and_rejects_semantic_substitution()
     )?;
     authority.append_dossier(dossier.clone())?;
 
-    let runs = authority.list_screen_runs(saved.revision().id(), 1)?;
+    let runs = authority.list_screen_runs(1)?;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].run().id(), execution.run().id());
     assert_eq!(runs[0].candidate_count(), 1);

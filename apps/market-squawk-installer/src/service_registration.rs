@@ -240,7 +240,7 @@ fn verify_owned_material(
     }
     #[cfg(not(test))]
     {
-        let desired = prepare_native(&material)?;
+        let desired = prepare_native(material)?;
         let mut expected = material.receipt.clone();
         expected.configuration_sha256 = desired.configuration_sha256.clone();
         if receipt != expected || receipt.pending_configuration_sha256.is_some() {
@@ -967,6 +967,7 @@ pub(super) fn sha256_bytes(bytes: &[u8]) -> Box<str> {
     format!("{:x}", Sha256::digest(bytes)).into()
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(super) fn xml_escape(value: &str) -> Result<String, ServiceRegistrationError> {
     if value.chars().any(|character| character.is_control()) {
         return Err(ServiceRegistrationError::Identity);
