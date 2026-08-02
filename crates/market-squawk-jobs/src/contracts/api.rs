@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::lifecycle::{
@@ -222,26 +226,301 @@ pub trait JobEventSink: Send + Sync {
     async fn append(&self, event: JobRunnerEvent) -> Result<JobSnapshot, JobRepositoryError>;
 }
 
+const PUBLICATION_OPEN: u8 = 0;
+const PUBLICATION_ACTIVE: u8 = 1;
+const CANCELLATION_ACTIVE: u8 = 2;
+const CANCELLATION_PERSISTED: u8 = 3;
+
+#[derive(Debug)]
+struct JobTerminalPublicationState {
+    state: AtomicU8,
+    latest_sequence: AtomicU64,
+    changed: Notify,
+}
+
+/// One process-local winner fence shared by cancellation and terminal publication.
+#[derive(Clone, Debug)]
+pub(crate) struct JobTerminalPublicationFence {
+    id: JobId,
+    generation: JobGeneration,
+    inner: Arc<JobTerminalPublicationState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobCancellationClaim {
+    Won,
+    PublicationActive,
+    CancellationActive,
+}
+
+impl JobTerminalPublicationFence {
+    pub(crate) fn new(
+        id: JobId,
+        generation: JobGeneration,
+        latest_sequence: JobEventSequence,
+    ) -> Self {
+        Self {
+            id,
+            generation,
+            inner: Arc::new(JobTerminalPublicationState {
+                state: AtomicU8::new(PUBLICATION_OPEN),
+                latest_sequence: AtomicU64::new(latest_sequence.get()),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn observe_sequence(&self, sequence: JobEventSequence) {
+        if self.inner.state.load(Ordering::Acquire) == PUBLICATION_OPEN {
+            self.inner
+                .latest_sequence
+                .store(sequence.get(), Ordering::Release);
+        }
+    }
+
+    pub(crate) fn claim_publication(
+        &self,
+        expected: JobEventSequence,
+    ) -> Result<JobTerminalPublicationPermit, JobRunError> {
+        if self.inner.latest_sequence.load(Ordering::Acquire) != expected.get() {
+            return Err(JobRunError::Recovery);
+        }
+        match self.inner.state.compare_exchange(
+            PUBLICATION_OPEN,
+            PUBLICATION_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(JobTerminalPublicationPermit {
+                id: self.id,
+                generation: self.generation,
+                expected,
+                fence: Some(self.clone()),
+            }),
+            Err(CANCELLATION_ACTIVE | CANCELLATION_PERSISTED) => Err(JobRunError::Cancelled),
+            Err(_) => Err(JobRunError::Recovery),
+        }
+    }
+
+    pub(crate) fn claim_cancellation(&self) -> JobCancellationClaim {
+        match self.inner.state.compare_exchange(
+            PUBLICATION_OPEN,
+            CANCELLATION_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => JobCancellationClaim::Won,
+            Err(PUBLICATION_ACTIVE) => JobCancellationClaim::PublicationActive,
+            Err(_) => JobCancellationClaim::CancellationActive,
+        }
+    }
+
+    pub(crate) fn cancellation_persisted(&self) {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                CANCELLATION_ACTIVE,
+                CANCELLATION_PERSISTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) fn cancellation_failed(&self) {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                CANCELLATION_ACTIVE,
+                PUBLICATION_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait_for_publication_release(&self) {
+        loop {
+            if self.inner.state.load(Ordering::Acquire) != PUBLICATION_ACTIVE {
+                return;
+            }
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.state.load(Ordering::Acquire) != PUBLICATION_ACTIVE {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn publication_is_active(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == PUBLICATION_ACTIVE
+    }
+
+    pub(crate) async fn wait_for_cancellation_resolution(&self) {
+        loop {
+            if self.inner.state.load(Ordering::Acquire) != CANCELLATION_ACTIVE {
+                return;
+            }
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.state.load(Ordering::Acquire) != CANCELLATION_ACTIVE {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// Opaque proof that one runner won terminal publication for an exact durable sequence.
+///
+/// The permit owns the same nonblocking winner fence used by cancellation. It must be moved into
+/// [`JobCompletion::Published`] after the domain result is durably published; the job authority
+/// retains it until the matching `Completed` event has been appended.
+pub struct JobTerminalPublicationPermit {
+    id: JobId,
+    generation: JobGeneration,
+    expected: JobEventSequence,
+    fence: Option<JobTerminalPublicationFence>,
+}
+
+impl JobTerminalPublicationPermit {
+    /// Seals the permit after the domain authority has durably committed its immutable result.
+    ///
+    /// An unsealed permit reopens publication when dropped. A sealed permit remains in the
+    /// publication state until the job authority durably appends `Completed`, including when that
+    /// append fails and requires restart reconciliation.
+    #[must_use]
+    pub fn seal(mut self) -> JobPublishedPermit {
+        JobPublishedPermit {
+            id: self.id,
+            generation: self.generation,
+            expected: self.expected,
+            fence: self.fence.take(),
+        }
+    }
+}
+
+impl Drop for JobTerminalPublicationPermit {
+    fn drop(&mut self) {
+        let Some(fence) = self.fence.take() else {
+            return;
+        };
+        if fence
+            .inner
+            .state
+            .compare_exchange(
+                PUBLICATION_ACTIVE,
+                PUBLICATION_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            fence.inner.changed.notify_waiters();
+        }
+    }
+}
+
+impl std::fmt::Debug for JobTerminalPublicationPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JobTerminalPublicationPermit")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .field("expected", &self.expected)
+            .field("fence", &"[TERMINAL PUBLICATION FENCE]")
+            .finish()
+    }
+}
+
+/// Opaque proof that the immutable business result was durably published.
+pub struct JobPublishedPermit {
+    id: JobId,
+    generation: JobGeneration,
+    expected: JobEventSequence,
+    fence: Option<JobTerminalPublicationFence>,
+}
+
+impl JobPublishedPermit {
+    pub(crate) const fn id(&self) -> JobId {
+        self.id
+    }
+
+    pub(crate) const fn generation(&self) -> JobGeneration {
+        self.generation
+    }
+
+    pub(crate) const fn expected(&self) -> JobEventSequence {
+        self.expected
+    }
+
+    pub(crate) fn completed(mut self) -> bool {
+        if let Some(fence) = self.fence.take()
+            && fence
+                .inner
+                .state
+                .compare_exchange(
+                    PUBLICATION_ACTIVE,
+                    PUBLICATION_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            fence.inner.changed.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl std::fmt::Debug for JobPublishedPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JobPublishedPermit")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .field("expected", &self.expected)
+            .field("fence", &"[SEALED TERMINAL PUBLICATION FENCE]")
+            .finish()
+    }
+}
+
 /// Cancellation and event authority for one runner generation.
 #[derive(Clone)]
 pub struct JobRunContext {
     snapshot: JobSnapshot,
     cancellation: CancellationToken,
     events: Arc<dyn JobEventSink>,
+    terminal_publication: JobTerminalPublicationFence,
 }
 
 impl JobRunContext {
     /// Binds a recovered or newly admitted snapshot to generation-scoped capabilities.
     #[must_use]
-    pub const fn new(
+    pub(crate) fn new(
         snapshot: JobSnapshot,
         cancellation: CancellationToken,
         events: Arc<dyn JobEventSink>,
+        terminal_publication: JobTerminalPublicationFence,
     ) -> Self {
         Self {
             snapshot,
             cancellation,
             events,
+            terminal_publication,
         }
     }
 
@@ -262,6 +541,20 @@ impl JobRunContext {
     pub const fn events(&self) -> &Arc<dyn JobEventSink> {
         &self.events
     }
+
+    /// Claims the exact generation sequence immediately before irreversible domain publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobRunError::Cancelled`] when durable cancellation won the generation gate.
+    /// Returns [`JobRunError::Recovery`] when the expected sequence is stale or durable job state
+    /// cannot be validated.
+    pub fn claim_terminal_publication(
+        &self,
+        expected: JobEventSequence,
+    ) -> Result<JobTerminalPublicationPermit, JobRunError> {
+        self.terminal_publication.claim_publication(expected)
+    }
 }
 
 impl std::fmt::Debug for JobRunContext {
@@ -271,6 +564,7 @@ impl std::fmt::Debug for JobRunContext {
             .field("snapshot", &self.snapshot)
             .field("cancellation", &"[CANCELLATION TOKEN]")
             .field("events", &"[JOB EVENT CAPABILITY]")
+            .field("terminal_publication", &"[TERMINAL PUBLICATION AUTHORITY]")
             .finish()
     }
 }
@@ -291,10 +585,10 @@ pub enum JobRecoveryDisposition {
 }
 
 /// Runner terminal outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum JobCompletion {
-    /// Domain authority published the immutable result.
-    Completed(JobResultReference),
+    /// Domain authority published the immutable result while holding the generation gate.
+    Published(JobResultReference, JobPublishedPermit),
     /// Execution paused cleanly at a generation-bound confirmation boundary.
     AwaitingConfirmation(JobConfirmationRequest),
     /// Cooperative cancellation completed without publishing a result.

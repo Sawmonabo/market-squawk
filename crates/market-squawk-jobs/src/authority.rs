@@ -8,11 +8,14 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    AdmittedJobSpec, FairJobScheduler, JobCompletion, JobConfirmation, JobContractError, JobEvent,
-    JobEventSequence, JobFailure, JobGeneration, JobId, JobLease, JobRecoveryDisposition,
-    JobRepository, JobRepositoryError, JobRunContext, JobRunError, JobRunner, JobSnapshot,
-    JobState, ScheduledJob, SchedulerError, SchedulerLimits,
+    AdmittedJobSpec, FairJobScheduler, JobCancellationClaim, JobCompletion, JobConfirmation,
+    JobContractError, JobEvent, JobEventSequence, JobFailure, JobGeneration, JobId, JobLease,
+    JobRecoveryDisposition, JobRepository, JobRepositoryError, JobRunContext, JobRunError,
+    JobRunner, JobSnapshot, JobState, JobTerminalPublicationFence, ScheduledJob, SchedulerError,
+    SchedulerLimits,
 };
+
+const PUBLICATION_RECONCILIATION_WAIT: Duration = Duration::from_secs(30);
 
 /// Complete job-authority failure without transport or storage leakage.
 #[derive(Clone, Copy, Debug, Eq, thiserror::Error, PartialEq)]
@@ -140,6 +143,7 @@ pub struct JobAuthority<R: JobRepository + 'static> {
     scheduler: FairJobScheduler,
     runners: Arc<BTreeMap<SourceIdentifier, Arc<dyn JobRunner>>>,
     cancellations: Arc<RwLock<BTreeMap<(JobId, JobGeneration), CancellationToken>>>,
+    publication_gates: Arc<RwLock<BTreeMap<(JobId, JobGeneration), JobTerminalPublicationFence>>>,
     tasks: Arc<RwLock<BTreeMap<(JobId, JobGeneration), AbortHandle>>>,
     admission: Arc<RwLock<()>>,
     tracker: TaskTracker,
@@ -153,6 +157,7 @@ impl<R: JobRepository + 'static> std::fmt::Debug for JobAuthority<R> {
             .field("scheduler", &self.scheduler)
             .field("runner_count", &self.runners.len())
             .field("cancellations", &"[GENERATION CANCELLATIONS]")
+            .field("publication_gates", &"[GENERATION PUBLICATION GATES]")
             .field("tasks", &"[GENERATION TASK HANDLES]")
             .finish_non_exhaustive()
     }
@@ -178,6 +183,7 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
             scheduler,
             runners: Arc::new(registry),
             cancellations: Arc::new(RwLock::new(BTreeMap::new())),
+            publication_gates: Arc::new(RwLock::new(BTreeMap::new())),
             tasks: Arc::new(RwLock::new(BTreeMap::new())),
             admission: Arc::new(RwLock::new(())),
             tracker,
@@ -215,32 +221,102 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
         expected: JobEventSequence,
         at: Timestamp,
     ) -> Result<JobSnapshot, JobAuthorityError> {
-        let current = self
-            .repository
-            .get(id, generation)
-            .await
-            .map_err(map_repository)?;
-        if current.sequence() != expected {
-            return Err(JobAuthorityError::Contract);
+        self.cancel_with_wait(
+            id,
+            generation,
+            expected,
+            at,
+            PUBLICATION_RECONCILIATION_WAIT,
+        )
+        .await
+    }
+
+    async fn cancel_with_wait(
+        &self,
+        id: JobId,
+        generation: JobGeneration,
+        expected: JobEventSequence,
+        at: Timestamp,
+        wait: Duration,
+    ) -> Result<JobSnapshot, JobAuthorityError> {
+        let fence =
+            generation_publication_gate(&self.publication_gates, (id, generation), expected).await;
+        loop {
+            match fence.claim_cancellation() {
+                JobCancellationClaim::Won => {
+                    let current = self.repository.get(id, generation).await.map_err(|error| {
+                        fence.cancellation_failed();
+                        map_repository(error)
+                    })?;
+                    if current.state() == JobState::Completed {
+                        fence.cancellation_failed();
+                        return Ok(current);
+                    }
+                    if current.sequence() != expected {
+                        fence.cancellation_failed();
+                        return Err(JobAuthorityError::Contract);
+                    }
+                    let snapshot = match self
+                        .repository
+                        .request_cancellation(id, generation, expected, at)
+                        .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            fence.cancellation_failed();
+                            return Err(map_repository(error));
+                        }
+                    };
+                    fence.cancellation_persisted();
+                    if let Some(cancellation) =
+                        self.cancellations.read().await.get(&(id, generation))
+                    {
+                        cancellation.cancel();
+                    } else if current.state() == JobState::AwaitingConfirmation {
+                        let event = JobEvent::try_new(
+                            JobState::Cancelled,
+                            snapshot.updated_at(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .map_err(map_contract)?;
+                        return self
+                            .repository
+                            .append(id, generation, snapshot.sequence(), event)
+                            .await
+                            .map_err(map_repository);
+                    }
+                    return Ok(snapshot);
+                }
+                JobCancellationClaim::PublicationActive => {
+                    tokio::time::timeout(wait, fence.wait_for_publication_release())
+                        .await
+                        .map_err(|_elapsed| JobAuthorityError::Repository)?;
+                    let current = self
+                        .repository
+                        .get(id, generation)
+                        .await
+                        .map_err(map_repository)?;
+                    if current.state().is_terminal() {
+                        return Ok(current);
+                    }
+                }
+                JobCancellationClaim::CancellationActive => {
+                    let current = self
+                        .repository
+                        .get(id, generation)
+                        .await
+                        .map_err(map_repository)?;
+                    if current.cancellation_requested() || current.state().is_terminal() {
+                        return Ok(current);
+                    }
+                    tokio::time::timeout(wait, fence.wait_for_cancellation_resolution())
+                        .await
+                        .map_err(|_elapsed| JobAuthorityError::Repository)?;
+                }
+            }
         }
-        let snapshot = self
-            .repository
-            .request_cancellation(id, generation, expected, at)
-            .await
-            .map_err(map_repository)?;
-        if let Some(cancellation) = self.cancellations.read().await.get(&(id, generation)) {
-            cancellation.cancel();
-        } else if current.state() == JobState::AwaitingConfirmation {
-            let event =
-                JobEvent::try_new(JobState::Cancelled, snapshot.updated_at(), None, None, None)
-                    .map_err(map_contract)?;
-            return self
-                .repository
-                .append(id, generation, snapshot.sequence(), event)
-                .await
-                .map_err(map_repository);
-        }
-        Ok(snapshot)
     }
 
     /// Confirms the exact pending request and resumes that same generation.
@@ -414,15 +490,15 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
         let _admission = self.admission.write().await;
         let queued = self.scheduler.close().map_err(map_scheduler)?;
         for job in queued {
-            if let Some(cancelling) = request_shutdown_cancellation(
-                self.repository.as_ref(),
-                job.id(),
-                job.generation(),
-                at,
-            )
-            .await?
-                && !cancelling.state().is_terminal()
-            {
+            let current = self
+                .repository
+                .get(job.id(), job.generation())
+                .await
+                .map_err(map_repository)?;
+            let cancelling = self
+                .cancel_with_wait(job.id(), job.generation(), current.sequence(), at, deadline)
+                .await?;
+            if !cancelling.state().is_terminal() {
                 let event = JobEvent::try_new(
                     JobState::Cancelled,
                     cancelling.updated_at(),
@@ -450,7 +526,13 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
             .map(|(identity, cancellation)| (*identity, cancellation.clone()))
             .collect::<Vec<_>>();
         for ((id, generation), cancellation) in &running {
-            request_shutdown_cancellation(self.repository.as_ref(), *id, *generation, at).await?;
+            let current = self
+                .repository
+                .get(*id, *generation)
+                .await
+                .map_err(map_repository)?;
+            self.cancel_with_wait(*id, *generation, current.sequence(), at, deadline)
+                .await?;
             cancellation.cancel();
         }
         self.tracker.close();
@@ -473,6 +555,11 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
                 continue;
             };
             if current.state().is_terminal() {
+                continue;
+            }
+            if let Some(fence) = self.publication_gates.read().await.get(&(*id, *generation))
+                && fence.publication_is_active()
+            {
                 continue;
             }
             let event = JobEvent::try_new(
@@ -522,6 +609,7 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
         let repository = self.repository.clone();
         let runners = self.runners.clone();
         let cancellations = self.cancellations.clone();
+        let publication_gates = self.publication_gates.clone();
         let tasks = self.tasks.clone();
         let task_tracker = self.tracker.clone();
         self.tracker.spawn(async move {
@@ -533,13 +621,22 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
                 };
                 let repository = repository.clone();
                 let cancellations = cancellations.clone();
+                let publication_gates = publication_gates.clone();
                 let tasks_for_run = tasks.clone();
                 let key = (job.id(), job.generation());
                 let (start, started) = oneshot::channel();
                 let handle = task_tracker.spawn(async move {
                     if started.await.is_ok() {
-                        run_scheduled(repository, cancellations, tasks_for_run, runner, job, lease)
-                            .await;
+                        run_scheduled(
+                            repository,
+                            cancellations,
+                            publication_gates,
+                            tasks_for_run,
+                            runner,
+                            job,
+                            lease,
+                        )
+                        .await;
                     }
                 });
                 tasks.write().await.insert(key, handle.abort_handle());
@@ -549,44 +646,25 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
     }
 }
 
-async fn request_shutdown_cancellation<R: JobRepository + ?Sized>(
-    repository: &R,
-    id: JobId,
-    generation: JobGeneration,
-    at: Timestamp,
-) -> Result<Option<JobSnapshot>, JobAuthorityError> {
-    for _attempt in 0..8 {
-        let current = repository
-            .get(id, generation)
-            .await
-            .map_err(map_repository)?;
-        if current.state().is_terminal() || current.state() == JobState::Cancelling {
-            return Ok(Some(current));
-        }
-        match repository
-            .request_cancellation(id, generation, current.sequence(), at)
-            .await
-        {
-            Ok(snapshot) => return Ok(Some(snapshot)),
-            Err(JobRepositoryError::Conflict) => continue,
-            Err(error) => return Err(map_repository(error)),
-        }
-    }
-    Err(JobAuthorityError::Repository)
-}
-
 async fn run_scheduled<R: JobRepository + 'static>(
     repository: Arc<R>,
     cancellations: Arc<RwLock<BTreeMap<(JobId, JobGeneration), CancellationToken>>>,
+    publication_gates: Arc<RwLock<BTreeMap<(JobId, JobGeneration), JobTerminalPublicationFence>>>,
     tasks: Arc<RwLock<BTreeMap<(JobId, JobGeneration), AbortHandle>>>,
     runner: Arc<dyn JobRunner>,
     job: ScheduledJob,
     lease: JobLease,
 ) {
     let Ok(mut snapshot) = repository.get(job.id(), job.generation()).await else {
-        finish_lease(&cancellations, &tasks, &job, lease).await;
+        finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
         return;
     };
+    let publication_gate = generation_publication_gate(
+        &publication_gates,
+        (job.id(), job.generation()),
+        snapshot.sequence(),
+    )
+    .await;
     let cancellation = CancellationToken::new();
     if snapshot.cancellation_requested() {
         cancellation.cancel();
@@ -600,14 +678,14 @@ async fn run_scheduled<R: JobRepository + 'static>(
         let Ok(preparing) =
             JobEvent::try_new(JobState::Preparing, snapshot.updated_at(), None, None, None)
         else {
-            finish_lease(&cancellations, &tasks, &job, lease).await;
+            finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
             return;
         };
         let Ok(next) = repository
             .append(job.id(), job.generation(), snapshot.sequence(), preparing)
             .await
         else {
-            finish_lease(&cancellations, &tasks, &job, lease).await;
+            finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
             return;
         };
         snapshot = next;
@@ -616,36 +694,34 @@ async fn run_scheduled<R: JobRepository + 'static>(
         let Ok(running) =
             JobEvent::try_new(JobState::Running, snapshot.updated_at(), None, None, None)
         else {
-            finish_lease(&cancellations, &tasks, &job, lease).await;
+            finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
             return;
         };
         let Ok(next) = repository
             .append(job.id(), job.generation(), snapshot.sequence(), running)
             .await
         else {
-            finish_lease(&cancellations, &tasks, &job, lease).await;
+            finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
             return;
         };
         snapshot = next;
     }
+    publication_gate.observe_sequence(snapshot.sequence());
     let sink = Arc::new(RepositoryEventSink {
         repository: repository.clone(),
         latest: RwLock::new(snapshot.clone()),
+        terminal_publication: publication_gate.clone(),
     });
-    let context = JobRunContext::new(snapshot, cancellation, sink);
+    let context = JobRunContext::new(snapshot, cancellation, sink, publication_gate.clone());
     let outcome = runner.run(context).await;
-    if let Ok(latest) = repository.get(job.id(), job.generation()).await
-        && let Ok(event) = completion_event(outcome, latest.updated_at())
-    {
-        let _ignored = repository
-            .append(job.id(), job.generation(), latest.sequence(), event)
-            .await;
-    }
-    finish_lease(&cancellations, &tasks, &job, lease).await;
+    let _ignored =
+        publish_terminal_outcome(repository.as_ref(), &job, &publication_gate, outcome).await;
+    finish_lease(&cancellations, &publication_gates, &tasks, &job, lease).await;
 }
 
 async fn finish_lease(
     cancellations: &RwLock<BTreeMap<(JobId, JobGeneration), CancellationToken>>,
+    publication_gates: &RwLock<BTreeMap<(JobId, JobGeneration), JobTerminalPublicationFence>>,
     tasks: &RwLock<BTreeMap<(JobId, JobGeneration), AbortHandle>>,
     job: &ScheduledJob,
     lease: JobLease,
@@ -654,14 +730,87 @@ async fn finish_lease(
         .write()
         .await
         .remove(&(job.id(), job.generation()));
+    let mut publication_gates = publication_gates.write().await;
+    let retain_for_reconciliation = publication_gates
+        .get(&(job.id(), job.generation()))
+        .is_some_and(JobTerminalPublicationFence::publication_is_active);
+    if !retain_for_reconciliation {
+        publication_gates.remove(&(job.id(), job.generation()));
+    }
+    drop(publication_gates);
     tasks.write().await.remove(&(job.id(), job.generation()));
     lease.release();
+}
+
+async fn generation_publication_gate(
+    gates: &RwLock<BTreeMap<(JobId, JobGeneration), JobTerminalPublicationFence>>,
+    identity: (JobId, JobGeneration),
+    latest_sequence: JobEventSequence,
+) -> JobTerminalPublicationFence {
+    if let Some(fence) = gates.read().await.get(&identity).cloned() {
+        return fence;
+    }
+    gates
+        .write()
+        .await
+        .entry(identity)
+        .or_insert_with(|| {
+            JobTerminalPublicationFence::new(identity.0, identity.1, latest_sequence)
+        })
+        .clone()
+}
+
+async fn publish_terminal_outcome<R: JobRepository + ?Sized>(
+    repository: &R,
+    job: &ScheduledJob,
+    publication_fence: &JobTerminalPublicationFence,
+    outcome: Result<JobCompletion, JobRunError>,
+) -> Result<JobSnapshot, JobRepositoryError> {
+    match outcome {
+        Ok(JobCompletion::Published(result, permit)) => {
+            if permit.id() != job.id() || permit.generation() != job.generation() {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            let current = repository.get(job.id(), job.generation()).await?;
+            if current.state() != JobState::Running || current.sequence() != permit.expected() {
+                return Err(JobRepositoryError::Conflict);
+            }
+            let event = JobEvent::try_new(
+                JobState::Completed,
+                current.updated_at(),
+                None,
+                Some(result),
+                None,
+            )
+            .map_err(|_error| JobRepositoryError::InvalidState)?;
+            let completed = repository
+                .append(job.id(), job.generation(), permit.expected(), event)
+                .await?;
+            if permit.completed() {
+                Ok(completed)
+            } else {
+                Err(JobRepositoryError::InvalidState)
+            }
+        }
+        outcome => {
+            if publication_fence.publication_is_active() {
+                return Err(JobRepositoryError::InvalidState);
+            }
+            let latest = repository.get(job.id(), job.generation()).await?;
+            let event = completion_event(outcome, latest.updated_at())
+                .map_err(|_error| JobRepositoryError::InvalidState)?;
+            repository
+                .append(job.id(), job.generation(), latest.sequence(), event)
+                .await
+        }
+    }
 }
 
 #[derive(Debug)]
 struct RepositoryEventSink<R: JobRepository> {
     repository: Arc<R>,
     latest: RwLock<JobSnapshot>,
+    terminal_publication: JobTerminalPublicationFence,
 }
 
 #[async_trait::async_trait]
@@ -691,6 +840,7 @@ impl<R: JobRepository + 'static> crate::JobEventSink for RepositoryEventSink<R> 
             )
             .await?;
         *self.latest.write().await = next.clone();
+        self.terminal_publication.observe_sequence(next.sequence());
         Ok(next)
     }
 }
@@ -700,8 +850,8 @@ fn completion_event(
     at: Timestamp,
 ) -> Result<JobEvent, JobContractError> {
     match outcome {
-        Ok(JobCompletion::Completed(result)) => {
-            JobEvent::try_new(JobState::Completed, at, None, Some(result), None)
+        Ok(JobCompletion::Published(_result, _permit)) => {
+            Err(JobContractError::UnexpectedTerminalEvidence)
         }
         Ok(JobCompletion::AwaitingConfirmation(confirmation)) => {
             JobEvent::try_new_with_confirmation(
