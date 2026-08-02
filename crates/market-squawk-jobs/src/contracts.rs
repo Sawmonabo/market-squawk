@@ -1,15 +1,22 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, str::FromStr};
 
-use async_trait::async_trait;
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_services::{ArtifactReference, RequestId};
+use market_squawk_services::RequestId;
 use serde::Serialize;
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod api;
+mod lifecycle;
+
+pub use api::*;
+pub use lifecycle::*;
 
 const MAXIMUM_RECOVERY_PAGE_ITEMS: usize = 1_024;
 const MAXIMUM_EVENT_PAGE_ITEMS: usize = 4_096;
+const MAXIMUM_JOB_ARTIFACTS: usize = 64;
+const MAXIMUM_JOB_ARTIFACT_BYTES: usize = 1_073_741_824;
+const MAXIMUM_JOB_ATTEMPTS: u64 = 64;
 
 /// Invalid durable-job contract input.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -17,12 +24,21 @@ pub enum JobContractError {
     /// UUID identities must not use the nil value.
     #[error("job identity must not be nil")]
     NilIdentity,
+    /// Text was not a valid UUID.
+    #[error("job identity is not a valid UUID")]
+    InvalidIdentityText,
     /// A job generation is one-based.
     #[error("job generation must be nonzero")]
     ZeroGeneration,
+    /// A generation or sequence cannot advance without overflow.
+    #[error("job counter overflow")]
+    CounterOverflow,
     /// A requested page size was zero or exceeded its hard ceiling.
     #[error("job page limit is invalid")]
     InvalidPageLimit,
+    /// A job attempt ceiling was zero or exceeded the code-owned maximum.
+    #[error("job attempt limit is invalid")]
+    InvalidAttemptLimit,
     /// Completed progress exceeded the declared total.
     #[error("completed job units exceed total units")]
     ProgressExceedsTotal,
@@ -36,8 +52,11 @@ pub enum JobContractError {
     #[error("failed job snapshot requires failure evidence")]
     MissingFailure,
     /// A nonterminal snapshot claimed terminal result or failure evidence.
-    #[error("nonterminal job snapshot contains terminal evidence")]
+    #[error("job snapshot contains incompatible terminal evidence")]
     UnexpectedTerminalEvidence,
+    /// Result artifacts exceeded the count or aggregate-byte ceiling.
+    #[error("job result artifacts exceed admitted bounds")]
+    ArtifactLimitExceeded,
 }
 
 /// Stable identity for one durable job.
@@ -55,10 +74,24 @@ impl JobId {
         }
     }
 
+    /// Parses a non-nil UUID job identity.
+    pub fn try_from_str(value: &str) -> Result<Self, JobContractError> {
+        value.parse()
+    }
+
     /// Returns the UUID value.
     #[must_use]
     pub const fn as_uuid(self) -> Uuid {
         self.0
+    }
+}
+
+impl FromStr for JobId {
+    type Err = JobContractError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(value).map_err(|_| JobContractError::InvalidIdentityText)?;
+        Self::try_from_uuid(uuid)
     }
 }
 
@@ -80,6 +113,14 @@ impl JobGeneration {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    /// Advances to the next generation without overflow.
+    pub fn checked_next(self) -> Result<Self, JobContractError> {
+        self.get()
+            .checked_add(1)
+            .ok_or(JobContractError::CounterOverflow)
+            .and_then(Self::try_new)
+    }
 }
 
 /// Monotonic event sequence within one job generation. Zero is the initial cursor.
@@ -99,49 +140,77 @@ impl JobEventSequence {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Advances to the next sequence without overflow.
+    pub fn checked_next(self) -> Result<Self, JobContractError> {
+        self.get()
+            .checked_add(1)
+            .map(Self)
+            .ok_or(JobContractError::CounterOverflow)
+    }
 }
 
-/// Maximum records returned by one nonterminal-recovery page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryPageLimit(usize);
+/// Finite ceiling on durable execution generations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct JobAttemptLimit(NonZeroU64);
 
-impl RecoveryPageLimit {
-    /// Creates a positive limit no larger than 1,024 snapshots.
-    pub fn try_new(value: usize) -> Result<Self, JobContractError> {
-        if value == 0 || value > MAXIMUM_RECOVERY_PAGE_ITEMS {
-            Err(JobContractError::InvalidPageLimit)
-        } else {
-            Ok(Self(value))
+impl JobAttemptLimit {
+    /// Admits between one and 64 execution generations.
+    pub fn try_new(value: u64) -> Result<Self, JobContractError> {
+        match NonZeroU64::new(value) {
+            Some(value) if value.get() <= MAXIMUM_JOB_ATTEMPTS => Ok(Self(value)),
+            _ => Err(JobContractError::InvalidAttemptLimit),
         }
     }
 
-    /// Returns the admitted item count.
+    /// Returns the admitted generation ceiling.
     #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
+    pub const fn get(self) -> u64 {
+        self.0.get()
     }
 }
 
-/// Maximum records returned by one job-event page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JobEventPageLimit(usize);
+macro_rules! page_limit {
+    ($name:ident, $maximum:expr, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name(usize);
 
-impl JobEventPageLimit {
-    /// Creates a positive limit no larger than 4,096 events.
-    pub fn try_new(value: usize) -> Result<Self, JobContractError> {
-        if value == 0 || value > MAXIMUM_EVENT_PAGE_ITEMS {
-            Err(JobContractError::InvalidPageLimit)
-        } else {
-            Ok(Self(value))
+        impl $name {
+            /// Creates a positive limit no larger than its code-owned ceiling.
+            pub fn try_new(value: usize) -> Result<Self, JobContractError> {
+                if value == 0 || value > $maximum {
+                    Err(JobContractError::InvalidPageLimit)
+                } else {
+                    Ok(Self(value))
+                }
+            }
+
+            /// Returns the admitted item count.
+            #[must_use]
+            pub const fn get(self) -> usize {
+                self.0
+            }
         }
-    }
-
-    /// Returns the admitted item count.
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
+    };
 }
+
+page_limit!(
+    RecoveryPageLimit,
+    MAXIMUM_RECOVERY_PAGE_ITEMS,
+    "Maximum records returned by one nonterminal-recovery page."
+);
+page_limit!(
+    JobEventPageLimit,
+    MAXIMUM_EVENT_PAGE_ITEMS,
+    "Maximum records returned by one job-event page."
+);
+page_limit!(
+    JobListPageLimit,
+    MAXIMUM_RECOVERY_PAGE_ITEMS,
+    "Maximum latest-generation snapshots returned by one job-list page."
+);
 
 /// Opaque continuation returned by nonterminal recovery scans.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -162,7 +231,24 @@ impl RecoveryCursor {
     }
 }
 
-/// Durable lifecycle state. Terminal states are completed, failed, and cancelled.
+/// Opaque continuation returned by bounded latest-job lists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct JobListCursor(SourceIdentifier);
+
+impl JobListCursor {
+    /// Wraps a repository-minted opaque continuation.
+    #[must_use]
+    pub const fn new(value: SourceIdentifier) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn as_source_identifier(&self) -> &SourceIdentifier {
+        &self.0
+    }
+}
+
+/// Durable lifecycle state. Completed, failed, cancelled, and interrupted end a generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -174,13 +260,13 @@ pub enum JobState {
     Running,
     /// Runner requires an explicit application confirmation.
     AwaitingConfirmation,
-    /// Cooperative cancellation has been requested.
+    /// Cooperative cancellation has been durably requested.
     Cancelling,
     /// Immutable domain result authority published successfully.
     Completed,
     /// Execution terminated with typed failure evidence.
     Failed,
-    /// Cooperative cancellation completed.
+    /// Cooperative cancellation and cleanup completed.
     Cancelled,
     /// Process or host interruption ended the prior generation.
     Interrupted,
@@ -189,10 +275,136 @@ pub enum JobState {
 }
 
 impl JobState {
-    /// Returns whether this state cannot transition again.
+    /// Returns whether the current execution generation cannot transition again.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
+/// Transport-neutral origin retained for audit and authorization correlation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobOrigin {
+    workspace: SourceIdentifier,
+    client: SourceIdentifier,
+}
+
+impl JobOrigin {
+    /// Binds an admitted workspace and initiating client identity.
+    #[must_use]
+    pub const fn new(workspace: SourceIdentifier, client: SourceIdentifier) -> Self {
+        Self { workspace, client }
+    }
+
+    /// Admitted workspace identity.
+    #[must_use]
+    pub const fn workspace(&self) -> &SourceIdentifier {
+        &self.workspace
+    }
+
+    /// Initiating client identity.
+    #[must_use]
+    pub const fn client(&self) -> &SourceIdentifier {
+        &self.client
+    }
+}
+
+/// Immutable path-free input identity retained for replay and recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmittedJobInput {
+    authority: SourceIdentifier,
+    identity: SourceIdentifier,
+    digest: EvidenceDigest,
+}
+
+impl AdmittedJobInput {
+    /// Binds the owning authority, immutable identity, and exact content digest.
+    #[must_use]
+    pub const fn new(
+        authority: SourceIdentifier,
+        identity: SourceIdentifier,
+        digest: EvidenceDigest,
+    ) -> Self {
+        Self {
+            authority,
+            identity,
+            digest,
+        }
+    }
+
+    /// Input-owning application authority.
+    #[must_use]
+    pub const fn authority(&self) -> &SourceIdentifier {
+        &self.authority
+    }
+
+    /// Immutable input identity.
+    #[must_use]
+    pub const fn identity(&self) -> &SourceIdentifier {
+        &self.identity
+    }
+
+    /// Exact input content digest.
+    #[must_use]
+    pub const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+}
+
+/// Exact authority image used when a job was admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobAuthoritySnapshot {
+    authority: SourceIdentifier,
+    identity: SourceIdentifier,
+    digest: EvidenceDigest,
+    captured_at: Timestamp,
+}
+
+impl JobAuthoritySnapshot {
+    /// Binds one immutable authority snapshot and observation time.
+    #[must_use]
+    pub const fn new(
+        authority: SourceIdentifier,
+        identity: SourceIdentifier,
+        digest: EvidenceDigest,
+        captured_at: Timestamp,
+    ) -> Self {
+        Self {
+            authority,
+            identity,
+            digest,
+            captured_at,
+        }
+    }
+
+    /// Authority that minted this snapshot.
+    #[must_use]
+    pub const fn authority(&self) -> &SourceIdentifier {
+        &self.authority
+    }
+
+    /// Immutable authority-image identity.
+    #[must_use]
+    pub const fn identity(&self) -> &SourceIdentifier {
+        &self.identity
+    }
+
+    /// Exact authority-image digest.
+    #[must_use]
+    pub const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    /// Time the authority image was captured.
+    #[must_use]
+    pub const fn captured_at(&self) -> Timestamp {
+        self.captured_at
     }
 }
 
@@ -203,30 +415,42 @@ pub struct AdmittedJobSpec {
     id: JobId,
     generation: JobGeneration,
     kind: SourceIdentifier,
+    origin: JobOrigin,
     request_id: RequestId,
-    input_digest: EvidenceDigest,
+    input: AdmittedJobInput,
+    authority: JobAuthoritySnapshot,
+    attempt_limit: JobAttemptLimit,
     admitted_at: Timestamp,
 }
 
 impl AdmittedJobSpec {
-    /// Creates an immutable specification from validated identities and exact input evidence.
-    #[must_use]
-    pub const fn new(
+    /// Creates an immutable path-free specification with a finite attempt ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
         id: JobId,
         generation: JobGeneration,
         kind: SourceIdentifier,
+        origin: JobOrigin,
         request_id: RequestId,
-        input_digest: EvidenceDigest,
+        input: AdmittedJobInput,
+        authority: JobAuthoritySnapshot,
+        attempt_limit: JobAttemptLimit,
         admitted_at: Timestamp,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, JobContractError> {
+        if generation.get() > attempt_limit.get() {
+            return Err(JobContractError::InvalidAttemptLimit);
+        }
+        Ok(Self {
             id,
             generation,
             kind,
+            origin,
             request_id,
-            input_digest,
+            input,
+            authority,
+            attempt_limit,
             admitted_at,
-        }
+        })
     }
 
     /// Stable job identity.
@@ -241,442 +465,60 @@ impl AdmittedJobSpec {
         self.generation
     }
 
+    /// Stable registered runner kind.
+    #[must_use]
+    pub const fn kind(&self) -> &SourceIdentifier {
+        &self.kind
+    }
+
     /// Initiating transport-neutral request identity.
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
         &self.request_id
     }
-}
 
-/// Persistable durable progress evidence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobProgress {
-    phase: SourceIdentifier,
-    completed: u64,
-    total: Option<u64>,
-    recorded_at: Timestamp,
-}
-
-impl JobProgress {
-    /// Creates progress whose completed units do not exceed a declared total.
-    pub fn try_new(
-        phase: SourceIdentifier,
-        completed: u64,
-        total: Option<u64>,
-        recorded_at: Timestamp,
-    ) -> Result<Self, JobContractError> {
-        if total.is_some_and(|total| completed > total) {
-            return Err(JobContractError::ProgressExceedsTotal);
-        }
-        Ok(Self {
-            phase,
-            completed,
-            total,
-            recorded_at,
-        })
-    }
-}
-
-/// Immutable reference to a result owned by a domain service.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobResultReference {
-    authority: SourceIdentifier,
-    identity: SourceIdentifier,
-    evidence_digest: EvidenceDigest,
-    artifacts: Box<[ArtifactReference]>,
-}
-
-impl JobResultReference {
-    /// Records the exact domain authority, result identity, digest, and optional artifacts.
+    /// Workspace and initiating client identity.
     #[must_use]
-    pub fn new(
-        authority: SourceIdentifier,
-        identity: SourceIdentifier,
-        evidence_digest: EvidenceDigest,
-        artifacts: Vec<ArtifactReference>,
-    ) -> Self {
-        Self {
-            authority,
-            identity,
-            evidence_digest,
-            artifacts: artifacts.into_boxed_slice(),
-        }
+    pub const fn origin(&self) -> &JobOrigin {
+        &self.origin
     }
-}
 
-/// Typed, redaction-safe runner failure.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobFailure {
-    class: SourceIdentifier,
-    diagnostic: SourceIdentifier,
-    retryable: bool,
-}
-
-impl JobFailure {
-    /// Creates bounded failure evidence without raw payloads or credentials.
+    /// Immutable admitted input authority.
     #[must_use]
-    pub const fn new(
-        class: SourceIdentifier,
-        diagnostic: SourceIdentifier,
-        retryable: bool,
-    ) -> Self {
-        Self {
-            class,
-            diagnostic,
-            retryable,
-        }
-    }
-}
-
-/// One event proposed for an append-CAS operation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobEvent {
-    state: JobState,
-    occurred_at: Timestamp,
-    progress: Option<JobProgress>,
-    result: Option<JobResultReference>,
-    failure: Option<JobFailure>,
-}
-
-impl JobEvent {
-    /// Creates a state event with optional evidence validated as a coherent snapshot fragment.
-    pub fn try_new(
-        state: JobState,
-        occurred_at: Timestamp,
-        progress: Option<JobProgress>,
-        result: Option<JobResultReference>,
-        failure: Option<JobFailure>,
-    ) -> Result<Self, JobContractError> {
-        validate_terminal_evidence(state, result.as_ref(), failure.as_ref())?;
-        Ok(Self {
-            state,
-            occurred_at,
-            progress,
-            result,
-            failure,
-        })
-    }
-}
-
-/// Materialized durable state after an accepted event.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JobSnapshot {
-    spec: AdmittedJobSpec,
-    sequence: JobEventSequence,
-    state: JobState,
-    progress: Option<JobProgress>,
-    result: Option<JobResultReference>,
-    failure: Option<JobFailure>,
-    updated_at: Timestamp,
-}
-
-impl JobSnapshot {
-    /// Creates a coherent materialized snapshot.
-    pub fn try_new(
-        spec: AdmittedJobSpec,
-        sequence: JobEventSequence,
-        state: JobState,
-        progress: Option<JobProgress>,
-        result: Option<JobResultReference>,
-        failure: Option<JobFailure>,
-        updated_at: Timestamp,
-    ) -> Result<Self, JobContractError> {
-        validate_terminal_evidence(state, result.as_ref(), failure.as_ref())?;
-        Ok(Self {
-            spec,
-            sequence,
-            state,
-            progress,
-            result,
-            failure,
-            updated_at,
-        })
+    pub const fn input(&self) -> &AdmittedJobInput {
+        &self.input
     }
 
-    /// Stable job identity.
+    /// Exact authority image used at admission.
     #[must_use]
-    pub const fn id(&self) -> JobId {
-        self.spec.id()
+    pub const fn authority(&self) -> &JobAuthoritySnapshot {
+        &self.authority
     }
 
-    /// Current job generation.
+    /// Finite execution-generation ceiling.
     #[must_use]
-    pub const fn generation(&self) -> JobGeneration {
-        self.spec.generation()
+    pub const fn attempt_limit(&self) -> JobAttemptLimit {
+        self.attempt_limit
     }
 
-    /// Last accepted event sequence.
+    /// Durable admission timestamp.
     #[must_use]
-    pub const fn sequence(&self) -> JobEventSequence {
-        self.sequence
+    pub const fn admitted_at(&self) -> Timestamp {
+        self.admitted_at
     }
 
-    /// Current lifecycle state.
-    #[must_use]
-    pub const fn state(&self) -> JobState {
-        self.state
-    }
-}
-
-fn validate_terminal_evidence(
-    state: JobState,
-    result: Option<&JobResultReference>,
-    failure: Option<&JobFailure>,
-) -> Result<(), JobContractError> {
-    match state {
-        JobState::Completed if result.is_none() => Err(JobContractError::MissingResult),
-        JobState::Failed if failure.is_none() => Err(JobContractError::MissingFailure),
-        JobState::Completed if failure.is_some() => {
-            Err(JobContractError::UnexpectedTerminalEvidence)
-        }
-        JobState::Failed if result.is_some() => Err(JobContractError::UnexpectedTerminalEvidence),
-        JobState::Cancelled if result.is_some() || failure.is_some() => {
-            Err(JobContractError::UnexpectedTerminalEvidence)
-        }
-        state if !state.is_terminal() && (result.is_some() || failure.is_some()) => {
-            Err(JobContractError::UnexpectedTerminalEvidence)
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Bounded page of accepted events.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JobEventPage {
-    events: Box<[(JobEventSequence, JobEvent)]>,
-    next: Option<JobEventSequence>,
-}
-
-impl JobEventPage {
-    /// Creates a page no larger than the caller's admitted limit.
-    pub fn try_new(
-        events: Vec<(JobEventSequence, JobEvent)>,
-        next: Option<JobEventSequence>,
-        limit: JobEventPageLimit,
-    ) -> Result<Self, JobContractError> {
-        if events.len() > limit.get() {
-            return Err(JobContractError::PageLimitExceeded);
-        }
-        Ok(Self {
-            events: events.into_boxed_slice(),
-            next,
-        })
-    }
-}
-
-/// Bounded page of nonterminal jobs awaiting recovery disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JobRecoveryPage {
-    snapshots: Box<[JobSnapshot]>,
-    next: Option<RecoveryCursor>,
-}
-
-impl JobRecoveryPage {
-    /// Creates a recovery page no larger than the caller's admitted limit.
-    pub fn try_new(
-        snapshots: Vec<JobSnapshot>,
-        next: Option<RecoveryCursor>,
-        limit: RecoveryPageLimit,
-    ) -> Result<Self, JobContractError> {
-        if snapshots.len() > limit.get() {
-            return Err(JobContractError::PageLimitExceeded);
-        }
-        Ok(Self {
-            snapshots: snapshots.into_boxed_slice(),
-            next,
-        })
-    }
-}
-
-/// Atomic durable storage required by the job authority.
-#[async_trait]
-pub trait JobRepository: Send + Sync {
-    /// Creates the initial queued snapshot exactly once.
-    async fn create(&self, spec: &AdmittedJobSpec) -> Result<JobSnapshot, JobRepositoryError>;
-    /// Appends one event only when identity, generation, and expected sequence all match.
-    async fn append(
-        &self,
-        id: JobId,
-        generation: JobGeneration,
-        expected: JobEventSequence,
-        event: JobEvent,
-    ) -> Result<JobSnapshot, JobRepositoryError>;
-    /// Reads one exact job generation.
-    async fn get(
-        &self,
-        id: JobId,
-        generation: JobGeneration,
-    ) -> Result<JobSnapshot, JobRepositoryError>;
-    /// Reads a bounded event page after an observed sequence.
-    async fn events_after(
-        &self,
-        id: JobId,
-        generation: JobGeneration,
-        after: JobEventSequence,
-        limit: JobEventPageLimit,
-    ) -> Result<JobEventPage, JobRepositoryError>;
-    /// Scans nonterminal work through an explicit bounded continuation.
-    async fn recover_nonterminal(
-        &self,
-        cursor: Option<&RecoveryCursor>,
-        limit: RecoveryPageLimit,
-    ) -> Result<JobRecoveryPage, JobRepositoryError>;
-}
-
-/// Durable repository failure without storage implementation leakage.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum JobRepositoryError {
-    /// The requested job or generation does not exist.
-    #[error("job was not found")]
-    NotFound,
-    /// Append compare-and-swap preconditions did not match.
-    #[error("job append conflict")]
-    Conflict,
-    /// Persisted state failed invariant validation.
-    #[error("job repository contains invalid state")]
-    InvalidState,
-    /// Bounded durable storage is unavailable.
-    #[error("job repository is unavailable")]
-    Unavailable,
-}
-
-/// Event capability supplied to one owned runner generation.
-#[async_trait]
-pub trait JobEventSink: Send + Sync {
-    /// Persists one event using the runner's current CAS sequence.
-    async fn append(&self, event: JobEvent) -> Result<JobSnapshot, JobRepositoryError>;
-}
-
-/// Cancellation and event authority for one runner generation.
-#[derive(Clone)]
-pub struct JobRunContext {
-    snapshot: JobSnapshot,
-    cancellation: CancellationToken,
-    events: Arc<dyn JobEventSink>,
-}
-
-impl JobRunContext {
-    /// Binds a recovered or newly admitted snapshot to generation-scoped capabilities.
-    #[must_use]
-    pub const fn new(
-        snapshot: JobSnapshot,
-        cancellation: CancellationToken,
-        events: Arc<dyn JobEventSink>,
-    ) -> Self {
-        Self {
-            snapshot,
-            cancellation,
-            events,
-        }
-    }
-
-    /// Starting snapshot for this runner generation.
-    #[must_use]
-    pub const fn snapshot(&self) -> &JobSnapshot {
-        &self.snapshot
-    }
-
-    /// Cooperative cancellation capability.
-    #[must_use]
-    pub const fn cancellation(&self) -> &CancellationToken {
-        &self.cancellation
-    }
-
-    /// Generation-scoped durable event capability.
-    #[must_use]
-    pub const fn events(&self) -> &Arc<dyn JobEventSink> {
-        &self.events
-    }
-}
-
-impl std::fmt::Debug for JobRunContext {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("JobRunContext")
-            .field("snapshot", &self.snapshot)
-            .field("cancellation", &"[CANCELLATION TOKEN]")
-            .field("events", &"[JOB EVENT CAPABILITY]")
-            .finish()
-    }
-}
-
-/// Runner recovery decision made before acquiring execution ownership.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum JobRecoveryDisposition {
-    /// Resume from retained immutable inputs and checkpoints.
-    Resume,
-    /// End safely with typed failure evidence.
-    Fail(JobFailure),
-    /// The domain result was already durably published before interruption.
-    Complete(JobResultReference),
-}
-
-/// Runner terminal outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum JobCompletion {
-    /// Domain authority published the immutable result.
-    Completed(JobResultReference),
-    /// Cooperative cancellation completed without publishing a result.
-    Cancelled,
-}
-
-/// Runner failure class.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum JobRunError {
-    /// The runner returned validated failure evidence.
-    #[error("job runner failed")]
-    Failed(JobFailure),
-    /// Cancellation was observed before completion.
-    #[error("job runner was cancelled")]
-    Cancelled,
-    /// Runner recovery state was invalid or unavailable.
-    #[error("job runner recovery failed")]
-    Recovery,
-}
-
-/// Application-supplied implementation of one closed job kind.
-#[async_trait]
-pub trait JobRunner: Send + Sync {
-    /// Stable kind dispatched by the job authority.
-    fn kind(&self) -> &SourceIdentifier;
-    /// Executes using only generation-scoped capabilities.
-    async fn run(&self, context: JobRunContext) -> Result<JobCompletion, JobRunError>;
-    /// Determines how an interrupted snapshot may proceed.
-    fn recover(&self, snapshot: &JobSnapshot) -> JobRecoveryDisposition;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identity_and_page_limits_reject_ambiguous_zero_values() {
-        assert_eq!(
-            JobId::try_from_uuid(Uuid::nil()),
-            Err(JobContractError::NilIdentity)
-        );
-        assert_eq!(
-            JobGeneration::try_new(0),
-            Err(JobContractError::ZeroGeneration)
-        );
-        assert_eq!(
-            RecoveryPageLimit::try_new(0),
-            Err(JobContractError::InvalidPageLimit)
-        );
-    }
-
-    #[test]
-    fn progress_rejects_completed_units_beyond_total() -> Result<(), Box<dyn std::error::Error>> {
-        let phase = SourceIdentifier::try_from("training")?;
-        assert_eq!(
-            JobProgress::try_new(phase, 2, Some(1), Timestamp::from_unix_nanos(1)),
-            Err(JobContractError::ProgressExceedsTotal),
-        );
-        Ok(())
+    pub(crate) fn next_generation(&self, admitted_at: Timestamp) -> Result<Self, JobContractError> {
+        let generation = self.generation.checked_next()?;
+        Self::try_new(
+            self.id,
+            generation,
+            self.kind.clone(),
+            self.origin.clone(),
+            self.request_id.clone(),
+            self.input.clone(),
+            self.authority.clone(),
+            self.attempt_limit,
+            admitted_at,
+        )
     }
 }
