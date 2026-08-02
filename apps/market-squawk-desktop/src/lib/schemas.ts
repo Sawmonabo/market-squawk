@@ -101,6 +101,11 @@ export const desktopBootstrapSchema = z.object({
   buildProfile: z.string(),
   platform: z.string(),
   dataRoot: z.string(),
+  runtime: z.object({
+    installationId: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+    serviceGeneration: z.number().int().positive(),
+  }),
   storage: readinessSchema,
   installation: readinessSchema,
   modelRuntime: readinessSchema,
@@ -163,8 +168,48 @@ export const providerBootstrapSchema = z.object({
   encryptedFileFallback: encryptedFileFallbackSchema,
 })
 
+export const inputTicketSchema = z.object({
+  id: z.string().uuid(),
+  installationId: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  generation: z.number().int().positive(),
+  clientId: z.string().uuid(),
+  mediaType: z.string(),
+  byteLength: z.number().int().positive(),
+  digest: z.object({
+    algorithm: z.literal("sha256"),
+    bytes: z.array(z.number().int().min(0).max(255)).length(32),
+  }),
+  expiresAt: z.number().int(),
+})
+
+export const mcpStatusSchema = z.object({
+  serviceReady: z.boolean(),
+  sharedEndpointReady: z.boolean(),
+  claudeCode: z.string(),
+  codex: z.string(),
+})
+
+export const desktopEventSchema = z.object({
+  runtime: desktopBootstrapSchema.shape.runtime,
+  sequence: z.number().int().nonnegative(),
+  body: z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("authority_changed"),
+      domain: z.string(),
+      operation: z.string(),
+      requestId: z.string(),
+    }),
+    z.object({
+      type: z.literal("resync_required"),
+      reason: z.string(),
+    }),
+  ]),
+})
+
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
+export type DesktopEvent = z.infer<typeof desktopEventSchema>
 export type EncryptedFileFallback = z.infer<
   typeof encryptedFileFallbackSchema
 >
@@ -172,6 +217,8 @@ export type InstallationControlResult = z.infer<
   typeof installationControlResultSchema
 >
 export type InstallationStatus = z.infer<typeof installationStatusSchema>
+export type InputTicket = z.infer<typeof inputTicketSchema>
+export type McpStatus = z.infer<typeof mcpStatusSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>

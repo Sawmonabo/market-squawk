@@ -4638,9 +4638,12 @@ dependencies = [
 name = "market-squawk-desktop"
 version = "1.0.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "clap",
  "market-squawk",
  "market-squawk-data",
+ "market-squawk-domain",
  "market-squawk-installer",
  "market-squawk-platform",
  "market-squawk-runtime",
@@ -4648,6 +4651,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

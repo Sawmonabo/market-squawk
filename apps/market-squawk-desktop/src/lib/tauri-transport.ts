@@ -1,20 +1,27 @@
-import { invoke, isTauri } from "@tauri-apps/api/core"
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core"
 
 import {
   applicationResultSchema,
+  desktopEventSchema,
   desktopBootstrapSchema,
   encryptedFileFallbackSchema,
   installationControlResultSchema,
+  inputTicketSchema,
+  mcpStatusSchema,
   providerActivationSchema,
   providerBootstrapSchema,
   providerSessionSchema,
 } from "@/lib/schemas"
 import type {
-  ApplicationRequest,
+  DashboardQuery,
+  JobControlRequest,
   InstallationControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
+  SourceLifecycleAction,
+  SourceLifecycleRequest,
+  TrainingInputKind,
 } from "@/lib/transport"
 
 export function createProductTransport(): ProductTransport {
@@ -38,14 +45,44 @@ class TauriTransport implements ProductTransport {
     return installationControlResultSchema.parse(value)
   }
 
-  async invoke(request: ApplicationRequest) {
-    const value = await invoke("application_invoke", {
-      request: {
-        operation: request.operation,
-        arguments: request.arguments ?? {},
-      },
-    })
+  async query(request: DashboardQuery) {
+    const value = await invoke("dashboard_query", { request })
     return applicationResultSchema.parse(value)
+  }
+
+  async jobControl(request: JobControlRequest, confirmed = false) {
+    const value = await invoke("job_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async sourceControl(
+    action: SourceLifecycleAction,
+    request: SourceLifecycleRequest,
+    confirmed = false,
+  ) {
+    const value = await invoke("source_control", { action, request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async stageTrainingInput(kind: TrainingInputKind) {
+    const value = await invoke("stage_training_input", { kind })
+    return value === null ? null : inputTicketSchema.parse(value)
+  }
+
+  async mcpStatus() {
+    const value = await invoke("mcp_status")
+    return mcpStatusSchema.parse(value)
+  }
+
+  async subscribe(onEvent: Parameters<ProductTransport["subscribe"]>[0]) {
+    let active = true
+    const channel = new Channel<unknown>((value) => {
+      if (active) onEvent(desktopEventSchema.parse(value))
+    })
+    await invoke("subscribe_service_events", { onEvent: channel })
+    return () => {
+      active = false
+    }
   }
 
   async onboard<Request extends ProviderOnboardingRequest>(
@@ -98,7 +135,27 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  invoke(): Promise<never> {
+  query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  jobControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  sourceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  stageTrainingInput(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  mcpStatus(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  subscribe(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

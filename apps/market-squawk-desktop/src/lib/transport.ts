@@ -1,17 +1,42 @@
 import type {
   ApplicationResult,
   DesktopBootstrap,
+  DesktopEvent,
   EncryptedFileFallback,
   InstallationControlResult,
+  InputTicket,
+  McpStatus,
   ProviderActivation,
   ProviderBootstrap,
   ProviderSession,
 } from "@/lib/schemas"
 
-export interface ApplicationRequest {
-  operation: string
-  arguments?: Record<string, unknown>
-}
+export type DashboardQuery =
+  | { query: "overview" }
+  | { query: "lookup"; text: string; categories?: string[] }
+  | { query: "marketSnapshot" | "marketQuality" }
+  | { query: "sourceStatus" | "sourceCoverage" | "sourceHealth" }
+  | { query: "researchDatasets"; afterDataset?: string }
+  | { query: "portfolioAccounts"; afterAccountId?: string }
+  | {
+      query:
+        | "portfolioHoldings"
+        | "portfolioPerformance"
+        | "portfolioExposure"
+        | "portfolioRisk"
+      accountId: string
+    }
+  | {
+      query:
+        | "modelBundles"
+        | "forecasts"
+        | "paperStatus"
+        | "paperOrders"
+        | "paperFills"
+        | "fairValueMeasurements"
+    }
+  | { query: "backtests"; dataset?: string }
+  | { query: "jobs"; afterJobId?: string; limit: number }
 
 export type InstallationControlRequest =
   | { action: "status" }
@@ -56,10 +81,64 @@ export interface ProductTransport {
   installation(
     request: InstallationControlRequest,
   ): Promise<InstallationControlResult>
-  invoke(request: ApplicationRequest): Promise<ApplicationResult>
+  query(request: DashboardQuery): Promise<ApplicationResult>
+  jobControl(request: JobControlRequest, confirmed?: boolean): Promise<ApplicationResult>
+  sourceControl(
+    action: SourceLifecycleAction,
+    request: SourceLifecycleRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  stageTrainingInput(kind: TrainingInputKind): Promise<InputTicket | null>
+  mcpStatus(): Promise<McpStatus>
+  subscribe(onEvent: (event: DesktopEvent) => void): Promise<() => void>
   onboard<Request extends ProviderOnboardingRequest>(
     request: Request,
   ): Promise<ProviderOnboardingResult<Request>>
   openOfficialProviderPage(providerId: string): Promise<void>
   openProtectedProviderSetup(providerId: string): Promise<void>
+}
+
+export type TrainingInputKind = "configuration" | "model_authority"
+
+export type JobControlRequest =
+  | { action: "list"; afterJobId?: string; limit: number }
+  | { action: "get"; jobId: string }
+  | {
+      action: "watch"
+      jobId: string
+      generation: number
+      afterSequence: number
+      limit: number
+    }
+  | {
+      action: "cancel" | "retry"
+      jobId: string
+      generation: number
+      expectedSequence: number
+    }
+  | {
+      action: "confirm"
+      jobId: string
+      generation: number
+      expectedSequence: number
+      identity: string
+      digest: string
+    }
+
+export type SourceLifecycleAction =
+  | "start"
+  | "stop"
+  | "retry"
+  | "resynchronize"
+  | "verify"
+  | "reconfigure"
+  | "remove"
+
+export interface SourceLifecycleRequest {
+  provider: string
+  expectedStateRevision: number
+  expectedGeneration?: number
+  onboardingSessionId?: string
+  publicConfigurationSha256?: string
+  reason?: string
 }

@@ -8,11 +8,14 @@ import {
 import type { ProductTransport } from "@/lib/transport"
 
 import { ProductProvider } from "./product-context"
+import { createProductQueryClient } from "./query-client"
 import { AppRoutes } from "./routes"
 
 export function App({ transport }: { transport: ProductTransport }) {
+  const [queryClient] = React.useState(createProductQueryClient)
   return (
-    <ProductProvider transport={transport}>
+    <QueryClientProvider client={queryClient}>
+      <ProductProvider transport={transport}>
       <SidebarProvider
         style={
           {
@@ -30,7 +33,10 @@ export function App({ transport }: { transport: ProductTransport }) {
           </div>
         </SidebarInset>
       </SidebarProvider>
-    </ProductProvider>
+      </ProductProvider>
+    </QueryClientProvider>
   )
 }
+import * as React from "react"
+import { QueryClientProvider } from "@tanstack/react-query"
 

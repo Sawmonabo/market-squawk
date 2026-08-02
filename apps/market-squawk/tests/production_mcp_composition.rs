@@ -15,7 +15,7 @@ use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
 };
-use market_squawk_runtime::NamedClient;
+use market_squawk_runtime::{ApplicationClient, EventPageLimit, NamedClient};
 use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext, RequestId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -54,6 +54,35 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
     let bootstrap = desktop.bootstrap(CancellationToken::new()).await?;
     assert_eq!(bootstrap["readiness"]["service"], true);
     assert!(bootstrap["runtime"]["workspaceId"].is_string());
+    let provider = bootstrap["sources"]["profiles"][0]["id"]
+        .as_str()
+        .ok_or("installed bootstrap did not expose a provider")?;
+    let registration = desktop
+        .invoke_operation(
+            RequestId::try_string("installed-source-registration")?,
+            "Source.Register",
+            json!({
+                "provider": provider,
+                "confirm": true,
+                "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+            }),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        registration.result()["ok"],
+        true,
+        "{}",
+        registration.result()
+    );
+    let (events, cursor) = desktop
+        .read_events(None, EventPageLimit::try_new(4)?, CancellationToken::new())
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "application.changed");
+    assert_eq!(events[0]["operation"], "Source.Register");
+    assert_eq!(cursor.sequence(), 1);
 
     let jobs = cli
         .invoke_operation(

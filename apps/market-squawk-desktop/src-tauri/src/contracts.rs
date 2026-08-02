@@ -3,6 +3,7 @@
 use std::fmt;
 
 use market_squawk::ProviderPortalActivationRequest;
+use market_squawk_runtime::RuntimeIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -144,6 +145,7 @@ pub(crate) struct DesktopBootstrap {
     build_profile: &'static str,
     platform: &'static str,
     data_root: String,
+    runtime: RuntimeIdentity,
     storage: Readiness,
     installation: Readiness,
     model_runtime: Readiness,
@@ -166,6 +168,7 @@ impl DesktopBootstrap {
         application_version: &'static str,
         build_profile: &'static str,
         data_root: String,
+        runtime: RuntimeIdentity,
         storage: Readiness,
         installation: Readiness,
         model_runtime: Readiness,
@@ -183,6 +186,7 @@ impl DesktopBootstrap {
             build_profile,
             platform: std::env::consts::OS,
             data_root,
+            runtime,
             storage,
             installation,
             model_runtime,
@@ -204,6 +208,190 @@ pub(crate) struct ApplicationInvocation {
     pub(crate) operation: String,
     #[serde(default)]
     pub(crate) arguments: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "query")]
+pub(crate) enum DashboardQueryCommand {
+    Overview,
+    Lookup {
+        text: String,
+        categories: Option<Vec<String>>,
+    },
+    MarketSnapshot,
+    MarketQuality,
+    SourceStatus,
+    SourceCoverage,
+    SourceHealth,
+    ResearchDatasets {
+        after_dataset: Option<String>,
+    },
+    PortfolioAccounts {
+        after_account_id: Option<String>,
+    },
+    PortfolioHoldings {
+        account_id: String,
+    },
+    PortfolioPerformance {
+        account_id: String,
+    },
+    PortfolioExposure {
+        account_id: String,
+    },
+    PortfolioRisk {
+        account_id: String,
+    },
+    ModelBundles,
+    Forecasts,
+    Backtests {
+        dataset: Option<String>,
+    },
+    PaperStatus,
+    PaperOrders,
+    PaperFills,
+    FairValueMeasurements,
+    Jobs {
+        after_job_id: Option<String>,
+        limit: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TrainingInputKind {
+    Configuration,
+    ModelAuthority,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum JobControlCommand {
+    List {
+        after_job_id: Option<String>,
+        limit: u16,
+    },
+    Get {
+        job_id: Uuid,
+    },
+    Watch {
+        job_id: Uuid,
+        generation: u64,
+        after_sequence: u64,
+        limit: u16,
+    },
+    Cancel {
+        job_id: Uuid,
+        generation: u64,
+        expected_sequence: u64,
+    },
+    Confirm {
+        job_id: Uuid,
+        generation: u64,
+        expected_sequence: u64,
+        identity: String,
+        digest: String,
+    },
+    Retry {
+        job_id: Uuid,
+        generation: u64,
+        expected_sequence: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct SourceLifecycleInput {
+    pub(crate) provider: String,
+    pub(crate) expected_state_revision: u64,
+    pub(crate) expected_generation: Option<u64>,
+    pub(crate) onboarding_session_id: Option<Uuid>,
+    pub(crate) public_configuration_sha256: Option<String>,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceLifecycleAction {
+    Start,
+    Stop,
+    Retry,
+    Resynchronize,
+    Verify,
+    Reconfigure,
+    Remove,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct McpStatus {
+    service_ready: bool,
+    shared_endpoint_ready: bool,
+    claude_code: &'static str,
+    codex: &'static str,
+}
+
+impl McpStatus {
+    pub(crate) const fn service_ready(shared_endpoint_ready: bool) -> Self {
+        Self {
+            service_ready: true,
+            shared_endpoint_ready,
+            claude_code: "registration_pending",
+            codex: "registration_pending",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopEvent {
+    runtime: RuntimeIdentity,
+    sequence: u64,
+    body: DesktopEventBody,
+}
+
+impl DesktopEvent {
+    pub(crate) const fn authority_changed(
+        runtime: RuntimeIdentity,
+        sequence: u64,
+        domain: String,
+        operation: String,
+        request_id: String,
+    ) -> Self {
+        Self {
+            runtime,
+            sequence,
+            body: DesktopEventBody::AuthorityChanged {
+                domain,
+                operation,
+                request_id,
+            },
+        }
+    }
+
+    pub(crate) const fn resync_required(
+        runtime: RuntimeIdentity,
+        sequence: u64,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            runtime,
+            sequence,
+            body: DesktopEventBody::ResyncRequired { reason },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum DesktopEventBody {
+    AuthorityChanged {
+        domain: String,
+        operation: String,
+        request_id: String,
+    },
+    ResyncRequired {
+        reason: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

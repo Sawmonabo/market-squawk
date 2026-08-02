@@ -459,31 +459,39 @@ async fn dispatch_request(
         .effect(envelope.operation())
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let execute = || async {
-        let result = match state.dispatcher.dispatch(envelope, context).await {
-            Ok(value) => json!({"ok": true, "value": value}),
-            Err(error) => json!({"ok": false, "error": error.code()}),
+        let (result, succeeded) = match state.dispatcher.dispatch(envelope, context).await {
+            Ok(value) => (json!({"ok": true, "value": value}), true),
+            Err(error) => (json!({"ok": false, "error": error.code()}), false),
         };
-        AppResponseEnvelope::try_success(
+        let response = AppResponseEnvelope::try_success(
             envelope.request_id().clone(),
             state.runtime.service_generation(),
             result,
             state.limits.service_limits.result_structure(),
             state.limits.response_body_bytes.get(),
         )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok((response, succeeded))
     };
     if effect == OperationEffect::Read {
-        return execute().await;
+        return execute().await.map(|(response, _succeeded)| response);
     }
     let digest = request_digest(envelope).map_err(|_| StatusCode::BAD_REQUEST)?;
     let key = ReplayKey::new(envelope.client_id(), envelope.request_id().clone());
     match state.replay.begin(key, digest) {
         Ok(ReplayAdmission::Completed(response)) => Ok(response),
         Ok(ReplayAdmission::Execute(permit)) => {
-            let response = execute().await?;
+            let (response, succeeded) = execute().await?;
             permit
                 .complete(response.clone())
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if succeeded {
+                let _ = state.events.publish(json!({
+                    "type": "application.changed",
+                    "operation": envelope.operation(),
+                    "requestId": envelope.request_id(),
+                }));
+            }
             Ok(response)
         }
         Err(_) => Err(StatusCode::CONFLICT),

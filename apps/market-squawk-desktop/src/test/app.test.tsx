@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react"
+import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -15,6 +15,11 @@ const blockedBootstrap: DesktopBootstrap = {
   buildProfile: "development",
   platform: "macos",
   dataRoot: ".market-squawk",
+  runtime: {
+    installationId: "7e8299e7-9757-4441-926f-d0b22c767a65",
+    workspaceId: "55e7626c-81c8-4e78-8aa6-45a1d9c2949a",
+    serviceGeneration: 1,
+  },
   storage: {
     state: "ready",
     label: "Ready",
@@ -140,7 +145,7 @@ function transport(
   onboard: ProductTransport["onboard"] = async () => {
     throw new Error("Provider onboarding is not configured for this test.")
   },
-  invoke: ProductTransport["invoke"] = async () => ({
+  query: ProductTransport["query"] = async () => ({
     data: null,
     metadata: {
       completeness: "complete",
@@ -167,7 +172,19 @@ function transport(
       receipt: null,
       restartRequired: false,
     }),
-    invoke,
+    query,
+    jobControl: async (request) =>
+      query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
+    sourceControl: async (_action, _request) =>
+      query({ query: "sourceStatus" }),
+    stageTrainingInput: async () => null,
+    mcpStatus: async () => ({
+      serviceReady: true,
+      sharedEndpointReady: true,
+      claudeCode: "registration_pending",
+      codex: "registration_pending",
+    }),
+    subscribe: async () => () => undefined,
     onboard,
     openOfficialProviderPage: async () => undefined,
     openProtectedProviderSetup: async () => undefined,
@@ -200,7 +217,6 @@ function datasetRead(
 
 describe("Market Squawk desktop boundary", () => {
   it("uses accessible product navigation to explore real research and MCP state", async () => {
-    const requests: Parameters<ProductTransport["invoke"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       setupSteps: blockedBootstrap.setupSteps.map((step) =>
@@ -232,34 +248,9 @@ describe("Market Squawk desktop boundary", () => {
         ),
       ],
     }
-    const user = userEvent.setup()
     const rendered = render(
       <MemoryRouter initialEntries={["/research"]}>
-        <App
-          transport={transport(
-            readyBootstrap,
-            undefined,
-            async (request) => {
-              requests.push(request)
-              if (requests.length > 1) {
-                throw new Error("dataset not found")
-              }
-              return {
-                data: {
-                  datasetId: "research-prices-v3",
-                  generation: 7,
-                },
-                metadata: {
-                  completeness: "complete",
-                  returnedItems: 1,
-                  availableItems: 1,
-                  sourceCoverage: { status: "not_applicable" },
-                  dataQuality: { status: "not_applicable" },
-                },
-              }
-            },
-          )}
-        />
+        <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
     )
 
@@ -309,45 +300,10 @@ describe("Market Squawk desktop boundary", () => {
     expect(paperExecution?.getAttribute("aria-disabled")).toBe("true")
     const backup = navigation.querySelector('a[href="/backup-recovery"]')
     expect(backup?.textContent).toContain("Backup & Recovery")
-    expect(screen.getByText("Input contract")).toBeTruthy()
-    expect(
-      screen.getByRole("option", { name: "Fundamental.GetFacts" }),
-    ).toBeTruthy()
-    expect(
-      screen.getByRole("option", { name: "Macro.GetRevisions" }),
-    ).toBeTruthy()
-
-    fireEvent.change(
-      screen.getByLabelText("Operation arguments"),
-      { target: { value: '{"dataset":"research-prices"}' } },
-    )
-    await user.click(
-      screen.getByRole("button", { name: "Run read-only operation" }),
-    )
-
-    expect(
-      await screen.findByText("research-prices-v3"),
-    ).toBeTruthy()
-    expect(screen.getByText("Source coverage")).toBeTruthy()
-    expect(screen.getByText("Data quality")).toBeTruthy()
-    expect(requests).toEqual([
-      {
-        operation: "Research.GetManifest",
-        arguments: { dataset: "research-prices" },
-      },
-    ])
-
-    fireEvent.change(
-      screen.getByLabelText("Operation arguments"),
-      { target: { value: '{"dataset":"missing"}' } },
-    )
-    await user.click(
-      screen.getByRole("button", { name: "Run read-only operation" }),
-    )
-    expect((await screen.findByRole("alert")).textContent).toContain(
-      "dataset not found",
-    )
-    expect(screen.queryByText("research-prices-v3")).toBeNull()
+    expect(screen.getByText("Technical capability details")).toBeTruthy()
+    expect(screen.getByText("Fundamental.GetFacts")).toBeTruthy()
+    expect(screen.getByText("Macro.GetRevisions")).toBeTruthy()
+    expect(screen.queryByText("Operation arguments")).toBeNull()
 
     rendered.unmount()
     render(

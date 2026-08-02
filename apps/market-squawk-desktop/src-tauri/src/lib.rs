@@ -17,13 +17,21 @@ use thiserror::Error;
 
 mod bridge;
 mod contracts;
+mod events;
+mod input_staging;
 mod installation;
+mod mcp_clients;
 mod service;
+mod service_client;
 
 use bridge::{
-    DesktopState, application_invoke, desktop_bootstrap, installation_control,
-    open_official_provider_page, open_protected_provider_setup, provider_onboarding,
+    DesktopState, desktop_bootstrap, installation_control, open_official_provider_page,
+    open_protected_provider_setup, provider_onboarding,
 };
+use events::subscribe_service_events;
+use input_staging::stage_training_input;
+use mcp_clients::mcp_status;
+use service_client::{dashboard_query, job_control, source_control};
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_APPIMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -180,12 +188,17 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            application_invoke,
+            dashboard_query,
             desktop_bootstrap,
+            job_control,
             installation_control,
+            mcp_status,
             open_official_provider_page,
             open_protected_provider_setup,
-            provider_onboarding
+            provider_onboarding,
+            source_control,
+            stage_training_input,
+            subscribe_service_events
         ])
         .build(tauri::generate_context!())?;
     let installation = installation::prepare(app.handle())?;
@@ -222,6 +235,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let state = DesktopState::try_new(
         service.application,
         service.bootstrap,
+        config.data_dir().to_path_buf(),
         installation.root,
         installation.status,
     )

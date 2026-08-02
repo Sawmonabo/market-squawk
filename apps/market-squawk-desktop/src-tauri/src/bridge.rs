@@ -1,6 +1,12 @@
 //! Least-privilege Tauri bridge over the existing local application authorities.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use market_squawk_installer::{
     CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
@@ -9,7 +15,7 @@ use market_squawk_installer::{
 use market_squawk_installer::{ProgramName, program_install_snapshot};
 #[cfg(not(target_os = "windows"))]
 use market_squawk_installer::{UninstallRequest, uninstall};
-use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient};
+use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, RuntimeIdentity};
 use market_squawk_services::RequestId;
 use serde_json::{Map, Value, json};
 use tauri::State;
@@ -62,7 +68,7 @@ const PAPER_SETUP_OPERATIONS: [&str; 8] = [
 ];
 
 #[derive(Clone, Copy, Debug)]
-enum InvocationAuthority {
+pub(crate) enum InvocationAuthority {
     ReadOnly,
     ExactConfirmed(&'static str),
 }
@@ -94,7 +100,7 @@ impl ServiceOperation {
 
 #[derive(Debug)]
 struct ServiceBootstrapSnapshot {
-    workspace_label: String,
+    runtime: RuntimeIdentity,
     provider_profiles: Value,
     encrypted_file_fallback: Value,
     operations: Vec<ServiceOperation>,
@@ -122,14 +128,13 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
                 "The installed Market Squawk service contract is incompatible with this dashboard.",
             ));
         }
-        let workspace = value
-            .pointer("/runtime/workspaceId")
-            .and_then(Value::as_str)
-            .ok_or_else(DesktopCommandError::internal)?;
-        let workspace = Uuid::parse_str(workspace)
-            .ok()
-            .filter(|workspace| !workspace.is_nil())
-            .ok_or_else(DesktopCommandError::internal)?;
+        let runtime = serde_json::from_value::<RuntimeIdentity>(
+            value
+                .get("runtime")
+                .cloned()
+                .ok_or_else(DesktopCommandError::internal)?,
+        )
+        .map_err(|_error| DesktopCommandError::internal())?;
         let provider_profiles = value
             .pointer("/sources/profiles")
             .filter(|profiles| profiles.is_array())
@@ -191,7 +196,7 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             .and_then(Value::as_bool)
             .ok_or_else(DesktopCommandError::internal)?;
         Ok(Self {
-            workspace_label: format!("workspace:{workspace}"),
+            runtime,
             provider_profiles,
             encrypted_file_fallback,
             operations: parsed_operations,
@@ -212,6 +217,7 @@ fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, Deskt
 pub(crate) struct DesktopState {
     application: Arc<LoopbackApplicationClient>,
     service_bootstrap: ServiceBootstrapSnapshot,
+    data_root: PathBuf,
     installation_root: PathBuf,
     installation_status: InstallStatus,
     cancellation: CancellationToken,
@@ -222,12 +228,14 @@ impl DesktopState {
     pub(crate) fn try_new(
         application: LoopbackApplicationClient,
         service_bootstrap: Value,
+        data_root: PathBuf,
         installation_root: PathBuf,
         installation_status: InstallStatus,
     ) -> Result<Self, DesktopCommandError> {
         Ok(Self {
             application: Arc::new(application),
             service_bootstrap: ServiceBootstrapSnapshot::try_from(service_bootstrap)?,
+            data_root,
             installation_root,
             installation_status,
             cancellation: CancellationToken::new(),
@@ -246,6 +254,31 @@ impl DesktopState {
 
     pub(crate) fn scheduled_restart_program(&self) -> Option<PathBuf> {
         self.restart_program.get().cloned()
+    }
+
+    pub(crate) fn application(&self) -> Arc<LoopbackApplicationClient> {
+        Arc::clone(&self.application)
+    }
+
+    pub(crate) const fn runtime(&self) -> RuntimeIdentity {
+        self.service_bootstrap.runtime
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.child_token()
+    }
+
+    pub(crate) fn service_operation_index(&self) -> BTreeMap<String, String> {
+        self.service_bootstrap
+            .operations
+            .iter()
+            .filter(|descriptor| !descriptor.read_only && descriptor.authorization != "read_only")
+            .map(|descriptor| (descriptor.name.clone(), descriptor.domain.clone()))
+            .collect()
+    }
+
+    pub(crate) const fn mcp_ready(&self) -> bool {
+        self.service_bootstrap.mcp_ready
     }
 
     async fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
@@ -326,7 +359,8 @@ impl DesktopState {
             } else {
                 "release"
             },
-            self.service_bootstrap.workspace_label.clone(),
+            self.data_root.to_string_lossy().into_owned(),
+            self.service_bootstrap.runtime,
             Readiness::new(
                 ReadinessState::Ready,
                 "Ready",
@@ -725,15 +759,7 @@ where
         .map_err(map_installation_error)
 }
 
-#[tauri::command]
-pub(crate) async fn application_invoke(
-    request: ApplicationInvocation,
-    state: State<'_, DesktopState>,
-) -> Result<Value, DesktopCommandError> {
-    invoke_application(request, &state, InvocationAuthority::ReadOnly).await
-}
-
-async fn invoke_application(
+pub(crate) async fn invoke_application(
     mut request: ApplicationInvocation,
     state: &DesktopState,
     authority: InvocationAuthority,
@@ -753,6 +779,11 @@ async fn invoke_application(
             "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
         }),
     );
+    if matches!(authority, InvocationAuthority::ExactConfirmed(_)) {
+        request
+            .arguments
+            .insert("confirm".to_owned(), Value::Bool(true));
+    }
     invoke_service_operation(state, &request.operation, request.arguments, authority).await
 }
 
@@ -959,7 +990,7 @@ async fn provider_bootstrap(state: &DesktopState) -> Result<Value, DesktopComman
     }))
 }
 
-fn map_application_client_error(error: ApplicationClientError) -> DesktopCommandError {
+pub(crate) fn map_application_client_error(error: ApplicationClientError) -> DesktopCommandError {
     let (code, message) = match error {
         ApplicationClientError::Rejected => (
             "operation_rejected",
