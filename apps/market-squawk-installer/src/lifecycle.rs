@@ -364,6 +364,29 @@ pub fn active_release_root_for_installed_program(
     executable: &Path,
     program: ProgramName,
 ) -> Result<Option<PathBuf>, InstallError> {
+    Ok(installed_program_location(executable, program)?.map(|(_, active)| active))
+}
+
+/// Resolves the installation root for a verified installed program path.
+///
+/// The path may identify either a stable Unix entrypoint or the executable inside the active
+/// immutable release. Paths that do not belong to an installation return `None`; a path that
+/// claims an installation but disagrees with its retained selector fails closed.
+///
+/// # Errors
+///
+/// Fails when a discovered installation, active release, or program entrypoint is inconsistent.
+pub fn installation_root_for_installed_program(
+    executable: &Path,
+    program: ProgramName,
+) -> Result<Option<PathBuf>, InstallError> {
+    Ok(installed_program_location(executable, program)?.map(|(root, _)| root))
+}
+
+fn installed_program_location(
+    executable: &Path,
+    program: ProgramName,
+) -> Result<Option<(PathBuf, PathBuf)>, InstallError> {
     let target = crate::platform::SupportedTarget::current()?;
     let relative = program.relative_path(target);
     let expected_name = relative
@@ -388,7 +411,7 @@ pub fn active_release_root_for_installed_program(
         if !same_canonical_path(executable, &expected)? {
             return Err(InstallError::CorruptInstallation);
         }
-        return Ok(Some(active));
+        return Ok(Some((root.to_path_buf(), active)));
     }
 
     let release = bin.parent().ok_or(InstallError::CorruptInstallation)?;
@@ -405,7 +428,7 @@ pub fn active_release_root_for_installed_program(
     if !same_canonical_path(release, &active)? || !same_canonical_path(executable, &expected)? {
         return Err(InstallError::CorruptInstallation);
     }
-    Ok(Some(active))
+    Ok(Some((root.to_path_buf(), active)))
 }
 
 fn installation_selector_exists(root: &Path) -> Result<bool, InstallError> {

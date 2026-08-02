@@ -18,8 +18,8 @@ pub use self::contracts::{
 };
 pub use self::lifecycle::{
     InstallError, active_program_path, active_release_root,
-    active_release_root_for_installed_program, install, program_install_snapshot, repair, rollback,
-    stable_program_path, status, uninstall, update,
+    active_release_root_for_installed_program, install, installation_root_for_installed_program,
+    program_install_snapshot, repair, rollback, stable_program_path, status, uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
@@ -57,7 +57,8 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        active_release_root, active_release_root_for_installed_program, stable_program_path,
+        active_release_root, active_release_root_for_installed_program,
+        installation_root_for_installed_program, stable_program_path,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -149,6 +150,26 @@ mod tests {
                 active_release_root_for_installed_program(&stable_cli, ProgramName::Cli)?,
                 Some(active_release_root(&root)?)
             );
+            assert_eq!(
+                installation_root_for_installed_program(&stable_cli, ProgramName::Cli)?,
+                Some(root.clone())
+            );
+            assert_eq!(
+                installation_root_for_installed_program(
+                    &temporary.path().join("source/bin/market-squawk"),
+                    ProgramName::Cli,
+                )?,
+                None
+            );
+            let altered_release = root.join("versions/altered/bin");
+            fs::create_dir_all(&altered_release)?;
+            let altered_cli = altered_release.join("market-squawk");
+            fs::copy(&stable_cli, &altered_cli)?;
+            assert!(matches!(
+                installation_root_for_installed_program(&altered_cli, ProgramName::Cli),
+                Err(InstallError::CorruptInstallation)
+            ));
+            fs::remove_dir_all(root.join("versions/altered"))?;
             let stable_capture = stable_program_path(&root, ProgramName::CaptureHelper)?;
             let stable_worker = stable_program_path(&root, ProgramName::OnnxWorker)?;
             assert_eq!(stable_service.parent(), stable_cli.parent());
