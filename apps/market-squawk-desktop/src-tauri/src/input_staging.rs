@@ -8,26 +8,85 @@ use std::{
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
 use cap_std::fs::{Dir, OpenOptions};
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
-use market_squawk_runtime::{ApplicationClient, InputAdmission, InputTicket};
+use market_squawk_runtime::{ApplicationClient, InputAdmission};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt as _;
 
 use crate::{
-    bridge::DesktopState,
-    contracts::{DesktopCommandError, TrainingInputKind},
+    bridge::{DesktopState, InvocationAuthority, invoke_application},
+    contracts::{ApplicationInvocation, DesktopCommandError, TrainingInputKind},
 };
 
 const MAXIMUM_TRAINING_CONFIG_BYTES: u64 = 256 * 1024;
 const MAXIMUM_MODEL_AUTHORITY_BYTES: u64 = 4 * 1024 * 1024;
+const MAXIMUM_BACKTEST_REGISTRATION_BYTES: u64 = 1024 * 1024;
+
+#[tauri::command]
+pub(crate) async fn start_backtest_from_file(
+    confirmed: bool,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<Value>, DesktopCommandError> {
+    if !confirmed {
+        return Err(DesktopCommandError::new(
+            "confirmation_required",
+            "Confirm the governed backtest before selecting its registration.",
+        ));
+    }
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Governed backtest registration", &["json"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected.into_path().map_err(|_error| {
+        DesktopCommandError::invalid_request("The selected registration is not a local file.")
+    })?;
+    let admitted = tauri::async_runtime::spawn_blocking(move || {
+        open_and_hash(path, MAXIMUM_BACKTEST_REGISTRATION_BYTES)
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())??;
+    let registration = serde_json::from_reader::<_, Value>(admitted.file)
+        .map_err(|_error| {
+            DesktopCommandError::invalid_request(
+                "The selected registration is not valid canonical JSON.",
+            )
+        })?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            DesktopCommandError::invalid_request(
+                "The governed backtest registration must be a JSON object.",
+            )
+        })?;
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("registration".to_owned(), Value::Object(registration));
+    invoke_application(
+        ApplicationInvocation {
+            operation: "Analysis.StartBacktest".to_owned(),
+            arguments,
+        },
+        &state,
+        InvocationAuthority::ExactConfirmed("Analysis.StartBacktest"),
+    )
+    .await
+    .map(Some)
+}
 
 #[tauri::command]
 pub(crate) async fn stage_training_input(
     kind: TrainingInputKind,
     app: AppHandle,
     state: State<'_, DesktopState>,
-) -> Result<Option<InputTicket>, DesktopCommandError> {
+) -> Result<Option<Value>, DesktopCommandError> {
     let selected = tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
             .file()
@@ -42,35 +101,30 @@ pub(crate) async fn stage_training_input(
     let path = selected.into_path().map_err(|_error| {
         DesktopCommandError::invalid_request("The selected input is not a local file.")
     })?;
-    let admitted = tauri::async_runtime::spawn_blocking(move || open_and_hash(kind, path))
-        .await
-        .map_err(|_error| DesktopCommandError::internal())??;
-    let admission = InputAdmission::try_new(
-        SourceIdentifier::try_from(kind.media_type())
-            .map_err(|_error| DesktopCommandError::internal())?,
-        admitted.byte_length,
-        admitted.digest,
-    )
-    .map_err(|_error| DesktopCommandError::internal())?;
+    let admitted =
+        tauri::async_runtime::spawn_blocking(move || open_and_hash(path, kind.maximum_bytes()))
+            .await
+            .map_err(|_error| DesktopCommandError::internal())??;
+    let admission =
+        InputAdmission::try_sha256(kind.media_type(), admitted.byte_length, admitted.digest)
+            .map_err(|_error| DesktopCommandError::internal())?;
     let mut input = tokio::fs::File::from_std(admitted.file);
-    state
+    let ticket = state
         .application()
         .stage_input(admission, &mut input, state.cancellation())
         .await
-        .map(Some)
-        .map_err(super::bridge::map_application_client_error)
+        .map_err(super::bridge::map_application_client_error)?;
+    let value = serde_json::to_value(ticket).map_err(|_error| DesktopCommandError::internal())?;
+    Ok(Some(super::bridge::lossless_webview_value(value)))
 }
 
 struct AdmittedFile {
     file: std::fs::File,
     byte_length: u64,
-    digest: EvidenceDigest,
+    digest: [u8; 32],
 }
 
-fn open_and_hash(
-    kind: TrainingInputKind,
-    path: PathBuf,
-) -> Result<AdmittedFile, DesktopCommandError> {
+fn open_and_hash(path: PathBuf, maximum_bytes: u64) -> Result<AdmittedFile, DesktopCommandError> {
     validate_extension(&path)?;
     let parent = path.parent().ok_or_else(|| {
         DesktopCommandError::invalid_request("The selected input path is invalid.")
@@ -87,7 +141,7 @@ fn open_and_hash(
         .map_err(map_file_error)?;
     let metadata = file.metadata().map_err(map_file_error)?;
     let byte_length = metadata.len();
-    if !metadata.is_file() || byte_length == 0 || byte_length > kind.maximum_bytes() {
+    if !metadata.is_file() || byte_length == 0 || byte_length > maximum_bytes {
         return Err(DesktopCommandError::invalid_request(
             "The selected input is empty, too large, or not a regular file.",
         ));
@@ -105,7 +159,7 @@ fn open_and_hash(
     Ok(AdmittedFile {
         file,
         byte_length,
-        digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
+        digest,
     })
 }
 

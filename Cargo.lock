@@ -4643,7 +4643,6 @@ dependencies = [
  "clap",
  "market-squawk",
  "market-squawk-data",
- "market-squawk-domain",
  "market-squawk-installer",
  "market-squawk-platform",
  "market-squawk-runtime",

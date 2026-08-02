@@ -173,6 +173,20 @@ function transport(
       restartRequired: false,
     }),
     query,
+    researchControl: async () =>
+      query({ query: "researchDatasets" }),
+    startBacktestFromFile: async () =>
+      query({ query: "jobs", limit: 25 }),
+    decisionControl: async () =>
+      query({ query: "overview" }),
+    modelControl: async () =>
+      query({ query: "jobs", limit: 25 }),
+    fairValueControl: async () =>
+      query({ query: "fairValueMeasurements" }),
+    paperControl: async () =>
+      query({ query: "paperStatus" }),
+    portfolioControl: async () =>
+      query({ query: "portfolioAccounts" }),
     jobControl: async (request) =>
       query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
     sourceControl: async (_action, _request) =>
@@ -232,6 +246,11 @@ describe("Market Squawk desktop boundary", () => {
       ),
       operations: [
         datasetRead(
+          "Research.ListDatasets",
+          "research",
+          "Return the bounded local research dataset inventory.",
+        ),
+        datasetRead(
           "Research.GetManifest",
           "research",
           "Return one immutable analytical dataset manifest.",
@@ -290,19 +309,20 @@ describe("Market Squawk desktop boundary", () => {
       'nav[aria-label="Market Squawk"]',
     )
     expect(navigation).toBeTruthy()
-    if (!navigation) {
+    if (!(navigation instanceof HTMLElement)) {
       throw new Error("Market Squawk navigation is absent")
     }
-    expect(navigation.querySelectorAll("a,button")).toHaveLength(15)
+    expect(navigation.querySelectorAll("a,button")).toHaveLength(16)
     const paperExecution = Array.from(
       navigation.querySelectorAll("button"),
     ).find((button) => button.textContent?.includes("Paper Execution"))
     expect(paperExecution?.getAttribute("aria-disabled")).toBe("true")
-    const backup = navigation.querySelector('a[href="/backup-recovery"]')
-    expect(backup?.textContent).toContain("Backup & Recovery")
-    expect(screen.getByText("Technical capability details")).toBeTruthy()
-    expect(screen.getByText("Fundamental.GetFacts")).toBeTruthy()
-    expect(screen.getByText("Macro.GetRevisions")).toBeTruthy()
+    expect(
+      await within(navigation).findByRole("link", {
+        name: "Backup & Recovery",
+      }),
+    ).toBeTruthy()
+    expect(await screen.findByText("No analytical datasets yet")).toBeTruthy()
     expect(screen.queryByText("Operation arguments")).toBeNull()
 
     rendered.unmount()

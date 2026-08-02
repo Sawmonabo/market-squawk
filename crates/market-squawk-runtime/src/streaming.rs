@@ -1,6 +1,6 @@
 //! Validated native-input tickets and generation-aware event cursors.
 
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -299,6 +299,26 @@ impl InputAdmission {
                 expected_digest,
             })
         }
+    }
+
+    /// Admits a nonempty SHA-256-addressed byte stream across the runtime boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeContractError::InvalidPayload`] when `media_type` is invalid and
+    /// [`RuntimeContractError::EmptyInput`] when `expected_bytes` is zero.
+    pub fn try_sha256(
+        media_type: &str,
+        expected_bytes: u64,
+        expected_digest: [u8; 32],
+    ) -> Result<Self, RuntimeContractError> {
+        let media_type = SourceIdentifier::try_from(media_type)
+            .map_err(|_error| RuntimeContractError::InvalidPayload)?;
+        Self::try_new(
+            media_type,
+            expected_bytes,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, expected_digest),
+        )
     }
 
     /// Declared media type of the staged bytes.

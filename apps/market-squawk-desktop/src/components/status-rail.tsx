@@ -1,9 +1,13 @@
+import * as React from "react"
+
+import type { ProductScope } from "@/app/query-client"
 import { useProduct } from "@/app/product-context"
+import { GlobalLookup } from "@/features/lookup/global-lookup"
+import { useOperationalQueries } from "@/features/overview/use-overview"
+import type { ProductTransport } from "@/lib/transport"
 
 export function StatusRail() {
   const product = useProduct()
-  const bootstrap = product.status === "ready" ? product.bootstrap : null
-  const paper = bootstrap?.setupSteps.find((step) => step.id === "paper")
 
   return (
     <section
@@ -11,7 +15,7 @@ export function StatusRail() {
       className="flex min-h-7 shrink-0 items-center gap-4 border-b border-border/70 bg-card/20 px-5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground"
     >
       <StatusFact
-        label="Local"
+        label="Workspace"
         value={
           product.status === "loading"
             ? "Starting"
@@ -19,32 +23,87 @@ export function StatusRail() {
               ? product.bootstrap.storage.label
               : "Unavailable"
         }
-        ready={bootstrap?.storage.state === "ready"}
+        ready={product.status === "ready" && product.bootstrap.storage.state === "ready"}
       />
-      <StatusFact
-        label="Install"
-        value={bootstrap?.installation.label ?? "Unknown"}
-        ready={bootstrap?.installation.state === "ready"}
-      />
-      <StatusFact
-        label="Mode"
-        value={paper?.complete ? "Paper only" : "Unavailable"}
-        ready={paper?.complete}
-      />
-      <StatusFact
-        label="Telemetry"
-        value={bootstrap?.telemetryEnabled ? "On" : "Off"}
-      />
-      <time className="ml-auto tabular-nums" dateTime={new Date().toISOString()}>
-        {new Intl.DateTimeFormat(undefined, {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-          timeZoneName: "short",
-        }).format(new Date())}
-      </time>
+      {product.status === "ready" ? (
+        <ReadyStatusRail
+          transport={product.transport}
+          scope={product.bootstrap.runtime}
+        />
+      ) : null}
+      <div className="ml-auto flex items-center gap-2">
+        {product.status === "ready" ? (
+          <GlobalLookup
+            transport={product.transport}
+            scope={product.bootstrap.runtime}
+          />
+        ) : null}
+        <CurrentClock />
+      </div>
     </section>
   )
+}
+
+function ReadyStatusRail({
+  transport,
+  scope,
+}: {
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const status = useOperationalQueries(transport, scope)
+  const activeJobs =
+    status.jobs.status === "ready"
+      ? status.jobs.data.jobs.filter(
+          (job) => !["completed", "failed", "cancelled", "interrupted"].includes(job.state),
+        ).length
+      : null
+  return (
+    <>
+      <StatusFact
+        label="Sources"
+        value={status.sources.status === "ready" ? String(status.sources.data?.length ?? 0) : statusLabel(status.sources.status)}
+        ready={status.sources.status === "ready"}
+      />
+      <StatusFact
+        label="Markets"
+        value={status.markets.status === "ready" ? String(status.markets.data?.length ?? 0) : statusLabel(status.markets.status)}
+        ready={status.markets.status === "ready" && (status.markets.data?.length ?? 0) > 0}
+      />
+      <StatusFact
+        label="Jobs"
+        value={activeJobs === null ? statusLabel(status.jobs.status) : `${activeJobs} active`}
+        ready={status.jobs.status === "ready"}
+      />
+      <StatusFact
+        label="Paper"
+        value={status.paper.status === "ready" ? status.paper.data.state : statusLabel(status.paper.status)}
+        ready={status.paper.status === "ready" && status.paper.data.state === "running"}
+      />
+    </>
+  )
+}
+
+function CurrentClock() {
+  const [now, setNow] = React.useState(() => new Date())
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  return (
+    <time className="tabular-nums" dateTime={now.toISOString()}>
+      {new Intl.DateTimeFormat(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZoneName: "short",
+      }).format(now)}
+    </time>
+  )
+}
+
+function statusLabel(status: "loading" | "ready" | "unavailable") {
+  return status === "loading" ? "Checking" : status === "ready" ? "Ready" : "Unavailable"
 }
 
 function StatusFact({

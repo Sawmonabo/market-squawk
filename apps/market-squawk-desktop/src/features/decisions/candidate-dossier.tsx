@@ -1,0 +1,402 @@
+import * as React from "react"
+import { useQuery } from "@tanstack/react-query"
+import {
+  AlertCircle,
+  BookOpenCheck,
+  BriefcaseBusiness,
+  RefreshCw,
+  Search,
+} from "lucide-react"
+
+import { messageFrom } from "@/app/product-context"
+import { productKeys, type ProductScope } from "@/app/query-client"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Skeleton } from "@/components/ui/skeleton"
+import { humanize } from "@/lib/formatters"
+import { formatTimestamp } from "@/lib/time"
+import type { ProductTransport } from "@/lib/transport"
+
+import {
+  digestHex,
+  parseDecisionCandidates,
+  parseDecisionDossier,
+  type CandidateView,
+  type DecisionDossierView,
+} from "./contracts"
+import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+
+export function CandidateDossierWorkspace({
+  transport,
+  scope,
+}: {
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const [runDraft, setRunDraft] = React.useState("")
+  const [runId, setRunId] = React.useState("")
+  const [dossierDraft, setDossierDraft] = React.useState("")
+  const [dossierId, setDossierId] = React.useState("")
+
+  const candidates = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "candidates", { runId }),
+    queryFn: async () =>
+      parseDecisionCandidates(
+        await transport.query({ query: "decisionCandidates", runId }),
+      ),
+    enabled: runId.length > 0,
+  })
+  const dossier = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "dossier", {
+      dossierId,
+    }),
+    queryFn: async () =>
+      parseDecisionDossier(
+        await transport.query({ query: "decisionDossier", dossierId }),
+      ),
+    enabled: dossierId.length > 0,
+  })
+
+  return (
+    <section aria-labelledby="candidate-funnel-heading" className="mt-8">
+      <div>
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+          Screen-to-decision evidence
+        </p>
+        <h2 id="candidate-funnel-heading" className="mt-1 text-lg font-semibold">
+          Candidate funnel and dossier
+        </h2>
+        <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
+          Load exact durable records by ID. The installed authority does not yet expose
+          run history or candidate-to-dossier discovery, so this page does not infer either link.
+        </p>
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <RecordPanel title="Candidates from a screen run" icon={Search}>
+          <IdentityForm
+            id="decision-run-id"
+            label="Screen run ID"
+            value={runDraft}
+            onChange={setRunDraft}
+            onSubmit={() => setRunId(runDraft.trim())}
+            pending={candidates.isFetching}
+          />
+          {!runId ? (
+            <PromptState text="Enter a known screen-run identity to load its ranked candidate funnel." />
+          ) : candidates.isPending ? (
+            <PanelLoading />
+          ) : candidates.isError ? (
+            <RecordError
+              title="Candidates could not be loaded"
+              error={candidates.error}
+              retry={() => void candidates.refetch()}
+            />
+          ) : candidates.data.length === 0 ? (
+            <PromptState text="This durable screen run contains no selected candidates." />
+          ) : (
+            <div className="mt-4 grid gap-3">
+              {candidates.data.map((candidate) => (
+                <CandidateCard key={candidate.id} candidate={candidate} />
+              ))}
+            </div>
+          )}
+        </RecordPanel>
+
+        <RecordPanel title="Global decision dossier" icon={BookOpenCheck}>
+          <IdentityForm
+            id="decision-dossier-id"
+            label="Dossier ID"
+            value={dossierDraft}
+            onChange={setDossierDraft}
+            onSubmit={() => setDossierId(dossierDraft.trim())}
+            pending={dossier.isFetching}
+          />
+          {!dossierId ? (
+            <PromptState text="Enter a known dossier identity to inspect its global evidence references." />
+          ) : dossier.isPending ? (
+            <PanelLoading />
+          ) : dossier.isError ? (
+            <RecordError
+              title="Dossier could not be loaded"
+              error={dossier.error}
+              retry={() => void dossier.refetch()}
+            />
+          ) : (
+            <DossierCard dossier={dossier.data} />
+          )}
+        </RecordPanel>
+      </div>
+    </section>
+  )
+}
+
+function CandidateCard({ candidate }: { candidate: CandidateView }) {
+  return (
+    <article className="rounded-xl border border-border bg-background/45 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-primary">
+            Rank {candidate.rank}
+          </p>
+          <h3 className="mt-1 truncate text-sm font-semibold" title={candidate.instrumentId}>
+            {candidate.instrumentId}
+          </h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Score {candidate.score} · selected {formatTimestamp(candidate.selectedAt)}
+          </p>
+          <EvidenceIdentity value={candidate.id} />
+        </div>
+        <StateLabel value={candidate.dataQuality} />
+      </div>
+
+      <dl className="mt-4 grid grid-cols-2 gap-2 text-xs">
+        <CandidateFact
+          label="Saved screen"
+          value={`${candidate.screenId} · revision ${candidate.screenRevision}`}
+        />
+        <CandidateFact label="Screen run" value={candidate.screenRunId} />
+        <CandidateFact label="Coverage" value={`${candidate.coverage}`} />
+        <CandidateFact label="Liquidity" value={`${candidate.liquidity}`} />
+      </dl>
+
+      <div className="mt-4">
+        <h4 className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+          Score contributions
+        </h4>
+        <ul className="mt-2 grid gap-2">
+          {candidate.scoreContributions.map((contribution) => (
+            <li
+              key={`${contribution.binding.name}:${contribution.binding.version}`}
+              className="rounded-lg border border-border/60 px-3 py-2 text-xs"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  {humanize(contribution.binding.name)} v{contribution.binding.version}
+                </span>
+                <span className="text-right text-muted-foreground">
+                  observed {contribution.observed ?? "missing"} · contribution {contribution.contribution}
+                </span>
+              </div>
+              <EvidenceIdentity value={digestHex(contribution.binding.semanticDigest)} />
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {candidate.flags.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {candidate.flags.map((flag) => (
+            <StateLabel key={flag} value={flag} />
+          ))}
+        </div>
+      )}
+
+      <div className="mt-4 grid gap-3 border-t border-border pt-3">
+        <EvidenceBlock label="Candidate evidence" digest={candidate.evidenceIdentity} />
+        <EvidenceBlock label="Portfolio impact revision" digest={candidate.portfolioRevision} />
+      </div>
+    </article>
+  )
+}
+
+function DossierCard({ dossier }: { dossier: DecisionDossierView }) {
+  return (
+    <article className="mt-4 rounded-xl border border-border bg-background/45 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-semibold" title={dossier.instrumentId}>
+            {dossier.instrumentId}
+          </h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Assembled {formatTimestamp(dossier.assembledAt)}
+          </p>
+        </div>
+        <StateLabel value={`${dossier.references.length} references`} />
+      </div>
+
+      <dl className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
+        <DossierFact label="Dossier" value={dossier.id} />
+        <DossierFact label="Candidate" value={dossier.candidateId} />
+        <DossierFact label="Model bundle" value={dossier.evidence.modelBundle ?? "Not bound"} />
+        <DossierFact
+          label="Fair-value decision"
+          value={dossier.evidence.fairValueDecision ?? "Not bound"}
+        />
+      </dl>
+
+      <div className="mt-4 rounded-lg border border-border/70 p-3">
+        <div className="flex items-center gap-2 text-xs font-medium">
+          <BriefcaseBusiness className="size-3.5 text-primary" aria-hidden="true" />
+          Portfolio impact evidence
+        </div>
+        <EvidenceIdentity value={digestHex(dossier.evidence.portfolioRevision)} />
+      </div>
+
+      <div className="mt-4">
+        <h4 className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+          Section references
+        </h4>
+        {dossier.references.length === 0 ? (
+          <p className="mt-2 text-xs text-muted-foreground">No section references are recorded.</p>
+        ) : (
+          <ul className="mt-2 grid gap-2 sm:grid-cols-2">
+            {dossier.references.map((reference, index) => (
+              <li
+                key={`${reference.section}:${index}`}
+                className="rounded-lg border border-border/60 px-3 py-2"
+              >
+                <span className="text-xs font-medium">{humanize(reference.section)}</span>
+                <EvidenceIdentity value={digestHex(reference.contentIdentity)} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="mt-4 border-t border-border pt-3">
+        <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+          Dossier content identity
+        </span>
+        <EvidenceIdentity value={digestHex(dossier.evidence.contentIdentity)} />
+      </div>
+    </article>
+  )
+}
+
+function IdentityForm({
+  id,
+  label,
+  value,
+  onChange,
+  onSubmit,
+  pending,
+}: {
+  id: string
+  label: string
+  value: string
+  onChange: (value: string) => void
+  onSubmit: () => void
+  pending: boolean
+}) {
+  return (
+    <form
+      className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-end"
+      onSubmit={(event) => {
+        event.preventDefault()
+        onSubmit()
+      }}
+    >
+      <label htmlFor={id} className="flex-1 text-xs font-medium">
+        {label}
+        <Input
+          id={id}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className="mt-2 font-mono text-xs"
+          autoComplete="off"
+        />
+      </label>
+      <Button type="submit" variant="outline" disabled={pending || value.trim().length === 0}>
+        {pending ? <RefreshCw className="animate-spin" aria-hidden="true" /> : <Search aria-hidden="true" />}
+        Load
+      </Button>
+    </form>
+  )
+}
+
+function RecordPanel({
+  title,
+  icon: Icon,
+  children,
+}: {
+  title: string
+  icon: typeof Search
+  children: React.ReactNode
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-card/40 p-4">
+      <div className="flex items-center gap-2">
+        <Icon className="size-4 text-primary" aria-hidden="true" />
+        <h3 className="text-sm font-semibold">{title}</h3>
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function CandidateFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-border/60 p-3">
+      <dt className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</dt>
+      <dd className="mt-1 truncate font-medium" title={value}>
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function DossierFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</dt>
+      <dd className="mt-1 truncate font-mono text-[10px]" title={value}>{value}</dd>
+    </div>
+  )
+}
+
+function EvidenceBlock({
+  label,
+  digest,
+}: {
+  label: string
+  digest: readonly number[] | null
+}) {
+  return (
+    <div>
+      <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</span>
+      <EvidenceIdentity value={digestHex(digest)} />
+    </div>
+  )
+}
+
+function PromptState({ text }: { text: string }) {
+  return (
+    <div className="mt-4 rounded-xl border border-dashed border-border p-5 text-xs leading-5 text-muted-foreground">
+      {text}
+    </div>
+  )
+}
+
+function PanelLoading() {
+  return (
+    <div className="mt-4 space-y-2" aria-label="Loading decision records">
+      <Skeleton className="h-24 w-full" />
+      <Skeleton className="h-16 w-full" />
+    </div>
+  )
+}
+
+function RecordError({
+  title,
+  error,
+  retry,
+}: {
+  title: string
+  error: unknown
+  retry: () => void
+}) {
+  return (
+    <Alert variant="destructive" className="mt-4">
+      <AlertCircle aria-hidden="true" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>
+        {messageFrom(error)}
+        <Button type="button" variant="outline" size="sm" className="mt-2" onClick={retry}>
+          Retry
+        </Button>
+      </AlertDescription>
+    </Alert>
+  )
+}

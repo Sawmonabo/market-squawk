@@ -1,0 +1,321 @@
+import * as React from "react"
+import {
+  ArrowRight,
+  BriefcaseBusiness,
+  Database,
+  Gauge,
+  Search,
+  ServerCog,
+  Settings2,
+} from "lucide-react"
+import { useNavigate } from "react-router-dom"
+
+import { Input } from "@/components/ui/input"
+import { Skeleton } from "@/components/ui/skeleton"
+import type { ProductScope } from "@/app/query-client"
+import type { ProductTransport } from "@/lib/transport"
+import { cn } from "@/lib/utils"
+
+import {
+  lookupCategories,
+  type LookupCategory,
+  type LookupMatch,
+} from "./schemas"
+import { useLookup } from "./use-lookup"
+
+const categoryLabels: Record<LookupCategory, string> = {
+  command: "Actions",
+  dataset: "Research data",
+  instrument: "Instruments",
+  job: "Running work",
+  model: "Models",
+  portfolio: "Portfolios",
+  provider: "Sources",
+  screen: "Saved screens",
+  target: "Investment targets",
+}
+
+export function LookupSurface({
+  transport,
+  scope,
+  autoFocus = false,
+}: {
+  transport: ProductTransport
+  scope: ProductScope
+  autoFocus?: boolean
+}) {
+  const navigate = useNavigate()
+  const [text, setText] = React.useState("")
+  const [categories, setCategories] = React.useState<LookupCategory[]>([])
+  const state = useLookup(transport, scope, text, categories)
+
+  const toggle = (category: LookupCategory) => {
+    setCategories((current) =>
+      current.includes(category)
+        ? current.filter((value) => value !== category)
+        : [...current, category],
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="relative">
+        <Search
+          className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <Input
+          autoFocus={autoFocus}
+          value={text}
+          maxLength={256}
+          onChange={(event) => setText(event.target.value)}
+          placeholder="Search sources, datasets, screens, jobs, or actions…"
+          aria-label="Search your Market Squawk workspace"
+          className="h-11 pl-10"
+        />
+      </div>
+
+      <div className="flex flex-wrap gap-2" aria-label="Limit lookup categories">
+        {lookupCategories.map((category) => {
+          const selected = categories.includes(category)
+          return (
+            <button
+              key={category}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => toggle(category)}
+              className={cn(
+                "rounded-full border px-3 py-1 text-[10px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                selected
+                  ? "border-primary/60 bg-primary/15 text-primary"
+                  : "border-border bg-card/40 text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {categoryLabels[category]}
+            </button>
+          )
+        })}
+      </div>
+
+      <LookupResults
+        state={state}
+        query={text.trim()}
+        onOpen={(match) => navigate(routeFor(match))}
+      />
+    </div>
+  )
+}
+
+function LookupResults({
+  state,
+  query,
+  onOpen,
+}: {
+  state: ReturnType<typeof useLookup>
+  query: string
+  onOpen: (match: LookupMatch) => void
+}) {
+  if (state.status === "idle") {
+    return (
+      <div className="rounded-xl border border-dashed border-border bg-card/20 px-5 py-8 text-center">
+        <Gauge className="mx-auto size-5 text-primary" aria-hidden="true" />
+        <p className="mt-3 text-sm font-medium">Find something in your workspace</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          Enter at least two characters. Lookup only searches bounded local indexes and never runs
+          arbitrary SQL or an AI prompt.
+        </p>
+      </div>
+    )
+  }
+  if (state.status === "loading") {
+    return (
+      <div className="space-y-2" aria-label="Searching local workspace">
+        <Skeleton className="h-16 rounded-lg" />
+        <Skeleton className="h-16 rounded-lg" />
+        <Skeleton className="h-16 rounded-lg" />
+      </div>
+    )
+  }
+  if (state.status === "unavailable") {
+    return (
+      <div role="alert" className="rounded-xl border border-destructive/40 bg-destructive/5 p-4">
+        <p className="text-sm font-medium text-destructive">Lookup is unavailable</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">{state.message}</p>
+      </div>
+    )
+  }
+
+  const data = state.data
+  const grouped = groupMatches(data.matches)
+  const unavailable = data.categories.filter(
+    (category) => category.state === "unavailable",
+  )
+  if (data.matches.length === 0) {
+    return (
+      <div className="rounded-xl border border-border bg-card/25 p-5">
+        <p className="text-sm font-medium">No matches for “{query}”</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          Try an exact source, dataset, screen, job, or operation name. Categories without a
+          bounded local index are listed below rather than guessed.
+        </p>
+        <UnavailableCategories categories={unavailable} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4" aria-live="polite">
+      {[...grouped.entries()].map(([category, matches]) => (
+        <section key={category} aria-labelledby={`lookup-${category}`}>
+          <div className="mb-2 flex items-center justify-between">
+            <h3
+              id={`lookup-${category}`}
+              className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+            >
+              {categoryLabels[category]}
+            </h3>
+            <span className="text-[10px] text-muted-foreground">{matches.length}</span>
+          </div>
+          <div className="grid gap-2">
+            {matches.map((match) => (
+              <button
+                key={`${match.category}:${match.id}`}
+                type="button"
+                onClick={() => onOpen(match)}
+                className="group flex w-full items-start gap-3 rounded-lg border border-border bg-card/40 p-3 text-left transition-colors hover:border-primary/40 hover:bg-card/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              >
+                <LookupIcon category={match.category} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{friendlyLabel(match)}</span>
+                  <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground">
+                    {detailFor(match)}
+                  </span>
+                </span>
+                <ArrowRight
+                  className="mt-1 size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary"
+                  aria-hidden="true"
+                />
+              </button>
+            ))}
+          </div>
+        </section>
+      ))}
+      {data.truncated ? (
+        <p className="text-[11px] text-muted-foreground">
+          More matches exist. Narrow the words or select fewer categories.
+        </p>
+      ) : null}
+      <UnavailableCategories categories={unavailable} />
+    </div>
+  )
+}
+
+function UnavailableCategories({
+  categories,
+}: {
+  categories: Array<{ category: LookupCategory; reason?: string }>
+}) {
+  if (categories.length === 0) return null
+  return (
+    <details className="mt-4 rounded-lg border border-border bg-background/40 px-3 py-2">
+      <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
+        Not searchable yet ({categories.length})
+      </summary>
+      <ul className="mt-2 space-y-2 text-[11px] leading-4 text-muted-foreground">
+        {categories.map((category) => (
+          <li key={category.category}>
+            <strong className="text-foreground/75">{categoryLabels[category.category]}:</strong>{" "}
+            {category.reason ?? "No bounded index is available."}
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+}
+
+function LookupIcon({ category }: { category: LookupCategory }) {
+  const Icon =
+    category === "provider"
+      ? ServerCog
+      : category === "dataset"
+        ? Database
+        : category === "portfolio" || category === "target"
+          ? BriefcaseBusiness
+          : Settings2
+  return (
+    <span className="rounded-md border border-border bg-background/70 p-2">
+      <Icon className="size-4 text-primary" aria-hidden="true" />
+    </span>
+  )
+}
+
+function friendlyLabel(match: LookupMatch) {
+  if (match.category === "provider" && typeof match.detail.display_name === "string") {
+    return match.detail.display_name
+  }
+  return match.label
+}
+
+function detailFor(match: LookupMatch) {
+  const detail = match.detail
+  if (match.category === "provider") {
+    return [detail.coverage, detail.quality_ceiling].filter(isText).join(" · ") || match.id
+  }
+  if (match.category === "dataset") {
+    const rows = typeof detail.rowCount === "number" ? `${detail.rowCount.toLocaleString()} rows` : null
+    return [detail.sourceId, rows].filter(isText).join(" · ") || match.id
+  }
+  if (match.category === "screen") {
+    return typeof detail.revision === "number" ? `Revision ${detail.revision}` : match.id
+  }
+  if (match.category === "job") {
+    return [detail.kind, detail.state].filter(isText).join(" · ") || match.id
+  }
+  if (match.category === "command" && typeof detail.domain === "string") {
+    return `${detail.domain} action · ${match.id}`
+  }
+  return match.id
+}
+
+function routeFor(match: LookupMatch) {
+  if (match.category === "provider") return "/sources"
+  if (match.category === "dataset" || match.category === "screen") return "/research"
+  if (match.category === "model") return "/models"
+  if (match.category === "portfolio") return "/portfolios"
+  if (match.category === "target") return "/fair-value"
+  if (match.category === "job") return "/overview"
+  if (match.category === "command" && typeof match.detail.domain === "string") {
+    const domain = match.detail.domain.toLowerCase()
+    const paths: Record<string, string> = {
+      analysis: "/backtests",
+      bot: "/risk",
+      decision: "/research",
+      execution: "/paper-execution",
+      fairvalue: "/fair-value",
+      fundamental: "/research",
+      job: "/overview",
+      macro: "/research",
+      market: "/markets",
+      model: "/models",
+      portfolio: "/portfolios",
+      research: "/research",
+      source: "/sources",
+    }
+    return paths[domain] ?? "/overview"
+  }
+  return "/overview"
+}
+
+function groupMatches(matches: LookupMatch[]) {
+  const grouped = new Map<LookupCategory, LookupMatch[]>()
+  for (const match of matches) {
+    const group = grouped.get(match.category)
+    if (group) group.push(match)
+    else grouped.set(match.category, [match])
+  }
+  return grouped
+}
+
+function isText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0
+}

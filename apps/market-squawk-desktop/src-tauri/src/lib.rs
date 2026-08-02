@@ -29,9 +29,12 @@ use bridge::{
     open_protected_provider_setup, provider_onboarding,
 };
 use events::subscribe_service_events;
-use input_staging::stage_training_input;
+use input_staging::{stage_training_input, start_backtest_from_file};
 use mcp_clients::mcp_status;
-use service_client::{dashboard_query, job_control, source_control};
+use service_client::{
+    dashboard_query, decision_control, fair_value_control, job_control, model_control,
+    paper_control, portfolio_control, research_control, source_control,
+};
 
 #[cfg(target_os = "linux")]
 const MAXIMUM_APPIMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -189,15 +192,22 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             dashboard_query,
+            decision_control,
             desktop_bootstrap,
+            fair_value_control,
             job_control,
             installation_control,
             mcp_status,
+            model_control,
             open_official_provider_page,
             open_protected_provider_setup,
+            paper_control,
+            portfolio_control,
             provider_onboarding,
+            research_control,
             source_control,
             stage_training_input,
+            start_backtest_from_file,
             subscribe_service_events
         ])
         .build(tauri::generate_context!())?;

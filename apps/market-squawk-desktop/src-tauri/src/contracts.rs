@@ -220,16 +220,34 @@ pub(crate) enum DashboardQueryCommand {
     },
     MarketSnapshot,
     MarketQuality,
-    SourceStatus,
-    SourceCoverage,
-    SourceHealth,
+    SourceStatus {
+        source_ids: Option<Vec<String>>,
+    },
+    SourceCoverage {
+        source_ids: Option<Vec<String>>,
+    },
+    SourceHealth {
+        source_ids: Option<Vec<String>>,
+    },
     ResearchDatasets {
         after_dataset: Option<String>,
+    },
+    ResearchManifest {
+        dataset: String,
+    },
+    ResearchHistory {
+        dataset: String,
+    },
+    ResearchAlternativeData {
+        dataset: String,
     },
     PortfolioAccounts {
         after_account_id: Option<String>,
     },
     PortfolioHoldings {
+        account_id: String,
+    },
+    PortfolioTransactions {
         account_id: String,
     },
     PortfolioPerformance {
@@ -241,18 +259,237 @@ pub(crate) enum DashboardQueryCommand {
     PortfolioRisk {
         account_id: String,
     },
+    PortfolioRevisions {
+        account_id: String,
+        after_revision_id: Option<String>,
+    },
+    PortfolioAttribution {
+        account_id: String,
+        baseline_revision_id: String,
+    },
+    PortfolioScenario {
+        account_id: String,
+        scenario: Map<String, Value>,
+    },
+    PortfolioScenarioBatch {
+        account_id: String,
+        scenarios: Vec<Value>,
+    },
+    PortfolioRebalance {
+        account_id: String,
+        proposal: Map<String, Value>,
+    },
+    PortfolioCandidateImpact {
+        account_id: String,
+        candidate: Map<String, Value>,
+    },
     ModelBundles,
     Forecasts,
-    Backtests {
-        dataset: Option<String>,
+    ModelMetadata {
+        model_id: String,
+    },
+    ModelPrediction {
+        model_id: String,
+        input: Map<String, Value>,
+    },
+    Forecast {
+        vintage_id: String,
+    },
+    ForecastOutcomes {
+        vintage_id: String,
+    },
+    DecisionScreens {
+        limit: u16,
+    },
+    DecisionCandidates {
+        run_id: String,
+    },
+    DecisionDossier {
+        dossier_id: String,
+    },
+    DecisionTarget {
+        target_id: String,
+        revision: u32,
+    },
+    DecisionTargets {
+        target_id: String,
+    },
+    DecisionTargetStatus {
+        target_id: String,
+        revision: u32,
+    },
+    Backtest {
+        run_id: String,
+    },
+    AnalysisArtifact {
+        artifact_id: String,
+        sha256: String,
+        byte_count: u64,
+        media_type: String,
+        offset: u64,
+        maximum_bytes: u64,
     },
     PaperStatus,
     PaperOrders,
     PaperFills,
     FairValueMeasurements,
+    FairValueClassification {
+        measurement_id: String,
+    },
+    FairValueExplanation {
+        measurement_id: String,
+    },
+    FairValueEvidence {
+        measurement_id: String,
+    },
+    FairValueApprovalStatus {
+        measurement_id: String,
+        at: String,
+    },
+    FairValueAudit {
+        after: Option<Map<String, Value>>,
+        limit: u16,
+    },
+    FairValueMarketAccess {
+        assessment_id: String,
+    },
     Jobs {
         after_job_id: Option<String>,
         limit: u16,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum ResearchControlCommand {
+    StartIngest {
+        provider: String,
+        object: String,
+        dataset: String,
+        discovery_receipt: String,
+    },
+    StartDatasetBuild {
+        registration: Map<String, Value>,
+    },
+    StartExport {
+        dataset: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum DecisionControlCommand {
+    SaveScreen {
+        expected_revision: Option<u32>,
+        screen: Map<String, Value>,
+    },
+    RunScreen {
+        run: Map<String, Value>,
+        candidates: Vec<Value>,
+        selected_at: String,
+    },
+    CreateTarget {
+        target: Map<String, Value>,
+    },
+    ReviewTarget {
+        review: Map<String, Value>,
+    },
+    ReevaluateTarget {
+        expected_revision: u32,
+        successor: Map<String, Value>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum ModelControlCommand {
+    Evaluate {
+        model_id: String,
+        input: Map<String, Value>,
+    },
+    StartTraining {
+        config_ticket_id: Uuid,
+        authority_ticket_id: Uuid,
+    },
+    StartForecast {
+        model_id: String,
+        request: Map<String, Value>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum FairValueControlCommand {
+    Measure {
+        measurement: Map<String, Value>,
+    },
+    Classify {
+        measurement_id: String,
+    },
+    Approve {
+        measurement_id: String,
+        decision_id: String,
+        approved_by: String,
+        approved_at: String,
+        expires_at: String,
+    },
+    ApproveMarketAccess {
+        account_id: String,
+        venue_id: String,
+        instrument_id: String,
+        conclusion: String,
+        effective_from: String,
+        effective_until: String,
+        rationale: String,
+        prepared_by: String,
+        prepared_at: String,
+        approved_by: String,
+        approved_at: String,
+    },
+    ProposeOverride {
+        measurement_id: String,
+        decision_id: String,
+        requested_hierarchy: String,
+        justification: String,
+        prepared_by: String,
+        prepared_at: String,
+        expires_at: String,
+    },
+    RevokeApproval {
+        approval_id: String,
+        revoked_by: String,
+        revoked_at: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum PaperControlCommand {
+    Start {
+        provider: String,
+        provider_session_id: Option<String>,
+        initial_cash: String,
+        fee_basis_points: u16,
+    },
+    Stop {
+        reason: String,
+    },
+    Cancel {
+        order_id: String,
+    },
+    Reconcile,
+    TriggerKillSwitch {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum PortfolioControlCommand {
+    Import {
+        account_id: String,
+        artifact_id: String,
     },
 }
 

@@ -1,5 +1,7 @@
 import { z } from "zod"
 
+import { losslessIntegerSchema } from "@/lib/lossless-integer"
+
 export const readinessSchema = z.object({
   state: z.enum(["ready", "available", "not_configured", "unverified"]),
   label: z.string(),
@@ -180,7 +182,7 @@ export const inputTicketSchema = z.object({
     algorithm: z.literal("sha256"),
     bytes: z.array(z.number().int().min(0).max(255)).length(32),
   }),
-  expiresAt: z.number().int(),
+  expiresAt: losslessIntegerSchema,
 })
 
 export const mcpStatusSchema = z.object({

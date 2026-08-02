@@ -5,6 +5,7 @@ import {
   Bot,
   Boxes,
   BriefcaseBusiness,
+  Crosshair,
   Database,
   FileClock,
   FileTerminal,
@@ -49,6 +50,12 @@ export const workspaceNavigation: NavigationItem[] = [
     domain: "portfolio",
   },
   { label: "Models", path: "/models", icon: Bot, domain: "model" },
+  {
+    label: "Decisions",
+    path: "/decisions",
+    icon: Crosshair,
+    domain: "decision",
+  },
   {
     label: "Backtests",
     path: "/backtests",

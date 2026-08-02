@@ -14,11 +14,17 @@ import {
 } from "@/lib/schemas"
 import type {
   DashboardQuery,
+  DecisionControlRequest,
+  FairValueControlRequest,
   JobControlRequest,
   InstallationControlRequest,
+  ModelControlRequest,
+  PaperControlRequest,
+  PortfolioControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
+  ResearchControlRequest,
   SourceLifecycleAction,
   SourceLifecycleRequest,
   TrainingInputKind,
@@ -47,6 +53,41 @@ class TauriTransport implements ProductTransport {
 
   async query(request: DashboardQuery) {
     const value = await invoke("dashboard_query", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async researchControl(request: ResearchControlRequest, confirmed = false) {
+    const value = await invoke("research_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async startBacktestFromFile(confirmed = false) {
+    const value = await invoke("start_backtest_from_file", { confirmed })
+    return value === null ? null : applicationResultSchema.parse(value)
+  }
+
+  async decisionControl(request: DecisionControlRequest, confirmed = false) {
+    const value = await invoke("decision_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async modelControl(request: ModelControlRequest, confirmed = false) {
+    const value = await invoke("model_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async fairValueControl(request: FairValueControlRequest, confirmed = false) {
+    const value = await invoke("fair_value_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async paperControl(request: PaperControlRequest, confirmed = false) {
+    const value = await invoke("paper_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async portfolioControl(request: PortfolioControlRequest, confirmed = false) {
+    const value = await invoke("portfolio_control", { request, confirmed })
     return applicationResultSchema.parse(value)
   }
 
@@ -136,6 +177,34 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  researchControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  startBacktestFromFile(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  decisionControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  modelControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  fairValueControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  paperControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  portfolioControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

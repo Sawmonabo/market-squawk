@@ -32,6 +32,7 @@ use crate::contracts::{
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAXIMUM_DESKTOP_RESULT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_DESKTOP_RESULT_ITEMS: u64 = 1_000;
+const MAXIMUM_SAFE_JAVASCRIPT_INTEGER: i64 = 9_007_199_254_740_991;
 const MAXIMUM_OPERATION_BYTES: usize = 128;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
@@ -71,6 +72,7 @@ const PAPER_SETUP_OPERATIONS: [&str; 8] = [
 pub(crate) enum InvocationAuthority {
     ReadOnly,
     ExactConfirmed(&'static str),
+    RiskMediated(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -779,7 +781,10 @@ pub(crate) async fn invoke_application(
             "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
         }),
     );
-    if matches!(authority, InvocationAuthority::ExactConfirmed(_)) {
+    if matches!(
+        authority,
+        InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
+    ) {
         request
             .arguments
             .insert("confirm".to_owned(), Value::Bool(true));
@@ -807,6 +812,11 @@ async fn invoke_service_operation(
             operation == expected
                 && !descriptor.read_only
                 && descriptor.authorization == "local_confirmation"
+        }
+        InvocationAuthority::RiskMediated(expected) => {
+            operation == expected
+                && !descriptor.read_only
+                && descriptor.authorization == "risk_mediated"
         }
     };
     if !authorized {
@@ -847,7 +857,49 @@ async fn invoke_service_operation(
             "The operation result exceeds the dashboard safety limit.",
         ));
     }
+    let result = lossless_webview_value(result);
+    let webview_bytes =
+        serde_json::to_vec(&result).map_err(|_error| DesktopCommandError::internal())?;
+    if webview_bytes.len() > maximum_result_bytes {
+        return Err(DesktopCommandError::new(
+            "resource_exhausted",
+            "The operation result exceeds the dashboard safety limit.",
+        ));
+    }
     Ok(result)
+}
+
+/// Preserves integers that JavaScript cannot represent exactly as decimal strings.
+///
+/// Tauri transports JSON values through a WebView. Nanosecond timestamps routinely exceed
+/// JavaScript's safe-integer range, so allowing Serde to emit them as JSON numbers would silently
+/// alter point-in-time evidence before the dashboard validates it.
+pub(crate) fn lossless_webview_value(value: Value) -> Value {
+    match value {
+        Value::Number(number) => {
+            let outside_safe_range = number.as_i64().is_some_and(|value| {
+                !(-MAXIMUM_SAFE_JAVASCRIPT_INTEGER..=MAXIMUM_SAFE_JAVASCRIPT_INTEGER)
+                    .contains(&value)
+            }) || number
+                .as_u64()
+                .is_some_and(|value| value > MAXIMUM_SAFE_JAVASCRIPT_INTEGER as u64);
+            if outside_safe_range {
+                Value::String(number.to_string())
+            } else {
+                Value::Number(number)
+            }
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(lossless_webview_value).collect())
+        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, lossless_webview_value(value)))
+                .collect(),
+        ),
+        scalar => scalar,
+    }
 }
 
 #[tauri::command]
@@ -1036,7 +1088,7 @@ fn decode_application_result(response: &Value) -> Result<Value, DesktopCommandEr
 mod tests {
     use serde_json::json;
 
-    use super::decode_application_result;
+    use super::{decode_application_result, lossless_webview_value};
 
     #[test]
     fn native_success_returns_the_application_result_envelope() {
@@ -1066,6 +1118,20 @@ mod tests {
                     "dataQuality": null
                 }
             }))
+        );
+    }
+
+    #[test]
+    fn webview_transport_preserves_financial_time_integers_exactly() {
+        assert_eq!(
+            lossless_webview_value(json!({
+                "timestamp": 1_800_000_000_000_000_001_i64,
+                "safeCount": 42
+            })),
+            json!({
+                "timestamp": "1800000000000000001",
+                "safeCount": 42
+            })
         );
     }
 }

@@ -152,7 +152,7 @@ export function ProviderStep({
       <div className="grid gap-3 lg:grid-cols-2">
         {sourceProfiles.map((profile) => {
           const session = sessionFor(profile)
-          const active = session?.next_action === "active"
+          const setupReady = session?.next_action === "active"
           const nativeSource = NATIVE_SOURCE_PROFILES.has(profile.id)
           const needsSecret =
             session && SECRET_ACTIONS.has(session.next_action)
@@ -170,15 +170,22 @@ export function ProviderStep({
                     {profile.coverage}
                   </p>
                 </div>
-                {active ? (
+                {setupReady ? (
                   <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-400">
                     <CircleCheck className="size-3.5" aria-hidden="true" />
-                    Active
+                    Setup ready
                   </span>
                 ) : null}
               </div>
 
-              {!active ? (
+              <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border/70 pt-3 text-[10px]">
+                <ProviderFact label="Account" value={profile.account_requirement} />
+                <ProviderFact label="Credential" value={profile.credential_requirement} />
+                <ProviderFact label="Cost" value={profile.zero_fee} />
+                <ProviderFact label="Quality ceiling" value={profile.quality_ceiling} />
+              </dl>
+
+              {!setupReady ? (
                 <div className="mt-4 flex flex-wrap gap-2">
                   {nativeSource && !session ? (
                     <Button
@@ -230,7 +237,7 @@ export function ProviderStep({
                 </div>
               ) : null}
 
-              {session && !active ? (
+              {session && !setupReady ? (
                 <p className="mt-3 text-[10px] text-muted-foreground">
                   Next: {plainAction(session.next_action)}
                 </p>
@@ -269,4 +276,13 @@ export function ProviderStep({
 
 function plainAction(action: string) {
   return action.replaceAll("_", " ")
+}
+
+function ProviderFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="uppercase tracking-wider text-muted-foreground">{label}</dt>
+      <dd className="mt-0.5 line-clamp-2 text-foreground/80">{value}</dd>
+    </div>
+  )
 }
