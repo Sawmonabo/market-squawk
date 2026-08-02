@@ -11,77 +11,10 @@ export type McpClientState =
   | "access_revoked"
   | "conflict"
 
-export interface McpClientReceipt {
-  commandSha256: string
-  observedAtUnixSeconds: number
-}
-
-export interface McpVerification {
-  protocolVersion: string
-  clientInfoName: string
-  serverName: string
-  toolCount: number
-  resourceCount: number
-  safeReadTool: string
-  verifiedAtUnixSeconds: number
-}
-
-export interface McpClientView {
-  client: McpClientKind
-  label: string
-  state: McpClientState
-  clientVersion: string | null
-  receipt: McpClientReceipt | null
-  verification: McpVerification | null
-  blocker: string | null
-  service: McpServiceClientStatus
-}
-
-export interface McpServiceClientStatus {
-  client: McpClientKind
-  clientId: string
-  credentialGeneration: number
-  credentialIdentity: string
-  maximumActiveRequests: number
-  activeRequests: number
-  admittedRequests: number
-  rateLimitedRequests: number
-  observedRelayInitializations: number
-  lastActivityUnixSeconds: number | null
-  credentialRotationRecoveryPending: boolean
-  priorCredentialCleanupPending: boolean
-  accessRevoked: boolean
-}
-
-export interface McpRuntimeStatus {
-  sessionModel: "stateless_request_scoped"
-  activeClients: number
-  activeRequests: number
-  admittedRequests: number | null
-  rateLimitedRequests: number | null
-  rejectedCredentials: number
-  uptimeSeconds: number
-  process: {
-    residentMemoryBytes: number | null
-    virtualMemoryBytes: number | null
-  }
-  limits: {
-    maximumFrameBytes: number
-    maximumBodyBytes: number
-    maximumActiveRequests: number
-    maximumInlineBytes: number
-    maximumInlineItems: number
-    maximumResultBytes: number
-    maximumResultItems: number
-    requestTimeoutMilliseconds: number
-  }
-  clients: McpServiceClientStatus[]
-}
-
-export type McpClientsStatus = Omit<SharedMcpClientsStatus, "clients"> & {
-  runtime: McpRuntimeStatus
-  clients: McpClientView[]
-}
+export type McpClientsStatus = SharedMcpClientsStatus
+export type McpClientView = McpClientsStatus["clients"][number]
+export type McpServiceClientStatus = McpClientView["service"]
+export type McpRuntimeStatus = McpClientsStatus["runtime"]
 
 export type McpClientAction =
   | "connect"

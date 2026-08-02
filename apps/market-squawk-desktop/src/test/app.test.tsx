@@ -183,34 +183,93 @@ function transport(
     sourceControl: async (_action, _request) =>
       query({ query: "sourceStatus" }),
     stageTrainingInput: async () => null,
-    mcpClients: async () => ({
-      serviceReady: true,
-      sharedEndpointReady: true,
-      workspaceId: bootstrap.runtime.workspaceId,
-      serviceGeneration: bootstrap.runtime.serviceGeneration,
-      protocolVersion: "2025-11-25",
-      transport: "stdio_relay",
-      clients: [
-        {
-          client: "claude_code",
-          label: "Claude Code",
-          state: "absent",
-          clientVersion: null,
-          receipt: null,
-          verification: null,
-          blocker: null,
+    mcpClients: async () => {
+      const claudeService = {
+        client: "claude_code" as const,
+        clientId: "d6b1a16d-bdf9-44d9-b10b-6e7558d701cb",
+        credentialGeneration: 1,
+        credentialIdentity: "d6b1a16d-bdf9-44d9-b10b-6e7558d701cb:1",
+        maximumActiveRequests: 4,
+        activeRequests: 0,
+        admittedRequests: 0,
+        rateLimitedRequests: 0,
+        observedRelayInitializations: 0,
+        lastActivityUnixSeconds: null,
+        credentialRotationRecoveryPending: false,
+        priorCredentialCleanupPending: false,
+        accessRevoked: false,
+      }
+      const codexService = {
+        client: "codex" as const,
+        clientId: "6c4a5edb-caa2-4945-91fb-95baaca448f8",
+        credentialGeneration: 1,
+        credentialIdentity: "6c4a5edb-caa2-4945-91fb-95baaca448f8:1",
+        maximumActiveRequests: 4,
+        activeRequests: 0,
+        admittedRequests: 0,
+        rateLimitedRequests: 0,
+        observedRelayInitializations: 0,
+        lastActivityUnixSeconds: null,
+        credentialRotationRecoveryPending: false,
+        priorCredentialCleanupPending: false,
+        accessRevoked: false,
+      }
+      const serviceClients = [claudeService, codexService]
+      return {
+        serviceReady: true,
+        sharedEndpointReady: true,
+        workspaceId: bootstrap.runtime.workspaceId,
+        serviceGeneration: bootstrap.runtime.serviceGeneration,
+        protocolVersion: "2025-11-25",
+        transport: "stdio_relay",
+        runtime: {
+          sessionModel: "stateless_request_scoped",
+          activeClients: 0,
+          activeRequests: 0,
+          admittedRequests: 0,
+          rateLimitedRequests: 0,
+          rejectedCredentials: 0,
+          uptimeSeconds: 60,
+          process: {
+            residentMemoryBytes: 16_777_216,
+            virtualMemoryBytes: 67_108_864,
+          },
+          limits: {
+            maximumFrameBytes: 1_048_576,
+            maximumBodyBytes: 1_048_576,
+            maximumActiveRequests: 8,
+            maximumInlineBytes: 262_144,
+            maximumInlineItems: 1_000,
+            maximumResultBytes: 16_777_216,
+            maximumResultItems: 10_000,
+            requestTimeoutMilliseconds: 30_000,
+          },
+          clients: serviceClients,
         },
-        {
-          client: "codex",
-          label: "Codex",
-          state: "absent",
-          clientVersion: null,
-          receipt: null,
-          verification: null,
-          blocker: null,
-        },
-      ],
-    }),
+        clients: [
+          {
+            client: "claude_code",
+            label: "Claude Code",
+            state: "absent",
+            clientVersion: null,
+            receipt: null,
+            verification: null,
+            blocker: null,
+            service: claudeService,
+          },
+          {
+            client: "codex",
+            label: "Codex",
+            state: "absent",
+            clientVersion: null,
+            receipt: null,
+            verification: null,
+            blocker: null,
+            service: codexService,
+          },
+        ],
+      }
+    },
     mcpClientControl: async () =>
       Promise.reject(new Error("MCP mutation is not configured for this test.")),
     subscribe: async () => () => undefined,
@@ -346,13 +405,9 @@ describe("Market Squawk desktop boundary", () => {
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
     )
-    expect(
-      await screen.findByText(
-        "/Applications/Market Squawk.app/Contents/MacOS/market-squawk",
-      ),
-    ).toBeTruthy()
-    expect(screen.getByText("Desktop exit required")).toBeTruthy()
-    expect(screen.getByText("Research.GetManifest")).toBeTruthy()
+    expect(await screen.findByText("One authenticated local endpoint")).toBeTruthy()
+    expect(screen.getByText("Claude Code and Codex")).toBeTruthy()
+    expect(screen.getByText("stateless request sessions", { exact: false })).toBeTruthy()
   })
 
   it("never promotes an unverified backend state to installation readiness", async () => {

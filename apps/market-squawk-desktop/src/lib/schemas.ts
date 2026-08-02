@@ -177,6 +177,47 @@ export const inputTicketSchema = z.object({
   expiresAt: losslessIntegerSchema,
 })
 
+const mcpServiceClientStatusSchema = z.object({
+  client: z.enum(["claude_code", "codex"]),
+  clientId: z.string().uuid(),
+  credentialGeneration: z.number().int().positive(),
+  credentialIdentity: z.string().min(1).max(128),
+  maximumActiveRequests: z.number().int().positive(),
+  activeRequests: z.number().int().nonnegative(),
+  admittedRequests: z.number().int().nonnegative(),
+  rateLimitedRequests: z.number().int().nonnegative(),
+  observedRelayInitializations: z.number().int().nonnegative(),
+  lastActivityUnixSeconds: z.number().int().nonnegative().nullable(),
+  credentialRotationRecoveryPending: z.boolean(),
+  priorCredentialCleanupPending: z.boolean(),
+  accessRevoked: z.boolean(),
+})
+
+const mcpRuntimeStatusSchema = z.object({
+  sessionModel: z.literal("stateless_request_scoped"),
+  activeClients: z.number().int().nonnegative(),
+  activeRequests: z.number().int().nonnegative(),
+  admittedRequests: z.number().int().nonnegative().nullable(),
+  rateLimitedRequests: z.number().int().nonnegative().nullable(),
+  rejectedCredentials: z.number().int().nonnegative(),
+  uptimeSeconds: z.number().int().nonnegative(),
+  process: z.object({
+    residentMemoryBytes: z.number().int().nonnegative().nullable(),
+    virtualMemoryBytes: z.number().int().nonnegative().nullable(),
+  }),
+  limits: z.object({
+    maximumFrameBytes: z.number().int().positive(),
+    maximumBodyBytes: z.number().int().positive(),
+    maximumActiveRequests: z.number().int().positive(),
+    maximumInlineBytes: z.number().int().positive(),
+    maximumInlineItems: z.number().int().positive(),
+    maximumResultBytes: z.number().int().positive(),
+    maximumResultItems: z.number().int().positive(),
+    requestTimeoutMilliseconds: z.number().int().positive(),
+  }),
+  clients: z.array(mcpServiceClientStatusSchema).length(2),
+})
+
 export const mcpClientsStatusSchema = z.object({
   serviceReady: z.boolean(),
   sharedEndpointReady: z.boolean(),
@@ -184,6 +225,7 @@ export const mcpClientsStatusSchema = z.object({
   serviceGeneration: z.number().int().positive(),
   protocolVersion: z.string().min(1).max(64),
   transport: z.literal("stdio_relay"),
+  runtime: mcpRuntimeStatusSchema,
   clients: z.array(
     z.object({
       client: z.enum(["claude_code", "codex"]),
@@ -194,6 +236,7 @@ export const mcpClientsStatusSchema = z.object({
         "ready",
         "owned",
         "repair_required",
+        "access_revoked",
         "conflict",
       ]),
       clientVersion: z.string().min(1).max(128).nullable(),
@@ -215,6 +258,7 @@ export const mcpClientsStatusSchema = z.object({
         })
         .nullable(),
       blocker: z.string().min(1).max(256).nullable(),
+      service: mcpServiceClientStatusSchema,
     }),
   ).length(2),
 })
