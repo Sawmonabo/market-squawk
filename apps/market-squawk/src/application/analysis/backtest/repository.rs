@@ -334,6 +334,17 @@ fn validate_input_evidence(
     command: &GovernedBacktestCommand,
     input: &PinnedBacktestInput,
 ) -> Result<(), ServiceError> {
+    if let Some(cohort) = &input.cohort {
+        if cohort.members.is_empty()
+            || cohort
+                .members
+                .iter()
+                .any(|member| !input_within_command_scope(command, &member.input))
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        return Ok(());
+    }
     let definition_count = input.instrument_definitions.instrument_count();
     if definition_count == 0
         || (!command.scope().instruments().is_empty()
@@ -364,15 +375,75 @@ fn validate_input_evidence(
     if batches.is_empty() || *byte_count == 0 {
         return Err(ServiceError::InvalidResult);
     }
-    if let Some((starts_at, ends_at)) = command.scope().time_range()
-        && (input.instrument_definitions.as_of() < ends_at
-            || batches
+    if !command.scope().time_ranges().is_empty()
+        && (input.instrument_definitions.as_of()
+            < command
+                .scope()
+                .time_ranges()
                 .iter()
-                .any(|batch| !batch_within_time_range(batch, starts_at, ends_at)))
+                .map(|(_, ends_at)| *ends_at)
+                .max()
+                .ok_or(ServiceError::InvalidResult)?
+            || batches.iter().any(|batch| {
+                !command
+                    .scope()
+                    .time_ranges()
+                    .iter()
+                    .any(|(starts_at, ends_at)| {
+                        batch_within_time_range(batch, *starts_at, *ends_at)
+                    })
+            }))
     {
         return Err(ServiceError::InvalidResult);
     }
     Ok(())
+}
+
+fn input_within_command_scope(
+    command: &GovernedBacktestCommand,
+    input: &PinnedBacktestInput,
+) -> bool {
+    let instruments = input
+        .instrument_definitions
+        .instrument_ids()
+        .collect::<Vec<_>>();
+    if instruments.is_empty()
+        || instruments.iter().any(|instrument| {
+            command
+                .scope()
+                .instruments()
+                .binary_search(instrument)
+                .is_err()
+        })
+        || input.sources.is_empty()
+        || !strictly_ordered(&input.sources)
+        || !input.sources.iter().all(|source| {
+            SourceId::try_from(source.as_str())
+                .ok()
+                .is_some_and(|source| command.scope().sources().binary_search(&source).is_ok())
+        })
+    {
+        return false;
+    }
+    let QueryResult::Inline {
+        batches,
+        byte_count,
+    } = input.query.result()
+    else {
+        return false;
+    };
+    *byte_count > 0
+        && !batches.is_empty()
+        && batches.iter().all(|batch| {
+            command
+                .scope()
+                .time_ranges()
+                .iter()
+                .any(|(starts_at, ends_at)| {
+                    input.instrument_definitions.as_of() >= *ends_at
+                        && batch_within_time_range(batch, *starts_at, *ends_at)
+                })
+        })
 }
 
 pub(super) fn strictly_ordered<T: Ord>(values: &[T]) -> bool {
@@ -529,7 +600,7 @@ mod tests {
         let command = GovernedBacktestCommand::new(
             SourceIdentifier::try_from("strategy-v1")?,
             SourceIdentifier::try_from("input-v1")?,
-            BacktestScope::new(Vec::new(), None, Vec::new()),
+            BacktestScope::new(Vec::new(), Vec::new(), Vec::new()),
         );
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         first

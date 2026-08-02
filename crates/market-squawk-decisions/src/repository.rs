@@ -2,13 +2,12 @@
 
 use std::fmt;
 
-use market_squawk_domain::RevisionNumber;
-
 use crate::{
-    DecisionDossier, GovernedTargetSet, InvestmentTargetSetId, SavedScreen, ScreenExecution,
-    ScreenId, ScreenRunId, TargetInvalidation, TargetReview, TargetReviewDisposition, TargetState,
-    TargetStatus,
+    CandidateId, DecisionDossier, GovernedTargetSet, InvestmentTargetSetId, SavedScreen,
+    ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetInvalidation, TargetReview,
+    TargetReviewDisposition, TargetState, TargetStatus,
 };
+use market_squawk_domain::{InstrumentId, RevisionNumber};
 
 const MAX_REPOSITORY_LIMIT: usize = 65_536;
 const MAX_REPOSITORY_CANDIDATES: usize = 1_000_000;
@@ -90,6 +89,88 @@ pub enum AppendOutcome {
     Appended,
     /// The exact same stable identity and immutable content was already present.
     AlreadyPresent,
+}
+
+/// Bounded discovery projection for one immutable saved-screen run.
+///
+/// It provides the exact retained run identity and candidate count, but never republishes candidate
+/// inputs, formulas, queries, or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScreenRunIndexEntry {
+    run: ScreenRun,
+    candidate_count: usize,
+}
+
+impl ScreenRunIndexEntry {
+    fn new(run: ScreenRun, candidate_count: usize) -> Self {
+        Self {
+            run,
+            candidate_count,
+        }
+    }
+
+    /// Exact immutable point-in-time screen run.
+    #[must_use]
+    pub const fn run(&self) -> &ScreenRun {
+        &self.run
+    }
+
+    /// Number of retained selected candidates, not an unbounded source-row count.
+    #[must_use]
+    pub const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+}
+
+/// Bounded discovery projection for the current immutable head of one target series.
+///
+/// The entry is a research/read-side locator only. It is neither a rebalance target nor an order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetIndexEntry {
+    id: InvestmentTargetSetId,
+    revision: RevisionNumber,
+    instrument_id: InstrumentId,
+    status: TargetStatus,
+}
+
+impl TargetIndexEntry {
+    fn new(
+        id: InvestmentTargetSetId,
+        revision: RevisionNumber,
+        instrument_id: InstrumentId,
+        status: TargetStatus,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            instrument_id,
+            status,
+        }
+    }
+
+    /// Stable target-series identity.
+    #[must_use]
+    pub const fn id(&self) -> &InvestmentTargetSetId {
+        &self.id
+    }
+
+    /// Latest immutable revision discovered for the series.
+    #[must_use]
+    pub const fn revision(&self) -> RevisionNumber {
+        self.revision
+    }
+
+    /// Instrument supported by this research judgment.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Append-derived current review state for the exact indexed revision.
+    #[must_use]
+    pub const fn status(&self) -> TargetStatus {
+        self.status
+    }
 }
 
 /// One typed persisted record. No variant contains a path, query, formula, credential, or order.
@@ -177,6 +258,7 @@ impl std::error::Error for DecisionRepositoryError {}
 pub struct DecisionRepository {
     limits: DecisionRepositoryLimits,
     records: Vec<DecisionRecord>,
+    target_index: Vec<TargetIndexEntry>,
 }
 
 impl DecisionRepository {
@@ -186,7 +268,15 @@ impl DecisionRepository {
         records
             .try_reserve_exact(limits.maximum_records)
             .map_err(|_error| DecisionRepositoryError::Allocation)?;
-        Ok(Self { limits, records })
+        let mut target_index = Vec::new();
+        target_index
+            .try_reserve_exact(limits.maximum_target_revisions)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        Ok(Self {
+            limits,
+            records,
+            target_index,
+        })
     }
 
     /// Replays a typed snapshot through every ordinary append invariant.
@@ -382,7 +472,14 @@ impl DecisionRepository {
         if self.target_count() >= self.limits.maximum_target_revisions {
             return Err(DecisionRepositoryError::Capacity);
         }
+        let indexed = TargetIndexEntry::new(
+            target.target().id().clone(),
+            target.target().revision(),
+            target.target().instrument_id(),
+            TargetStatus::PendingReview,
+        );
         self.push(DecisionRecord::Target(target))?;
+        self.replace_target_index(indexed);
         Ok(AppendOutcome::Appended)
     }
 
@@ -419,7 +516,15 @@ impl DecisionRepository {
         if self.review_count() >= self.limits.maximum_reviews {
             return Err(DecisionRepositoryError::Capacity);
         }
+        let status = match review.disposition() {
+            TargetReviewDisposition::Activate => TargetStatus::Active,
+            TargetReviewDisposition::Reject => TargetStatus::Rejected,
+            TargetReviewDisposition::NeedsChanges => TargetStatus::NeedsChanges,
+        };
+        let target_id = review.target_id().clone();
+        let revision = review.target_revision();
         self.push(DecisionRecord::Review(review))?;
+        self.set_index_status(&target_id, revision, status);
         Ok(AppendOutcome::Appended)
     }
 
@@ -449,7 +554,10 @@ impl DecisionRepository {
         if self.invalidation_count() >= self.limits.maximum_invalidations {
             return Err(DecisionRepositoryError::Capacity);
         }
+        let target_id = invalidation.target_id().clone();
+        let revision = invalidation.target_revision();
         self.push(DecisionRecord::Invalidation(invalidation))?;
+        self.set_index_status(&target_id, revision, TargetStatus::NeedsReview);
         Ok(AppendOutcome::Appended)
     }
 
@@ -477,12 +585,116 @@ impl DecisionRepository {
         })
     }
 
+    /// Lists bounded saved-screen run locators in durable append order.
+    ///
+    /// The caller must select a positive presentation bound. This exposes only retained run
+    /// identities and selected-candidate counts; exact candidates remain a separate lookup.
+    pub fn list_screen_runs(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<ScreenRunIndexEntry>, DecisionRepositoryError> {
+        self.list_screen_runs_after(None, maximum)
+    }
+
+    /// Continues bounded saved-screen run discovery strictly after one exact retained run identity.
+    ///
+    /// A supplied cursor must name a retained execution. Unknown cursors fail closed rather than
+    /// restarting at the beginning and presenting a misleading duplicate page.
+    pub fn list_screen_runs_after(
+        &self,
+        after: Option<&ScreenRunId>,
+        maximum: usize,
+    ) -> Result<Vec<ScreenRunIndexEntry>, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let count = self.screen_run_count().min(maximum);
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut executions = self.records.iter().filter_map(|record| match record {
+            DecisionRecord::ScreenExecution(execution) => Some(execution),
+            _ => None,
+        });
+        if let Some(after) = after {
+            if executions
+                .position(|execution| execution.run().id() == after)
+                .is_none()
+            {
+                return Err(DecisionRepositoryError::NotFound);
+            }
+        }
+        result.extend(executions.take(maximum).map(|execution| {
+            ScreenRunIndexEntry::new(execution.run().clone(), execution.candidates().len())
+        }));
+        Ok(result)
+    }
+
     /// Finds one immutable dossier.
     pub fn dossier(&self, id: &crate::DossierId) -> Option<&DecisionDossier> {
         self.records.iter().find_map(|record| match record {
             DecisionRecord::Dossier(dossier) if dossier.dossier().id() == id => Some(dossier),
             _ => None,
         })
+    }
+
+    /// Lists bounded dossiers assembled for one exact retained candidate.
+    ///
+    /// Candidate-to-dossier discovery is derived from immutable retained identities rather than a
+    /// caller-supplied relationship or a second mutable index.
+    pub fn dossiers_for_candidate(
+        &self,
+        candidate_id: &CandidateId,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionRepositoryError> {
+        self.dossiers_for_candidate_after(candidate_id, None, maximum)
+    }
+
+    /// Continues dossier discovery for one candidate strictly after an exact retained dossier.
+    ///
+    /// The optional cursor is validated against the candidate relationship itself, preventing a
+    /// caller from paging one candidate through another candidate's evidence chain.
+    pub fn dossiers_for_candidate_after(
+        &self,
+        candidate_id: &CandidateId,
+        after: Option<&crate::DossierId>,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let count = self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record, DecisionRecord::Dossier(dossier)
+                    if dossier.dossier().candidate_id() == candidate_id)
+            })
+            .take(maximum)
+            .count();
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut dossiers = self.records.iter().filter_map(|record| match record {
+            DecisionRecord::Dossier(dossier)
+                if dossier.dossier().candidate_id() == candidate_id =>
+            {
+                Some(dossier)
+            }
+            _ => None,
+        });
+        if let Some(after) = after {
+            if dossiers
+                .position(|dossier| dossier.dossier().id() == after)
+                .is_none()
+            {
+                return Err(DecisionRepositoryError::NotFound);
+            }
+        }
+        result.extend(dossiers.take(maximum).cloned());
+        Ok(result)
     }
 
     /// Lists immutable revisions for one target series.
@@ -603,6 +815,45 @@ impl DecisionRepository {
         ))
     }
 
+    /// Lists at most one bounded locator for each target series, always at its latest revision.
+    ///
+    /// The index is rebuilt only through the same checked append paths as its immutable source
+    /// records, so it cannot become an independently mutable source of target authority.
+    pub fn list_target_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionRepositoryError> {
+        self.list_target_index_after(None, maximum)
+    }
+
+    /// Continues target-series discovery strictly after one exact current index identity.
+    ///
+    /// The cursor is checked against the in-memory index maintained by immutable append paths. A
+    /// target that no longer appears as a current series head therefore cannot be used to restart
+    /// discovery ambiguously.
+    pub fn list_target_index_after(
+        &self,
+        after: Option<&InvestmentTargetSetId>,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+        let count = self.target_index.len().min(maximum);
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        let mut entries = self.target_index.iter();
+        if let Some(after) = after {
+            if entries.position(|entry| entry.id() == after).is_none() {
+                return Err(DecisionRepositoryError::NotFound);
+            }
+        }
+        result.extend(entries.take(maximum).cloned());
+        Ok(result)
+    }
+
     fn screen_head(&self, id: &ScreenId) -> Option<RevisionNumber> {
         self.screens()
             .filter(|screen| screen.revision().id() == id)
@@ -614,6 +865,35 @@ impl DecisionRepository {
         self.target_revisions(id)
             .map(|target| target.target().revision())
             .max_by_key(|revision| revision.get())
+    }
+
+    fn replace_target_index(&mut self, entry: TargetIndexEntry) {
+        if let Some(existing) = self
+            .target_index
+            .iter_mut()
+            .find(|existing| existing.id == entry.id)
+        {
+            *existing = entry;
+        } else {
+            // The vector is reserved to the checked target-revision capacity before any append.
+            // One target series cannot outnumber retained target revisions.
+            self.target_index.push(entry);
+        }
+    }
+
+    fn set_index_status(
+        &mut self,
+        id: &InvestmentTargetSetId,
+        revision: RevisionNumber,
+        status: TargetStatus,
+    ) {
+        if let Some(entry) = self
+            .target_index
+            .iter_mut()
+            .find(|entry| entry.id == *id && entry.revision == revision)
+        {
+            entry.status = status;
+        }
     }
 
     fn push(&mut self, record: DecisionRecord) -> Result<(), DecisionRepositoryError> {

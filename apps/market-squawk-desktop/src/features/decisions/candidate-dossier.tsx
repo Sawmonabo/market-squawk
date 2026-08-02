@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 import {
   AlertCircle,
   BookOpenCheck,
@@ -12,7 +12,6 @@ import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
@@ -21,11 +20,15 @@ import type { ProductTransport } from "@/lib/transport"
 import {
   digestHex,
   parseDecisionCandidates,
-  parseDecisionDossier,
+  parseDecisionCandidateDossierPage,
+  parseDecisionScreenRunPage,
   type CandidateView,
   type DecisionDossierView,
+  type ScreenRunIndexView,
 } from "./contracts"
 import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+
+const DISCOVERY_LIMIT = 100
 
 export function CandidateDossierWorkspace({
   transport,
@@ -34,10 +37,23 @@ export function CandidateDossierWorkspace({
   transport: ProductTransport
   scope: ProductScope
 }) {
-  const [runDraft, setRunDraft] = React.useState("")
   const [runId, setRunId] = React.useState("")
-  const [dossierDraft, setDossierDraft] = React.useState("")
-  const [dossierId, setDossierId] = React.useState("")
+  const [candidateId, setCandidateId] = React.useState("")
+  const runs = useInfiniteQuery({
+    queryKey: productKeys.operation(scope, "decision", "screen-runs", {
+      limit: DISCOVERY_LIMIT,
+    }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) =>
+      parseDecisionScreenRunPage(
+        await transport.query({
+          query: "decisionScreenRuns",
+          ...(pageParam ? { afterRunId: pageParam } : {}),
+          limit: DISCOVERY_LIMIT,
+        }),
+      ),
+    getNextPageParam: (page) => page.nextAfter ?? undefined,
+  })
 
   const candidates = useQuery({
     queryKey: productKeys.operation(scope, "decision", "candidates", { runId }),
@@ -47,16 +63,26 @@ export function CandidateDossierWorkspace({
       ),
     enabled: runId.length > 0,
   })
-  const dossier = useQuery({
-    queryKey: productKeys.operation(scope, "decision", "dossier", {
-      dossierId,
+  const dossiers = useInfiniteQuery({
+    queryKey: productKeys.operation(scope, "decision", "candidate-dossiers", {
+      candidateId,
+      limit: DISCOVERY_LIMIT,
     }),
-    queryFn: async () =>
-      parseDecisionDossier(
-        await transport.query({ query: "decisionDossier", dossierId }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) =>
+      parseDecisionCandidateDossierPage(
+        await transport.query({
+          query: "decisionCandidateDossiers",
+          candidateId,
+          ...(pageParam ? { afterDossierId: pageParam } : {}),
+          limit: DISCOVERY_LIMIT,
+        }),
       ),
-    enabled: dossierId.length > 0,
+    enabled: candidateId.length > 0,
+    getNextPageParam: (page) => page.nextAfter ?? undefined,
   })
+  const runEntries = runs.data?.pages.flatMap((page) => page.items) ?? []
+  const dossierEntries = dossiers.data?.pages.flatMap((page) => page.items) ?? []
 
   return (
     <section aria-labelledby="candidate-funnel-heading" className="mt-8">
@@ -68,23 +94,55 @@ export function CandidateDossierWorkspace({
           Candidate funnel and dossier
         </h2>
         <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-          Load exact durable records by ID. The installed authority does not yet expose
-          run history or candidate-to-dossier discovery, so this page does not infer either link.
+          Start with an immutable point-in-time screen run, review its bounded ranked candidates,
+          then open only dossiers the decision authority retained for the selected candidate.
         </p>
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <RecordPanel title="Candidates from a screen run" icon={Search}>
-          <IdentityForm
-            id="decision-run-id"
-            label="Screen run ID"
-            value={runDraft}
-            onChange={setRunDraft}
-            onSubmit={() => setRunId(runDraft.trim())}
-            pending={candidates.isFetching}
-          />
+        <RecordPanel title="Saved-screen runs" icon={Search}>
+          {runs.isPending ? (
+            <PanelLoading />
+          ) : runs.isError ? (
+            <RecordError
+              title="Saved-screen runs could not be loaded"
+              error={runs.error}
+              retry={() => void runs.refetch()}
+            />
+          ) : runEntries.length === 0 ? (
+            <PromptState text="No immutable saved-screen runs are retained in this workspace." />
+          ) : (
+            <div className="mt-4 grid gap-2">
+              {runEntries.map((run) => (
+                <ScreenRunCard
+                  key={run.id}
+                  run={run}
+                  selected={run.id === runId}
+                  onSelect={() => {
+                    setRunId(run.id)
+                    setCandidateId("")
+                  }}
+                />
+              ))}
+              {runs.hasNextPage && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={runs.isFetchingNextPage}
+                  onClick={() => void runs.fetchNextPage()}
+                >
+                  {runs.isFetchingNextPage ? <RefreshCw className="animate-spin" /> : null}
+                  Load more runs
+                </Button>
+              )}
+            </div>
+          )}
+        </RecordPanel>
+
+        <RecordPanel title="Candidates from the selected run" icon={Search}>
           {!runId ? (
-            <PromptState text="Enter a known screen-run identity to load its ranked candidate funnel." />
+            <PromptState text="Select a retained saved-screen run to load its ranked candidate funnel." />
           ) : candidates.isPending ? (
             <PanelLoading />
           ) : candidates.isError ? (
@@ -98,33 +156,48 @@ export function CandidateDossierWorkspace({
           ) : (
             <div className="mt-4 grid gap-3">
               {candidates.data.map((candidate) => (
-                <CandidateCard key={candidate.id} candidate={candidate} />
+                <CandidateCard
+                  key={candidate.id}
+                  candidate={candidate}
+                  selected={candidate.id === candidateId}
+                  onSelect={() => setCandidateId(candidate.id)}
+                />
               ))}
             </div>
           )}
         </RecordPanel>
 
-        <RecordPanel title="Global decision dossier" icon={BookOpenCheck}>
-          <IdentityForm
-            id="decision-dossier-id"
-            label="Dossier ID"
-            value={dossierDraft}
-            onChange={setDossierDraft}
-            onSubmit={() => setDossierId(dossierDraft.trim())}
-            pending={dossier.isFetching}
-          />
-          {!dossierId ? (
-            <PromptState text="Enter a known dossier identity to inspect its global evidence references." />
-          ) : dossier.isPending ? (
+        <RecordPanel title="Dossiers for the selected candidate" icon={BookOpenCheck}>
+          {!candidateId ? (
+            <PromptState text="Select a candidate to discover its authoritative decision dossiers." />
+          ) : dossiers.isPending ? (
             <PanelLoading />
-          ) : dossier.isError ? (
+          ) : dossiers.isError ? (
             <RecordError
-              title="Dossier could not be loaded"
-              error={dossier.error}
-              retry={() => void dossier.refetch()}
+              title="Candidate dossiers could not be loaded"
+              error={dossiers.error}
+              retry={() => void dossiers.refetch()}
             />
+          ) : dossierEntries.length === 0 ? (
+            <PromptState text="The selected candidate has no retained dossier yet." />
           ) : (
-            <DossierCard dossier={dossier.data} />
+            <div className="mt-4 grid gap-3">
+              {dossierEntries.map((dossier) => (
+                <DossierCard key={dossier.id} dossier={dossier} />
+              ))}
+              {dossiers.hasNextPage && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={dossiers.isFetchingNextPage}
+                  onClick={() => void dossiers.fetchNextPage()}
+                >
+                  {dossiers.isFetchingNextPage ? <RefreshCw className="animate-spin" /> : null}
+                  Load more dossiers
+                </Button>
+              )}
+            </div>
           )}
         </RecordPanel>
       </div>
@@ -132,9 +205,56 @@ export function CandidateDossierWorkspace({
   )
 }
 
-function CandidateCard({ candidate }: { candidate: CandidateView }) {
+function ScreenRunCard({
+  run,
+  selected,
+  onSelect,
+}: {
+  run: ScreenRunIndexView
+  selected: boolean
+  onSelect: () => void
+}) {
   return (
-    <article className="rounded-xl border border-border bg-background/45 p-4">
+    <button
+      type="button"
+      className="rounded-lg border border-border bg-background/45 p-3 text-left transition-colors hover:border-primary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-pressed={selected}
+      onClick={onSelect}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-xs font-semibold">
+            {run.screenId} · revision {run.screenRevision}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Cutoff {formatTimestamp(run.asOf)} · {run.candidateCount} selected
+          </p>
+        </div>
+        <StateLabel value={selected ? "selected" : "open"} />
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <EvidenceBlock label="Dataset identity" digest={run.datasetIdentity} />
+        <EvidenceBlock label="Universe identity" digest={run.universeIdentity} />
+      </div>
+    </button>
+  )
+}
+
+function CandidateCard({
+  candidate,
+  selected,
+  onSelect,
+}: {
+  candidate: CandidateView
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <article
+      className={`rounded-xl border bg-background/45 p-4 ${
+        selected ? "border-primary/60" : "border-border"
+      }`}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-primary">
@@ -197,6 +317,10 @@ function CandidateCard({ candidate }: { candidate: CandidateView }) {
         <EvidenceBlock label="Candidate evidence" digest={candidate.evidenceIdentity} />
         <EvidenceBlock label="Portfolio impact revision" digest={candidate.portfolioRevision} />
       </div>
+      <Button type="button" variant="outline" size="sm" className="mt-4" onClick={onSelect}>
+        <BookOpenCheck aria-hidden="true" />
+        {selected ? "Showing dossiers" : "Discover dossiers"}
+      </Button>
     </article>
   )
 }
@@ -262,47 +386,6 @@ function DossierCard({ dossier }: { dossier: DecisionDossierView }) {
         <EvidenceIdentity value={digestHex(dossier.evidence.contentIdentity)} />
       </div>
     </article>
-  )
-}
-
-function IdentityForm({
-  id,
-  label,
-  value,
-  onChange,
-  onSubmit,
-  pending,
-}: {
-  id: string
-  label: string
-  value: string
-  onChange: (value: string) => void
-  onSubmit: () => void
-  pending: boolean
-}) {
-  return (
-    <form
-      className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-end"
-      onSubmit={(event) => {
-        event.preventDefault()
-        onSubmit()
-      }}
-    >
-      <label htmlFor={id} className="flex-1 text-xs font-medium">
-        {label}
-        <Input
-          id={id}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          className="mt-2 font-mono text-xs"
-          autoComplete="off"
-        />
-      </label>
-      <Button type="submit" variant="outline" disabled={pending || value.trim().length === 0}>
-        {pending ? <RefreshCw className="animate-spin" aria-hidden="true" /> : <Search aria-hidden="true" />}
-        Load
-      </Button>
-    </form>
   )
 }
 

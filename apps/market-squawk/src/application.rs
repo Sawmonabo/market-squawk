@@ -18,16 +18,23 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod analysis;
+pub mod backup;
 mod contracts;
 pub mod decision;
 mod domain_support;
 pub mod fair_value;
+pub mod governance;
 pub mod job;
+pub mod lifecycle;
 mod live_fair_value;
+pub mod logs;
 pub mod model;
+pub mod operations;
 mod paper;
 mod research;
+pub mod settings;
 pub mod source;
+pub mod workspace;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
 pub use fair_value::{
@@ -535,7 +542,7 @@ fn effective_service_limits(
 
 const fn domain_index(domain: ServiceDomain) -> Option<usize> {
     match domain {
-        ServiceDomain::Job | ServiceDomain::Decision => None,
+        ServiceDomain::Job | ServiceDomain::Decision | ServiceDomain::Operations => None,
         ServiceDomain::Source => Some(0),
         ServiceDomain::Market => Some(1),
         ServiceDomain::Research => Some(2),

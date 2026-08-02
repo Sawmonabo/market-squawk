@@ -31,7 +31,7 @@ pub use identity::{
 };
 pub use repository::{
     AppendOutcome, DecisionJournalSnapshot, DecisionRecord, DecisionRepository,
-    DecisionRepositoryError, DecisionRepositoryLimits,
+    DecisionRepositoryError, DecisionRepositoryLimits, ScreenRunIndexEntry, TargetIndexEntry,
 };
 pub use screen::{
     AsOfSemantics, ComparisonOperator, MAX_SCREEN_DATA_QUALITIES, MAX_SCREEN_RESULTS, NullPolicy,

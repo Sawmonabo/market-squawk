@@ -74,6 +74,16 @@ const candidateSchema = z.object({
   evidenceIdentity: digestSchema,
 })
 
+const screenRunIndexSchema = z.object({
+  id: z.string().min(1),
+  screenId: z.string().min(1),
+  screenRevision: z.number().int().positive(),
+  asOf: timestampSchema,
+  datasetIdentity: digestSchema,
+  universeIdentity: digestSchema,
+  candidateCount: z.number().int().nonnegative(),
+})
+
 const dossierSchema = z.object({
   id: z.string().min(1),
   candidateId: z.string().min(1),
@@ -114,6 +124,7 @@ const invalidationSchema = z.object({
     "reference_mark",
     "assumption",
   ]),
+  actor: z.string().min(1).nullable(),
   observedAt: timestampSchema,
   contentIdentity: digestSchema,
 })
@@ -177,14 +188,93 @@ const targetStateSchema = z.object({
   latestInvalidation: invalidationSchema.nullable(),
 })
 
+const targetIndexSchema = z.object({
+  id: z.string().min(1),
+  revision: z.number().int().positive(),
+  instrumentId: z.string().min(1),
+  status: z.enum([
+    "pending_review",
+    "active",
+    "rejected",
+    "needs_changes",
+    "needs_review",
+    "superseded",
+  ]),
+})
+
 const screenListSchema = z.object({ screens: z.array(screenSchema) })
+const screenRunListSchema = z.object({
+  runs: z.array(screenRunIndexSchema),
+  nextAfter: z.string().min(1).nullable().optional(),
+})
 const candidateListSchema = z.object({ candidates: z.array(candidateSchema) })
+const candidateDossierListSchema = z.object({
+  dossiers: z.array(dossierSchema),
+  nextAfter: z.string().min(1).nullable().optional(),
+})
 const targetListSchema = z.object({ targets: z.array(targetStateSchema) })
+const targetIndexListSchema = z.object({
+  targets: z.array(targetIndexSchema),
+  nextAfter: z.string().min(1).nullable().optional(),
+})
+const governancePrincipalSchema = z.object({
+  principalId: z.string().min(1),
+  displayName: z.string().min(1),
+  roles: z.array(z.string().min(1)).min(1),
+})
+const governancePrincipalPageSchema = z.object({
+  principals: z.array(governancePrincipalSchema),
+  nextAfter: z.string().nullable().optional(),
+})
+const governancePreviewSchema = z.object({
+  preview: z.object({
+    previewId: z.string().min(1),
+    digest: z.string().min(1),
+    requiredRoles: z.array(z.string().min(1)).min(1),
+    distinctPrincipalCount: z.number().int().positive(),
+    eligiblePrincipalIds: z.array(z.string().min(1)),
+    expiresAt: z.string().min(1),
+    effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
+  }),
+})
+const governanceAuthorizationSchema = z.object({
+  authorization: z.object({
+    authorizationHandle: z.string().min(1),
+    previewId: z.string().min(1),
+    principalId: z.string().min(1),
+    expiresAt: z.string().min(1),
+  }),
+})
+const governanceReceiptSchema = z.object({
+  receipt: z.object({
+    receiptId: z.string().min(1),
+    previewId: z.string().min(1),
+    digest: z.string().min(1),
+    committedAt: z.string().min(1),
+    authorizedPrincipals: z.array(
+      z.object({
+        principalId: z.string().min(1),
+        roles: z.array(z.string().min(1)),
+      }),
+    ),
+    effects: z.array(z.object({ kind: z.string().min(1) })),
+  }),
+})
 
 export type CandidateView = z.infer<typeof candidateSchema>
 export type DecisionDossierView = z.infer<typeof dossierSchema>
 export type SavedScreenView = z.infer<typeof screenSchema>
+export type ScreenRunIndexView = z.infer<typeof screenRunIndexSchema>
 export type TargetStateView = z.infer<typeof targetStateSchema>
+export type TargetIndexView = z.infer<typeof targetIndexSchema>
+export type GovernancePrincipalView = z.infer<typeof governancePrincipalSchema>
+export type GovernancePreviewView = z.infer<typeof governancePreviewSchema>["preview"]
+export type GovernanceAuthorizationView = z.infer<typeof governanceAuthorizationSchema>["authorization"]
+export type GovernanceReceiptView = z.infer<typeof governanceReceiptSchema>["receipt"]
+export interface DecisionDiscoveryPage<Item> {
+  items: Item[]
+  nextAfter: string | null
+}
 
 export function parseDecisionScreens(result: ApplicationResult): SavedScreenView[] {
   return parseResult(screenListSchema, result, "saved-screen list").screens
@@ -196,14 +286,63 @@ export function parseDecisionCandidates(
   return parseResult(candidateListSchema, result, "candidate funnel").candidates
 }
 
+export function parseDecisionScreenRunPage(
+  result: ApplicationResult,
+): DecisionDiscoveryPage<ScreenRunIndexView> {
+  const page = parseResult(screenRunListSchema, result, "saved-screen run discovery")
+  return { items: page.runs, nextAfter: page.nextAfter ?? null }
+}
+
 export function parseDecisionDossier(
   result: ApplicationResult,
 ): DecisionDossierView {
   return parseResult(dossierSchema, result, "decision dossier")
 }
 
+export function parseDecisionCandidateDossierPage(
+  result: ApplicationResult,
+): DecisionDiscoveryPage<DecisionDossierView> {
+  const page = parseResult(
+    candidateDossierListSchema,
+    result,
+    "candidate-to-dossier discovery",
+  )
+  return { items: page.dossiers, nextAfter: page.nextAfter ?? null }
+}
+
 export function parseDecisionTargets(result: ApplicationResult): TargetStateView[] {
   return parseResult(targetListSchema, result, "target history").targets
+}
+
+export function parseDecisionTargetIndexPage(
+  result: ApplicationResult,
+): DecisionDiscoveryPage<TargetIndexView> {
+  const page = parseResult(targetIndexListSchema, result, "target discovery")
+  return { items: page.targets, nextAfter: page.nextAfter ?? null }
+}
+
+export function parseGovernancePrincipals(
+  result: ApplicationResult,
+): GovernancePrincipalView[] {
+  return parseResult(governancePrincipalPageSchema, result, "governance principals").principals
+}
+
+export function parseGovernancePreview(result: ApplicationResult): GovernancePreviewView {
+  return parseResult(governancePreviewSchema, result, "governance action preview").preview
+}
+
+export function parseGovernanceAuthorization(
+  result: ApplicationResult,
+): GovernanceAuthorizationView {
+  return parseResult(
+    governanceAuthorizationSchema,
+    result,
+    "governance authorization",
+  ).authorization
+}
+
+export function parseGovernanceReceipt(result: ApplicationResult): GovernanceReceiptView {
+  return parseResult(governanceReceiptSchema, result, "governance commit receipt").receipt
 }
 
 export function digestHex(value: readonly number[] | null): string {

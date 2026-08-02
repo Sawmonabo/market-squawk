@@ -125,12 +125,52 @@ impl ResearchExecutionAssumptions {
         self.digest
     }
 
-    pub(crate) const fn latency_nanos(self) -> i64 {
+    /// Returns the complete deterministic research-fill policy for evidence presentation.
+    #[must_use]
+    pub const fn fee_basis_points(self) -> BasisPoints {
+        self.fee_basis_points
+    }
+
+    /// Returns the deterministic adverse slippage beyond the observed half spread.
+    #[must_use]
+    pub const fn slippage_basis_points(self) -> BasisPoints {
+        self.slippage_basis_points
+    }
+
+    /// Returns the seeded additional adverse-slippage ceiling.
+    #[must_use]
+    pub const fn maximum_random_slippage_basis_points(self) -> BasisPoints {
+        self.maximum_random_slippage_basis_points
+    }
+
+    /// Returns the maximum observed executable-depth participation rate.
+    #[must_use]
+    pub const fn maximum_participation_basis_points(self) -> BasisPoints {
+        self.maximum_participation_basis_points
+    }
+
+    /// Returns the deterministic shared-depth allocation rule.
+    #[must_use]
+    pub const fn liquidity_priority(self) -> ResearchLiquidityPriority {
+        self.liquidity_priority
+    }
+
+    /// Returns the minimum event-time delay between a signal and execution.
+    #[must_use]
+    pub const fn latency_nanos(self) -> i64 {
         self.latency_nanos
     }
 
-    pub(crate) const fn liquidity_priority(self) -> ResearchLiquidityPriority {
-        self.liquidity_priority
+    /// Returns whether an order can complete below its requested quantity.
+    #[must_use]
+    pub const fn allow_partial_fills(self) -> bool {
+        self.allow_partial_fills
+    }
+
+    /// Returns the exact fee decimal scale and rounding contract.
+    #[must_use]
+    pub const fn fee_decimal_scale(self) -> u32 {
+        self.fee_decimal_scale
     }
 }
 

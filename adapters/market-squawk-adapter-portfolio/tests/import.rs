@@ -42,6 +42,31 @@ struct FixtureRecord {
 }
 
 #[test]
+fn preview_normalizes_without_promoting_raw_or_active_source_state() -> TestResult {
+    let fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
+    let batch = batch(&fixture.records, "portfolio-preview")?;
+    let archive = tempfile::tempdir()?;
+    let mut source = PortfolioExtractionSource::try_new(
+        SourceId::try_from(SOURCE_ID)?,
+        MetadataRevision::new(SourceIdentifier::try_from(METADATA_REVISION)?),
+        DataQuality::DirectUnverified,
+        LocalAuthorityStateStore::try_open(archive.path())?,
+        None,
+        PortfolioImportLimits::standard(),
+    )?;
+
+    let preview = source.preview_batch(&batch)?;
+    assert_eq!(preview.disposition(), ImportDisposition::Applied);
+    assert_eq!(preview.transactions().len(), 5);
+    assert!(source.raw_records().is_empty());
+
+    let committed = source.import_batch(&batch)?;
+    assert_eq!(committed.disposition(), ImportDisposition::Applied);
+    assert_eq!(source.raw_records().len(), fixture.records.len());
+    Ok(())
+}
+
+#[test]
 fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_data() -> TestResult {
     let fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
     let batch = batch(&fixture.records, "portfolio-statement")?;

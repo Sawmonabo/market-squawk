@@ -233,6 +233,14 @@ fn digest_vintage(
     hash.update(created_at.unix_nanos().to_be_bytes());
     hash.update(expires_at.unix_nanos().to_be_bytes());
     hash.update(artifact_hash.bytes());
+    for observation in &path.observed_history {
+        hash.update(observation.observed_at().unix_nanos().to_be_bytes());
+        hash.update(observation.available_at().unix_nanos().to_be_bytes());
+        hash.update(observation.value().mantissa().to_be_bytes());
+        hash.update([observation.value().scale()]);
+        hash.update(observation.source_pit_hash().bytes());
+        hash.update([quality_tag(observation.quality())]);
+    }
     for point in &path.points {
         hash.update(point.target_at.unix_nanos().to_be_bytes());
         hash.update(point.central.mantissa.to_be_bytes());

@@ -15,6 +15,7 @@ import {
   type LucideIcon,
   WalletCards,
 } from "lucide-react"
+import { Link } from "react-router-dom"
 
 import { ProviderStep } from "@/components/setup/provider-step"
 import { Button } from "@/components/ui/button"
@@ -148,7 +149,7 @@ export function SetupFlow({
             onRefresh={onRefresh}
           />
         ) : current.id === "mcp" ? (
-          <McpStep step={current} instruction={bootstrap.mcpClient} />
+          <McpStep step={current} onClose={onClose} />
         ) : current.id === "review" ? (
           <ReviewStep steps={steps} onRefresh={onRefresh} />
         ) : (
@@ -199,57 +200,25 @@ export function SetupFlow({
 
 function McpStep({
   step,
-  instruction,
+  onClose,
 }: {
   step: SetupStep
-  instruction: DesktopBootstrap["mcpClient"]
+  onClose: () => void
 }) {
-  const clientConfiguration = instruction
-    ? {
-        mcpServers: {
-          "market-squawk": {
-            command: instruction.program,
-            args: instruction.arguments,
-            env: instruction.environment,
-          },
-        },
-      }
-    : null
-
   return (
     <div className="mx-auto max-w-2xl space-y-5 py-4">
       <StepStatus step={step} />
-      {clientConfiguration ? (
-        <section className="space-y-4 rounded-lg border border-border bg-background/35 p-4">
-          <div>
-            <h3 className="text-sm font-semibold">
-              Generated local client configuration
-            </h3>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              The installed capability is verified, but the service is stopped
-              and no MCP client has been configured automatically.
-            </p>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              Advanced policy supplied only through environment variables must
-              also be added to your MCP client.
-            </p>
-          </div>
-          <pre className="max-h-64 overflow-auto rounded-md border border-border bg-black/35 p-3 font-mono text-[11px] leading-relaxed text-foreground/85">
-            {JSON.stringify(clientConfiguration, null, 2)}
-          </pre>
-          <div className="flex gap-3 rounded-md border border-amber-400/25 bg-amber-400/5 p-3">
-            <CircleAlert
-              className="mt-0.5 size-4 shrink-0 text-amber-300"
-              aria-hidden="true"
-            />
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              Close Market Squawk before your MCP client starts this service.
-              The desktop and MCP process use the same local workspace and must
-              not own it at the same time.
-            </p>
-          </div>
-        </section>
-      ) : null}
+      <section className="space-y-3 rounded-lg border border-border bg-background/35 p-4">
+        <h3 className="text-sm font-semibold">Connect your AI workspace</h3>
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Market Squawk keeps one shared service running for this user. The MCP workspace can
+          connect Claude Code and Codex, verify each real connection, and repair an owned entry
+          without closing the dashboard or copying configuration text.
+        </p>
+        <Button asChild size="sm">
+          <Link to="/mcp" onClick={onClose}>Open MCP workspace</Link>
+        </Button>
+      </section>
     </div>
   )
 }

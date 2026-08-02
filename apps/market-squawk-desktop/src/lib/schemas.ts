@@ -90,13 +90,6 @@ export const setupStepSchema = z.object({
     .nullable(),
 })
 
-export const mcpClientInstructionSchema = z.object({
-  program: z.string().min(1),
-  arguments: z.array(z.string()),
-  environment: z.record(z.string(), z.string()),
-  requiresDesktopExit: z.literal(true),
-})
-
 export const desktopBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
   applicationVersion: z.string(),
@@ -112,7 +105,6 @@ export const desktopBootstrapSchema = z.object({
   installation: readinessSchema,
   modelRuntime: readinessSchema,
   mcp: readinessSchema,
-  mcpClient: mcpClientInstructionSchema.nullable(),
   telemetryEnabled: z.boolean(),
   encryptedFileFallback: encryptedFileFallbackSchema,
   providerProfiles: z.array(providerProfileSchema),
@@ -185,11 +177,46 @@ export const inputTicketSchema = z.object({
   expiresAt: losslessIntegerSchema,
 })
 
-export const mcpStatusSchema = z.object({
+export const mcpClientsStatusSchema = z.object({
   serviceReady: z.boolean(),
   sharedEndpointReady: z.boolean(),
-  claudeCode: z.string(),
-  codex: z.string(),
+  workspaceId: z.string().uuid(),
+  serviceGeneration: z.number().int().positive(),
+  protocolVersion: z.string().min(1).max(64),
+  transport: z.literal("stdio_relay"),
+  clients: z.array(
+    z.object({
+      client: z.enum(["claude_code", "codex"]),
+      label: z.string().min(1).max(64),
+      state: z.enum([
+        "absent",
+        "unsupported",
+        "ready",
+        "owned",
+        "repair_required",
+        "conflict",
+      ]),
+      clientVersion: z.string().min(1).max(128).nullable(),
+      receipt: z
+        .object({
+          commandSha256: z.string().regex(/^[0-9a-f]{64}$/),
+          observedAtUnixSeconds: z.number().int().nonnegative(),
+        })
+        .nullable(),
+      verification: z
+        .object({
+          protocolVersion: z.string().min(1).max(64),
+          clientInfoName: z.string().min(1).max(128),
+          serverName: z.string().min(1).max(128),
+          toolCount: z.number().int().nonnegative(),
+          resourceCount: z.number().int().nonnegative(),
+          safeReadTool: z.string().min(1).max(128),
+          verifiedAtUnixSeconds: z.number().int().nonnegative(),
+        })
+        .nullable(),
+      blocker: z.string().min(1).max(256).nullable(),
+    }),
+  ).length(2),
 })
 
 export const desktopEventSchema = z.object({
@@ -220,7 +247,7 @@ export type InstallationControlResult = z.infer<
 >
 export type InstallationStatus = z.infer<typeof installationStatusSchema>
 export type InputTicket = z.infer<typeof inputTicketSchema>
-export type McpStatus = z.infer<typeof mcpStatusSchema>
+export type McpClientsStatus = z.infer<typeof mcpClientsStatusSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>

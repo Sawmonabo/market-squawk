@@ -7,9 +7,10 @@ use std::collections::HashSet;
 use chrono::DateTime;
 use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use market_squawk_services::{
-    PARQUET_ARTIFACT_MEDIA_TYPE, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
-    ServiceDomain, SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract,
-    ToolDescriptor, ToolEffects, ToolInputError, ToolResultPolicy, ToolScope,
+    NDJSON_ARTIFACT_MEDIA_TYPE, PARQUET_ARTIFACT_MEDIA_TYPE, ScopeRequirement, ServiceCapabilities,
+    ServiceCapabilityError, ServiceDomain, SourceEvidencePolicy, ToolArtifactPolicy,
+    ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects, ToolInputError, ToolResultPolicy,
+    ToolScope,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -32,6 +33,7 @@ const MAXIMUM_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_ARTIFACT_CHUNK_BYTES: u64 = 32 * 1024;
 const MAXIMUM_SOURCE_INSPECTION_PAGE_INDEX: u64 = 63;
 const MAXIMUM_SOURCE_INSPECTION_RECORDS: u64 = 1_024;
+const MAXIMUM_FORECAST_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -180,7 +182,7 @@ const MODEL_TRAINING_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const MODEL_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("modelId", ArgumentKind::Identifier),
-    ArgumentSpec::required("request", ArgumentKind::Object),
+    ArgumentSpec::required("request", ArgumentKind::ForecastRequest),
 ];
 const MODEL_FORECAST_ID_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("vintageId", ArgumentKind::Sha256)];
@@ -208,10 +210,31 @@ const DECISION_LIST_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
 )];
 const DECISION_RUN_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
+const DECISION_RUN_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterRunId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
 const DECISION_DOSSIER_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
     "dossierId",
     ArgumentKind::Identifier,
 )];
+const DECISION_DOSSIER_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("candidateId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("afterDossierId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
 const DECISION_TARGET_CREATE_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("target", ArgumentKind::Object)];
 const DECISION_TARGET_ARGUMENTS: &[ArgumentSpec] = &[
@@ -226,6 +249,16 @@ const DECISION_TARGET_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const DECISION_TARGET_LIST_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("targetId", ArgumentKind::Identifier)];
+const DECISION_TARGET_INDEX_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterTargetId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
 const DECISION_TARGET_REVIEW_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("review", ArgumentKind::Object)];
 const DECISION_TARGET_REEVALUATE_ARGUMENTS: &[ArgumentSpec] = &[
@@ -237,6 +270,110 @@ const DECISION_TARGET_REEVALUATE_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
     ArgumentSpec::required("successor", ArgumentKind::Object),
+];
+const OPERATIONS_BACKUP_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterBackupId", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 64,
+        },
+    ),
+];
+const OPERATIONS_BACKUP_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("backupId", ArgumentKind::Sha256)];
+const OPERATIONS_RETENTION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "keepLatest",
+    ArgumentKind::Unsigned {
+        minimum: 1,
+        maximum: 128,
+    },
+)];
+const OPERATIONS_WORKSPACE_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterWorkspaceId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 64,
+        },
+    ),
+];
+const OPERATIONS_WORKSPACE_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("workspaceId", ArgumentKind::Uuid)];
+const OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
+];
+const OPERATIONS_LOG_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("from", ArgumentKind::Timestamp),
+    ArgumentSpec::optional("through", ArgumentKind::Timestamp),
+    ArgumentSpec::optional(
+        "minimumSeverity",
+        ArgumentKind::Enumeration(&["trace", "debug", "info", "warn", "error"]),
+    ),
+    ArgumentSpec::optional(
+        "domain",
+        ArgumentKind::Enumeration(&[
+            "application",
+            "source",
+            "market",
+            "research",
+            "portfolio",
+            "model",
+            "backtest",
+            "execution",
+            "risk",
+            "fair_value",
+            "mcp",
+            "lifecycle",
+        ]),
+    ),
+    ArgumentSpec::optional("sourceId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("jobId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("correlationId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("search", ArgumentKind::Text),
+    ArgumentSpec::optional(
+        "afterSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 10_000,
+        },
+    ),
+];
+const OPERATIONS_SETTINGS_CHANGE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("changes", ArgumentKind::SettingsChanges),
+];
+const OPERATIONS_SETTINGS_ROLLBACK_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "targetRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
 ];
 const MEASUREMENT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "measurementId",
@@ -322,7 +459,11 @@ const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
     ),
     ArgumentSpec::required(
         "mediaType",
-        ArgumentKind::Enumeration(&["application/json", PARQUET_ARTIFACT_MEDIA_TYPE]),
+        ArgumentKind::Enumeration(&[
+            "application/json",
+            PARQUET_ARTIFACT_MEDIA_TYPE,
+            NDJSON_ARTIFACT_MEDIA_TYPE,
+        ]),
     ),
     ArgumentSpec::required(
         "offset",
@@ -999,6 +1140,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
+        "Decision.ListScreenRuns",
+        "List bounded immutable saved-screen runs using an exact continuation cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
         "Decision.GetCandidates",
         "Return ranked candidates for one exact screen run.",
         ServiceDomain::Decision,
@@ -1012,6 +1161,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Decision,
         LOCAL_SCOPE,
         DECISION_DOSSIER_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListCandidateDossiers",
+        "List bounded retained dossiers for one exact candidate using an exact continuation cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_LIST_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     idempotent_mutation(
@@ -1038,6 +1195,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         DECISION_TARGET_LIST_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
+    read(
+        "Decision.ListTargetIndex",
+        "List bounded current heads of governed investment-target series using an exact cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_INDEX_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
     idempotent_mutation(
         "Decision.ReviewTargetSet",
         "Record one immutable review of a governed investment target revision.",
@@ -1061,6 +1226,198 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         DECISION_TARGET_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.ListBackups",
+        "List bounded verified product backups and retention state.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.GetBackup",
+        "Return one exact verified product-backup manifest.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartBackup",
+        "Start one durable complete product-backup job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Operations.StartBackupVerification",
+        "Start durable verification of one exact retained backup.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewBackupRetention",
+        "Preview exact backups selected by the bounded retention policy.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_RETENTION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartBackupRetention",
+        "Start one exact preview-bound durable backup-retention job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewRestore",
+        "Preview restoring one exact backup into a new fenced workspace.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartRestore",
+        "Start one exact preview-bound durable restore and workspace-switch job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.ListWorkspaces",
+        "List bounded local workspaces and the active generation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_WORKSPACE_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.PreviewWorkspaceSwitch",
+        "Preview a fenced local workspace switch and its blockers.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_WORKSPACE_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartWorkspaceSwitch",
+        "Start one exact preview-bound durable workspace switch.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.GetUpdateStatus",
+        "Return current trusted update, known-good, and recovery state.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.CheckForUpdates",
+        "Check trusted metadata and stage only an admitted update candidate.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewUpdate",
+        "Preview activation of the currently staged trusted update.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartUpdate",
+        "Start exact preview-bound update activation and health verification.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewProgramRollback",
+        "Preview rollback to the verified known-good program generation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartProgramRollback",
+        "Start exact preview-bound rollback of program files without restoring data.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.QueryLogs",
+        "Query bounded redacted local structured logs.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_LOG_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.ExportLogs",
+        "Publish a bounded redacted log export to controlled artifacts.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_LOG_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.GetSettings",
+        "Return typed effective settings with origin and restart impact.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.PreviewSettingsChange",
+        "Preview a typed settings change at one exact revision.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_SETTINGS_CHANGE_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.ApplySettingsChange",
+        "Apply one exact preview-bound typed settings change.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewSettingsRollback",
+        "Preview restoring retained typed settings as a new monotonic revision.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_SETTINGS_ROLLBACK_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.RollbackSettings",
+        "Apply one exact preview-bound typed settings rollback.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     read(
         "FairValue.ListMeasurements",
@@ -1530,6 +1887,8 @@ enum ArgumentKind {
     Array,
     Timestamp,
     FairValueMeasurement,
+    ForecastRequest,
+    SettingsChanges,
     Enumeration(&'static [&'static str]),
     Unsigned { minimum: u64, maximum: u64 },
 }
@@ -1679,6 +2038,8 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
+        ArgumentKind::ForecastRequest => forecast_request_schema(),
+        ArgumentKind::SettingsChanges => settings_changes_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
             "type": "integer",
@@ -1899,6 +2260,8 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Timestamp => admit_timestamp(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
+        ArgumentKind::ForecastRequest => admit_forecast_request(value),
+        ArgumentKind::SettingsChanges => admit_settings_changes(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
             .filter(|value| values.contains(value))
@@ -1910,6 +2273,331 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn settings_changes_schema() -> Value {
+    let variant = |kind: &'static str, value: Value| {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": {"const": kind},
+                "value": value,
+            },
+            "required": ["kind", "value"],
+            "additionalProperties": false,
+        })
+    };
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "items": {
+            "oneOf": [
+                variant("log_retention_days", json!({"type": "integer", "minimum": 1, "maximum": 365})),
+                variant("log_minimum_severity", json!({"type": "string", "enum": ["trace", "debug", "info", "warn", "error"]})),
+                variant("update_channel", json!({"type": "string", "enum": ["stable", "preview"]})),
+                variant("automatic_update_checks", json!({"type": "boolean"})),
+                variant("storage_soft_limit_bytes", json!({"type": "integer", "minimum": 1_073_741_824_u64, "maximum": 17_592_186_044_416_u64})),
+                variant("default_query_row_limit", json!({"type": "integer", "minimum": 100, "maximum": 1_000_000})),
+                variant("maximum_concurrent_jobs", json!({"type": "integer", "minimum": 1, "maximum": 64})),
+                variant("market_freshness_millis", json!({"type": "integer", "minimum": 250, "maximum": 600_000})),
+                variant("backup_retention_count", json!({"type": "integer", "minimum": 1, "maximum": 64})),
+            ]
+        }
+    })
+}
+
+fn admit_settings_changes(value: &Value) -> Result<(), ToolInputError> {
+    let changes = value.as_array().ok_or(ToolInputError::Invalid)?;
+    if changes.is_empty() || changes.len() > 16 {
+        return Err(ToolInputError::Invalid);
+    }
+    let mut kinds = HashSet::new();
+    for change in changes {
+        let change = change.as_object().ok_or(ToolInputError::Invalid)?;
+        if change.len() != 2 || !change.contains_key("value") {
+            return Err(ToolInputError::Invalid);
+        }
+        let kind = change
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| kinds.insert(*kind))
+            .ok_or(ToolInputError::Invalid)?;
+        let setting = change.get("value").ok_or(ToolInputError::Invalid)?;
+        let valid = match kind {
+            "log_retention_days" => unsigned_in(setting, 1, 365),
+            "log_minimum_severity" => {
+                string_in(setting, &["trace", "debug", "info", "warn", "error"])
+            }
+            "update_channel" => string_in(setting, &["stable", "preview"]),
+            "automatic_update_checks" => setting.is_boolean(),
+            "storage_soft_limit_bytes" => unsigned_in(setting, 1_073_741_824, 17_592_186_044_416),
+            "default_query_row_limit" => unsigned_in(setting, 100, 1_000_000),
+            "maximum_concurrent_jobs" => unsigned_in(setting, 1, 64),
+            "market_freshness_millis" => unsigned_in(setting, 250, 600_000),
+            "backup_retention_count" => unsigned_in(setting, 1, 64),
+            _ => false,
+        };
+        if !valid {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn unsigned_in(value: &Value, minimum: u64, maximum: u64) -> bool {
+    value
+        .as_u64()
+        .is_some_and(|value| (minimum..=maximum).contains(&value))
+}
+
+fn string_in(value: &Value, allowed: &[&str]) -> bool {
+    value.as_str().is_some_and(|value| allowed.contains(&value))
+}
+
+fn forecast_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instrumentId": {"type": "string", "format": "uuid"},
+            "bundleId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAXIMUM_IDENTIFIER_BYTES
+            },
+            "bundleVersion": {"type": "integer", "minimum": 1},
+            "observedThroughUnixNanos": {"type": "integer"},
+            "availableAtUnixNanos": {"type": "integer"},
+            "horizonPoints": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": market_squawk_modeling::MAX_FORECAST_POINTS
+            },
+            "horizonStepNanos": {"type": "integer", "minimum": 1},
+            "decimalScale": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
+            },
+            "validityNanos": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAXIMUM_FORECAST_VALIDITY_NANOS
+            },
+            "observedHistory": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "observedAtUnixNanos": {"type": "integer"},
+                        "availableAtUnixNanos": {"type": "integer"},
+                        "mantissa": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 40,
+                            "pattern": "^-?[0-9]+$"
+                        },
+                        "sourcePitHash": {
+                            "type": "string",
+                            "minLength": 64,
+                            "maxLength": 64,
+                            "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "quality": {
+                            "type": "string",
+                            "enum": [
+                                "direct_verified",
+                                "direct_unverified",
+                                "official_delayed",
+                                "aggregated",
+                                "indicative",
+                                "estimated",
+                                "stale",
+                                "quarantined"
+                            ]
+                        }
+                    },
+                    "required": [
+                        "observedAtUnixNanos",
+                        "availableAtUnixNanos",
+                        "mantissa",
+                        "sourcePitHash",
+                        "quality"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "inputs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": market_squawk_modeling::MAX_FORECAST_POINTS,
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": market_squawk_modeling::MAX_MODEL_FEATURES,
+                    "items": {"type": "number"}
+                }
+            }
+        },
+        "required": [
+            "instrumentId",
+            "bundleId",
+            "bundleVersion",
+            "observedThroughUnixNanos",
+            "availableAtUnixNanos",
+            "horizonPoints",
+            "horizonStepNanos",
+            "decimalScale",
+            "validityNanos",
+            "observedHistory",
+            "inputs"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn admit_forecast_request(value: &Value) -> Result<(), ToolInputError> {
+    const FIELDS: [&str; 11] = [
+        "instrumentId",
+        "bundleId",
+        "bundleVersion",
+        "observedThroughUnixNanos",
+        "availableAtUnixNanos",
+        "horizonPoints",
+        "horizonStepNanos",
+        "decimalScale",
+        "validityNanos",
+        "observedHistory",
+        "inputs",
+    ];
+    const OBSERVED_FIELDS: [&str; 5] = [
+        "observedAtUnixNanos",
+        "availableAtUnixNanos",
+        "mantissa",
+        "sourcePitHash",
+        "quality",
+    ];
+    const OBSERVED_QUALITIES: [&str; 8] = [
+        "direct_verified",
+        "direct_unverified",
+        "official_delayed",
+        "aggregated",
+        "indicative",
+        "estimated",
+        "stale",
+        "quarantined",
+    ];
+
+    let request = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if request.len() != FIELDS.len()
+        || request.keys().any(|name| !FIELDS.contains(&name.as_str()))
+        || request
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+        || request
+            .get("bundleId")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !valid_identifier(value))
+        || request
+            .get("bundleVersion")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || request
+            .get("observedThroughUnixNanos")
+            .and_then(Value::as_i64)
+            .is_none()
+        || request
+            .get("availableAtUnixNanos")
+            .and_then(Value::as_i64)
+            .is_none()
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let horizon_points = request
+        .get("horizonPoints")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=market_squawk_modeling::MAX_FORECAST_POINTS).contains(value))
+        .ok_or(ToolInputError::Invalid)?;
+    if request
+        .get("horizonStepNanos")
+        .and_then(Value::as_u64)
+        .is_none_or(|value| value == 0)
+        || request
+            .get("decimalScale")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| {
+                value > u64::from(market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE)
+            })
+        || request
+            .get("validityNanos")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0 || value > MAXIMUM_FORECAST_VALIDITY_NANOS)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let observed = request
+        .get("observedHistory")
+        .and_then(Value::as_array)
+        .filter(|values| {
+            !values.is_empty()
+                && values.len() <= market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+        })
+        .ok_or(ToolInputError::Invalid)?;
+    for point in observed {
+        let point = point.as_object().ok_or(ToolInputError::Invalid)?;
+        let hash = point.get("sourcePitHash").and_then(Value::as_str);
+        if point.len() != OBSERVED_FIELDS.len()
+            || point
+                .keys()
+                .any(|name| !OBSERVED_FIELDS.contains(&name.as_str()))
+            || point
+                .get("observedAtUnixNanos")
+                .and_then(Value::as_i64)
+                .is_none()
+            || point
+                .get("availableAtUnixNanos")
+                .and_then(Value::as_i64)
+                .is_none()
+            || point
+                .get("mantissa")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<i128>().ok())
+                .is_none()
+            || hash.is_none_or(|value| {
+                value == "0000000000000000000000000000000000000000000000000000000000000000"
+                    || value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            || point
+                .get("quality")
+                .and_then(Value::as_str)
+                .is_none_or(|value| !OBSERVED_QUALITIES.contains(&value))
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    let inputs = request
+        .get("inputs")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == horizon_points)
+        .ok_or(ToolInputError::Invalid)?;
+    if inputs.iter().any(|row| {
+        row.as_array().is_none_or(|values| {
+            values.is_empty()
+                || values.len() > market_squawk_modeling::MAX_MODEL_FEATURES
+                || values.iter().any(|value| value.as_f64().is_none())
+        })
+    }) {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
 }
 
 fn fair_value_measurement_schema() -> Value {

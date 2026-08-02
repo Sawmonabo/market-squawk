@@ -34,6 +34,7 @@ pub const GET_FORECAST_OUTCOMES: &str = "Model.GetForecastOutcomes";
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const MAXIMUM_VINTAGES: usize = 100_000;
 const MAXIMUM_OUTCOMES: usize = 1_000_000;
+const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
 
 /// Closed storage and result ceilings for one installed forecast authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,8 +119,7 @@ impl ForecastApplicationService {
     ) -> Result<Value, ForecastApplicationError> {
         let _publication = self.publication.lock().await;
         if let Some(existing) = self.vintage_for_request(request_hash).await {
-            return serde_json::to_value(existing)
-                .map_err(|_error| ForecastApplicationError::CorruptIndex);
+            return self.get_forecast(&existing.vintage_id).await;
         }
         context.ensure_live()?;
         let payload = ForecastPayloadRecord::from_path(&path, created_at, expires_at)?;
@@ -150,7 +150,7 @@ impl ForecastApplicationService {
             Ok(true)
         })
         .await?;
-        serde_json::to_value(record).map_err(|_error| ForecastApplicationError::CorruptIndex)
+        self.get_forecast(&record.vintage_id).await
     }
 
     /// Appends one realized outcome without mutating the referenced vintage.
@@ -195,7 +195,16 @@ impl ForecastApplicationService {
             .iter()
             .find(|value| value.vintage_id == id)
             .ok_or(ForecastApplicationError::NotFound)?;
-        serde_json::to_value(vintage).map_err(|_error| ForecastApplicationError::CorruptIndex)
+        let mut value = serde_json::to_value(vintage)
+            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let object = value
+            .as_object_mut()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        object.insert(
+            "driftMonitoring".to_owned(),
+            drift_monitoring_value(&index, vintage)?,
+        );
+        Ok(value)
     }
 
     /// Lists newest stored vintages first under the lower caller/storage ceiling.
@@ -280,6 +289,60 @@ impl ForecastApplicationService {
         *index = candidate;
         Ok(())
     }
+}
+
+fn drift_monitoring_value(
+    index: &ForecastIndex,
+    vintage: &VintageRecord,
+) -> Result<Value, ForecastApplicationError> {
+    let mut observed = 0_usize;
+    let mut included = 0_usize;
+    let mut total_absolute_error = 0_i128;
+    for outcome in index
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.vintage_id == vintage.vintage_id)
+    {
+        observed = observed
+            .checked_add(1)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        if included == MAXIMUM_DRIFT_OUTCOMES {
+            continue;
+        }
+        let absolute = outcome
+            .absolute_error_mantissa()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        total_absolute_error = total_absolute_error
+            .checked_add(absolute)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        included = included
+            .checked_add(1)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+    }
+    let scale = vintage
+        .decimal_scale()
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let state = if observed == 0 {
+        "awaiting_observed_outcomes"
+    } else {
+        "outcome_error_observed"
+    };
+    Ok(json!({
+        "status": state,
+        "basis": "immutable_forecast_outcomes",
+        "observedOutcomeCount": observed,
+        "includedOutcomeCount": included,
+        "truncated": observed > included,
+        "absoluteErrorMantissaTotal": total_absolute_error.to_string(),
+        "meanAbsoluteErrorMantissa": if included == 0 {
+            None
+        } else {
+            Some((total_absolute_error / i128::try_from(included).map_err(|_| ForecastApplicationError::CorruptIndex)?).to_string())
+        },
+        "decimalScale": scale,
+        "thresholdState": "not_configured",
+        "interpretation": "Observed outcome error is monitoring evidence, not a future-performance guarantee."
+    }))
 }
 
 impl std::fmt::Debug for ForecastApplicationService {

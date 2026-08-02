@@ -4,6 +4,8 @@ use super::*;
 
 /// Maximum future points in one admitted forecast path.
 pub const MAX_FORECAST_POINTS: usize = 512;
+/// Maximum qualified historical observations retained beside one forecast vintage.
+pub const MAX_FORECAST_OBSERVED_POINTS: usize = 4_096;
 /// Maximum base-10 fractional digits at the research forecast boundary.
 pub const MAX_FORECAST_DECIMAL_SCALE: u8 = 12;
 pub(super) const MAX_CALIBRATION_ASSUMPTION_BYTES: usize = 512;
@@ -159,6 +161,101 @@ fn scaled_mantissa(value: ForecastValue, target_scale: u8) -> Option<i128> {
     value.mantissa.checked_mul(factor)
 }
 
+/// One qualified observed value retained as the historical context for a forecast vintage.
+///
+/// Observations remain source/PIT-bound evidence. They cannot contain a modeled value and are
+/// deliberately separate from future [`ForecastPoint`] values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForecastObservedPoint {
+    observed_at: Timestamp,
+    available_at: Timestamp,
+    value: ForecastValue,
+    source_pit_hash: Sha256Digest,
+    quality: DataQuality,
+}
+
+impl ForecastObservedPoint {
+    /// Constructs one non-modeled observed value with its source/PIT identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero source identity, availability before observation, and modeled data.
+    pub fn try_new(
+        observed_at: Timestamp,
+        available_at: Timestamp,
+        value: ForecastValue,
+        source_pit_hash: Sha256Digest,
+        quality: DataQuality,
+    ) -> Result<Self, ForecastError> {
+        if source_pit_hash.bytes() == [0; 32]
+            || available_at < observed_at
+            || matches!(quality, DataQuality::Modeled)
+        {
+            return Err(ForecastError::InvalidObservedHistory);
+        }
+        Ok(Self {
+            observed_at,
+            available_at,
+            value,
+            source_pit_hash,
+            quality,
+        })
+    }
+
+    /// Time of the qualified observation.
+    #[must_use]
+    pub const fn observed_at(self) -> Timestamp {
+        self.observed_at
+    }
+
+    /// Time at which this observation became available to the forecast input.
+    #[must_use]
+    pub const fn available_at(self) -> Timestamp {
+        self.available_at
+    }
+
+    /// Exact observed value under the forecast decimal policy.
+    #[must_use]
+    pub const fn value(self) -> ForecastValue {
+        self.value
+    }
+
+    /// Exact source/PIT identity.
+    #[must_use]
+    pub const fn source_pit_hash(self) -> Sha256Digest {
+        self.source_pit_hash
+    }
+
+    /// Original observed-data quality; it is never upgraded by forecasting.
+    #[must_use]
+    pub const fn quality(self) -> DataQuality {
+        self.quality
+    }
+}
+
+#[cfg(test)]
+mod observed_history_tests {
+    use market_squawk_data::Sha256Digest;
+    use market_squawk_domain::{DataQuality, Timestamp};
+
+    use super::{ForecastObservedPoint, ForecastValue};
+
+    #[test]
+    fn modeled_values_cannot_enter_observed_forecast_history() {
+        let value = ForecastValue::try_new(101_25, 2).expect("fixed decimal value");
+
+        let result = ForecastObservedPoint::try_new(
+            Timestamp::from_unix_nanos(10),
+            Timestamp::from_unix_nanos(10),
+            value,
+            Sha256Digest::new([7; 32]),
+            DataQuality::Modeled,
+        );
+
+        assert!(result.is_err());
+    }
+}
+
 /// Exact ordered inputs for one research forecast operation.
 #[derive(Clone, Copy, Debug)]
 pub struct ForecastRequest<'input> {
@@ -167,6 +264,7 @@ pub struct ForecastRequest<'input> {
     pub(super) available_at: Timestamp,
     pub(super) horizon: ForecastHorizon,
     pub(super) decimal_scale: u8,
+    pub(super) observed_history: &'input [ForecastObservedPoint],
     pub(super) inputs: &'input [ModelInput<'input>],
 }
 
@@ -197,6 +295,57 @@ impl<'input> ForecastRequest<'input> {
             available_at,
             horizon,
             decimal_scale,
+            observed_history: &[],
+            inputs,
+        })
+    }
+
+    /// Constructs a point-in-time request with required qualified observed-history context.
+    ///
+    /// The public installed-product boundary uses this constructor so predictive presentation has
+    /// the exact source-qualified series ending at the forecast boundary.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the observed evidence is independent from future inputs and PIT coordinates"
+    )]
+    pub fn try_new_with_observed_history(
+        instrument_id: InstrumentId,
+        observed_cutoff: Timestamp,
+        available_at: Timestamp,
+        horizon: ForecastHorizon,
+        decimal_scale: u8,
+        observed_history: &'input [ForecastObservedPoint],
+        inputs: &'input [ModelInput<'input>],
+    ) -> Result<Self, ForecastError> {
+        if available_at > observed_cutoff
+            || decimal_scale > MAX_FORECAST_DECIMAL_SCALE
+            || inputs.len() != usize::from(horizon.points().get())
+            || observed_history.is_empty()
+            || observed_history.len() > MAX_FORECAST_OBSERVED_POINTS
+        {
+            return Err(ForecastError::InvalidRequest);
+        }
+        if observed_history.iter().any(|point| {
+            point.value.scale() != decimal_scale
+                || point.observed_at > observed_cutoff
+                || point.available_at > observed_cutoff
+        }) || observed_history
+            .windows(2)
+            .any(|pair| pair[0].observed_at >= pair[1].observed_at)
+            || observed_history
+                .last()
+                .is_none_or(|point| point.observed_at != observed_cutoff)
+        {
+            return Err(ForecastError::InvalidObservedHistory);
+        }
+        horizon.target_at(observed_cutoff, inputs.len() - 1)?;
+        Ok(Self {
+            instrument_id,
+            observed_cutoff,
+            available_at,
+            horizon,
+            decimal_scale,
+            observed_history,
             inputs,
         })
     }
@@ -229,6 +378,12 @@ impl<'input> ForecastRequest<'input> {
     #[must_use]
     pub const fn decimal_scale(self) -> u8 {
         self.decimal_scale
+    }
+
+    /// Ordered qualified history ending exactly at the forecast cutoff.
+    #[must_use]
+    pub const fn observed_history(self) -> &'input [ForecastObservedPoint] {
+        self.observed_history
     }
 }
 
@@ -353,6 +508,7 @@ pub struct ForecastPath {
     pub(super) observed_cutoff: Timestamp,
     pub(super) available_at: Timestamp,
     pub(super) horizon: ForecastHorizon,
+    pub(super) observed_history: Box<[ForecastObservedPoint]>,
     pub(super) points: Box<[ForecastPoint]>,
     pub(super) model_id: ModelId,
     pub(super) bundle_id: BundleId,
@@ -393,6 +549,12 @@ impl ForecastPath {
     #[must_use]
     pub const fn horizon(&self) -> ForecastHorizon {
         self.horizon
+    }
+
+    /// Qualified historical context ending at [`Self::observed_cutoff`].
+    #[must_use]
+    pub fn observed_history(&self) -> &[ForecastObservedPoint] {
+        &self.observed_history
     }
 
     /// Ordered future points.
@@ -498,6 +660,7 @@ impl ForecastPath {
         size_of::<Self>()
             .saturating_add(self.bundle_id.as_str().len())
             .saturating_add(self.universe_id.as_str().len())
+            .saturating_add(self.observed_history.len() * size_of::<ForecastObservedPoint>())
             .saturating_add(self.points.len() * size_of::<ForecastPoint>())
             .saturating_add(
                 self.feature_semantic_digests.len() * size_of::<FeatureSemanticDigest>(),
@@ -522,6 +685,9 @@ pub enum ForecastError {
     /// Point-in-time, scale, or input shape is invalid.
     #[error("forecast request is invalid")]
     InvalidRequest,
+    /// Qualified observed-history context is missing, unordered, modeled, or incompatible.
+    #[error("forecast observed-history context is invalid")]
+    InvalidObservedHistory,
     /// A backend score cannot be represented under the fixed decimal policy.
     #[error("forecast decimal conversion is invalid")]
     InvalidDecimal,

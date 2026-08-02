@@ -157,11 +157,69 @@ function MetadataEvidence({ metadata }: { metadata: ModelMetadata }) {
           </ul>
         )}
       </div>
-      <p className="text-[11px] leading-5 text-muted-foreground">
-        Current metadata does not include independent drift monitoring, train/validation/test or
-        walk-forward boundaries, horizon/regime cohorts, an inference health probe, or an admission
-        review/rejection record. Those claims remain unavailable.
-      </p>
+      <AdmissionAndRuntimeEvidence metadata={metadata} />
+      <TrainingAndCohortEvidence metadata={metadata} />
+    </div>
+  )
+}
+
+function AdmissionAndRuntimeEvidence({ metadata }: { metadata: ModelMetadata }) {
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <div className="rounded-lg border border-emerald-400/25 bg-emerald-400/5 p-3">
+        <p className="text-xs font-medium text-emerald-200">Admission and rejection boundary</p>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Fact label="Status" value={humanize(metadata.admissionEvidence.status)} />
+          <Fact label="Authority" value={humanize(metadata.admissionEvidence.authority)} />
+          <Fact label="Metadata proof" value={short(metadata.admissionEvidence.metadataHash)} mono />
+          <Fact label="Training proof" value={short(metadata.admissionEvidence.trainingRunHash)} mono />
+        </dl>
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">
+          {metadata.admissionEvidence.rejectionPolicy}
+        </p>
+      </div>
+      <div className="rounded-lg border border-sky-400/25 bg-sky-400/5 p-3">
+        <p className="text-xs font-medium text-sky-200">Runtime health</p>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Fact label="Status" value={humanize(metadata.runtimeHealth.status)} />
+          <Fact label="Probe" value={humanize(metadata.runtimeHealth.probe)} />
+          <Fact label="Backend generations" value={metadata.runtimeHealth.backendGenerations.toLocaleString()} />
+          <Fact label="Registry generations" value={metadata.runtimeHealth.registryGenerations.toLocaleString()} />
+        </dl>
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">
+          Failure behavior: {metadata.runtimeHealth.failureBehavior}.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function TrainingAndCohortEvidence({ metadata }: { metadata: ModelMetadata }) {
+  const evidence = metadata.trainingEvidence
+  return (
+    <div className="rounded-lg border border-violet-400/25 bg-violet-400/5 p-3">
+      <p className="text-xs font-medium text-violet-200">Training and cohort evidence</p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="Train / validation / test" value={`${evidence.splits.train.toLocaleString()} / ${evidence.splits.validation.toLocaleString()} / ${evidence.splits.test.toLocaleString()}`} mono />
+        <Fact label="Split identity" value={short(evidence.splits.splitHash)} mono />
+        <Fact label="Seed / missing policy" value={`${evidence.seed.toLocaleString()} · ${humanize(evidence.missingPolicy)}`} />
+        <Fact label="Trial identity" value={short(evidence.trialHash)} mono />
+      </dl>
+      {evidence.forecastSchedule ? (
+        <p className="mt-3 text-xs leading-5 text-muted-foreground">
+          Forecast schedule: {humanize(evidence.forecastSchedule.strategy)} · horizons {evidence.forecastSchedule.horizons.join(", ")} · {evidence.forecastSchedule.rollingSplits} rolling splits.
+        </p>
+      ) : null}
+      <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+        {evidence.cohortEvidence.map((cohort) => (
+          <li key={cohort.dimension} className="rounded-md border border-border bg-background/25 p-2.5">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              {humanize(cohort.dimension)} · {humanize(cohort.status)}
+            </p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{cohort.reason}</p>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }

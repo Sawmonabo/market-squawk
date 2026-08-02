@@ -8,6 +8,7 @@
 //! ```
 
 pub(crate) mod audit;
+pub mod clients;
 #[cfg(test)]
 mod journal_worker;
 #[cfg(test)]

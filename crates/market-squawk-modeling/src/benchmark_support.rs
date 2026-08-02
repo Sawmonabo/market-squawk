@@ -345,6 +345,8 @@ fn build_bundle(
         metadata_bytes,
         artifact_bytes,
         training_run_bytes,
+        forecast_residuals_bytes: None,
+        forecast_policy_bytes: None,
         retained_bytes,
     })
 }

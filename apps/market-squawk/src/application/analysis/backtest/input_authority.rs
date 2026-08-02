@@ -32,6 +32,8 @@ use recipe::{InputRecipe, RecipeError, RegistrationRecipe};
 use resolution::BacktestInputMaterializer;
 
 pub use recipe::{
+    GovernedBacktestCohortCandidateRegistrationInput,
+    GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,
     GovernedBacktestCorporateActionsInput, GovernedBacktestInputRegistrationInput,
     GovernedBacktestInputRegistrationJsonError, GovernedBacktestPortfolioSeedInput,
     GovernedBacktestQueryLimitsInput, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
@@ -205,7 +207,10 @@ impl ProductionGovernedBacktestInputAuthority {
         let encoded = recipe.encode().map_err(map_registration_recipe_error)?;
         let stored = StoredInputRecipe::try_new(encoded, self.limits.index())
             .map_err(map_index_error_to_service)?;
-        let command = recipe.core().command(stored.input_id().clone());
+        let command = recipe
+            .core()
+            .command(stored.input_id().clone())
+            .map_err(map_registration_recipe_error)?;
         let store = Arc::clone(&self.store);
         let index = Arc::clone(&self.index);
         let lifecycle = Arc::clone(&self.lifecycle);
@@ -267,7 +272,10 @@ impl GovernedBacktestInputResolver for ProductionGovernedBacktestInputAuthority 
             .ok_or(ServiceError::NotFound)?;
         let recipe =
             InputRecipe::decode(stored.recipe_bytes()).map_err(|_| ServiceError::InvalidResult)?;
-        let registered_command = recipe.core().command(stored.input_id().clone());
+        let registered_command = recipe
+            .core()
+            .command(stored.input_id().clone())
+            .map_err(|_| ServiceError::InvalidResult)?;
         if &registered_command != command {
             return Err(ServiceError::InvalidRequest);
         }

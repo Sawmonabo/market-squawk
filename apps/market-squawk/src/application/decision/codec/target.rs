@@ -391,6 +391,8 @@ pub(super) struct InvalidationWire {
     target_id: String,
     target_revision: u32,
     kind: InvalidationKindWire,
+    #[serde(default)]
+    actor: Option<String>,
     observed_at: Timestamp,
     content_identity: EvidenceDigest,
 }
@@ -402,6 +404,7 @@ impl From<&TargetInvalidation> for InvalidationWire {
             target_id: value.target_id().as_str().to_owned(),
             target_revision: value.target_revision().get(),
             kind: value.kind().into(),
+            actor: value.actor().map(|actor| actor.as_str().to_owned()),
             observed_at: value.observed_at(),
             content_identity: value.content_identity().evidence_digest(),
         }
@@ -434,14 +437,27 @@ impl InvalidationWire {
         {
             return Err(DecisionApplicationError::InvalidPersistentState);
         }
-        TargetInvalidation::try_new(
-            TargetInvalidationId::try_new(&self.id)
-                .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?,
-            target,
-            self.kind.into(),
-            self.observed_at,
-            content_digest(self.content_identity)?,
-        )
+        let id = TargetInvalidationId::try_new(&self.id)
+            .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
+        let content_identity = content_digest(self.content_identity)?;
+        match self.actor {
+            Some(actor) => TargetInvalidation::try_new(
+                id,
+                target,
+                self.kind.into(),
+                DecisionActorId::try_new(actor)
+                    .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?,
+                self.observed_at,
+                content_identity,
+            ),
+            None => TargetInvalidation::try_new_legacy(
+                id,
+                target,
+                self.kind.into(),
+                self.observed_at,
+                content_identity,
+            ),
+        }
         .map_err(|_error| DecisionApplicationError::InvalidPersistentState)
     }
 }

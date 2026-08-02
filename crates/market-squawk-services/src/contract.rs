@@ -22,6 +22,8 @@ pub enum ServiceDomain {
     Job,
     /// Screens, dossiers, investment targets, reviews, and invalidation state.
     Decision,
+    /// Backup, restore, updates, workspaces, settings, logs, and local lifecycle authority.
+    Operations,
     /// Source registration, status, coverage, and health.
     Source,
     /// Live and historical market observations.
@@ -53,6 +55,7 @@ impl ServiceDomain {
         match self {
             Self::Job => "job",
             Self::Decision => "decision",
+            Self::Operations => "operations",
             Self::Source => "source",
             Self::Market => "market",
             Self::Research => "research",

@@ -286,6 +286,7 @@ impl ComponentIdentity {
 pub enum ComponentRole {
     Desktop,
     Service,
+    McpRelay,
     Cli,
     CaptureHelper,
     OnnxWorker,
@@ -301,9 +302,10 @@ pub enum ComponentRole {
 }
 
 impl ComponentRole {
-    pub(crate) const REQUIRED: [Self; 11] = [
+    pub(crate) const REQUIRED: [Self; 12] = [
         Self::Desktop,
         Self::Service,
+        Self::McpRelay,
         Self::Cli,
         Self::CaptureHelper,
         Self::OnnxWorker,
@@ -320,6 +322,7 @@ impl ComponentRole {
             self,
             Self::Desktop
                 | Self::Service
+                | Self::McpRelay
                 | Self::Cli
                 | Self::CaptureHelper
                 | Self::OnnxWorker
@@ -336,6 +339,7 @@ impl ComponentRole {
         match self {
             Self::Desktop => Some(format!("bin/market-squawk-desktop{suffix}")),
             Self::Service => Some(format!("bin/market-squawk-service{suffix}")),
+            Self::McpRelay => Some(format!("bin/market-squawk-mcp-relay{suffix}")),
             Self::Cli => Some(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => Some(format!("bin/market-squawk-capture-helper{suffix}")),
             Self::OnnxWorker => Some(format!("bin/market-squawk-onnx-worker{suffix}")),

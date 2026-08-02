@@ -92,6 +92,58 @@ export const modelMetadataSchema = modelBundleSchema.extend({
   }),
   intendedUse: z.string().min(1),
   limitations: z.array(z.string().min(1)).max(256),
+  admissionEvidence: z.object({
+    status: z.literal("admitted"),
+    authority: z.literal("rust_verified_durable_registry"),
+    metadataHash: digestSchema,
+    artifactHash: digestSchema,
+    trainingRunHash: digestSchema,
+    rejectionPolicy: z.string().min(1),
+    failureBehavior: z.literal("no_action"),
+  }),
+  runtimeHealth: z.object({
+    status: z.literal("ready"),
+    probe: z.literal("registry_backend_identity_match"),
+    backendGenerations: z.number().int().nonnegative(),
+    registryGenerations: z.number().int().nonnegative(),
+    failureBehavior: z.string().min(1),
+  }),
+  trainingEvidence: z.object({
+    schemaVersion: z.number().int().positive(),
+    trialHash: digestSchema,
+    seed: z.number().int().nonnegative(),
+    missingPolicy: z.enum(["reject", "drop_row"]),
+    splits: z.object({
+      train: z.number().int().nonnegative(),
+      validation: z.number().int().nonnegative(),
+      test: z.number().int().nonnegative(),
+      splitHash: digestSchema,
+    }),
+    forecastSchedule: z
+      .object({
+        strategy: z.enum(["direct", "recursive", "multi_output", "chained"]),
+        horizons: z.array(z.number().int().positive()).min(1).max(512),
+        observedCutoffUnixNanos: losslessIntegerSchema,
+        rollingSplits: z.number().int().min(2).max(32),
+        selectionHash: digestSchema,
+      })
+      .nullable(),
+    cohortEvidence: z
+      .array(
+        z.object({
+          dimension: z.enum(["horizon", "regime", "instrument", "confidence"]),
+          status: z.enum([
+            "recorded",
+            "not_applicable",
+            "not_recorded",
+            "universe_bound_only",
+            "calibration_bound_only",
+          ]),
+          reason: z.string().min(1),
+        }),
+      )
+      .length(4),
+  }),
 })
 
 const modelBundlePageSchema = z.object({
@@ -140,6 +192,37 @@ const forecastPointSchema = z.object({
   centralMantissa: z.string().regex(/^-?\d+$/),
   decimalScale: z.number().int().min(0).max(18),
   intervals: forecastIntervalsSchema.nullable(),
+})
+
+const observedHistoryPointSchema = z.object({
+  observedAtUnixNanos: losslessIntegerSchema,
+  availableAtUnixNanos: losslessIntegerSchema,
+  mantissa: z.string().regex(/^-?\d+$/),
+  decimalScale: z.number().int().min(0).max(18),
+  sourcePitHash: digestSchema,
+  quality: z.enum([
+    "direct_verified",
+    "direct_unverified",
+    "official_delayed",
+    "aggregated",
+    "indicative",
+    "estimated",
+    "stale",
+    "quarantined",
+  ]),
+})
+
+const driftMonitoringSchema = z.object({
+  status: z.enum(["awaiting_observed_outcomes", "outcome_error_observed"]),
+  basis: z.literal("immutable_forecast_outcomes"),
+  observedOutcomeCount: z.number().int().nonnegative(),
+  includedOutcomeCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  absoluteErrorMantissaTotal: z.string().regex(/^\d+$/),
+  meanAbsoluteErrorMantissa: z.string().regex(/^\d+$/).nullable(),
+  decimalScale: z.number().int().min(0).max(18),
+  thresholdState: z.literal("not_configured"),
+  interpretation: z.string().min(1),
 })
 
 const calibrationSchema = z.object({
@@ -196,10 +279,12 @@ export const forecastVintageSchema = z.object({
   horizonPoints: z.number().int().positive().max(512),
   horizonStepNanos: losslessIntegerSchema,
   quality: z.literal("modeled"),
+  observedHistory: z.array(observedHistoryPointSchema).max(4_096),
   points: z.array(forecastPointSchema).min(1).max(512),
   calibration: calibrationSchema.nullable(),
   limitations: z.array(z.string().min(1)).max(256),
   unavailableReason: z.string().min(1),
+  driftMonitoring: driftMonitoringSchema,
 })
 
 const forecastOutcomeSchema = z.object({

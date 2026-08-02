@@ -1,11 +1,10 @@
 //! Least-privilege Tauri bridge over the existing local application authorities.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
-    sync::OnceLock,
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use market_squawk_installer::{
@@ -35,6 +34,8 @@ const MAXIMUM_DESKTOP_RESULT_ITEMS: u64 = 1_000;
 const MAXIMUM_SAFE_JAVASCRIPT_INTEGER: i64 = 9_007_199_254_740_991;
 const MAXIMUM_OPERATION_BYTES: usize = 128;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
 const LIVE_MARKET_SETUP_SURFACES: [&str; 3] = [
@@ -103,6 +104,9 @@ impl ServiceOperation {
 #[derive(Debug)]
 struct ServiceBootstrapSnapshot {
     runtime: RuntimeIdentity,
+    mcp_endpoint_identity: String,
+    claude_code_credential_identity: String,
+    codex_credential_identity: String,
     provider_profiles: Value,
     encrypted_file_fallback: Value,
     operations: Vec<ServiceOperation>,
@@ -137,6 +141,12 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
                 .ok_or_else(DesktopCommandError::internal)?,
         )
         .map_err(|_error| DesktopCommandError::internal())?;
+        let mcp_endpoint_identity =
+            required_string(&value, "/mcpAuthority/endpointIdentity")?.to_owned();
+        let claude_code_credential_identity =
+            required_string(&value, "/mcpAuthority/claudeCodeCredentialIdentity")?.to_owned();
+        let codex_credential_identity =
+            required_string(&value, "/mcpAuthority/codexCredentialIdentity")?.to_owned();
         let provider_profiles = value
             .pointer("/sources/profiles")
             .filter(|profiles| profiles.is_array())
@@ -199,6 +209,9 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             .ok_or_else(DesktopCommandError::internal)?;
         Ok(Self {
             runtime,
+            mcp_endpoint_identity,
+            claude_code_credential_identity,
+            codex_credential_identity,
             provider_profiles,
             encrypted_file_fallback,
             operations: parsed_operations,
@@ -224,6 +237,14 @@ pub(crate) struct DesktopState {
     installation_status: InstallStatus,
     cancellation: CancellationToken,
     restart_program: OnceLock<PathBuf>,
+    governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
+}
+
+struct NativeGovernanceAuthorization {
+    window_label: String,
+    preview_id: Uuid,
+    ticket_id: Uuid,
+    retained_until: Instant,
 }
 
 impl DesktopState {
@@ -242,6 +263,7 @@ impl DesktopState {
             installation_status,
             cancellation: CancellationToken::new(),
             restart_program: OnceLock::new(),
+            governance_authorizations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -281,6 +303,14 @@ impl DesktopState {
 
     pub(crate) const fn mcp_ready(&self) -> bool {
         self.service_bootstrap.mcp_ready
+    }
+
+    pub(crate) fn mcp_authority_identities(&self) -> (&str, &str, &str) {
+        (
+            &self.service_bootstrap.mcp_endpoint_identity,
+            &self.service_bootstrap.claude_code_credential_identity,
+            &self.service_bootstrap.codex_credential_identity,
+        )
     }
 
     async fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
@@ -371,7 +401,6 @@ impl DesktopState {
             installation,
             model_runtime,
             mcp,
-            None,
             self.service_bootstrap.encrypted_file_fallback.clone(),
             self.service_bootstrap.provider_profiles.clone(),
             Value::Array(sessions),
@@ -415,13 +444,140 @@ impl DesktopState {
         Ok(sessions)
     }
 
+    pub(crate) fn retain_governance_authorization(
+        &self,
+        window_label: &str,
+        mut result: Value,
+    ) -> Result<Value, DesktopCommandError> {
+        let authorization = result
+            .pointer("/data/authorization")
+            .and_then(Value::as_object)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let ticket_id = required_uuid(authorization, "ticketId")?;
+        let preview_id = required_uuid(authorization, "previewId")?;
+        let principal_id = required_uuid(authorization, "principalId")?;
+        let expires_at = authorization
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(DesktopCommandError::internal)?
+            .to_owned();
+        let retained_until = Instant::now()
+            .checked_add(GOVERNANCE_AUTHORIZATION_LIFETIME)
+            .ok_or_else(DesktopCommandError::internal)?;
+        let mut authorizations = self
+            .governance_authorizations
+            .lock()
+            .map_err(|_| DesktopCommandError::internal())?;
+        authorizations.retain(|_, entry| entry.retained_until > Instant::now());
+        if authorizations.len() >= MAXIMUM_GOVERNANCE_AUTHORIZATIONS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many pending governance authorizations are open. Finish or restart the current review.",
+            ));
+        }
+        let handle = allocate_authorization_handle(&authorizations)?;
+        authorizations.insert(
+            handle,
+            NativeGovernanceAuthorization {
+                window_label: window_label.to_owned(),
+                preview_id,
+                ticket_id,
+                retained_until,
+            },
+        );
+        let data = result
+            .get_mut("data")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(DesktopCommandError::internal)?;
+        data.insert(
+            "authorization".to_owned(),
+            json!({
+                "authorizationHandle": handle,
+                "previewId": preview_id,
+                "principalId": principal_id,
+                "expiresAt": expires_at,
+            }),
+        );
+        Ok(result)
+    }
+
+    pub(crate) fn consume_governance_authorizations(
+        &self,
+        window_label: &str,
+        preview_id: Uuid,
+        handles: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, DesktopCommandError> {
+        if handles.is_empty() || handles.len() > 2 {
+            return Err(DesktopCommandError::invalid_request(
+                "The governance action requires one or two current authorizations.",
+            ));
+        }
+        let mut unique = HashSet::new();
+        if handles.iter().any(|handle| !unique.insert(*handle)) {
+            return Err(DesktopCommandError::invalid_request(
+                "A governance authorization can be used only once.",
+            ));
+        }
+        let now = Instant::now();
+        let mut authorizations = self
+            .governance_authorizations
+            .lock()
+            .map_err(|_| DesktopCommandError::internal())?;
+        authorizations.retain(|_, entry| entry.retained_until > now);
+        let mut ticket_ids = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let entry = authorizations.get(handle).ok_or_else(|| {
+                DesktopCommandError::new(
+                    "authorization_unavailable",
+                    "The governance authorization expired or is no longer available. Authenticate again.",
+                )
+            })?;
+            if entry.window_label != window_label || entry.preview_id != preview_id {
+                return Err(DesktopCommandError::new(
+                    "unauthorized",
+                    "The governance authorization does not belong to this window and preview.",
+                ));
+            }
+            ticket_ids.push(entry.ticket_id);
+        }
+        for handle in handles {
+            authorizations.remove(&handle);
+        }
+        Ok(ticket_ids)
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         self.cancellation.cancel();
+        if let Ok(mut authorizations) = self.governance_authorizations.lock() {
+            authorizations.clear();
+        }
     }
 
     pub(crate) async fn finish_shutdown(&self) {
         self.begin_shutdown();
     }
+}
+
+fn required_uuid(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<Uuid, DesktopCommandError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|value| !value.is_nil())
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+fn allocate_authorization_handle(
+    authorizations: &HashMap<Uuid, NativeGovernanceAuthorization>,
+) -> Result<Uuid, DesktopCommandError> {
+    (0..16)
+        .map(|_| Uuid::new_v4())
+        .find(|candidate| !authorizations.contains_key(candidate))
+        .ok_or_else(DesktopCommandError::internal)
 }
 
 fn setup_steps(
@@ -790,6 +946,18 @@ pub(crate) async fn invoke_application(
             .insert("confirm".to_owned(), Value::Bool(true));
     }
     invoke_service_operation(state, &request.operation, request.arguments, authority).await
+}
+
+/// Invokes one private installed-client operation without copying transport bookkeeping fields into
+/// its closed business input. The operation must still be present in the authenticated service
+/// bootstrap and match the exact native authority supplied by the caller.
+pub(crate) async fn invoke_private_application(
+    operation: &'static str,
+    arguments: Map<String, Value>,
+    state: &DesktopState,
+    authority: InvocationAuthority,
+) -> Result<Value, DesktopCommandError> {
+    invoke_service_operation(state, operation, arguments, authority).await
 }
 
 async fn invoke_service_operation(

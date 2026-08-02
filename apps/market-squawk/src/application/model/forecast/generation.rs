@@ -7,10 +7,10 @@ use std::{
 };
 
 use market_squawk_data::Sha256Digest;
-use market_squawk_domain::{InstrumentId, ModelId, Timestamp};
+use market_squawk_domain::{DataQuality, InstrumentId, ModelId, Timestamp};
 use market_squawk_modeling::{
-    BundleId, CalibrationEvidence, ForecastError, ForecastHorizon, ForecastRequest,
-    ModelFeatureValue, ModelInput, ResearchForecastBackend,
+    BundleId, CalibrationEvidence, ForecastError, ForecastHorizon, ForecastObservedPoint,
+    ForecastRequest, ForecastValue, ModelFeatureValue, ModelInput, ResearchForecastBackend,
 };
 use market_squawk_services::{
     ArtifactError, ArtifactPublicationContext, RequestContext, ServiceError, TypedToolRequest,
@@ -76,12 +76,13 @@ impl ModelDomainService {
                 ModelInput::try_new(metadata, values).map_err(|_error| ServiceError::InvalidRequest)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let forecast_request = ForecastRequest::try_new(
+        let forecast_request = ForecastRequest::try_new_with_observed_history(
             parsed.instrument_id,
             parsed.observed_cutoff,
             parsed.available_at,
             parsed.horizon,
             parsed.decimal_scale,
+            &parsed.observed_history,
             &inputs,
         )
         .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -190,6 +191,7 @@ struct ParsedForecastRequest {
     horizon: ForecastHorizon,
     decimal_scale: u8,
     validity_nanos: u64,
+    observed_history: Box<[ForecastObservedPoint]>,
     inputs: Box<[Box<[f64]>]>,
 }
 
@@ -208,6 +210,14 @@ impl ParsedForecastRequest {
         digest.update(self.horizon.step_nanos().get().to_be_bytes());
         digest.update([self.decimal_scale]);
         digest.update(self.validity_nanos.to_be_bytes());
+        for point in &self.observed_history {
+            digest.update(point.observed_at().unix_nanos().to_be_bytes());
+            digest.update(point.available_at().unix_nanos().to_be_bytes());
+            digest.update(point.value().mantissa().to_be_bytes());
+            digest.update([point.value().scale()]);
+            digest.update(point.source_pit_hash().bytes());
+            digest.update([quality_tag(point.quality())]);
+        }
         for row in &self.inputs {
             let row_length =
                 u64::try_from(row.len()).map_err(|_error| ServiceError::InvalidRequest)?;
@@ -224,7 +234,7 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
     type Error = ServiceError;
 
     fn try_from(input: &Map<String, Value>) -> Result<Self, Self::Error> {
-        const FIELDS: [&str; 10] = [
+        const FIELDS: [&str; 11] = [
             "instrumentId",
             "bundleId",
             "bundleVersion",
@@ -234,6 +244,7 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             "horizonStepNanos",
             "decimalScale",
             "validityNanos",
+            "observedHistory",
             "inputs",
         ];
         if input.len() != FIELDS.len() || input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
@@ -263,6 +274,21 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
         let validity_nanos = unsigned(input, "validityNanos")
             .filter(|value| *value > 0 && *value <= MAXIMUM_FORECAST_VALIDITY_NANOS)
             .ok_or(ServiceError::InvalidRequest)?;
+        let observed_history = input
+            .get("observedHistory")
+            .and_then(Value::as_array)
+            .filter(|values| {
+                !values.is_empty()
+                    && values.len() <= market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+            })
+            .ok_or(ServiceError::InvalidRequest)?;
+        let mut observed = Vec::new();
+        observed
+            .try_reserve_exact(observed_history.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for value in observed_history {
+            observed.push(parse_observed_point(value, decimal_scale)?);
+        }
         let encoded_inputs = input
             .get("inputs")
             .and_then(Value::as_array)
@@ -301,8 +327,77 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             horizon,
             decimal_scale,
             validity_nanos,
+            observed_history: observed.into_boxed_slice(),
             inputs: inputs.into_boxed_slice(),
         })
+    }
+}
+
+fn parse_observed_point(
+    value: &Value,
+    decimal_scale: u8,
+) -> Result<ForecastObservedPoint, ServiceError> {
+    let object = value.as_object().ok_or(ServiceError::InvalidRequest)?;
+    const FIELDS: [&str; 5] = [
+        "observedAtUnixNanos",
+        "availableAtUnixNanos",
+        "mantissa",
+        "sourcePitHash",
+        "quality",
+    ];
+    if object.len() != FIELDS.len() || object.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let observed_at = timestamp(object, "observedAtUnixNanos")?;
+    let available_at = timestamp(object, "availableAtUnixNanos")?;
+    let mantissa = object
+        .get("mantissa")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i128>().ok())
+        .ok_or(ServiceError::InvalidRequest)?;
+    let source_pit_hash = digest(object, "sourcePitHash")?;
+    let quality = data_quality(
+        object
+            .get("quality")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::InvalidRequest)?,
+    )?;
+    ForecastObservedPoint::try_new(
+        observed_at,
+        available_at,
+        ForecastValue::try_new(mantissa, decimal_scale).map_err(invalid)?,
+        source_pit_hash,
+        quality,
+    )
+    .map_err(invalid)
+}
+
+fn digest(input: &Map<String, Value>, name: &str) -> Result<Sha256Digest, ServiceError> {
+    let value = input
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| valid_digest(value))
+        .ok_or(ServiceError::InvalidRequest)?;
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or(ServiceError::InvalidRequest)?;
+        let low = hex_nibble(pair[1]).ok_or(ServiceError::InvalidRequest)?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(Sha256Digest::new(bytes))
+}
+
+fn data_quality(value: &str) -> Result<DataQuality, ServiceError> {
+    match value {
+        "direct_verified" => Ok(DataQuality::DirectVerified),
+        "direct_unverified" => Ok(DataQuality::DirectUnverified),
+        "official_delayed" => Ok(DataQuality::OfficialDelayed),
+        "aggregated" => Ok(DataQuality::Aggregated),
+        "indicative" => Ok(DataQuality::Indicative),
+        "estimated" => Ok(DataQuality::Estimated),
+        "stale" => Ok(DataQuality::Stale),
+        "quarantined" => Ok(DataQuality::Quarantined),
+        _ => Err(ServiceError::InvalidRequest),
     }
 }
 
@@ -378,6 +473,7 @@ fn map_modeling_forecast_error(error: ForecastError) -> ServiceError {
         ForecastError::Inference(_) => ServiceError::Unavailable,
         ForecastError::InvalidHorizon
         | ForecastError::InvalidRequest
+        | ForecastError::InvalidObservedHistory
         | ForecastError::InvalidDecimal
         | ForecastError::InvalidCalibration
         | ForecastError::CalibrationIdentityMismatch
@@ -393,6 +489,28 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+const fn quality_tag(quality: DataQuality) -> u8 {
+    match quality {
+        DataQuality::DirectVerified => 1,
+        DataQuality::DirectUnverified => 2,
+        DataQuality::OfficialDelayed => 3,
+        DataQuality::Aggregated => 4,
+        DataQuality::Indicative => 5,
+        DataQuality::Modeled => 6,
+        DataQuality::Estimated => 7,
+        DataQuality::Stale => 8,
+        DataQuality::Quarantined => 9,
+    }
 }
 
 fn invalid<T>(_error: T) -> ServiceError {

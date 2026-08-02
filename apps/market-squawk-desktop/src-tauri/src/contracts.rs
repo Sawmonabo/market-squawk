@@ -150,7 +150,6 @@ pub(crate) struct DesktopBootstrap {
     installation: Readiness,
     model_runtime: Readiness,
     mcp: Readiness,
-    mcp_client: Option<Value>,
     telemetry_enabled: bool,
     encrypted_file_fallback: Value,
     provider_profiles: Value,
@@ -173,7 +172,6 @@ impl DesktopBootstrap {
         installation: Readiness,
         model_runtime: Readiness,
         mcp: Readiness,
-        mcp_client: Option<Value>,
         encrypted_file_fallback: Value,
         provider_profiles: Value,
         provider_sessions: Value,
@@ -191,7 +189,6 @@ impl DesktopBootstrap {
             installation,
             model_runtime,
             mcp,
-            mcp_client,
             telemetry_enabled: false,
             encrypted_file_fallback,
             provider_profiles,
@@ -301,8 +298,17 @@ pub(crate) enum DashboardQueryCommand {
     DecisionScreens {
         limit: u16,
     },
+    DecisionScreenRuns {
+        after_run_id: Option<String>,
+        limit: u16,
+    },
     DecisionCandidates {
         run_id: String,
+    },
+    DecisionCandidateDossiers {
+        candidate_id: String,
+        after_dossier_id: Option<String>,
+        limit: u16,
     },
     DecisionDossier {
         dossier_id: String,
@@ -313,6 +319,10 @@ pub(crate) enum DashboardQueryCommand {
     },
     DecisionTargets {
         target_id: String,
+    },
+    DecisionTargetIndex {
+        after_target_id: Option<String>,
+        limit: u16,
     },
     DecisionTargetStatus {
         target_id: String,
@@ -378,10 +388,146 @@ pub(crate) enum ModelControlCommand {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum FairValueControlCommand {
-    Classify { measurement_id: String },
+    Classify {
+        measurement_id: String,
+    },
+    PreviewGovernanceAction {
+        proposal: FairValueGovernanceProposal,
+    },
+    CommitGovernanceAction {
+        preview_id: Uuid,
+        authorization_handles: Vec<Uuid>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+pub(crate) enum FairValueGovernanceProposal {
+    Approve {
+        measurement_id: String,
+        decision_id: String,
+        expires_at: String,
+    },
+    Override {
+        measurement_id: String,
+        decision_id: String,
+        requested_hierarchy: FairValueHierarchyInput,
+        justification: String,
+        expires_at: String,
+    },
+    Revoke {
+        approval_id: String,
+        reason: String,
+    },
+    MarketAccess {
+        account_id: String,
+        venue_id: String,
+        instrument_id: String,
+        conclusion: MarketAccessConclusionInput,
+        effective_from: String,
+        effective_until: String,
+        rationale: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FairValueHierarchyInput {
+    Level2,
+    Level3,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MarketAccessConclusionInput {
+    Accessible,
+    Inaccessible,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum DecisionControlCommand {
+    PreviewGovernanceAction {
+        proposal: DecisionGovernanceProposal,
+    },
+    CommitGovernanceAction {
+        preview_id: Uuid,
+        authorization_handles: Vec<Uuid>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+pub(crate) enum DecisionGovernanceProposal {
+    Review {
+        target_id: String,
+        target_revision: u64,
+        disposition: DecisionReviewDispositionInput,
+        note: String,
+    },
+    Invalidation {
+        target_id: String,
+        target_revision: u64,
+        invalidation_kind: DecisionInvalidationKindInput,
+        note: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecisionReviewDispositionInput {
+    Activate,
+    Reject,
+    NeedsChanges,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecisionInvalidationKindInput {
+    CorporateAction,
+    Model,
+    Data,
+    ReferenceMark,
+    Assumption,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "query")]
+pub(crate) enum GovernanceQueryCommand {
+    Principals {
+        after: Option<Uuid>,
+        limit: Option<u16>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum GovernanceControlCommand {
+    AuthenticateAction {
+        preview_id: Uuid,
+        principal_id: Uuid,
+        credential: String,
+    },
+}
+
+impl fmt::Debug for GovernanceControlCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AuthenticateAction {
+                preview_id,
+                principal_id,
+                credential: _,
+            } => formatter
+                .debug_struct("AuthenticateAction")
+                .field("preview_id", preview_id)
+                .field("principal_id", principal_id)
+                .field("credential", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -468,26 +614,6 @@ pub(crate) enum SourceLifecycleAction {
     Verify,
     Reconfigure,
     Remove,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct McpStatus {
-    service_ready: bool,
-    shared_endpoint_ready: bool,
-    claude_code: &'static str,
-    codex: &'static str,
-}
-
-impl McpStatus {
-    pub(crate) const fn service_ready(shared_endpoint_ready: bool) -> Self {
-        Self {
-            service_ready: true,
-            shared_endpoint_ready,
-            claude_code: "registration_pending",
-            codex: "registration_pending",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]

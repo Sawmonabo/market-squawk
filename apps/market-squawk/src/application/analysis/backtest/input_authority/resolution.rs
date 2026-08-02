@@ -10,10 +10,16 @@ use market_squawk_services::ServiceError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{PinnedBacktestInput, ResearchService};
+use crate::{
+    PinnedBacktestInput, ResearchService,
+    backtest_service::{
+        PinnedBacktestCohort, PinnedBacktestCohortCandidate, PinnedBacktestCohortMember,
+    },
+};
 
 use super::recipe::{
-    ExpectedEvidence, InputCoreWire, ManifestAuthorityWire, sort_manifest_authorities,
+    CohortMemberEvidence, ExpectedEvidence, InputCoreWire, ManifestAuthorityWire,
+    sort_manifest_authorities,
 };
 
 const HARD_MAXIMUM_MANIFEST_NODES: usize = 4_096;
@@ -25,25 +31,44 @@ pub(super) struct MaterializedInput {
 
 impl MaterializedInput {
     pub(super) fn validate_registration(self) -> Result<(), ServiceError> {
-        let limits = self.input.limits;
-        let dataset = BacktestDataset::try_from_pinned_query(
-            self.input.query,
-            self.input.instrument_definitions,
-            limits,
-        )
-        .map_err(|_| ServiceError::InvalidRequest)?;
-        BacktestRequest::try_new(
-            dataset,
-            self.input.execution_assumptions,
-            self.input.portfolio,
-            self.input.corporate_actions,
-            self.input.sources,
-            self.input.seed,
-            limits,
-        )
-        .map(|_| ())
-        .map_err(|_| ServiceError::InvalidRequest)
+        validate_pinned_input(self.input)
     }
+}
+
+fn validate_pinned_input(input: PinnedBacktestInput) -> Result<(), ServiceError> {
+    let PinnedBacktestInput {
+        query,
+        instrument_definitions,
+        execution_assumptions,
+        portfolio,
+        corporate_actions,
+        sources,
+        seed,
+        limits,
+        experiment: _,
+        cohort,
+    } = input;
+    let dataset = BacktestDataset::try_from_pinned_query(query, instrument_definitions, limits)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    BacktestRequest::try_new(
+        dataset,
+        execution_assumptions,
+        portfolio,
+        corporate_actions,
+        sources,
+        seed,
+        limits,
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    if let Some(cohort) = cohort {
+        for member in cohort.members {
+            if member.input.cohort.is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+            validate_pinned_input(member.input)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -67,6 +92,66 @@ impl BacktestInputMaterializer {
     }
 
     pub(super) async fn materialize(
+        &self,
+        core: &InputCoreWire,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<MaterializedInput, ServiceError> {
+        let mut materialized = self
+            .materialize_single(core, cancellation.clone(), deadline)
+            .await?;
+        let Some(cohort) = core.cohort().map_err(|_| ServiceError::InvalidResult)? else {
+            return Ok(materialized);
+        };
+        let member_cores = cohort
+            .member_cores(core)
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let mut members = Vec::new();
+        let mut evidence = Vec::new();
+        members
+            .try_reserve_exact(member_cores.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        evidence
+            .try_reserve_exact(member_cores.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for (member_id, member_core) in member_cores {
+            let member = self
+                .materialize_single(&member_core, cancellation.clone(), deadline)
+                .await?;
+            evidence.push(CohortMemberEvidence {
+                member_id: member_id.clone(),
+                evidence: Box::new(member.evidence),
+            });
+            members.push(PinnedBacktestCohortMember {
+                member_id,
+                input: member.input,
+            });
+        }
+        materialized.evidence.cohort_members = evidence;
+        materialized.input.cohort = Some(PinnedBacktestCohort {
+            generator_version: cohort.generator_version().clone(),
+            generator_parameters: cohort.generator_parameters(),
+            members,
+            folds: cohort
+                .folds()
+                .into_iter()
+                .map(|fold| {
+                    fold.into_iter()
+                        .map(|(in_sample_member_id, out_of_sample_member_id)| {
+                            PinnedBacktestCohortCandidate {
+                                in_sample_member_id,
+                                out_of_sample_member_id,
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+            selection_member_ids: cohort.selection_member_ids(),
+        });
+        Ok(materialized)
+    }
+
+    async fn materialize_single(
         &self,
         core: &InputCoreWire,
         cancellation: CancellationToken,
@@ -141,6 +226,7 @@ impl BacktestInputMaterializer {
             seed: core.seed(),
             limits: core.limits().map_err(|_| ServiceError::InvalidResult)?,
             experiment: core.experiment().map_err(|_| ServiceError::InvalidResult)?,
+            cohort: None,
         };
         let evidence = ExpectedEvidence::from_input(&input, manifests);
         ensure_live(&cancellation, deadline)?;

@@ -15,7 +15,7 @@ pub use artifact::{
     ArtifactAuthority, ArtifactError, ArtifactPublication, ArtifactPublicationContext,
     ArtifactRead, ArtifactReadContext, ArtifactReadRequest, ArtifactReference,
     ArtifactReferenceResolver, ArtifactRepository, ArtifactResolveRequest,
-    PARQUET_ARTIFACT_MEDIA_TYPE,
+    NDJSON_ARTIFACT_MEDIA_TYPE, PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 pub use contract::{
     ScopeRequirement, ServiceDomain, SourceEvidencePolicy, TOOL_CONFIRMATION_FIELD,

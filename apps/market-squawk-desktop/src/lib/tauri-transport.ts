@@ -7,17 +7,21 @@ import {
   encryptedFileFallbackSchema,
   installationControlResultSchema,
   inputTicketSchema,
-  mcpStatusSchema,
+  mcpClientsStatusSchema,
   providerActivationSchema,
   providerBootstrapSchema,
   providerSessionSchema,
 } from "@/lib/schemas"
 import type {
   DashboardQuery,
+  DecisionControlRequest,
   FairValueControlRequest,
+  GovernanceControlRequest,
+  GovernanceQueryRequest,
   JobControlRequest,
   InstallationControlRequest,
   ModelControlRequest,
+  McpClientControlRequest,
   PaperControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
@@ -69,6 +73,21 @@ class TauriTransport implements ProductTransport {
     return applicationResultSchema.parse(value)
   }
 
+  async decisionControl(request: DecisionControlRequest, confirmed = false) {
+    const value = await invoke("decision_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async governanceQuery(request: GovernanceQueryRequest) {
+    const value = await invoke("governance_query", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async governanceControl(request: GovernanceControlRequest, confirmed = false) {
+    const value = await invoke("governance_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
   async fairValueControl(request: FairValueControlRequest, confirmed = false) {
     const value = await invoke("fair_value_control", { request, confirmed })
     return applicationResultSchema.parse(value)
@@ -98,9 +117,14 @@ class TauriTransport implements ProductTransport {
     return value === null ? null : inputTicketSchema.parse(value)
   }
 
-  async mcpStatus() {
+  async mcpClients() {
     const value = await invoke("mcp_status")
-    return mcpStatusSchema.parse(value)
+    return mcpClientsStatusSchema.parse(value)
+  }
+
+  async mcpClientControl(request: McpClientControlRequest, confirmed = false) {
+    const value = await invoke("mcp_client_control", { request, confirmed })
+    return mcpClientsStatusSchema.parse(value)
   }
 
   async subscribe(onEvent: Parameters<ProductTransport["subscribe"]>[0]) {
@@ -180,6 +204,18 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
+  decisionControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  governanceQuery(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  governanceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
   fairValueControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
@@ -200,7 +236,11 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  mcpStatus(): Promise<never> {
+  mcpClients(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  mcpClientControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

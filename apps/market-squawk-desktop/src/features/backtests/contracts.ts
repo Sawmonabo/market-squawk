@@ -18,17 +18,73 @@ const metricSchema = z
   })
   .strict()
 
+const executionAssumptionsSchema = z
+  .object({
+    policyVersion: z.literal(3),
+    feeBasisPoints: z.number().int().min(0).max(10_000),
+    spreadModel: z.literal("observed-point-in-time-half-spread"),
+    slippageBasisPoints: z.number().int().min(0).max(10_000),
+    maximumRandomSlippageBasisPoints: z.number().int().min(0).max(10_000),
+    latencyNanos: losslessIntegerSchema,
+    maximumParticipationBasisPoints: z.number().int().min(1).max(10_000),
+    liquidityPriority: z.literal("signal-time-then-order-id"),
+    partialFillsAllowed: z.boolean(),
+    feeDecimalScale: z.number().int().min(0).max(28),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (compareLosslessIntegers(value.latencyNanos, "0") <= 0) {
+      context.addIssue({
+        code: "custom",
+        message: "Backtest latency must be positive.",
+      })
+    }
+  })
+
+const legacyArtifactSchema = z
+  .object({
+    reference: z.string().min(1),
+    digest: digestSchema,
+    byteCount: z.number().int().positive(),
+  })
+  .strict()
+
+const controlledReportArtifactSchema = z
+  .object({
+    artifactId: z.string().regex(/^backtest-report-[0-9a-f]{64}$/),
+    sha256: digestSchema,
+    byteCount: z.number().int().positive(),
+    mediaType: z.literal("application/json"),
+  })
+  .strict()
+  .superRefine((artifact, context) => {
+    if (artifact.artifactId !== `backtest-report-${artifact.sha256}`) {
+      context.addIssue({
+        code: "custom",
+        message: "The report identity does not bind its digest.",
+      })
+    }
+  })
+
+const cohortDiagnosticsSchema = z.union([
+  z.object({ state: z.literal("not-evaluated") }).strict(),
+  z
+    .object({
+      state: z.literal("completed"),
+      evaluationId: digestSchema,
+      probabilityOfBacktestOverfitting: z.number().min(0).max(1).refine(Number.isFinite),
+      foldCount: z.number().int().min(2).max(1024),
+      deflatedPerformanceProbability: z.number().min(0).max(1).refine(Number.isFinite),
+      expectedMaximumSharpe: z.number().refine(Number.isFinite),
+    })
+    .strict(),
+])
+
 const completedStatusSchema = z
   .object({
     state: z.literal("completed"),
     resultDigest: digestSchema,
-    artifact: z
-      .object({
-        reference: z.string().min(1),
-        digest: digestSchema,
-        byteCount: z.number().int().positive(),
-      })
-      .strict(),
+    artifact: z.union([legacyArtifactSchema, controlledReportArtifactSchema]),
     metrics: z.array(metricSchema).max(256),
     datasetPartition: z
       .object({
@@ -38,8 +94,11 @@ const completedStatusSchema = z
       .strict()
       .nullable(),
     fillCount: z.number().int().nonnegative(),
+    partialFillCount: z.number().int().nonnegative().optional(),
     noActionCount: z.number().int().nonnegative(),
     accountingReconciliation: z.literal("independent"),
+    executionAssumptions: executionAssumptionsSchema.optional(),
+    cohortDiagnostics: cohortDiagnosticsSchema.optional(),
   })
   .strict()
   .superRefine((status, context) => {
@@ -59,7 +118,7 @@ const completedStatusSchema = z
 
 const backtestRecordSchema = z
   .object({
-    recordVersion: z.literal(1),
+    recordVersion: z.union([z.literal(1), z.literal(2)]),
     runId: digestSchema,
     datasetIdentity: digestSchema,
     objectGraphDigest: digestSchema,
@@ -83,6 +142,28 @@ const backtestRecordSchema = z
         code: "custom",
         message: "The cohort evidence pair is incomplete.",
       })
+    }
+    if (record.recordVersion === 2 && record.status.state === "completed") {
+      if (
+        !("artifactId" in record.status.artifact) ||
+        record.status.partialFillCount === undefined ||
+        record.status.executionAssumptions === undefined ||
+        record.status.cohortDiagnostics === undefined
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "The V2 governed record is missing required evidence.",
+        })
+      }
+      if (
+        record.status.cohortDiagnostics?.state === "completed" &&
+        (record.cohortAuthorityDigest === null || record.cohortUniverseDigest === null)
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "Completed cohort diagnostics require the exact cohort authority bindings.",
+        })
+      }
     }
   })
 

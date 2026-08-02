@@ -14,10 +14,11 @@ use market_squawk_services::{
 };
 use market_squawk_valuation::{
     ActorId, ApprovalStatus, ApprovedMarketAccess, AuditEventId, AuditEventKind,
-    ClassificationRuleset, DecisionId, EvidenceOrigin, FairValueAuditCursor, FairValueAuditEvent,
-    FairValueError, FairValueService, InputSignificance, MarketAccess, MarketAccessAssessmentId,
-    MarketPriceSelection, MeasurementId, OverrideProposal, ValuationAmount, ValuationApprovalId,
-    ValuationInput, ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
+    ClassificationRuleset, DecisionBasis, DecisionId, EvidenceOrigin, FairValueAuditCursor,
+    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueService,
+    InputSignificance, MarketAccess, MarketAccessAssessmentId, MarketPriceSelection, MeasurementId,
+    OverrideProposal, RulesetHash, ValuationAmount, ValuationApprovalId, ValuationInput,
+    ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
@@ -388,6 +389,97 @@ pub struct FairValueDomainService {
     lifecycle: Arc<DomainLifecycle>,
 }
 
+/// Immutable fair-value evidence retained by a governed approval or override preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedFairValueDecisionEvidence {
+    measurement_id: MeasurementId,
+    decision_id: DecisionId,
+    evidence_hash: FairValueEvidenceHash,
+    ruleset_hash: RulesetHash,
+    hierarchy: FairValueHierarchy,
+    basis: DecisionBasis,
+}
+
+impl GovernedFairValueDecisionEvidence {
+    pub(crate) const fn measurement_id(&self) -> MeasurementId {
+        self.measurement_id
+    }
+
+    pub(crate) const fn decision_id(&self) -> DecisionId {
+        self.decision_id
+    }
+
+    pub(crate) const fn evidence_hash(&self) -> FairValueEvidenceHash {
+        self.evidence_hash
+    }
+
+    pub(crate) const fn ruleset_hash(&self) -> RulesetHash {
+        self.ruleset_hash
+    }
+
+    pub(crate) const fn hierarchy(&self) -> FairValueHierarchy {
+        self.hierarchy
+    }
+
+    pub(crate) const fn basis(&self) -> DecisionBasis {
+        self.basis
+    }
+}
+
+/// Immutable active approval plus its exact measurement/decision evidence chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedFairValueApprovalEvidence {
+    approval_id: ValuationApprovalId,
+    decision: GovernedFairValueDecisionEvidence,
+    expires_at: Timestamp,
+}
+
+impl GovernedFairValueApprovalEvidence {
+    pub(crate) const fn approval_id(&self) -> ValuationApprovalId {
+        self.approval_id
+    }
+
+    pub(crate) const fn decision(&self) -> &GovernedFairValueDecisionEvidence {
+        &self.decision
+    }
+
+    pub(crate) const fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+}
+
+/// Exact typed market coordinates and current retained assessment identity, when one exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernedFairValueMarketAccessEvidence {
+    account_id: AccountId,
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+    effective_from: Timestamp,
+    current_assessment_id: Option<MarketAccessAssessmentId>,
+}
+
+impl GovernedFairValueMarketAccessEvidence {
+    pub(crate) const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub(crate) const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn effective_from(&self) -> Timestamp {
+        self.effective_from
+    }
+
+    pub(crate) const fn current_assessment_id(&self) -> Option<MarketAccessAssessmentId> {
+        self.current_assessment_id
+    }
+}
+
 impl FairValueDomainService {
     /// Binds one durable service to code-owned rules, genuine selection, and receipt resolution.
     ///
@@ -410,6 +502,143 @@ impl FairValueDomainService {
             maximum_query_results: limits.max_query_results(),
             lifecycle: DomainLifecycle::new(),
         })
+    }
+
+    /// Resolves the immutable evidence chain used by one governed approval or override preview.
+    pub(crate) async fn governed_decision_evidence(
+        &self,
+        measurement_id: MeasurementId,
+        decision_id: DecisionId,
+    ) -> Result<GovernedFairValueDecisionEvidence, FairValueError> {
+        let state = self.state.lock().await;
+        resolve_governed_decision(&state, measurement_id, decision_id)
+    }
+
+    /// Resolves an active approval and its complete immutable measurement/decision chain.
+    pub(crate) async fn governed_approval_evidence(
+        &self,
+        approval_id: ValuationApprovalId,
+        at: Timestamp,
+    ) -> Result<GovernedFairValueApprovalEvidence, FairValueError> {
+        let state = self.state.lock().await;
+        resolve_governed_approval(&state, approval_id, at)
+    }
+
+    /// Resolves the exact typed market and the assessment current at the proposed effective start.
+    pub(crate) async fn governed_market_access_evidence(
+        &self,
+        account_id: AccountId,
+        venue_id: VenueId,
+        instrument_id: InstrumentId,
+        effective_from: Timestamp,
+    ) -> Result<GovernedFairValueMarketAccessEvidence, FairValueError> {
+        let state = self.state.lock().await;
+        resolve_governed_market_access(&state, account_id, venue_id, instrument_id, effective_from)
+    }
+
+    /// Revalidates the preview evidence and durably approves through the existing authority.
+    pub(crate) async fn commit_governed_approval(
+        &self,
+        evidence: GovernedFairValueDecisionEvidence,
+        approved_by: ActorId,
+        approved_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<ValuationApprovalId, FairValueError> {
+        let mut state = self.state.lock().await;
+        if resolve_governed_decision(&state, evidence.measurement_id, evidence.decision_id)?
+            != evidence
+        {
+            return Err(FairValueError::InvalidMeasurement);
+        }
+        state
+            .approve(evidence.decision_id, approved_by, approved_at, expires_at)
+            .map(|approval| approval.id())
+    }
+
+    /// Revalidates the preview evidence and durably records one non-promoting override.
+    pub(crate) async fn commit_governed_override(
+        &self,
+        evidence: GovernedFairValueDecisionEvidence,
+        requested_hierarchy: FairValueHierarchy,
+        justification: &str,
+        prepared_by: ActorId,
+        prepared_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<market_squawk_valuation::OverrideId, FairValueError> {
+        let mut state = self.state.lock().await;
+        let current =
+            resolve_governed_decision(&state, evidence.measurement_id, evidence.decision_id)?;
+        validate_governed_override(&current, requested_hierarchy)?;
+        if current != evidence {
+            return Err(FairValueError::InvalidOverride);
+        }
+        state
+            .propose_override(
+                evidence.decision_id,
+                requested_hierarchy,
+                justification,
+                prepared_by,
+                prepared_at,
+                expires_at,
+            )
+            .map(|proposal| proposal.valuation_override().id())
+    }
+
+    /// Revalidates active status and durably revokes through the existing authority.
+    pub(crate) async fn commit_governed_revocation(
+        &self,
+        evidence: GovernedFairValueApprovalEvidence,
+        revoked_by: ActorId,
+        revoked_at: Timestamp,
+        reason: &str,
+    ) -> Result<market_squawk_valuation::ApprovalRevocationId, FairValueError> {
+        let mut state = self.state.lock().await;
+        if resolve_governed_approval(&state, evidence.approval_id, revoked_at)? != evidence {
+            return Err(FairValueError::InvalidRevocationTime);
+        }
+        state
+            .revoke_approval(evidence.approval_id, revoked_by, revoked_at, reason)
+            .map(|revocation| revocation.id())
+    }
+
+    /// Revalidates the exact market head and durably appends a dual-principal assessment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_governed_market_access(
+        &self,
+        evidence: GovernedFairValueMarketAccessEvidence,
+        conclusion: MarketAccess,
+        effective_until: Timestamp,
+        rationale: &str,
+        prepared_by: ActorId,
+        approved_by: ActorId,
+        committed_at: Timestamp,
+    ) -> Result<MarketAccessAssessmentId, FairValueError> {
+        let mut state = self.state.lock().await;
+        if resolve_governed_market_access(
+            &state,
+            evidence.account_id,
+            evidence.venue_id.clone(),
+            evidence.instrument_id,
+            evidence.effective_from,
+        )? != evidence
+        {
+            return Err(FairValueError::InvalidMarketAccessAssessment);
+        }
+        state
+            .approve_market_access(
+                evidence.account_id,
+                evidence.venue_id,
+                evidence.instrument_id,
+                conclusion,
+                evidence.effective_from,
+                effective_until,
+                rationale,
+                prepared_by,
+                committed_at,
+                approved_by,
+                committed_at,
+            )
+            .map(|assessment| assessment.id())
     }
 
     async fn list_measurements(
@@ -1567,6 +1796,108 @@ fn validate_resolved_input(
     } else {
         Ok(())
     }
+}
+
+fn resolve_governed_decision(
+    state: &FairValueService,
+    measurement_id: MeasurementId,
+    decision_id: DecisionId,
+) -> Result<GovernedFairValueDecisionEvidence, FairValueError> {
+    let measurement = state
+        .measurement(measurement_id)
+        .ok_or(FairValueError::MeasurementNotFound)?;
+    let decision = state
+        .decision(decision_id)
+        .ok_or(FairValueError::DecisionNotFound)?;
+    if decision.measurement_id() != measurement_id
+        || decision.evidence_hash() != measurement.evidence_hash()
+    {
+        return Err(FairValueError::InvalidMeasurement);
+    }
+    if decision.hierarchy() == FairValueHierarchy::Level1
+        && (decision.basis() != DecisionBasis::Rules
+            || measurement
+                .inputs()
+                .iter()
+                .filter(|input| input.significance() == InputSignificance::Significant)
+                .any(|input| {
+                    input.market_access() != MarketAccess::Accessible
+                        || input.market_access_assessment().is_none()
+                }))
+    {
+        return Err(FairValueError::InvalidMeasurement);
+    }
+    Ok(GovernedFairValueDecisionEvidence {
+        measurement_id,
+        decision_id,
+        evidence_hash: measurement.evidence_hash(),
+        ruleset_hash: decision.ruleset_hash(),
+        hierarchy: decision.hierarchy(),
+        basis: decision.basis(),
+    })
+}
+
+fn resolve_governed_approval(
+    state: &FairValueService,
+    approval_id: ValuationApprovalId,
+    at: Timestamp,
+) -> Result<GovernedFairValueApprovalEvidence, FairValueError> {
+    let approval = state
+        .approval(approval_id)
+        .ok_or(FairValueError::ApprovalNotFound)?;
+    if state.approval_status(approval_id, at)? != ApprovalStatus::Active {
+        return Err(FairValueError::InvalidRevocationTime);
+    }
+    let decision =
+        resolve_governed_decision(state, approval.measurement_id(), approval.decision_id())?;
+    Ok(GovernedFairValueApprovalEvidence {
+        approval_id,
+        decision,
+        expires_at: approval.expires_at(),
+    })
+}
+
+fn resolve_governed_market_access(
+    state: &FairValueService,
+    account_id: AccountId,
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+    effective_from: Timestamp,
+) -> Result<GovernedFairValueMarketAccessEvidence, FairValueError> {
+    let current_assessment_id = state
+        .current_market_access(account_id, &venue_id, instrument_id, effective_from)?
+        .map(|assessment| assessment.id());
+    Ok(GovernedFairValueMarketAccessEvidence {
+        account_id,
+        venue_id,
+        instrument_id,
+        effective_from,
+        current_assessment_id,
+    })
+}
+
+/// Rejects every Level 1/Unclassified request and every hierarchy promotion before preview.
+pub(crate) fn validate_governed_override(
+    evidence: &GovernedFairValueDecisionEvidence,
+    requested: FairValueHierarchy,
+) -> Result<(), FairValueError> {
+    let current_rank = match evidence.hierarchy {
+        FairValueHierarchy::Level1 => 1_u8,
+        FairValueHierarchy::Level2 => 2,
+        FairValueHierarchy::Level3 => 3,
+        FairValueHierarchy::Unclassified => return Err(FairValueError::InvalidOverride),
+    };
+    let requested_rank = match requested {
+        FairValueHierarchy::Level2 => 2_u8,
+        FairValueHierarchy::Level3 => 3,
+        FairValueHierarchy::Level1 | FairValueHierarchy::Unclassified => {
+            return Err(FairValueError::InvalidOverride);
+        }
+    };
+    if evidence.basis != DecisionBasis::Rules || requested_rank <= current_rank {
+        return Err(FairValueError::InvalidOverride);
+    }
+    Ok(())
 }
 
 fn origin_matches(

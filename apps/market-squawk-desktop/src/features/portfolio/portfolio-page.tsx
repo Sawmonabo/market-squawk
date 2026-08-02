@@ -280,7 +280,10 @@ function DetailWorkspace({
         ) : (
           <InlineUnavailable text="Mark provenance is unavailable without holding evidence." />
         )}
-        <ReconciliationPanel account={account} />
+        <ReconciliationPanel
+          account={account}
+          performance={details.performance.data?.value ?? null}
+        />
       </div>
     </div>
   )

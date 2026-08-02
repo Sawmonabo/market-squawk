@@ -178,6 +178,27 @@ impl ExperimentInventory {
         })
     }
 
+    /// Reads one content-addressed backtest report through the inventory's confined artifact root.
+    ///
+    /// The caller supplies only the immutable digest and exact retained byte count. The inventory
+    /// derives the capability-relative location, refuses oversized or mismatched content, and
+    /// never returns a filesystem path.
+    pub fn read_artifact(
+        &self,
+        digest: Sha256Digest,
+        byte_count: u64,
+    ) -> Result<Vec<u8>, ExperimentError> {
+        let artifact = BacktestArtifact {
+            reference: artifact_reference(digest)?.into_boxed_str(),
+            digest,
+            byte_count,
+        };
+        let (path, maximum) = self.validate_artifact_authority(&artifact)?;
+        let bytes = read_bounded(&self.root, &path, maximum)?;
+        validate_artifact_bytes(&bytes, &artifact)?;
+        Ok(bytes)
+    }
+
     pub(crate) fn publish_cohort_evaluation(
         &self,
         evaluation: &BacktestCohortEvaluation,

@@ -52,7 +52,7 @@ pub use intent::{
 };
 pub use limits::{
     AccountRiskViolation, MAX_PAPER_FEE_BASIS_POINTS, MAX_RISK_INSTRUMENTS, RiskLimits,
-    RiskLimitsError, RiskLimitsInput,
+    RiskLimitsError, RiskLimitsInput, RiskLimitsSnapshot,
 };
 pub use live_hook::{ExecutionLiveActionHook, ExecutionLiveActionHookError};
 pub use portfolio::{

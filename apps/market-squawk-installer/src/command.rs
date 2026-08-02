@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt as _;
+use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration, WorkspaceId};
 use reqwest::redirect::Policy;
 use semver::Version;
 use serde::Serialize;
@@ -17,6 +18,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 use crate::contracts::{
     InstallReceipt, InstallRequest, MutableDataClass, RepairRequest, RollbackRequest,
@@ -30,6 +32,10 @@ use crate::manifest::{
     MAXIMUM_ENTRY_BYTES, MAXIMUM_MANIFEST_BYTES, ReleaseManifest,
 };
 use crate::platform::{NativeTrustMode, ProgramName, SupportedTarget, default_install_root};
+use crate::service_registration::{
+    RestartInstalledServiceRequest, installed_service_status, restart_installed_service,
+    verify_installed_service,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -107,11 +113,53 @@ enum InstallerCommand {
         #[arg(value_enum)]
         program: ProgramName,
     },
+    /// Inspect or restart only the exact installer-owned per-user service registration.
+    Service {
+        #[command(subcommand)]
+        command: ServiceControlCommand,
+    },
     /// Build release metadata from one closed native staging tree.
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceControlCommand {
+    /// Verify owned registration and authenticated current health.
+    Status,
+    /// Verify owned registration against one exact expected runtime generation.
+    Verify(ExpectedRuntimeArguments),
+    /// Restart the owned registration and require the exact next runtime generation.
+    Restart(ExpectedRuntimeArguments),
+}
+
+#[derive(Debug, Args)]
+struct ExpectedRuntimeArguments {
+    /// Exact stable installation identity authenticated by the currently running service.
+    #[arg(long)]
+    installation_id: Uuid,
+    /// Exact active workspace identity authenticated by the currently running service.
+    #[arg(long)]
+    workspace_id: Uuid,
+    /// Exact current one-based service generation.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    service_generation: u64,
+}
+
+impl ExpectedRuntimeArguments {
+    fn runtime(self) -> Result<RuntimeIdentity, CommandError> {
+        RuntimeIdentity::try_new(
+            InstallationId::try_from_uuid(self.installation_id)
+                .map_err(|_| CommandError::ServiceIdentity)?,
+            WorkspaceId::try_from_uuid(self.workspace_id)
+                .map_err(|_| CommandError::ServiceIdentity)?,
+            ServiceGeneration::try_new(self.service_generation)
+                .map_err(|_| CommandError::ServiceIdentity)?,
+        )
+        .map_err(|_| CommandError::ServiceIdentity)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,6 +323,21 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 return Err(CommandError::ProgramExit(exit.code()));
             }
         }
+        InstallerCommand::Service { command } => match command {
+            ServiceControlCommand::Status => {
+                let status = installed_service_status(&root)?;
+                output(json, "verified installed service", &status)?;
+            }
+            ServiceControlCommand::Verify(expected) => {
+                let status = verify_installed_service(&root, expected.runtime()?)?;
+                output(json, "verified expected installed service", &status)?;
+            }
+            ServiceControlCommand::Restart(expected) => {
+                let request = RestartInstalledServiceRequest::new(root, expected.runtime()?);
+                let status = restart_installed_service(request)?;
+                output(json, "restarted installed service", &status)?;
+            }
+        },
         InstallerCommand::Manifest { .. } => return Err(CommandError::ManifestBuild),
     }
     Ok(())
@@ -831,6 +894,10 @@ pub enum CommandError {
     Launch(#[source] std::io::Error),
     #[error("installed program exited unsuccessfully: {0:?}")]
     ProgramExit(Option<i32>),
+    #[error("installed-service runtime identity is invalid")]
+    ServiceIdentity,
+    #[error(transparent)]
+    ServiceRegistration(#[from] crate::service_registration::ServiceRegistrationError),
     #[error(transparent)]
     Lifecycle(#[from] InstallError),
     #[error(transparent)]

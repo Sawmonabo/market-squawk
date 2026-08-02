@@ -127,6 +127,8 @@ pub enum ProgramName {
     Desktop,
     /// The permanent installed application service.
     Service,
+    /// The permanent local MCP relay shared by supported clients.
+    McpRelay,
     /// The Market Squawk command-line interface and stdio MCP server.
     Cli,
     /// The isolated raw-capture helper.
@@ -149,6 +151,7 @@ impl ProgramName {
         match self {
             Self::Desktop => PathBuf::from(format!("bin/market-squawk-desktop{suffix}")),
             Self::Service => PathBuf::from(format!("bin/market-squawk-service{suffix}")),
+            Self::McpRelay => PathBuf::from(format!("bin/market-squawk-mcp-relay{suffix}")),
             Self::Cli => PathBuf::from(format!("bin/market-squawk{suffix}")),
             Self::CaptureHelper => {
                 PathBuf::from(format!("bin/market-squawk-capture-helper{suffix}"))

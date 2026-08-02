@@ -9,7 +9,7 @@ use market_squawk_decisions::{
     AppendOutcome, CandidateAssessment, CandidateInput, DecisionAuthority, DecisionDossier,
     DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits, GovernedTargetSet,
     InvestmentTargetSetId, SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
-    TargetInvalidation, TargetReview, TargetState, TargetStatus,
+    TargetIndexEntry, TargetInvalidation, TargetReview, TargetState, TargetStatus,
 };
 use market_squawk_domain::{RevisionNumber, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
@@ -159,6 +159,27 @@ impl DecisionApplication {
         Ok(result)
     }
 
+    /// `Decision.ListScreenRuns` discovery implementation. Each locator remains bounded and exact;
+    /// consumers must use `Decision.GetCandidates` for the selected immutable run.
+    pub fn list_screen_runs(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_decisions::ScreenRunIndexEntry>, DecisionApplicationError> {
+        self.list_screen_runs_after(None, maximum)
+    }
+
+    /// Continues `Decision.ListScreenRuns` strictly after an exact retained cursor identity.
+    pub fn list_screen_runs_after(
+        &self,
+        after: Option<&ScreenRunId>,
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_decisions::ScreenRunIndexEntry>, DecisionApplicationError> {
+        self.writer()?
+            .authority
+            .list_screen_runs_after(after, maximum)
+            .map_err(Into::into)
+    }
+
     /// Appends one immutable reference-only dossier after durable commit.
     pub fn append_dossier(
         &self,
@@ -176,6 +197,31 @@ impl DecisionApplication {
         id: &market_squawk_decisions::DossierId,
     ) -> Result<DecisionDossier, DecisionApplicationError> {
         Ok(self.writer()?.authority.get_dossier(id)?.clone())
+    }
+
+    /// `Decision.ListCandidateDossiers` discovery implementation.
+    ///
+    /// The relationship is derived solely from retained immutable candidate and dossier records;
+    /// callers cannot invent a link or create a dossier by reading this index.
+    pub fn list_candidate_dossiers(
+        &self,
+        candidate_id: &market_squawk_decisions::CandidateId,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionApplicationError> {
+        self.list_candidate_dossiers_after(candidate_id, None, maximum)
+    }
+
+    /// Continues `Decision.ListCandidateDossiers` strictly after an exact dossier cursor.
+    pub fn list_candidate_dossiers_after(
+        &self,
+        candidate_id: &market_squawk_decisions::CandidateId,
+        after: Option<&market_squawk_decisions::DossierId>,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionApplicationError> {
+        self.writer()?
+            .authority
+            .list_candidate_dossiers_after(candidate_id, after, maximum)
+            .map_err(Into::into)
     }
 
     /// Immutable `CreateTargetSet` implementation committed before acknowledgment.
@@ -216,6 +262,29 @@ impl DecisionApplication {
             result.push(state.authority.get_target(id, target.target().revision())?);
         }
         Ok(result)
+    }
+
+    /// `Decision.ListTargetIndex` discovery implementation.
+    ///
+    /// It returns exactly one append-derived locator per target series and does not grant any
+    /// rebalance, order, valuation, or execution authority.
+    pub fn list_target_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionApplicationError> {
+        self.list_target_index_after(None, maximum)
+    }
+
+    /// Continues `Decision.ListTargetIndex` strictly after an exact target-series cursor.
+    pub fn list_target_index_after(
+        &self,
+        after: Option<&InvestmentTargetSetId>,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionApplicationError> {
+        self.writer()?
+            .authority
+            .list_target_index_after(after, maximum)
+            .map_err(Into::into)
     }
 
     /// Explicit immutable `ReviewTargetSet` implementation committed before acknowledgment.

@@ -22,7 +22,8 @@ use market_squawk_platform::ArtifactRoot;
 use market_squawk_services::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactReferenceResolver,
-    ArtifactRepository, ArtifactResolveRequest, PARQUET_ARTIFACT_MEDIA_TYPE,
+    ArtifactRepository, ArtifactResolveRequest, NDJSON_ARTIFACT_MEDIA_TYPE,
+    PARQUET_ARTIFACT_MEDIA_TYPE,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -669,6 +670,12 @@ fn artifact_coordinate(
             media_type: PARQUET_ARTIFACT_MEDIA_TYPE,
             path: format!("{ARTIFACT_NAMESPACE}/parquet/{prefix}/{digest}.parquet").into(),
         }),
+        NDJSON_ARTIFACT_MEDIA_TYPE => Ok(ArtifactCoordinate {
+            id: format!("mcp-ndjson-{digest}"),
+            sha256: digest.to_owned(),
+            media_type: NDJSON_ARTIFACT_MEDIA_TYPE,
+            path: format!("{ARTIFACT_NAMESPACE}/ndjson/{prefix}/{digest}.ndjson").into(),
+        }),
         _ => Err(ArtifactError::InvalidReference),
     }
 }
@@ -676,6 +683,8 @@ fn artifact_coordinate(
 fn artifact_coordinate_from_id(id: &str) -> Result<ArtifactCoordinate, ArtifactError> {
     let (digest, media_type) = if let Some(digest) = id.strip_prefix("mcp-parquet-") {
         (digest, PARQUET_ARTIFACT_MEDIA_TYPE)
+    } else if let Some(digest) = id.strip_prefix("mcp-ndjson-") {
+        (digest, NDJSON_ARTIFACT_MEDIA_TYPE)
     } else if let Some(digest) = id.strip_prefix("mcp-") {
         (digest, "application/json")
     } else {

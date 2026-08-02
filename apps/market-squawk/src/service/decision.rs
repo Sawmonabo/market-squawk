@@ -37,10 +37,13 @@ const SAVE_SCREEN: &str = "Decision.SaveScreen";
 const RUN_SCREEN: &str = "Decision.RunScreen";
 const LIST_SCREENS: &str = "Decision.ListScreens";
 const GET_CANDIDATES: &str = "Decision.GetCandidates";
+const LIST_SCREEN_RUNS: &str = "Decision.ListScreenRuns";
 const GET_DOSSIER: &str = "Decision.GetDossier";
+const LIST_CANDIDATE_DOSSIERS: &str = "Decision.ListCandidateDossiers";
 const CREATE_TARGET: &str = "Decision.CreateTargetSet";
 const GET_TARGET: &str = "Decision.GetTargetSet";
 const LIST_TARGETS: &str = "Decision.ListTargetSets";
+const LIST_TARGET_INDEX: &str = "Decision.ListTargetIndex";
 const REVIEW_TARGET: &str = "Decision.ReviewTargetSet";
 const REEVALUATE_TARGET: &str = "Decision.ReevaluateTargetSet";
 const TARGET_STATUS: &str = "Decision.GetTargetSetStatus";
@@ -68,10 +71,13 @@ impl InstalledDecisionOperations {
                 | RUN_SCREEN
                 | LIST_SCREENS
                 | GET_CANDIDATES
+                | LIST_SCREEN_RUNS
                 | GET_DOSSIER
+                | LIST_CANDIDATE_DOSSIERS
                 | CREATE_TARGET
                 | GET_TARGET
                 | LIST_TARGETS
+                | LIST_TARGET_INDEX
                 | REVIEW_TARGET
                 | REEVALUATE_TARGET
                 | TARGET_STATUS
@@ -134,6 +140,29 @@ impl InstalledDecisionOperations {
                     count,
                 )
             }
+            LIST_SCREEN_RUNS => {
+                let input: ScreenRunListRequest = decode(&arguments)?;
+                let after = input
+                    .after_run_id
+                    .map(ScreenRunId::try_new)
+                    .transpose()
+                    .map_err(invalid)?;
+                let mut runs = self
+                    .decisions
+                    .list_screen_runs_after(after.as_ref(), page_fetch_limit(input.limit)?)
+                    .map_err(map_application)?;
+                let next_after = trim_next(&mut runs, input.limit, |entry| {
+                    entry.run().id().as_str().to_owned()
+                });
+                let count = runs.len().max(1);
+                (
+                    json!({
+                        "runs": runs.iter().map(screen_run_index_value).collect::<Vec<_>>(),
+                        "nextAfter": next_after,
+                    }),
+                    count,
+                )
+            }
             GET_DOSSIER => {
                 let input: DossierIdentityRequest = decode(&arguments)?;
                 let dossier = self
@@ -141,6 +170,34 @@ impl InstalledDecisionOperations {
                     .get_dossier(&DossierId::try_new(input.dossier_id).map_err(invalid)?)
                     .map_err(map_application)?;
                 (dossier_value(&dossier), 1)
+            }
+            LIST_CANDIDATE_DOSSIERS => {
+                let input: CandidateDossierListRequest = decode(&arguments)?;
+                let candidate_id = CandidateId::try_new(input.candidate_id).map_err(invalid)?;
+                let after = input
+                    .after_dossier_id
+                    .map(DossierId::try_new)
+                    .transpose()
+                    .map_err(invalid)?;
+                let mut dossiers = self
+                    .decisions
+                    .list_candidate_dossiers_after(
+                        &candidate_id,
+                        after.as_ref(),
+                        page_fetch_limit(input.limit)?,
+                    )
+                    .map_err(map_application)?;
+                let next_after = trim_next(&mut dossiers, input.limit, |dossier| {
+                    dossier.dossier().id().as_str().to_owned()
+                });
+                let count = dossiers.len().max(1);
+                (
+                    json!({
+                        "dossiers": dossiers.iter().map(dossier_value).collect::<Vec<_>>(),
+                        "nextAfter": next_after,
+                    }),
+                    count,
+                )
             }
             CREATE_TARGET => {
                 let input: CreateTargetRequest = decode(&arguments)?;
@@ -168,6 +225,28 @@ impl InstalledDecisionOperations {
                 let count = targets.len().max(1);
                 (
                     json!({"targets": targets.iter().map(target_state_value).collect::<Vec<_>>() }),
+                    count,
+                )
+            }
+            LIST_TARGET_INDEX => {
+                let input: TargetIndexListRequest = decode(&arguments)?;
+                let after = input
+                    .after_target_id
+                    .map(|value| target_id(&value))
+                    .transpose()?;
+                let mut targets = self
+                    .decisions
+                    .list_target_index_after(after.as_ref(), page_fetch_limit(input.limit)?)
+                    .map_err(map_application)?;
+                let next_after = trim_next(&mut targets, input.limit, |entry| {
+                    entry.id().as_str().to_owned()
+                });
+                let count = targets.len().max(1);
+                (
+                    json!({
+                        "targets": targets.iter().map(target_index_value).collect::<Vec<_>>(),
+                        "nextAfter": next_after,
+                    }),
                     count,
                 )
             }
@@ -254,8 +333,23 @@ struct RunIdentityRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ScreenRunListRequest {
+    after_run_id: Option<String>,
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DossierIdentityRequest {
     dossier_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CandidateDossierListRequest {
+    candidate_id: String,
+    after_dossier_id: Option<String>,
+    limit: usize,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +369,13 @@ struct TargetIdentityRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct TargetListRequest {
     target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TargetIndexListRequest {
+    after_target_id: Option<String>,
+    limit: usize,
 }
 
 #[derive(Deserialize)]
@@ -808,6 +909,25 @@ fn statistical(value: f64) -> Result<StatisticalF64, ServiceError> {
     StatisticalF64::try_new(value).map_err(invalid)
 }
 
+fn page_fetch_limit(limit: usize) -> Result<usize, ServiceError> {
+    if limit == 0 || limit > 1_000 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    limit.checked_add(1).ok_or(ServiceError::InvalidRequest)
+}
+
+fn trim_next<T>(
+    values: &mut Vec<T>,
+    limit: usize,
+    identity: impl FnOnce(&T) -> String,
+) -> Option<String> {
+    if values.len() <= limit {
+        return None;
+    }
+    values.truncate(limit);
+    values.last().map(identity)
+}
+
 fn invalid<T>(_error: T) -> ServiceError {
     ServiceError::InvalidRequest
 }
@@ -887,6 +1007,19 @@ fn screen_value(screen: &SavedScreen) -> Value {
     })
 }
 
+fn screen_run_index_value(entry: &market_squawk_decisions::ScreenRunIndexEntry) -> Value {
+    let run = entry.run();
+    json!({
+        "id": run.id().as_str(),
+        "screenId": run.screen().id().as_str(),
+        "screenRevision": run.screen().revision().get(),
+        "asOf": run.as_of(),
+        "datasetIdentity": run.dataset_identity().evidence_digest(),
+        "universeIdentity": run.universe_identity().evidence_digest(),
+        "candidateCount": entry.candidate_count(),
+    })
+}
+
 fn execution_value(execution: &market_squawk_decisions::ScreenExecution) -> Value {
     let run = execution.run();
     json!({
@@ -958,9 +1091,19 @@ fn target_state_value(state: &TargetState) -> Value {
             "targetId": invalidation.target_id().as_str(),
             "targetRevision": invalidation.target_revision().get(),
             "kind": invalidation_kind_name(invalidation.kind()),
+            "actor": invalidation.actor().map(DecisionActorId::as_str),
             "observedAt": invalidation.observed_at(),
             "contentIdentity": invalidation.content_identity().evidence_digest(),
         })),
+    })
+}
+
+fn target_index_value(entry: &market_squawk_decisions::TargetIndexEntry) -> Value {
+    json!({
+        "id": entry.id().as_str(),
+        "revision": entry.revision().get(),
+        "instrumentId": entry.instrument_id(),
+        "status": target_status_name(entry.status()),
     })
 }
 

@@ -13,7 +13,8 @@ use std::{
 use crate::{
     AppendOutcome, AsOfSemantics, CandidateFlag, CandidateId, CandidateInput, ComparisonOperator,
     DecisionActorId, DecisionAuthority, DecisionContentDigest, DecisionContractError,
-    DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits, DecisionText, DossierId,
+    DecisionDossier, DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits,
+    DecisionText, Dossier, DossierEvidence, DossierId, DossierReference, DossierSection,
     GovernedTargetSet, InvestmentTargetSet, InvestmentTargetSetId, NullPolicy, RankingDirection,
     ReferenceMark, SavedScreen, ScreenConstraints, ScreenFeatureBinding, ScreenFeatureObservation,
     ScreenId, ScreenPredicate, ScreenRanking, ScreenRevision, ScreenRun, ScreenRunId,
@@ -222,6 +223,46 @@ fn screen_run_binds_exact_pit_inputs_and_rejects_semantic_substitution()
     );
     assert_eq!(execution.candidates().len(), 1);
 
+    let dossier = DecisionDossier::try_new(
+        Dossier::try_new(
+            DossierId::try_new("dossier.quality")?,
+            execution.candidates()[0].record(),
+            Timestamp::from_unix_nanos(52),
+            DossierEvidence::new(None, None, None, content_digest(33)?),
+        )?,
+        vec![DossierReference::new(
+            DossierSection::Data,
+            content_digest(34)?,
+        )],
+    )?;
+    authority.append_dossier(dossier.clone())?;
+
+    let runs = authority.list_screen_runs(saved.revision().id(), 1)?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run().id(), execution.run().id());
+    assert_eq!(runs[0].candidate_count(), 1);
+    assert!(
+        authority
+            .list_screen_runs_after(Some(execution.run().id()), 1)?
+            .is_empty()
+    );
+    assert_eq!(
+        authority.list_screen_runs_after(Some(&ScreenRunId::try_new("run.unknown")?), 1),
+        Err(DecisionRepositoryError::NotFound)
+    );
+
+    let dossiers = authority.list_candidate_dossiers(execution.candidates()[0].record().id(), 1)?;
+    assert_eq!(dossiers, vec![dossier]);
+    assert!(
+        authority
+            .list_candidate_dossiers_after(
+                execution.candidates()[0].record().id(),
+                Some(&DossierId::try_new("dossier.quality")?),
+                1,
+            )?
+            .is_empty()
+    );
+
     let wrong_metadata = registry
         .feature_registry()
         .entries()
@@ -325,6 +366,41 @@ fn target_revision_history_is_append_only_and_not_a_rebalance_target()
 }
 
 #[test]
+fn target_index_discovers_only_each_series_latest_immutable_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut repository = DecisionRepository::try_new(limits()?)?;
+    let first = governed_target(1, None)?;
+    let second = governed_target(
+        2,
+        Some((RevisionNumber::new(1)?, Timestamp::from_unix_nanos(27))),
+    )?;
+    repository.append_target(None, first.clone())?;
+    repository.append_target(Some(RevisionNumber::new(1)?), second.clone())?;
+
+    let index = repository.list_target_index(1)?;
+    assert_eq!(index.len(), 1);
+    assert_eq!(index[0].id(), second.target().id());
+    assert_eq!(index[0].revision(), RevisionNumber::new(2)?);
+    assert_eq!(index[0].instrument_id(), second.target().instrument_id());
+    assert_eq!(index[0].status(), TargetStatus::PendingReview);
+    assert!(
+        repository
+            .list_target_index_after(Some(second.target().id()), 1)?
+            .is_empty()
+    );
+    assert_eq!(
+        repository
+            .list_target_index_after(Some(&InvestmentTargetSetId::try_new("target.unknown")?), 1),
+        Err(DecisionRepositoryError::NotFound)
+    );
+    assert_eq!(
+        repository.list_target_index(0),
+        Err(DecisionRepositoryError::InvalidLimits)
+    );
+    Ok(())
+}
+
+#[test]
 fn every_invalidator_appends_idempotent_needs_review_without_replacing_approval()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut repository = DecisionRepository::try_new(limits()?)?;
@@ -350,9 +426,14 @@ fn every_invalidator_appends_idempotent_needs_review_without_replacing_approval(
             TargetInvalidationId::try_new(format!("invalidate.{index}"))?,
             governed.target(),
             kind,
+            DecisionActorId::try_new("reviewer.alpha")?,
             Timestamp::from_unix_nanos(70 + i64::try_from(index)?),
             content_digest(60 + u8::try_from(index)?)?,
         )?;
+        assert_eq!(
+            invalidation.actor().map(DecisionActorId::as_str),
+            Some("reviewer.alpha")
+        );
         assert_eq!(
             repository.append_invalidation(invalidation.clone())?,
             AppendOutcome::Appended

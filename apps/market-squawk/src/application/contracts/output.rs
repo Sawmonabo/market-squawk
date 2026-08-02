@@ -340,6 +340,9 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("trainingRunHash", text()),
             ("features", array(record())),
             ("decisionThresholds", record()),
+            ("admissionEvidence", record()),
+            ("runtimeHealth", record()),
+            ("trainingEvidence", record()),
         ]),
         "Model.ListBundles" => closed(
             vec![(
@@ -406,13 +409,69 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             vec![("screens", bounded_array(record(), 4_096))],
             &["screens"],
         ),
+        "Decision.ListScreenRuns" => closed(
+            vec![
+                (
+                    "runs",
+                    bounded_array(
+                        signature(vec![
+                            ("id", text()),
+                            ("screenId", text()),
+                            ("screenRevision", unsigned()),
+                            ("asOf", timestamp()),
+                            ("datasetIdentity", text()),
+                            ("universeIdentity", text()),
+                            ("candidateCount", unsigned()),
+                        ]),
+                        1_000,
+                    ),
+                ),
+                ("nextAfter", nullable(text())),
+            ],
+            &["runs", "nextAfter"],
+        ),
         "Decision.GetCandidates" => closed(
             vec![("candidates", bounded_array(record(), 4_096))],
             &["candidates"],
         ),
+        "Decision.ListCandidateDossiers" => closed(
+            vec![
+                ("dossiers", bounded_array(record(), 1_000)),
+                ("nextAfter", nullable(text())),
+            ],
+            &["dossiers", "nextAfter"],
+        ),
         "Decision.ListTargetSets" => closed(
             vec![("targets", bounded_array(record(), 4_096))],
             &["targets"],
+        ),
+        "Decision.ListTargetIndex" => closed(
+            vec![
+                (
+                    "targets",
+                    bounded_array(
+                        signature(vec![
+                            ("id", text()),
+                            ("revision", unsigned()),
+                            ("instrumentId", uuid()),
+                            (
+                                "status",
+                                enumeration(&[
+                                    "pending_review",
+                                    "active",
+                                    "rejected",
+                                    "needs_changes",
+                                    "needs_review",
+                                    "superseded",
+                                ]),
+                            ),
+                        ]),
+                        1_000,
+                    ),
+                ),
+                ("nextAfter", nullable(text())),
+            ],
+            &["targets", "nextAfter"],
         ),
         "Decision.GetTargetSetStatus" => closed(
             vec![(
@@ -427,6 +486,86 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ]),
             )],
             &["status"],
+        ),
+        "Operations.ListBackups" => closed(
+            vec![
+                ("revision", unsigned()),
+                ("manifests", bounded_array(record(), 64)),
+                ("nextAfterBackupId", nullable(text())),
+                ("pendingDeletions", unsigned()),
+            ],
+            &[
+                "revision",
+                "manifests",
+                "nextAfterBackupId",
+                "pendingDeletions",
+            ],
+        ),
+        "Operations.GetBackup" | "Operations.GetUpdateStatus" => record(),
+        "Operations.StartBackup"
+        | "Operations.StartBackupVerification"
+        | "Operations.StartBackupRetention"
+        | "Operations.StartRestore"
+        | "Operations.StartWorkspaceSwitch"
+        | "Operations.StartUpdate"
+        | "Operations.StartProgramRollback" => job_receipt(),
+        "Operations.PreviewBackupRetention"
+        | "Operations.PreviewRestore"
+        | "Operations.PreviewWorkspaceSwitch"
+        | "Operations.CheckForUpdates"
+        | "Operations.PreviewUpdate"
+        | "Operations.PreviewProgramRollback"
+        | "Operations.PreviewSettingsChange"
+        | "Operations.PreviewSettingsRollback" => operations_preview(),
+        "Operations.ListWorkspaces" => closed(
+            vec![
+                ("active", record()),
+                ("workspaces", bounded_array(record(), 64)),
+                ("nextAfterWorkspaceId", nullable(uuid())),
+            ],
+            &["active", "workspaces", "nextAfterWorkspaceId"],
+        ),
+        "Operations.QueryLogs" => closed(
+            vec![
+                ("records", bounded_array(record(), 10_000)),
+                ("nextAfterSequence", nullable(unsigned())),
+            ],
+            &["records", "nextAfterSequence"],
+        ),
+        "Operations.ExportLogs" => closed(
+            vec![
+                ("artifactReference", text()),
+                ("byteLength", unsigned()),
+                ("sha256", text()),
+            ],
+            &["artifactReference", "byteLength", "sha256"],
+        ),
+        "Operations.GetSettings" => closed(
+            vec![
+                ("revision", unsigned()),
+                ("entries", bounded_array(record(), 16)),
+                ("digest", text()),
+            ],
+            &["revision", "entries", "digest"],
+        ),
+        "Operations.ApplySettingsChange" | "Operations.RollbackSettings" => closed(
+            vec![
+                ("previousRevision", unsigned()),
+                ("activeRevision", unsigned()),
+                ("activeDigest", text()),
+                (
+                    "restartImpact",
+                    enumeration(&["none", "service_reload", "service_restart"]),
+                ),
+                ("rolledBackFromRevision", nullable(unsigned())),
+            ],
+            &[
+                "previousRevision",
+                "activeRevision",
+                "activeDigest",
+                "restartImpact",
+                "rolledBackFromRevision",
+            ],
         ),
         "FairValue.ListMeasurements" => closed(
             vec![("measurements", array(measurement()))],
@@ -721,6 +860,18 @@ fn job_receipt() -> Value {
     )
 }
 
+fn operations_preview() -> Value {
+    closed(
+        vec![
+            ("previewId", uuid()),
+            ("previewDigest", text()),
+            ("expiresAt", timestamp()),
+            ("evidence", record()),
+        ],
+        &["previewId", "previewDigest", "expiresAt", "evidence"],
+    )
+}
+
 fn source_lifecycle_receipt() -> Value {
     signature(vec![
         ("operationId", text()),
@@ -791,7 +942,9 @@ fn forecast_vintage() -> Value {
         ("horizonPoints", unsigned()),
         ("horizonStepNanos", unsigned()),
         ("quality", text()),
+        ("observedHistory", bounded_array(record(), 4_096)),
         ("points", bounded_array(record(), 4_096)),
+        ("driftMonitoring", record()),
         ("calibration", nullable(record())),
         ("limitations", bounded_array(text(), 256)),
         ("unavailableReason", nullable(text())),

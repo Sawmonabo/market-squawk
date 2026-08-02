@@ -14,7 +14,8 @@ mod supervisor;
 use audit::ProductionAuditService;
 pub use audit::{
     ProductionAuditBarrierError, ProductionAuditError, ProductionAuditEvidence,
-    ProductionAuditShutdown, ProductionAuditShutdownStatus,
+    ProductionAuditShutdown, ProductionAuditShutdownStatus, ProductionExecutionAuditReadError,
+    ProductionExecutionAuditRecord, ProductionExecutionAuditSnapshot,
 };
 
 use std::{
@@ -40,7 +41,8 @@ use market_squawk_execution::{
     ExecutionDispatcherShutdown, ExecutionLiveActionHook, ExecutionLiveActionHookError,
     ExecutionMarketSink, ExecutionState, ExecutionTaskDrain, ExecutionTaskReaper,
     ExecutionTaskReaperError, PortfolioReadCapability, ReconciledOrderStatus,
-    RecoveredDispatchOrder, RiskLimits, RiskService, RiskServiceConfig, RiskServiceError, Strategy,
+    RecoveredDispatchOrder, RiskLimits, RiskLimitsSnapshot, RiskService, RiskServiceConfig,
+    RiskServiceError, Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, LiveActionHook, LiveRouteConfig, LiveRuntimeConfig,
@@ -369,6 +371,7 @@ impl ProductionPaperBotComposition {
             execution,
             strategies,
         } = self;
+        let risk_limits = execution.risk_limits.snapshot();
         let startup_deadline = tokio::time::Instant::now()
             .checked_add(execution.paper_control_timeout)
             .ok_or(ProductionPaperBotStartError::InvalidRecoveryOwnership)?;
@@ -504,6 +507,7 @@ impl ProductionPaperBotComposition {
                 return Err(with_rollback(startup, rollback));
             }
         };
+        let execution_audit_read_view = audit_service.execution_read_view();
         if let Err(error) = checkpoint_repository.mark_run_dirty() {
             let startup = ProductionPaperBotStartError::CheckpointRepository(error);
             drop(execution_audit);
@@ -911,6 +915,8 @@ impl ProductionPaperBotComposition {
                 checkpoint_repository,
                 task_reaper,
                 paper_control_timeout: execution.paper_control_timeout,
+                risk_limits,
+                execution_audit_read_view,
                 audit_service,
             },
             #[cfg(feature = "release-evidence")]
@@ -938,6 +944,8 @@ pub struct ProductionPaperBotRuntime {
     checkpoint_repository: PaperCheckpointRepository,
     task_reaper: ExecutionTaskReaper,
     paper_control_timeout: Duration,
+    risk_limits: RiskLimitsSnapshot,
+    execution_audit_read_view: audit::ProductionExecutionAuditReadView,
     audit_service: ProductionAuditService,
 }
 
@@ -1030,6 +1038,21 @@ impl ProductionPaperBotRuntime {
     /// Reports whether durable paper state and account-risk authority share one current sequence.
     pub fn financial_reconciliation_current(&self) -> bool {
         self.accounts.reconciliation_fence().is_current()
+    }
+
+    /// Returns the immutable active central-risk policy without any assessment or mutation power.
+    pub const fn risk_limits(&self) -> &RiskLimitsSnapshot {
+        &self.risk_limits
+    }
+
+    /// Returns an immutable bounded page of decisions already durably admitted by the audit owner.
+    pub fn execution_audit_snapshot(
+        &self,
+        cursor: Option<u64>,
+        maximum_items: usize,
+    ) -> Result<ProductionExecutionAuditSnapshot, ProductionExecutionAuditReadError> {
+        self.execution_audit_read_view
+            .snapshot_after(cursor, maximum_items)
     }
 
     /// Returns a complete paper state image without exposing the paper adapter.
@@ -1129,6 +1152,8 @@ impl ProductionPaperBotRuntime {
             mut checkpoint_repository,
             task_reaper,
             paper_control_timeout,
+            risk_limits: _,
+            execution_audit_read_view: _,
             audit_service,
         } = self;
         let source_and_live = live.shutdown().await;

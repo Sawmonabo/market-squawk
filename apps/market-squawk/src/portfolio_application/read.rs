@@ -421,6 +421,16 @@ fn holdings(
             let mut value = serde_json::to_value(holding)
                 .map_err(|_| PortfolioApplicationServiceError::Publication)?;
             enrich_row(&mut value, revision)?;
+            let object = value
+                .as_object_mut()
+                .ok_or(PortfolioApplicationServiceError::Publication)?;
+            object.insert(
+                "markEvidence".to_owned(),
+                source_mark_details(
+                    holding.source_reference().as_str(),
+                    holding.as_of().unix_nanos().to_string(),
+                ),
+            );
             Ok(value)
         })
         .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
@@ -646,4 +656,52 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, PortfolioApplicationService
         .timestamp_nanos_opt()
         .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
     Ok(Timestamp::from_unix_nanos(timestamp))
+}
+
+/// Makes the limits of a portfolio-import holding mark explicit.
+///
+/// A holding value is an exact source observation. The portfolio importer has no authority to
+/// promote it to a live, delayed, stale, modeled, or venue-qualified market mark, and it has no
+/// alternate mark authority to select as a fallback. Keeping those facts adjacent to every value
+/// prevents presentation code from inferring a stronger mark state from the source record alone.
+pub(super) fn source_mark_details(source_reference: &str, observed_at_unix_nanos: String) -> Value {
+    json!({
+        "sourceReference": source_reference,
+        "observedAtUnixNanos": observed_at_unix_nanos,
+        "venue": Value::Null,
+        "venueStatus": "not_supplied_by_portfolio_source",
+        "state": "source_reported",
+        "quality": "direct_unverified",
+        "executionEligible": false,
+        "freshness": {
+            "status": "not_evaluated_no_market_policy",
+            "reason": "portfolio_import_does_not_authorize_market_freshness"
+        },
+        "fallback": {
+            "status": "not_applicable_no_alternate_mark_authority",
+            "reason": "no_live_delayed_stale_or_modeled_mark_was_selected"
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_mark_details;
+
+    #[test]
+    fn source_reported_mark_never_claims_an_unevidenced_freshness_or_fallback() {
+        let mark = source_mark_details("raw-holding-42", "1700000000000000000".to_owned());
+
+        assert_eq!(mark["sourceReference"], "raw-holding-42");
+        assert_eq!(mark["observedAtUnixNanos"], "1700000000000000000");
+        assert_eq!(mark["state"], "source_reported");
+        assert_eq!(
+            mark["freshness"]["status"],
+            "not_evaluated_no_market_policy"
+        );
+        assert_eq!(
+            mark["fallback"]["status"],
+            "not_applicable_no_alternate_mark_authority"
+        );
+    }
 }

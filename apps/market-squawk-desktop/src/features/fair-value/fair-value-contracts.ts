@@ -269,6 +269,42 @@ const classificationControlResultSchema = z.object({
   classificationReplay: z.boolean(),
 })
 
+const governancePrincipalSchema = z.object({
+  principalId: identifierSchema,
+  displayName: z.string().min(1),
+  roles: z.array(z.string().min(1)).min(1),
+})
+
+const governancePreviewSchema = z.object({
+  previewId: identifierSchema,
+  digest: digestSchema,
+  requiredRoles: z.array(z.string().min(1)).min(1),
+  distinctPrincipalCount: z.number().int().positive(),
+  eligiblePrincipalIds: z.array(identifierSchema).min(1),
+  expiresAt: identifierSchema,
+  effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
+})
+
+const governanceAuthorizationSchema = z.object({
+  authorizationHandle: identifierSchema,
+  previewId: identifierSchema,
+  principalId: identifierSchema,
+  expiresAt: identifierSchema,
+})
+
+const governanceCommitSchema = z.object({
+  receipt: z.object({
+    receiptId: identifierSchema,
+    previewId: identifierSchema,
+    digest: digestSchema,
+    committedAt: identifierSchema,
+    authorizedPrincipals: z
+      .array(z.object({ principalId: identifierSchema, roles: z.array(z.string().min(1)).min(1) }))
+      .min(1),
+    effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
+  }),
+})
+
 export type FairValueApproval = z.infer<typeof approvalSchema>
 export type FairValueAuditEvent = z.infer<typeof auditEventSchema>
 export type FairValueAuditCursor = z.infer<typeof auditCursorSchema>
@@ -278,6 +314,44 @@ export type FairValueInput = z.infer<typeof valuationInputSchema>
 export type FairValueMarketAccess = z.infer<typeof marketAccessSchema>
 export type FairValueMeasurement = z.infer<typeof measurementSchema>
 export type FairValueReason = z.infer<typeof reasonSchema>
+export type GovernanceActionPreview = z.infer<typeof governancePreviewSchema>
+export type GovernanceAuthorization = z.infer<typeof governanceAuthorizationSchema>
+export type GovernanceCommit = z.infer<typeof governanceCommitSchema>["receipt"]
+export type GovernancePrincipal = z.infer<typeof governancePrincipalSchema>
+
+/// Typed proposal sent exactly once to the service for canonical preview. Actor, action time,
+/// roles, approval evidence, and immutable audit identities are deliberately absent: the service
+/// derives them from admitted principals and the retained fair-value records.
+export type FairValueGovernanceProposal =
+  | {
+      kind: "approve"
+      measurementId: string
+      decisionId: string
+      expiresAt: string
+    }
+  | {
+      kind: "override"
+      measurementId: string
+      decisionId: string
+      requestedHierarchy: "level_2" | "level_3"
+      justification: string
+      expiresAt: string
+    }
+  | {
+      kind: "revoke"
+      approvalId: string
+      reason: string
+    }
+  | {
+      kind: "market_access"
+      accountId: string
+      venueId: string
+      instrumentId: string
+      conclusion: "accessible" | "inaccessible"
+      effectiveFrom: string
+      effectiveUntil: string
+      rationale: string
+    }
 
 export interface FairValueWorkspace {
   measurements: FairValueMeasurement[]
@@ -445,6 +519,47 @@ export function parseFairValueClassificationControl(
     classification: parsed.data.classification,
     replay: parsed.data.classificationReplay,
   }
+}
+
+export function parseGovernancePrincipals(result: ApplicationResult): GovernancePrincipal[] {
+  const parsed = z
+    .object({
+      principals: z.array(governancePrincipalSchema),
+      nextAfter: identifierSchema.nullable(),
+    })
+    .safeParse(result.data)
+  if (!parsed.success) throw unsupportedDetail("governance principal")
+  return parsed.data.principals
+}
+
+export function parseFairValueGovernancePreview(
+  result: ApplicationResult,
+): GovernanceActionPreview {
+  const parsed = z.object({ preview: governancePreviewSchema }).safeParse(result.data)
+  if (!parsed.success) throw unsupportedDetail("governance preview")
+  return parsed.data.preview
+}
+
+export function parseGovernanceAuthorization(
+  result: ApplicationResult,
+  expectedPreviewId: string,
+): GovernanceAuthorization {
+  const parsed = z.object({ authorization: governanceAuthorizationSchema }).safeParse(result.data)
+  if (!parsed.success || parsed.data.authorization.previewId !== expectedPreviewId) {
+    throw unsupportedDetail("governance authorization")
+  }
+  return parsed.data.authorization
+}
+
+export function parseFairValueGovernanceCommit(
+  result: ApplicationResult,
+  expectedPreviewId: string,
+): GovernanceCommit {
+  const parsed = governanceCommitSchema.safeParse(result.data)
+  if (!parsed.success || parsed.data.receipt.previewId !== expectedPreviewId) {
+    throw unsupportedDetail("governance commit")
+  }
+  return parsed.data.receipt
 }
 
 function withMetadata<Value extends object>(

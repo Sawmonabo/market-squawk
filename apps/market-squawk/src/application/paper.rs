@@ -15,10 +15,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use market_squawk_adapter_paper::{PaperExecutionSnapshot, PaperFillSnapshot, PaperOrderSnapshot};
-use market_squawk_domain::OrderId;
+use market_squawk_adapter_paper::{
+    PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionSnapshot, PaperFillSnapshot,
+    PaperOrderSnapshot, PaperPosition,
+};
+use market_squawk_domain::{OrderId, OrderSide};
 use market_squawk_execution::{
     CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionDispatchError, ExecutionState,
+    RiskLimitsSnapshot,
 };
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
@@ -37,6 +41,7 @@ use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
     AppConfig, ProductionSourceProvider, ProviderAdapterActivation,
     paper_bot::{
+        ProductionExecutionAuditRecord, ProductionExecutionAuditSnapshot,
         ProductionPaperBotRuntime, local_coinbase_direct_paper_bot_with_activation,
         local_paper_bot_with_provider_rate,
     },
@@ -157,7 +162,11 @@ impl ApplicationDomainService for BotDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let limits = effective_service_limits(&request, &context)?;
         let content = match request.name() {
-            BOT_GET_STATUS => self.controller.status(&context).await?,
+            BOT_GET_STATUS => {
+                self.controller
+                    .status(&context, limits.maximum_result_items())
+                    .await?
+            }
             BOT_START => self.controller.start(&request, &context).await?,
             BOT_STOP | RISK_TRIGGER_KILL_SWITCH => {
                 let reason = required_string(&request, "reason")?;
@@ -272,7 +281,11 @@ impl PaperController {
         }
     }
 
-    async fn status(&self, context: &RequestContext) -> Result<Value, ServiceError> {
+    async fn status(
+        &self,
+        context: &RequestContext,
+        maximum_items: usize,
+    ) -> Result<Value, ServiceError> {
         ensure_live(context)?;
         let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
         match &*state {
@@ -303,6 +316,9 @@ impl PaperController {
                     .paper_snapshot(context.deadline(), context.cancellation())
                     .await
                     .map_err(map_control_error)?;
+                let audit = runtime
+                    .execution_audit_snapshot(None, maximum_items)
+                    .map_err(|_error| ServiceError::Unavailable)?;
                 Ok(json!({
                     "state": "running",
                     "sequence": snapshot.sequence(),
@@ -312,6 +328,14 @@ impl PaperController {
                     "orders": snapshot.orders().len(),
                     "fills": snapshot.fills().len(),
                     "positions": snapshot.positions().len(),
+                    "accounts": bounded_evidence(snapshot.accounts(), maximum_items, account_value)?,
+                    "cash": bounded_evidence(snapshot.cash(), maximum_items, cash_value)?,
+                    "positionEvidence": bounded_evidence(snapshot.positions(), maximum_items, position_value)?,
+                    "configurationDigestSha256": hex(snapshot.configuration_digest()),
+                    "simulation": simulation_value(snapshot.simulation()),
+                    "reconciliation": reconciliation_value(&snapshot, financial_reconciliation_current),
+                    "riskLimits": risk_limits_value(runtime.risk_limits(), maximum_items)?,
+                    "riskDecisions": audit_snapshot_value(&audit)?,
                 }))
             }
         }
@@ -542,7 +566,11 @@ impl PaperController {
         values
             .try_reserve_exact(returned)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
-        values.extend(snapshot.orders()[..returned].iter().map(order_value));
+        values.extend(
+            snapshot.orders()[..returned]
+                .iter()
+                .map(|order| order_value(order, snapshot.fills())),
+        );
         Ok((Value::Array(values), returned, available))
     }
 
@@ -951,7 +979,7 @@ const fn map_adapter_error(error: ExecutionAdapterError) -> ServiceError {
     }
 }
 
-fn order_value(order: &PaperOrderSnapshot) -> Value {
+fn order_value(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value {
     json!({
         "orderId": order.order_id(),
         "accountId": order.account_id(),
@@ -961,12 +989,215 @@ fn order_value(order: &PaperOrderSnapshot) -> Value {
         "averageFillPriceTicks": order.average_fill_price(),
         "maximumFillPriceTicks": order.maximum_fill_price(),
         "maximumExecutionPriceTicks": order.maximum_execution_price(),
+        "side": order.side(),
+        "referencePriceTicks": order.reference_price(),
+        "maximumSlippageBasisPoints": order.maximum_slippage().get(),
         "cumulativeFees": order.cumulative_fees(),
         "acceptedAt": order.accepted_at(),
         "eligibleAt": order.eligible_at(),
         "expiresAt": order.expires_at(),
         "revision": order.revision(),
+        "observed": observed_order_evidence(order, fills),
     })
+}
+
+fn observed_order_evidence(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value {
+    let first_fill = fills
+        .iter()
+        .filter(|fill| fill.order_id() == order.order_id())
+        .min_by_key(|fill| fill.event_at());
+    let first_fill_at = first_fill.map(|fill| fill.event_at());
+    let observed_latency_nanos = first_fill_at.and_then(|filled_at| {
+        filled_at
+            .unix_nanos()
+            .checked_sub(order.eligible_at().unix_nanos())
+    });
+    let observed_slippage_ticks =
+        order
+            .average_fill_price()
+            .and_then(|average| match order.side() {
+                OrderSide::Buy => average.get().checked_sub(order.reference_price().get()),
+                OrderSide::Sell => order.reference_price().get().checked_sub(average.get()),
+            });
+    let observed_slippage_basis_points = observed_slippage_ticks.and_then(|ticks| {
+        i128::from(ticks)
+            .checked_mul(10_000)
+            .and_then(|scaled| scaled.checked_div(i128::from(order.reference_price().get())))
+            .and_then(|basis_points| i64::try_from(basis_points).ok())
+    });
+    json!({
+        "firstFillAt": first_fill_at,
+        "firstFillAfterEligibilityNanos": observed_latency_nanos,
+        "averageFillSlippageTicks": observed_slippage_ticks,
+        "averageFillSlippageBasisPoints": observed_slippage_basis_points,
+    })
+}
+
+fn simulation_value(simulation: market_squawk_adapter_paper::PaperSimulationSnapshot) -> Value {
+    json!({
+        "configurationVersion": simulation.configuration_version(),
+        "minimumLatencyNanos": simulation.minimum_latency_nanos(),
+        "maximumLatencyNanos": simulation.maximum_latency_nanos(),
+        "cancelLatencyNanos": simulation.cancel_latency_nanos(),
+        "maximumMarkAgeNanos": simulation.maximum_mark_age_nanos(),
+        "maximumParticipationBasisPoints": simulation.maximum_participation_basis_points(),
+        "impactBasisPointsPerLevel": simulation.impact_basis_points_per_level(),
+        "makerFeeBasisPoints": simulation.maker_fee_basis_points(),
+        "takerFeeBasisPoints": simulation.taker_fee_basis_points(),
+        "minimumFee": simulation.minimum_fee(),
+        "maximumFee": simulation.maximum_fee(),
+    })
+}
+
+fn reconciliation_value(
+    snapshot: &PaperExecutionSnapshot,
+    financial_reconciliation_current: bool,
+) -> Value {
+    json!({
+        "snapshotSequence": snapshot.sequence(),
+        "snapshotComplete": snapshot.complete(),
+        "configurationDigestSha256": hex(snapshot.configuration_digest()),
+        "reconciliationRequired": snapshot.reconciliation_required(),
+        "financialReconciliationCurrent": financial_reconciliation_current,
+        "activeOrderCount": snapshot.active_orders().len(),
+        "archivedOrderCount": snapshot.archived_orders().len(),
+        "fillCount": snapshot.fills().len(),
+        "accountCount": snapshot.accounts().len(),
+        "cashBalanceCount": snapshot.cash().len(),
+        "positionCount": snapshot.positions().len(),
+    })
+}
+
+fn bounded_evidence<T: Copy>(
+    values: &[T],
+    maximum_items: usize,
+    value: fn(T) -> Value,
+) -> Result<Value, ServiceError> {
+    let returned = values.len().min(maximum_items);
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(returned)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    rows.extend(values[..returned].iter().copied().map(value));
+    Ok(json!({
+        "rows": rows,
+        "returnedItems": returned,
+        "availableItems": values.len(),
+    }))
+}
+
+fn account_value(account: PaperAccountRiskSnapshot) -> Value {
+    json!({
+        "accountId": account.account_id(),
+        "revision": account.revision().get(),
+        "eligible": account.eligible(),
+        "currency": account.currency(),
+        "settledCapital": account.settled_capital(),
+        "markedEquity": account.marked_equity(),
+        "peakMarkedEquity": account.peak_marked_equity(),
+        "grossExposure": account.marked_gross_exposure(),
+        "unrealizedPnl": account.unrealized_pnl(),
+        "realizedPnl": account.realized_pnl(),
+        "realizedLoss": account.realized_loss(),
+        "drawdown": account.drawdown(),
+        "markDigestSha256": hex(account.mark_digest()),
+    })
+}
+
+fn cash_value(cash: PaperCashBalance) -> Value {
+    json!({"accountId": cash.account_id(), "balance": cash.balance()})
+}
+
+fn position_value(position: PaperPosition) -> Value {
+    json!({
+        "accountId": position.account_id(),
+        "instrumentId": position.instrument_id(),
+        "lots": position.lots(),
+        "costBasis": position.cost_basis(),
+    })
+}
+
+fn risk_limits_value(
+    limits: &RiskLimitsSnapshot,
+    maximum_items: usize,
+) -> Result<Value, ServiceError> {
+    let eligible = bounded_evidence(limits.eligible_instruments(), maximum_items, |instrument| {
+        json!(instrument)
+    })?;
+    Ok(json!({
+        "currency": limits.currency(),
+        "eligibleInstruments": eligible,
+        "maximumPositionLots": limits.maximum_position_lots(),
+        "maximumOrderNotional": limits.maximum_order_notional(),
+        "maximumGrossExposure": limits.maximum_gross_exposure(),
+        "maximumLeverageBasisPoints": limits.maximum_leverage().get(),
+        "minimumCapital": limits.minimum_capital(),
+        "maximumLoss": limits.maximum_loss(),
+        "maximumDrawdown": limits.maximum_drawdown(),
+        "maximumFeeBasisPoints": limits.maximum_fee().get(),
+        "maximumPriceDeviationBasisPoints": limits.maximum_price_deviation().get(),
+        "maximumSlippageBasisPoints": limits.maximum_slippage().get(),
+        "maximumOrdersPerWindow": limits.maximum_orders_per_window().get(),
+        "orderRateWindowNanos": limits.order_rate_window_nanos(),
+        "reservationTtlNanos": limits.reservation_ttl_nanos(),
+        "allowShort": limits.allow_short(),
+        "killSwitch": limits.kill_switch(),
+    }))
+}
+
+fn audit_snapshot_value(
+    snapshot: &ProductionExecutionAuditSnapshot,
+) -> Result<Value, ServiceError> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(snapshot.records().len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    records.extend(snapshot.records().iter().copied().map(audit_record_value));
+    Ok(json!({
+        "records": records,
+        "returnedItems": snapshot.returned_items(),
+        "availableItems": snapshot.available_items(),
+        "totalPublished": snapshot.total_published(),
+        "oldestSequence": snapshot.oldest_sequence(),
+        "latestSequence": snapshot.latest_sequence(),
+        "cursorExpired": snapshot.cursor_expired(),
+        "nextCursor": snapshot.next_cursor(),
+    }))
+}
+
+fn audit_record_value(record: ProductionExecutionAuditRecord) -> Value {
+    let event = record.event();
+    json!({
+        "sequence": record.sequence(),
+        "kind": event.kind(),
+        "approvalId": event.approval_id(),
+        "orderId": event.order_id(),
+        "accountId": event.account_id(),
+        "instrumentId": event.instrument_id(),
+        "strategyId": event.strategy_id(),
+        "modelId": event.model_id(),
+        "intentDigestSha256": hex(event.intent_digest().as_bytes()),
+        "assessmentDigestSha256": event.assessment_digest().map(hex),
+        "evidenceBindingDigestSha256": event.evidence_binding_digest().map(hex),
+        "executionIdentityDigestSha256": event.execution_identity_digest().map(hex),
+        "portfolioContentDigestSha256": event.portfolio_content_digest().map(hex),
+        "maximumExecutionPriceTicks": event.execution_price_bound().map(|bound| bound.maximum_price()),
+        "riskPolicyDigestSha256": hex(event.risk_policy().digest()),
+        "riskPolicyRulesetVersion": event.risk_policy().ruleset_version().get(),
+        "marketObservedAt": event.market_observed_at(),
+        "validUntil": event.valid_until(),
+        "observedAt": event.observed_at(),
+        "reasons": event.reasons().collect::<Vec<_>>(),
+    })
+}
+
+fn hex(bytes: [u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn fill_value(fill: PaperFillSnapshot) -> Value {

@@ -390,6 +390,13 @@ impl ExperimentWire {
         })
     }
 
+    /// True only when selected parameters may differ while the exact search and selection design
+    /// remains shared by every independently materialized cohort member.
+    pub(super) fn same_design(&self, other: &Self) -> bool {
+        self.search_space == other.search_space
+            && self.selection_criterion == other.selection_criterion
+    }
+
     fn validate(&self) -> Result<(), RecipeError> {
         if self.parameters.len() > MAX_EXPERIMENT_PARAMETERS
             || self.search_space.len() > MAX_SEARCH_DIMENSIONS
@@ -446,9 +453,9 @@ impl ExperimentWire {
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ParameterWire {
-    name: SourceIdentifier,
-    value: SourceIdentifier,
+pub(super) struct ParameterWire {
+    pub(super) name: SourceIdentifier,
+    pub(super) value: SourceIdentifier,
 }
 
 impl From<TrialParameter> for ParameterWire {
@@ -457,6 +464,12 @@ impl From<TrialParameter> for ParameterWire {
             name: value.name().clone(),
             value: value.value().clone(),
         }
+    }
+}
+
+impl ParameterWire {
+    pub(super) fn into_trial_parameter(self) -> TrialParameter {
+        TrialParameter::new(self.name, self.value)
     }
 }
 

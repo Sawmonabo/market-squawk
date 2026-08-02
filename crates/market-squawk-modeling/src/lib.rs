@@ -40,10 +40,10 @@ pub use bundle::{
 };
 pub use forecast::{
     CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow, ForecastCoverage,
-    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastOutcome,
-    ForecastOutcomeId, ForecastPath, ForecastPoint, ForecastRequest, ForecastValue,
-    ForecastVintage, ForecastVintageId, MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_POINTS,
-    RealizedCoverage, ResearchForecastBackend,
+    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastObservedPoint,
+    ForecastOutcome, ForecastOutcomeId, ForecastPath, ForecastPoint, ForecastRequest,
+    ForecastValue, ForecastVintage, ForecastVintageId, MAX_FORECAST_DECIMAL_SCALE,
+    MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS, RealizedCoverage, ResearchForecastBackend,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,

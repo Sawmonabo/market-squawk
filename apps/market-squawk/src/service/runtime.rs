@@ -26,7 +26,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use super::InstalledServiceError;
+use super::{InstalledServiceError, mcp_control::PreparedMcpClientAuthority};
 
 const STATE_FORMAT_VERSION: u16 = 1;
 const SERVICE_DIRECTORY: &str = "installed-service";
@@ -147,6 +147,7 @@ pub(super) struct PreparedRuntime {
     state: InstalledRuntimeState,
     secret_store: Arc<dyn SecretStore>,
     credentials: Arc<CredentialRegistry>,
+    mcp_clients: Option<PreparedMcpClientAuthority>,
     listener: Option<TcpListener>,
     rendezvous: RendezvousAuthority,
     record: RendezvousRecord,
@@ -178,7 +179,7 @@ impl PreparedRuntime {
         let identity_store =
             LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
         let loaded = identity_store.load()?;
-        let (state, credentials, signing_key, listener) = match loaded
+        let (state, _root_credentials, signing_key, listener) = match loaded
             .map(|encoded| decode_document(&encoded))
             .transpose()?
         {
@@ -212,6 +213,35 @@ impl PreparedRuntime {
             }
             None => initialize_runtime(&identity_store, Arc::clone(&secret_store)).await?,
         };
+        let mcp_roots = [
+            state
+                .registration(NamedClient::ClaudeCode)
+                .cloned()
+                .ok_or(InstalledServiceError::InvalidRuntimeState)?,
+            state
+                .registration(NamedClient::Codex)
+                .cloned()
+                .ok_or(InstalledServiceError::InvalidRuntimeState)?,
+        ];
+        let mcp_clients = PreparedMcpClientAuthority::try_prepare(
+            paths,
+            state.runtime,
+            &secret_store,
+            mcp_roots,
+        )?;
+        let effective_mcp = mcp_clients.registrations()?;
+        let mut effective_registrations = state.credentials.clone();
+        for effective in effective_mcp {
+            let root = effective_registrations
+                .iter_mut()
+                .find(|registration| registration.client() == effective.client())
+                .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+            *root = effective;
+        }
+        let credentials = Arc::new(CredentialRegistry::try_load(
+            Arc::clone(&secret_store),
+            effective_registrations,
+        )?);
         drop(identity_store);
         let verifier = SystemProcessIdentityVerifier;
         let process = verifier.current()?;
@@ -232,6 +262,7 @@ impl PreparedRuntime {
             state,
             secret_store,
             credentials,
+            mcp_clients: Some(mcp_clients),
             listener: Some(listener),
             rendezvous,
             record,
@@ -249,6 +280,18 @@ impl PreparedRuntime {
 
     pub(super) fn credentials(&self) -> Arc<CredentialRegistry> {
         Arc::clone(&self.credentials)
+    }
+
+    pub(super) fn secret_store(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.secret_store)
+    }
+
+    pub(super) fn take_mcp_clients(
+        &mut self,
+    ) -> Result<PreparedMcpClientAuthority, InstalledServiceError> {
+        self.mcp_clients
+            .take()
+            .ok_or(InstalledServiceError::InvalidComposition)
     }
 
     pub(super) fn registration(
@@ -543,6 +586,11 @@ pub(super) struct ResolvedRuntimeClient {
     pub(super) credential: SecretValue,
 }
 
+pub(super) struct ResolvedRuntimeClientRoot {
+    pub(super) record: RendezvousRecord,
+    pub(super) registration: ClientCredentialRegistration,
+}
+
 impl std::fmt::Debug for ResolvedRuntimeClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -559,6 +607,20 @@ pub(super) fn resolve_client(
     secret_store: Arc<dyn SecretStore>,
     client: NamedClient,
 ) -> Result<ResolvedRuntimeClient, InstalledServiceError> {
+    let resolved = resolve_client_root(paths, Arc::clone(&secret_store), client)?;
+    let credential = load_client_credential(&secret_store, &resolved.registration)?;
+    Ok(ResolvedRuntimeClient {
+        record: resolved.record,
+        registration: resolved.registration,
+        credential,
+    })
+}
+
+pub(super) fn resolve_client_root(
+    paths: &LocalPaths,
+    secret_store: Arc<dyn SecretStore>,
+    client: NamedClient,
+) -> Result<ResolvedRuntimeClientRoot, InstalledServiceError> {
     let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
     let identity_store = LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
     let encoded = identity_store
@@ -586,17 +648,22 @@ pub(super) fn resolve_client(
         .registration(client)
         .cloned()
         .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    let credential = secret_store
+    Ok(ResolvedRuntimeClientRoot {
+        record,
+        registration,
+    })
+}
+
+pub(super) fn load_client_credential(
+    secret_store: &Arc<dyn SecretStore>,
+    registration: &ClientCredentialRegistration,
+) -> Result<SecretValue, InstalledServiceError> {
+    secret_store
         .read(
             registration.reference(),
             &secret_control("installed-runtime-client-credential-load")?,
         )
-        .map_err(|_error| InstalledServiceError::SecretStore)?;
-    Ok(ResolvedRuntimeClient {
-        record,
-        registration,
-        credential,
-    })
+        .map_err(|_error| InstalledServiceError::SecretStore)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -3,8 +3,12 @@
 mod analysis;
 mod decision;
 mod dispatch;
+mod governance;
+mod governance_persistence;
 mod jobs;
 mod mcp_client;
+mod mcp_control;
+mod operations;
 mod resources;
 mod runtime;
 mod tool_services;
@@ -12,7 +16,7 @@ mod tool_services;
 use std::{sync::Arc, time::Duration};
 
 use axum::{Router, extract::State, http::Request, response::Response, routing::any};
-use dispatch::{InstalledApplicationDispatcher, InstalledMcpAuthenticator};
+use dispatch::InstalledApplicationDispatcher;
 use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
@@ -37,6 +41,13 @@ use mcp_client::InstalledMcpRelayTransport;
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
 use self::runtime::{PreparedRuntime, current_timestamp};
+use self::{
+    governance::{
+        GovernedActionService, GovernedActionServiceLimits, InstalledGovernanceOperations,
+    },
+    governance_persistence::GovernancePersistence,
+};
+use crate::application::governance::{GovernanceAuthority, GovernanceLimits};
 
 const RUNTIME_SECRET_DIRECTORY: &str = "secrets/installed-runtime";
 const REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -144,13 +155,16 @@ impl InstalledServiceConnector {
             return Err(InstalledServiceError::InvalidComposition);
         }
         let resolved =
-            runtime::resolve_client(&self.paths, Arc::clone(&self.secret_store), client)?;
-        let transport = InstalledMcpRelayTransport::try_new(
-            &resolved.record,
-            resolved.credential,
-            CLIENT_TIMEOUT,
-        )
-        .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+            runtime::resolve_client_root(&self.paths, Arc::clone(&self.secret_store), client)?;
+        let registration = mcp_control::resolve_registration(
+            &self.paths,
+            resolved.record.runtime(),
+            &resolved.registration,
+        )?;
+        let credential = runtime::load_client_credential(&self.secret_store, &registration)?;
+        let transport =
+            InstalledMcpRelayTransport::try_new(&resolved.record, credential, CLIENT_TIMEOUT)
+                .map_err(|_error| InstalledServiceError::InvalidComposition)?;
         Ok(Arc::new(transport))
     }
 }
@@ -331,6 +345,46 @@ fn compose_transport(
         InputStagingLimits::try_new(MAXIMUM_STAGED_INPUTS, MAXIMUM_STAGED_INPUT_BYTES)
             .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     ));
+    let mcp_limit_spec = McpLimitSpec::default();
+    let desktop_registration = runtime.registration(NamedClient::Desktop)?;
+    let mcp_control = runtime.take_mcp_clients()?.activate(
+        runtime.runtime(),
+        desktop_registration.client_id(),
+        runtime.secret_store(),
+        runtime.credentials(),
+        MCP_CLIENT_REQUESTS,
+        mcp_limit_spec,
+    )?;
+    let governance_persistence = GovernancePersistence::try_open(paths)
+        .map_err(|_error| InstalledServiceError::GovernanceState)?;
+    let governance_actions = governance_persistence
+        .load_registrations()
+        .map_err(|_error| InstalledServiceError::GovernanceState)?
+        .map(|registrations| {
+            let authority = GovernanceAuthority::try_load(
+                runtime.secret_store(),
+                registrations,
+                governance_persistence.audit_sink(),
+                GovernanceLimits::standard()
+                    .map_err(|_error| InstalledServiceError::GovernanceState)?,
+            )
+            .map_err(|_error| InstalledServiceError::GovernanceState)?;
+            GovernedActionService::try_new(
+                Arc::new(authority),
+                product.decision_governance(),
+                product.fair_value_governance(),
+                GovernedActionServiceLimits::standard()
+                    .map_err(|_error| InstalledServiceError::GovernanceState)?,
+            )
+            .map(Arc::new)
+            .map_err(|_error| InstalledServiceError::GovernanceState)
+        })
+        .transpose()?;
+    let governance = Arc::new(InstalledGovernanceOperations::new(
+        governance_actions,
+        runtime.runtime(),
+        desktop_registration.client_id(),
+    ));
     let services = Arc::new(
         InstalledToolServices::try_new(
             Arc::clone(&application),
@@ -342,8 +396,15 @@ fn compose_transport(
         .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     );
     let dispatcher = Arc::new(
-        InstalledApplicationDispatcher::try_new(Arc::clone(&services), product, runtime.runtime())
-            .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+        InstalledApplicationDispatcher::try_new(
+            Arc::clone(&services),
+            product,
+            runtime.runtime(),
+            runtime.endpoint(),
+            Arc::clone(&mcp_control),
+            governance,
+        )
+        .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     );
     let replay = Arc::new(
         MutationReplayGuard::try_new(
@@ -384,7 +445,7 @@ fn compose_transport(
         jobs.repository(),
         product.artifact_authority(),
     ));
-    let limits = McpLimits::try_from(McpLimitSpec::default())
+    let limits = McpLimits::try_from(mcp_limit_spec)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let services: Arc<dyn ToolServices> = services;
     let audit_sink: Arc<dyn AuditSink> = audit.clone();
@@ -397,15 +458,7 @@ fn compose_transport(
         runtime.runtime().workspace_id(),
     )
     .map_err(|_error| InstalledServiceError::InvalidComposition)?;
-    let authenticator = Arc::new(
-        InstalledMcpAuthenticator::new(
-            runtime.credentials(),
-            runtime.registration(NamedClient::ClaudeCode)?,
-            runtime.registration(NamedClient::Codex)?,
-            MCP_CLIENT_REQUESTS,
-        )
-        .map_err(|_error| InstalledServiceError::InvalidComposition)?,
-    );
+    let authenticator: Arc<dyn market_squawk_mcp::McpHttpAuthenticator> = mcp_control;
     let endpoint = runtime.endpoint().to_string();
     let request_cancellation = native.request_cancellation();
     let mcp = Arc::new(McpHttpService::new(
@@ -536,6 +589,9 @@ pub enum InstalledServiceError {
     /// The local secret authority rejected the requested operation.
     #[error("installed-service secret storage is unavailable")]
     SecretStore,
+    /// Durable governance registrations, audit, or authority state could not be composed.
+    #[error("installed-service governance state is unavailable")]
+    GovernanceState,
     /// Operating-system entropy is unavailable.
     #[error("installed-service entropy is unavailable")]
     EntropyUnavailable,
@@ -569,6 +625,9 @@ pub enum InstalledServiceError {
     /// Durable MCP audit construction failed.
     #[error(transparent)]
     Audit(#[from] crate::mcp::LocalAuditError),
+    /// Installed MCP client authority construction or recovery failed.
+    #[error("installed MCP client authority is unavailable")]
+    McpControl,
     /// A code-owned service limit or component contract was invalid.
     #[error("installed-service composition is invalid")]
     InvalidComposition,
@@ -599,5 +658,11 @@ impl InstalledServiceError {
 impl From<LocalAuthorityStateStoreError> for InstalledServiceError {
     fn from(error: LocalAuthorityStateStoreError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<mcp_control::McpControlError> for InstalledServiceError {
+    fn from(_error: mcp_control::McpControlError) -> Self {
+        Self::McpControl
     }
 }

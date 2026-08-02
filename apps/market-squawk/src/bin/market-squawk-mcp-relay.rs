@@ -13,14 +13,14 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RelayClient {
-    ClaudeCode,
+    Claude,
     Codex,
 }
 
 impl From<RelayClient> for NamedClient {
     fn from(value: RelayClient) -> Self {
         match value {
-            RelayClient::ClaudeCode => Self::ClaudeCode,
+            RelayClient::Claude => Self::ClaudeCode,
             RelayClient::Codex => Self::Codex,
         }
     }

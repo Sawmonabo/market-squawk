@@ -67,6 +67,12 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
     ),
   },
   {
+    id: "markEvidence",
+    accessorFn: (holding) => holding.markEvidence.observedAtUnixNanos,
+    header: "Mark evidence",
+    cell: ({ row }) => <MarkEvidence holding={row.original} />,
+  },
+  {
     id: "marketValue",
     accessorFn: (holding) => holding.market_value.amount,
     header: "Market value",
@@ -108,6 +114,21 @@ const holdingColumns: ColumnDef<PortfolioHolding, unknown>[] = [
     ),
   },
 ]
+
+function MarkEvidence({ holding }: { holding: PortfolioHolding }) {
+  const mark = holding.markEvidence
+  return (
+    <div className="max-w-56 text-xs">
+      <p>{humanize(mark.state)}</p>
+      <p className="mt-1 text-[10px] text-muted-foreground">
+        Observed {formatTimestamp(mark.observedAtUnixNanos)} · {mark.sourceReference}
+      </p>
+      <p className="mt-1 text-[10px] text-amber-300">
+        {humanize(mark.freshness.status)} · {humanize(mark.fallback.status)}
+      </p>
+    </div>
+  )
+}
 
 function BasisValue({ holding }: { holding: PortfolioHolding }) {
   switch (holding.basis.status) {

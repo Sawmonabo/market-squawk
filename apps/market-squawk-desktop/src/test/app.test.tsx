@@ -40,17 +40,6 @@ const blockedBootstrap: DesktopBootstrap = {
     label: "Available",
     detail: "The local MCP service can be started.",
   },
-  mcpClient: {
-    program: "/Applications/Market Squawk.app/Contents/MacOS/market-squawk",
-    arguments: [
-      "--data-dir",
-      "/Users/operator/Library/Application Support/com.market-squawk.desktop",
-      "mcp",
-      "serve",
-    ],
-    environment: {},
-    requiresDesktopExit: true,
-  },
   telemetryEnabled: false,
   encryptedFileFallback: "locked",
   providerProfiles: [],
@@ -179,6 +168,12 @@ function transport(
       query({ query: "jobs", limit: 25 }),
     modelControl: async () =>
       query({ query: "jobs", limit: 25 }),
+    decisionControl: async () =>
+      query({ query: "decisionScreens", limit: 25 }),
+    governanceQuery: async () =>
+      query({ query: "decisionScreens", limit: 25 }),
+    governanceControl: async () =>
+      query({ query: "decisionScreens", limit: 25 }),
     fairValueControl: async () =>
       query({ query: "fairValueMeasurements" }),
     paperControl: async () =>
@@ -188,12 +183,36 @@ function transport(
     sourceControl: async (_action, _request) =>
       query({ query: "sourceStatus" }),
     stageTrainingInput: async () => null,
-    mcpStatus: async () => ({
+    mcpClients: async () => ({
       serviceReady: true,
       sharedEndpointReady: true,
-      claudeCode: "registration_pending",
-      codex: "registration_pending",
+      workspaceId: bootstrap.runtime.workspaceId,
+      serviceGeneration: bootstrap.runtime.serviceGeneration,
+      protocolVersion: "2025-11-25",
+      transport: "stdio_relay",
+      clients: [
+        {
+          client: "claude_code",
+          label: "Claude Code",
+          state: "absent",
+          clientVersion: null,
+          receipt: null,
+          verification: null,
+          blocker: null,
+        },
+        {
+          client: "codex",
+          label: "Codex",
+          state: "absent",
+          clientVersion: null,
+          receipt: null,
+          verification: null,
+          blocker: null,
+        },
+      ],
     }),
+    mcpClientControl: async () =>
+      Promise.reject(new Error("MCP mutation is not configured for this test.")),
     subscribe: async () => () => undefined,
     onboard,
     openOfficialProviderPage: async () => undefined,

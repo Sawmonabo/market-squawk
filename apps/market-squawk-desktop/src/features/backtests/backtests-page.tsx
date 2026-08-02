@@ -46,7 +46,6 @@ import { cn } from "@/lib/utils"
 import {
   BACKTEST_JOB_KIND,
   BACKTEST_RESULT_AUTHORITY,
-  metricValue,
   parseBacktestRecord,
   type BacktestMetric,
   type BacktestRecord,
@@ -144,6 +143,29 @@ function BacktestsWorkspace({
       )
     },
   })
+  const reportArtifact = React.useMemo(() => {
+    if (resultQuery.data?.status.state !== "completed") return null
+    const artifact = resultQuery.data.status.artifact
+    return "artifactId" in artifact ? artifact : null
+  }, [resultQuery.data])
+  const reportQuery = useQuery({
+    queryKey: productKeys.operation(scope, "analysis", "Analysis.ReadArtifact", {
+      artifactId: reportArtifact?.artifactId ?? null,
+    }),
+    enabled: false,
+    queryFn: async () => {
+      if (!reportArtifact) throw new Error("No compatible governed report is available.")
+      return transport.query({
+        query: "analysisArtifact",
+        artifactId: reportArtifact.artifactId,
+        sha256: reportArtifact.sha256,
+        byteCount: reportArtifact.byteCount,
+        mediaType: reportArtifact.mediaType,
+        offset: 0,
+        maximumBytes: Math.min(reportArtifact.byteCount, 64 * 1024),
+      })
+    },
+  })
 
   return (
     <BacktestsFrame>
@@ -238,6 +260,16 @@ function BacktestsWorkspace({
           loading={resultQuery.isPending && resultQuery.fetchStatus !== "idle"}
           error={resultQuery.isError ? messageFrom(resultQuery.error) : null}
           canRead={operations.has("Analysis.GetBacktests")}
+          onReadReport={reportArtifact ? () => void reportQuery.refetch() : null}
+          reportState={
+            reportQuery.isFetching
+              ? "loading"
+              : reportQuery.isError
+                ? messageFrom(reportQuery.error)
+                : reportQuery.data
+                  ? "retrieved"
+                  : null
+          }
         />
       </section>
 
@@ -366,12 +398,16 @@ function BacktestEvidence({
   loading,
   error,
   canRead,
+  onReadReport,
+  reportState,
 }: {
   job: JobView | null
   record: BacktestRecord | null
   loading: boolean
   error: string | null
   canRead: boolean
+  onReadReport: (() => void) | null
+  reportState: "loading" | "retrieved" | string | null
 }) {
   return (
     <section className="rounded-2xl border border-border bg-card/35 p-5" aria-labelledby="backtest-evidence-heading">
@@ -406,7 +442,11 @@ function BacktestEvidence({
       ) : error ? (
         <UnavailableCard title="Result details unavailable" detail={error} />
       ) : record ? (
-        <BacktestRecordView record={record} />
+        <BacktestRecordView
+          record={record}
+          onReadReport={onReadReport}
+          reportState={reportState}
+        />
       ) : (
         <UnavailableCard
           title="Result details unavailable"
@@ -417,10 +457,24 @@ function BacktestEvidence({
   )
 }
 
-function BacktestRecordView({ record }: { record: BacktestRecord }) {
+function BacktestRecordView({
+  record,
+  onReadReport,
+  reportState,
+}: {
+  record: BacktestRecord
+  onReadReport: (() => void) | null
+  reportState: "loading" | "retrieved" | string | null
+}) {
   const metrics = record.status.state === "completed" ? record.status.metrics : []
-  const pbo = metricValue(metrics, "probability-of-backtest-overfitting")
-  const deflated = metricValue(metrics, "deflated-performance-probability")
+  const pbo =
+    record.status.state === "completed" && record.status.cohortDiagnostics?.state === "completed"
+      ? record.status.cohortDiagnostics.probabilityOfBacktestOverfitting
+      : null
+  const deflated =
+    record.status.state === "completed" && record.status.cohortDiagnostics?.state === "completed"
+      ? record.status.cohortDiagnostics.deflatedPerformanceProbability
+      : null
 
   return (
     <div className="mt-5 grid gap-4">
@@ -473,6 +527,8 @@ function BacktestRecordView({ record }: { record: BacktestRecord }) {
           metrics={metrics}
           pbo={pbo}
           deflated={deflated}
+          onReadReport={onReadReport}
+          reportState={reportState}
         />
       )}
     </div>
@@ -484,17 +540,29 @@ function CompletedResult({
   metrics,
   pbo,
   deflated,
+  onReadReport,
+  reportState,
 }: {
   status: Extract<BacktestRecord["status"], { state: "completed" }>
   metrics: readonly BacktestMetric[]
   pbo: number | null
   deflated: number | null
+  onReadReport: (() => void) | null
+  reportState: "loading" | "retrieved" | string | null
 }) {
   return (
     <>
       <div className="grid gap-3 sm:grid-cols-3">
         <ResultFact label="Recorded metrics" value={metrics.length.toLocaleString()} />
         <ResultFact label="Simulated fills" value={status.fillCount.toLocaleString()} />
+        <ResultFact
+          label="Partial fills"
+          value={
+            status.partialFillCount === undefined
+              ? "Legacy record"
+              : status.partialFillCount.toLocaleString()
+          }
+        />
         <ResultFact label="No-action decisions" value={status.noActionCount.toLocaleString()} />
       </div>
       {metrics.length > 0 ? (
@@ -519,26 +587,79 @@ function CompletedResult({
         <DiagnosticFact
           label="Probability of backtest overfitting"
           value={pbo}
-          unavailable="No PBO metric was published for this result."
+          unavailable="No completed controlled cohort evaluation qualifies this terminal, so PBO is not available."
         />
         <DiagnosticFact
           label="Deflated performance probability"
           value={deflated}
-          unavailable="No multiple-testing-adjusted performance metric was published."
+          unavailable="No completed controlled cohort evaluation qualifies this terminal, so no multiple-testing-adjusted probability is available."
         />
       </div>
+      <ExecutionAssumptions assumptions={status.executionAssumptions ?? null} />
       <div className="rounded-xl border border-border bg-background/25 p-4 text-xs leading-relaxed text-muted-foreground">
         <p>
           Accounting reconciliation: <span className="font-medium text-foreground">independent</span>.
-          The governed report is {status.artifact.byteCount.toLocaleString()} bytes and is
-          bound by {shortDigest(status.artifact.digest)}.
+          The governed report is {status.artifact.byteCount.toLocaleString()} bytes.
         </p>
-        <p className="mt-2">
-          Opening the report remains unavailable because this terminal record does not provide a
-          compatible controlled-artifact ID and media type for the closed artifact reader.
-        </p>
+        {"artifactId" in status.artifact ? (
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <Button size="sm" variant="outline" disabled={reportState === "loading"} onClick={onReadReport ?? undefined}>
+              {reportState === "loading" ? "Retrieving report…" : "Retrieve controlled report"}
+            </Button>
+            <span>
+              {reportState === "retrieved"
+                ? "The first bounded report segment was verified and retrieved."
+                : typeof reportState === "string"
+                  ? `Report retrieval failed: ${reportState}`
+                  : `ID ${shortDigest(status.artifact.artifactId)} · SHA-256 ${shortDigest(status.artifact.sha256)}`}
+            </span>
+          </div>
+        ) : (
+          <p className="mt-2">This legacy terminal has no compatible controlled report identity.</p>
+        )}
       </div>
     </>
+  )
+}
+
+function ExecutionAssumptions({
+  assumptions,
+}: {
+  assumptions: Extract<BacktestRecord["status"], { state: "completed" }>["executionAssumptions"] | null
+}) {
+  if (!assumptions) {
+    return (
+      <UnavailableCard
+        title="Execution assumptions are legacy-only"
+        detail="This terminal binds an assumption digest but predates the readable V2 fee, spread, slippage, latency, participation, liquidity, and partial-fill evidence."
+      />
+    )
+  }
+  const facts = [
+    ["Fee", `${assumptions.feeBasisPoints} bp`],
+    ["Spread", "Observed point-in-time half spread"],
+    ["Adverse slippage", `${assumptions.slippageBasisPoints} bp + up to ${assumptions.maximumRandomSlippageBasisPoints} bp seeded`],
+    ["Latency", `${assumptions.latencyNanos} ns minimum event-time delay`],
+    ["Participation", `${(assumptions.maximumParticipationBasisPoints / 100).toLocaleString(undefined, { maximumFractionDigits: 2 })}% of evidenced depth`],
+    ["Liquidity priority", humanize(assumptions.liquidityPriority)],
+    ["Partial fills", assumptions.partialFillsAllowed ? "Permitted when depth is insufficient" : "Rejected when depth is insufficient"],
+    ["Fee rounding", `Scale ${assumptions.feeDecimalScale}; nearest-even`],
+  ] as const
+  return (
+    <div className="rounded-xl border border-border bg-background/25 p-4">
+      <h3 className="text-sm font-medium">Bound execution assumptions</h3>
+      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+        Policy v{assumptions.policyVersion}. These values are immutable run evidence; the UI does not infer costs or liquidity.
+      </p>
+      <dl className="mt-3 grid gap-x-5 gap-y-3 sm:grid-cols-2">
+        {facts.map(([label, value]) => (
+          <div key={label} className="border-b border-border/60 pb-2">
+            <dt className="text-xs text-muted-foreground">{label}</dt>
+            <dd className="mt-1 text-sm">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   )
 }
 

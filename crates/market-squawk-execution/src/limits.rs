@@ -134,6 +134,85 @@ pub struct RiskLimits {
     input: RiskLimitsInput,
 }
 
+/// Immutable, authority-free read image of the active central risk policy.
+///
+/// This is deliberately separate from [`RiskLimits`]: it cannot reserve capacity, assess an
+/// intent, or alter policy. The eligible universe remains bounded by [`MAX_RISK_INSTRUMENTS`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskLimitsSnapshot {
+    currency: Currency,
+    eligible_instruments: Box<[InstrumentId]>,
+    maximum_position_lots: i64,
+    maximum_order_notional: Money,
+    maximum_gross_exposure: Money,
+    maximum_leverage: BasisPoints,
+    minimum_capital: Money,
+    maximum_loss: Money,
+    maximum_drawdown: Money,
+    maximum_fee: BasisPoints,
+    maximum_price_deviation: BasisPoints,
+    maximum_slippage: BasisPoints,
+    maximum_orders_per_window: NonZeroU32,
+    order_rate_window_nanos: i64,
+    reservation_ttl_nanos: i64,
+    allow_short: bool,
+    kill_switch: bool,
+}
+
+impl RiskLimitsSnapshot {
+    pub const fn currency(&self) -> Currency {
+        self.currency
+    }
+    pub const fn eligible_instruments(&self) -> &[InstrumentId] {
+        &self.eligible_instruments
+    }
+    pub const fn maximum_position_lots(&self) -> i64 {
+        self.maximum_position_lots
+    }
+    pub const fn maximum_order_notional(&self) -> Money {
+        self.maximum_order_notional
+    }
+    pub const fn maximum_gross_exposure(&self) -> Money {
+        self.maximum_gross_exposure
+    }
+    pub const fn maximum_leverage(&self) -> BasisPoints {
+        self.maximum_leverage
+    }
+    pub const fn minimum_capital(&self) -> Money {
+        self.minimum_capital
+    }
+    pub const fn maximum_loss(&self) -> Money {
+        self.maximum_loss
+    }
+    pub const fn maximum_drawdown(&self) -> Money {
+        self.maximum_drawdown
+    }
+    pub const fn maximum_fee(&self) -> BasisPoints {
+        self.maximum_fee
+    }
+    pub const fn maximum_price_deviation(&self) -> BasisPoints {
+        self.maximum_price_deviation
+    }
+    pub const fn maximum_slippage(&self) -> BasisPoints {
+        self.maximum_slippage
+    }
+    pub const fn maximum_orders_per_window(&self) -> NonZeroU32 {
+        self.maximum_orders_per_window
+    }
+    pub const fn order_rate_window_nanos(&self) -> i64 {
+        self.order_rate_window_nanos
+    }
+    pub const fn reservation_ttl_nanos(&self) -> i64 {
+        self.reservation_ttl_nanos
+    }
+    pub const fn allow_short(&self) -> bool {
+        self.allow_short
+    }
+    pub const fn kill_switch(&self) -> bool {
+        self.kill_switch
+    }
+}
+
 impl RiskLimits {
     /// Validates currency, sign, bound, and duration invariants.
     ///
@@ -195,6 +274,30 @@ impl RiskLimits {
             return Err(RiskLimitsError::NonPositiveDuration);
         }
         Ok(Self { input })
+    }
+
+    /// Copies the validated policy into a read-only bounded image.
+    #[must_use]
+    pub fn snapshot(&self) -> RiskLimitsSnapshot {
+        RiskLimitsSnapshot {
+            currency: self.input.currency,
+            eligible_instruments: self.input.eligible_instruments.iter().copied().collect(),
+            maximum_position_lots: self.input.maximum_position_lots,
+            maximum_order_notional: self.input.maximum_order_notional,
+            maximum_gross_exposure: self.input.maximum_gross_exposure,
+            maximum_leverage: self.input.maximum_leverage,
+            minimum_capital: self.input.minimum_capital,
+            maximum_loss: self.input.maximum_loss,
+            maximum_drawdown: self.input.maximum_drawdown,
+            maximum_fee: self.input.maximum_fee,
+            maximum_price_deviation: self.input.maximum_price_deviation,
+            maximum_slippage: self.input.maximum_slippage,
+            maximum_orders_per_window: self.input.maximum_orders_per_window,
+            order_rate_window_nanos: self.input.order_rate_window_nanos,
+            reservation_ttl_nanos: self.input.reservation_ttl_nanos,
+            allow_short: self.input.allow_short,
+            kill_switch: self.input.kill_switch,
+        }
     }
 
     pub(crate) const fn currency(&self) -> Currency {

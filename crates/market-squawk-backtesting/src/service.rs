@@ -120,6 +120,17 @@ impl BacktestService {
         Self { inventory }
     }
 
+    /// Reads one content-addressed report through this service's confined experiment inventory.
+    pub fn read_artifact(
+        &self,
+        digest: market_squawk_data::Sha256Digest,
+        byte_count: u64,
+    ) -> Result<Vec<u8>, BacktestServiceError> {
+        self.inventory
+            .read_artifact(digest, byte_count)
+            .map_err(Into::into)
+    }
+
     /// Derives one exact trial from the request and strategy capability before durable reservation.
     pub fn run(
         &self,

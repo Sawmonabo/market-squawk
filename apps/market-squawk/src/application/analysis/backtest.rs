@@ -3,7 +3,10 @@
 use std::{fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use market_squawk_backtesting::{BacktestOutcome, TrialStatus};
+use market_squawk_backtesting::{
+    BacktestCohortEvaluation, BacktestOutcome, ResearchExecutionAssumptions,
+    ResearchLiquidityPriority, TrialStatus,
+};
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, SourceIdentifier, Timestamp,
 };
@@ -22,6 +25,8 @@ mod input_authority;
 mod repository;
 
 pub use input_authority::{
+    GovernedBacktestCohortCandidateRegistrationInput,
+    GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,
     GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
     GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
     GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
@@ -37,13 +42,16 @@ pub use repository::{
 
 const MAXIMUM_BACKTEST_RECORD_BYTES: usize = 1024 * 1024;
 const MAXIMUM_BACKTEST_RECORD_METRICS: usize = 4_096;
-const BACKTEST_RECORD_VERSION: u16 = 1;
+const BACKTEST_RECORD_VERSION: u16 = 2;
+const LEGACY_BACKTEST_RECORD_VERSION: u16 = 1;
+const BACKTEST_REPORT_MEDIA_TYPE: &str = "application/json";
+const BACKTEST_REPORT_ID_PREFIX: &str = "backtest-report-";
 
 /// Optional exact scope attached to one governed backtest request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BacktestScope {
     instruments: Box<[InstrumentId]>,
-    time_range: Option<(Timestamp, Timestamp)>,
+    time_ranges: Box<[(Timestamp, Timestamp)]>,
     sources: Box<[SourceId]>,
 }
 
@@ -54,23 +62,35 @@ impl BacktestScope {
         time_range: Option<(Timestamp, Timestamp)>,
         sources: Vec<SourceId>,
     ) -> Result<Self, ServiceError> {
+        Self::try_new_with_time_ranges(instruments, time_range.into_iter().collect(), sources)
+    }
+
+    /// Admits a canonical exact union of governed time intervals.
+    pub fn try_new_with_time_ranges(
+        instruments: Vec<InstrumentId>,
+        time_ranges: Vec<(Timestamp, Timestamp)>,
+        sources: Vec<SourceId>,
+    ) -> Result<Self, ServiceError> {
         if instruments.windows(2).any(|pair| pair[0] >= pair[1])
             || sources.windows(2).any(|pair| pair[0] >= pair[1])
-            || time_range.is_some_and(|(starts_at, ends_at)| starts_at >= ends_at)
+            || time_ranges
+                .iter()
+                .any(|(starts_at, ends_at)| starts_at >= ends_at)
+            || time_ranges.windows(2).any(|pair| pair[0].1 >= pair[1].0)
         {
             return Err(ServiceError::InvalidRequest);
         }
-        Ok(Self::new(instruments, time_range, sources))
+        Ok(Self::new(instruments, time_ranges, sources))
     }
 
     pub(super) fn new(
         instruments: Vec<InstrumentId>,
-        time_range: Option<(Timestamp, Timestamp)>,
+        time_ranges: Vec<(Timestamp, Timestamp)>,
         sources: Vec<SourceId>,
     ) -> Self {
         Self {
             instruments: instruments.into_boxed_slice(),
-            time_range,
+            time_ranges: time_ranges.into_boxed_slice(),
             sources: sources.into_boxed_slice(),
         }
     }
@@ -84,7 +104,17 @@ impl BacktestScope {
     /// Exact optional observation interval requested by the caller.
     #[must_use]
     pub const fn time_range(&self) -> Option<(Timestamp, Timestamp)> {
-        self.time_range
+        if self.time_ranges.len() == 1 {
+            Some(self.time_ranges[0])
+        } else {
+            None
+        }
+    }
+
+    /// Exact sorted, non-overlapping time coverage authorized for this command.
+    #[must_use]
+    pub fn time_ranges(&self) -> &[(Timestamp, Timestamp)] {
+        &self.time_ranges
     }
 
     /// Exact optional source coverage requested by the caller.
@@ -158,13 +188,21 @@ impl GovernedBacktestCommand {
         for instrument in &self.scope.instruments {
             hash.update(instrument.as_uuid().as_bytes());
         }
-        match self.scope.time_range {
-            Some((starts_at, ends_at)) => {
+        match self.scope.time_ranges.as_ref() {
+            [] => hash.update([0]),
+            [(starts_at, ends_at)] => {
                 hash.update([1]);
                 hash.update(starts_at.unix_nanos().to_be_bytes());
                 hash.update(ends_at.unix_nanos().to_be_bytes());
             }
-            None => hash.update([0]),
+            time_ranges => {
+                hash.update([2]);
+                hash_count(&mut hash, time_ranges.len())?;
+                for (starts_at, ends_at) in time_ranges {
+                    hash.update(starts_at.unix_nanos().to_be_bytes());
+                    hash.update(ends_at.unix_nanos().to_be_bytes());
+                }
+            }
         }
         hash_count(&mut hash, self.scope.sources.len())?;
         for source in &self.scope.sources {
@@ -185,7 +223,11 @@ pub struct GovernedBacktestRecord {
 }
 
 impl GovernedBacktestRecord {
-    fn from_outcome(outcome: &BacktestOutcome) -> Result<Self, ServiceError> {
+    fn from_outcome(
+        outcome: &BacktestOutcome,
+        assumptions: ResearchExecutionAssumptions,
+        cohort: Option<&BacktestCohortEvaluation>,
+    ) -> Result<Self, ServiceError> {
         let (trial, run) = match outcome {
             BacktestOutcome::Completed(result) => (result.trial(), Some(result.run())),
             BacktestOutcome::Failed(failure) => (failure.trial(), None),
@@ -196,13 +238,15 @@ impl GovernedBacktestRecord {
             TrialStatus::Reserved => return Err(ServiceError::InvalidResult),
             TrialStatus::Completed(completion) => {
                 let run = run.ok_or(ServiceError::InvalidResult)?;
+                let report_digest = encode_hex(completion.artifact().digest().bytes());
                 json!({
                     "state": "completed",
                     "resultDigest": encode_hex(completion.result_digest().bytes()),
                     "artifact": {
-                        "reference": completion.artifact().reference(),
-                        "digest": encode_hex(completion.artifact().digest().bytes()),
-                        "byteCount": completion.artifact().byte_count()
+                        "artifactId": format!("{BACKTEST_REPORT_ID_PREFIX}{report_digest}"),
+                        "sha256": report_digest,
+                        "byteCount": completion.artifact().byte_count(),
+                        "mediaType": BACKTEST_REPORT_MEDIA_TYPE
                     },
                     "metrics": completion
                         .metrics()
@@ -217,8 +261,11 @@ impl GovernedBacktestRecord {
                         "endsAtUnixNanos": partition.ends_at().unix_nanos()
                     })),
                     "fillCount": run.fills().len(),
+                    "partialFillCount": run.fills().iter().filter(|fill| fill.partial()).count(),
                     "noActionCount": run.no_action_count(),
-                    "accountingReconciliation": "independent"
+                    "accountingReconciliation": "independent",
+                    "executionAssumptions": execution_assumptions_content(assumptions),
+                    "cohortDiagnostics": cohort_diagnostics_content(cohort, spec.id())?
                 })
             }
             TrialStatus::Failed(_) => json!({"state": "failed"}),
@@ -256,6 +303,10 @@ impl GovernedBacktestRecord {
             return Err(ServiceError::ResourceExhausted);
         }
         let object = content.as_object().ok_or(ServiceError::InvalidResult)?;
+        let record_version = object
+            .get("recordVersion")
+            .and_then(Value::as_u64)
+            .ok_or(ServiceError::InvalidResult)?;
         if !has_exact_fields(
             object,
             &[
@@ -270,8 +321,8 @@ impl GovernedBacktestRecord {
                 "selectionCriterion",
                 "status",
             ],
-        ) || object.get("recordVersion").and_then(Value::as_u64)
-            != Some(u64::from(BACKTEST_RECORD_VERSION))
+        ) || (record_version != u64::from(LEGACY_BACKTEST_RECORD_VERSION)
+            && record_version != u64::from(BACKTEST_RECORD_VERSION))
         {
             return Err(ServiceError::InvalidResult);
         }
@@ -307,7 +358,27 @@ impl GovernedBacktestRecord {
             .and_then(|value| {
                 SourceIdentifier::try_from(value).map_err(|_| ServiceError::InvalidResult)
             })?;
-        if !valid_terminal_status(object.get("status")) {
+        if !valid_terminal_status(object.get("status"), record_version) {
+            return Err(ServiceError::InvalidResult);
+        }
+        if record_version == u64::from(BACKTEST_RECORD_VERSION)
+            && object
+                .get("status")
+                .and_then(Value::as_object)
+                .and_then(|status| status.get("cohortDiagnostics"))
+                .and_then(Value::as_object)
+                .and_then(|diagnostics| diagnostics.get("state"))
+                .and_then(Value::as_str)
+                == Some("completed")
+            && (object
+                .get("cohortAuthorityDigest")
+                .and_then(Value::as_str)
+                .is_none()
+                || object
+                    .get("cohortUniverseDigest")
+                    .and_then(Value::as_str)
+                    .is_none())
+        {
             return Err(ServiceError::InvalidResult);
         }
         Ok(Self {
@@ -345,6 +416,61 @@ impl fmt::Debug for GovernedBacktestRecord {
             .field("run_id", &self.run_id)
             .field("content", &"[BACKTEST RECORD]")
             .finish()
+    }
+}
+
+/// Opaque, content-addressed report identity accepted by the governed backtest authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedBacktestReportReference {
+    artifact_id: Box<str>,
+    sha256: [u8; 32],
+    byte_count: u64,
+}
+
+impl GovernedBacktestReportReference {
+    /// Validates a V2 report reference without accepting a filesystem path or arbitrary media type.
+    pub fn try_new(
+        artifact_id: &str,
+        sha256: &str,
+        byte_count: u64,
+        media_type: &str,
+    ) -> Result<Self, ServiceError> {
+        let digest = decode_digest(sha256).ok_or(ServiceError::InvalidRequest)?;
+        if byte_count == 0
+            || media_type != BACKTEST_REPORT_MEDIA_TYPE
+            || artifact_id != format!("{BACKTEST_REPORT_ID_PREFIX}{sha256}")
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(Self {
+            artifact_id: artifact_id.into(),
+            sha256: digest,
+            byte_count,
+        })
+    }
+
+    /// Returns the path-free published report identifier.
+    #[must_use]
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    /// Returns the exact SHA-256 content identity.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    /// Returns the exact bounded report length.
+    #[must_use]
+    pub const fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    /// Returns the only report media type admitted by this authority.
+    #[must_use]
+    pub const fn media_type(&self) -> &'static str {
+        BACKTEST_REPORT_MEDIA_TYPE
     }
 }
 
@@ -420,6 +546,18 @@ pub trait GovernedBacktestAuthority: Send + Sync + 'static {
         deadline: Instant,
     ) -> Result<Option<GovernedBacktestRecord>, ServiceError>;
 
+    /// Reads a completed report through the confined backtest artifact authority.
+    ///
+    /// The default preserves older test-only authorities while failing closed for all callers.
+    async fn read_report(
+        &self,
+        _report: GovernedBacktestReportReference,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<Vec<u8>, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
     /// Atomically rejects new work and cancels owned activity.
     fn begin_shutdown(&self);
 
@@ -474,19 +612,26 @@ impl ProductionBacktestAuthority {
     ) -> Result<GovernedBacktestRecord, ServiceError> {
         self.ensure_live(&cancellation, deadline)?;
         let linked = LinkedCancellation::new(cancellation, self.shutdown.child_token(), deadline);
-        let input = self
+        let mut input = self
             .repository
             .resolve(&command, linked.token().clone(), deadline)
             .await?;
         self.ensure_live(linked.token(), deadline)?;
+        let assumptions = input.execution_assumptions;
         let service = Arc::clone(&self.service);
         let strategy_id = command.strategy_id().clone();
         let worker_cancellation = linked.token().clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            service.run(input, &strategy_id, &worker_cancellation)
+        let cohort = input.cohort.take();
+        let worker = tokio::task::spawn_blocking(move || match cohort {
+            Some(cohort) => service
+                .run_cohort(cohort, &strategy_id, &worker_cancellation)
+                .map(|outcome| (outcome.outcome, Some(outcome.evaluation))),
+            None => service
+                .run(input, &strategy_id, &worker_cancellation)
+                .map(|outcome| (outcome, None)),
         });
-        let outcome = join_backtest(worker, linked.token(), deadline).await?;
-        let record = GovernedBacktestRecord::from_outcome(&outcome)?;
+        let (outcome, cohort) = join_backtest(worker, linked.token(), deadline).await?;
+        let record = GovernedBacktestRecord::from_outcome(&outcome, assumptions, cohort.as_ref())?;
         self.ensure_live(linked.token(), deadline)?;
         if let Some(prepublish) = &prepublish {
             prepublish.validate_prepublish()?;
@@ -553,6 +698,26 @@ impl GovernedBacktestAuthority for ProductionBacktestAuthority {
         Ok(result)
     }
 
+    async fn read_report(
+        &self,
+        report: GovernedBacktestReportReference,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, ServiceError> {
+        self.ensure_live(&cancellation, deadline)?;
+        let linked = LinkedCancellation::new(cancellation, self.shutdown.child_token(), deadline);
+        let service = Arc::clone(&self.service);
+        let worker = tokio::task::spawn_blocking(move || {
+            service.read_report(
+                market_squawk_data::Sha256Digest::new(report.sha256()),
+                report.byte_count(),
+            )
+        });
+        let result = worker.await.map_err(|_| ServiceError::Internal)?;
+        self.ensure_live(linked.token(), deadline)?;
+        result.map_err(map_backtest_error)
+    }
+
     fn begin_shutdown(&self) {
         self.shutdown.cancel();
         self.repository.begin_shutdown();
@@ -608,10 +773,12 @@ impl Drop for LinkedCancellation {
 }
 
 async fn join_backtest(
-    worker: JoinHandle<Result<BacktestOutcome, ProductionBacktestServiceError>>,
+    worker: JoinHandle<
+        Result<(BacktestOutcome, Option<BacktestCohortEvaluation>), ProductionBacktestServiceError>,
+    >,
     cancellation: &CancellationToken,
     deadline: Instant,
-) -> Result<BacktestOutcome, ServiceError> {
+) -> Result<(BacktestOutcome, Option<BacktestCohortEvaluation>), ServiceError> {
     let result = worker.await.map_err(|_| ServiceError::Internal)?;
     if Instant::now() >= deadline {
         return Err(ServiceError::DeadlineExceeded);
@@ -644,18 +811,138 @@ fn optional_digest(value: Option<&Value>) -> bool {
     value.is_some_and(|value| value.is_null() || value.as_str().is_some_and(canonical_run_id))
 }
 
-fn valid_terminal_status(value: Option<&Value>) -> bool {
+fn valid_terminal_status(value: Option<&Value>, record_version: u64) -> bool {
     let Some(status) = value.and_then(Value::as_object) else {
         return false;
     };
     match status.get("state").and_then(Value::as_str) {
         Some("failed") => has_exact_fields(status, &["state"]),
-        Some("completed") => valid_completed_status(status),
+        Some("completed") => valid_completed_status(status, record_version),
         _ => false,
     }
 }
 
-fn valid_completed_status(status: &Map<String, Value>) -> bool {
+fn valid_completed_status(status: &Map<String, Value>, record_version: u64) -> bool {
+    if record_version == u64::from(LEGACY_BACKTEST_RECORD_VERSION) {
+        return valid_legacy_completed_status(status);
+    }
+    if !has_exact_fields(
+        status,
+        &[
+            "state",
+            "resultDigest",
+            "artifact",
+            "metrics",
+            "datasetPartition",
+            "fillCount",
+            "partialFillCount",
+            "noActionCount",
+            "accountingReconciliation",
+            "executionAssumptions",
+            "cohortDiagnostics",
+        ],
+    ) || !status
+        .get("resultDigest")
+        .and_then(Value::as_str)
+        .is_some_and(canonical_run_id)
+        || status.get("fillCount").and_then(Value::as_u64).is_none()
+        || status
+            .get("partialFillCount")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status
+            .get("noActionCount")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status
+            .get("accountingReconciliation")
+            .and_then(Value::as_str)
+            != Some("independent")
+    {
+        return false;
+    }
+    let Some(artifact) = status.get("artifact").and_then(Value::as_object) else {
+        return false;
+    };
+    if !has_exact_fields(
+        artifact,
+        &["artifactId", "sha256", "byteCount", "mediaType"],
+    ) || GovernedBacktestReportReference::try_new(
+        artifact
+            .get("artifactId")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        artifact
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        artifact
+            .get("byteCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        artifact
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let Some(metrics) = status.get("metrics").and_then(Value::as_array) else {
+        return false;
+    };
+    if !valid_metrics(metrics) {
+        return false;
+    }
+    valid_dataset_partition(status.get("datasetPartition"))
+        && valid_execution_assumptions(status.get("executionAssumptions"))
+        && valid_cohort_diagnostics(status.get("cohortDiagnostics"))
+}
+
+fn valid_cohort_diagnostics(value: Option<&Value>) -> bool {
+    let Some(diagnostics) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    match diagnostics.get("state").and_then(Value::as_str) {
+        Some("not-evaluated") => has_exact_fields(diagnostics, &["state"]),
+        Some("completed") => {
+            has_exact_fields(
+                diagnostics,
+                &[
+                    "state",
+                    "evaluationId",
+                    "probabilityOfBacktestOverfitting",
+                    "foldCount",
+                    "deflatedPerformanceProbability",
+                    "expectedMaximumSharpe",
+                ],
+            ) && diagnostics
+                .get("evaluationId")
+                .and_then(Value::as_str)
+                .is_some_and(canonical_run_id)
+                && diagnostics
+                    .get("probabilityOfBacktestOverfitting")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                && diagnostics
+                    .get("foldCount")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|value| value >= 2)
+                && diagnostics
+                    .get("deflatedPerformanceProbability")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                && diagnostics
+                    .get("expectedMaximumSharpe")
+                    .and_then(Value::as_f64)
+                    .is_some_and(f64::is_finite)
+        }
+        _ => false,
+    }
+}
+
+fn valid_legacy_completed_status(status: &Map<String, Value>) -> bool {
     if !has_exact_fields(
         status,
         &[
@@ -687,29 +974,24 @@ fn valid_completed_status(status: &Map<String, Value>) -> bool {
     let Some(artifact) = status.get("artifact").and_then(Value::as_object) else {
         return false;
     };
-    if !has_exact_fields(artifact, &["reference", "digest", "byteCount"])
-        || !artifact
+    has_exact_fields(artifact, &["reference", "digest", "byteCount"])
+        && artifact
             .get("reference")
             .and_then(Value::as_str)
             .is_some_and(canonical_artifact_reference)
-        || !artifact
+        && artifact
             .get("digest")
             .and_then(Value::as_str)
             .is_some_and(canonical_run_id)
-        || !artifact
+        && artifact
             .get("byteCount")
             .and_then(Value::as_u64)
             .is_some_and(|bytes| bytes > 0)
-    {
-        return false;
-    }
-    let Some(metrics) = status.get("metrics").and_then(Value::as_array) else {
-        return false;
-    };
-    if !valid_metrics(metrics) {
-        return false;
-    }
-    valid_dataset_partition(status.get("datasetPartition"))
+        && status
+            .get("metrics")
+            .and_then(Value::as_array)
+            .is_some_and(|metrics| valid_metrics(metrics))
+        && valid_dataset_partition(status.get("datasetPartition"))
 }
 
 fn valid_metrics(metrics: &[Value]) -> bool {
@@ -760,6 +1042,117 @@ fn valid_dataset_partition(value: Option<&Value>) -> bool {
     })
 }
 
+fn cohort_diagnostics_content(
+    cohort: Option<&BacktestCohortEvaluation>,
+    trial_id: market_squawk_backtesting::TrialId,
+) -> Result<Value, ServiceError> {
+    let Some(cohort) = cohort else {
+        return Ok(json!({"state": "not-evaluated"}));
+    };
+    if cohort.selected().trial_id() != trial_id {
+        return Err(ServiceError::InvalidResult);
+    }
+    let pbo = cohort.probability_of_backtest_overfitting();
+    let deflated = cohort.deflated_performance();
+    if !pbo.probability().is_finite()
+        || !deflated.probability().is_finite()
+        || !deflated.expected_maximum_sharpe().is_finite()
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(json!({
+        "state": "completed",
+        "evaluationId": encode_hex(cohort.id().digest().bytes()),
+        "probabilityOfBacktestOverfitting": pbo.probability(),
+        "foldCount": pbo.fold_count(),
+        "deflatedPerformanceProbability": deflated.probability(),
+        "expectedMaximumSharpe": deflated.expected_maximum_sharpe(),
+    }))
+}
+
+fn execution_assumptions_content(assumptions: ResearchExecutionAssumptions) -> Value {
+    json!({
+        "policyVersion": assumptions.version().get(),
+        "feeBasisPoints": assumptions.fee_basis_points().get(),
+        "spreadModel": "observed-point-in-time-half-spread",
+        "slippageBasisPoints": assumptions.slippage_basis_points().get(),
+        "maximumRandomSlippageBasisPoints": assumptions.maximum_random_slippage_basis_points().get(),
+        "latencyNanos": assumptions.latency_nanos(),
+        "maximumParticipationBasisPoints": assumptions.maximum_participation_basis_points().get(),
+        "liquidityPriority": match assumptions.liquidity_priority() {
+            ResearchLiquidityPriority::SignalTimeThenOrderId => "signal-time-then-order-id",
+        },
+        "partialFillsAllowed": assumptions.allow_partial_fills(),
+        "feeDecimalScale": assumptions.fee_decimal_scale(),
+    })
+}
+
+fn valid_execution_assumptions(value: Option<&Value>) -> bool {
+    let Some(value) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    has_exact_fields(
+        value,
+        &[
+            "policyVersion",
+            "feeBasisPoints",
+            "spreadModel",
+            "slippageBasisPoints",
+            "maximumRandomSlippageBasisPoints",
+            "latencyNanos",
+            "maximumParticipationBasisPoints",
+            "liquidityPriority",
+            "partialFillsAllowed",
+            "feeDecimalScale",
+        ],
+    ) && value.get("policyVersion").and_then(Value::as_u64) == Some(3)
+        && value
+            .get("feeBasisPoints")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| (0..=10_000).contains(&value))
+        && value.get("spreadModel").and_then(Value::as_str)
+            == Some("observed-point-in-time-half-spread")
+        && value
+            .get("slippageBasisPoints")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| (0..=10_000).contains(&value))
+        && value
+            .get("maximumRandomSlippageBasisPoints")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| (0..=10_000).contains(&value))
+        && value
+            .get("latencyNanos")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value > 0)
+        && value
+            .get("maximumParticipationBasisPoints")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| (1..=10_000).contains(&value))
+        && value.get("liquidityPriority").and_then(Value::as_str)
+            == Some("signal-time-then-order-id")
+        && value
+            .get("partialFillsAllowed")
+            .and_then(Value::as_bool)
+            .is_some()
+        && value
+            .get("feeDecimalScale")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value <= 28)
+}
+
+fn decode_digest(value: &str) -> Option<[u8; 32]> {
+    if !canonical_run_id(value) {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        output[index] = u8::try_from((high << 4) | low).ok()?;
+    }
+    Some(output)
+}
+
 fn canonical_artifact_reference(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 8_192
@@ -788,4 +1181,116 @@ fn hash_count(hash: &mut Sha256, value: usize) -> Result<(), ServiceError> {
 
 fn has_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> bool {
     object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::GovernedBacktestRecord;
+
+    #[test]
+    fn governed_v2_record_binds_visible_execution_and_report_evidence() {
+        let digest = |byte: &str| byte.repeat(32);
+        let record = GovernedBacktestRecord::try_from_persisted(json!({
+            "recordVersion": 2,
+            "runId": digest("11"),
+            "datasetIdentity": digest("22"),
+            "objectGraphDigest": digest("33"),
+            "executionAssumptionDigest": digest("44"),
+            "cohortAuthorityDigest": null,
+            "cohortUniverseDigest": null,
+            "seed": 7,
+            "selectionCriterion": "total-return",
+            "status": {
+                "state": "completed",
+                "resultDigest": digest("55"),
+                "artifact": {
+                    "artifactId": format!("backtest-report-{}", digest("66")),
+                    "sha256": digest("66"),
+                    "byteCount": 128,
+                    "mediaType": "application/json"
+                },
+                "metrics": [],
+                "datasetPartition": {
+                    "startsAtUnixNanos": 1,
+                    "endsAtUnixNanos": 2
+                },
+                "fillCount": 2,
+                "partialFillCount": 1,
+                "noActionCount": 0,
+                "accountingReconciliation": "independent",
+                "executionAssumptions": {
+                    "policyVersion": 3,
+                    "feeBasisPoints": 1,
+                    "spreadModel": "observed-point-in-time-half-spread",
+                    "slippageBasisPoints": 2,
+                    "maximumRandomSlippageBasisPoints": 3,
+                    "latencyNanos": 4,
+                    "maximumParticipationBasisPoints": 5,
+                    "liquidityPriority": "signal-time-then-order-id",
+                    "partialFillsAllowed": true,
+                    "feeDecimalScale": 2
+                },
+                "cohortDiagnostics": {"state": "not-evaluated"}
+            }
+        }));
+        assert!(record.is_ok());
+    }
+
+    #[test]
+    fn governed_v2_record_accepts_only_bound_completed_cohort_diagnostics() {
+        let digest = |byte: &str| byte.repeat(32);
+        let record = GovernedBacktestRecord::try_from_persisted(json!({
+            "recordVersion": 2,
+            "runId": digest("11"),
+            "datasetIdentity": digest("22"),
+            "objectGraphDigest": digest("33"),
+            "executionAssumptionDigest": digest("44"),
+            "cohortAuthorityDigest": digest("55"),
+            "cohortUniverseDigest": digest("66"),
+            "seed": 7,
+            "selectionCriterion": "total-return",
+            "status": {
+                "state": "completed",
+                "resultDigest": digest("77"),
+                "artifact": {
+                    "artifactId": format!("backtest-report-{}", digest("88")),
+                    "sha256": digest("88"),
+                    "byteCount": 128,
+                    "mediaType": "application/json"
+                },
+                "metrics": [],
+                "datasetPartition": {
+                    "startsAtUnixNanos": 1,
+                    "endsAtUnixNanos": 2
+                },
+                "fillCount": 2,
+                "partialFillCount": 1,
+                "noActionCount": 0,
+                "accountingReconciliation": "independent",
+                "executionAssumptions": {
+                    "policyVersion": 3,
+                    "feeBasisPoints": 1,
+                    "spreadModel": "observed-point-in-time-half-spread",
+                    "slippageBasisPoints": 2,
+                    "maximumRandomSlippageBasisPoints": 3,
+                    "latencyNanos": 4,
+                    "maximumParticipationBasisPoints": 5,
+                    "liquidityPriority": "signal-time-then-order-id",
+                    "partialFillsAllowed": true,
+                    "feeDecimalScale": 2
+                },
+                "cohortDiagnostics": {
+                    "state": "completed",
+                    "evaluationId": digest("99"),
+                    "probabilityOfBacktestOverfitting": 0.25,
+                    "foldCount": 2,
+                    "deflatedPerformanceProbability": 0.75,
+                    "expectedMaximumSharpe": 0.5
+                }
+            }
+        }));
+        assert!(record.is_ok());
+    }
 }

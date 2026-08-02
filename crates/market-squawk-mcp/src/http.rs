@@ -1,6 +1,13 @@
 //! Authenticated, POST-only stateless Streamable HTTP composition.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::Body,
@@ -30,6 +37,16 @@ pub struct AuthenticatedMcpClient {
     client_id: ClientId,
     credential_generation: CredentialGeneration,
     requests: Arc<Semaphore>,
+    maximum_active_requests: usize,
+    telemetry: Arc<ClientRequestTelemetry>,
+}
+
+#[derive(Debug, Default)]
+struct ClientRequestTelemetry {
+    admitted_requests: AtomicU64,
+    saturated_requests: AtomicU64,
+    initialized_relays: AtomicU64,
+    last_activity_unix_seconds: AtomicU64,
 }
 
 impl AuthenticatedMcpClient {
@@ -55,6 +72,28 @@ impl AuthenticatedMcpClient {
             client_id,
             credential_generation,
             requests: Arc::new(Semaphore::new(maximum_active_requests)),
+            maximum_active_requests,
+            telemetry: Arc::new(ClientRequestTelemetry::default()),
+        })
+    }
+
+    /// Advances only the credential generation while retaining this client's request ceiling and
+    /// telemetry authority.
+    pub fn with_credential_generation(
+        &self,
+        client_id: ClientId,
+        credential_generation: CredentialGeneration,
+    ) -> Result<Self, McpHttpAuthError> {
+        if client_id != self.client_id {
+            return Err(McpHttpAuthError::InvalidIdentity);
+        }
+        Ok(Self {
+            client: self.client,
+            client_id,
+            credential_generation,
+            requests: Arc::clone(&self.requests),
+            maximum_active_requests: self.maximum_active_requests,
+            telemetry: Arc::clone(&self.telemetry),
         })
     }
 
@@ -76,11 +115,84 @@ impl AuthenticatedMcpClient {
         self.credential_generation
     }
 
-    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, McpHttpAuthError> {
-        Arc::clone(&self.requests)
-            .try_acquire_owned()
-            .map_err(|_error| McpHttpAuthError::Saturated)
+    /// Configured simultaneous request ceiling retained across credential rotations.
+    #[must_use]
+    pub const fn maximum_active_requests(&self) -> usize {
+        self.maximum_active_requests
     }
+
+    /// Requests currently retaining this client's semaphore permit.
+    #[must_use]
+    pub fn active_requests(&self) -> usize {
+        self.maximum_active_requests
+            .saturating_sub(self.requests.available_permits())
+    }
+
+    /// Requests admitted since this installed-service process started.
+    #[must_use]
+    pub fn admitted_requests(&self) -> u64 {
+        self.telemetry.admitted_requests.load(Ordering::Relaxed)
+    }
+
+    /// Requests rejected because this client's request ceiling was already exhausted.
+    #[must_use]
+    pub fn saturated_requests(&self) -> u64 {
+        self.telemetry.saturated_requests.load(Ordering::Relaxed)
+    }
+
+    /// Stateless relay initialization requests admitted during this service process.
+    #[must_use]
+    pub fn initialized_relays(&self) -> u64 {
+        self.telemetry.initialized_relays.load(Ordering::Relaxed)
+    }
+
+    /// Last admitted request activity as Unix seconds, or `None` before the first request.
+    #[must_use]
+    pub fn last_activity_unix_seconds(&self) -> Option<u64> {
+        match self
+            .telemetry
+            .last_activity_unix_seconds
+            .load(Ordering::Relaxed)
+        {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, McpHttpAuthError> {
+        match Arc::clone(&self.requests).try_acquire_owned() {
+            Ok(permit) => {
+                increment(&self.telemetry.admitted_requests);
+                self.observe_activity();
+                Ok(permit)
+            }
+            Err(_error) => {
+                increment(&self.telemetry.saturated_requests);
+                self.observe_activity();
+                Err(McpHttpAuthError::Saturated)
+            }
+        }
+    }
+
+    fn observe_method(&self, method: Option<&str>) {
+        if method == Some("initialize") {
+            increment(&self.telemetry.initialized_relays);
+        }
+    }
+
+    fn observe_activity(&self) {
+        if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            self.telemetry
+                .last_activity_unix_seconds
+                .store(elapsed.as_secs(), Ordering::Relaxed);
+        }
+    }
+}
+
+fn increment(counter: &AtomicU64) {
+    let _result = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 impl fmt::Debug for AuthenticatedMcpClient {
@@ -275,6 +387,12 @@ impl McpHttpService {
             Ok(permit) => permit,
             Err(_error) => return response(StatusCode::TOO_MANY_REQUESTS, None),
         };
+        identity.observe_method(
+            request
+                .headers()
+                .get("mcp-method")
+                .and_then(|value| value.to_str().ok()),
+        );
         request.extensions_mut().insert(identity);
         let inner = self.inner.handle(request).await;
         let (parts, body) = inner.into_parts();

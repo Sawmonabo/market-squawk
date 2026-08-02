@@ -13,14 +13,15 @@ use async_trait::async_trait;
 use market_squawk_data::{DatasetManifestRef, Sha256Digest};
 use market_squawk_domain::ModelId;
 use market_squawk_modeling::{
-    BundleId, FeatureNormalizer, InferenceBackend, ModelDecision, ModelFeatureValue, ModelFormat,
-    ModelInput, ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity,
+    BundleId, FeatureNormalizer, InferenceBackend, ModelBundle, ModelDecision, ModelFeatureValue,
+    ModelFormat, ModelInput, ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity,
     ValidationMetricName,
 };
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -133,7 +134,28 @@ impl ModelDomainService {
             .filter(|backend| backend.metadata().model_id() == model_id)
             .max_by_key(|backend| backend.metadata().bundle_version())
             .ok_or(ServiceError::NotFound)?;
-        one_result(model_metadata_value(bundle.metadata()), request, context)
+        let retained = image
+            .registry
+            .get(
+                bundle.metadata().bundle_id(),
+                bundle.metadata().bundle_version(),
+            )
+            .map_err(|_| ServiceError::Unavailable)?
+            .ok_or(ServiceError::Unavailable)?;
+        one_result(
+            model_metadata_value(
+                &retained,
+                runtime_health_value(
+                    image.backends.len(),
+                    image
+                        .registry
+                        .len()
+                        .map_err(|_| ServiceError::Unavailable)?,
+                ),
+            )?,
+            request,
+            context,
+        )
     }
 
     fn bundles(
@@ -503,7 +525,11 @@ fn bundle_summary(metadata: &ModelMetadata) -> Value {
     })
 }
 
-fn model_metadata_value(metadata: &ModelMetadata) -> Value {
+fn model_metadata_value(
+    bundle: &ModelBundle,
+    runtime_health: Value,
+) -> Result<Value, ServiceError> {
+    let metadata = bundle.metadata();
     let thresholds = metadata.decision_thresholds();
     let dataset = metadata.dataset();
     let features = metadata
@@ -525,7 +551,7 @@ fn model_metadata_value(metadata: &ModelMetadata) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({
+    Ok(json!({
         "modelId": metadata.model_id().to_string(),
         "bundleId": metadata.bundle_id().as_str(),
         "bundleVersion": metadata.bundle_version().get(),
@@ -559,8 +585,120 @@ fn model_metadata_value(metadata: &ModelMetadata) -> Value {
         "fallbackBehavior": {
             "decision": "no_action",
             "reason": metadata.fallback_reason()
-        }
+        },
+        "admissionEvidence": admission_evidence_value(metadata),
+        "runtimeHealth": runtime_health,
+        "trainingEvidence": training_evidence_value(bundle)?
+    }))
+}
+
+fn admission_evidence_value(metadata: &ModelMetadata) -> Value {
+    json!({
+        "status": "admitted",
+        "authority": "rust_verified_durable_registry",
+        "metadataHash": digest_value(metadata.metadata_hash()),
+        "artifactHash": digest_value(metadata.artifact_hash()),
+        "trainingRunHash": digest_value(metadata.training_run_hash()),
+        "rejectionPolicy": "A candidate that fails verification is never published into the registry or backend read image.",
+        "failureBehavior": "no_action"
     })
+}
+
+fn runtime_health_value(backend_generations: usize, registry_generations: usize) -> Value {
+    json!({
+        "status": "ready",
+        "probe": "registry_backend_identity_match",
+        "backendGenerations": backend_generations,
+        "registryGenerations": registry_generations,
+        "failureBehavior": "unavailable inference returns no action"
+    })
+}
+
+fn training_evidence_value(bundle: &ModelBundle) -> Result<Value, ServiceError> {
+    let wire: TrainingRunEvidenceWire = serde_json::from_slice(bundle.training_run_bytes())
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let splits = wire.trial.split_counts;
+    let forecast = wire.trial.forecast.map(|forecast| {
+        json!({
+            "strategy": forecast.strategy,
+            "horizons": forecast.horizons,
+            "observedCutoffUnixNanos": forecast.observed_cutoff_unix_nanos,
+            "rollingSplits": forecast.rolling_splits,
+            "selectionHash": forecast.selection_sha256
+        })
+    });
+    let horizon_status = if forecast.is_some() {
+        "recorded"
+    } else {
+        "not_applicable"
+    };
+    Ok(json!({
+        "schemaVersion": wire.schema_version,
+        "trialHash": wire.trial_sha256,
+        "seed": wire.trial.seed,
+        "missingPolicy": wire.trial.missing_policy,
+        "splits": {
+            "train": splits.train,
+            "validation": splits.validation,
+            "test": splits.test,
+            "splitHash": wire.trial.split_sha256
+        },
+        "forecastSchedule": forecast,
+        "cohortEvidence": [
+            {
+                "dimension": "horizon",
+                "status": horizon_status,
+                "reason": if horizon_status == "recorded" { "Bound forecast horizons and rolling temporal splits are retained in the admitted training run." } else { "This admitted bundle is not a forecast model." }
+            },
+            {
+                "dimension": "regime",
+                "status": "not_recorded",
+                "reason": "The admitted training-run schema has no regime partition; no regime metric is inferred."
+            },
+            {
+                "dimension": "instrument",
+                "status": "universe_bound_only",
+                "reason": "The training universe is bound by immutable bundle metadata; no per-instrument metric is retained."
+            },
+            {
+                "dimension": "confidence",
+                "status": "calibration_bound_only",
+                "reason": "Confidence evidence is limited to the admitted calibration coverage and interval policy when present."
+            }
+        ]
+    }))
+}
+
+#[derive(Deserialize)]
+struct TrainingRunEvidenceWire {
+    schema_version: u32,
+    trial_sha256: String,
+    trial: TrainingTrialEvidenceWire,
+}
+
+#[derive(Deserialize)]
+struct TrainingTrialEvidenceWire {
+    seed: u64,
+    missing_policy: String,
+    split_counts: SplitCountsEvidenceWire,
+    split_sha256: String,
+    forecast: Option<ForecastScheduleEvidenceWire>,
+}
+
+#[derive(Deserialize)]
+struct SplitCountsEvidenceWire {
+    train: usize,
+    validation: usize,
+    test: usize,
+}
+
+#[derive(Deserialize)]
+struct ForecastScheduleEvidenceWire {
+    strategy: String,
+    horizons: Vec<u32>,
+    observed_cutoff_unix_nanos: i64,
+    rolling_splits: u32,
+    selection_sha256: String,
 }
 
 fn model_output_value(output: &ModelOutput) -> Value {

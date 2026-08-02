@@ -9,9 +9,10 @@ use clap::Parser;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
 use market_squawk_installer::{
-    InstallError, PlatformError, UninstallRequest, default_install_root, uninstall,
+    InstallError, PlatformError, ProgramName, UninstallRequest, default_install_root,
+    program_install_snapshot, uninstall,
 };
-use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
+use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources, LocalPaths};
 use tauri::Manager;
 use thiserror::Error;
 
@@ -30,10 +31,10 @@ use bridge::{
 };
 use events::subscribe_service_events;
 use input_staging::{stage_training_input, start_backtest_from_file};
-use mcp_clients::mcp_status;
+use mcp_clients::{DesktopMcpClientState, mcp_client_control, mcp_status};
 use service_client::{
-    dashboard_query, fair_value_control, job_control, model_control, paper_control,
-    research_control, source_control,
+    dashboard_query, decision_control, fair_value_control, governance_control, governance_query,
+    job_control, model_control, paper_control, research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -103,6 +104,8 @@ enum DesktopStartupError {
     Tauri(#[from] tauri::Error),
     #[error("desktop state was already installed")]
     DuplicateState,
+    #[error("installed MCP client authority is unavailable")]
+    McpClientAuthority,
     #[error("native package cleanup could not determine the program root")]
     NativeUninstallRoot(#[from] PlatformError),
     #[error("native package cleanup failed")]
@@ -192,10 +195,14 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             dashboard_query,
+            decision_control,
             desktop_bootstrap,
             fair_value_control,
+            governance_control,
+            governance_query,
             job_control,
             installation_control,
+            mcp_client_control,
             mcp_status,
             model_control,
             open_official_provider_page,
@@ -240,6 +247,12 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     )?;
     let service =
         tauri::async_runtime::block_on(service::connect_or_start(&config, config_path.as_deref()))?;
+    let local_paths = LocalPaths::open_existing(config.data_dir())
+        .map_err(|_error| DesktopStartupError::McpClientAuthority)?;
+    let relay_snapshot = program_install_snapshot(&installation.root, ProgramName::McpRelay)?;
+    let relay_program = relay_snapshot
+        .program_path()
+        .ok_or(DesktopStartupError::McpClientAuthority)?;
     let state = DesktopState::try_new(
         service.application,
         service.bootstrap,
@@ -248,7 +261,18 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         installation.status,
     )
     .map_err(|_error| DesktopStartupError::InvalidServiceBootstrap)?;
-    if !app.manage(state) {
+    let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
+        state.mcp_authority_identities();
+    let mcp_clients = DesktopMcpClientState::try_new(
+        &local_paths,
+        relay_program,
+        state.runtime(),
+        endpoint_identity,
+        claude_credential_identity,
+        codex_credential_identity,
+    )
+    .map_err(|_error| DesktopStartupError::McpClientAuthority)?;
+    if !app.manage(state) || !app.manage(mcp_clients) {
         return Err(DesktopStartupError::DuplicateState);
     }
     let exit_code = app.run_return(|handle, event| match event {

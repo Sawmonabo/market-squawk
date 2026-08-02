@@ -10,8 +10,8 @@ use std::{
 use getrandom::fill as fill_random;
 use market_squawk_platform::{
     LocalSecretStoreError, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
-    SecretKey, SecretMutationPlan, SecretOperationControl, SecretReconciliationObservation,
-    SecretRef, SecretStore, SecretValue,
+    SecretKey, SecretMutationKind, SecretMutationPlan, SecretOperationControl,
+    SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use subtle::ConstantTimeEq as _;
@@ -142,6 +142,46 @@ pub struct ClientCredentialProvisioningPlan {
     client_id: ClientId,
     client: NamedClient,
     mutation: SecretMutationPlan,
+}
+
+/// Durable non-secret plan for advancing one registered client credential by one generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ClientCredentialRotationPlan {
+    client_id: ClientId,
+    client: NamedClient,
+    current: ClientCredentialRegistration,
+    mutation: SecretMutationPlan,
+}
+
+impl ClientCredentialRotationPlan {
+    /// Registered client identity retained across the rotation.
+    #[must_use]
+    pub const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    /// Closed named-client class retained across the rotation.
+    #[must_use]
+    pub const fn client(&self) -> NamedClient {
+        self.client
+    }
+
+    /// Exact pre-rotation registration that remains authoritative until commit.
+    #[must_use]
+    pub const fn current(&self) -> &ClientCredentialRegistration {
+        &self.current
+    }
+
+    /// Candidate registration fixed before any credential bytes are written.
+    #[must_use]
+    pub fn candidate(&self) -> ClientCredentialRegistration {
+        ClientCredentialRegistration::new(
+            self.client_id,
+            self.client,
+            self.mutation.target().clone(),
+        )
+    }
 }
 
 impl ClientCredentialProvisioningPlan {
@@ -400,14 +440,14 @@ impl CredentialRegistry {
         Ok(credential.registration.client)
     }
 
-    /// Creates a higher candidate while retaining the active generation until durable commit.
-    pub fn begin_rotation(
+    /// Selects one exact replacement target without changing secret or in-process authority.
+    pub fn plan_rotation(
         &self,
         client_id: ClientId,
-    ) -> Result<ClientCredentialRegistration, CredentialError> {
-        let mut active = self
+    ) -> Result<ClientCredentialRotationPlan, CredentialError> {
+        let active = self
             .active
-            .write()
+            .read()
             .map_err(|_| CredentialError::Unavailable)?;
         let current = active.get(&client_id).ok_or(CredentialError::NotFound)?;
         if current.pending.is_some() {
@@ -420,36 +460,100 @@ impl CredentialRegistry {
             .checked_add(1)
             .ok_or(CredentialError::GenerationExhausted)?;
         let next_generation = CredentialGeneration::try_new(next_value)?.to_secret_generation()?;
-        let candidate = generate_credential()?;
-        let key = secret_key(current.registration.client)?;
-        let reference = self
+        let client = current.registration.client();
+        let mutation = self
             .store
-            .replace(
-                &key,
-                &current.registration.reference,
+            .plan_replace(
+                &secret_key(client)?,
+                current.registration.reference(),
                 next_generation,
-                candidate,
-                &secret_control("runtime-auth-rotate")?,
+                &secret_control("runtime-auth-plan-rotation")?,
             )
             .map_err(map_secret_error)?;
-        let registration =
-            ClientCredentialRegistration::new(client_id, current.registration.client, reference);
-        let value = match self.store.read(
-            &registration.reference,
-            &secret_control("runtime-auth-reload")?,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                if let Ok(control) = secret_control("runtime-auth-rotate-cleanup") {
-                    let _cleanup = self.store.delete(&registration.reference, &control);
+        Ok(ClientCredentialRotationPlan {
+            client_id,
+            client,
+            current: current.registration.clone(),
+            mutation,
+        })
+    }
+
+    /// Reconciles a durably recorded replacement target after an interrupted process.
+    pub fn reconcile_planned_rotation(
+        store: &dyn SecretStore,
+        plan: &ClientCredentialRotationPlan,
+    ) -> Result<ClientCredentialRegistration, CredentialError> {
+        validate_rotation_plan(plan)?;
+        let key = secret_key(plan.client)?;
+        let control = secret_control("runtime-auth-reconcile-planned-rotation")?;
+        match store
+            .inspect_planned(&key, &plan.mutation, &control)
+            .map_err(map_secret_error)?
+        {
+            SecretReconciliationObservation::Absent => {
+                if let Err(failure) =
+                    store.execute_planned(&key, &plan.mutation, generate_credential()?, &control)
+                    && !matches!(
+                        store.inspect_planned(&key, &plan.mutation, &control),
+                        Ok(SecretReconciliationObservation::PresentUnverified)
+                            | Ok(SecretReconciliationObservation::Matches)
+                    )
+                {
+                    return Err(map_secret_error(failure.into_error()));
                 }
-                return Err(map_secret_error(error));
             }
-        };
-        active
-            .get_mut(&client_id)
-            .ok_or(CredentialError::NotFound)?
-            .pending = Some(PendingCredential {
+            SecretReconciliationObservation::PresentUnverified
+            | SecretReconciliationObservation::Matches => {}
+            SecretReconciliationObservation::Mismatch => {
+                return Err(CredentialError::SecretStore);
+            }
+        }
+        Ok(plan.candidate())
+    }
+
+    /// Loads a durably planned replacement into the in-process pending slot.
+    pub fn begin_planned_rotation(
+        &self,
+        plan: &ClientCredentialRotationPlan,
+    ) -> Result<ClientCredentialRegistration, CredentialError> {
+        validate_rotation_plan(plan)?;
+        {
+            let active = self
+                .active
+                .read()
+                .map_err(|_| CredentialError::Unavailable)?;
+            let current = active
+                .get(&plan.client_id)
+                .ok_or(CredentialError::NotFound)?;
+            if current.registration != plan.current {
+                return Err(CredentialError::GenerationMismatch);
+            }
+            if current.pending.is_some() {
+                return Err(CredentialError::RotationInProgress);
+            }
+        }
+        let registration = Self::reconcile_planned_rotation(self.store.as_ref(), plan)?;
+        let value = self
+            .store
+            .read(
+                registration.reference(),
+                &secret_control("runtime-auth-load-planned-rotation")?,
+            )
+            .map_err(map_secret_error)?;
+        let mut active = self
+            .active
+            .write()
+            .map_err(|_| CredentialError::Unavailable)?;
+        let current = active
+            .get_mut(&plan.client_id)
+            .ok_or(CredentialError::NotFound)?;
+        if current.registration != plan.current {
+            return Err(CredentialError::GenerationMismatch);
+        }
+        if current.pending.is_some() {
+            return Err(CredentialError::RotationInProgress);
+        }
+        current.pending = Some(PendingCredential {
             registration: registration.clone(),
             value,
         });
@@ -562,6 +666,26 @@ fn validate_clients(clients: &[(ClientId, NamedClient)]) -> Result<(), Credentia
     } else {
         Ok(())
     }
+}
+
+fn validate_rotation_plan(plan: &ClientCredentialRotationPlan) -> Result<(), CredentialError> {
+    let expected_generation = plan
+        .current
+        .generation()
+        .get()
+        .checked_add(1)
+        .ok_or(CredentialError::GenerationExhausted)?;
+    if plan.client_id != plan.current.client_id()
+        || plan.client != plan.current.client()
+        || plan.mutation.target().generation().get() != expected_generation
+        || !matches!(
+            plan.mutation.kind(),
+            SecretMutationKind::Replace { current } if current == plan.current.reference()
+        )
+    {
+        return Err(CredentialError::GenerationMismatch);
+    }
+    Ok(())
 }
 
 /// Non-secret completion evidence for a two-phase credential rotation.

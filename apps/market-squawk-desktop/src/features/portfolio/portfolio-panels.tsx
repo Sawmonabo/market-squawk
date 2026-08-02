@@ -132,6 +132,9 @@ export function PerformancePanel({
           history.
         </EvidenceNote>
       ) : null}
+      {performance.accountingEvidence ? (
+        <AccountingPanel accounting={performance.accountingEvidence} />
+      ) : null}
     </section>
   )
 }
@@ -265,16 +268,47 @@ export function ProvenancePanel({
           {" "}of {holdingsResult.evidence.availableItems}).
         </p>
       </div>
+      <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
+        <p className="text-sm font-medium text-foreground">Import progress</p>
+        <ol className="mt-3 space-y-2 text-xs leading-5 text-muted-foreground">
+          <li>
+            1. Source file archived and normalized into immutable revision {" "}
+            <span className="font-mono text-[10px] text-foreground">
+              {shortIdentity(account.currentRevision.revisionId, "Revision")}
+            </span>
+            .
+          </li>
+          <li>
+            2. {account.holdingCount.toLocaleString()} holdings and {" "}
+            {account.transactionCount.toLocaleString()} source transactions are available to
+            review.
+          </li>
+          <li>
+            3. {account.reconciliationDiscrepancies === 0
+              ? "Review the reconciliation explanation before relying on the totals."
+              : "Review each reconciliation difference below, then import a corrected later source revision if needed."}
+          </li>
+        </ol>
+      </div>
       <EvidenceNote icon={CircleAlert}>
-        This portfolio result does not provide a distinct market-mark source, venue, freshness
-        policy, or per-holding quality. Those facts are not inferred from the import source.
+        Each holding row shows its exact imported mark source and observation time. This portfolio
+        source has not supplied a venue, market-freshness policy, or alternate mark authority, so
+        Market Squawk does not promote the values to live, delayed, stale, or modeled marks.
       </EvidenceNote>
     </section>
   )
 }
 
-export function ReconciliationPanel({ account }: { account: PortfolioAccount }) {
-  const hasNoFindings = account.reconciliationDiscrepancies === 0
+export function ReconciliationPanel({
+  account,
+  performance,
+}: {
+  account: PortfolioAccount
+  performance: PortfolioPerformance | null
+}) {
+  const details = performance?.accountingEvidence?.reconciliation
+  const hasNoFindings = details?.discrepancies.length === 0
+  const missingDetails = details === undefined
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
@@ -295,26 +329,89 @@ export function ReconciliationPanel({ account }: { account: PortfolioAccount }) 
           ) : (
             <CircleAlert className="size-4 text-amber-300" aria-hidden="true" />
           )}
-          {hasNoFindings
+          {missingDetails
+            ? "Detailed reconciliation evidence is unavailable"
+            : hasNoFindings
             ? "No supplied-versus-calculated discrepancy was retained"
             : `${account.reconciliationDiscrepancies} supplied total${
                 account.reconciliationDiscrepancies === 1 ? "" : "s"
               } need review`}
         </div>
-        {!hasNoFindings ? (
+        {missingDetails ? (
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            The current desktop query reports the discrepancy count but does not expose the exact
-            supplied and calculated values. No resolution action is shown without that evidence.
+            The service has not returned the source-total comparison rows for this revision. Do
+            not treat the discrepancy count as a reconciliation result.
+          </p>
+        ) : !hasNoFindings ? (
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            Each mismatch below keeps the source value, independently calculated value, tolerance,
+            and raw source reference together. Correct the source export or import a later
+            revision; the dashboard never overwrites either side.
           </p>
         ) : (
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            The count does not establish which source totals were present. Detailed supplied and
-            calculated values are not available through the current desktop query.
+            This says only that no retained comparison exceeded its declared tolerance. It does not
+            establish that the source supplied every possible total.
           </p>
         )}
       </div>
+      {details && details.discrepancies.length > 0 ? (
+        <div className="mt-4 space-y-3">
+          {details.discrepancies.map((detail) => (
+            <div key={`${detail.sourceReference}-${detail.field}`} className="rounded-lg border border-border bg-background/35 p-3 text-xs">
+              <p className="font-medium text-foreground">{humanize(detail.field)}</p>
+              <dl className="mt-2 grid gap-2 sm:grid-cols-3">
+                <Fact label="Supplied" value={formatMoney(detail.supplied)} />
+                <Fact label="Calculated" value={formatMoney(detail.calculated)} />
+                <Fact label="Tolerance" value={formatMoney(detail.tolerance.amount)} />
+              </dl>
+              <p className="mt-2 break-all font-mono text-[10px] text-muted-foreground">
+                Source {detail.sourceReference}
+              </p>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </section>
   )
+}
+
+function AccountingPanel({
+  accounting,
+}: {
+  accounting: NonNullable<PortfolioPerformance["accountingEvidence"]>
+}) {
+  const entries: [string, string][] = [
+    ["Source-reported cash", formatMoney(accounting.cash.amount)],
+    ["Source-reported market value", formatMoney(accounting.reportedMarketValue)],
+    ["Unrealized gain", accountingValue(accounting.unrealizedGain)],
+    ["Realized gain", accountingValue(accounting.realizedGain)],
+    ["Source-classified income", accountingValue(accounting.income)],
+    ["Source-classified fees", accountingValue(accounting.fees)],
+  ]
+  return (
+    <section className="mt-5 rounded-lg border border-border bg-background/35 p-4">
+      <p className="font-medium text-sm">Accounting evidence</p>
+      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+        Exact source values and calculated values remain separate. A gain is shown only after the
+        import has enough basis and trade-lifecycle evidence to support it.
+      </p>
+      <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {entries.map(([label, value]) => <Fact key={label} label={label} value={value} />)}
+      </dl>
+      <p className="mt-3 text-[11px] text-muted-foreground">
+        Cash observed {formatTimestamp(accounting.cash.observedAtUnixNanos)} · source {accounting.cash.sourceReference}
+      </p>
+    </section>
+  )
+}
+
+function accountingValue(value: {
+  status: string
+  amount?: { amount: string; currency: string }
+  reason?: string
+}) {
+  return value.amount ? formatMoney(value.amount) : evidenceLabel(value.status)
 }
 
 function SummaryFact({

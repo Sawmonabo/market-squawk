@@ -37,18 +37,25 @@ import {
   type FairValueApproval,
   type FairValueAuditEvent,
   type FairValueClassification,
+  type FairValueGovernanceProposal,
   type FairValueInput,
   type FairValueMeasurement,
+  type GovernanceAuthorization,
   parseFairValueApprovals,
   parseFairValueAuditPage,
   parseFairValueClassification,
   parseFairValueClassificationControl,
   parseFairValueEvidence,
+  parseFairValueGovernanceCommit,
+  parseFairValueGovernancePreview,
   parseFairValueExplanation,
   parseFairValueMarketAccess,
+  parseGovernanceAuthorization,
+  parseGovernancePrincipals,
   parseFairValueWorkspace,
 } from "./fair-value-contracts"
 import { FairValueDetail } from "./fair-value-detail"
+import { FairValueGovernanceWorkflow } from "./fair-value-governance"
 
 export function FairValuePage() {
   const product = useProduct()
@@ -244,6 +251,9 @@ function SelectedFairValue({
   const [approvalCutoff] = React.useState(() => new Date().toISOString())
   const [confirmClassification, setConfirmClassification] = React.useState(false)
   const [announcement, setAnnouncement] = React.useState("")
+  const [governanceAuthorizations, setGovernanceAuthorizations] = React.useState<
+    GovernanceAuthorization[]
+  >([])
   const operations = React.useMemo(
     () => new Set(bootstrap.operations.map((operation) => operation.name)),
     [bootstrap.operations],
@@ -382,6 +392,95 @@ function SelectedFairValue({
         result.replay
           ? "The current rules classification was already retained."
           : "The measurement was evaluated with the current rules.",
+      )
+      await queryClient.invalidateQueries({
+        queryKey: productKeys.domain(bootstrap.runtime, "FairValue"),
+      })
+    },
+  })
+  const governanceAvailable =
+    operations.has("Governance.ListPrincipals") &&
+    operations.has("Governance.AuthenticateAction") &&
+    operations.has("FairValue.PreviewGovernanceAction") &&
+    operations.has("FairValue.CommitGovernanceAction")
+  const governancePrincipals = useQuery({
+    queryKey: productKeys.operation(bootstrap.runtime, "Governance", "Governance.ListPrincipals", {}),
+    queryFn: async () =>
+      parseGovernancePrincipals(
+        await transport.governanceQuery({ query: "principals" }),
+      ),
+    enabled: governanceAvailable,
+  })
+  const governancePreview = useMutation({
+    mutationFn: async (proposal: FairValueGovernanceProposal) =>
+      parseFairValueGovernancePreview(
+        await transport.fairValueControl(
+          { action: "previewGovernanceAction", proposal },
+          true,
+        ),
+      ),
+    onSuccess: () => {
+      setGovernanceAuthorizations([])
+      setAnnouncement("The service created a canonical governance preview. Authenticate every required principal before committing it.")
+    },
+  })
+  const governanceAuthenticate = useMutation({
+    mutationFn: async ({
+      principalId,
+      credential,
+    }: {
+      principalId: string
+      credential: string
+    }) => {
+      const preview = governancePreview.data
+      if (!preview) throw new Error("Create a governance preview before authenticating a principal.")
+      return parseGovernanceAuthorization(
+        await transport.governanceControl(
+          {
+            action: "authenticateAction",
+            previewId: preview.previewId,
+            principalId,
+            credential,
+          },
+          true,
+        ),
+        preview.previewId,
+      )
+    },
+    onSuccess: (authorization) => {
+      setGovernanceAuthorizations((current) => [
+        ...current.filter(
+          (item) =>
+            item.principalId !== authorization.principalId,
+        ),
+        authorization,
+      ])
+      setAnnouncement("The service accepted this principal's one-use authorization for the exact preview.")
+    },
+  })
+  const governanceCommit = useMutation({
+    mutationFn: async () => {
+      const preview = governancePreview.data
+      if (!preview) throw new Error("Create a governance preview before committing it.")
+      return parseFairValueGovernanceCommit(
+        await transport.fairValueControl(
+          {
+            action: "commitGovernanceAction",
+            previewId: preview.previewId,
+            authorizationHandles: governanceAuthorizations.map(
+              (authorization) => authorization.authorizationHandle,
+            ),
+          },
+          true,
+        ),
+        preview.previewId,
+      )
+    },
+    onSuccess: async (commit) => {
+      setGovernanceAuthorizations([])
+      governancePreview.reset()
+      setAnnouncement(
+        `The service committed the governed action and retained receipt ${commit.receiptId}.`,
       )
       await queryClient.invalidateQueries({
         queryKey: productKeys.domain(bootstrap.runtime, "FairValue"),
@@ -536,6 +635,47 @@ function SelectedFairValue({
           onLoadMore: () => void audit.fetchNextPage(),
         }}
       />
+      {governanceAvailable ? (
+        <FairValueGovernanceWorkflow
+          measurement={measurement}
+          classification={resolvedClassification}
+          inputs={evidence.data?.inputs}
+          approvals={approvals.data?.approvals}
+          principals={governancePrincipals.data}
+          state={{
+            preview: governancePreview.data ?? null,
+            authorizations: governanceAuthorizations,
+            busy:
+              governancePreview.isPending ||
+              governanceAuthenticate.isPending ||
+              governanceCommit.isPending,
+            error: governanceAuthenticate.isError
+              ? "Authentication was not accepted. Reauthenticate an eligible principal for this exact preview."
+              : governanceCommit.isError
+                ? messageFrom(governanceCommit.error)
+                : governancePreview.isError
+                  ? messageFrom(governancePreview.error)
+                  : governancePrincipals.isError
+                    ? messageFrom(governancePrincipals.error)
+                    : null,
+          }}
+          onPreview={(proposal) => governancePreview.mutate(proposal)}
+          onAuthenticate={(principalId, credential) =>
+            governanceAuthenticate.mutate({ principalId, credential })
+          }
+          onCommit={() => governanceCommit.mutate()}
+        />
+      ) : (
+        <Alert className="border-dashed">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Guided governance is unavailable</AlertTitle>
+          <AlertDescription>
+            This installed service does not advertise the principal, preview, authentication, and
+            commit operations required to record a governed action. Do not substitute actor names,
+            raw requests, or browser confirmation for those service-held controls.
+          </AlertDescription>
+        </Alert>
+      )}
       <Dialog open={confirmClassification} onOpenChange={setConfirmClassification}>
         <DialogContent>
           <DialogHeader>

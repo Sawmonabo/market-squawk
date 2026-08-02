@@ -122,6 +122,17 @@ impl BacktestRequest {
         self.dataset.object_graph_digest()
     }
 
+    /// Returns the exact decision-time interval that was admitted for this request.
+    ///
+    /// This is intentionally derived from the sealed dataset rather than caller input so cohort
+    /// generation can bind each member to the same partition the engine will execute.
+    #[must_use]
+    pub fn dataset_partition(&self) -> Option<crate::TrialDatasetPartition> {
+        let starts_at = self.dataset.observations.first()?.decision_at;
+        let ends_at = self.dataset.observations.last()?.decision_at;
+        crate::TrialDatasetPartition::try_new(starts_at, ends_at).ok()
+    }
+
     /// Returns the exact research execution-assumption identity.
     #[must_use]
     pub const fn assumption_digest(&self) -> Sha256Digest {

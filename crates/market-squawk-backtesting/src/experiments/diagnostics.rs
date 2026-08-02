@@ -92,6 +92,12 @@ impl BacktestOverfittingDiagnostic {
     pub const fn probability(self) -> f64 {
         self.probability
     }
+
+    /// Returns the number of independently materialized folds used by the diagnostic.
+    #[must_use]
+    pub const fn fold_count(self) -> usize {
+        self.folds
+    }
 }
 
 /// Inputs to the multiple-testing-adjusted deflated Sharpe probability.
@@ -161,6 +167,12 @@ impl DeflatedPerformanceDiagnostic {
     #[must_use]
     pub const fn probability(self) -> f64 {
         self.probability
+    }
+
+    /// Returns the multiple-testing-adjusted Sharpe hurdle used by the diagnostic.
+    #[must_use]
+    pub const fn expected_maximum_sharpe(self) -> f64 {
+        self.expected_maximum_sharpe
     }
 }
 

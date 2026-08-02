@@ -199,22 +199,31 @@ struct CommandWire {
     input_id: SourceIdentifier,
     instruments: Vec<InstrumentId>,
     time_range: Option<TimeRangeWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_ranges: Option<Vec<TimeRangeWire>>,
     sources: Vec<SourceId>,
 }
 
 impl CommandWire {
     fn from_command(command: &GovernedBacktestCommand) -> Self {
+        let time_ranges = command.scope().time_ranges();
         Self {
             strategy_id: command.strategy_id().clone(),
             input_id: command.input_id().clone(),
             instruments: command.scope().instruments().to_vec(),
-            time_range: command
-                .scope()
-                .time_range()
-                .map(|(starts_at, ends_at)| TimeRangeWire {
-                    starts_at_unix_nanos: starts_at.unix_nanos(),
-                    ends_at_unix_nanos: ends_at.unix_nanos(),
-                }),
+            time_range: (time_ranges.len() == 1).then(|| TimeRangeWire {
+                starts_at_unix_nanos: time_ranges[0].0.unix_nanos(),
+                ends_at_unix_nanos: time_ranges[0].1.unix_nanos(),
+            }),
+            time_ranges: (time_ranges.len() > 1).then(|| {
+                time_ranges
+                    .iter()
+                    .map(|(starts_at, ends_at)| TimeRangeWire {
+                        starts_at_unix_nanos: starts_at.unix_nanos(),
+                        ends_at_unix_nanos: ends_at.unix_nanos(),
+                    })
+                    .collect()
+            }),
             sources: command.scope().sources().to_vec(),
         }
     }
@@ -225,11 +234,26 @@ impl CommandWire {
         if !strictly_ordered(&self.instruments) || !strictly_ordered(&self.sources) {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
-        let time_range = self.time_range.map(TimeRangeWire::into_range).transpose()?;
+        if self.time_range.is_some() && self.time_ranges.is_some() {
+            return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
+        }
+        let time_ranges = match self.time_ranges {
+            Some(time_ranges) => time_ranges
+                .into_iter()
+                .map(TimeRangeWire::into_range)
+                .collect::<Result<Vec<_>, _>>()?,
+            None => self
+                .time_range
+                .map(TimeRangeWire::into_range)
+                .transpose()?
+                .into_iter()
+                .collect(),
+        };
         Ok(GovernedBacktestCommand::new(
             self.strategy_id,
             self.input_id,
-            BacktestScope::new(self.instruments, time_range, self.sources),
+            BacktestScope::try_new_with_time_ranges(self.instruments, time_ranges, self.sources)
+                .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?,
         ))
     }
 }
@@ -264,13 +288,21 @@ pub(super) fn command_digest(command: &GovernedBacktestCommand) -> Result<String
     for instrument in command.scope().instruments() {
         hash.update(instrument.as_uuid().as_bytes());
     }
-    match command.scope().time_range() {
-        Some((starts_at, ends_at)) => {
+    match command.scope().time_ranges() {
+        [] => hash.update([0]),
+        [(starts_at, ends_at)] => {
             hash.update([1]);
             hash.update(starts_at.unix_nanos().to_be_bytes());
             hash.update(ends_at.unix_nanos().to_be_bytes());
         }
-        None => hash.update([0]),
+        time_ranges => {
+            hash.update([2]);
+            hash_count(&mut hash, time_ranges.len())?;
+            for (starts_at, ends_at) in time_ranges {
+                hash.update(starts_at.unix_nanos().to_be_bytes());
+                hash.update(ends_at.unix_nanos().to_be_bytes());
+            }
+        }
     }
     hash_count(&mut hash, command.scope().sources().len())?;
     for source in command.scope().sources() {

@@ -37,6 +37,7 @@ pub trait ResearchForecastBackend: InferenceBackend {
             observed_cutoff: request.observed_cutoff,
             available_at: request.available_at,
             horizon: request.horizon,
+            observed_history: request.observed_history.into(),
             points: points.into_boxed_slice(),
             model_id: metadata.model_id(),
             bundle_id: metadata.bundle_id().clone(),

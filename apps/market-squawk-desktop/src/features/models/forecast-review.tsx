@@ -6,6 +6,7 @@ import { productKeys } from "@/app/query-client"
 import {
   MarketPriceChart,
   type ForecastPricePoint,
+  type ObservedPricePoint,
 } from "@/components/charts/market-price-chart"
 import { humanize } from "@/lib/formatters"
 import type { LosslessInteger } from "@/lib/lossless-integer"
@@ -211,17 +212,16 @@ function ForecastDetail({
   const chartPoints = detail.points.map((point) =>
     chartPoint(point, outcomeByTarget.get(point.targetAtUnixNanos)),
   )
-  const chartUnavailable =
-    "Observed historical prices were not returned by the closed model queries. The modeled path can be reviewed, but Market Squawk will not manufacture pre-cutoff market evidence, targets, or scenarios."
+  const observedPoints = detail.observedHistory.map(observedPoint)
 
   return (
     <div className="mt-5 space-y-4">
       <MarketPriceChart
-        observed={[]}
+        observed={observedPoints}
         forecast={chartPoints}
         cutoffUnixNanos={detail.observedThroughUnixNanos}
         unit={`mantissa × 10^-${detail.points[0]?.decimalScale ?? "?"}`}
-        unavailableReason={chartUnavailable}
+        unavailableReason="This immutable vintage has no qualified observed history, so the chart cannot truthfully render a pre-forecast series."
       />
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -244,6 +244,7 @@ function ForecastDetail({
       </div>
 
       <CalibrationEvidence vintage={detail} />
+      <DriftMonitoring vintage={detail} />
 
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full min-w-[720px] text-left text-xs">
@@ -305,9 +306,33 @@ function ForecastDetail({
         </div>
       ) : null}
       <p className="text-[11px] leading-5 text-muted-foreground">
-        No target or deterministic scenario query was requested in this Models view. Neither layer
-        is derived from the modeled central path. Observed history also remains unavailable from the
-        current desktop market query surface.
+        The solid series is immutable source/PIT-qualified observed history through the vertical
+        forecast boundary. The dashed future path is modeled evidence only. No target or
+        deterministic scenario query was requested in this Models view.
+      </p>
+    </div>
+  )
+}
+
+function DriftMonitoring({ vintage }: { vintage: ForecastVintage }) {
+  const monitoring = vintage.driftMonitoring
+  const mean = monitoring.meanAbsoluteErrorMantissa
+    ? formatDecimal(monitoring.meanAbsoluteErrorMantissa, monitoring.decimalScale)
+    : "Not available"
+  return (
+    <div className="rounded-lg border border-violet-400/25 bg-violet-400/5 p-3">
+      <p className="text-xs font-medium text-violet-200">Outcome drift monitoring</p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="State" value={humanize(monitoring.status)} />
+        <Fact
+          label="Observed outcomes"
+          value={`${monitoring.includedOutcomeCount.toLocaleString()}${monitoring.truncated ? "+" : ""} of ${monitoring.observedOutcomeCount.toLocaleString()}`}
+        />
+        <Fact label="Mean absolute error" value={mean} mono />
+        <Fact label="Threshold" value={humanize(monitoring.thresholdState)} />
+      </dl>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        {monitoring.interpretation}
       </p>
     </div>
   )
@@ -361,6 +386,16 @@ function chartPoint(
     interval80: numberInterval(point.intervals?.interval80, scale),
     interval95: numberInterval(point.intervals?.interval95, scale),
     actual: outcome ? decimalNumber(outcome.actualMantissa, outcome.decimalScale) : undefined,
+  }
+}
+
+function observedPoint(
+  point: ForecastVintage["observedHistory"][number],
+): ObservedPricePoint {
+  return {
+    timeUnixNanos: point.observedAtUnixNanos,
+    value: decimalNumber(point.mantissa, point.decimalScale),
+    quality: point.quality,
   }
 }
 

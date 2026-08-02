@@ -1,20 +1,32 @@
 //! Installed-service ownership of durable job persistence and bounded execution.
 
 mod backtest;
+mod backup;
 mod forecast;
+mod recovery;
 mod research;
 mod scenario;
 mod screen;
 mod training;
+mod update;
 
 pub use backtest::{BacktestJobRunner, BacktestJobRunnerError};
+pub use backup::{
+    BackupJobAction, BackupJobAuthority, BackupJobCommand, BackupJobRunner, LifecycleJobAuthority,
+    LifecycleJobCommand, LifecycleJobExecutionError, LifecycleJobPublication,
+    LifecycleJobPublicationError, LifecycleJobRunnerError,
+};
 pub use forecast::{ForecastJobRunner, ForecastJobRunnerError};
+pub use recovery::{
+    RecoveryJobAction, RecoveryJobAuthority, RecoveryJobCommand, RecoveryJobRunner,
+};
 pub use research::{
     DatasetJobRunner, ResearchExportJobRunner, ResearchJobRunner, ResearchJobRunnerError,
 };
 pub use scenario::ScenarioJobRunner;
 pub use screen::{ScreenJobCommand, ScreenJobRunner, ScreenJobRunnerError};
 pub use training::{GovernedTrainingInput, TrainingJobRunner, TrainingJobRunnerError};
+pub use update::{UpdateJobAuthority, UpdateJobCommand, UpdateJobRunner};
 
 use std::{
     fmt,

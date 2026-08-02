@@ -3,7 +3,7 @@
 use std::{collections::HashSet, str::FromStr};
 
 use market_squawk_data::{Sha256Digest, UniverseId};
-use market_squawk_domain::{InstrumentId, ModelId};
+use market_squawk_domain::{DataQuality, InstrumentId, ModelId};
 use market_squawk_modeling::{
     BundleId, CalibrationMethod, ForecastOutcome, ForecastPath, ForecastVintage,
 };
@@ -68,6 +68,10 @@ impl VintageRecord {
         })
     }
 
+    pub(super) fn decimal_scale(&self) -> Option<u8> {
+        self.payload.points.first().map(|point| point.decimal_scale)
+    }
+
     fn validate(&self) -> bool {
         valid_digest(&self.vintage_id)
             && valid_digest(&self.request_hash)
@@ -126,6 +130,8 @@ pub(super) struct ForecastPayloadRecord {
     data_age_nanos_at_publication: i64,
     horizon_points: u16,
     horizon_step_nanos: u64,
+    #[serde(default)]
+    observed_history: Vec<ObservedPointRecord>,
     quality: String,
     points: Vec<PointRecord>,
     calibration: Option<CalibrationRecord>,
@@ -185,6 +191,12 @@ impl ForecastPayloadRecord {
             data_age_nanos_at_publication,
             horizon_points: path.horizon().points().get(),
             horizon_step_nanos: path.horizon().step_nanos().get(),
+            observed_history: path
+                .observed_history()
+                .iter()
+                .copied()
+                .map(ObservedPointRecord::from_point)
+                .collect(),
             quality: "modeled".to_owned(),
             points: path
                 .points()
@@ -246,6 +258,7 @@ impl ForecastPayloadRecord {
             || self.horizon_points == 0
             || usize::from(self.horizon_points) != self.points.len()
             || self.horizon_step_nanos == 0
+            || self.observed_history.len() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
             || self.quality != "modeled"
         {
             return false;
@@ -262,6 +275,66 @@ impl ForecastPayloadRecord {
                     calibrated,
                 )
             })
+            && (self.observed_history.is_empty()
+                || (self
+                    .observed_history
+                    .windows(2)
+                    .all(|pair| pair[0].observed_at_unix_nanos < pair[1].observed_at_unix_nanos)
+                    && self.observed_history.last().is_some_and(|point| {
+                        point.observed_at_unix_nanos == self.observed_through_unix_nanos
+                    })
+                    && self.observed_history.iter().all(|point| {
+                        point.validate(
+                            self.observed_through_unix_nanos,
+                            self.available_at_unix_nanos,
+                            self.points.first().map(|value| value.decimal_scale),
+                        )
+                    })))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedPointRecord {
+    observed_at_unix_nanos: i64,
+    available_at_unix_nanos: i64,
+    mantissa: String,
+    decimal_scale: u8,
+    source_pit_hash: String,
+    quality: String,
+}
+
+impl ObservedPointRecord {
+    fn from_point(point: market_squawk_modeling::ForecastObservedPoint) -> Self {
+        Self {
+            observed_at_unix_nanos: point.observed_at().unix_nanos(),
+            available_at_unix_nanos: point.available_at().unix_nanos(),
+            mantissa: point.value().mantissa().to_string(),
+            decimal_scale: point.value().scale(),
+            source_pit_hash: hex(point.source_pit_hash().bytes()),
+            quality: observed_quality_name(point.quality()).to_owned(),
+        }
+    }
+
+    fn validate(&self, cutoff: i64, path_available_at: i64, scale: Option<u8>) -> bool {
+        self.mantissa.parse::<i128>().is_ok()
+            && self.decimal_scale <= market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
+            && scale == Some(self.decimal_scale)
+            && self.observed_at_unix_nanos <= cutoff
+            && self.available_at_unix_nanos >= self.observed_at_unix_nanos
+            && self.available_at_unix_nanos <= path_available_at
+            && valid_digest(&self.source_pit_hash)
+            && matches!(
+                self.quality.as_str(),
+                "direct_verified"
+                    | "direct_unverified"
+                    | "official_delayed"
+                    | "aggregated"
+                    | "indicative"
+                    | "estimated"
+                    | "stale"
+                    | "quarantined"
+            )
     }
 }
 
@@ -455,6 +528,10 @@ impl OutcomeRecord {
         &self.outcome_id
     }
 
+    pub(super) fn absolute_error_mantissa(&self) -> Option<i128> {
+        self.absolute_error_mantissa.parse().ok()
+    }
+
     pub(super) fn from_outcome(
         outcome: &ForecastOutcome,
         vintage: &VintageRecord,
@@ -646,4 +723,18 @@ pub(super) fn hex<const N: usize>(bytes: [u8; N]) -> String {
         value.push(char::from(ALPHABET[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+const fn observed_quality_name(quality: DataQuality) -> &'static str {
+    match quality {
+        DataQuality::DirectVerified => "direct_verified",
+        DataQuality::DirectUnverified => "direct_unverified",
+        DataQuality::OfficialDelayed => "official_delayed",
+        DataQuality::Aggregated => "aggregated",
+        DataQuality::Indicative => "indicative",
+        DataQuality::Modeled => "modeled",
+        DataQuality::Estimated => "estimated",
+        DataQuality::Stale => "stale",
+        DataQuality::Quarantined => "quarantined",
+    }
 }

@@ -21,7 +21,8 @@ use crate::{
     framing::{BoundedFrameReader, Frame, FramingError},
 };
 
-const STABLE_PROTOCOL_VERSION: &str = "2026-07-28";
+/// Exact stable MCP version admitted by the shared service and every installed relay.
+pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// One credential-free request for the installed connector to send to `/mcp`.
 pub struct McpRelayExchange {
@@ -407,7 +408,7 @@ impl RelayClientMetadata {
         if value
             .pointer("/result/protocolVersion")
             .and_then(Value::as_str)
-            != Some(STABLE_PROTOCOL_VERSION)
+            != Some(MCP_PROTOCOL_VERSION)
         {
             return Err(McpRelayError::InvalidResponse);
         }
@@ -438,7 +439,7 @@ impl RelayClientMetadata {
         insert_exact(
             metadata,
             "io.modelcontextprotocol/protocolVersion",
-            Value::String(STABLE_PROTOCOL_VERSION.to_owned()),
+            Value::String(MCP_PROTOCOL_VERSION.to_owned()),
         )?;
         insert_exact(
             metadata,
@@ -536,7 +537,7 @@ fn prepare_message(
     Ok(PreparedRelayMessage::Exchange {
         request_id,
         exchange: McpRelayExchange {
-            protocol_version: Arc::from(STABLE_PROTOCOL_VERSION),
+            protocol_version: Arc::from(MCP_PROTOCOL_VERSION),
             method,
             name,
             body: body.into_boxed_slice(),

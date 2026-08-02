@@ -448,6 +448,7 @@ pub struct TargetInvalidation {
     target_id: InvestmentTargetSetId,
     target_revision: RevisionNumber,
     kind: InvalidationKind,
+    actor: Option<DecisionActorId>,
     observed_at: Timestamp,
     content_identity: DecisionContentDigest,
 }
@@ -462,6 +463,33 @@ impl TargetInvalidation {
         id: TargetInvalidationId,
         target: &InvestmentTargetSet,
         kind: InvalidationKind,
+        actor: DecisionActorId,
+        observed_at: Timestamp,
+        content_identity: DecisionContentDigest,
+    ) -> Result<Self, DecisionContractError> {
+        Self::try_new_inner(id, target, kind, Some(actor), observed_at, content_identity)
+    }
+
+    /// Recovers a schema-v1 invalidation that predates persisted governance principals.
+    ///
+    /// New workflow commits must use [`Self::try_new`], which always binds the authenticated actor
+    /// selected by the service-owned governance session. This compatibility constructor exists only
+    /// to preserve old immutable journal evidence during one-way recovery.
+    pub fn try_new_legacy(
+        id: TargetInvalidationId,
+        target: &InvestmentTargetSet,
+        kind: InvalidationKind,
+        observed_at: Timestamp,
+        content_identity: DecisionContentDigest,
+    ) -> Result<Self, DecisionContractError> {
+        Self::try_new_inner(id, target, kind, None, observed_at, content_identity)
+    }
+
+    fn try_new_inner(
+        id: TargetInvalidationId,
+        target: &InvestmentTargetSet,
+        kind: InvalidationKind,
+        actor: Option<DecisionActorId>,
         observed_at: Timestamp,
         content_identity: DecisionContentDigest,
     ) -> Result<Self, DecisionContractError> {
@@ -473,6 +501,7 @@ impl TargetInvalidation {
             target_id: target.id.clone(),
             target_revision: target.revision,
             kind,
+            actor,
             observed_at,
             content_identity,
         })
@@ -500,6 +529,14 @@ impl TargetInvalidation {
     #[must_use]
     pub const fn kind(&self) -> InvalidationKind {
         self.kind
+    }
+
+    /// Authenticated governance principal that committed this invalidation, when the immutable
+    /// record was created by the current V1 workflow. `None` is retained only for recovered
+    /// schema-v1 journal evidence that predates principal persistence.
+    #[must_use]
+    pub const fn actor(&self) -> Option<&DecisionActorId> {
+        self.actor.as_ref()
     }
 
     /// Returns when invalidating evidence was observed.

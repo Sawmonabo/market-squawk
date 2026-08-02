@@ -32,12 +32,14 @@ mod catalog;
 mod serialization;
 
 pub use backtest::{
-    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand,
-    GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
-    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
-    GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
-    GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
-    GovernedBacktestPrepublishAuthority, GovernedBacktestQueryLimitsInput, GovernedBacktestRecord,
+    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCohortCandidateRegistrationInput,
+    GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,
+    GovernedBacktestCommand, GovernedBacktestCorporateActionsInput,
+    GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
+    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationJsonError,
+    GovernedBacktestInputRegistrationReceipt, GovernedBacktestInputResolver,
+    GovernedBacktestPortfolioSeedInput, GovernedBacktestPrepublishAuthority,
+    GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestReportReference,
     GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
     MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionBacktestAuthority,
     ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
@@ -501,13 +503,41 @@ impl AnalysisDomainService {
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
-        let artifacts = self.artifacts.as_ref().ok_or(ServiceError::Unavailable)?;
         let artifact_id = required_string(request, "artifactId")?;
         let sha256 = required_string(request, "sha256")?;
         let media_type = required_string(request, "mediaType")?;
         let byte_count = required_usize(request, "byteCount")?;
         let offset = required_usize(request, "offset")?;
         let maximum_bytes = required_usize(request, "maximumBytes")?;
+        if artifact_id.starts_with("backtest-report-") {
+            let report = GovernedBacktestReportReference::try_new(
+                artifact_id,
+                sha256,
+                u64::try_from(byte_count).map_err(|_| ServiceError::InvalidRequest)?,
+                media_type,
+            )?;
+            let content = self
+                .backtests
+                .read_report(
+                    report.clone(),
+                    context.cancellation().clone(),
+                    context.deadline(),
+                )
+                .await?;
+            ensure_request_live(context, &self.lifecycle)?;
+            return bounded_artifact_read_result(
+                report.artifact_id(),
+                sha256,
+                byte_count,
+                report.media_type(),
+                &content,
+                offset,
+                maximum_bytes,
+                request,
+                context,
+            );
+        }
+        let artifacts = self.artifacts.as_ref().ok_or(ServiceError::Unavailable)?;
         let complete_limit = NonZeroUsize::new(byte_count).ok_or(ServiceError::InvalidRequest)?;
         let reference = ArtifactReference::try_new(
             artifact_id.to_owned(),
@@ -525,44 +555,18 @@ impl AnalysisDomainService {
             .await
             .map_err(map_artifact_error)?;
         ensure_request_live(context, &self.lifecycle)?;
-        if offset > read.content().len() {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let end = offset
-            .checked_add(maximum_bytes)
-            .map(|end| end.min(read.content().len()))
-            .ok_or(ServiceError::InvalidRequest)?;
-        let content_base64 = BASE64_STANDARD.encode(&read.content()[offset..end]);
         let reference = read.reference();
-        TypedToolResult::try_new(
-            json!({
-                "artifact": {
-                    "artifactId": reference.id(),
-                    "sha256": reference.sha256(),
-                    "byteCount": reference.byte_count(),
-                    "mediaType": reference.media_type(),
-                },
-                "offset": offset,
-                "returnedBytes": end - offset,
-                "contentBase64": content_base64,
-                "nextOffset": end,
-                "complete": end == read.content().len(),
-            }),
-            1,
-            ToolResultMetadata::complete_not_applicable(),
-            admitted_result_limits(request, context)?,
+        bounded_artifact_read_result(
+            reference.id(),
+            reference.sha256(),
+            reference.byte_count(),
+            reference.media_type(),
+            read.content(),
+            offset,
+            maximum_bytes,
+            request,
+            context,
         )
-        .map_err(|error| match error {
-            ServiceContractError::TooManyItems
-            | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
-                ServiceError::ResourceExhausted
-            }
-            ServiceContractError::ZeroItemsForNonNullResult
-            | ServiceContractError::InvalidMetadata
-            | ServiceContractError::InvalidCompleteness
-            | ServiceContractError::SourceEvidencePolicy
-            | ServiceContractError::Json(_) => ServiceError::InvalidResult,
-        })
     }
 
     fn selected_dataset(
@@ -1082,6 +1086,55 @@ const fn map_artifact_error(error: ArtifactError) -> ServiceError {
         ArtifactError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         ArtifactError::InvalidPublication => ServiceError::Internal,
     }
+}
+
+fn bounded_artifact_read_result(
+    artifact_id: &str,
+    sha256: &str,
+    byte_count: usize,
+    media_type: &str,
+    content: &[u8],
+    offset: usize,
+    maximum_bytes: usize,
+    request: &TypedToolRequest,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
+    if content.len() != byte_count || offset > content.len() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let end = offset
+        .checked_add(maximum_bytes)
+        .map(|end| end.min(content.len()))
+        .ok_or(ServiceError::InvalidRequest)?;
+    TypedToolResult::try_new(
+        json!({
+            "artifact": {
+                "artifactId": artifact_id,
+                "sha256": sha256,
+                "byteCount": byte_count,
+                "mediaType": media_type,
+            },
+            "offset": offset,
+            "returnedBytes": end - offset,
+            "contentBase64": BASE64_STANDARD.encode(&content[offset..end]),
+            "nextOffset": end,
+            "complete": end == content.len(),
+        }),
+        1,
+        ToolResultMetadata::complete_not_applicable(),
+        admitted_result_limits(request, context)?,
+    )
+    .map_err(|error| match error {
+        ServiceContractError::TooManyItems
+        | ServiceContractError::Json(JsonContractError::EncodingOrBytes) => {
+            ServiceError::ResourceExhausted
+        }
+        ServiceContractError::ZeroItemsForNonNullResult
+        | ServiceContractError::InvalidMetadata
+        | ServiceContractError::InvalidCompleteness
+        | ServiceContractError::SourceEvidencePolicy
+        | ServiceContractError::Json(_) => ServiceError::InvalidResult,
+    })
 }
 
 fn not_applicable_result(

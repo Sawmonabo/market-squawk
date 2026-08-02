@@ -20,7 +20,9 @@ import type { PaperControlRequest, ProductTransport } from "@/lib/transport"
 
 import {
   type PaperFill,
+  type PaperAccount,
   type PaperOrder,
+  type PaperPosition,
   type PaperStatus,
   parsePaperFills,
   parsePaperOrders,
@@ -140,6 +142,9 @@ function ReadyPaperExecution({
             orderCount={orders.data?.value.length}
             fillCount={fills.data?.value.length}
           />
+          <FinancialEvidence status={status.data?.value} />
+          <SimulationAndReconciliationEvidence status={status.data?.value} />
+          <PaperRiskEvidence status={status.data?.value} />
           <PaperControlPanel
             status={status.data?.value}
             sessions={bootstrap.providerSessions}
@@ -245,6 +250,144 @@ function PaperSummary({
   )
 }
 
+function FinancialEvidence({ status }: { status: PaperStatus | undefined }) {
+  if (status?.state !== "running") return null
+  const accounts = status.accounts?.rows ?? []
+  const cash = status.cash?.rows ?? []
+  const positions = status.positionEvidence?.rows ?? []
+  return (
+    <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <Panel title="Balances and P&L" subtitle="Current paper-ledger balances and marked accounting values.">
+        {accounts.length === 0 ? (
+          <InlineEmpty detail="The active snapshot returned no account evidence." />
+        ) : (
+          <div className="space-y-4">
+            {accounts.map((account) => <AccountEvidence key={account.accountId} account={account} />)}
+          </div>
+        )}
+        <EvidenceCount label="Account rows" evidence={status.accounts} />
+        <EvidenceCount label="Cash rows" evidence={status.cash} />
+        {cash.length > 0 ? (
+          <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
+            {cash.map((row) => <Fact key={`${row.accountId}:${row.balance.currency}`} label={`Cash · ${shortId(row.accountId)}`} value={formatMoney(row.balance)} />)}
+          </dl>
+        ) : null}
+      </Panel>
+      <Panel title="Positions and reconciliation" subtitle="Settled lots and cost basis from the same complete paper snapshot.">
+        {positions.length === 0 ? (
+          <InlineEmpty detail="No settled paper positions were returned." />
+        ) : (
+          <div className="space-y-3">
+            {positions.map((position) => <PositionEvidence key={`${position.accountId}:${position.instrumentId}`} position={position} />)}
+          </div>
+        )}
+        <EvidenceCount label="Position rows" evidence={status.positionEvidence} />
+        <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3 text-xs text-muted-foreground">
+          <p>Snapshot configuration {status.configurationDigestSha256 ? shortId(status.configurationDigestSha256) : "not returned"} · sequence {status.sequence}.</p>
+          <p className="mt-1">Financial fence: {status.financialReconciliationCurrent ? "current" : "not current"}; reconciliation {status.reconciliationRequired ? "required" : "not required"}.</p>
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
+function AccountEvidence({ account }: { account: PaperAccount }) {
+  return (
+    <article className="rounded-lg border border-border bg-background/35 p-3">
+      <p className="font-mono text-[10px] text-muted-foreground">{shortId(account.accountId)} · revision {account.revision}</p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Fact label="Marked equity" value={formatMoney(account.markedEquity)} />
+        <Fact label="Settled capital" value={formatMoney(account.settledCapital)} />
+        <Fact label="Realized P&L" value={formatMoney(account.realizedPnl)} />
+        <Fact label="Unrealized P&L" value={formatMoney(account.unrealizedPnl)} />
+        <Fact label="Gross exposure" value={formatMoney(account.grossExposure)} />
+        <Fact label="Drawdown" value={formatMoney(account.drawdown)} />
+      </dl>
+    </article>
+  )
+}
+
+function PaperRiskEvidence({ status }: { status: PaperStatus | undefined }) {
+  if (status?.state !== "running") return null
+  const limits = status.riskLimits
+  const decisions = status.riskDecisions
+  return (
+    <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <Panel title="Central risk limits" subtitle="Immutable limits enforced before paper dispatch.">
+        {!limits ? <InlineEmpty detail="The active runtime did not return a risk-limit image." /> : (
+          <dl className="grid gap-3 sm:grid-cols-2">
+            <Fact label="Order notional" value={formatMoney(limits.maximumOrderNotional)} />
+            <Fact label="Gross exposure" value={formatMoney(limits.maximumGrossExposure)} />
+            <Fact label="Maximum slippage" value={`${limits.maximumSlippageBasisPoints.toLocaleString()} bp`} />
+            <Fact label="Order rate" value={`${limits.maximumOrdersPerWindow} / ${limits.orderRateWindowNanos.toLocaleString()} ns`} />
+          </dl>
+        )}
+      </Panel>
+      <Panel title="Risk decisions and breaches" subtitle="Bounded decisions already committed by the durable audit owner.">
+        {!decisions ? <InlineEmpty detail="No retained durable decision image was returned." /> : (
+          <>
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <Fact label="Retained decisions" value={`${decisions.returnedItems} of ${decisions.availableItems}`} />
+              <Fact label="Published decisions" value={decisions.totalPublished.toLocaleString()} />
+              <Fact label="Latest sequence" value={decisions.latestSequence?.toLocaleString() ?? "Not reported"} />
+              <Fact label="Reconciliation" value={status.reconciliationRequired ? "Required" : "Current"} />
+            </dl>
+            {decisions.records.some((decision) => decision.reasons.length > 0) ? <Notice bad text="One or more retained central-risk or dispatch decisions contain typed rejection reasons. Open Risk for the bounded decision evidence." /> : null}
+          </>
+        )}
+      </Panel>
+    </div>
+  )
+}
+
+function SimulationAndReconciliationEvidence({ status }: { status: PaperStatus | undefined }) {
+  if (status?.state !== "running") return null
+  return (
+    <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <Panel title="Configured paper simulation" subtitle="Fixed terms from the active paper runtime; these are not estimates inferred by the dashboard.">
+        {!status.simulation ? <InlineEmpty detail="Configured simulation evidence was not returned." /> : (
+          <dl className="grid gap-3 sm:grid-cols-2">
+            <Fact label="Entry latency" value={`${durationNanos(status.simulation.minimumLatencyNanos)} to ${durationNanos(status.simulation.maximumLatencyNanos)}`} />
+            <Fact label="Cancel latency" value={durationNanos(status.simulation.cancelLatencyNanos)} />
+            <Fact label="Book participation" value={`${status.simulation.maximumParticipationBasisPoints.toLocaleString()} bp`} />
+            <Fact label="Impact per level" value={`${status.simulation.impactBasisPointsPerLevel.toLocaleString()} bp`} />
+            <Fact label="Maker / taker fee" value={`${status.simulation.makerFeeBasisPoints} / ${status.simulation.takerFeeBasisPoints} bp`} />
+            <Fact label="Fee floor / cap" value={`${formatMoney(status.simulation.minimumFee)} / ${status.simulation.maximumFee ? formatMoney(status.simulation.maximumFee) : "No cap"}`} />
+          </dl>
+        )}
+      </Panel>
+      <Panel title="Reconciliation report" subtitle="A point-in-time report from the same complete paper snapshot; no external balance is fabricated.">
+        {!status.reconciliation ? <InlineEmpty detail="The runtime did not return a reconciliation report." /> : (
+          <>
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <Fact label="Snapshot" value={`${status.reconciliation.snapshotComplete ? "Complete" : "Incomplete"} · #${status.reconciliation.snapshotSequence}`} />
+              <Fact label="Financial fence" value={status.reconciliation.financialReconciliationCurrent ? "Current" : "Not current"} />
+              <Fact label="Order scope" value={`${status.reconciliation.activeOrderCount} active · ${status.reconciliation.archivedOrderCount} archived`} />
+              <Fact label="Financial scope" value={`${status.reconciliation.accountCount} accounts · ${status.reconciliation.cashBalanceCount} cash balances · ${status.reconciliation.positionCount} positions`} />
+              <Fact label="Fill evidence" value={status.reconciliation.fillCount.toLocaleString()} />
+              <Fact label="Action required" value={status.reconciliation.reconciliationRequired ? "Yes" : "No"} />
+            </dl>
+            <p className="mt-3 font-mono text-[10px] text-muted-foreground">Configuration {shortId(status.reconciliation.configurationDigestSha256)}</p>
+          </>
+        )}
+      </Panel>
+    </div>
+  )
+}
+
+function PositionEvidence({ position }: { position: PaperPosition }) {
+  return (
+    <article className="rounded-lg border border-border bg-background/35 p-3">
+      <p className="font-mono text-xs">{position.instrumentId}</p>
+      <p className="mt-1 text-xs text-muted-foreground">{position.lots.toLocaleString()} settled lots · cost basis {formatMoney(position.costBasis)}</p>
+    </article>
+  )
+}
+
+function EvidenceCount({ label, evidence }: { label: string; evidence: { returnedItems: number; availableItems: number } | undefined }) {
+  return <p className="mt-3 text-[10px] text-muted-foreground">{label}: {evidence ? `${evidence.returnedItems} of ${evidence.availableItems} returned` : "not returned"}.</p>
+}
+
 function OrdersPanel({
   orders,
   error,
@@ -335,6 +478,15 @@ function OrderRow({
             {order.maximumExecutionPriceTicks.toLocaleString()} execution limit ticks
           </span>
         ) : null}
+        {order.referencePriceTicks !== undefined ? (
+          <span className="block">Reference {order.referencePriceTicks.toLocaleString()} ticks</span>
+        ) : null}
+        {order.maximumSlippageBasisPoints !== undefined ? (
+          <span className="block">Risk slippage bound {order.maximumSlippageBasisPoints.toLocaleString()} bp</span>
+        ) : null}
+        {order.observed?.averageFillSlippageTicks !== null && order.observed?.averageFillSlippageTicks !== undefined ? (
+          <span className="block">Observed average slippage {order.observed.averageFillSlippageTicks.toLocaleString()} ticks ({order.observed.averageFillSlippageBasisPoints?.toLocaleString() ?? "not calculable"} bp)</span>
+        ) : null}
       </td>
       <td className="py-3 pr-4 font-mono">
         {order.cumulativeFees ? formatMoney(order.cumulativeFees) : "Not reported"}
@@ -342,7 +494,12 @@ function OrderRow({
       <td className="py-3 text-muted-foreground">
         {order.acceptedAt === undefined ? "Not reported" : `Accepted ${timeValue(order.acceptedAt)}`}
         {order.eligibleAt !== undefined ? (
-          <span className="block">Eligible {timeValue(order.eligibleAt)}</span>
+          <span className="block">
+            Eligible {timeValue(order.eligibleAt)}{order.acceptedAt !== undefined ? ` · ${latencyValue(order.acceptedAt, order.eligibleAt)}` : ""}
+          </span>
+        ) : null}
+        {order.observed?.firstFillAfterEligibilityNanos !== null && order.observed?.firstFillAfterEligibilityNanos !== undefined ? (
+          <span className="block">First fill {durationNanos(order.observed.firstFillAfterEligibilityNanos)} after eligibility</span>
         ) : null}
         {order.expiresAt !== undefined ? (
           <span className="block">Expires {timeValue(order.expiresAt)}</span>
@@ -432,8 +589,8 @@ function EvidenceBoundary({
   return (
     <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
       Bot status: {status?.completeness ?? "unavailable"}. Orders: {countBoundary(orders)}. Fills:{" "}
-      {countBoundary(fills)}. Latency and slippage are not inferred from timestamps or price bounds;
-      they appear only when the service returns those measures explicitly.
+      {countBoundary(fills)}. Timing is calculated only from the returned accepted and eligible timestamps.
+      Price bounds are the central-risk-approved bounds returned with the order, not a claim about future fills.
     </p>
   )
 }
@@ -601,6 +758,19 @@ function timeValue(value: string | number) {
   const milliseconds = Math.trunc(value / 1_000_000)
   const date = new Date(milliseconds)
   return Number.isNaN(date.getTime()) ? value.toLocaleString() : date.toLocaleString()
+}
+
+function latencyValue(accepted: string | number, eligible: string | number) {
+  if (typeof accepted !== "number" || typeof eligible !== "number") return "latency not numeric"
+  const nanos = eligible - accepted
+  if (nanos < 0) return "invalid timing evidence"
+  return nanos >= 1_000_000 ? `${(nanos / 1_000_000).toLocaleString()} ms simulated latency` : `${nanos.toLocaleString()} ns simulated latency`
+}
+
+function durationNanos(nanos: number) {
+  if (nanos >= 1_000_000_000) return `${(nanos / 1_000_000_000).toLocaleString()} s`
+  if (nanos >= 1_000_000) return `${(nanos / 1_000_000).toLocaleString()} ms`
+  return `${nanos.toLocaleString()} ns`
 }
 
 function isCancelable(state: string) {

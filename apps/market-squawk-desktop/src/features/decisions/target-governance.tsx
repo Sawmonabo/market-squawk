@@ -1,12 +1,10 @@
 import * as React from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 import {
   AlertCircle,
   CalendarClock,
   CircleDollarSign,
-  RefreshCw,
   Scale,
-  Search,
   ShieldAlert,
 } from "lucide-react"
 
@@ -14,7 +12,6 @@ import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatMoney, humanize } from "@/lib/formatters"
 import { formatTimestamp, timestampFromUnixNanos } from "@/lib/time"
@@ -22,10 +19,15 @@ import type { ProductTransport } from "@/lib/transport"
 
 import {
   digestHex,
+  parseDecisionTargetIndexPage,
   parseDecisionTargets,
+  type TargetIndexView,
   type TargetStateView,
 } from "./contracts"
 import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
+import { TargetGovernanceWorkflow } from "./governance-workflow"
+
+const DISCOVERY_LIMIT = 100
 
 export function TargetGovernanceWorkspace({
   transport,
@@ -34,8 +36,22 @@ export function TargetGovernanceWorkspace({
   transport: ProductTransport
   scope: ProductScope
 }) {
-  const [targetDraft, setTargetDraft] = React.useState("")
   const [targetId, setTargetId] = React.useState("")
+  const targetIndex = useInfiniteQuery({
+    queryKey: productKeys.operation(scope, "decision", "target-index", {
+      limit: DISCOVERY_LIMIT,
+    }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) =>
+      parseDecisionTargetIndexPage(
+        await transport.query({
+          query: "decisionTargetIndex",
+          ...(pageParam ? { afterTargetId: pageParam } : {}),
+          limit: DISCOVERY_LIMIT,
+        }),
+      ),
+    getNextPageParam: (page) => page.nextAfter ?? undefined,
+  })
   const targets = useQuery({
     queryKey: productKeys.operation(scope, "decision", "target-history", {
       targetId,
@@ -50,6 +66,7 @@ export function TargetGovernanceWorkspace({
   const revisions = [...(targets.data ?? [])].sort(
     (left, right) => right.target.revision - left.target.revision,
   )
+  const targetEntries = targetIndex.data?.pages.flatMap((page) => page.items) ?? []
 
   return (
     <section aria-labelledby="target-governance-heading" className="mt-8">
@@ -62,8 +79,8 @@ export function TargetGovernanceWorkspace({
             Target ranges, review, and invalidation
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Inspect every known revision for one durable target-set ID. Target discovery is not
-            exposed by the installed service, so the identity must come from an existing record.
+            Discover bounded target-series heads, then inspect immutable history, evidence, review,
+            and invalidation state for the selected research judgment.
           </p>
         </div>
         <div className="max-w-sm rounded-xl border border-primary/25 bg-primary/5 p-3 text-xs leading-5 text-muted-foreground">
@@ -71,36 +88,52 @@ export function TargetGovernanceWorkspace({
         </div>
       </div>
 
-      <form
-        className="mt-4 flex max-w-2xl flex-col gap-2 sm:flex-row sm:items-end"
-        onSubmit={(event) => {
-          event.preventDefault()
-          setTargetId(targetDraft.trim())
-        }}
-      >
-        <label htmlFor="decision-target-id" className="flex-1 text-xs font-medium">
-          Target-set ID
-          <Input
-            id="decision-target-id"
-            value={targetDraft}
-            onChange={(event) => setTargetDraft(event.target.value)}
-            className="mt-2 font-mono text-xs"
-            autoComplete="off"
-          />
-        </label>
-        <Button
-          type="submit"
-          variant="outline"
-          disabled={targets.isFetching || targetDraft.trim().length === 0}
-        >
-          {targets.isFetching ? (
-            <RefreshCw className="animate-spin" aria-hidden="true" />
-          ) : (
-            <Search aria-hidden="true" />
+      {targetIndex.isPending ? (
+        <TargetLoading />
+      ) : targetIndex.isError ? (
+        <Alert variant="destructive" className="mt-4">
+          <AlertCircle aria-hidden="true" />
+          <AlertTitle>Target discovery could not be loaded</AlertTitle>
+          <AlertDescription>
+            {messageFrom(targetIndex.error)}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={() => void targetIndex.refetch()}
+            >
+              Retry
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : targetEntries.length === 0 ? (
+        <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground">
+          No target series are retained in this workspace.
+        </div>
+      ) : (
+        <div className="mt-4 grid gap-2 lg:grid-cols-2">
+          {targetEntries.map((entry) => (
+            <TargetIndexCard
+              key={entry.id}
+              entry={entry}
+              selected={entry.id === targetId}
+              onSelect={() => setTargetId(entry.id)}
+            />
+          ))}
+          {targetIndex.hasNextPage && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={targetIndex.isFetchingNextPage}
+              onClick={() => void targetIndex.fetchNextPage()}
+            >
+              Load more targets
+            </Button>
           )}
-          Load history
-        </Button>
-      </form>
+        </div>
+      )}
 
       {!targetId ? (
         <TargetPrompt />
@@ -133,6 +166,12 @@ export function TargetGovernanceWorkspace({
             <TargetRevisionCard
               key={`${state.target.id}:${state.target.revision}`}
               state={state}
+              transport={transport}
+              scope={scope}
+              onCommitted={() => {
+                void targets.refetch()
+                void targetIndex.refetch()
+              }}
             />
           ))}
         </div>
@@ -141,7 +180,17 @@ export function TargetGovernanceWorkspace({
   )
 }
 
-function TargetRevisionCard({ state }: { state: TargetStateView }) {
+function TargetRevisionCard({
+  state,
+  transport,
+  scope,
+  onCommitted,
+}: {
+  state: TargetStateView
+  transport: ProductTransport
+  scope: ProductScope
+  onCommitted: () => void
+}) {
   const { target } = state
   const expired = isPast(target.expiresAt)
   const reviewOverdue = isPast(target.reviewDueAt)
@@ -180,9 +229,47 @@ function TargetRevisionCard({ state }: { state: TargetStateView }) {
           <GovernanceTimeline state={state} />
           <RiskInvalidation state={state} />
           <ExecutionBoundary />
+          <TargetGovernanceWorkflow
+            transport={transport}
+            scope={scope}
+            targetId={target.id}
+            targetRevision={target.revision}
+            onCommitted={onCommitted}
+          />
         </div>
       </div>
     </article>
+  )
+}
+
+function TargetIndexCard({
+  entry,
+  selected,
+  onSelect,
+}: {
+  entry: TargetIndexView
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      className="rounded-xl border border-border bg-card/45 p-4 text-left transition-colors hover:border-primary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-pressed={selected}
+      onClick={onSelect}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold" title={entry.instrumentId}>
+            {entry.instrumentId}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {entry.id} · revision {entry.revision}
+          </p>
+        </div>
+        <StateLabel value={entry.status} />
+      </div>
+    </button>
   )
 }
 
@@ -313,7 +400,9 @@ function GovernanceTimeline({ state }: { state: TargetStateView }) {
             Latest immutable invalidation
           </h5>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-            <span>{formatTimestamp(latestInvalidation.observedAt)}</span>
+            <span>
+              {latestInvalidation.actor ?? "Legacy record without principal"} · {formatTimestamp(latestInvalidation.observedAt)}
+            </span>
             <StateLabel value={latestInvalidation.kind} />
           </div>
           <EvidenceIdentity value={latestInvalidation.id} />
@@ -349,8 +438,8 @@ function ExecutionBoundary() {
       <AlertTitle>Research only</AlertTitle>
       <AlertDescription>
         Review state does not confer execution authority. No order controls are available here.
-        Review mutations also require an authenticated actor and canonical content identity that
-        this desktop contract does not currently supply.
+        Every new review or invalidation uses the service-owned authenticated governance flow and
+        retains immutable audit evidence.
       </AlertDescription>
     </Alert>
   )
@@ -409,7 +498,7 @@ function TimelineFact({ label, value }: { label: string; value: string }) {
 function TargetPrompt() {
   return (
     <div className="mt-4 rounded-xl border border-dashed border-border p-6 text-sm leading-6 text-muted-foreground">
-      Enter a known target-set identity to load its versioned judgment, evidence, review state,
+      Select a discovered target series to load its versioned judgment, evidence, review state,
       expiration timestamps, and latest invalidation record.
     </div>
   )

@@ -4,9 +4,10 @@ use serde_json::{Map, Value, json};
 use tauri::State;
 
 use crate::{
-    bridge::{DesktopState, InvocationAuthority, invoke_application},
+    bridge::{DesktopState, InvocationAuthority, invoke_application, invoke_private_application},
     contracts::{
-        ApplicationInvocation, DashboardQueryCommand, DesktopCommandError, FairValueControlCommand,
+        ApplicationInvocation, DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
+        FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
         JobControlCommand, ModelControlCommand, PaperControlCommand, ResearchControlCommand,
         SourceLifecycleAction, SourceLifecycleInput,
     },
@@ -139,6 +140,15 @@ pub(crate) async fn dashboard_query(
             arguments.insert("limit".to_owned(), json!(limit));
             ("Decision.ListScreens", arguments)
         }
+        DashboardQueryCommand::DecisionScreenRuns {
+            after_run_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "afterRunId", after_run_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Decision.ListScreenRuns", arguments)
+        }
         DashboardQueryCommand::DecisionCandidates { run_id } => {
             let mut arguments = Map::new();
             arguments.insert("runId".to_owned(), json!(run_id));
@@ -148,6 +158,17 @@ pub(crate) async fn dashboard_query(
             let mut arguments = Map::new();
             arguments.insert("dossierId".to_owned(), json!(dossier_id));
             ("Decision.GetDossier", arguments)
+        }
+        DashboardQueryCommand::DecisionCandidateDossiers {
+            candidate_id,
+            after_dossier_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("candidateId".to_owned(), json!(candidate_id));
+            insert_optional(&mut arguments, "afterDossierId", after_dossier_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Decision.ListCandidateDossiers", arguments)
         }
         DashboardQueryCommand::DecisionTarget {
             target_id,
@@ -160,6 +181,15 @@ pub(crate) async fn dashboard_query(
             let mut arguments = Map::new();
             arguments.insert("targetId".to_owned(), json!(target_id));
             ("Decision.ListTargetSets", arguments)
+        }
+        DashboardQueryCommand::DecisionTargetIndex {
+            after_target_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "afterTargetId", after_target_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Decision.ListTargetIndex", arguments)
         }
         DashboardQueryCommand::DecisionTargetStatus {
             target_id,
@@ -247,16 +277,141 @@ pub(crate) async fn fair_value_control(
     request: FairValueControlCommand,
     confirmed: bool,
     state: State<'_, DesktopState>,
+    window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
-    let FairValueControlCommand::Classify { measurement_id } = request;
-    invoke_narrow(
-        "FairValue.Classify",
-        measurement_arguments(measurement_id),
-        true,
-        confirmed,
+    match request {
+        FairValueControlCommand::Classify { measurement_id } => {
+            invoke_narrow(
+                "FairValue.Classify",
+                measurement_arguments(measurement_id),
+                true,
+                confirmed,
+                &state,
+            )
+            .await
+        }
+        FairValueControlCommand::PreviewGovernanceAction { proposal } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("proposal".to_owned(), json!(proposal));
+            invoke_private_application(
+                "FairValue.PreviewGovernanceAction",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("FairValue.PreviewGovernanceAction"),
+            )
+            .await
+        }
+        FairValueControlCommand::CommitGovernanceAction {
+            preview_id,
+            authorization_handles,
+        } => {
+            require_confirmation(confirmed)?;
+            let ticket_ids = state.consume_governance_authorizations(
+                window.label(),
+                preview_id,
+                authorization_handles,
+            )?;
+            let mut arguments = Map::new();
+            arguments.insert("previewId".to_owned(), json!(preview_id));
+            arguments.insert("ticketIds".to_owned(), json!(ticket_ids));
+            invoke_private_application(
+                "FairValue.CommitGovernanceAction",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("FairValue.CommitGovernanceAction"),
+            )
+            .await
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn decision_control(
+    request: DecisionControlCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+    window: tauri::Window,
+) -> Result<Value, DesktopCommandError> {
+    require_confirmation(confirmed)?;
+    match request {
+        DecisionControlCommand::PreviewGovernanceAction { proposal } => {
+            let mut arguments = Map::new();
+            arguments.insert("proposal".to_owned(), json!(proposal));
+            invoke_private_application(
+                "Decision.PreviewGovernanceAction",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.PreviewGovernanceAction"),
+            )
+            .await
+        }
+        DecisionControlCommand::CommitGovernanceAction {
+            preview_id,
+            authorization_handles,
+        } => {
+            let ticket_ids = state.consume_governance_authorizations(
+                window.label(),
+                preview_id,
+                authorization_handles,
+            )?;
+            let mut arguments = Map::new();
+            arguments.insert("previewId".to_owned(), json!(preview_id));
+            arguments.insert("ticketIds".to_owned(), json!(ticket_ids));
+            invoke_private_application(
+                "Decision.CommitGovernanceAction",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.CommitGovernanceAction"),
+            )
+            .await
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn governance_query(
+    request: GovernanceQueryCommand,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    let GovernanceQueryCommand::Principals { after, limit } = request;
+    let mut arguments = Map::new();
+    insert_optional(&mut arguments, "after", after);
+    insert_optional(&mut arguments, "limit", limit);
+    invoke_private_application(
+        "Governance.ListPrincipals",
+        arguments,
         &state,
+        InvocationAuthority::ReadOnly,
     )
     .await
+}
+
+#[tauri::command]
+pub(crate) async fn governance_control(
+    request: GovernanceControlCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+    window: tauri::Window,
+) -> Result<Value, DesktopCommandError> {
+    require_confirmation(confirmed)?;
+    let GovernanceControlCommand::AuthenticateAction {
+        preview_id,
+        principal_id,
+        credential,
+    } = request;
+    let mut arguments = Map::new();
+    arguments.insert("previewId".to_owned(), json!(preview_id));
+    arguments.insert("principalId".to_owned(), json!(principal_id));
+    arguments.insert("credential".to_owned(), Value::String(credential));
+    let result = invoke_private_application(
+        "Governance.AuthenticateAction",
+        arguments,
+        &state,
+        InvocationAuthority::ExactConfirmed("Governance.AuthenticateAction"),
+    )
+    .await?;
+    state.retain_governance_authorization(window.label(), result)
 }
 
 #[tauri::command]
@@ -484,6 +639,17 @@ async fn invoke_narrow(
         authority,
     )
     .await
+}
+
+fn require_confirmation(confirmed: bool) -> Result<(), DesktopCommandError> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(DesktopCommandError::new(
+            "confirmation_required",
+            "Confirm the governance step before continuing.",
+        ))
+    }
 }
 
 fn map_with_job_id(job_id: uuid::Uuid) -> Map<String, Value> {

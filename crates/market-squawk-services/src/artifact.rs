@@ -12,6 +12,8 @@ const MAXIMUM_ARTIFACT_ID_BYTES: usize = 160;
 const MAXIMUM_MEDIA_TYPE_BYTES: usize = 128;
 /// Closed media type for verified immutable Parquet query results.
 pub const PARQUET_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.apache.parquet";
+/// Closed media type for verified newline-delimited JSON diagnostic exports.
+pub const NDJSON_ARTIFACT_MEDIA_TYPE: &str = "application/x-ndjson";
 
 /// Complete content-addressed publication handed to a capability-confined repository.
 ///
@@ -43,6 +45,46 @@ impl ArtifactPublication {
             sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
             content: content.into(),
             media_type: Arc::from("application/json"),
+        })
+    }
+
+    /// Creates an immutable newline-delimited JSON publication and derives its content identity.
+    ///
+    /// Every nonempty line must be exactly one JSON object. A final newline is accepted, while
+    /// blank records and non-object values are rejected so readers can stream records safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidPublication`] when `content` is empty or malformed.
+    pub fn try_ndjson(content: Vec<u8>) -> Result<Self, ArtifactError> {
+        if content.is_empty() {
+            return Err(ArtifactError::InvalidPublication);
+        }
+        let mut records = 0_usize;
+        let mut lines = content.split(|byte| *byte == b'\n').peekable();
+        while let Some(line) = lines.next() {
+            if line.is_empty() {
+                if lines.peek().is_none() {
+                    continue;
+                }
+                return Err(ArtifactError::InvalidPublication);
+            }
+            let value = serde_json::from_slice::<serde_json::Value>(line)
+                .map_err(|_| ArtifactError::InvalidPublication)?;
+            if !value.is_object() {
+                return Err(ArtifactError::InvalidPublication);
+            }
+            records = records
+                .checked_add(1)
+                .ok_or(ArtifactError::InvalidPublication)?;
+        }
+        if records == 0 {
+            return Err(ArtifactError::InvalidPublication);
+        }
+        Ok(Self {
+            sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
+            content: content.into(),
+            media_type: Arc::from(NDJSON_ARTIFACT_MEDIA_TYPE),
         })
     }
 

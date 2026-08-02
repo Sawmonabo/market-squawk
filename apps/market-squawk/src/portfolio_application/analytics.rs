@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use market_squawk_adapter_portfolio::TransactionKind;
+use market_squawk_adapter_portfolio::{
+    BasisResolution, ReconciliationField, ReconciliationTolerance, TransactionKind,
+};
 use market_squawk_analytics::{
     Annualization, ExactDecimalScale, ExactRate, MissingValuePolicy, MonetaryBasis, MonetaryValue,
     PortfolioAllocation, Quantile, ReturnSeries, ScenarioShock, ShockComposition, StatisticalInput,
@@ -34,6 +36,10 @@ pub(super) fn performance(
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let history = admitted_history(image, revision, scope)?;
     let mut output = base_report(revision, "modified_dietz_v1");
+    output.insert(
+        "accountingEvidence".to_owned(),
+        accounting_evidence(revision)?,
+    );
     output.insert(
         "currentValue".to_owned(),
         money_value(total_value(revision, scope)?),
@@ -484,6 +490,120 @@ fn base_report(revision: &PublishedRevision, policy: &str) -> Map<String, Value>
         }),
     );
     output
+}
+
+/// Returns only source-backed accounting aggregates available to the installed portfolio reader.
+///
+/// Raw holdings are snapshot evidence, while normalized trade and income records still require
+/// the explicit lifecycle/subtype interpretation authority before they can become a realized-gain
+/// ledger. This result retains exact source totals and explains that boundary instead of using the
+/// previous synthetic cash-only replay as accounting evidence.
+fn accounting_evidence(
+    revision: &PublishedRevision,
+) -> Result<Value, PortfolioApplicationServiceError> {
+    let currency = revision.account.currency();
+    let reported_market_value = revision.holdings.iter().try_fold(
+        Money::new(Decimal::ZERO, currency),
+        |total, holding| {
+            total
+                .checked_add(holding.market_value())
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)
+        },
+    )?;
+    let resolved_unrealized = revision.holdings.iter().try_fold(
+        Some(Money::new(Decimal::ZERO, currency)),
+        |total, holding| match (total, holding.basis()) {
+            (Some(total), BasisResolution::Resolved { observation }) => holding
+                .market_value()
+                .checked_sub(observation.amount())
+                .and_then(|gain| total.checked_add(gain))
+                .map(Some)
+                .map_err(|_| PortfolioApplicationServiceError::Analytics),
+            _ => Ok(None),
+        },
+    )?;
+    let source_income = source_transaction_total(revision, TransactionKind::Income)?;
+    let source_fees = source_transaction_total(revision, TransactionKind::Fee)?;
+    let reconciliation = revision
+        .discrepancies
+        .iter()
+        .map(|discrepancy| {
+            let ReconciliationTolerance::Absolute { amount } = discrepancy.tolerance_policy();
+            json!({
+                "field": reconciliation_field(discrepancy.field()),
+                "supplied": money_value(discrepancy.supplied()),
+                "calculated": money_value(discrepancy.calculated()),
+                "currency": discrepancy.currency().as_str(),
+                "tolerance": {
+                    "kind": "absolute",
+                    "amount": money_value(amount)
+                },
+                "sourceReference": discrepancy.source_reference().as_str()
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "cash": {
+            "amount": money_value(revision.account.cash_balance()),
+            "observedAtUnixNanos": revision.account.as_of().unix_nanos().to_string(),
+            "sourceReference": revision.account.source_reference().as_str(),
+            "status": "source_reported_snapshot"
+        },
+        "reportedMarketValue": money_value(reported_market_value),
+        "unrealizedGain": resolved_unrealized.map_or_else(
+            || json!({
+                "status": "not_calculable_incomplete_source_basis",
+                "reason": "one_or_more_holdings_has_missing_or_ambiguous_basis"
+            }),
+            |amount| json!({
+                "status": "calculated_from_source_reported_mark_and_resolved_basis",
+                "amount": money_value(amount)
+            })
+        ),
+        "realizedGain": {
+            "status": "requires_committed_trade_lifecycle_interpretation",
+            "reason": "signed_trade_quantity_does_not_distinguish_sell_from_short_or_buy_from_cover"
+        },
+        "income": {
+            "status": "source_classified_pending_explicit_subtype",
+            "amount": money_value(source_income),
+            "reason": "generic_income_does_not_distinguish_dividend_interest_or_withholding"
+        },
+        "fees": {
+            "status": "source_classified",
+            "amount": money_value(source_fees)
+        },
+        "reconciliation": {
+            "status": if revision.discrepancies.is_empty() { "no_retained_discrepancies" } else { "discrepancies_require_review" },
+            "discrepancies": reconciliation
+        }
+    }))
+}
+
+fn source_transaction_total(
+    revision: &PublishedRevision,
+    kind: TransactionKind,
+) -> Result<Money, PortfolioApplicationServiceError> {
+    revision
+        .transactions
+        .iter()
+        .filter(|transaction| transaction.kind() == kind)
+        .try_fold(
+            Money::new(Decimal::ZERO, revision.account.currency()),
+            |total, transaction| {
+                total
+                    .checked_add(transaction.amount())
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)
+            },
+        )
+}
+
+const fn reconciliation_field(field: ReconciliationField) -> &'static str {
+    match field {
+        ReconciliationField::Cash => "cash",
+        ReconciliationField::MarketValue => "market_value",
+        ReconciliationField::CostBasis => "cost_basis",
+    }
 }
 
 fn money_value(value: Money) -> Value {

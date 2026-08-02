@@ -8,6 +8,8 @@ mod cli_provider;
 mod cli_transport;
 mod executable;
 mod fair_value_producer;
+mod governance;
+mod operations;
 mod provider_activation_state;
 mod source_lifecycle;
 
@@ -46,6 +48,7 @@ use self::executable::{
     installed_application_program, installed_release_programs, installed_service_program,
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
+use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
 use self::provider_activation_state::DurableProviderActivationState;
 use self::source_lifecycle::ProductionSourceLifecycleAuthority;
 use crate::application::analysis::{
@@ -56,6 +59,9 @@ use crate::application::analysis::{
     ProductionGovernedBacktestRepository,
 };
 use crate::application::decision::{DecisionApplication, DecisionApplicationError};
+use crate::application::governance::{
+    DecisionGovernanceActionFactory, FairValueGovernanceActionFactory,
+};
 use crate::application::model::runtime::{
     ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
 };
@@ -142,6 +148,8 @@ pub struct LocalProduct {
     provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
     decisions: Arc<DecisionApplication>,
+    decision_governance: Arc<dyn DecisionGovernanceActionFactory>,
+    fair_value_governance: Arc<dyn FairValueGovernanceActionFactory>,
     research_domain: Arc<dyn ApplicationDomainService>,
     analysis_domain: Arc<dyn ApplicationDomainService>,
     model_domain: Arc<dyn ApplicationDomainService>,
@@ -365,6 +373,11 @@ impl LocalProduct {
             selection_authority,
             maximum_quote_age_nanos,
         )?);
+        let decision_governance: Arc<dyn DecisionGovernanceActionFactory> =
+            Arc::new(DecisionGovernanceAdapter::new(Arc::clone(&decisions)));
+        let fair_value_governance: Arc<dyn FairValueGovernanceActionFactory> = Arc::new(
+            ProductionFairValueGovernanceActionFactory::new(Arc::clone(&fair_value)),
+        );
 
         let application = Arc::new(Application::try_from_product_services(
             source,
@@ -388,6 +401,8 @@ impl LocalProduct {
             provider_activation_state,
             portfolio,
             decisions,
+            decision_governance,
+            fair_value_governance,
             research_domain: research_domains.research(),
             analysis_domain: analysis,
             model_domain: model,
@@ -505,6 +520,14 @@ impl LocalProduct {
     /// Returns the sole durable decision workflow authority.
     pub fn decisions(&self) -> Arc<DecisionApplication> {
         Arc::clone(&self.decisions)
+    }
+
+    pub(crate) fn decision_governance(&self) -> Arc<dyn DecisionGovernanceActionFactory> {
+        Arc::clone(&self.decision_governance)
+    }
+
+    pub(crate) fn fair_value_governance(&self) -> Arc<dyn FairValueGovernanceActionFactory> {
+        Arc::clone(&self.fair_value_governance)
     }
 
     pub(crate) fn research_domain(&self) -> Arc<dyn ApplicationDomainService> {

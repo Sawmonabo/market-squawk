@@ -31,8 +31,9 @@ pub use calibration::{
     RealizedCoverage,
 };
 pub use contracts::{
-    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastPath,
-    ForecastPoint, ForecastRequest, ForecastValue, MAX_FORECAST_DECIMAL_SCALE, MAX_FORECAST_POINTS,
+    ForecastError, ForecastHorizon, ForecastInterval, ForecastIntervals, ForecastObservedPoint,
+    ForecastPath, ForecastPoint, ForecastRequest, ForecastValue, MAX_FORECAST_DECIMAL_SCALE,
+    MAX_FORECAST_OBSERVED_POINTS, MAX_FORECAST_POINTS,
 };
 pub use engine::ResearchForecastBackend;
 pub use evidence::{ForecastOutcome, ForecastOutcomeId, ForecastVintage, ForecastVintageId};

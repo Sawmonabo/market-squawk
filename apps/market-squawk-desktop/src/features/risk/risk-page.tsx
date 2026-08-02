@@ -25,6 +25,14 @@ import {
   parseRiskAccounts,
   parseRiskReport,
 } from "./contracts"
+import {
+  parsePaperOrders,
+  parsePaperStatus,
+  type PaperOrder,
+  type PaperRiskLimits,
+  type PaperRiskDecisions,
+  type PaperStatus,
+} from "../paper/contracts"
 
 export function RiskPage() {
   const product = useProduct()
@@ -58,6 +66,14 @@ function ReadyRiskPage({
     queryFn: async () =>
       parseRiskAccounts(await transport.query({ query: "portfolioAccounts" })),
   })
+  const executionStatus = useQuery({
+    queryKey: productKeys.operation(bootstrap.runtime, "Bot", "Bot.GetStatus", {}),
+    queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
+  })
+  const executionOrders = useQuery({
+    queryKey: productKeys.operation(bootstrap.runtime, "Execution", "Execution.GetOrders", {}),
+    queryFn: async () => parsePaperOrders(await transport.query({ query: "paperOrders" })),
+  })
   const availableAccounts = accounts.data?.value ?? []
   const [selectedAccount, setSelectedAccount] = React.useState<string | null>(null)
   const accountId = availableAccounts.some((account) => account.accountId === selectedAccount)
@@ -78,6 +94,11 @@ function ReadyRiskPage({
         </Button>
       }
     >
+      <CentralExecutionRisk
+        status={executionStatus.data?.value}
+        orders={executionOrders.data?.value ?? []}
+        error={executionStatus.error ?? executionOrders.error}
+      />
       {accounts.isLoading ? (
         <RiskGridLoading />
       ) : accounts.isError ? (
@@ -125,6 +146,98 @@ function ReadyRiskPage({
         </>
       )}
     </PageFrame>
+  )
+}
+
+function CentralExecutionRisk({
+  status,
+  orders,
+  error,
+}: {
+  status: PaperStatus | undefined
+  orders: PaperOrder[]
+  error: unknown
+}) {
+  const rejected = orders.filter((order) => order.state === "rejected").length
+  const activeBounds = orders.filter((order) => order.maximumExecutionPriceTicks !== undefined).length
+  return (
+    <section className="mb-4 rounded-xl border border-border bg-card/35 p-4">
+      <div className="flex gap-3">
+        <ShieldAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold">Central paper-execution risk</h2>
+          {error ? (
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">Execution-risk evidence could not be read: {messageFrom(error)}</p>
+          ) : status?.state !== "running" ? (
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">No active paper-risk evidence. Starting a paper runtime never bypasses central risk.</p>
+          ) : (
+            <>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                Every returned paper order reached the adapter only after central assessment. This immutable read image is published by the existing durable audit owner; it cannot amend a decision, consume an audit record, or change limits.
+              </p>
+              <dl className="mt-3 grid gap-3 sm:grid-cols-3">
+                <Fact label="Orders with execution bound" value={activeBounds.toLocaleString()} />
+                <Fact label="Adapter rejected orders" value={rejected.toLocaleString()} />
+                <Fact label="Breach / reconciliation state" value={status.reconciliationRequired || !status.financialReconciliationCurrent ? "Action required" : "Current"} />
+              </dl>
+              <RiskLimitEvidence limits={status.riskLimits} />
+              <RiskDecisionEvidence decisions={status.riskDecisions} />
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function RiskLimitEvidence({ limits }: { limits: PaperRiskLimits | undefined }) {
+  if (!limits) return <p className="mt-3 text-xs text-muted-foreground">Active central-risk limits were not returned.</p>
+  return (
+    <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
+      <h3 className="text-xs font-semibold">Active immutable limits</h3>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="Order notional" value={formatMoney(limits.maximumOrderNotional)} />
+        <Fact label="Gross exposure" value={formatMoney(limits.maximumGrossExposure)} />
+        <Fact label="Position limit" value={`${limits.maximumPositionLots.toLocaleString()} lots`} />
+        <Fact label="Leverage limit" value={`${limits.maximumLeverageBasisPoints.toLocaleString()} bp`} />
+        <Fact label="Slippage limit" value={`${limits.maximumSlippageBasisPoints.toLocaleString()} bp`} />
+        <Fact label="Price deviation" value={`${limits.maximumPriceDeviationBasisPoints.toLocaleString()} bp`} />
+        <Fact label="Loss / drawdown" value={`${formatMoney(limits.maximumLoss)} / ${formatMoney(limits.maximumDrawdown)}`} />
+        <Fact label="Rate limit" value={`${limits.maximumOrdersPerWindow} orders / ${durationFromNanos(limits.orderRateWindowNanos)}`} />
+      </dl>
+      <p className="mt-3 text-[10px] text-muted-foreground">
+        Eligible instruments: {limits.eligibleInstruments.returnedItems} of {limits.eligibleInstruments.availableItems}; shorting {limits.allowShort ? "allowed" : "disabled"}; kill switch {limits.killSwitch ? "engaged" : "clear"}.
+      </p>
+    </div>
+  )
+}
+
+function RiskDecisionEvidence({ decisions }: { decisions: PaperRiskDecisions | undefined }) {
+  if (!decisions) return <p className="mt-3 text-xs text-muted-foreground">No retained durable execution decisions were returned.</p>
+  return (
+    <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
+      <h3 className="text-xs font-semibold">Durable decision evidence</h3>
+      <p className="mt-1 text-[10px] text-muted-foreground">
+        {decisions.returnedItems} of {decisions.availableItems} retained decisions returned; {decisions.totalPublished} published. Sequence {decisions.oldestSequence ?? "—"} to {decisions.latestSequence ?? "—"}; {decisions.cursorExpired ? "requested cursor expired" : decisions.nextCursor ? `next cursor ${decisions.nextCursor}` : "page complete"}.
+      </p>
+      {decisions.records.length === 0 ? null : (
+        <div className="mt-3 space-y-2">
+          {decisions.records.map((decision) => (
+            <article key={decision.sequence} className="rounded-md border border-border/70 p-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="font-mono">#{decision.sequence} · {humanize(decision.kind)}</p>
+                <span className={decision.reasons.length > 0 ? "rounded-md border border-rose-400/20 bg-rose-400/10 px-2 py-1 text-[10px] text-rose-200" : "rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground"}>
+                  {decision.reasons.length > 0 ? `${decision.reasons.length} reason${decision.reasons.length === 1 ? "" : "s"}` : "No rejection reason"}
+                </span>
+              </div>
+              <p className="mt-2 text-muted-foreground">Order {shortDigest(decision.orderId)} · account {shortDigest(decision.accountId)} · observed {timeValue(decision.observedAt)}</p>
+              <p className="mt-1 font-mono text-[10px] text-muted-foreground">Intent {shortDigest(decision.intentDigestSha256)} · policy {shortDigest(decision.riskPolicyDigestSha256)} v{decision.riskPolicyRulesetVersion}</p>
+              {decision.reasons.length > 0 ? <p className="mt-2 text-rose-200">Reasons: {decision.reasons.map(reasonText).join(" · ")}</p> : null}
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -423,6 +536,25 @@ function countBoundary(
 
 function shortDigest(value: string) {
   return value.length > 18 ? `${value.slice(0, 10)}…${value.slice(-6)}` : value
+}
+
+function durationFromNanos(value: number) {
+  return value >= 1_000_000_000 ? `${value / 1_000_000_000}s` : `${value / 1_000_000}ms`
+}
+
+function timeValue(value: string | number) {
+  if (typeof value === "string") return timeFromNanos(value)
+  const date = new Date(Math.trunc(value / 1_000_000))
+  return Number.isNaN(date.getTime()) ? value.toLocaleString() : date.toLocaleString()
+}
+
+function reasonText(reason: unknown) {
+  if (typeof reason === "string") return humanize(reason)
+  if (reason && typeof reason === "object") {
+    const [kind = "unknown", detail] = Object.entries(reason)[0] ?? []
+    return detail === undefined ? humanize(kind) : `${humanize(kind)}: ${humanize(String(detail))}`
+  }
+  return "Unknown reason"
 }
 
 function timeFromNanos(value: string | null | undefined) {

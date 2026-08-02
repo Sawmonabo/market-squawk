@@ -6,6 +6,11 @@ mod import;
 mod model;
 mod read;
 
+pub(crate) use import::{
+    GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
+    ServerHeldPortfolioImportResolution,
+};
+
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{
@@ -197,6 +202,89 @@ impl PortfolioApplicationService {
         PortfolioFairValueReadCapability {
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Prepares a non-mutating portfolio import from bytes already claimed by native input
+    /// staging. The caller must pass the server-derived ticket ID only for audit binding; this
+    /// method neither resolves a filesystem path nor accepts a client-provided artifact ID.
+    ///
+    /// The returned preview is canonical and server-held. Committing it is intentionally exposed
+    /// through a separate governed path so interpretation and approval evidence cannot be
+    /// smuggled into preview input.
+    pub(crate) fn prepare_staged_import(
+        &self,
+        account_id: AccountId,
+        input_ticket_id: String,
+        bytes: &[u8],
+        context: &RequestContext,
+    ) -> Result<PortfolioImportPreview, PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let preview = authority.prepare_staged_import(
+            &self.runtime.artifacts,
+            account_id,
+            input_ticket_id,
+            bytes,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        Ok(preview)
+    }
+
+    /// Commits a prepared import using only server-held resolution evidence. The shared native
+    /// boundary must consume and validate the governance authorization handle before it can
+    /// construct `resolution`; the desktop never supplies its actor/time/rule, selected lots, or
+    /// corporate-action plan through this API.
+    pub(crate) fn commit_prepared_import(
+        &self,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image = authority.commit_prepared_import(
+            &self.runtime.artifacts,
+            preview_id,
+            interpretations,
+            resolution,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
+    }
+
+    /// Recovers a durable promotion that was interrupted after governance admission but before
+    /// portfolio publication. The caller must rehydrate the same server-held resolution evidence
+    /// from the governance authority; this method refuses newly supplied client interpretations.
+    pub(crate) fn recover_promoting_import(
+        &self,
+        preview_id: &str,
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image =
+            authority.recover_promoting_import(&self.runtime.artifacts, preview_id, resolution)?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
     }
 }
 

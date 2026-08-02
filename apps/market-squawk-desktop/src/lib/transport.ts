@@ -5,7 +5,7 @@ import type {
   EncryptedFileFallback,
   InstallationControlResult,
   InputTicket,
-  McpStatus,
+  McpClientsStatus,
   ProviderActivation,
   ProviderBootstrap,
   ProviderSession,
@@ -81,7 +81,18 @@ export type DashboardQuery =
     }
   | { query: "forecast" | "forecastOutcomes"; vintageId: string }
   | { query: "decisionScreens"; limit: number }
+  | {
+      query: "decisionScreenRuns"
+      afterRunId?: string
+      limit: number
+    }
   | { query: "decisionCandidates"; runId: string }
+  | {
+      query: "decisionCandidateDossiers"
+      candidateId: string
+      afterDossierId?: string
+      limit: number
+    }
   | { query: "decisionDossier"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"
@@ -89,6 +100,7 @@ export type DashboardQuery =
       revision: number
     }
   | { query: "decisionTargets"; targetId: string }
+  | { query: "decisionTargetIndex"; afterTargetId?: string; limit: number }
   | {
       query:
         | "fairValueClassification"
@@ -113,7 +125,10 @@ export type DashboardQuery =
       artifactId: string
       sha256: string
       byteCount: number
-      mediaType: "application/json" | "application/vnd.apache.parquet"
+      mediaType:
+        | "application/json"
+        | "application/vnd.apache.parquet"
+        | "application/x-ndjson"
       offset: number
       maximumBytes: number
     }
@@ -172,6 +187,15 @@ export interface ProductTransport {
     request: ModelControlRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
+  decisionControl(
+    request: DecisionControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  governanceQuery(request: GovernanceQueryRequest): Promise<ApplicationResult>
+  governanceControl(
+    request: GovernanceControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
   fairValueControl(
     request: FairValueControlRequest,
     confirmed?: boolean,
@@ -187,7 +211,11 @@ export interface ProductTransport {
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   stageTrainingInput(kind: TrainingInputKind): Promise<InputTicket | null>
-  mcpStatus(): Promise<McpStatus>
+  mcpClients(): Promise<McpClientsStatus>
+  mcpClientControl(
+    request: McpClientControlRequest,
+    confirmed?: boolean,
+  ): Promise<McpClientsStatus>
   subscribe(onEvent: (event: DesktopEvent) => void): Promise<() => void>
   onboard<Request extends ProviderOnboardingRequest>(
     request: Request,
@@ -197,6 +225,11 @@ export interface ProductTransport {
 }
 
 export type TrainingInputKind = "configuration" | "model_authority"
+
+export type McpClientControlRequest = {
+  action: "connect" | "verify" | "repair" | "disconnect"
+  client: "claude_code" | "codex"
+}
 
 export type ResearchControlRequest = { action: "startExport"; dataset: string }
 
@@ -212,10 +245,91 @@ export type ModelControlRequest =
       authorityTicketId: string
     }
 
-export type FairValueControlRequest = {
-  action: "classify"
-  measurementId: string
+export type GovernanceQueryRequest = {
+  query: "principals"
+  after?: string
+  limit?: number
 }
+
+export type GovernanceControlRequest = {
+  action: "authenticateAction"
+  previewId: string
+  principalId: string
+  credential: string
+}
+
+export type DecisionControlRequest =
+  | {
+      action: "previewGovernanceAction"
+      proposal:
+        | {
+            kind: "review"
+            targetId: string
+            targetRevision: number
+            disposition: "activate" | "reject" | "needs_changes"
+            note: string
+          }
+        | {
+            kind: "invalidation"
+            targetId: string
+            targetRevision: number
+            invalidationKind:
+              | "corporate_action"
+              | "model"
+              | "data"
+              | "reference_mark"
+              | "assumption"
+            note: string
+          }
+    }
+  | {
+      action: "commitGovernanceAction"
+      previewId: string
+      authorizationHandles: string[]
+    }
+
+export type FairValueGovernanceProposal =
+  | {
+      kind: "approve"
+      measurementId: string
+      decisionId: string
+      expiresAt: string
+    }
+  | {
+      kind: "override"
+      measurementId: string
+      decisionId: string
+      requestedHierarchy: "level_2" | "level_3"
+      justification: string
+      expiresAt: string
+    }
+  | {
+      kind: "revoke"
+      approvalId: string
+      reason: string
+    }
+  | {
+      kind: "market_access"
+      accountId: string
+      venueId: string
+      instrumentId: string
+      conclusion: "accessible" | "inaccessible"
+      effectiveFrom: string
+      effectiveUntil: string
+      rationale: string
+    }
+
+export type FairValueControlRequest =
+  | { action: "classify"; measurementId: string }
+  | {
+      action: "previewGovernanceAction"
+      proposal: FairValueGovernanceProposal
+    }
+  | {
+      action: "commitGovernanceAction"
+      previewId: string
+      authorizationHandles: string[]
+    }
 
 export type PaperControlRequest =
   | {

@@ -23,17 +23,23 @@ use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
 use crate::platform::ProgramName;
+use crate::service_registration::{
+    RegistrationSpec, ServiceRegistrationError, activate_and_verify as activate_registration,
+    remove_owned as remove_owned_registration, verify as verify_registration,
+};
 use crate::store::{
     InstallStore, InstallationState, StoreError, StoredVersion, remove_tree, validate_store_parent,
 };
+use crate::update_metadata::UpdateMetadataError;
 
 const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const STABLE_PROGRAMS: [ProgramName; 6] = [
+const STABLE_PROGRAMS: [ProgramName; 7] = [
     ProgramName::Desktop,
     ProgramName::Service,
+    ProgramName::McpRelay,
     ProgramName::Cli,
     ProgramName::CaptureHelper,
     ProgramName::OnnxWorker,
@@ -65,24 +71,30 @@ pub fn install(request: InstallRequest) -> Result<InstallReceipt, InstallError> 
 /// Returns [`InstallError::NotInstalled`] without an active selector and
 /// [`InstallError::UpdateNotNewer`] unless the admitted semantic version is strictly newer.
 pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
-    let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    let UpdateRequest {
+        root,
+        release,
+        bundle,
+        channel_manifest_url,
+        trusted_update,
+    } = request;
+    let store = InstallStore::open_existing(&root)?.ok_or(InstallError::NotInstalled)?;
     recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let current =
         Version::parse(&state.active.version).map_err(|_| InstallError::CorruptInstallation)?;
     let candidate =
-        Version::parse(request.release.version()).map_err(|_| InstallError::CorruptInstallation)?;
+        Version::parse(release.version()).map_err(|_| InstallError::CorruptInstallation)?;
     if candidate <= current {
         return Err(InstallError::UpdateNotNewer);
     }
     let retain_current_as_previous =
         verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok();
-    let active = prepare_candidate(&store, &request.release, &request.bundle)?;
-    state.activate(
-        active,
-        request.channel_manifest_url,
-        retain_current_as_previous,
-    )?;
+    let active = prepare_candidate(&store, &release, &bundle)?;
+    if let Some(trusted_update) = trusted_update {
+        trusted_update.persist()?;
+    }
+    state.activate(active, channel_manifest_url, retain_current_as_previous)?;
     commit_activation(&store, &state)?;
     receipt(&state, false)
 }
@@ -121,7 +133,9 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
             read_cached_release(&store, &state.active)?;
             false
         };
-        if verify_stable_programs(&store, &state).is_ok() {
+        if verify_stable_programs(&store, &state).is_ok()
+            && verify_service_registration(&store, &state.active).is_ok()
+        {
             return complete_repair(
                 &store,
                 &mut state,
@@ -157,6 +171,7 @@ fn complete_repair(
     if state.bind_channel_manifest_url(channel_manifest_url)? {
         commit_activation(store, state)?;
     } else if publish_programs {
+        activate_service_registration(store, &state.active)?;
         publish_stable_programs(store, state)?;
     }
     store.verify_private_permissions()?;
@@ -236,7 +251,8 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
     };
     let healthy =
         verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok()
-            && verify_stable_programs(&store, &state).is_ok();
+            && verify_stable_programs(&store, &state).is_ok()
+            && verify_service_registration(&store, &state.active).is_ok();
     Ok(installed_status(&state, healthy))
 }
 
@@ -544,13 +560,121 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
     let Some(state) = store.load_pending_activation()? else {
         return Ok(());
     };
+    let previous = store.load_state()?;
     verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
-    store.write_state(&state)?;
-    publish_stable_programs(store, &state)?;
+    let precommit = (|| {
+        activate_service_registration(store, &state.active)?;
+        publish_stable_programs(store, &state)?;
+        Ok::<(), InstallError>(())
+    })();
+    if let Err(error) = precommit {
+        restore_known_good_activation(store, previous.as_ref(), state.active.target)?;
+        return Err(error);
+    }
+    if let Err(error) = store.write_state(&state) {
+        let committed = store.load_state()?.is_some_and(|observed| {
+            observed.active.manifest_sha256 == state.active.manifest_sha256
+        });
+        if !committed {
+            restore_known_good_activation(store, previous.as_ref(), state.active.target)?;
+            return Err(error.into());
+        }
+    }
     store.prune(&state)?;
     store.clear_pending_activation()?;
     store.verify_private_permissions()?;
     Ok(())
+}
+
+fn activate_service_registration(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<(), InstallError> {
+    let version_root = store.version_path(version);
+    let install_root = install_root_from_version(&version_root)?;
+    let specification = RegistrationSpec::new(
+        install_root,
+        &version_root,
+        version.target,
+        &version.version,
+        &version.manifest_sha256,
+    )?;
+    activate_registration(&specification)?;
+    Ok(())
+}
+
+fn verify_service_registration(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<(), InstallError> {
+    let version_root = store.version_path(version);
+    let install_root = install_root_from_version(&version_root)?;
+    let specification = RegistrationSpec::new(
+        install_root,
+        &version_root,
+        version.target,
+        &version.version,
+        &version.manifest_sha256,
+    )?;
+    verify_registration(&specification)?;
+    Ok(())
+}
+
+fn restore_known_good_activation(
+    store: &InstallStore,
+    previous: Option<&InstallationState>,
+    failed_target: crate::platform::SupportedTarget,
+) -> Result<(), InstallError> {
+    let failed_version_root = store
+        .load_pending_activation()?
+        .map(|pending| store.version_path(&pending.active))
+        .ok_or(InstallError::CorruptInstallation)?;
+    let install_root = install_root_from_version(&failed_version_root)?;
+    remove_owned_registration(install_root, failed_target)?;
+    if let Some(previous) = previous {
+        activate_service_registration(store, &previous.active)?;
+        publish_stable_programs(store, previous)?;
+    } else {
+        clear_stable_programs(store, failed_target)?;
+    }
+    store.clear_pending_activation()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_stable_programs(
+    store: &InstallStore,
+    target: crate::platform::SupportedTarget,
+) -> Result<(), InstallError> {
+    for program in STABLE_PROGRAMS {
+        let path = store.entrypoint_path(program, target)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(InstallError::Io {
+                    operation: "remove failed stable program entrypoint",
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clear_stable_programs(
+    _store: &InstallStore,
+    _target: crate::platform::SupportedTarget,
+) -> Result<(), InstallError> {
+    Ok(())
+}
+
+fn install_root_from_version(version_root: &Path) -> Result<&Path, InstallError> {
+    version_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(InstallError::CorruptInstallation)
 }
 
 #[cfg(not(unix))]
@@ -642,6 +766,7 @@ fn program_receipt(
 /// mutable-data path.
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
     let prepared_deletions = preflight_deletions(&request.deletions, &request.root)?;
+    remove_owned_registration(&request.root, crate::platform::SupportedTarget::current()?)?;
     let store = InstallStore::open_existing(&request.root)?;
     let removed_program = if let Some(store) = store.as_ref() {
         let detached = store.quarantine_for_uninstall()?;
@@ -1385,6 +1510,18 @@ pub enum InstallError {
     /// Current release platform detection failed.
     #[error(transparent)]
     Platform(#[from] crate::platform::PlatformError),
+    /// Per-user service registration, ownership validation, or readiness failed.
+    #[error(transparent)]
+    ServiceRegistration(#[from] ServiceRegistrationError),
+    /// Threshold-signed update metadata or monotonic trust persistence failed.
+    #[error(transparent)]
+    UpdateMetadata(#[from] UpdateMetadataError),
+    /// A network-channel update did not carry verified trusted metadata.
+    #[error("network-channel updates require threshold-signed trusted metadata")]
+    TrustedUpdateRequired,
+    /// Trusted targets do not bind the supplied release manifest and archive exactly.
+    #[error("trusted update targets do not match the supplied release")]
+    TrustedUpdateIdentity,
 }
 
 #[cfg(test)]

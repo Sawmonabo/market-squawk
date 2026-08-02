@@ -6,7 +6,9 @@ mod contracts;
 mod lifecycle;
 mod manifest;
 mod platform;
+mod service_registration;
 mod store;
+mod update_metadata;
 
 pub use self::archive::ArchiveError;
 pub use self::command::{CommandError, run_cli, update_from_channel};
@@ -25,7 +27,15 @@ pub use self::manifest::{
 pub use self::platform::{
     NativeTrustMode, PlatformError, ProgramName, SupportedTarget, default_install_root,
 };
+pub use self::service_registration::{
+    InstalledServiceStatus, RestartInstalledServiceRequest, ServiceRegistrationError,
+    installed_service_status, restart_installed_service, verify_installed_service,
+};
 pub use self::store::StoreError;
+pub use self::update_metadata::{
+    PendingTrustedUpdate, SuppliedMetadata, SuppliedTarget, TargetSource, TrustedRoot,
+    TrustedTarget, TrustedUpdateReceipt, TrustedUpdateStore, UpdateMetadataError,
+};
 
 #[cfg(test)]
 mod tests {
@@ -134,6 +144,7 @@ mod tests {
         {
             let stable_cli = stable_program_path(&root, ProgramName::Cli)?;
             let stable_service = stable_program_path(&root, ProgramName::Service)?;
+            let stable_relay = stable_program_path(&root, ProgramName::McpRelay)?;
             assert_eq!(
                 active_release_root_for_installed_program(&stable_cli, ProgramName::Cli)?,
                 Some(active_release_root(&root)?)
@@ -141,12 +152,17 @@ mod tests {
             let stable_capture = stable_program_path(&root, ProgramName::CaptureHelper)?;
             let stable_worker = stable_program_path(&root, ProgramName::OnnxWorker)?;
             assert_eq!(stable_service.parent(), stable_cli.parent());
+            assert_eq!(stable_relay.parent(), stable_cli.parent());
             assert_eq!(stable_capture.parent(), stable_cli.parent());
             assert_eq!(stable_worker.parent(), stable_cli.parent());
             assert_eq!(fs::read(&stable_cli)?, b"0.1.0:bin/market-squawk");
             assert_eq!(
                 fs::read(stable_service)?,
                 b"0.1.0:bin/market-squawk-service"
+            );
+            assert_eq!(
+                fs::read(stable_relay)?,
+                b"0.1.0:bin/market-squawk-mcp-relay"
             );
             assert_eq!(
                 fs::read(stable_capture)?,
@@ -402,6 +418,35 @@ mod tests {
     }
 
     #[test]
+    fn failed_service_health_restores_the_known_good_release() -> TestResult {
+        let temporary = test_directory()?;
+        let root = temporary.path().join("program");
+        let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
+        install(InstallRequest::from_local(
+            root.clone(),
+            &first.manifest,
+            &first.bundle,
+        )?)?;
+        let candidate = BundleFixture::create(
+            temporary.path(),
+            "0.2.0",
+            BundleDefect::ServiceHealthFailure,
+        )?;
+
+        let result = update(UpdateRequest::from_local(
+            root.clone(),
+            &candidate.manifest,
+            &candidate.bundle,
+        )?);
+
+        assert!(result.is_err());
+        let restored = status(&root)?;
+        assert_eq!(restored.active_version(), Some("0.1.0"));
+        assert!(restored.is_healthy());
+        Ok(())
+    }
+
+    #[test]
     fn update_preserves_the_last_known_good_previous_version() -> TestResult {
         let temporary = test_directory()?;
         let root = temporary.path().join("program");
@@ -623,6 +668,7 @@ mod tests {
         UnlistedEntry,
         DigestMismatch,
         MisplacedRequiredRole,
+        ServiceHealthFailure,
     }
 
     struct BundleFixture {
@@ -650,7 +696,13 @@ mod tests {
                 } else {
                     expected_path
                 };
-                let bytes = format!("{version}:{path}").into_bytes();
+                let bytes = if matches!(defect, BundleDefect::ServiceHealthFailure)
+                    && role == ComponentRole::Service
+                {
+                    b"market-squawk-test-service-health-failure".to_vec()
+                } else {
+                    format!("{version}:{path}").into_bytes()
+                };
                 let options = SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Deflated)
                     .unix_permissions(if executable { 0o755 } else { 0o644 });

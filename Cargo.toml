@@ -60,6 +60,8 @@ datafusion = { version = "=54.0.0", default-features = false, features = [
     "sql",
 ] }
 directories = "=6.0.0"
+ed25519-dalek = { version = "=3.0.0", features = ["signature"] }
+olpc-cjson = "=0.1.4"
 fs2 = "0.4"
 futures-util = "0.3"
 getrandom = "=0.3.4"

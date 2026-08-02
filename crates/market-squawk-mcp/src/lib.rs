@@ -38,8 +38,8 @@ pub use market_squawk_services::{
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
 pub use relay::{
-    McpRelayError, McpRelayExchange, McpRelayResponse, McpRelayResponseError, McpRelayTransport,
-    McpRelayTransportError, McpStdioRelay,
+    MCP_PROTOCOL_VERSION, McpRelayError, McpRelayExchange, McpRelayResponse, McpRelayResponseError,
+    McpRelayTransport, McpRelayTransportError, McpStdioRelay,
 };
 pub use resources::{
     McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest,

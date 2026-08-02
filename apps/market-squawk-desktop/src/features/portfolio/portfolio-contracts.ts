@@ -50,6 +50,24 @@ const basisSchema = z.discriminatedUnion("status", [
   }),
 ])
 
+const holdingMarkEvidenceSchema = z.object({
+  sourceReference: z.string().min(1),
+  observedAtUnixNanos: losslessIntegerSchema,
+  venue: z.string().min(1).nullable(),
+  venueStatus: z.string().min(1),
+  state: z.string().min(1),
+  quality: z.string().min(1),
+  executionEligible: z.boolean(),
+  freshness: z.object({
+    status: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+  fallback: z.object({
+    status: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+})
+
 export const holdingSchema = z.object({
   account_id: z.string().min(1),
   instrument_id: z.string().min(1),
@@ -65,6 +83,7 @@ export const holdingSchema = z.object({
   availableAtUnixNanos: z.string().nullable(),
   sourceId: z.string().min(1),
   artifactSha256: digestSchema,
+  markEvidence: holdingMarkEvidenceSchema,
 })
 
 export const portfolioTransactionSchema = z.object({
@@ -176,6 +195,42 @@ export const portfolioCandidateImpactSchema = advancedReportBase.extend({
   }),
 })
 
+const reconciliationDetailSchema = z.object({
+  field: z.enum(["cash", "market_value", "cost_basis"]),
+  supplied: moneySchema,
+  calculated: moneySchema,
+  currency: z.string().min(1),
+  tolerance: z.object({
+    kind: z.literal("absolute"),
+    amount: moneySchema,
+  }),
+  sourceReference: z.string().min(1),
+})
+
+const measuredAccountingSchema = z.object({
+  status: z.string().min(1),
+  amount: moneySchema.optional(),
+  reason: z.string().min(1).optional(),
+})
+
+const accountingEvidenceSchema = z.object({
+  cash: z.object({
+    amount: moneySchema,
+    observedAtUnixNanos: losslessIntegerSchema,
+    sourceReference: z.string().min(1),
+    status: z.literal("source_reported_snapshot"),
+  }),
+  reportedMarketValue: moneySchema,
+  unrealizedGain: measuredAccountingSchema,
+  realizedGain: measuredAccountingSchema,
+  income: measuredAccountingSchema,
+  fees: measuredAccountingSchema,
+  reconciliation: z.object({
+    status: z.string().min(1),
+    discrepancies: z.array(reconciliationDetailSchema),
+  }),
+})
+
 export const performanceSchema = reportBase.extend({
   currentValue: moneySchema,
   historyStatus: z.string().optional(),
@@ -183,6 +238,7 @@ export const performanceSchema = reportBase.extend({
   moneyWeightedReturn: exactDecimalSchema.optional(),
   periods: z.number().int().nonnegative().optional(),
   analyticsEvidenceDigest: digestSchema.optional(),
+  accountingEvidence: accountingEvidenceSchema.optional(),
 })
 
 const exposureRowSchema = z.object({

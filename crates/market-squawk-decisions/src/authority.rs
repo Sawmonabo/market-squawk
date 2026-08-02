@@ -5,8 +5,8 @@ use market_squawk_domain::{RevisionNumber, Timestamp};
 use crate::{
     AppendOutcome, CandidateAssessment, CandidateInput, DecisionDossier, DecisionRepository,
     DecisionRepositoryError, GovernedTargetSet, InvestmentTargetSetId, SavedScreen,
-    ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetInvalidation, TargetReview,
-    TargetState, TargetStatus, candidate::execute,
+    ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation,
+    TargetReview, TargetState, TargetStatus, candidate::execute,
 };
 
 /// One transport-neutral workflow authority. Mutation requires exclusive access to the sole writer.
@@ -71,6 +71,23 @@ impl DecisionAuthority {
             .ok_or(DecisionRepositoryError::NotFound)
     }
 
+    /// Lists bounded retained saved-screen runs for discovery before exact candidate lookup.
+    pub fn list_screen_runs(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<crate::ScreenRunIndexEntry>, DecisionRepositoryError> {
+        self.repository.list_screen_runs(maximum)
+    }
+
+    /// Continues bounded screen-run discovery after one exact retained run identity.
+    pub fn list_screen_runs_after(
+        &self,
+        after: Option<&ScreenRunId>,
+        maximum: usize,
+    ) -> Result<Vec<crate::ScreenRunIndexEntry>, DecisionRepositoryError> {
+        self.repository.list_screen_runs_after(after, maximum)
+    }
+
     /// Returns one immutable reference-only dossier.
     pub fn get_dossier(
         &self,
@@ -87,6 +104,27 @@ impl DecisionAuthority {
         dossier: DecisionDossier,
     ) -> Result<AppendOutcome, DecisionRepositoryError> {
         self.repository.append_dossier(dossier)
+    }
+
+    /// Lists bounded immutable dossiers assembled for one exact candidate.
+    pub fn list_candidate_dossiers(
+        &self,
+        candidate_id: &crate::CandidateId,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionRepositoryError> {
+        self.repository
+            .dossiers_for_candidate(candidate_id, maximum)
+    }
+
+    /// Continues dossier discovery for one candidate after one exact retained dossier identity.
+    pub fn list_candidate_dossiers_after(
+        &self,
+        candidate_id: &crate::CandidateId,
+        after: Option<&crate::DossierId>,
+        maximum: usize,
+    ) -> Result<Vec<DecisionDossier>, DecisionRepositoryError> {
+        self.repository
+            .dossiers_for_candidate_after(candidate_id, after, maximum)
     }
 
     /// Creates revision one of an investment target series.
@@ -112,6 +150,23 @@ impl DecisionAuthority {
         id: &'a InvestmentTargetSetId,
     ) -> impl Iterator<Item = &'a GovernedTargetSet> + 'a {
         self.repository.target_revisions(id)
+    }
+
+    /// Lists one locator for each discovered target series at its current immutable revision.
+    pub fn list_target_index(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionRepositoryError> {
+        self.repository.list_target_index(maximum)
+    }
+
+    /// Continues target-series discovery after one exact retained target-series identity.
+    pub fn list_target_index_after(
+        &self,
+        after: Option<&InvestmentTargetSetId>,
+        maximum: usize,
+    ) -> Result<Vec<TargetIndexEntry>, DecisionRepositoryError> {
+        self.repository.list_target_index_after(after, maximum)
     }
 
     /// Appends explicit review evidence; activation is impossible without this operation.
