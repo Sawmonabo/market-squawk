@@ -11,13 +11,21 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::{
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode, header},
+};
+use market_squawk_jobs::JobId;
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
-    LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer, MutationAuditBundle,
-    MutationAuditReservation, ServerError, ServerExit,
+    AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass, McpHandlerFactory,
+    McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec, McpLimits,
+    McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest, McpServer,
+    MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
 };
+use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient};
 use market_squawk_services::{
     ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
     ServiceDomain, ServiceError, SourceEvidencePolicy, TOOL_INSTRUMENT_IDS_FIELD,
@@ -816,10 +824,19 @@ impl ToolServices for WaitingService {
 
     async fn call(
         &self,
-        _request: TypedToolRequest,
+        request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.name() != "Market.Wait" {
+            return TypedToolResult::try_new(
+                json!({"ok":true}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into);
+        }
         self.started.notify_one();
         context.cancellation().cancelled().await;
         Err(ServiceError::Cancelled)
@@ -1212,5 +1229,384 @@ async fn terminal_results_close_delayed_progress_for_normal_and_cancelled_calls(
     }
 
     assert_eq!(harness.close().await?, ServerExit::EndOfInput);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct HttpResources;
+
+#[async_trait]
+impl McpResourceProvider for HttpResources {
+    async fn read(
+        &self,
+        request: McpResourceRequest,
+        _context: RequestContext,
+    ) -> Result<McpResourceDocument, McpResourceError> {
+        let kind = match request {
+            McpResourceRequest::Service => "service",
+            McpResourceRequest::Workspace => "workspace",
+            McpResourceRequest::Source(_) => "source",
+            McpResourceRequest::Model(_) => "model",
+            McpResourceRequest::Job(_) => "job",
+            McpResourceRequest::Artifact(_) => "artifact",
+        };
+        McpResourceDocument::try_new(json!({"kind":kind}), 1)
+    }
+}
+
+#[derive(Debug)]
+struct FixedHttpAuthenticator {
+    alpha: AuthenticatedMcpClient,
+    beta: AuthenticatedMcpClient,
+}
+
+impl FixedHttpAuthenticator {
+    fn try_new() -> Result<Self, Box<dyn Error>> {
+        let alpha_id: ClientId = serde_json::from_str("\"00000000-0000-0000-0000-000000000011\"")?;
+        let beta_id: ClientId = serde_json::from_str("\"00000000-0000-0000-0000-000000000012\"")?;
+        let generation = CredentialGeneration::try_new(1)?;
+        Ok(Self {
+            alpha: AuthenticatedMcpClient::try_new(
+                NamedClient::ClaudeCode,
+                alpha_id,
+                generation,
+                1,
+            )?,
+            beta: AuthenticatedMcpClient::try_new(NamedClient::Codex, beta_id, generation, 1)?,
+        })
+    }
+}
+
+impl McpHttpAuthenticator for FixedHttpAuthenticator {
+    fn authenticate(&self, bearer_token: &str) -> Result<AuthenticatedMcpClient, McpHttpAuthError> {
+        match bearer_token {
+            "alpha" => Ok(self.alpha.clone()),
+            "beta" => Ok(self.beta.clone()),
+            _ => Err(McpHttpAuthError::Rejected),
+        }
+    }
+}
+
+fn stateless_request(method: Method, token: Option<&str>, body: Value) -> Request<Body> {
+    let rpc_method = body.get("method").and_then(Value::as_str);
+    let rpc_name = rpc_method.and_then(|method| match method {
+        "tools/call" => body.pointer("/params/name").and_then(Value::as_str),
+        "resources/read" => body.pointer("/params/uri").and_then(Value::as_str),
+        _ => None,
+    });
+    let mut builder = Request::builder()
+        .method(method)
+        .uri("/mcp")
+        .header(header::HOST, "127.0.0.1:43123")
+        .header(header::ORIGIN, "http://localhost:43123")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28");
+    if let Some(method) = rpc_method {
+        builder = builder.header("Mcp-Method", method);
+    }
+    if let Some(name) = rpc_name {
+        builder = builder.header("Mcp-Name", name);
+    }
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| Request::new(Body::empty()))
+}
+
+fn stateless_message(id: &str, method: &str, params: Value) -> Value {
+    let mut params = params.as_object().cloned().unwrap_or_default();
+    params.insert(
+        "_meta".to_owned(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientInfo":{"name":"tests","version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }),
+    );
+    json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+}
+
+async fn response_json(response: axum::response::Response) -> Result<Value, Box<dyn Error>> {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn stateless_rpc(
+    http: &McpHttpService,
+    token: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let response = http
+        .handle(stateless_request(
+            Method::POST,
+            Some(token),
+            stateless_message(method, method, params),
+        ))
+        .await;
+    let status = response.status();
+    let value = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "unexpected MCP response: {value}");
+    Ok(value)
+}
+
+#[tokio::test]
+async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabilities()
+-> Result<(), Box<dyn Error>> {
+    let services = Arc::new(WaitingService::default());
+    let limits = McpLimits::try_from(McpLimitSpec {
+        maximum_frame_bytes: 256 * 1024,
+        maximum_body_bytes: 8 * 1024,
+        maximum_writer_queue_bytes: 256 * 1024 + 1,
+        ..McpLimitSpec::default()
+    })?;
+    let audit = Arc::new(CollectingAudit::default());
+    let factory = McpHandlerFactory::try_new(
+        services.clone(),
+        limits,
+        audit.clone(),
+        Arc::new(RejectingArtifacts),
+        Arc::new(HttpResources),
+    )?;
+    let http = McpHttpService::new(
+        factory,
+        Arc::new(FixedHttpAuthenticator::try_new()?),
+        HttpMcpConfig::try_new(
+            ["127.0.0.1:43123"],
+            ["http://localhost:43123"],
+            CancellationToken::new(),
+        )?,
+    );
+
+    for token in ["alpha", "beta"] {
+        let discover = stateless_rpc(&http, token, "server/discover", json!({})).await?;
+        assert_eq!(
+            discover["result"]["supportedVersions"],
+            json!(["2026-07-28"]),
+            "unexpected discovery response: {discover}"
+        );
+        assert!(discover["result"]["capabilities"].get("tools").is_some());
+        assert!(
+            discover["result"]["capabilities"]
+                .get("resources")
+                .is_some()
+        );
+        assert!(discover["result"]["capabilities"].get("tasks").is_none());
+        let tools = stateless_rpc(&http, token, "tools/list", json!({})).await?;
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "Bot.Test"))
+        );
+        let resources = stateless_rpc(&http, token, "resources/templates/list", json!({})).await?;
+        assert!(
+            resources["result"]["resourceTemplates"]
+                .as_array()
+                .is_some_and(|templates| templates
+                    .iter()
+                    .any(|template| template["uriTemplate"] == "market-squawk://jobs/{job_id}"))
+        );
+        let read = stateless_rpc(
+            &http,
+            token,
+            "tools/call",
+            json!({"name":"Bot.Test","arguments":{}}),
+        )
+        .await?;
+        assert_eq!(read["result"]["structuredContent"]["data"]["ok"], true);
+    }
+
+    let held = http
+        .handle(stateless_request(
+            Method::POST,
+            Some("alpha"),
+            stateless_message(
+                "read",
+                "tools/call",
+                json!({"name":"Bot.Test","arguments":{}}),
+            ),
+        ))
+        .await;
+    assert_eq!(held.status(), StatusCode::OK);
+    assert_eq!(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("alpha"),
+            stateless_message("saturated", "server/discover", json!({})),
+        ))
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("beta"),
+            stateless_message("isolated", "server/discover", json!({})),
+        ))
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let read = response_json(held).await?;
+    assert_eq!(read["result"]["structuredContent"]["data"]["ok"], true);
+
+    let interrupted_http = http.clone();
+    let interrupted = tokio::spawn(async move {
+        interrupted_http
+            .handle(stateless_request(
+                Method::POST,
+                Some("alpha"),
+                stateless_message(
+                    "interrupted",
+                    "tools/call",
+                    json!({"name":"Market.Wait","arguments":{}}),
+                ),
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), services.started.notified())
+        .await
+        .map_err(|_error| "interrupted MCP service call did not start")?;
+    interrupted.abort();
+    let _ = interrupted.await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        audit.wait_for_result_count(market_squawk_mcp::AuditResultClass::Cancelled, 1),
+    )
+    .await
+    .map_err(|_error| "dropping the MCP request did not cancel its service call")??;
+    let unaffected = stateless_rpc(&http, "beta", "server/discover", json!({})).await?;
+    assert_eq!(
+        unaffected["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+
+    for (request, expected) in [
+        (
+            stateless_request(
+                Method::POST,
+                None,
+                stateless_message("missing", "server/discover", json!({})),
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            stateless_request(
+                Method::POST,
+                Some("wrong"),
+                stateless_message("wrong", "server/discover", json!({})),
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            stateless_request(Method::GET, Some("alpha"), json!({})),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            stateless_request(Method::DELETE, Some("alpha"), json!({})),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        assert_eq!(http.handle(request).await.status(), expected);
+    }
+
+    let missing_metadata = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        json!({"jsonrpc":"2.0","id":"metadata","method":"server/discover","params":{}}),
+    );
+    assert_ne!(http.handle(missing_metadata).await.status(), StatusCode::OK);
+
+    let mut wrong_host = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("host", "server/discover", json!({})),
+    );
+    wrong_host.headers_mut().insert(
+        header::HOST,
+        header::HeaderValue::from_static("example.com"),
+    );
+    assert_ne!(http.handle(wrong_host).await.status(), StatusCode::OK);
+
+    let mut wrong_origin = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("origin", "server/discover", json!({})),
+    );
+    wrong_origin.headers_mut().insert(
+        header::ORIGIN,
+        header::HeaderValue::from_static("https://example.com"),
+    );
+    assert_ne!(http.handle(wrong_origin).await.status(), StatusCode::OK);
+
+    let mut disagreement = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("version", "tools/list", json!({})),
+    );
+    disagreement.headers_mut().insert(
+        "MCP-Protocol-Version",
+        header::HeaderValue::from_static("2025-11-25"),
+    );
+    assert_ne!(http.handle(disagreement).await.status(), StatusCode::OK);
+
+    let mut unsupported_body = stateless_message("unsupported", "tools/list", json!({}));
+    unsupported_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2025-11-25");
+    let mut unsupported = stateless_request(Method::POST, Some("alpha"), unsupported_body);
+    unsupported.headers_mut().insert(
+        "MCP-Protocol-Version",
+        header::HeaderValue::from_static("2025-11-25"),
+    );
+    assert_ne!(http.handle(unsupported).await.status(), StatusCode::OK);
+
+    let mut legacy = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("legacy", "server/discover", json!({})),
+    );
+    legacy.headers_mut().insert(
+        "Mcp-Session-Id",
+        header::HeaderValue::from_static("legacy-session"),
+    );
+    legacy.headers_mut().insert(
+        "Last-Event-ID",
+        header::HeaderValue::from_static("legacy-event"),
+    );
+    assert_eq!(http.handle(legacy).await.status(), StatusCode::BAD_REQUEST);
+
+    let oversized = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        json!({"padding":"x".repeat(9 * 1024)}),
+    );
+    assert_eq!(
+        http.handle(oversized).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    let job_id: JobId = "00000000-0000-0000-0000-000000000001".parse()?;
+    let job = response_json(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("beta"),
+            stateless_message(
+                "job",
+                "resources/read",
+                json!({"uri":format!("market-squawk://jobs/{}", job_id.as_uuid())}),
+            ),
+        ))
+        .await,
+    )
+    .await?;
+    assert_eq!(
+        job["result"]["contents"][0]["uri"],
+        format!("market-squawk://jobs/{}", job_id.as_uuid())
+    );
+    assert_eq!(job["result"]["contents"][0]["mimeType"], "application/json");
     Ok(())
 }

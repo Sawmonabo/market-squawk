@@ -513,6 +513,9 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(match self.identity_class {
+                LocalProcessIdentityClass::AuthenticatedInstalledClient => {
+                    "Authenticated access to the installed Market Squawk service."
+                }
                 LocalProcessIdentityClass::InheritedStdioUnverified => {
                     "Inherited local stdio; peer identity is unverified. No business-domain tools are present unless explicitly registered."
                 }
@@ -628,7 +631,7 @@ pub fn validate_service_capabilities(
     validated_protocol_tools(capabilities, limits).map(|_tools| ())
 }
 
-fn validated_protocol_tools(
+pub(crate) fn validated_protocol_tools(
     capabilities: &ServiceCapabilities,
     limits: McpLimits,
 ) -> Result<Arc<[Tool]>, ServerError> {
