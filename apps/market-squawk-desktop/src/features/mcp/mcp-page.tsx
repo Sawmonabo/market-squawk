@@ -22,7 +22,6 @@ import { ClientCard } from "./client-card"
 import {
   actionDescription,
   actionLabel,
-  requireMcpTransport,
   type McpClientAction,
   type McpClientControlRequest,
 } from "./contracts"
@@ -61,12 +60,12 @@ function McpWorkspace({
   const queryKey = [...productKeys.domain(bootstrap.runtime, "mcp"), "clients"] as const
   const status = useQuery({
     queryKey,
-    queryFn: () => requireMcpTransport(transport).mcpClients(),
+    queryFn: () => transport.mcpClients(),
     refetchInterval: 15_000,
   })
   const control = useMutation({
     mutationFn: (request: McpClientControlRequest) =>
-      requireMcpTransport(transport).mcpClientControl(request, true),
+      transport.mcpClientControl(request, true),
     onSuccess: async (next, request) => {
       queryClient.setQueryData(queryKey, next)
       setAnnouncement(`${clientName(request.client)} ${actionPastTense(request.action)}.`)

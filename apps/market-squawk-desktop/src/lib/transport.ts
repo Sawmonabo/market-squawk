@@ -227,7 +227,14 @@ export interface ProductTransport {
 export type TrainingInputKind = "configuration" | "model_authority"
 
 export type McpClientControlRequest = {
-  action: "connect" | "verify" | "repair" | "disconnect"
+  action:
+    | "connect"
+    | "reconnect"
+    | "verify"
+    | "repair"
+    | "rotateCredential"
+    | "revokeCredential"
+    | "disconnect"
   client: "claude_code" | "codex"
 }
 

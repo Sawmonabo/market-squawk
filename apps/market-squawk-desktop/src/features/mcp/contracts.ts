@@ -1,7 +1,9 @@
 import type { McpClientsStatus as SharedMcpClientsStatus } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import type { McpClientControlRequest as SharedMcpClientControlRequest } from "@/lib/transport"
 
-export type McpClientKind = "claude_code" | "codex"
+export type McpClientControlRequest = SharedMcpClientControlRequest
+export type McpClientAction = McpClientControlRequest["action"]
+export type McpClientKind = McpClientControlRequest["client"]
 export type McpClientState =
   | "absent"
   | "unsupported"
@@ -15,37 +17,6 @@ export type McpClientsStatus = SharedMcpClientsStatus
 export type McpClientView = McpClientsStatus["clients"][number]
 export type McpServiceClientStatus = McpClientView["service"]
 export type McpRuntimeStatus = McpClientsStatus["runtime"]
-
-export type McpClientAction =
-  | "connect"
-  | "reconnect"
-  | "verify"
-  | "repair"
-  | "rotateCredential"
-  | "revokeCredential"
-  | "disconnect"
-
-export interface McpClientControlRequest {
-  action: McpClientAction
-  client: McpClientKind
-}
-
-export type McpDashboardTransport = Omit<
-  ProductTransport,
-  "mcpClients" | "mcpClientControl"
-> & {
-  mcpClients(): Promise<McpClientsStatus>
-  mcpClientControl(
-    request: McpClientControlRequest,
-    confirmed?: boolean,
-  ): Promise<McpClientsStatus>
-}
-
-export function requireMcpTransport(
-  transport: ProductTransport,
-): McpDashboardTransport {
-  return transport as McpDashboardTransport
-}
 
 export function availableActions(client: McpClientView): McpClientAction[] {
   switch (client.state) {
