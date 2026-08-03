@@ -67,6 +67,9 @@ process-wrap = { workspace = true }
 [target.'cfg(market_squawk_loom)'.dependencies]
 loom = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 atomicwrites = { workspace = true }
 

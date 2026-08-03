@@ -541,6 +541,10 @@ impl SecretOperationControl {
         self.retry_budget
     }
 
+    pub(super) const fn interaction_policy(&self) -> SecretInteractionPolicy {
+        self.interaction
+    }
+
     pub(super) fn preflight(
         &self,
         capabilities: SecretStoreCapabilities,

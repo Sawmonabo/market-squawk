@@ -383,12 +383,14 @@ impl SecretStore for PreferredSecretStore {
     ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
         match self.primary.plan_create(key, generation, control) {
             Ok(plan) => Ok(plan),
-            Err(error) if keyring_is_unavailable(&error) => match self.fallback.as_ref() {
-                Some(fallback) => {
-                    fallback.with_ready(|store| store.plan_create(key, generation, control))
+            Err(error) if keyring_cannot_plan_non_interactively(&error) => {
+                match self.fallback.as_ref() {
+                    Some(fallback) => {
+                        fallback.with_ready(|store| store.plan_create(key, generation, control))
+                    }
+                    None => Err(error),
                 }
-                None => Err(error),
-            },
+            }
             Err(error) => Err(error),
         }
     }
@@ -580,6 +582,10 @@ fn keyring_is_unavailable(error: &LocalSecretStoreError) -> bool {
             | LocalSecretStoreError::SessionUnavailable
             | LocalSecretStoreError::UnsupportedOperation
     )
+}
+
+fn keyring_cannot_plan_non_interactively(error: &LocalSecretStoreError) -> bool {
+    keyring_is_unavailable(error) || matches!(error, LocalSecretStoreError::InteractionRequired)
 }
 
 #[cfg(test)]
