@@ -541,6 +541,7 @@ impl SecretOperationControl {
         self.retry_budget
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) const fn interaction_policy(&self) -> SecretInteractionPolicy {
         self.interaction
     }
