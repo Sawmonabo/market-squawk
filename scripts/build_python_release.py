@@ -14,7 +14,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
 import re
 import shutil
@@ -443,6 +443,7 @@ class InstalledDistribution:
     name: str
     version: str
     roots: tuple[str, ...]
+    external_paths: tuple[str, ...]
     record: Path
     record_sha256: str
     record_size: int
@@ -4447,6 +4448,7 @@ def inspect_installed_distribution(
     entries: dict[str, tuple[str, int]] = {}
     hashed_entries: set[str] = set()
     checked_hash_bytecode: list[tuple[str, str]] = []
+    external_entries: set[str] = set()
     saw_record = False
     saw_training_driver = False
     total_size = 0
@@ -4482,10 +4484,14 @@ def inspect_installed_distribution(
                         raise ReleaseBuildError(
                             "installed training driver path is invalid"
                         )
+                    external_entries.add(name)
                     saw_training_driver = True
                 else:
-                    relative = _safe_record_path(name)
-                    path = site_packages / relative
+                    path, is_internal = _installed_record_path(
+                        name, site_packages, release_root, profile
+                    )
+                    if not is_internal:
+                        external_entries.add(name)
                 if path.is_symlink() or not path.is_file():
                     raise ReleaseBuildError("installed distribution file is unavailable")
                 observed_size, observed_sha256, header = (
@@ -4553,7 +4559,9 @@ def inspect_installed_distribution(
     ):
         raise ReleaseBuildError("installed distribution RECORD is incomplete")
     internal_entries = {
-        name for name in entries if name != training_driver_record
+        name
+        for name in entries
+        if name != training_driver_record and name not in external_entries
     }
     roots = tuple(
         sorted(
@@ -4587,6 +4595,7 @@ def inspect_installed_distribution(
         name=requirement.name,
         version=requirement.version,
         roots=roots,
+        external_paths=tuple(sorted(external_entries)),
         record=record.relative_to(release_root),
         record_sha256=record_sha256,
         record_size=record_size,
@@ -4640,11 +4649,16 @@ def _require_disjoint_distribution_roots(
     distributions: tuple[InstalledDistribution, ...],
 ) -> None:
     roots = set()
+    external_paths = set()
     for distribution in distributions:
         for root in distribution.roots:
             if root in roots:
                 raise ReleaseBuildError("installed distribution roots overlap")
             roots.add(root)
+        for path in distribution.external_paths:
+            if path in external_paths:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            external_paths.add(path)
 
 
 def install_training_environment(
@@ -4851,16 +4865,70 @@ def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
 
 
 def _safe_record_path(value: str) -> Path:
-    path = Path(value)
+    parts = _record_path_parts(value, allow_leading_parents=False)
+    return Path(*parts)
+
+
+def _installed_record_path(
+    value: str,
+    site_packages: Path,
+    release_root: Path,
+    profile: PlatformProfile,
+) -> tuple[Path, bool]:
+    """Resolve an installed RECORD path within its owned installation scheme."""
+
+    try:
+        return site_packages / _safe_record_path(value), True
+    except ReleaseBuildError:
+        parts = _record_path_parts(value, allow_leading_parents=True)
+    if parts[0] != "..":
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+    first_owned = next(
+        (index for index, part in enumerate(parts) if part != ".."), None
+    )
+    if first_owned is None or any(part == ".." for part in parts[first_owned:]):
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+
+    try:
+        canonical_release = release_root.resolve(strict=True)
+        canonical_site_packages = site_packages.resolve(strict=True)
+        scripts = release_root / _training_driver_path(profile).parent
+        if scripts.is_symlink() or not scripts.is_dir():
+            raise ReleaseBuildError("installed project RECORD path is invalid")
+        canonical_scripts = scripts.resolve(strict=True)
+        path = canonical_site_packages.joinpath(*parts).resolve(strict=False)
+    except OSError as error:
+        raise ReleaseBuildError("installed project RECORD path is invalid") from error
+    observed = os.path.relpath(path, canonical_site_packages).replace(os.sep, "/")
+    if (
+        not canonical_site_packages.is_relative_to(canonical_release)
+        or canonical_scripts.parent != canonical_release
+        or path.parent != canonical_scripts
+        or observed != value
+    ):
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+    return path, False
+
+
+def _record_path_parts(
+    value: str, *, allow_leading_parents: bool
+) -> tuple[str, ...]:
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    raw_parts = value.split("/")
     if (
         not value
         or len(value.encode("utf-8")) > 1024
+        or "\0" in value
         or "\\" in value
-        or path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts)
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or any(part in {"", "."} for part in raw_parts)
+        or (not allow_leading_parents and ".." in raw_parts)
     ):
         raise ReleaseBuildError("installed project RECORD path is invalid")
-    return path
+    return tuple(raw_parts)
 
 
 def _record_set_sha256(entries: dict[str, tuple[str, int]]) -> str:

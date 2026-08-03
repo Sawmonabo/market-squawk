@@ -6548,8 +6548,8 @@
     },
     {
       "path": "python/pyproject.toml",
-      "sha256": "ff456c7e0a7c5d268e55a1807a464d83372bb65dd287f2b4a78f67c9fc6e061f",
-      "size_bytes": 722
+      "sha256": "fb7edbb91ad1ca5abc003790a5d2a6b6ceb683ff908a88272a602ee1b4c521ed",
+      "size_bytes": 793
     },
     {
       "path": "python/requirements.lock",
@@ -6603,13 +6603,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "c13f99dda893441658a1c4bb10af4f0817f2198963caa634cff947dafeb7a2eb",
-      "size_bytes": 204332
+      "sha256": "31e077c3583069be21513f4012f66d21156d1ee892053f9d33cb74549ce313f9",
+      "size_bytes": 207134
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "1f7fd0a1c8cb808e43efe43c27a79288edf4c5cc80b1ec3bf146a5bdd5fc8d72",
-      "size_bytes": 21953
+      "sha256": "f087d3e80b74c2866ad3b656b5095614905733de68e2288b5a790cc954172694",
+      "size_bytes": 28849
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import hashlib
 import json
@@ -350,6 +351,152 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 environment,
             )
             self.assertEqual(executables.application, release / "market-squawk")
+
+    def test_installed_record_confines_cross_platform_script_paths(self) -> None:
+        cases = (
+            (
+                "x86_64-unknown-linux-gnu",
+                Path("lib/python3.14/site-packages"),
+                Path("bin/f2py"),
+                "../../../bin/f2py",
+                "../../../../escape",
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                Path("Lib/site-packages"),
+                Path("Scripts/f2py.exe"),
+                "../../Scripts/f2py.exe",
+                "../../../escape",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for target, site_relative, script_relative, record_path, escape in cases:
+                with self.subTest(target=target):
+                    release = Path(temporary) / target / "release-cp314"
+                    site_packages = release / site_relative
+                    dist_info = site_packages / "numpy-2.5.1.dist-info"
+                    dist_info.mkdir(parents=True)
+                    metadata = b"Metadata-Version: 2.4\nName: numpy\nVersion: 2.5.1\n\n"
+                    (dist_info / "METADATA").write_bytes(metadata)
+                    script = release / script_relative
+                    script.parent.mkdir()
+                    script_bytes = b"locked uv launcher"
+                    script.write_bytes(script_bytes)
+
+                    def hashed_row(name: str, content: bytes) -> str:
+                        encoded = base64.urlsafe_b64encode(
+                            hashlib.sha256(content).digest()
+                        ).rstrip(b"=")
+                        return f"{name},sha256={encoded.decode('ascii')},{len(content)}"
+
+                    record = dist_info / "RECORD"
+                    record.write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    "numpy-2.5.1.dist-info/METADATA", metadata
+                                ),
+                                "numpy-2.5.1.dist-info/RECORD,,",
+                                hashed_row(record_path, script_bytes),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    runtime = builder.PythonRuntime(
+                        release / "python", (3, 14, 6)
+                    )
+                    profile = builder.platform_profile(target)
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        distribution = builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
+                    self.assertEqual(distribution.file_count, 2)
+                    self.assertEqual(
+                        distribution.roots, ("numpy-2.5.1.dist-info",)
+                    )
+
+                    escaped = site_packages.joinpath(*escape.split("/")).resolve()
+                    escaped.parent.mkdir(parents=True, exist_ok=True)
+                    escaped.write_bytes(script_bytes)
+                    record.write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    "numpy-2.5.1.dist-info/METADATA", metadata
+                                ),
+                                "numpy-2.5.1.dist-info/RECORD,,",
+                                hashed_row(escape, script_bytes),
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        with self.assertRaisesRegex(
+                            builder.ReleaseBuildError,
+                            "installed project RECORD path is invalid",
+                        ):
+                            builder.inspect_installed_distribution(
+                                release,
+                                runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
+
+    def test_installed_distributions_reject_shared_external_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary) / "release-cp314"
+            site_packages = release / "lib/python3.14/site-packages"
+            script = release / "bin/shared-tool"
+            script.parent.mkdir(parents=True)
+            script_bytes = b"identical owned script"
+            script.write_bytes(script_bytes)
+
+            def hashed_row(name: str, content: bytes) -> str:
+                encoded = base64.urlsafe_b64encode(
+                    hashlib.sha256(content).digest()
+                ).rstrip(b"=")
+                return f"{name},sha256={encoded.decode('ascii')},{len(content)}"
+
+            distributions = []
+            profile = builder.platform_profile("x86_64-unknown-linux-gnu")
+            runtime = builder.PythonRuntime(release / "bin/python", (3, 14, 6))
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                for name in ("alpha", "beta"):
+                    metadata = (
+                        f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.0\n\n"
+                    ).encode("ascii")
+                    dist_info = site_packages / f"{name}-1.0.dist-info"
+                    dist_info.mkdir(parents=True)
+                    (dist_info / "METADATA").write_bytes(metadata)
+                    (dist_info / "RECORD").write_text(
+                        "\n".join(
+                            (
+                                hashed_row(
+                                    f"{name}-1.0.dist-info/METADATA", metadata
+                                ),
+                                hashed_row("../../../bin/shared-tool", script_bytes),
+                                f"{name}-1.0.dist-info/RECORD,,",
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    distributions.append(
+                        builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement(name, "1.0"),
+                        )
+                    )
+
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError,
+                "installed distribution ownership overlaps",
+            ):
+                builder._require_disjoint_distribution_roots(tuple(distributions))
 
     def test_training_receipts_bind_build_foundation_and_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
