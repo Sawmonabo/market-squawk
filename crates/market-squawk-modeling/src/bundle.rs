@@ -131,6 +131,9 @@ impl ControlledModelRoot {
 pub struct ModelBundle {
     metadata: ModelMetadata,
     artifact: BundleArtifact,
+    metadata_path: Box<str>,
+    artifact_path: Box<str>,
+    training_run_path: Box<str>,
     metadata_bytes: Box<[u8]>,
     artifact_bytes: Box<[u8]>,
     training_run_bytes: Box<[u8]>,
@@ -414,6 +417,9 @@ impl ModelBundle {
             .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
             .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
             .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(artifact_reference.relative_path().len()))
+            .and_then(|bytes| bytes.checked_add(training_run_reference.relative_path().len()))
             .and_then(|bytes| {
                 bytes.checked_add(
                     forecast_residuals_bytes
@@ -432,6 +438,9 @@ impl ModelBundle {
         Ok(Self {
             metadata,
             artifact,
+            metadata_path: reference.relative_path().into(),
+            artifact_path: artifact_reference.relative_path().into(),
+            training_run_path: training_run_reference.relative_path().into(),
             metadata_bytes: metadata_bytes.into_boxed_slice(),
             artifact_bytes: artifact_bytes.into_boxed_slice(),
             training_run_bytes: training_run_bytes.into_boxed_slice(),
@@ -481,6 +490,55 @@ impl ModelBundle {
     #[must_use]
     pub fn forecast_policy_bytes(&self) -> Option<&[u8]> {
         self.forecast_policy_bytes.as_deref()
+    }
+
+    /// Iterates every exact admitted member in stable semantic order.
+    ///
+    /// Paths were validated by the same controlled-path grammar used during admission. Digests
+    /// name the exact retained bytes and optional forecast members are present as an inseparable
+    /// pair.
+    pub fn retained_members(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, &str, &[u8], Sha256Digest)> {
+        let metadata = self.metadata();
+        [
+            Some((
+                "metadata",
+                self.metadata_path.as_ref(),
+                self.metadata_bytes.as_ref(),
+                metadata.metadata_hash(),
+            )),
+            Some((
+                "artifact",
+                self.artifact_path.as_ref(),
+                self.artifact_bytes.as_ref(),
+                metadata.artifact_hash(),
+            )),
+            Some((
+                "training_run",
+                self.training_run_path.as_ref(),
+                self.training_run_bytes.as_ref(),
+                metadata.training_run_hash(),
+            )),
+            self.forecast_residuals_bytes.as_deref().map(|bytes| {
+                (
+                    "forecast_residuals",
+                    FORECAST_RESIDUALS_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
+            self.forecast_policy_bytes.as_deref().map(|bytes| {
+                (
+                    "forecast_policy",
+                    FORECAST_POLICY_PATH,
+                    bytes,
+                    sha256_digest(bytes),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     pub(crate) const fn native_artifact(&self) -> Option<&NativeArtifact> {

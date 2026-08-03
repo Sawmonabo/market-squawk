@@ -142,6 +142,22 @@ const PORTFOLIO_IMPORT_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("accountId", ArgumentKind::Identifier),
     ArgumentSpec::required("artifactId", ArgumentKind::Identifier),
 ];
+const PORTFOLIO_IMPORT_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid),
+];
+const PORTFOLIO_IMPORT_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Sha256),
+    ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "interpretations",
+        ArgumentKind::PortfolioImportInterpretations,
+    ),
+];
+const PORTFOLIO_IMPORT_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("approvalId", ArgumentKind::Uuid)];
+const PORTFOLIO_IMPORT_DISCARD_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("previewId", ArgumentKind::Sha256)];
 const LIST_ACCOUNTS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
     "afterAccountId",
     ArgumentKind::Identifier,
@@ -875,6 +891,38 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Portfolio,
         PORTFOLIO_SCOPE,
         PORTFOLIO_IMPORT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Portfolio.PreviewStagedImport",
+        "Claim one staged portfolio file and return a bounded server-owned interpretation preview.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_PREVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Portfolio.ApproveStagedImport",
+        "Bind selected interpretations to one exact server-owned portfolio preview.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_APPROVAL_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Portfolio.CommitStagedImport",
+        "Commit one durably approved portfolio import through the portfolio authority.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Portfolio.DiscardStagedImport",
+        "Discard one unapproved server-owned portfolio import preview.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_DISCARD_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     read(
@@ -1888,6 +1936,7 @@ enum ArgumentKind {
     Timestamp,
     FairValueMeasurement,
     ForecastRequest,
+    PortfolioImportInterpretations,
     SettingsChanges,
     Enumeration(&'static [&'static str]),
     Unsigned { minimum: u64, maximum: u64 },
@@ -2039,6 +2088,7 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::ForecastRequest => forecast_request_schema(),
+        ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
         ArgumentKind::SettingsChanges => settings_changes_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
@@ -2261,6 +2311,9 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::Timestamp => admit_timestamp(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
         ArgumentKind::ForecastRequest => admit_forecast_request(value),
+        ArgumentKind::PortfolioImportInterpretations => {
+            admit_portfolio_import_interpretations(value)
+        }
         ArgumentKind::SettingsChanges => admit_settings_changes(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
@@ -2273,6 +2326,95 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn portfolio_import_interpretations_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 100_000,
+        "items": {
+            "type": "object",
+            "properties": {
+                "recordId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAXIMUM_IDENTIFIER_BYTES,
+                },
+                "interpretation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAXIMUM_TEXT_BYTES,
+                },
+                "selectedLotIndexes": {
+                    "type": "array",
+                    "maxItems": 100_000,
+                    "uniqueItems": true,
+                    "items": {"type": "integer", "minimum": 0, "maximum": 99_999},
+                },
+            },
+            "required": ["recordId", "interpretation", "rationale"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn admit_portfolio_import_interpretations(value: &Value) -> Result<(), ToolInputError> {
+    let selections = value
+        .as_array()
+        .filter(|selections| !selections.is_empty() && selections.len() <= 100_000)
+        .ok_or(ToolInputError::Invalid)?;
+    for selection in selections {
+        let selection = selection.as_object().ok_or(ToolInputError::Invalid)?;
+        if selection.len() < 3
+            || selection.len() > 4
+            || selection.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "recordId" | "interpretation" | "rationale" | "selectedLotIndexes"
+                )
+            })
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        let text_is_valid = |name: &str, maximum: usize| {
+            selection
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty() && value.len() <= maximum)
+        };
+        if !text_is_valid("recordId", MAXIMUM_IDENTIFIER_BYTES)
+            || !text_is_valid("interpretation", 128)
+            || !text_is_valid("rationale", MAXIMUM_TEXT_BYTES)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        if let Some(indexes) = selection.get("selectedLotIndexes") {
+            let indexes = indexes
+                .as_array()
+                .filter(|indexes| indexes.len() <= 100_000)
+                .ok_or(ToolInputError::Invalid)?;
+            let mut unique = HashSet::new();
+            unique
+                .try_reserve(indexes.len())
+                .map_err(|_| ToolInputError::Invalid)?;
+            if indexes.iter().any(|index| {
+                index
+                    .as_u64()
+                    .filter(|index| *index <= 99_999)
+                    .is_none_or(|index| !unique.insert(index))
+            }) {
+                return Err(ToolInputError::Invalid);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn settings_changes_schema() -> Value {

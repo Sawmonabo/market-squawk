@@ -40,6 +40,12 @@ impl InstalledServiceLifecycle {
         }
     }
 
+    /// Returns the exact runtime generation owned by this lifecycle signal.
+    #[must_use]
+    pub(crate) const fn current(&self) -> RuntimeIdentity {
+        self.current
+    }
+
     /// Signals one already-persisted restart handoff.
     ///
     /// The next identity must retain the installation and advance the service generation exactly
@@ -99,7 +105,7 @@ impl fmt::Debug for InstalledServiceLifecycle {
 
 /// Closed service-lifecycle signal failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ServiceLifecycleError {
+pub(super) enum ServiceLifecycleError {
     /// The requested runtime is not the exact next generation of this installation.
     #[error("installed-service restart transition is invalid")]
     InvalidTransition,

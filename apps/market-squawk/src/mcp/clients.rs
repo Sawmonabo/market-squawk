@@ -67,6 +67,20 @@ impl McpClientKind {
             Self::Codex => codex::EXECUTABLE_NAME,
         }
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ClaudeCode => 0,
+            Self::Codex => 1,
+        }
+    }
+
+    const fn registration_scope(self) -> McpRegistrationScope {
+        match self {
+            Self::ClaudeCode => McpRegistrationScope::User,
+            Self::Codex => McpRegistrationScope::Host,
+        }
+    }
 }
 
 /// Truthful lifecycle state derived from the official client CLI and an owned receipt.
@@ -220,6 +234,7 @@ impl McpClientStatus {
 /// Registration plan passed only to official client CLI commands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpClientRegistration {
+    scope: McpRegistrationScope,
     command: String,
     arguments: Vec<String>,
 }
@@ -235,6 +250,7 @@ impl McpClientRegistration {
             .ok_or(McpClientRegistrationError::InvalidRelayProgram)?
             .to_owned();
         Ok(Self {
+            scope: client.registration_scope(),
             command,
             arguments: vec!["--client".to_owned(), client.relay_argument().to_owned()],
         })
@@ -260,12 +276,24 @@ impl McpClientRegistration {
         matches!(
             observed,
             ObservedRegistration::Present {
+                scope,
                 transport,
                 command,
                 arguments,
                 has_environment: false,
-            } if transport == "stdio" && command == &self.command && arguments == &self.arguments
+            } if scope == &self.scope
+                && transport == "stdio"
+                && command == &self.command
+                && arguments == &self.arguments
         )
+    }
+
+    fn from_receipt(receipt: &McpClientRegistrationReceipt) -> Self {
+        Self {
+            scope: receipt.client.registration_scope(),
+            command: receipt.command.clone(),
+            arguments: receipt.arguments.clone(),
+        }
     }
 }
 
@@ -274,6 +302,7 @@ pub struct McpClientRegistrationManager {
     receipts: LocalAuthorityStateStore,
     relay_program: PathBuf,
     search_directories: Vec<PathBuf>,
+    client_mutation_gates: [Mutex<()>; 2],
     mutation_gate: Mutex<()>,
 }
 
@@ -302,6 +331,7 @@ impl McpClientRegistrationManager {
             receipts,
             relay_program,
             search_directories: discovery_directories(),
+            client_mutation_gates: [Mutex::new(()), Mutex::new(())],
             mutation_gate: Mutex::new(()),
         })
     }
@@ -311,22 +341,39 @@ impl McpClientRegistrationManager {
         &self,
         client: McpClientKind,
     ) -> Result<McpClientStatus, McpClientRegistrationError> {
+        let _guard = self.lock_client(client)?;
+        self.inspect_unlocked(client)
+    }
+
+    fn inspect_unlocked(
+        &self,
+        client: McpClientKind,
+    ) -> Result<McpClientStatus, McpClientRegistrationError> {
         let Some(program) = self.find_client_program(client)? else {
             return Ok(status(client, McpClientState::Absent, None, None, None));
         };
         let version_output = run_checked(&version_command(client, &program))?;
         let capability_output = run_checked(&capability_command(client, &program))?;
-        let version = output_text(&version_output);
+        let version = normalized_client_version(&version_output);
         let capability = output_text(&capability_output);
         if !version_output.status.success() || !capability_output.status.success() {
             return Ok(status(
                 client,
                 McpClientState::Unsupported,
-                (!version.is_empty()).then_some(version),
+                version,
                 Some(program),
                 Some("The installed client rejected its official MCP capability check."),
             ));
         }
+        let Some(version) = version else {
+            return Ok(status(
+                client,
+                McpClientState::Unsupported,
+                None,
+                Some(program),
+                Some("The installed client returned an invalid or unbounded version."),
+            ));
+        };
         if !supports(client, &version, &capability) {
             return Ok(status(
                 client,
@@ -341,12 +388,19 @@ impl McpClientRegistrationManager {
         let document = self.load_receipts()?;
         let receipt = document.receipt(client).cloned();
         let state = match (&observed, receipt.as_ref()) {
-            (ObservedRegistration::Missing, _) => McpClientState::Ready,
+            (ObservedRegistration::Missing, None) => McpClientState::Ready,
+            (ObservedRegistration::Missing, Some(_receipt)) => McpClientState::RepairRequired,
+            (observed, Some(receipt)) if registration.matches(observed) => {
+                if receipt.command_sha256 == registration.digest()? {
+                    McpClientState::Owned
+                } else {
+                    McpClientState::RepairRequired
+                }
+            }
             (observed, Some(receipt))
-                if registration.matches(observed)
-                    && receipt.command_sha256 == registration.digest()? =>
+                if McpClientRegistration::from_receipt(receipt).matches(observed) =>
             {
-                McpClientState::Owned
+                McpClientState::RepairRequired
             }
             (ObservedRegistration::Present { .. }, _) => McpClientState::Conflict,
         };
@@ -356,9 +410,18 @@ impl McpClientRegistrationManager {
             client_version: Some(version),
             executable: Some(program.to_string_lossy().into_owned()),
             owned_receipt: receipt,
-            blocker: (state == McpClientState::Conflict).then_some(
-                "A same-name client entry is not the exact Market Squawk-owned registration.",
-            ),
+            blocker: match state {
+                McpClientState::Conflict => Some(
+                    "A same-name client entry is not the exact Market Squawk-owned registration.",
+                ),
+                McpClientState::RepairRequired => Some(
+                    "The owned client receipt and current official client entry must be reconciled.",
+                ),
+                McpClientState::Absent
+                | McpClientState::Unsupported
+                | McpClientState::Ready
+                | McpClientState::Owned => None,
+            },
         })
     }
 
@@ -389,7 +452,14 @@ impl McpClientRegistrationManager {
         client: McpClientKind,
         authority: McpRegistrationAuthority,
     ) -> Result<McpClientStatus, McpClientRegistrationError> {
-        let status = self.inspect(client)?;
+        let _guard = self.lock_client(client)?;
+        let status = self.inspect_unlocked(client)?;
+        if matches!(
+            status.state,
+            McpClientState::Absent | McpClientState::Unsupported
+        ) {
+            return Err(McpClientRegistrationError::ClientUnavailable { client });
+        }
         let program = status
             .executable
             .as_deref()
@@ -400,7 +470,7 @@ impl McpClientRegistrationManager {
             McpClientState::Ready => {
                 run_success(&add_command(client, &program, &registration), client)?;
             }
-            McpClientState::Owned => {}
+            McpClientState::Owned => return Ok(status),
             McpClientState::Conflict => {
                 return Err(McpClientRegistrationError::UnownedConflict { client });
             }
@@ -419,7 +489,7 @@ impl McpClientRegistrationManager {
             .ok_or(McpClientRegistrationError::InvalidClientOutput { client })?;
         let receipt = receipt(client, version, registration, authority)?;
         self.mutate_receipts(|document| document.upsert(receipt))?;
-        self.inspect(client)
+        self.inspect_unlocked(client)
     }
 
     /// Repairs only an entry already owned by a durable Market Squawk receipt.
@@ -428,14 +498,54 @@ impl McpClientRegistrationManager {
         client: McpClientKind,
         authority: McpRegistrationAuthority,
     ) -> Result<McpClientStatus, McpClientRegistrationError> {
-        if self.load_receipts()?.receipt(client).is_none() {
-            return Err(McpClientRegistrationError::OwnershipRequired { client });
+        let _guard = self.lock_client(client)?;
+        let owned_receipt = self
+            .load_receipts()?
+            .receipt(client)
+            .cloned()
+            .ok_or(McpClientRegistrationError::OwnershipRequired { client })?;
+        let status = self.inspect_unlocked(client)?;
+        if matches!(
+            status.state,
+            McpClientState::Absent | McpClientState::Unsupported
+        ) {
+            return Err(McpClientRegistrationError::ClientUnavailable { client });
         }
-        let status = self.inspect(client)?;
-        if status.state == McpClientState::Conflict {
-            return Err(McpClientRegistrationError::UnownedConflict { client });
+        if status.state == McpClientState::Owned && owned_receipt.authority == authority {
+            return Ok(status);
         }
-        self.connect(client, authority)
+        let program = status
+            .executable
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or(McpClientRegistrationError::ClientUnavailable { client })?;
+        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let observed = observe(client, &program)?;
+        match &observed {
+            ObservedRegistration::Missing => {
+                run_success(&add_command(client, &program, &registration), client)?;
+            }
+            _ if registration.matches(&observed) => {}
+            _ if McpClientRegistration::from_receipt(&owned_receipt).matches(&observed) => {
+                run_success(&remove_command(client, &program), client)?;
+                if !matches!(observe(client, &program)?, ObservedRegistration::Missing) {
+                    return Err(McpClientRegistrationError::RegistrationVerification { client });
+                }
+                run_success(&add_command(client, &program, &registration), client)?;
+            }
+            ObservedRegistration::Present { .. } => {
+                return Err(McpClientRegistrationError::UnownedConflict { client });
+            }
+        }
+        if !registration.matches(&observe(client, &program)?) {
+            return Err(McpClientRegistrationError::RegistrationVerification { client });
+        }
+        let version = status
+            .client_version
+            .ok_or(McpClientRegistrationError::InvalidClientOutput { client })?;
+        let receipt = receipt(client, version, registration, authority)?;
+        self.mutate_receipts(|document| document.upsert(receipt))?;
+        self.inspect_unlocked(client)
     }
 
     /// Removes only an exact entry backed by Market Squawk's receipt.
@@ -443,21 +553,39 @@ impl McpClientRegistrationManager {
         &self,
         client: McpClientKind,
     ) -> Result<McpClientStatus, McpClientRegistrationError> {
-        let status = self.inspect(client)?;
-        if status.state != McpClientState::Owned {
-            return Err(McpClientRegistrationError::OwnershipRequired { client });
+        let _guard = self.lock_client(client)?;
+        let owned_receipt = self
+            .load_receipts()?
+            .receipt(client)
+            .cloned()
+            .ok_or(McpClientRegistrationError::OwnershipRequired { client })?;
+        let status = self.inspect_unlocked(client)?;
+        if matches!(
+            status.state,
+            McpClientState::Absent | McpClientState::Unsupported
+        ) {
+            return Err(McpClientRegistrationError::ClientUnavailable { client });
         }
         let program = status
             .executable
             .as_deref()
             .map(PathBuf::from)
             .ok_or(McpClientRegistrationError::ClientUnavailable { client })?;
-        run_success(&remove_command(client, &program), client)?;
-        if !matches!(observe(client, &program)?, ObservedRegistration::Missing) {
-            return Err(McpClientRegistrationError::RegistrationVerification { client });
+        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let observed = observe(client, &program)?;
+        if !matches!(observed, ObservedRegistration::Missing) {
+            if !registration.matches(&observed)
+                && !McpClientRegistration::from_receipt(&owned_receipt).matches(&observed)
+            {
+                return Err(McpClientRegistrationError::UnownedConflict { client });
+            }
+            run_success(&remove_command(client, &program), client)?;
+            if !matches!(observe(client, &program)?, ObservedRegistration::Missing) {
+                return Err(McpClientRegistrationError::RegistrationVerification { client });
+            }
         }
         self.mutate_receipts(|document| document.remove(client))?;
-        self.inspect(client)
+        self.inspect_unlocked(client)
     }
 
     /// Runs a real initialized MCP session through the exact installed relay.
@@ -465,7 +593,8 @@ impl McpClientRegistrationManager {
         &self,
         client: McpClientKind,
     ) -> Result<McpProtocolVerification, McpClientRegistrationError> {
-        let status = self.inspect(client)?;
+        let _guard = self.lock_client(client)?;
+        let status = self.inspect_unlocked(client)?;
         if status.state != McpClientState::Owned {
             return Err(McpClientRegistrationError::OwnershipRequired { client });
         }
@@ -476,6 +605,15 @@ impl McpClientRegistrationManager {
             }
         })?;
         Ok(verification)
+    }
+
+    fn lock_client(
+        &self,
+        client: McpClientKind,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, McpClientRegistrationError> {
+        self.client_mutation_gates[client.index()]
+            .lock()
+            .map_err(|_error| McpClientRegistrationError::ReceiptMutation)
     }
 
     /// Verifies both named clients concurrently against one shared service authority.
@@ -587,13 +725,14 @@ impl ReceiptDocument {
         }
         for receipt in &self.receipts {
             let registration = McpClientRegistration {
+                scope: receipt.client.registration_scope(),
                 command: receipt.command.clone(),
                 arguments: receipt.arguments.clone(),
             };
             if receipt.receipt_version != RECEIPT_FORMAT_VERSION
                 || receipt.server_name != SERVER_NAME
                 || receipt.client_version.is_empty()
-                || receipt.client_version.len() > 256
+                || receipt.client_version.len() > 128
                 || receipt.command_sha256 != registration.digest()?
                 || receipt.arguments
                     != [
@@ -642,11 +781,19 @@ impl ReceiptDocument {
 pub(super) enum ObservedRegistration {
     Missing,
     Present {
+        scope: McpRegistrationScope,
         transport: String,
         command: String,
         arguments: Vec<String>,
         has_environment: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum McpRegistrationScope {
+    User,
+    Host,
+    Other,
 }
 
 #[derive(Debug)]
@@ -869,6 +1016,19 @@ fn output_text(output: &McpCommandOutput) -> String {
         text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
     text.trim().to_owned()
+}
+
+fn normalized_client_version(output: &McpCommandOutput) -> Option<String> {
+    let value = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_control() && character != '\t')
+    {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn receipt(

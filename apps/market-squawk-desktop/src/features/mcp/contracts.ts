@@ -19,6 +19,13 @@ export type McpServiceClientStatus = McpClientView["service"]
 export type McpRuntimeStatus = McpClientsStatus["runtime"]
 
 export function availableActions(client: McpClientView): McpClientAction[] {
+  if (client.service.credentialRotationRecoveryPending) {
+    if (client.state === "repair_required") return ["repair"]
+    if (client.state === "owned" && !client.service.accessRevoked) {
+      return ["verify"]
+    }
+    return []
+  }
   switch (client.state) {
     case "ready":
       return ["connect"]
@@ -27,7 +34,6 @@ export function availableActions(client: McpClientView): McpClientAction[] {
         "verify",
         "rotateCredential",
         "revokeCredential",
-        "repair",
         "disconnect",
       ]
     case "repair_required":

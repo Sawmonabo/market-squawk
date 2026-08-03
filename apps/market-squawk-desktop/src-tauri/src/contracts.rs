@@ -497,6 +497,7 @@ pub(crate) enum DecisionInvalidationKindInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "query")]
 pub(crate) enum GovernanceQueryCommand {
+    ProvisioningStatus,
     Principals {
         after: Option<Uuid>,
         limit: Option<u16>,
@@ -506,6 +507,12 @@ pub(crate) enum GovernanceQueryCommand {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum GovernanceControlCommand {
+    ProvisionPrincipalSet {
+        primary_display_name: String,
+        primary_credential: String,
+        reviewer_display_name: String,
+        reviewer_credential: String,
+    },
     AuthenticateAction {
         preview_id: Uuid,
         principal_id: Uuid,
@@ -516,6 +523,18 @@ pub(crate) enum GovernanceControlCommand {
 impl fmt::Debug for GovernanceControlCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProvisionPrincipalSet {
+                primary_display_name,
+                primary_credential: _,
+                reviewer_display_name,
+                reviewer_credential: _,
+            } => formatter
+                .debug_struct("ProvisionPrincipalSet")
+                .field("primary_display_name", primary_display_name)
+                .field("primary_credential", &"[REDACTED]")
+                .field("reviewer_display_name", reviewer_display_name)
+                .field("reviewer_credential", &"[REDACTED]")
+                .finish(),
             Self::AuthenticateAction {
                 preview_id,
                 principal_id,

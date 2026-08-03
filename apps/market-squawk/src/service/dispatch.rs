@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::LocalProduct;
+use crate::local_product::operations::ProductionSettingsOperations;
 
 use super::{
     governance::InstalledGovernanceOperations,
@@ -23,18 +24,36 @@ pub(super) struct InstalledApplicationDispatcher {
     services: Arc<InstalledToolServices>,
     mcp: Arc<InstalledMcpControl>,
     governance: Arc<InstalledGovernanceOperations>,
+    settings: Arc<ProductionSettingsOperations>,
     bootstrap: Value,
+}
+
+pub(super) struct InstalledDispatcherComposition {
+    pub(super) services: Arc<InstalledToolServices>,
+    pub(super) runtime: market_squawk_runtime::RuntimeIdentity,
+    pub(super) workspace_generation: u64,
+    pub(super) workspace_placement: &'static str,
+    pub(super) endpoint: SocketAddr,
+    pub(super) mcp: Arc<InstalledMcpControl>,
+    pub(super) governance: Arc<InstalledGovernanceOperations>,
+    pub(super) settings: Arc<ProductionSettingsOperations>,
 }
 
 impl InstalledApplicationDispatcher {
     pub(super) fn try_new(
-        services: Arc<InstalledToolServices>,
+        composition: InstalledDispatcherComposition,
         product: &LocalProduct,
-        runtime: market_squawk_runtime::RuntimeIdentity,
-        endpoint: SocketAddr,
-        mcp: Arc<InstalledMcpControl>,
-        governance: Arc<InstalledGovernanceOperations>,
     ) -> Result<Self, DispatchError> {
+        let InstalledDispatcherComposition {
+            services,
+            runtime,
+            workspace_generation,
+            workspace_placement,
+            endpoint,
+            mcp,
+            governance,
+            settings,
+        } = composition;
         let claude_code = mcp
             .registration(NamedClient::ClaudeCode)
             .map_err(map_mcp_error)?;
@@ -82,6 +101,11 @@ impl InstalledApplicationDispatcher {
                 "deployment": "self_hosted",
             },
             "runtime": runtime,
+            "workspace": {
+                "id": runtime.workspace_id(),
+                "generation": workspace_generation,
+                "placement": workspace_placement,
+            },
             "application": {
                 "contractVersion": crate::application::APPLICATION_CONTRACT_VERSION,
                 "operations": operations,
@@ -115,6 +139,7 @@ impl InstalledApplicationDispatcher {
             services,
             mcp,
             governance,
+            settings,
             bootstrap,
         })
     }
@@ -127,6 +152,7 @@ impl fmt::Debug for InstalledApplicationDispatcher {
             .field("services", &"[INSTALLED TOOL SERVICES]")
             .field("mcp", &"[DYNAMIC MCP CLIENT AUTHORITY]")
             .field("governance", &"[PRIVATE GOVERNANCE AUTHORITY]")
+            .field("settings", &"[INSTALLED SETTINGS AUTHORITY]")
             .field("bootstrap", &"[NON-SECRET PRODUCT SNAPSHOT]")
             .finish()
     }
@@ -232,6 +258,13 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
             .call(request, context)
             .await
             .map(market_squawk_services::TypedToolResult::into_envelope)
+            .map_err(map_service_error)
+    }
+
+    fn mutation_response_committed(&self) -> Result<(), DispatchError> {
+        self.settings
+            .signal_pending_restart_after_response()
+            .map(|_signalled| ())
             .map_err(map_service_error)
     }
 }

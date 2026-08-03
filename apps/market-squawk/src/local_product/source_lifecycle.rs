@@ -30,6 +30,7 @@ use super::{
         DurableActivationRecipeState, DurableProviderActivationState,
         DurableProviderActivationStateError, DurableSourceLifecyclePhase,
         DurableSourceLifecycleRecord, DurableSourceLifecycleTransition,
+        SERIALIZED_RESEARCH_SURFACES,
     },
 };
 
@@ -660,6 +661,55 @@ impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
 
 #[async_trait]
 impl SourceLifecycleAuthority for ProductionSourceLifecycleAuthority {
+    fn active_source_count(&self) -> Result<usize, SourceLifecycleError> {
+        let mut active_live = 0_usize;
+        for surface in LIVE_SURFACES {
+            if self
+                .durable
+                .source_lifecycle_record(surface)
+                .map_err(map_durable_error)?
+                .phase()
+                == DurableSourceLifecyclePhase::Active
+            {
+                active_live = active_live
+                    .checked_add(1)
+                    .ok_or(SourceLifecycleError::Unavailable)?;
+            }
+        }
+        let observed_live = self.live.active_source_count().map_err(map_live_error)?;
+        if observed_live != active_live {
+            return Err(SourceLifecycleError::Unavailable);
+        }
+
+        let mut active_research = 0_usize;
+        for surface in SERIALIZED_RESEARCH_SURFACES {
+            let provider = SourceIdentifier::try_from(surface)
+                .map_err(|_| SourceLifecycleError::InvalidResult)?;
+            let durable_active = self
+                .durable
+                .source_lifecycle_record(surface)
+                .map_err(map_durable_error)?
+                .phase()
+                == DurableSourceLifecyclePhase::Active;
+            let runtime_active = self
+                .activation
+                .research_runtime_generation(&provider)
+                .map_err(|_error| SourceLifecycleError::Unavailable)?
+                .is_some();
+            if durable_active != runtime_active {
+                return Err(SourceLifecycleError::Unavailable);
+            }
+            if runtime_active {
+                active_research = active_research
+                    .checked_add(1)
+                    .ok_or(SourceLifecycleError::Unavailable)?;
+            }
+        }
+        active_live
+            .checked_add(active_research)
+            .ok_or(SourceLifecycleError::Unavailable)
+    }
+
     async fn status(
         &self,
         provider: &SourceIdentifier,

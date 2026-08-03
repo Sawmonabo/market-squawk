@@ -2,7 +2,9 @@
 
 use std::{collections::BTreeMap, fmt, path::Path, sync::Mutex};
 
-use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
+use market_squawk_platform::{
+    AppConfig, ConfigOrigin, ConfigSetting, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -41,6 +43,12 @@ impl SettingKey {
         Self::MarketFreshnessMillis,
         Self::BackupRetentionCount,
     ];
+
+    /// Returns the complete closed setting-key set for composition-time consumer binding.
+    #[must_use]
+    pub(crate) const fn all() -> [Self; 9] {
+        Self::ALL
+    }
 
     /// Returns whether applying this setting requires a service lifecycle event.
     #[must_use]
@@ -126,6 +134,7 @@ impl SettingValue {
 pub enum SettingOrigin {
     SafeDefault,
     LocalPersisted,
+    LocalConfiguration,
     Environment,
     CliOverride,
     ManagedPolicy,
@@ -176,6 +185,12 @@ impl SettingEntry {
     pub const fn key(&self) -> SettingKey {
         self.key
     }
+
+    /// Returns the validated typed value for service-owned consumer application.
+    #[must_use]
+    pub(crate) const fn value(&self) -> &SettingValue {
+        &self.value
+    }
 }
 
 /// Complete effective seed supplied after safe-default/file/environment/CLI composition.
@@ -203,6 +218,29 @@ impl SettingsSeed {
 
     /// Recommended complete local defaults used when no higher-precedence value is supplied.
     pub fn recommended_defaults() -> Result<Self, SettingsError> {
+        Self::with_market_freshness(5_000, SettingOrigin::SafeDefault)
+    }
+
+    /// Derives the overlapping effective setting and its exact configuration-layer origin.
+    pub(crate) fn from_config(config: &AppConfig) -> Result<Self, SettingsError> {
+        let freshness = u64::try_from(config.stale_after().as_millis()).map_err(|_| {
+            SettingsError::InvalidValue {
+                key: SettingKey::MarketFreshnessMillis,
+            }
+        })?;
+        let origin = match config.provenance().origin(ConfigSetting::StaleAfter) {
+            ConfigOrigin::SafeDefault => SettingOrigin::SafeDefault,
+            ConfigOrigin::LocalFile => SettingOrigin::LocalConfiguration,
+            ConfigOrigin::Environment => SettingOrigin::Environment,
+            ConfigOrigin::Cli => SettingOrigin::CliOverride,
+        };
+        Self::with_market_freshness(freshness, origin)
+    }
+
+    fn with_market_freshness(
+        freshness_millis: u64,
+        freshness_origin: SettingOrigin,
+    ) -> Result<Self, SettingsError> {
         Self::try_new(vec![
             SettingEntry::try_new(
                 SettingValue::LogRetentionDays(30),
@@ -233,8 +271,8 @@ impl SettingsSeed {
                 SettingOrigin::SafeDefault,
             )?,
             SettingEntry::try_new(
-                SettingValue::MarketFreshnessMillis(5_000),
-                SettingOrigin::SafeDefault,
+                SettingValue::MarketFreshnessMillis(freshness_millis),
+                freshness_origin,
             )?,
             SettingEntry::try_new(
                 SettingValue::BackupRetentionCount(8),
@@ -305,6 +343,73 @@ impl SettingsDocument {
             prior_revision = historical.revision;
         }
         Ok(self)
+    }
+}
+
+/// Versioned non-secret settings state retained as workspace-backup evidence.
+///
+/// The portable startup entries are evidence only. Restore uses the durable local document and
+/// deliberately does not promote captured environment or command-line origins into authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct WorkspaceSettingsBackup {
+    format_version: u16,
+    document: SettingsDocument,
+    startup: PortableStartupConfiguration,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PortableStartupConfiguration {
+    revision: u64,
+    entries: Vec<SettingEntry>,
+    effective_digest: [u8; 32],
+}
+
+impl WorkspaceSettingsBackup {
+    fn try_new(
+        document: SettingsDocument,
+        entries: BTreeMap<SettingKey, SettingEntry>,
+    ) -> Result<Self, SettingsError> {
+        let effective_digest = effective_settings_digest(document.revision, &entries)?;
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            startup: PortableStartupConfiguration {
+                revision: document.revision,
+                entries: entries.into_values().collect(),
+                effective_digest,
+            },
+            document,
+        })
+    }
+
+    pub(crate) fn validate(self) -> Result<Self, SettingsError> {
+        if self.format_version != FORMAT_VERSION || self.startup.revision != self.document.revision
+        {
+            return Err(SettingsError::CorruptState);
+        }
+        self.document.clone().validate()?;
+        let entries = self
+            .startup
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.key, entry))
+            .collect::<BTreeMap<_, _>>();
+        if entries.len() != self.startup.entries.len()
+            || validate_complete_entries(&entries).is_err()
+            || self.startup.effective_digest
+                != effective_settings_digest(self.startup.revision, &entries)?
+        {
+            return Err(SettingsError::CorruptState);
+        }
+        Ok(self)
+    }
+
+    /// Returns the source startup revision and effective-digest evidence for journal binding.
+    #[must_use]
+    pub(crate) const fn startup_binding(&self) -> (u64, [u8; 32]) {
+        (self.startup.revision, self.startup.effective_digest)
     }
 }
 
@@ -468,6 +573,56 @@ impl DurableSettingsStore {
             digest: effective_settings_digest(document.revision, &entries)?,
             entries: entries.into_values().collect(),
         })
+    }
+
+    /// Captures validated durable local state and non-secret startup evidence.
+    ///
+    /// This operation does not export a configuration path, data directory, source locator,
+    /// credential, or ambient-input authority. Callers that require an atomic workspace snapshot
+    /// retain their wider lifecycle transaction while calling it.
+    pub(crate) fn export_workspace_backup(&self) -> Result<WorkspaceSettingsBackup, SettingsError> {
+        let document = self
+            .document
+            .lock()
+            .map_err(|_| SettingsError::Unavailable)?
+            .clone()
+            .validate()?;
+        WorkspaceSettingsBackup::try_new(
+            document.clone(),
+            effective_entries(&self.seed, &document.local_values)?,
+        )
+    }
+
+    /// Rehydrates a validated backup only into an absent durable settings authority, then reopens
+    /// it through the normal checked constructor.
+    pub(crate) fn restore_workspace_backup_absent(
+        control_root: &Path,
+        seed: SettingsSeed,
+        backup: WorkspaceSettingsBackup,
+    ) -> Result<Self, SettingsError> {
+        let backup = backup.validate()?;
+        let store = LocalAuthorityStateStore::try_open(control_root.join(AUTHORITY_DIRECTORY))?;
+        if store.load()?.is_some() {
+            return Err(SettingsError::RestoreTargetExists);
+        }
+        store.store(&encode(&backup.document)?)?;
+        let reopened = Self::try_open(control_root, seed)?;
+        if reopened.snapshot()?.revision() != backup.document.revision {
+            return Err(SettingsError::CorruptState);
+        }
+        Ok(reopened)
+    }
+
+    /// Refuses restore unless the target settings authority contains no durable document.
+    pub(crate) fn ensure_workspace_backup_target_absent(
+        control_root: &Path,
+    ) -> Result<(), SettingsError> {
+        let store = LocalAuthorityStateStore::try_open(control_root.join(AUTHORITY_DIRECTORY))?;
+        if store.load()?.is_some() {
+            Err(SettingsError::RestoreTargetExists)
+        } else {
+            Ok(())
+        }
     }
 
     /// Validates a bounded patch and reports its combined lifecycle impact before approval.
@@ -781,6 +936,8 @@ pub enum SettingsError {
     RevisionExhausted,
     #[error("settings authority state is corrupt")]
     CorruptState,
+    #[error("settings restore target already contains durable state")]
+    RestoreTargetExists,
     #[error("settings authority is unavailable")]
     Unavailable,
     #[error("settings authority capacity is exhausted")]
@@ -818,6 +975,43 @@ mod tests {
         let rollback = store.rollback(receipt.active_revision, first.revision())?;
         assert_eq!(rollback.active_revision, receipt.active_revision + 1);
         assert_eq!(rollback.rolled_back_from_revision, Some(first.revision()));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_backup_restores_only_once_and_reopens_the_exact_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_directory = tempfile::tempdir()?;
+        let source = DurableSettingsStore::try_open(
+            source_directory.path(),
+            SettingsSeed::recommended_defaults()?,
+        )?;
+        let before = source.snapshot()?;
+        source.apply(
+            source
+                .preview(before.revision(), vec![SettingValue::LogRetentionDays(14)])?
+                .approve(),
+        )?;
+        let expected = source.snapshot()?;
+        let backup = source.export_workspace_backup()?;
+
+        let target_directory = tempfile::tempdir()?;
+        let restored = DurableSettingsStore::restore_workspace_backup_absent(
+            target_directory.path(),
+            SettingsSeed::recommended_defaults()?,
+            backup.clone(),
+        )?;
+
+        assert_eq!(restored.snapshot()?.revision(), expected.revision());
+        assert_eq!(restored.snapshot()?.digest(), expected.digest());
+        assert!(matches!(
+            DurableSettingsStore::restore_workspace_backup_absent(
+                target_directory.path(),
+                SettingsSeed::recommended_defaults()?,
+                backup,
+            ),
+            Err(SettingsError::RestoreTargetExists)
+        ));
         Ok(())
     }
 }

@@ -11,14 +11,27 @@ mod logging;
 mod mcp_client;
 mod mcp_control;
 mod operations;
+mod operations_activity;
+mod operations_activity_bindings;
+mod operations_bootstrap;
+mod operations_composition;
+mod portfolio_import;
 mod resources;
 mod runtime;
 mod tool_services;
+mod update_package;
+mod workspace_recovery;
+mod workspace_selector;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{Router, extract::State, http::Request, response::Response, routing::any};
-use dispatch::InstalledApplicationDispatcher;
+use dispatch::{InstalledApplicationDispatcher, InstalledDispatcherComposition};
+use market_squawk_installer::{PlatformError, default_installation_data_root};
 use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
@@ -31,7 +44,9 @@ use market_squawk_runtime::{
     InputStagingLimits, LoopbackApplicationClient, MutationReplayGuard, NamedClient, OriginPolicy,
     RendezvousError, ReplayLimits, RuntimeContractError, RuntimeRouter, RuntimeRouterLimits,
 };
-use market_squawk_services::{JsonStructureLimits, ServiceLimits, ToolServices};
+use market_squawk_services::{
+    JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceLimits, ToolServices,
+};
 use resources::InstalledResourceProvider;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -43,13 +58,17 @@ use mcp_client::InstalledMcpRelayTransport;
 use lifecycle::InstalledServiceLifecycle;
 pub use lifecycle::InstalledServiceRunOutcome;
 pub use logging::{InstalledServiceLogging, InstalledServiceLoggingError, TerminalLogFormat};
+use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations};
 
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
+use self::portfolio_import::InstalledPortfolioImportOperations;
 use self::runtime::{PreparedRuntime, current_timestamp};
+use self::workspace_selector::{WorkspacePlacement, WorkspaceSelector, WorkspaceSelectorError};
 use self::{
     governance::{
-        GovernedActionService, GovernedActionServiceLimits, InstalledGovernanceOperations,
+        GovernedActionService, GovernedActionServiceLimits, InstalledGovernanceComposition,
+        InstalledGovernanceOperations,
     },
     governance_persistence::GovernancePersistence,
 };
@@ -95,8 +114,8 @@ impl std::fmt::Debug for InstalledServiceConnector {
 
 impl InstalledServiceConnector {
     /// Opens only discovery and native secret capabilities; it never constructs product domains.
-    pub fn try_new(config: &AppConfig) -> Result<Self, InstalledServiceError> {
-        let paths = LocalPaths::prepare(config.data_dir())?;
+    pub fn try_new(_config: &AppConfig) -> Result<Self, InstalledServiceError> {
+        let paths = LocalPaths::prepare(default_installation_data_root()?)?;
         let secret_store = runtime_secret_store(&paths)?;
         Ok(Self {
             paths,
@@ -112,7 +131,8 @@ impl InstalledServiceConnector {
         config: &AppConfig,
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, InstalledServiceError> {
-        let paths = LocalPaths::prepare(config.data_dir())?;
+        let legacy_paths = LocalPaths::prepare(config.data_dir())?;
+        let paths = LocalPaths::prepare(deterministic_installation_root(&legacy_paths)?)?;
         Ok(Self {
             paths,
             secret_store,
@@ -183,6 +203,7 @@ pub struct InstalledService {
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     runtime: PreparedRuntime,
     lifecycle: Arc<InstalledServiceLifecycle>,
+    _workspace_selector: Arc<WorkspaceSelector>,
 }
 
 impl std::fmt::Debug for InstalledService {
@@ -195,6 +216,7 @@ impl std::fmt::Debug for InstalledService {
             .field("audit", &"[DURABLE AUDIT AUTHORITY]")
             .field("server", &self.server)
             .field("lifecycle", &self.lifecycle)
+            .field("workspace_selector", &"[INSTALLATION-GLOBAL AUTHORITY]")
             .finish_non_exhaustive()
     }
 }
@@ -203,9 +225,26 @@ impl InstalledService {
     /// Composes every installed-product authority, proves the bound route is ready, then publishes
     /// the authenticated rendezvous as the final startup step.
     pub async fn start(config: AppConfig) -> Result<Self, InstalledServiceError> {
-        let paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&paths)?;
-        Self::start_prepared(config, paths, secret_store).await
+        let logs = logging::open_installation_log_store()?;
+        Self::start_with_logging_store(config, logs).await
+    }
+
+    /// Composes the installed service over the process-owned structured-log store.
+    pub async fn start_with_logging_store(
+        config: AppConfig,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+    ) -> Result<Self, InstalledServiceError> {
+        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
+        let installation_paths = LocalPaths::prepare(default_installation_data_root()?)?;
+        let secret_store = runtime_secret_store(&installation_paths)?;
+        Self::start_prepared(
+            config,
+            installation_paths,
+            workspace_paths,
+            secret_store,
+            logs,
+        )
+        .await
     }
 
     /// Composes the installed service with an already-owned native secret capability.
@@ -216,27 +255,70 @@ impl InstalledService {
         config: AppConfig,
         secret_store: Arc<dyn SecretStore>,
     ) -> Result<Self, InstalledServiceError> {
-        let paths = LocalPaths::prepare(config.data_dir())?;
-        Self::start_prepared(config, paths, secret_store).await
+        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
+        let installation_paths =
+            LocalPaths::prepare(deterministic_installation_root(&workspace_paths)?)?;
+        let logs = logging::open_log_store(&installation_paths)?;
+        Self::start_prepared(
+            config,
+            installation_paths,
+            workspace_paths,
+            secret_store,
+            logs,
+        )
+        .await
     }
 
     async fn start_prepared(
         config: AppConfig,
-        paths: LocalPaths,
+        installation_paths: LocalPaths,
+        legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
     ) -> Result<Self, InstalledServiceError> {
-        let mut runtime = PreparedRuntime::prepare(&paths, secret_store).await?;
-        let product = LocalProduct::try_new(config)?;
-        let runners = match crate::jobs::InstalledJobRunners::try_new(&product) {
-            Ok(runners) => Arc::new(runners),
-            Err(error) => {
-                shutdown_application(product.application()).await;
-                return Err(error.into());
-            }
-        };
-        let jobs =
-            match InstalledJobAuthority::open(&paths, runners.registered(), current_timestamp()?)
-                .await
+        let workspace_selector = Arc::new(
+            WorkspaceSelector::try_open_or_bootstrap(&installation_paths, &legacy_workspace_paths)
+                .map_err(map_workspace_selector_startup)?,
+        );
+        let selection = workspace_selector
+            .startup_selection()
+            .map_err(|_error| InstalledServiceError::WorkspaceSelection)?;
+        let failed_startup_selector = Arc::clone(&workspace_selector);
+        let failed_startup_selection = selection.clone();
+        let result = async move {
+            let mut runtime =
+                PreparedRuntime::prepare(&installation_paths, secret_store, selection.identity())
+                    .await?;
+            let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
+            let workspace_paths = selection.paths().clone();
+            let product = LocalProduct::try_new_at_paths(config.clone(), workspace_paths.clone())?;
+            let prepared_operations = PreparedInstalledOperations::prepare(
+                &config,
+                &installation_paths,
+                &workspace_paths,
+                selection.clone(),
+                &product,
+                Arc::clone(&lifecycle),
+                Arc::clone(&workspace_selector),
+                logs,
+            )
+            .map_err(|error| composition_stage(error, "operations preparation"))?;
+            let runners = match crate::jobs::InstalledJobRunners::try_new(
+                &product,
+                prepared_operations.application_for_job_runners(),
+            ) {
+                Ok(runners) => Arc::new(runners),
+                Err(error) => {
+                    shutdown_application(product.application()).await;
+                    return Err(error.into());
+                }
+            };
+            let jobs = match InstalledJobAuthority::open(
+                &workspace_paths,
+                runners.registered(),
+                current_timestamp()?,
+            )
+            .await
             {
                 Ok(jobs) => jobs,
                 Err(error) => {
@@ -244,41 +326,82 @@ impl InstalledService {
                     return Err(error.into());
                 }
             };
-        let ComposedTransport {
-            audit,
-            server,
-            readiness,
-        } = match compose_transport(&paths, &mut runtime, &product, &jobs, runners) {
-            Ok(composed) => composed,
-            Err(error) => {
+            let operations = match prepared_operations.bind(&product, &jobs, &runners).await {
+                Ok(operations) => operations,
+                Err(error) => {
+                    cleanup_startup(&product, &jobs).await;
+                    return Err(composition_stage(error, "operations binding"));
+                }
+            };
+            if let Err(error) = operations.reconcile_settings_startup() {
+                cleanup_startup(&product, &jobs).await;
+                return Err(composition_stage(error, "settings startup reconciliation"));
+            }
+            let ComposedTransport {
+                audit,
+                server,
+                readiness,
+            } = match compose_transport(TransportComposition {
+                paths: &workspace_paths,
+                runtime: &mut runtime,
+                product: &product,
+                jobs: &jobs,
+                runners,
+                operations: &operations,
+                workspace_selector: Arc::clone(&workspace_selector),
+                workspace_placement: selection.placement(),
+            }) {
+                Ok(composed) => composed,
+                Err(error) => {
+                    cleanup_startup(&product, &jobs).await;
+                    return Err(error);
+                }
+            };
+            if readiness
+                .probe_ready(CancellationToken::new())
+                .await
+                .is_err()
+                || server.is_finished()
+            {
+                drain_failed_server(server).await;
+                cleanup_startup(&product, &jobs).await;
+                return Err(InstalledServiceError::ReadinessFailed);
+            }
+            if operations
+                .recovery_bridge()
+                .finalize_startup(&selection)
+                .is_err()
+            {
+                drain_failed_server(server).await;
+                cleanup_startup(&product, &jobs).await;
+                return Err(InstalledServiceError::WorkspaceSelection);
+            }
+            if let Err(error) = runtime.publish() {
+                drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
                 return Err(error);
             }
-        };
-        if readiness
-            .probe_ready(CancellationToken::new())
-            .await
+            Ok(Self {
+                server,
+                product,
+                jobs,
+                audit,
+                runtime,
+                lifecycle,
+                _workspace_selector: workspace_selector,
+            })
+        }
+        .await;
+        if result.is_err()
+            && recover_failed_workspace_startup(
+                failed_startup_selector.as_ref(),
+                &failed_startup_selection,
+            )
             .is_err()
-            || server.is_finished()
         {
-            drain_failed_server(server).await;
-            cleanup_startup(&product, &jobs).await;
-            return Err(InstalledServiceError::ReadinessFailed);
+            return Err(InstalledServiceError::WorkspaceSelection);
         }
-        if let Err(error) = runtime.publish() {
-            drain_failed_server(server).await;
-            cleanup_startup(&product, &jobs).await;
-            return Err(error);
-        }
-        let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
-        Ok(Self {
-            server,
-            product,
-            jobs,
-            audit,
-            runtime,
-            lifecycle,
-        })
+        result
     }
 
     /// Serves until cancellation, then executes every shutdown phase in authority order.
@@ -293,6 +416,7 @@ impl InstalledService {
             audit,
             runtime,
             lifecycle,
+            _workspace_selector,
         } = self;
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
@@ -349,19 +473,73 @@ impl InstalledService {
     }
 }
 
+fn composition_stage(error: InstalledServiceError, stage: &'static str) -> InstalledServiceError {
+    if matches!(error, InstalledServiceError::InvalidComposition) {
+        InstalledServiceError::CompositionStage(stage)
+    } else {
+        error
+    }
+}
+
+fn map_workspace_selector_startup(error: WorkspaceSelectorError) -> InstalledServiceError {
+    if matches!(
+        error,
+        WorkspaceSelectorError::Persistence(LocalAuthorityStateStoreError::AlreadyLocked)
+    ) {
+        InstalledServiceError::AlreadyRunning
+    } else {
+        InstalledServiceError::WorkspaceSelection
+    }
+}
+
+fn recover_failed_workspace_startup(
+    selector: &WorkspaceSelector,
+    selection: &workspace_selector::WorkspaceStartupSelection,
+) -> Result<(), InstalledServiceError> {
+    let Some(handoff) = selection.handoff() else {
+        return Ok(());
+    };
+    match handoff.phase() {
+        workspace_selector::WorkspaceHandoffPhase::Activate => selector
+            .stage_startup_rollback(handoff.handoff_id(), selection.identity())
+            .map(|_rollback| ()),
+        workspace_selector::WorkspaceHandoffPhase::Rollback => {
+            selector.mark_rollback_failed(handoff.handoff_id(), selection.identity())
+        }
+    }
+    .map_err(|_error| InstalledServiceError::WorkspaceSelection)
+}
+
 struct ComposedTransport {
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     server: market_squawk_runtime::RuntimeServer,
     readiness: LoopbackApplicationClient,
 }
 
-fn compose_transport(
-    paths: &LocalPaths,
-    runtime: &mut PreparedRuntime,
-    product: &LocalProduct,
-    jobs: &InstalledJobAuthority,
+struct TransportComposition<'a> {
+    paths: &'a LocalPaths,
+    runtime: &'a mut PreparedRuntime,
+    product: &'a LocalProduct,
+    jobs: &'a InstalledJobAuthority,
     runners: Arc<crate::jobs::InstalledJobRunners>,
+    operations: &'a ReadyInstalledOperations,
+    workspace_selector: Arc<WorkspaceSelector>,
+    workspace_placement: WorkspacePlacement,
+}
+
+fn compose_transport(
+    composition: TransportComposition<'_>,
 ) -> Result<ComposedTransport, InstalledServiceError> {
+    let TransportComposition {
+        paths,
+        runtime,
+        product,
+        jobs,
+        runners,
+        operations,
+        workspace_selector,
+        workspace_placement,
+    } = composition;
     let structure = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let service_limits =
@@ -395,8 +573,19 @@ fn compose_transport(
         MCP_CLIENT_REQUESTS,
         mcp_limit_spec,
     )?;
-    let governance_persistence = GovernancePersistence::try_open(paths)
+    let governance_persistence = Arc::new(
+        GovernancePersistence::try_open(paths)
+            .map_err(|_error| InstalledServiceError::GovernanceState)?,
+    );
+    governance_persistence
+        .recover_pending(runtime.secret_store().as_ref())
         .map_err(|_error| InstalledServiceError::GovernanceState)?;
+    let governance_limits =
+        GovernanceLimits::standard().map_err(|_error| InstalledServiceError::GovernanceState)?;
+    let governed_action_limits = GovernedActionServiceLimits::standard()
+        .map_err(|_error| InstalledServiceError::GovernanceState)?;
+    let decision_governance = product.decision_governance();
+    let fair_value_governance = product.fair_value_governance();
     let governance_actions = governance_persistence
         .load_registrations()
         .map_err(|_error| InstalledServiceError::GovernanceState)?
@@ -405,46 +594,94 @@ fn compose_transport(
                 runtime.secret_store(),
                 registrations,
                 governance_persistence.audit_sink(),
-                GovernanceLimits::standard()
-                    .map_err(|_error| InstalledServiceError::GovernanceState)?,
+                governance_limits,
             )
             .map_err(|_error| InstalledServiceError::GovernanceState)?;
             GovernedActionService::try_new(
                 Arc::new(authority),
-                product.decision_governance(),
-                product.fair_value_governance(),
-                GovernedActionServiceLimits::standard()
-                    .map_err(|_error| InstalledServiceError::GovernanceState)?,
+                Arc::clone(&decision_governance),
+                Arc::clone(&fair_value_governance),
+                governed_action_limits,
             )
             .map(Arc::new)
             .map_err(|_error| InstalledServiceError::GovernanceState)
         })
         .transpose()?;
     let governance = Arc::new(InstalledGovernanceOperations::new(
-        governance_actions,
+        InstalledGovernanceComposition {
+            actions: governance_actions,
+            persistence: Arc::clone(&governance_persistence),
+            secrets: runtime.secret_store(),
+            decisions: decision_governance,
+            fair_value: fair_value_governance,
+            authority_limits: governance_limits,
+            action_limits: governed_action_limits,
+        },
         runtime.runtime(),
         desktop_registration.client_id(),
     ));
+    let portfolio_import = InstalledPortfolioImportOperations::try_new(
+        product.paths(),
+        product.portfolio(),
+        Arc::clone(&inputs),
+        runtime.runtime(),
+    )
+    .map_err(|error| InstalledServiceError::PortfolioImportState(error.to_string()))?;
     let services = Arc::new(
         InstalledToolServices::try_new(
             Arc::clone(&application),
+            operations.application(),
             product,
             jobs,
             runners,
             Arc::clone(&inputs),
+            portfolio_import,
         )
-        .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+        .map_err(|_error| InstalledServiceError::CompositionStage("installed tool services"))?,
     );
+    let recovery_deadline = Instant::now()
+        .checked_add(CLIENT_TIMEOUT)
+        .ok_or(InstalledServiceError::InvalidComposition)?;
+    let recovery_origin = RequestOrigin::try_new(
+        runtime.runtime().workspace_id().as_uuid(),
+        desktop_registration.client_id().as_uuid(),
+    )
+    .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+    services
+        .recover_promoting_portfolio_imports(
+            &RequestContext::new(
+                RequestId::try_string("startup-portfolio-import-recovery")
+                    .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+                CancellationToken::new(),
+                recovery_deadline,
+                service_limits,
+            )
+            .with_origin(recovery_origin),
+        )
+        .map_err(|error| InstalledServiceError::PortfolioImportState(error.to_string()))?;
     let dispatcher = Arc::new(
         InstalledApplicationDispatcher::try_new(
-            Arc::clone(&services),
+            InstalledDispatcherComposition {
+                services: Arc::clone(&services),
+                runtime: runtime.runtime(),
+                workspace_generation: operations
+                    .workspaces()
+                    .active()
+                    .map_err(|_error| InstalledServiceError::InvalidComposition)?
+                    .generation()
+                    .get(),
+                workspace_placement: match workspace_placement {
+                    WorkspacePlacement::Managed => "managed",
+                    WorkspacePlacement::LegacyMigrationRequired => "legacy_migration_required",
+                },
+                endpoint: runtime.endpoint(),
+                mcp: Arc::clone(&mcp_control),
+                governance,
+                settings: operations.settings_operations(),
+            },
             product,
-            runtime.runtime(),
-            runtime.endpoint(),
-            Arc::clone(&mcp_control),
-            governance,
         )
-        .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+        .map_err(|_error| InstalledServiceError::CompositionStage("application dispatcher"))?,
     );
     let replay = Arc::new(
         MutationReplayGuard::try_new(
@@ -474,7 +711,20 @@ fn compose_transport(
         events,
         inputs,
     )
-    .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+    .map_err(|_error| InstalledServiceError::CompositionStage("runtime router"))?;
+    let activity_readers = operations_activity_bindings::build_runtime_activity_readers(
+        jobs,
+        product.source_lifecycle_authority(),
+        product.paper_runtime_activity_authority(),
+        native.client_activity_reader(),
+        Arc::clone(&mcp_control),
+        operations.workspaces(),
+        workspace_selector,
+    );
+    operations
+        .activity()
+        .bind(activity_readers)
+        .map_err(|_error| InstalledServiceError::InvalidComposition)?;
 
     let audit = Arc::new(crate::mcp::audit::DurableAuditSink::try_new(
         paths.control_root()?.try_clone_directory()?,
@@ -497,7 +747,7 @@ fn compose_transport(
         resources,
         runtime.runtime().workspace_id(),
     )
-    .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+    .map_err(|_error| InstalledServiceError::CompositionStage("MCP handler factory"))?;
     let authenticator: Arc<dyn market_squawk_mcp::McpHttpAuthenticator> = mcp_control;
     let endpoint = runtime.endpoint().to_string();
     let request_cancellation = native.request_cancellation();
@@ -516,7 +766,7 @@ fn compose_transport(
         .with_state(mcp);
     let server = native
         .start(runtime.take_listener()?, Some(mcp_router))
-        .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+        .map_err(|_error| InstalledServiceError::CompositionStage("runtime server"))?;
     let registration = runtime.registration(NamedClient::Desktop)?;
     let scope = ApplicationRequestScope::try_new(
         runtime.runtime(),
@@ -584,6 +834,16 @@ fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, Inst
     ))
 }
 
+fn deterministic_installation_root(
+    workspace_paths: &LocalPaths,
+) -> Result<PathBuf, InstalledServiceError> {
+    workspace_paths
+        .root()
+        .parent()
+        .map(|parent| parent.join(".market-squawk-installed-service"))
+        .ok_or(InstalledServiceError::InvalidComposition)
+}
+
 /// Terminal evidence for every installed-service shutdown barrier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstalledServiceShutdownReport {
@@ -632,6 +892,18 @@ pub enum InstalledServiceError {
     /// Durable governance registrations, audit, or authority state could not be composed.
     #[error("installed-service governance state is unavailable")]
     GovernanceState,
+    /// Durable governed portfolio-import approval or recovery state is unavailable.
+    #[error("installed-service portfolio import state is unavailable: {0}")]
+    PortfolioImportState(String),
+    /// A concrete backup, recovery, or update authority rejected startup state.
+    #[error("installed-service operations {stage} is unavailable")]
+    OperationsAuthority {
+        /// Exact closed construction or recovery stage.
+        stage: &'static str,
+        /// Closed service-level cause.
+        #[source]
+        source: market_squawk_services::ServiceError,
+    },
     /// Operating-system entropy is unavailable.
     #[error("installed-service entropy is unavailable")]
     EntropyUnavailable,
@@ -644,6 +916,12 @@ pub enum InstalledServiceError {
     /// A local path capability could not be opened.
     #[error(transparent)]
     Path(#[from] PathError),
+    /// The operating system did not expose the per-user installation-data location.
+    #[error(transparent)]
+    Platform(#[from] PlatformError),
+    /// Durable active-workspace selection or generation fencing failed.
+    #[error("installed-service workspace selection is unavailable")]
+    WorkspaceSelection,
     /// A runtime identity or bounded protocol contract is invalid.
     #[error(transparent)]
     Runtime(#[from] RuntimeContractError),
@@ -671,6 +949,9 @@ pub enum InstalledServiceError {
     /// A code-owned service limit or component contract was invalid.
     #[error("installed-service composition is invalid")]
     InvalidComposition,
+    /// One named installed-service composition stage rejected its closed configuration.
+    #[error("installed-service {0} composition is invalid")]
+    CompositionStage(&'static str),
     /// The authenticated exact-generation self-probe did not prove readiness.
     #[error("installed-service readiness verification failed")]
     ReadinessFailed,
@@ -686,6 +967,9 @@ pub enum InstalledServiceError {
     /// One or more bounded shutdown barriers did not complete.
     #[error("installed-service shutdown was incomplete: {0:?}")]
     ShutdownIncomplete(InstalledServiceShutdownReport),
+    /// Structured-log storage could not be opened for service composition.
+    #[error(transparent)]
+    Logging(#[from] InstalledServiceLoggingError),
 }
 
 impl InstalledServiceError {

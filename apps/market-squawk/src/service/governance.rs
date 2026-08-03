@@ -8,12 +8,12 @@ use std::{
     collections::HashMap,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use market_squawk_domain::Timestamp;
-use market_squawk_platform::SecretValue;
+use market_squawk_platform::{SecretStore, SecretValue};
 use market_squawk_runtime::{ClientId, RuntimeIdentity};
 use market_squawk_services::{RequestContext, ServiceError, ToolResultMetadata, TypedToolResult};
 use serde::Deserialize;
@@ -21,6 +21,9 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::governance_persistence::{
+    GovernancePersistence, GovernancePersistenceError, GovernanceProvisioningRequest,
+};
 use crate::application::governance::{
     CanonicalGovernanceAction, DecisionGovernanceActionFactory, DecisionInvalidationKind,
     DecisionInvalidationProposal, DecisionReviewDisposition, DecisionReviewProposal,
@@ -28,9 +31,10 @@ use crate::application::governance::{
     FairValueMarketAccessProposal, FairValueOverrideProposal, FairValueRequestedHierarchy,
     FairValueRevocationProposal, GovernanceActionKind, GovernanceActionPreview,
     GovernanceAuthenticationTicket, GovernanceAuthority, GovernanceCommitReceipt,
-    GovernanceDomainAdapterError, GovernanceError, GovernancePreviewId, GovernancePreviewRequest,
-    GovernancePrincipalId, GovernancePrincipalPage, GovernanceRequestBinding, GovernanceRole,
-    GovernanceRoleSet, GovernanceTicketId, GovernedActionCommitReceipt,
+    GovernanceDomainAdapterError, GovernanceError, GovernanceLimits, GovernancePreviewId,
+    GovernancePreviewRequest, GovernancePrincipalId, GovernancePrincipalPage,
+    GovernanceRequestBinding, GovernanceRole, GovernanceRoleSet, GovernanceTicketId,
+    GovernedActionCommitReceipt,
 };
 
 /// Bounded state and expiry policy for the domain action side of governance previews.
@@ -43,7 +47,6 @@ pub(crate) struct GovernedActionServiceLimits {
 
 impl GovernedActionServiceLimits {
     /// Production-safe policy aligned with the generic governance authority defaults.
-    #[must_use]
     pub(crate) fn standard() -> Result<Self, GovernedActionServiceError> {
         Self::try_new(256, 64, Duration::from_secs(5 * 60))
     }
@@ -639,6 +642,8 @@ fn receipt_matches_action(
 }
 
 const LIST_PRINCIPALS: &str = "Governance.ListPrincipals";
+const PROVISIONING_STATUS: &str = "Governance.ProvisioningStatus";
+const PROVISION_PRINCIPAL_SET: &str = "Governance.ProvisionPrincipalSet";
 const AUTHENTICATE_ACTION: &str = "Governance.AuthenticateAction";
 const PREVIEW_DECISION_ACTION: &str = "Decision.PreviewGovernanceAction";
 const COMMIT_DECISION_ACTION: &str = "Decision.CommitGovernanceAction";
@@ -647,32 +652,59 @@ const COMMIT_FAIR_VALUE_ACTION: &str = "FairValue.CommitGovernanceAction";
 
 /// Private installed-client adapter over one optional configured governance authority.
 pub(crate) struct InstalledGovernanceOperations {
-    actions: Option<Arc<GovernedActionService>>,
+    actions: RwLock<Option<Arc<GovernedActionService>>>,
+    persistence: Arc<GovernancePersistence>,
+    secrets: Arc<dyn SecretStore>,
+    decisions: Arc<dyn DecisionGovernanceActionFactory>,
+    fair_value: Arc<dyn FairValueGovernanceActionFactory>,
+    authority_limits: GovernanceLimits,
+    action_limits: GovernedActionServiceLimits,
     runtime: RuntimeIdentity,
     desktop_client: ClientId,
 }
 
+pub(super) struct InstalledGovernanceComposition {
+    pub(super) actions: Option<Arc<GovernedActionService>>,
+    pub(super) persistence: Arc<GovernancePersistence>,
+    pub(super) secrets: Arc<dyn SecretStore>,
+    pub(super) decisions: Arc<dyn DecisionGovernanceActionFactory>,
+    pub(super) fair_value: Arc<dyn FairValueGovernanceActionFactory>,
+    pub(super) authority_limits: GovernanceLimits,
+    pub(super) action_limits: GovernedActionServiceLimits,
+}
+
 impl InstalledGovernanceOperations {
-    pub(crate) const fn new(
-        actions: Option<Arc<GovernedActionService>>,
+    pub(crate) fn new(
+        composition: InstalledGovernanceComposition,
         runtime: RuntimeIdentity,
         desktop_client: ClientId,
     ) -> Self {
         Self {
-            actions,
+            actions: RwLock::new(composition.actions),
+            persistence: composition.persistence,
+            secrets: composition.secrets,
+            decisions: composition.decisions,
+            fair_value: composition.fair_value,
+            authority_limits: composition.authority_limits,
+            action_limits: composition.action_limits,
             runtime,
             desktop_client,
         }
     }
 
-    pub(crate) const fn is_configured(&self) -> bool {
-        self.actions.is_some()
+    pub(crate) fn is_configured(&self) -> bool {
+        match self.actions.read() {
+            Ok(actions) => actions.is_some(),
+            Err(_error) => false,
+        }
     }
 
     pub(crate) fn owns(operation: &str) -> bool {
         matches!(
             operation,
-            LIST_PRINCIPALS
+            PROVISIONING_STATUS
+                | PROVISION_PRINCIPAL_SET
+                | LIST_PRINCIPALS
                 | AUTHENTICATE_ACTION
                 | PREVIEW_DECISION_ACTION
                 | COMMIT_DECISION_ACTION
@@ -682,14 +714,13 @@ impl InstalledGovernanceOperations {
     }
 
     pub(crate) fn is_mutation(operation: &str) -> bool {
-        operation != LIST_PRINCIPALS
+        !matches!(operation, PROVISIONING_STATUS | LIST_PRINCIPALS)
     }
 
     pub(crate) fn desktop_capabilities(&self) -> Vec<Value> {
-        if !self.is_configured() {
-            return Vec::new();
-        }
         [
+            (PROVISIONING_STATUS, true, false),
+            (PROVISION_PRINCIPAL_SET, false, false),
             (LIST_PRINCIPALS, true, false),
             (AUTHENTICATE_ACTION, false, false),
             (PREVIEW_DECISION_ACTION, false, false),
@@ -729,7 +760,55 @@ impl InstalledGovernanceOperations {
     ) -> Result<Value, ServiceError> {
         self.authorize(context)?;
         ensure_live(context)?;
-        let actions = self.actions.as_ref().ok_or(ServiceError::Unavailable)?;
+        if operation == PROVISIONING_STATUS {
+            let (data, item_count) = self.provisioning_status()?;
+            return finish_result(data, item_count, context);
+        }
+        if operation == PROVISION_PRINCIPAL_SET {
+            let input: ProvisionPrincipalSetInput = decode(arguments)?;
+            let actions = self
+                .persistence
+                .provision_principal_set(
+                    Arc::clone(&self.secrets),
+                    GovernanceProvisioningRequest {
+                        primary_display_name: input.primary_display_name,
+                        primary_credential: SecretValue::new(input.primary_credential)
+                            .map_err(|_| ServiceError::InvalidRequest)?,
+                        reviewer_display_name: input.reviewer_display_name,
+                        reviewer_credential: SecretValue::new(input.reviewer_credential)
+                            .map_err(|_| ServiceError::InvalidRequest)?,
+                        limits: self.authority_limits,
+                    },
+                    |authority| {
+                        GovernedActionService::try_new(
+                            Arc::new(authority),
+                            Arc::clone(&self.decisions),
+                            Arc::clone(&self.fair_value),
+                            self.action_limits,
+                        )
+                        .map(Arc::new)
+                        .map_err(|_error| ())
+                    },
+                )
+                .map_err(map_governance_persistence_error)?;
+            let mut installed = self
+                .actions
+                .write()
+                .map_err(|_| ServiceError::Unavailable)?;
+            if installed.is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+            *installed = Some(actions);
+            drop(installed);
+            let (data, item_count) = self.provisioning_status()?;
+            return finish_result(data, item_count, context);
+        }
+        let actions = self
+            .actions
+            .read()
+            .map_err(|_| ServiceError::Unavailable)?
+            .clone()
+            .ok_or(ServiceError::Unavailable)?;
         let now = Instant::now();
         let observed_at =
             super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
@@ -960,15 +1039,54 @@ impl InstalledGovernanceOperations {
             }
             _ => return Err(ServiceError::NotFound),
         };
-        ensure_live(context)?;
-        TypedToolResult::try_new(
-            data,
+        finish_result(data, item_count, context)
+    }
+
+    fn provisioning_status(&self) -> Result<(Value, usize), ServiceError> {
+        let Some(registrations) = self
+            .persistence
+            .load_registrations()
+            .map_err(map_governance_persistence_error)?
+        else {
+            return Ok((
+                json!({
+                    "state": "unprovisioned",
+                    "configured": false,
+                    "principals": [],
+                    "missingRoles": [
+                        "decisionReviewer",
+                        "decisionInvalidator",
+                        "fairValueApprover",
+                        "fairValueOverrideApprover",
+                        "fairValueRevoker",
+                        "fairValueMarketAccessApprover",
+                        "portfolioImportResolver",
+                    ],
+                }),
+                0,
+            ));
+        };
+        let principals = registrations
+            .iter()
+            .map(|registration| {
+                let principal = registration.principal();
+                json!({
+                    "principalId": principal.id(),
+                    "displayName": principal.display_name(),
+                    "roles": principal.roles(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let item_count = principals.len();
+        Ok((
+            json!({
+                "state": "active",
+                "configured": true,
+                "principals": principals,
+                "missingRoles": [],
+            }),
             item_count,
-            ToolResultMetadata::complete_not_applicable(),
-            context.limits(),
-        )
-        .map(TypedToolResult::into_envelope)
-        .map_err(Into::into)
+        ))
     }
 
     fn authorize(&self, context: &RequestContext) -> Result<(), ServiceError> {
@@ -980,6 +1098,22 @@ impl InstalledGovernanceOperations {
         }
         Ok(())
     }
+}
+
+fn finish_result(
+    data: Value,
+    item_count: usize,
+    context: &RequestContext,
+) -> Result<Value, ServiceError> {
+    ensure_live(context)?;
+    TypedToolResult::try_new(
+        data,
+        item_count,
+        ToolResultMetadata::complete_not_applicable(),
+        context.limits(),
+    )
+    .map(TypedToolResult::into_envelope)
+    .map_err(Into::into)
 }
 
 impl fmt::Debug for InstalledGovernanceOperations {
@@ -998,6 +1132,15 @@ impl fmt::Debug for InstalledGovernanceOperations {
 struct PrincipalListInput {
     after: Option<Uuid>,
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProvisionPrincipalSetInput {
+    primary_display_name: String,
+    primary_credential: String,
+    reviewer_display_name: String,
+    reviewer_credential: String,
 }
 
 #[derive(Deserialize)]
@@ -1112,7 +1255,7 @@ fn commit_request(input: CommitInput) -> Result<GovernanceActionCommitRequest, S
         input
             .ticket_ids
             .into_iter()
-            .map(|value| GovernanceTicketId::try_from_uuid(value))
+            .map(GovernanceTicketId::try_from_uuid)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ServiceError::InvalidRequest)?,
     )
@@ -1140,6 +1283,35 @@ fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
         return Err(ServiceError::DeadlineExceeded);
     }
     Ok(())
+}
+
+fn map_governance_persistence_error(error: GovernancePersistenceError) -> ServiceError {
+    match error {
+        GovernancePersistenceError::AlreadyProvisioned
+        | GovernancePersistenceError::InvalidPrincipalSet
+        | GovernancePersistenceError::InvalidRegistrationState => ServiceError::InvalidRequest,
+        GovernancePersistenceError::Capacity => ServiceError::ResourceExhausted,
+        GovernancePersistenceError::Path(_)
+        | GovernancePersistenceError::State(_)
+        | GovernancePersistenceError::StateUnavailable
+        | GovernancePersistenceError::ProvisioningRecoveryRequired
+        | GovernancePersistenceError::SecretOperation
+        | GovernancePersistenceError::Governance(_)
+        | GovernancePersistenceError::Io(_)
+        | GovernancePersistenceError::UnsafeAuditIdentity
+        | GovernancePersistenceError::InsecureAuditPermissions
+        | GovernancePersistenceError::AuditAlreadyLocked
+        | GovernancePersistenceError::CorruptAuditRecord
+        | GovernancePersistenceError::PoisonedAudit
+        | GovernancePersistenceError::AuditEncoding => ServiceError::Unavailable,
+        #[cfg(unix)]
+        GovernancePersistenceError::AuditOwnerMismatch => ServiceError::Unavailable,
+        #[cfg(not(unix))]
+        GovernancePersistenceError::AuditOwnerMismatch
+        | GovernancePersistenceError::AuditPermissionProofUnavailable => ServiceError::Unavailable,
+        #[cfg(not(any(unix, windows)))]
+        GovernancePersistenceError::DirectoryDurabilityUnavailable => ServiceError::Unavailable,
+    }
 }
 
 fn map_governance_service_error(error: GovernedActionServiceError) -> ServiceError {

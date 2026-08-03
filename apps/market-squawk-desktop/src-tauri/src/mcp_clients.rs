@@ -22,6 +22,7 @@ use market_squawk_services::RequestId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tauri::State;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +45,7 @@ const MCP_REVOKE_OPERATION: &str = "Mcp.RevokeCredential";
 /// Sole native mutation authority for supported MCP client registrations.
 pub(crate) struct DesktopMcpClientState {
     runtime: RuntimeIdentity,
+    control_gate: AsyncMutex<()>,
     inner: Arc<Mutex<DesktopMcpClientAuthority>>,
 }
 
@@ -92,6 +94,7 @@ impl DesktopMcpClientState {
         ]);
         Ok(Self {
             runtime,
+            control_gate: AsyncMutex::new(()),
             inner: Arc::new(Mutex::new(DesktopMcpClientAuthority {
                 manager: McpClientRegistrationManager::try_new(paths, relay_program)?,
                 authorities,
@@ -155,10 +158,14 @@ impl DesktopMcpClientAuthority {
         service: &McpServiceClientStatus,
     ) -> McpClientPresentation {
         let client = status.client();
-        let last_verification = status
-            .receipt()
-            .and_then(|receipt| receipt.last_verification())
-            .map(McpVerificationPresentation::from);
+        let last_verification = if status.state() == McpClientState::Owned {
+            status
+                .receipt()
+                .and_then(|receipt| receipt.last_verification())
+                .map(McpVerificationPresentation::from)
+        } else {
+            None
+        };
         let receipt = status.receipt().map(|receipt| McpOwnedReceiptPresentation {
             command_sha256: receipt.command_sha256().to_owned(),
             observed_at_unix_seconds: receipt.observed_at_unix_seconds(),
@@ -193,24 +200,53 @@ impl DesktopMcpClientAuthority {
             .collect()
     }
 
-    fn inspect_all_with(
+    fn admit_control(
         &self,
-        updated: McpClientStatus,
+        request: McpClientControlCommand,
         service: &McpServiceRuntimeStatus,
-    ) -> Result<Vec<McpClientPresentation>, McpClientRegistrationError> {
-        let other_client = match updated.client() {
-            McpClientKind::ClaudeCode => McpClientKind::Codex,
-            McpClientKind::Codex => McpClientKind::ClaudeCode,
-        };
-        let updated_facts = service
-            .client(updated.client())
+    ) -> Result<(), NativeMcpOperationError> {
+        let client = request.client();
+        let authority = self.authority(client)?;
+        let status = self.manager.inspect_with_authority(client, &authority)?;
+        let facts = service
+            .client(client)
             .ok_or(McpClientRegistrationError::InvalidAuthorityIdentity)?;
-        let mut clients = vec![
-            self.present(updated, updated_facts),
-            self.inspect_client(other_client, service)?,
-        ];
-        clients.sort_by_key(|client| client.client);
-        Ok(clients)
+        if request.service_operation().is_some() && facts.credential_rotation_recovery_pending {
+            return Err(NativeMcpOperationError::CredentialRecoveryPending);
+        }
+        let admitted = match request {
+            McpClientControlCommand::Connect { .. } => status.state() == McpClientState::Ready,
+            McpClientControlCommand::Reconnect { .. } => {
+                status.state() == McpClientState::Owned && facts.access_revoked
+            }
+            McpClientControlCommand::Repair { .. } => matches!(
+                status.state(),
+                McpClientState::Owned | McpClientState::RepairRequired
+            ),
+            McpClientControlCommand::RotateCredential { .. }
+            | McpClientControlCommand::RevokeCredential { .. }
+            | McpClientControlCommand::Verify { .. } => {
+                status.state() == McpClientState::Owned && !facts.access_revoked
+            }
+            McpClientControlCommand::Disconnect { .. } => matches!(
+                status.state(),
+                McpClientState::Owned | McpClientState::RepairRequired
+            ),
+        };
+        if admitted {
+            return Ok(());
+        }
+        Err(match status.state() {
+            McpClientState::Absent | McpClientState::Unsupported => {
+                McpClientRegistrationError::ClientUnavailable { client }.into()
+            }
+            McpClientState::Conflict => {
+                McpClientRegistrationError::UnownedConflict { client }.into()
+            }
+            McpClientState::Ready | McpClientState::Owned | McpClientState::RepairRequired => {
+                McpClientRegistrationError::OwnershipRequired { client }.into()
+            }
+        })
     }
 }
 
@@ -298,10 +334,15 @@ impl McpServiceRuntimeStatus {
         let rate_limited_requests = self.clients.iter().try_fold(0_u64, |total, facts| {
             total.checked_add(facts.rate_limited_requests)
         });
+        let distinct_client_authorities = claude.zip(codex).is_some_and(|(claude, codex)| {
+            claude.client_id != codex.client_id
+                && claude.credential_identity != codex.credential_identity
+        });
         if self.session_model != "stateless_request_scoped"
             || self.clients.len() != 2
             || claude.is_none()
             || codex.is_none()
+            || !distinct_client_authorities
             || active_requests != Some(self.active_requests)
             || admitted_requests != self.admitted_requests
             || rate_limited_requests != self.rate_limited_requests
@@ -443,6 +484,8 @@ struct McpVerificationPresentation {
     server_name: String,
     tool_count: usize,
     resource_count: usize,
+    tool_domains: Box<[String]>,
+    resource_names: Box<[String]>,
     safe_read_tool: String,
     verified_at_unix_seconds: u64,
 }
@@ -455,6 +498,8 @@ impl From<&McpProtocolVerification> for McpVerificationPresentation {
             server_name: verification.server_name().to_owned(),
             tool_count: verification.tool_count(),
             resource_count: verification.resource_count(),
+            tool_domains: verification.tool_domains().into(),
+            resource_names: verification.resource_names().into(),
             safe_read_tool: verification.safe_read_tool().to_owned(),
             verified_at_unix_seconds: verification.verified_at_unix_seconds(),
         }
@@ -548,6 +593,7 @@ pub(crate) async fn mcp_client_control(
         ));
     }
     admit_current_runtime(&desktop, &clients)?;
+    let _control_guard = clients.control_gate.lock().await;
     if !desktop.mcp_ready() {
         return Err(DesktopCommandError::new(
             "mcp_endpoint_unavailable",
@@ -559,6 +605,21 @@ pub(crate) async fn mcp_client_control(
         .probe_ready(desktop.cancellation())
         .await
         .map_err(map_application_client_error)?;
+
+    let initial_service =
+        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
+            .await?;
+    initial_service.validate().map_err(map_mcp_client_error)?;
+    let runtime = desktop.runtime();
+    let preflight_service = initial_service.clone();
+    let authority = Arc::clone(&clients.inner);
+    run_blocking(MCP_STATUS_TIMEOUT, move || {
+        let mut authority = lock_authority(&authority)?;
+        authority.synchronize_service_authority(runtime, &preflight_service)?;
+        authority.admit_control(request, &preflight_service)
+    })
+    .await?;
+
     if let Some(operation) = request.service_operation() {
         let mutation = invoke_mcp_service::<McpCredentialMutationReceipt>(
             &desktop,
@@ -568,34 +629,37 @@ pub(crate) async fn mcp_client_control(
         .await?;
         mutation.validate(request.client(), operation)?;
     }
-    let service =
+
+    let effective_service = if request.service_operation().is_some() {
         invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
-            .await?;
-    service.validate().map_err(map_mcp_client_error)?;
-    let response_service = service.clone();
+            .await?
+    } else {
+        initial_service
+    };
+    effective_service.validate().map_err(map_mcp_client_error)?;
     let runtime = desktop.runtime();
     let timeout = request.timeout();
     let authority = Arc::clone(&clients.inner);
-    let client_statuses = run_blocking(timeout, move || {
+    run_blocking(timeout, move || {
         let mut authority = lock_authority(&authority)?;
-        authority.synchronize_service_authority(runtime, &service)?;
-        let status = match request {
+        authority.synchronize_service_authority(runtime, &effective_service)?;
+        match request {
             McpClientControlCommand::Connect { client } => {
                 let registration_authority = authority.authority(client)?;
-                authority.manager.connect(client, registration_authority)?
+                authority.manager.connect(client, registration_authority)?;
             }
             McpClientControlCommand::Reconnect { client }
             | McpClientControlCommand::Repair { client }
             | McpClientControlCommand::RotateCredential { client }
             | McpClientControlCommand::RevokeCredential { client } => {
                 let registration_authority = authority.authority(client)?;
-                authority.manager.repair(client, registration_authority)?
+                authority.manager.repair(client, registration_authority)?;
             }
             McpClientControlCommand::Disconnect { client } => {
-                authority.manager.disconnect(client)?
+                authority.manager.disconnect(client)?;
             }
             McpClientControlCommand::Verify { client } => {
-                if service
+                if effective_service
                     .client(client)
                     .is_none_or(|facts| facts.access_revoked)
                 {
@@ -611,12 +675,24 @@ pub(crate) async fn mcp_client_control(
                 authority.manager.verify_protocol(client)?;
                 authority
                     .manager
-                    .inspect_with_authority(client, &registration_authority)?
+                    .inspect_with_authority(client, &registration_authority)?;
             }
-        };
-        authority
-            .inspect_all_with(status, &service)
-            .map_err(Into::into)
+        }
+        Ok(())
+    })
+    .await?;
+
+    let final_service =
+        invoke_mcp_service::<McpServiceRuntimeStatus>(&desktop, MCP_STATUS_OPERATION, json!({}))
+            .await?;
+    final_service.validate().map_err(map_mcp_client_error)?;
+    let response_service = final_service.clone();
+    let runtime = desktop.runtime();
+    let authority = Arc::clone(&clients.inner);
+    let client_statuses = run_blocking(MCP_STATUS_TIMEOUT, move || {
+        let mut authority = lock_authority(&authority)?;
+        authority.synchronize_service_authority(runtime, &final_service)?;
+        authority.inspect_all(&final_service).map_err(Into::into)
     })
     .await?;
     Ok(status_response(&desktop, response_service, client_statuses))
@@ -706,6 +782,10 @@ where
         .map_err(|error| match error {
             NativeMcpOperationError::Registration(error) => map_mcp_client_error(error),
             NativeMcpOperationError::AuthorityUnavailable => DesktopCommandError::internal(),
+            NativeMcpOperationError::CredentialRecoveryPending => DesktopCommandError::new(
+                "mcp_credential_recovery_pending",
+                "Restart Market Squawk to finish the interrupted credential change before making another client change.",
+            ),
         })
 }
 
@@ -713,6 +793,7 @@ where
 enum NativeMcpOperationError {
     Registration(McpClientRegistrationError),
     AuthorityUnavailable,
+    CredentialRecoveryPending,
 }
 
 impl From<McpClientRegistrationError> for NativeMcpOperationError {

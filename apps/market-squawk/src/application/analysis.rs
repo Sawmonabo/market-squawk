@@ -526,13 +526,15 @@ impl AnalysisDomainService {
                 .await?;
             ensure_request_live(context, &self.lifecycle)?;
             return bounded_artifact_read_result(
-                report.artifact_id(),
-                sha256,
-                byte_count,
-                report.media_type(),
-                &content,
-                offset,
-                maximum_bytes,
+                BoundedArtifactRead {
+                    artifact_id: report.artifact_id(),
+                    sha256,
+                    byte_count,
+                    media_type: report.media_type(),
+                    content: &content,
+                    offset,
+                    maximum_bytes,
+                },
                 request,
                 context,
             );
@@ -557,13 +559,15 @@ impl AnalysisDomainService {
         ensure_request_live(context, &self.lifecycle)?;
         let reference = read.reference();
         bounded_artifact_read_result(
-            reference.id(),
-            reference.sha256(),
-            reference.byte_count(),
-            reference.media_type(),
-            read.content(),
-            offset,
-            maximum_bytes,
+            BoundedArtifactRead {
+                artifact_id: reference.id(),
+                sha256: reference.sha256(),
+                byte_count: reference.byte_count(),
+                media_type: reference.media_type(),
+                content: read.content(),
+                offset,
+                maximum_bytes,
+            },
             request,
             context,
         )
@@ -1088,37 +1092,42 @@ const fn map_artifact_error(error: ArtifactError) -> ServiceError {
     }
 }
 
-fn bounded_artifact_read_result(
-    artifact_id: &str,
-    sha256: &str,
+struct BoundedArtifactRead<'a> {
+    artifact_id: &'a str,
+    sha256: &'a str,
     byte_count: usize,
-    media_type: &str,
-    content: &[u8],
+    media_type: &'a str,
+    content: &'a [u8],
     offset: usize,
     maximum_bytes: usize,
+}
+
+fn bounded_artifact_read_result(
+    read: BoundedArtifactRead<'_>,
     request: &TypedToolRequest,
     context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
-    if content.len() != byte_count || offset > content.len() {
+    if read.content.len() != read.byte_count || read.offset > read.content.len() {
         return Err(ServiceError::InvalidResult);
     }
-    let end = offset
-        .checked_add(maximum_bytes)
-        .map(|end| end.min(content.len()))
+    let end = read
+        .offset
+        .checked_add(read.maximum_bytes)
+        .map(|end| end.min(read.content.len()))
         .ok_or(ServiceError::InvalidRequest)?;
     TypedToolResult::try_new(
         json!({
             "artifact": {
-                "artifactId": artifact_id,
-                "sha256": sha256,
-                "byteCount": byte_count,
-                "mediaType": media_type,
+                "artifactId": read.artifact_id,
+                "sha256": read.sha256,
+                "byteCount": read.byte_count,
+                "mediaType": read.media_type,
             },
-            "offset": offset,
-            "returnedBytes": end - offset,
-            "contentBase64": BASE64_STANDARD.encode(&content[offset..end]),
+            "offset": read.offset,
+            "returnedBytes": end - read.offset,
+            "contentBase64": BASE64_STANDARD.encode(&read.content[read.offset..end]),
             "nextOffset": end,
-            "complete": end == content.len(),
+            "complete": end == read.content.len(),
         }),
         1,
         ToolResultMetadata::complete_not_applicable(),

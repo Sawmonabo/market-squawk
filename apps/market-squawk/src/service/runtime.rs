@@ -18,7 +18,7 @@ use market_squawk_runtime::{
     ClientCredentialProvisioningPlan, ClientCredentialRegistration, ClientId, CorrelationId,
     CredentialRegistry, InstallationId, LoopbackApplicationClient, NamedClient, ProcessIdentity,
     ProcessIdentityVerifier, RendezvousAuthority, RendezvousError, RendezvousRecord,
-    RuntimeIdentity, ServiceGeneration, WorkspaceId,
+    RuntimeIdentity,
 };
 use market_squawk_services::JsonStructureLimits;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use super::{InstalledServiceError, mcp_control::PreparedMcpClientAuthority};
+use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
 const STATE_FORMAT_VERSION: u16 = 1;
 const SERVICE_DIRECTORY: &str = "installed-service";
@@ -60,7 +61,6 @@ struct InstalledRuntimeInitialization {
 impl InstalledRuntimeInitialization {
     fn validate(self) -> Result<Self, InstalledServiceError> {
         if self.format_version != STATE_FORMAT_VERSION
-            || self.runtime.service_generation().get() != 1
             || self.credentials.len() != 4
             || [
                 NamedClient::Desktop,
@@ -120,21 +120,6 @@ impl InstalledRuntimeState {
         Ok(self)
     }
 
-    fn advance_generation(&mut self) -> Result<(), InstalledServiceError> {
-        let next = self
-            .runtime
-            .service_generation()
-            .get()
-            .checked_add(1)
-            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-        self.runtime = RuntimeIdentity::try_new(
-            self.runtime.installation_id(),
-            self.runtime.workspace_id(),
-            ServiceGeneration::try_new(next)?,
-        )?;
-        Ok(())
-    }
-
     fn registration(&self, client: NamedClient) -> Option<&ClientCredentialRegistration> {
         self.credentials
             .iter()
@@ -171,6 +156,7 @@ impl PreparedRuntime {
     pub(super) async fn prepare(
         paths: &LocalPaths,
         secret_store: Arc<dyn SecretStore>,
+        selected: WorkspaceRuntimeIdentity,
     ) -> Result<Self, InstalledServiceError> {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let instance_guard =
@@ -187,7 +173,9 @@ impl PreparedRuntime {
                 let mut state = state.validate()?;
                 let listener = bind_loopback().await?;
                 state.endpoint = listener.local_addr()?;
-                state.advance_generation()?;
+                state.runtime = selected
+                    .to_runtime(state.runtime.installation_id())
+                    .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
                 let credentials = Arc::new(CredentialRegistry::try_load(
                     Arc::clone(&secret_store),
                     state.credentials.clone(),
@@ -203,15 +191,29 @@ impl PreparedRuntime {
                 })?)?;
                 (state, credentials, signing_key, listener)
             }
-            Some(InstalledRuntimeDocument::Initializing { initialization }) => {
-                resume_initialization(
-                    &identity_store,
-                    Arc::clone(&secret_store),
-                    initialization.validate()?,
-                )
-                .await?
+            Some(InstalledRuntimeDocument::Initializing { mut initialization }) => {
+                initialization.runtime = selected
+                    .to_runtime(initialization.runtime.installation_id())
+                    .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
+                identity_store.store(&encode_document(
+                    &InstalledRuntimeDocument::Initializing {
+                        initialization: initialization.validate()?,
+                    },
+                )?)?;
+                let InstalledRuntimeDocument::Initializing { initialization } = decode_document(
+                    &identity_store
+                        .load()?
+                        .ok_or(InstalledServiceError::InvalidRuntimeState)?,
+                )?
+                else {
+                    return Err(InstalledServiceError::InvalidRuntimeState);
+                };
+                resume_initialization(&identity_store, Arc::clone(&secret_store), initialization)
+                    .await?
             }
-            None => initialize_runtime(&identity_store, Arc::clone(&secret_store)).await?,
+            None => {
+                initialize_runtime(&identity_store, Arc::clone(&secret_store), selected).await?
+            }
         };
         let mcp_roots = [
             state
@@ -345,6 +347,7 @@ impl PreparedRuntime {
 async fn initialize_runtime(
     identity_store: &LocalAuthorityStateStore,
     secret_store: Arc<dyn SecretStore>,
+    selected: WorkspaceRuntimeIdentity,
 ) -> Result<
     (
         InstalledRuntimeState,
@@ -378,11 +381,9 @@ async fn initialize_runtime(
         .map_err(|_error| InstalledServiceError::SecretStore)?;
     let initialization = InstalledRuntimeInitialization {
         format_version: STATE_FORMAT_VERSION,
-        runtime: RuntimeIdentity::try_new(
-            InstallationId::try_from_uuid(Uuid::new_v4())?,
-            WorkspaceId::try_from_uuid(Uuid::new_v4())?,
-            ServiceGeneration::try_new(1)?,
-        )?,
+        runtime: selected
+            .to_runtime(InstallationId::try_from_uuid(Uuid::new_v4())?)
+            .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?,
         credentials,
         rendezvous_signing_plan: signing_plan,
     }

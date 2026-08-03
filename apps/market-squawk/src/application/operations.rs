@@ -8,7 +8,7 @@ pub use contracts::{
     ManagedBackupOperations, ManagedRecoveryOperations, ManagedSettingsOperations,
     ManagedSettingsRollbackApproval, ManagedSettingsRollbackPreview, ManagedUpdateOperations,
     PreparedOperation, ProgramRollbackPreviewEvidence, RestorePreviewEvidence, TrustedStagedUpdate,
-    UpdateStatusEvidence,
+    UpdateAvailabilityEvidence, UpdateStatusEvidence,
 };
 
 use std::{fmt, sync::Arc, time::Instant};
@@ -238,7 +238,7 @@ impl OperationsApplicationServices {
                 if !preview.can_approve() {
                     return Err(ServiceError::InvalidRequest);
                 }
-                let operation = self.recovery_operations.prepare_restore(preview)?;
+                let operation = self.recovery_operations.prepare_restore(*preview)?;
                 let command = RecoveryJobCommand::new(
                     RecoveryJobAction::RestoreWorkspace,
                     operation.identity().clone(),
@@ -426,7 +426,7 @@ impl ApplicationDomainService for OperationsApplicationServices {
                     &context,
                     "restore",
                     &preview,
-                    PreviewPayload::Restore(preview.clone()),
+                    PreviewPayload::Restore(Box::new(preview.clone())),
                 )?
             }
             LIST_WORKSPACES => {

@@ -210,6 +210,46 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "reconciliationDiscrepancies",
             ],
         ),
+        "Portfolio.PreviewStagedImport" => closed(
+            vec![
+                ("previewId", text()),
+                ("digest", text()),
+                ("preview", record()),
+            ],
+            &["previewId", "digest", "preview"],
+        ),
+        "Portfolio.ApproveStagedImport" => closed(
+            vec![
+                ("approvalId", uuid()),
+                ("previewId", text()),
+                ("previewDigest", text()),
+                ("status", enumeration(&["approved", "promoting"])),
+            ],
+            &["approvalId", "previewId", "previewDigest", "status"],
+        ),
+        "Portfolio.CommitStagedImport" => closed(
+            vec![
+                ("approvalId", uuid()),
+                ("previewId", text()),
+                ("previewDigest", text()),
+                ("receipt", record()),
+                ("status", enumeration(&["committed"])),
+            ],
+            &[
+                "approvalId",
+                "previewId",
+                "previewDigest",
+                "receipt",
+                "status",
+            ],
+        ),
+        "Portfolio.DiscardStagedImport" => closed(
+            vec![
+                ("previewId", text()),
+                ("status", enumeration(&["discarded"])),
+            ],
+            &["previewId", "status"],
+        ),
         "Portfolio.ListAccounts" | "Portfolio.ListRevisions" => nullable_rows(record()),
         "Portfolio.GetHoldings" => array(signature(vec![
             ("instrument_id", text()),
@@ -525,6 +565,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         ),
         "Operations.GetUpdateStatus" => closed(
             vec![
+                ("availability", text()),
                 ("currentGeneration", unsigned()),
                 ("knownGoodVersion", text()),
                 ("stagedCandidate", nullable(record())),
@@ -532,6 +573,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("recoveryRequired", boolean()),
             ],
             &[
+                "availability",
                 "currentGeneration",
                 "knownGoodVersion",
                 "stagedCandidate",

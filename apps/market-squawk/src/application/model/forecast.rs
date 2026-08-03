@@ -6,7 +6,8 @@ use market_squawk_data::Sha256Digest;
 use market_squawk_modeling::{ForecastOutcome, ForecastPath, ForecastVintage};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_services::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
+    ArtifactRepository,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -17,8 +18,13 @@ use persistence::{
     validate_digest,
 };
 
+use super::runtime::{
+    ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
+    RetainedRuntimeBackup,
+};
+
 mod generation;
-mod persistence;
+pub(in crate::application::model) mod persistence;
 
 /// Starts durable forecast generation through the installed job authority.
 pub const START_FORECAST: &str = "Model.StartForecast";
@@ -80,6 +86,23 @@ pub struct ForecastApplicationService {
     limits: ForecastApplicationLimits,
 }
 
+pub(super) struct RetainedForecastBackup {
+    pub(super) runtime: RetainedRuntimeBackup,
+    pub(super) canonical_index: Box<[u8]>,
+    pub(super) artifact_references: Vec<ArtifactReference>,
+}
+
+impl std::fmt::Debug for RetainedForecastBackup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedForecastBackup")
+            .field("runtime", &self.runtime)
+            .field("canonical_index", &"[CANONICAL FORECAST INDEX]")
+            .field("artifact_count", &self.artifact_references.len())
+            .finish()
+    }
+}
+
 impl ForecastApplicationService {
     /// Opens and semantically verifies the complete durable forecast index.
     pub fn try_open(
@@ -101,6 +124,14 @@ impl ForecastApplicationService {
             artifacts,
             limits,
         })
+    }
+
+    pub(super) fn artifact_repository(&self) -> Arc<dyn ArtifactRepository> {
+        Arc::clone(&self.artifacts)
+    }
+
+    pub(super) const fn backup_limits(&self) -> ForecastApplicationLimits {
+        self.limits
     }
 
     /// Publishes one complete path, then durably appends its immutable vintage record.
@@ -259,6 +290,63 @@ impl ForecastApplicationService {
         }))
     }
 
+    pub(super) async fn retain_backup_with_runtime(
+        &self,
+        runtime: Option<&ProductionModelRuntime>,
+        runtime_limits: ProductionModelRuntimeLimits,
+    ) -> Result<RetainedForecastBackup, ForecastBackupCaptureError> {
+        let index = self.index.lock().await;
+        let canonical_index = index.canonical_bytes(self.limits)?.into_boxed_slice();
+        let artifact_references = index.artifact_references()?;
+        let runtime = match runtime {
+            Some(runtime) => runtime.retain_backup()?,
+            None => ProductionModelRuntime::empty_backup(runtime_limits)?,
+        };
+        let runtime_coordinates = runtime
+            .models
+            .iter()
+            .map(|(coordinate, _bundle)| {
+                (
+                    coordinate.model_id.to_string(),
+                    coordinate.bundle_id.as_str().to_owned(),
+                    coordinate.bundle_version.get(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if index.model_coordinates().any(|coordinate| {
+            !runtime_coordinates.iter().any(|candidate| {
+                candidate.0 == coordinate.0
+                    && candidate.1 == coordinate.1
+                    && candidate.2 == coordinate.2
+            })
+        }) {
+            return Err(ForecastBackupCaptureError::ModelCoordinateMismatch);
+        }
+        Ok(RetainedForecastBackup {
+            runtime,
+            canonical_index,
+            artifact_references,
+        })
+    }
+
+    pub(super) fn stage_backup_index(
+        root: impl AsRef<Path>,
+        canonical_index: &[u8],
+        expected_artifacts: &[ArtifactReference],
+        limits: ForecastApplicationLimits,
+    ) -> Result<(), ForecastApplicationError> {
+        let index = ForecastIndex::decode_canonical(canonical_index, limits)?;
+        if index.artifact_references()? != expected_artifacts {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let store = LocalAuthorityStateStore::try_open(root)?;
+        if store.load()?.is_some() {
+            return Err(ForecastApplicationError::RestoreTargetNotFresh);
+        }
+        store.store(canonical_index)?;
+        Ok(())
+    }
+
     async fn vintage_for_request(&self, request_hash: Sha256Digest) -> Option<VintageRecord> {
         let request_hash = hex(request_hash.bytes());
         self.index
@@ -386,4 +474,17 @@ pub enum ForecastApplicationError {
     /// Controlled forecast payload publication failed.
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
+    /// Restore attempted to reuse an authority outside a fresh inactive workspace.
+    #[error("forecast restore target is not fresh")]
+    RestoreTargetNotFresh,
+}
+
+#[derive(Debug, Error)]
+pub(super) enum ForecastBackupCaptureError {
+    #[error(transparent)]
+    Forecast(#[from] ForecastApplicationError),
+    #[error(transparent)]
+    Runtime(#[from] ProductionModelRuntimeError),
+    #[error("forecast refers to a model generation outside the retained runtime")]
+    ModelCoordinateMismatch,
 }

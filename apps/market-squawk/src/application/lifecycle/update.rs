@@ -224,6 +224,29 @@ pub struct UpdateTransitionRecord {
     state: UpdateTransitionState,
 }
 
+impl UpdateTransitionRecord {
+    /// Validates one exact journal successor and returns its resulting active generation.
+    pub fn validate_after(
+        &self,
+        current: ProgramGeneration,
+    ) -> Result<ProgramGeneration, UpdateError> {
+        let attempted = current.next()?;
+        let expected_active = match self.state {
+            UpdateTransitionState::Activated => attempted,
+            UpdateTransitionState::RolledBack => attempted.next()?,
+        };
+        if self.previous_generation != current
+            || self.attempted_generation != attempted
+            || self.active_generation != expected_active
+            || self.candidate_manifest_sha256 == [0; 32]
+            || self.preview_sha256 == [0; 32]
+        {
+            return Err(UpdateError::JournalUnavailable);
+        }
+        Ok(expected_active)
+    }
+}
+
 /// Client-visible update receipt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

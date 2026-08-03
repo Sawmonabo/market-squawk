@@ -165,10 +165,23 @@ impl ProgramRollbackPreviewEvidence {
     }
 }
 
+/// Package-derived availability of the installed trusted-update channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateAvailabilityEvidence {
+    /// The immutable package contains an admitted public root and repository contract.
+    Available,
+    /// This process is a source or development execution rather than an installed release.
+    SourceOrDevelopmentExecution,
+    /// The installed package was intentionally built without production update trust material.
+    ProductionSigningMaterialUnavailable,
+}
+
 /// Current trusted-update state without paths, URLs, or signing material.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStatusEvidence {
+    availability: UpdateAvailabilityEvidence,
     current_generation: ProgramGeneration,
     known_good_version: String,
     staged_candidate: Option<StagedUpdateCandidate>,
@@ -179,6 +192,7 @@ pub struct UpdateStatusEvidence {
 impl UpdateStatusEvidence {
     /// Creates bounded status derived from the trusted update and installer authorities.
     pub fn try_new(
+        availability: UpdateAvailabilityEvidence,
         current_generation: ProgramGeneration,
         known_good_version: impl Into<String>,
         staged_candidate: Option<StagedUpdateCandidate>,
@@ -193,6 +207,7 @@ impl UpdateStatusEvidence {
             return Err(ServiceError::InvalidResult);
         }
         Ok(Self {
+            availability,
             current_generation,
             known_good_version,
             staged_candidate,

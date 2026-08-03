@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt as _;
 use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration, WorkspaceId};
 use reqwest::redirect::Policy;
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
@@ -25,7 +26,8 @@ use crate::contracts::{
     UninstallRequest, UpdateRequest,
 };
 use crate::lifecycle::{
-    InstallError, active_program_path, install, repair, rollback, status, uninstall, update,
+    InstallError, active_program_path, active_release_root, install, repair, rollback, status,
+    uninstall, update,
 };
 use crate::manifest::{
     ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_ARCHIVE_ENTRIES,
@@ -36,6 +38,10 @@ use crate::service_registration::{
     RestartInstalledServiceRequest, installed_service_status, restart_installed_service,
     verify_installed_service,
 };
+use crate::update_metadata::{
+    SuppliedMetadata, SuppliedTarget, TargetSource, TrustedRoot, TrustedUpdateStore,
+    UpdateMetadataError,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -43,6 +49,91 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAXIMUM_REDIRECTS: usize = 10;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const MAXIMUM_MANIFEST_TREE_DEPTH: usize = 64;
+const MAXIMUM_UPDATE_METADATA_BYTES: usize = 1024 * 1024;
+const MAXIMUM_ROOT_CHAIN: usize = 32;
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "availability")]
+enum InstalledChannelDocument {
+    #[serde(rename = "available")]
+    Available(AvailableInstalledChannel),
+    #[serde(rename = "unavailable")]
+    Unavailable(UnavailableInstalledChannel),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AvailableInstalledChannel {
+    schema_version: u16,
+    minimum_workspace_schema_version: u64,
+    maximum_workspace_schema_version: u64,
+    pinned_root: InstalledPinnedRoot,
+    repository_base_url: String,
+    targets: std::collections::BTreeMap<String, InstalledTargetSelection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnavailableInstalledChannel {
+    schema_version: u16,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledPinnedRoot {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstalledTargetSelection {
+    manifest_target_path: String,
+    archive_target_path: String,
+}
+
+struct AdmittedInstalledChannel {
+    repository_base_url: String,
+    pinned_root_sha256: String,
+    pinned_root_size: u64,
+    targets: std::collections::BTreeMap<String, InstalledTargetSelection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutedMetadataEnvelope {
+    signed: RoutedMetadata,
+    signatures: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutedMetadata {
+    meta: std::collections::BTreeMap<String, RoutedMetadataDescription>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutedMetadataDescription {
+    version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetRoutingEnvelope {
+    signed: TargetRouting,
+    signatures: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TargetRouting {
+    targets: std::collections::BTreeMap<String, TargetRoutingDescription>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TargetRoutingDescription {
+    hashes: std::collections::BTreeMap<String, String>,
+}
 
 /// Parses and executes one installer command.
 ///
@@ -62,18 +153,89 @@ pub async fn run_cli() -> Result<(), CommandError> {
 /// installation lifecycle fails admission.
 pub async fn update_from_channel(root: &Path) -> Result<InstallReceipt, CommandError> {
     let current = status(root)?;
-    let url = current
+    let retained_channel = current
         .channel_manifest_url()
         .ok_or(CommandError::UpdateChannel)?
         .to_owned();
-    let downloaded = download_release(&url, root).await?;
+    let active = active_release_root(root)?;
+    let channel = load_installed_update_channel(&active)?;
+    let client = release_client()?;
+    let pinned_root = stable_read_file(
+        &active.join("share/market-squawk/update/1.root.json"),
+        MAXIMUM_UPDATE_METADATA_BYTES as u64,
+    )?;
+    if pinned_root.is_empty()
+        || pinned_root.len() > MAXIMUM_UPDATE_METADATA_BYTES
+        || format!("{:x}", Sha256::digest(&pinned_root)) != channel.pinned_root_sha256
+        || u64::try_from(pinned_root.len()).ok() != Some(channel.pinned_root_size)
+    {
+        return Err(CommandError::TrustedUpdate);
+    }
+    let trusted_root = TrustedRoot::from_pinned(&pinned_root)?;
+    let store = TrustedUpdateStore::open_or_bootstrap(root, trusted_root, Utc::now())?;
+    let base = admitted_repository_base_url(&channel.repository_base_url)?;
+    let root_chain = download_root_chain(&client, &base, store.current_root_version()).await?;
+    let timestamp = download_metadata(&client, repository_url(&base, "timestamp.json")?).await?;
+    let snapshot_version = routed_metadata_version(&timestamp, "snapshot.json")?;
+    let snapshot_path = format!("{snapshot_version}.snapshot.json");
+    let snapshot = download_metadata(&client, repository_url(&base, &snapshot_path)?).await?;
+    let targets_version = routed_metadata_version(&snapshot, "targets.json")?;
+    let targets_path = format!("{targets_version}.targets.json");
+    let targets = download_metadata(&client, repository_url(&base, &targets_path)?).await?;
+
+    let selection = channel
+        .targets
+        .get(SupportedTarget::current()?.as_str())
+        .ok_or(CommandError::TrustedUpdate)?;
+    let manifest_download_path = consistent_target_path(&targets, &selection.manifest_target_path)?;
+    let archive_download_path = consistent_target_path(&targets, &selection.archive_target_path)?;
+    let manifest =
+        download_metadata(&client, repository_url(&base, &manifest_download_path)?).await?;
+    if manifest.len() > MAXIMUM_MANIFEST_BYTES {
+        return Err(CommandError::DownloadIdentity);
+    }
+    let bundle = download_target_file(
+        &client,
+        repository_url(&base, &archive_download_path)?,
+        root,
+        MAXIMUM_ARCHIVE_BYTES,
+    )
+    .await?;
+    let root_refs = root_chain.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let supplied_targets = [
+        SuppliedTarget {
+            metadata_path: &selection.manifest_target_path,
+            download_path: &manifest_download_path,
+            source: TargetSource::Bytes(&manifest),
+        },
+        SuppliedTarget {
+            metadata_path: &selection.archive_target_path,
+            download_path: &archive_download_path,
+            source: TargetSource::File(bundle.path()),
+        },
+    ];
+    let pending = store.admit(
+        SuppliedMetadata {
+            root_chain: &root_refs,
+            timestamp: &timestamp,
+            snapshot_path: &snapshot_path,
+            snapshot: &snapshot,
+            targets_path: &targets_path,
+            targets: &targets,
+        },
+        &supplied_targets,
+        Utc::now(),
+    )?;
     Ok(update(
-        UpdateRequest::from_local(
+        UpdateRequest::from_trusted_local(
             root.to_path_buf(),
-            &downloaded.manifest,
-            downloaded.bundle.path(),
+            &manifest,
+            bundle.path(),
+            pending,
+            &selection.manifest_target_path,
+            &selection.archive_target_path,
         )?
-        .with_channel_manifest_url(&url)?,
+        .with_channel_manifest_url(&retained_channel)?,
     )?)
 }
 
@@ -656,13 +818,246 @@ struct DownloadedRelease {
     bundle: NamedTempFile,
 }
 
-async fn download_release(
-    manifest_url: &str,
+fn load_installed_update_channel(
+    release_root: &Path,
+) -> Result<AdmittedInstalledChannel, CommandError> {
+    let path = release_root.join("share/market-squawk/update/channel.json");
+    let bytes = stable_read_file(&path, MAXIMUM_UPDATE_METADATA_BYTES as u64)?;
+    let document: InstalledChannelDocument =
+        serde_json::from_slice(&bytes).map_err(|_| CommandError::TrustedUpdate)?;
+    let InstalledChannelDocument::Available(channel) = document else {
+        let InstalledChannelDocument::Unavailable(unavailable) = document else {
+            return Err(CommandError::TrustedUpdate);
+        };
+        if unavailable.schema_version != 1
+            || unavailable.reason != "production-signing-material-unavailable"
+        {
+            return Err(CommandError::TrustedUpdate);
+        }
+        return Err(CommandError::UpdateChannel);
+    };
+    let supported = [
+        SupportedTarget::Aarch64AppleDarwin,
+        SupportedTarget::X86_64AppleDarwin,
+        SupportedTarget::X86_64PcWindowsMsvc,
+        SupportedTarget::X86_64UnknownLinuxGnu,
+    ];
+    if channel.schema_version != 1
+        || channel.minimum_workspace_schema_version == 0
+        || channel.minimum_workspace_schema_version > channel.maximum_workspace_schema_version
+        || channel.pinned_root.path != "1.root.json"
+        || channel.pinned_root.size == 0
+        || channel.pinned_root.size > MAXIMUM_UPDATE_METADATA_BYTES as u64
+        || !is_lower_sha256(&channel.pinned_root.sha256)
+        || channel.targets.len() != supported.len()
+        || supported.into_iter().any(|target| {
+            channel
+                .targets
+                .get(target.as_str())
+                .is_none_or(|selection| {
+                    selection.manifest_target_path
+                        != format!("channels/stable/{}/manifest.json", target.as_str())
+                        || selection.archive_target_path
+                            != format!("channels/stable/{}/bundle.zip", target.as_str())
+                })
+        })
+    {
+        return Err(CommandError::TrustedUpdate);
+    }
+    Ok(AdmittedInstalledChannel {
+        repository_base_url: channel.repository_base_url,
+        pinned_root_sha256: channel.pinned_root.sha256,
+        pinned_root_size: channel.pinned_root.size,
+        targets: channel.targets,
+    })
+}
+
+fn admitted_repository_base_url(value: &str) -> Result<Url, CommandError> {
+    let url = Url::parse(value).map_err(|_| CommandError::DownloadUrl)?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().ends_with('/')
+        || url.path().starts_with("//")
+    {
+        return Err(CommandError::DownloadUrl);
+    }
+    Ok(url)
+}
+
+fn repository_url(base: &Url, path: &str) -> Result<Url, CommandError> {
+    if path.is_empty() || path.starts_with('/') || path.contains("..") || path.contains('\\') {
+        return Err(CommandError::DownloadUrl);
+    }
+    base.join(path).map_err(|_| CommandError::DownloadUrl)
+}
+
+async fn download_root_chain(
+    client: &reqwest::Client,
+    base: &Url,
+    current_version: u64,
+) -> Result<Vec<Vec<u8>>, CommandError> {
+    let mut chain = Vec::new();
+    let mut version = current_version
+        .checked_add(1)
+        .ok_or(CommandError::TrustedUpdate)?;
+    while chain.len() < MAXIMUM_ROOT_CHAIN {
+        let path = format!("{version}.root.json");
+        let response = client
+            .get(repository_url(base, &path)?)
+            .send()
+            .await
+            .map_err(CommandError::Network)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(chain);
+        }
+        let bytes = collect_bounded_response(
+            response.error_for_status().map_err(CommandError::Network)?,
+            MAXIMUM_UPDATE_METADATA_BYTES,
+        )
+        .await?;
+        chain.push(bytes);
+        version = version.checked_add(1).ok_or(CommandError::TrustedUpdate)?;
+    }
+    Err(CommandError::TrustedUpdate)
+}
+
+async fn download_metadata(client: &reqwest::Client, url: Url) -> Result<Vec<u8>, CommandError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(CommandError::Network)?
+        .error_for_status()
+        .map_err(CommandError::Network)?;
+    collect_bounded_response(response, MAXIMUM_UPDATE_METADATA_BYTES).await
+}
+
+fn routed_metadata_version(bytes: &[u8], role: &str) -> Result<u64, CommandError> {
+    let envelope: RoutedMetadataEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| CommandError::TrustedUpdate)?;
+    if envelope.signatures.is_empty() {
+        return Err(CommandError::TrustedUpdate);
+    }
+    envelope
+        .signed
+        .meta
+        .get(role)
+        .map(|description| description.version)
+        .filter(|version| *version > 0)
+        .ok_or(CommandError::TrustedUpdate)
+}
+
+fn consistent_target_path(bytes: &[u8], logical_path: &str) -> Result<String, CommandError> {
+    let envelope: TargetRoutingEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| CommandError::TrustedUpdate)?;
+    if envelope.signatures.is_empty() {
+        return Err(CommandError::TrustedUpdate);
+    }
+    let digest = envelope
+        .signed
+        .targets
+        .get(logical_path)
+        .and_then(|description| description.hashes.get("sha256"))
+        .filter(|digest| is_lower_sha256(digest))
+        .ok_or(CommandError::TrustedUpdate)?;
+    let (parent, name) = logical_path
+        .rsplit_once('/')
+        .filter(|(parent, name)| !parent.is_empty() && !name.is_empty())
+        .ok_or(CommandError::TrustedUpdate)?;
+    Ok(format!("{parent}/{digest}.{name}"))
+}
+
+async fn download_target_file(
+    client: &reqwest::Client,
+    url: Url,
     install_root: &Path,
-) -> Result<DownloadedRelease, CommandError> {
-    let manifest_url = admitted_manifest_url(manifest_url)?;
+    maximum: u64,
+) -> Result<NamedTempFile, CommandError> {
+    let parent = install_root.parent().ok_or(CommandError::DownloadRoot)?;
+    fs::create_dir_all(parent).map_err(CommandError::Io)?;
+    let mut output = tempfile::Builder::new()
+        .prefix(".market-squawk-download-")
+        .suffix(".target")
+        .tempfile_in(parent)
+        .map_err(CommandError::Io)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(CommandError::Network)?
+        .error_for_status()
+        .map_err(CommandError::Network)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum)
+    {
+        return Err(CommandError::DownloadIdentity);
+    }
+    let mut stream = response.bytes_stream();
+    let mut total = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(CommandError::Network)?;
+        total = total
+            .checked_add(u64::try_from(chunk.len()).map_err(|_| CommandError::DownloadIdentity)?)
+            .filter(|value| *value <= maximum)
+            .ok_or(CommandError::DownloadIdentity)?;
+        output.write_all(&chunk).map_err(CommandError::Io)?;
+    }
+    if total == 0 {
+        return Err(CommandError::DownloadIdentity);
+    }
+    output.as_file_mut().sync_all().map_err(CommandError::Io)?;
+    Ok(output)
+}
+
+fn stable_read_file(path: &Path, maximum: u64) -> Result<Vec<u8>, CommandError> {
+    let named_before = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if !named_before.file_type().is_file()
+        || named_before.file_type().is_symlink()
+        || named_before.len() == 0
+        || named_before.len() > maximum
+    {
+        return Err(CommandError::TrustedUpdate);
+    }
+    let mut file = File::open(path).map_err(CommandError::Io)?;
+    let opened_before = file.metadata().map_err(CommandError::Io)?;
+    if !same_file_metadata(&named_before, &opened_before) {
+        return Err(CommandError::TrustedUpdate);
+    }
+    let capacity = usize::try_from(named_before.len()).map_err(|_| CommandError::TrustedUpdate)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| CommandError::TrustedUpdate)?;
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(CommandError::Io)?;
+    let opened_after = file.metadata().map_err(CommandError::Io)?;
+    let named_after = fs::symlink_metadata(path).map_err(CommandError::Io)?;
+    if u64::try_from(bytes.len()).ok() != Some(named_before.len())
+        || !same_file_metadata(&named_before, &opened_after)
+        || !same_file_metadata(&named_before, &named_after)
+    {
+        return Err(CommandError::TrustedUpdate);
+    }
+    Ok(bytes)
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn release_client() -> Result<reqwest::Client, CommandError> {
     install_tls_provider()?;
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(concat!(
             "market-squawk-installer/",
             env!("CARGO_PKG_VERSION")
@@ -684,7 +1079,15 @@ async fn download_release(
             }
         }))
         .build()
-        .map_err(CommandError::Network)?;
+        .map_err(CommandError::Network)
+}
+
+async fn download_release(
+    manifest_url: &str,
+    install_root: &Path,
+) -> Result<DownloadedRelease, CommandError> {
+    let manifest_url = admitted_manifest_url(manifest_url)?;
+    let client = release_client()?;
 
     let manifest_response = client
         .get(manifest_url)
@@ -876,6 +1279,8 @@ pub enum CommandError {
     InstallSource,
     #[error("the installed release has no retained HTTPS update channel")]
     UpdateChannel,
+    #[error("trusted update routing or installed channel metadata is invalid")]
+    TrustedUpdate,
     #[error("release URL must be an uncredentialed HTTPS URL without a fragment")]
     DownloadUrl,
     #[error("release download size or identity is invalid")]
@@ -906,6 +1311,8 @@ pub enum CommandError {
     Manifest(#[from] crate::manifest::ManifestError),
     #[error(transparent)]
     Platform(#[from] crate::platform::PlatformError),
+    #[error(transparent)]
+    UpdateMetadata(#[from] UpdateMetadataError),
 }
 
 #[cfg(test)]

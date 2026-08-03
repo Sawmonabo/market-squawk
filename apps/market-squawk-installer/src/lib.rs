@@ -26,6 +26,7 @@ pub use self::manifest::{
 };
 pub use self::platform::{
     NativeTrustMode, PlatformError, ProgramName, SupportedTarget, default_install_root,
+    default_installation_data_root,
 };
 pub use self::service_registration::{
     InstalledServiceStatus, RestartInstalledServiceRequest, ServiceRegistrationError,
@@ -71,9 +72,11 @@ mod tests {
                 "Windows local application-data directory is unavailable",
             )
         })?;
-        Ok(tempfile::Builder::new()
+        let temporary = tempfile::Builder::new()
             .prefix("market-squawk-installer-")
-            .tempdir_in(local_app_data)?)
+            .tempdir_in(local_app_data)?;
+        crate::store::secure_test_store_parent(temporary.path())?;
+        Ok(temporary)
     }
 
     #[cfg(not(windows))]

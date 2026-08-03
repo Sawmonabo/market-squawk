@@ -49,7 +49,7 @@ pub use fair_value::{
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub use paper::PaperApplicationServices;
-pub(crate) use paper::PaperSourceLifecycleControl;
+pub(crate) use paper::{PaperRuntimeActivityAuthority, PaperSourceLifecycleControl};
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,

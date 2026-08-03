@@ -53,14 +53,14 @@ const MAXIMUM_PENDING_OPERATIONS: usize = 256;
 /// The binding deliberately contains no path or pre-selected file. Its authority must issue all
 /// required components for the request's exact snapshot and revalidate their producer leases after
 /// materialization.
-pub struct ManagedBackupComponentSource {
+pub(crate) struct ManagedBackupComponentSource {
     authority: Arc<dyn ProductBackupSnapshotAuthority>,
 }
 
 impl ManagedBackupComponentSource {
     /// Retains the sole component-snapshot authority for installed backup composition.
     #[must_use]
-    pub fn new(authority: Arc<dyn ProductBackupSnapshotAuthority>) -> Self {
+    pub(crate) fn new(authority: Arc<dyn ProductBackupSnapshotAuthority>) -> Self {
         Self { authority }
     }
 }
@@ -108,7 +108,7 @@ fn private_permissions(_metadata: &Metadata) -> bool {
 }
 
 /// Exclusive capability-confined repository for complete staged and published backup bundles.
-pub struct ManagedBackupRepository {
+pub(crate) struct ManagedBackupRepository {
     root: Dir,
     display_root: PathBuf,
     _owner_lock: std::fs::File,
@@ -117,7 +117,7 @@ pub struct ManagedBackupRepository {
 
 impl ManagedBackupRepository {
     /// Opens the sole installed repository below the already prepared control-root capability.
-    pub fn try_open(control_root: &ControlRoot) -> Result<Self, ServiceError> {
+    pub(crate) fn try_open(control_root: &ControlRoot) -> Result<Self, ServiceError> {
         let control = control_root
             .try_clone_directory()
             .map_err(|_| ServiceError::Unavailable)?;
@@ -146,6 +146,11 @@ impl ManagedBackupRepository {
             _owner_lock: owner_lock,
             mutation: TokioMutex::new(()),
         })
+    }
+
+    /// Returns the already-validated managed bundle root for bounded recovery inspection.
+    pub(crate) fn root(&self) -> &Path {
+        &self.display_root
     }
 
     fn create_staging(&self) -> Result<StagedBundle, RepositoryError> {
@@ -212,6 +217,60 @@ impl ManagedBackupRepository {
             return Err(RepositoryError::Corrupt);
         }
         Ok(manifest)
+    }
+
+    /// Opens one exact manifest-owned component under the retained repository capability.
+    pub(crate) async fn open_exact_component(
+        &self,
+        manifest: &ProductBackupManifest,
+        component: &crate::application::backup::ProductBackupComponent,
+    ) -> Result<cap_std::fs::File, ProductBackupError> {
+        let _mutation = self.mutation.lock().await;
+        manifest.verify()?;
+        let retained = self
+            .manifest_for_id(manifest.backup_id())
+            .map_err(map_repository_product_error)?;
+        if retained != *manifest
+            || !manifest
+                .components()
+                .iter()
+                .any(|declared| declared == component)
+        {
+            return Err(ProductBackupError::ArtifactMismatch);
+        }
+        let location = self
+            .location_for_id(manifest.backup_id())
+            .map_err(map_repository_product_error)?;
+        let root = location
+            .artifacts()
+            .try_clone_directory()
+            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
+        let path = Path::new(component.artifact_reference());
+        let before = root
+            .symlink_metadata(path)
+            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || !private_permissions(&before)
+            || before.len() != component.byte_length()
+        {
+            return Err(ProductBackupError::ArtifactMismatch);
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        configure_nonblocking_read(&mut options);
+        let file = root
+            .open_with(path, &options)
+            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
+        let after = file
+            .metadata()
+            .map_err(|_| ProductBackupError::ArtifactUnavailable)?;
+        if FileIdentity::from_metadata(&before) != FileIdentity::from_metadata(&after)
+            || after.len() != component.byte_length()
+        {
+            return Err(ProductBackupError::ArtifactMismatch);
+        }
+        Ok(file)
     }
 
     fn write_staged_manifest(
@@ -371,10 +430,9 @@ impl From<std::io::Error> for RepositoryError {
 enum RetainedBackupPlan {
     Create {
         active: WorkspaceRuntimeIdentity,
-        cutoff: Timestamp,
     },
     Verify {
-        manifest: ProductBackupManifest,
+        manifest: Box<ProductBackupManifest>,
     },
     Retention {
         approval: BackupRetentionApproval,
@@ -398,7 +456,7 @@ struct RetainedOperation {
 }
 
 /// Sole installed implementation of backup prepare, revoke, execute, and recovery authority.
-pub struct InstalledManagedBackupOperations {
+pub(crate) struct InstalledManagedBackupOperations {
     installation_id: InstallationId,
     service: Arc<ProductBackupService>,
     inventory: Arc<ProductBackupInventory>,
@@ -410,16 +468,18 @@ pub struct InstalledManagedBackupOperations {
 }
 
 impl InstalledManagedBackupOperations {
-    /// Constructs the complete installed backup authority from existing analytical, inventory,
-    /// control-root, installation, and coherent component-snapshot authority.
+    /// Constructs the authority over the exact repository already retained by restore readers.
+    ///
+    /// Opening the repository once avoids a second owner lock and guarantees that create, verify,
+    /// retention, and restore all address the same managed bundle authority.
     #[allow(
         clippy::too_many_arguments,
         reason = "every backup authority and resource ceiling remains explicit at composition"
     )]
-    pub fn try_new(
+    pub(crate) fn try_new_with_repository(
         analytical: Arc<AnalyticalBackupService>,
         inventory: Arc<ProductBackupInventory>,
-        control_root: &ControlRoot,
+        repository: Arc<ManagedBackupRepository>,
         installation_id: InstallationId,
         component_source: ManagedBackupComponentSource,
         limits: AnalyticalBackupLimits,
@@ -432,7 +492,6 @@ impl InstalledManagedBackupOperations {
             analytical,
             component_source.authority,
         ));
-        let repository = Arc::new(ManagedBackupRepository::try_open(control_root)?);
         Ok(Self {
             installation_id,
             service,
@@ -449,7 +508,7 @@ impl InstalledManagedBackupOperations {
     ///
     /// Composition must await this method before publishing Operations inventory reads. Every
     /// execution also invokes it, so a missed startup call still fails closed before mutation.
-    pub async fn recover(
+    pub(crate) async fn recover(
         &self,
         cancellation: &CancellationToken,
         deadline: Instant,
@@ -584,7 +643,6 @@ impl InstalledManagedBackupOperations {
     async fn execute_create(
         &self,
         active: WorkspaceRuntimeIdentity,
-        cutoff: Timestamp,
         cancellation: CancellationToken,
         deadline: Instant,
         publication: Arc<dyn LifecycleJobPublication>,
@@ -607,7 +665,6 @@ impl InstalledManagedBackupOperations {
         let created = run_create_until_deadline(
             self.service.as_ref(),
             location,
-            cutoff,
             self.limits,
             ownership,
             &cancellation,
@@ -737,11 +794,7 @@ impl ManagedBackupOperations for InstalledManagedBackupOperations {
     ) -> Result<PreparedOperation, ServiceError> {
         self.recover(&cancellation, deadline).await?;
         ensure_service_live(&cancellation, deadline)?;
-        let cutoff = current_timestamp()?;
-        self.retain_plan(
-            RetainedBackupPlan::Create { active, cutoff },
-            (active, cutoff),
-        )
+        self.retain_plan(RetainedBackupPlan::Create { active }, active)
     }
 
     async fn prepare_verify(
@@ -768,7 +821,7 @@ impl ManagedBackupOperations for InstalledManagedBackupOperations {
         ensure_service_live(&cancellation, deadline)?;
         self.retain_plan(
             RetainedBackupPlan::Verify {
-                manifest: manifest.clone(),
+                manifest: Box::new(manifest.clone()),
             },
             manifest,
         )
@@ -817,12 +870,12 @@ impl ManagedBackupOperations for InstalledManagedBackupOperations {
             .take_plan(&command)
             .map_err(map_service_execution_error)?;
         match plan {
-            RetainedBackupPlan::Create { active, cutoff } => {
-                self.execute_create(active, cutoff, cancellation, deadline, publication)
+            RetainedBackupPlan::Create { active } => {
+                self.execute_create(active, cancellation, deadline, publication)
                     .await
             }
             RetainedBackupPlan::Verify { manifest } => {
-                self.execute_verify(manifest, cancellation, deadline, publication)
+                self.execute_verify(*manifest, cancellation, deadline, publication)
                     .await
             }
             RetainedBackupPlan::Retention { approval } => {
@@ -843,14 +896,19 @@ impl ManagedBackupOperations for InstalledManagedBackupOperations {
 async fn run_create_until_deadline(
     service: &ProductBackupService,
     location: AnalyticalBackupLocation,
-    cutoff: Timestamp,
     limits: AnalyticalBackupLimits,
     ownership: ProductBackupOwnership,
     request_cancellation: &CancellationToken,
     operation_cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<crate::application::backup::VerifiedProductBackup, LifecycleJobExecutionError> {
-    let operation = service.create(location, cutoff, limits, ownership, operation_cancellation);
+    let operation = service.create(
+        location,
+        limits,
+        ownership,
+        operation_cancellation,
+        current_timestamp,
+    );
     tokio::pin!(operation);
     let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
     tokio::pin!(deadline_sleep);
@@ -951,7 +1009,8 @@ fn map_backup_service_error(error: ProductBackupError) -> ServiceError {
         | ProductBackupError::InvalidRetentionPolicy
         | ProductBackupError::RetentionEmpty
         | ProductBackupError::StaleRetentionApproval => ServiceError::InvalidRequest,
-        ProductBackupError::Encoding
+        ProductBackupError::CutoffUnavailable
+        | ProductBackupError::Encoding
         | ProductBackupError::SnapshotMismatch
         | ProductBackupError::ArtifactUnavailable
         | ProductBackupError::ArtifactMismatch
@@ -974,11 +1033,24 @@ fn map_repository_service_error(error: RepositoryError) -> ServiceError {
     }
 }
 
-fn current_timestamp() -> Result<Timestamp, ServiceError> {
+fn map_repository_product_error(error: RepositoryError) -> ProductBackupError {
+    match error {
+        RepositoryError::NotFound => ProductBackupError::BackupNotFound,
+        RepositoryError::Conflict | RepositoryError::Corrupt => {
+            ProductBackupError::ArtifactMismatch
+        }
+        RepositoryError::Capacity
+        | RepositoryError::Unavailable
+        | RepositoryError::Indeterminate => ProductBackupError::ArtifactUnavailable,
+    }
+}
+
+fn current_timestamp() -> Result<Timestamp, ProductBackupError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| ServiceError::Unavailable)?;
-    let nanos = i64::try_from(elapsed.as_nanos()).map_err(|_| ServiceError::Unavailable)?;
+        .map_err(|_| ProductBackupError::CutoffUnavailable)?;
+    let nanos =
+        i64::try_from(elapsed.as_nanos()).map_err(|_| ProductBackupError::CutoffUnavailable)?;
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 

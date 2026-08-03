@@ -680,6 +680,29 @@ impl ProductionResearchIngestCoordinator {
         Ok((coordinator, authority))
     }
 
+    /// Captures registry tombstones and clean durable budget checkpoints under the sole
+    /// coordinator mutation fence.
+    ///
+    /// Runtime adapters, discovery receipts, pending replacement handles, active request markers,
+    /// and permits are intentionally absent from the returned owner-issued image.
+    pub(crate) fn retain_provider_metadata_registry_backup(
+        &self,
+    ) -> Result<Box<[u8]>, ResearchIngestCompositionError> {
+        if self.lifecycle.shutdown_token().is_cancelled() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        authority
+            .registry
+            .as_ref()
+            .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+            .retain_clean_restart_backup_bytes()
+            .map_err(Into::into)
+    }
+
     fn register_source_inner<S>(
         &self,
         profile: SourceIdentifier,

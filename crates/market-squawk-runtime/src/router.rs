@@ -6,7 +6,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -87,6 +87,13 @@ pub trait ApplicationDispatcher: fmt::Debug + Send + Sync + 'static {
         request: &AppRequestEnvelope,
         context: RequestContext,
     ) -> Result<Value, DispatchError>;
+
+    /// Completes service-owned work that must follow durable mutation-response publication.
+    ///
+    /// This hook runs only after the exact mutation response has been committed to the replay
+    /// authority. It must be idempotent because a later successful mutation may retry a pending
+    /// lifecycle handoff that could not be signalled previously.
+    fn mutation_response_committed(&self) -> Result<(), DispatchError>;
 }
 
 /// Closed dispatcher failure safe for transport mapping.
@@ -200,12 +207,105 @@ struct RouterState {
     origins: OriginPolicy,
     limits: RuntimeRouterLimits,
     credentials: Arc<CredentialRegistry>,
+    clients: RuntimeClientActivity,
     dispatcher: Arc<dyn ApplicationDispatcher>,
     replay: Arc<MutationReplayGuard>,
     events: Arc<EventHub>,
     inputs: Arc<InputStager>,
     accepting: AtomicBool,
     request_cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+struct RuntimeClientActivitySlot {
+    client_id: ClientId,
+    active_requests: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeClientActivity {
+    slots: Arc<[RuntimeClientActivitySlot]>,
+}
+
+impl RuntimeClientActivity {
+    fn try_new(client_ids: Box<[ClientId]>) -> Result<Self, RouterError> {
+        if client_ids.is_empty() {
+            return Err(RouterError::InvalidConfiguration);
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(client_ids.len())
+            .map_err(|_| RouterError::Unavailable)?;
+        slots.extend(client_ids.into_vec().into_iter().map(|client_id| {
+            RuntimeClientActivitySlot {
+                client_id,
+                active_requests: AtomicUsize::new(0),
+            }
+        }));
+        Ok(Self {
+            slots: Arc::from(slots),
+        })
+    }
+
+    fn begin(&self, client_id: ClientId) -> Result<RuntimeClientActivityGuard, RouterError> {
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.client_id == client_id)
+            .ok_or(RouterError::Unavailable)?;
+        slot.active_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| RouterError::Unavailable)?;
+        Ok(RuntimeClientActivityGuard {
+            activity: self.clone(),
+            client_id,
+        })
+    }
+
+    fn connected_clients(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.active_requests.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
+    fn finish(&self, client_id: ClientId) {
+        if let Some(slot) = self.slots.iter().find(|slot| slot.client_id == client_id) {
+            let _prior =
+                slot.active_requests
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        current.checked_sub(1)
+                    });
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeClientActivityGuard {
+    activity: RuntimeClientActivity,
+    client_id: ClientId,
+}
+
+impl Drop for RuntimeClientActivityGuard {
+    fn drop(&mut self) {
+        self.activity.finish(self.client_id);
+    }
+}
+
+/// Read-only generation-scoped count of native clients with active requests.
+#[derive(Clone, Debug)]
+pub struct RuntimeClientActivityReader {
+    activity: RuntimeClientActivity,
+}
+
+impl RuntimeClientActivityReader {
+    /// Returns the exact number of distinct registered clients currently holding requests.
+    #[must_use]
+    pub fn connected_clients(&self) -> usize {
+        self.activity.connected_clients()
+    }
 }
 
 impl fmt::Debug for RouterState {
@@ -244,6 +344,11 @@ impl RuntimeRouter {
         if endpoint.ip() != Ipv4Addr::LOCALHOST || endpoint.port() == 0 {
             return Err(RouterError::NonLoopback);
         }
+        let clients = RuntimeClientActivity::try_new(
+            credentials
+                .registered_client_ids()
+                .map_err(|_| RouterError::Unavailable)?,
+        )?;
         Ok(Self {
             state: Arc::new(RouterState {
                 runtime,
@@ -252,6 +357,7 @@ impl RuntimeRouter {
                 origins,
                 limits,
                 credentials,
+                clients,
                 dispatcher,
                 replay,
                 events,
@@ -266,6 +372,14 @@ impl RuntimeRouter {
     #[must_use]
     pub fn request_cancellation(&self) -> CancellationToken {
         self.state.request_cancellation.child_token()
+    }
+
+    /// Returns a read-only handle to exact native client activity for this runtime generation.
+    #[must_use]
+    pub fn client_activity_reader(&self) -> RuntimeClientActivityReader {
+        RuntimeClientActivityReader {
+            activity: self.state.clients.clone(),
+        }
     }
 
     /// Builds the private routes and optionally merges one separately closed MCP router.
@@ -324,6 +438,14 @@ pub struct RuntimeServer {
 }
 
 impl RuntimeServer {
+    /// Returns a read-only handle to exact native client activity for this runtime generation.
+    #[must_use]
+    pub fn client_activity_reader(&self) -> RuntimeClientActivityReader {
+        RuntimeClientActivityReader {
+            activity: self.state.clients.clone(),
+        }
+    }
+
     /// True when the listener task has already ended unexpectedly.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -380,9 +502,10 @@ impl Drop for RuntimeServer {
 }
 
 async fn health(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
-    if authenticate_transport(&state, &request, Method::GET, None).is_err() {
-        return rejected(StatusCode::UNAUTHORIZED);
-    }
+    let _authentication = match authenticate_transport(&state, &request, Method::GET, None) {
+        Ok(authentication) => authentication,
+        Err(_status) => return rejected(StatusCode::UNAUTHORIZED),
+    };
     axum::Json(json!({
         "status": "ready",
         "runtime": state.runtime,
@@ -392,9 +515,10 @@ async fn health(State(state): State<Arc<RouterState>>, request: Request<Body>) -
 }
 
 async fn bootstrap(State(state): State<Arc<RouterState>>, request: Request<Body>) -> Response {
-    if authenticate_transport(&state, &request, Method::GET, None).is_err() {
-        return rejected(StatusCode::UNAUTHORIZED);
-    }
+    let _authentication = match authenticate_transport(&state, &request, Method::GET, None) {
+        Ok(authentication) => authentication,
+        Err(_status) => return rejected(StatusCode::UNAUTHORIZED),
+    };
     match state.dispatcher.bootstrap() {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(DispatchError::Rejected) => rejected(StatusCode::BAD_REQUEST),
@@ -486,6 +610,10 @@ async fn dispatch_request(
                 .complete(response.clone())
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             if succeeded {
+                state
+                    .dispatcher
+                    .mutation_response_committed()
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
                 let _ = state.events.publish(json!({
                     "type": "application.changed",
                     "operation": envelope.operation(),
@@ -596,6 +724,7 @@ async fn read_events(State(state): State<Arc<RouterState>>, request: Request<Bod
 struct AuthenticatedClient {
     client_id: ClientId,
     generation: CredentialGeneration,
+    _activity: RuntimeClientActivityGuard,
 }
 
 fn authenticate_transport(
@@ -673,9 +802,14 @@ fn authenticate_transport(
         .credentials
         .authenticate(client_id, generation, authorization)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let activity = state
+        .clients
+        .begin(client_id)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(AuthenticatedClient {
         client_id,
         generation,
+        _activity: activity,
     })
 }
 

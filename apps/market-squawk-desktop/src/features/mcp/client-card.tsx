@@ -142,6 +142,14 @@ export function ClientCard({
                 value={`${client.verification.toolCount} tools · ${client.verification.resourceCount} resources`}
               />
               <EvidenceRow
+                label="Tool domains"
+                value={client.verification.toolDomains.join(", ")}
+              />
+              <EvidenceRow
+                label="Resources"
+                value={client.verification.resourceNames.join(", ")}
+              />
+              <EvidenceRow
                 label="Session identity"
                 value={client.verification.clientInfoName}
                 mono
@@ -191,16 +199,25 @@ export function ClientCard({
         ))}
         {actions.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            {client.state === "conflict"
-              ? "Market Squawk will not replace this unowned entry. Resolve the named entry in the client, then refresh."
-              : client.state === "absent"
-                ? `Install ${client.label} to connect it to the shared service.`
-                : "Update the client to a supported version, then refresh discovery."}
+            {noActionMessage(client)}
           </p>
         ) : null}
       </div>
     </article>
   )
+}
+
+function noActionMessage(client: McpClientView) {
+  if (client.service.credentialRotationRecoveryPending) {
+    return "Restart Market Squawk to finish protected credential recovery before changing this connection."
+  }
+  if (client.state === "conflict") {
+    return "Market Squawk will not replace this unowned entry. Resolve the named entry in the client, then refresh."
+  }
+  if (client.state === "absent") {
+    return `Install ${client.label} to connect it to the shared service.`
+  }
+  return "Update the client to a supported version, then refresh discovery."
 }
 
 function shortIdentity(value: string) {

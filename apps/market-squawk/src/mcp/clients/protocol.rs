@@ -1,7 +1,7 @@
 //! Real bounded MCP verification through one installed named-client relay.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead as _, BufReader, BufWriter, Write},
     path::Path,
     process::{Child, Command, Stdio},
@@ -19,6 +19,7 @@ use super::{McpClientKind, McpClientRegistrationError, read_bounded};
 pub use market_squawk_mcp::MCP_PROTOCOL_VERSION;
 const VERIFICATION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAXIMUM_FRAME_BYTES: usize = 1024 * 1024;
+const MAXIMUM_DISCOVERED_DOMAINS: usize = 32;
 const SAFE_READ_TOOL: &str = "Job.List";
 
 /// Secret-free proof of one complete initialized MCP discovery and safe-read exchange.
@@ -31,6 +32,8 @@ pub struct McpProtocolVerification {
     server_name: String,
     tool_count: usize,
     resource_count: usize,
+    tool_domains: Box<[String]>,
+    resource_names: Box<[String]>,
     safe_read_tool: String,
     verified_at_unix_seconds: u64,
 }
@@ -67,6 +70,16 @@ impl McpProtocolVerification {
     }
 
     #[must_use]
+    pub fn tool_domains(&self) -> &[String] {
+        &self.tool_domains
+    }
+
+    #[must_use]
+    pub fn resource_names(&self) -> &[String] {
+        &self.resource_names
+    }
+
+    #[must_use]
     pub fn safe_read_tool(&self) -> &str {
         &self.safe_read_tool
     }
@@ -86,6 +99,12 @@ impl McpProtocolVerification {
             && self.server_name == "market-squawk"
             && self.tool_count > 0
             && self.resource_count > 0
+            && !self.tool_domains.is_empty()
+            && self.tool_domains.len() <= self.tool_count
+            && !self.resource_names.is_empty()
+            && self.resource_names.len() <= self.resource_count
+            && list_is_canonical(&self.tool_domains)
+            && list_is_canonical(&self.resource_names)
             && self.safe_read_tool == SAFE_READ_TOOL
     }
 }
@@ -228,6 +247,8 @@ pub(super) fn verify(
     {
         return Err(McpClientRegistrationError::Protocol);
     }
+    let tool_domains = discovered_names(tools, true)?;
+    let resource_names = discovered_names(resources, false)?;
     drop(writer);
     wait_for_exit(&mut child.child, deadline)?;
     child.disarm();
@@ -249,9 +270,57 @@ pub(super) fn verify(
         server_name,
         tool_count: tools.len(),
         resource_count: resources.len(),
+        tool_domains,
+        resource_names,
         safe_read_tool: SAFE_READ_TOOL.to_owned(),
         verified_at_unix_seconds,
     })
+}
+
+fn discovered_names(
+    entries: &[Value],
+    select_tool_domain: bool,
+) -> Result<Box<[String]>, McpClientRegistrationError> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let full_name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(McpClientRegistrationError::Protocol)?;
+        let name = if select_tool_domain {
+            full_name
+                .split_once('.')
+                .map(|(domain, _operation)| domain)
+                .ok_or(McpClientRegistrationError::Protocol)?
+        } else {
+            full_name
+        };
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(McpClientRegistrationError::Protocol);
+        }
+        names.insert(name.to_owned());
+    }
+    if names.is_empty() || names.len() > MAXIMUM_DISCOVERED_DOMAINS {
+        return Err(McpClientRegistrationError::Protocol);
+    }
+    Ok(names.into_iter().collect::<Vec<_>>().into_boxed_slice())
+}
+
+fn list_is_canonical(values: &[String]) -> bool {
+    values.len() <= MAXIMUM_DISCOVERED_DOMAINS
+        && values.iter().all(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn write_message(

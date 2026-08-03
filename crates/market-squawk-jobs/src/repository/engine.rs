@@ -3,8 +3,9 @@ use market_squawk_platform::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatab
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use tokio::sync::mpsc;
 
+use super::backup::{capture, verify_database};
 use super::codec::{decode_snapshot, encode_event, encode_snapshot, state_code};
-use super::{JobRepositoryConfig, SCHEMA_VERSION, WriteCommand};
+use super::{JOB_DATABASE_APPLICATION_ID, JobRepositoryConfig, SCHEMA_VERSION, WriteCommand};
 use crate::{
     AdmittedJobSpec, JobEvent, JobEventSequence, JobFailure, JobGeneration, JobId,
     JobRepositoryError, JobSnapshot, JobState, validate_transition,
@@ -15,10 +16,25 @@ pub(super) fn initialize(
     config: JobRepositoryConfig,
 ) -> Result<(), JobRepositoryError> {
     let connection = open_writer(location, config)?;
+    initialize_schema(&connection)?;
+    verify_database(&connection)
+}
+
+pub(super) fn initialize_schema(connection: &Connection) -> Result<(), JobRepositoryError> {
+    let application_id = connection
+        .query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+        .map_err(map_sql)?;
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(map_sql)?;
-    if version == 0 {
+    let objects = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_sql)?;
+    if application_id == 0 && version == 0 && objects == 0 {
         connection
             .execute_batch(
                 "BEGIN IMMEDIATE;
@@ -38,17 +54,18 @@ pub(super) fn initialize(
                     PRIMARY KEY (job_id, generation, sequence),
                     FOREIGN KEY (job_id, generation) REFERENCES jobs(job_id, generation)
                  ) WITHOUT ROWID;
+                 PRAGMA application_id = 1297305930;
                  PRAGMA user_version = 1;
                  COMMIT;",
             )
             .map_err(map_sql)?;
-    } else if version != SCHEMA_VERSION {
+    } else if application_id != JOB_DATABASE_APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(JobRepositoryError::InvalidState);
     }
     Ok(())
 }
 
-fn open_writer(
+pub(super) fn open_writer(
     location: &JobDatabaseLocation,
     config: JobRepositoryConfig,
 ) -> Result<Connection, JobRepositoryError> {
@@ -151,6 +168,32 @@ pub(super) fn writer_loop(
                     .map_err(|error| *error)
                     .and_then(|connection| begin_retry(connection, &failed, at));
                 let _ignored = reply.send(result);
+            }
+            WriteCommand::Snapshot {
+                binding,
+                backup_id,
+                backup_generation,
+                backup_kind,
+                reply,
+                release,
+            } => {
+                let result = connection
+                    .as_ref()
+                    .map_err(|error| *error)
+                    .and_then(|connection| {
+                        capture(
+                            connection,
+                            binding,
+                            backup_id,
+                            backup_generation,
+                            &backup_kind,
+                        )
+                    });
+                let retained = result.is_ok();
+                let _ignored = reply.send(result);
+                if retained {
+                    let _ignored = release.recv();
+                }
             }
             WriteCommand::Shutdown { reply } => {
                 receiver.close();
@@ -373,7 +416,7 @@ fn update_snapshot(
     }
 }
 
-fn apply_event(
+pub(super) fn apply_event(
     snapshot: JobSnapshot,
     sequence: JobEventSequence,
     event: &JobEvent,

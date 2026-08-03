@@ -307,7 +307,10 @@ fn map_portfolio_error(
         Error::ResourceExhausted => FairValueProducerSelectionError::ResourceExhausted,
         Error::Cancelled => FairValueProducerSelectionError::Cancelled,
         Error::DeadlineExceeded => FairValueProducerSelectionError::DeadlineExceeded,
-        Error::Path | Error::Authority => FairValueProducerSelectionError::Unavailable,
+        Error::Path
+        | Error::Authority
+        | Error::SnapshotUnavailable
+        | Error::RestoreTargetNotFresh => FairValueProducerSelectionError::Unavailable,
         Error::CorruptPublication | Error::Publication | Error::Analytics => {
             FairValueProducerSelectionError::Internal
         }

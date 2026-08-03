@@ -63,6 +63,57 @@ pub struct PaperApplicationServices {
     controller: Arc<PaperController>,
 }
 
+/// Exact synchronous paper/execution facts accepted by lifecycle preflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PaperRuntimeActivitySnapshot {
+    paper_execution_active: bool,
+    reconciliation_pending: bool,
+}
+
+impl PaperRuntimeActivitySnapshot {
+    /// Returns whether the paper execution runtime currently owns execution authority.
+    pub(crate) const fn paper_execution_active(self) -> bool {
+        self.paper_execution_active
+    }
+
+    /// Returns whether execution state requires reconciliation.
+    pub(crate) const fn reconciliation_pending(self) -> bool {
+        self.reconciliation_pending
+    }
+}
+
+/// Read-only synchronous paper runtime authority used by installed lifecycle preflight.
+pub(crate) trait PaperRuntimeActivityAuthority: fmt::Debug + Send + Sync + 'static {
+    /// Samples one coherent activity state or fails closed while the owner cannot do so.
+    fn activity(&self) -> Result<PaperRuntimeActivitySnapshot, ServiceError>;
+}
+
+#[derive(Clone, Debug)]
+struct PaperRuntimeActivityControl {
+    controller: Arc<PaperController>,
+}
+
+impl PaperRuntimeActivityAuthority for PaperRuntimeActivityControl {
+    fn activity(&self) -> Result<PaperRuntimeActivitySnapshot, ServiceError> {
+        let state = self
+            .controller
+            .state
+            .try_lock()
+            .map_err(|_busy| ServiceError::Unavailable)?;
+        match &*state {
+            PaperState::Stopped { .. } => Ok(PaperRuntimeActivitySnapshot {
+                paper_execution_active: false,
+                reconciliation_pending: false,
+            }),
+            PaperState::Starting { .. } | PaperState::Running { .. } | PaperState::Stopping => {
+                // The paper adapter's authoritative reconciliation fact is asynchronous. A
+                // synchronous preflight must not guess it while a runtime or transition exists.
+                Err(ServiceError::Unavailable)
+            }
+        }
+    }
+}
+
 impl PaperApplicationServices {
     /// Creates a stopped paper controller from validated effective configuration.
     #[must_use]
@@ -113,6 +164,13 @@ impl PaperApplicationServices {
     /// Returns lifecycle control sharing this exact paper/live runtime owner.
     pub(crate) fn source_lifecycle_control(&self) -> PaperSourceLifecycleControl {
         PaperSourceLifecycleControl::new(Arc::clone(&self.controller))
+    }
+
+    /// Returns read-only exact paper/execution activity for installed lifecycle preflight.
+    pub(crate) fn runtime_activity_authority(&self) -> Arc<dyn PaperRuntimeActivityAuthority> {
+        Arc::new(PaperRuntimeActivityControl {
+            controller: Arc::clone(&self.controller),
+        })
     }
 }
 

@@ -36,9 +36,10 @@ use std::{
 
 use market_squawk_domain::Timestamp;
 use market_squawk_jobs::{
-    JobAuthority, JobAuthorityError, JobEventSequence, JobPublishedPermit, JobRepositoryConfig,
-    JobRepositoryError, JobRunContext, JobRunError, JobRunner, JobShutdownOutcome, SchedulerError,
-    SchedulerLimits, SqliteJobRepository,
+    JobActivityClass, JobAuthority, JobAuthorityError, JobEventSequence, JobPublishedPermit,
+    JobRepositoryConfig, JobRepositoryError, JobRunContext, JobRunError, JobRunner,
+    JobRunnerRegistration, JobShutdownOutcome, SchedulerError, SchedulerLimits,
+    SqliteJobRepository,
 };
 use market_squawk_platform::LocalPaths;
 use thiserror::Error;
@@ -64,11 +65,17 @@ pub struct InstalledJobRunners {
     forecast: Arc<ForecastJobRunner>,
     training: Option<Arc<TrainingJobRunner>>,
     screen: Arc<ScreenJobRunner>,
+    backup: Arc<BackupJobRunner>,
+    recovery: Arc<RecoveryJobRunner>,
+    update: Arc<UpdateJobRunner>,
 }
 
 impl InstalledJobRunners {
     /// Binds every installed runner to the same product authorities used by synchronous calls.
-    pub fn try_new(product: &crate::LocalProduct) -> Result<Self, InstalledJobError> {
+    pub fn try_new(
+        product: &crate::LocalProduct,
+        operations: Arc<crate::application::operations::OperationsApplicationServices>,
+    ) -> Result<Self, InstalledJobError> {
         let artifacts = product.artifacts();
         let ingest_authority: Arc<dyn crate::application::ResearchIngestCoordinator> =
             product.research_ingest();
@@ -152,6 +159,25 @@ impl InstalledJobRunners {
             ScreenJobRunner::try_new(product.decisions(), RUNNER_PENDING_CAPACITY)
                 .map_err(|_error| InstalledJobError::RunnerComposition)?,
         );
+        let backup_authority: Arc<dyn BackupJobAuthority> = operations.clone();
+        let backup = Arc::new(
+            BackupJobRunner::try_new(backup_authority, RUNNER_PENDING_CAPACITY, RUNNER_DEADLINE)
+                .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let recovery_authority: Arc<dyn RecoveryJobAuthority> = operations.clone();
+        let recovery = Arc::new(
+            RecoveryJobRunner::try_new(
+                recovery_authority,
+                RUNNER_PENDING_CAPACITY,
+                RUNNER_DEADLINE,
+            )
+            .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
+        let update_authority: Arc<dyn UpdateJobAuthority> = operations;
+        let update = Arc::new(
+            UpdateJobRunner::try_new(update_authority, RUNNER_PENDING_CAPACITY, RUNNER_DEADLINE)
+                .map_err(|_error| InstalledJobError::RunnerComposition)?,
+        );
         Ok(Self {
             ingest,
             dataset,
@@ -163,23 +189,29 @@ impl InstalledJobRunners {
             forecast,
             training,
             screen,
+            backup,
+            recovery,
+            update,
         })
     }
 
     /// Returns a deterministic registration list while retaining typed admission handles.
-    pub fn registered(&self) -> Vec<Arc<dyn JobRunner>> {
-        let mut runners: Vec<Arc<dyn JobRunner>> = vec![
-            self.ingest.clone(),
-            self.dataset.clone(),
-            self.feature.clone(),
-            self.export.clone(),
-            self.scenario.clone(),
-            self.backtest.clone(),
-            self.forecast.clone(),
-            self.screen.clone(),
+    pub fn registered(&self) -> Vec<JobRunnerRegistration> {
+        let mut runners = vec![
+            mutation_registration(self.ingest.clone()),
+            mutation_registration(self.dataset.clone()),
+            mutation_registration(self.feature.clone()),
+            mutation_registration(self.export.clone()),
+            mutation_registration(self.scenario.clone()),
+            mutation_registration(self.backtest.clone()),
+            mutation_registration(self.forecast.clone()),
+            mutation_registration(self.screen.clone()),
+            mutation_registration(self.backup.clone()),
+            mutation_registration(self.recovery.clone()),
+            mutation_registration(self.update.clone()),
         ];
         if let Some(training) = &self.training {
-            runners.push(training.clone());
+            runners.push(mutation_registration(training.clone()));
         }
         runners
     }
@@ -220,6 +252,18 @@ impl InstalledJobRunners {
 
     pub(crate) const fn forecast(&self) -> &Arc<ForecastJobRunner> {
         &self.forecast
+    }
+
+    pub(crate) const fn backup(&self) -> &Arc<BackupJobRunner> {
+        &self.backup
+    }
+
+    pub(crate) const fn recovery(&self) -> &Arc<RecoveryJobRunner> {
+        &self.recovery
+    }
+
+    pub(crate) const fn update(&self) -> &Arc<UpdateJobRunner> {
+        &self.update
     }
 }
 
@@ -308,15 +352,19 @@ pub struct InstalledJobAuthority {
 }
 
 impl InstalledJobAuthority {
+    pub(crate) fn repository_config() -> Result<JobRepositoryConfig, InstalledJobError> {
+        JobRepositoryConfig::try_new(JOB_DATABASE_BUSY_TIMEOUT, JOB_WRITER_QUEUE_CAPACITY)
+            .map_err(Into::into)
+    }
+
     /// Opens the capability-confined job database, registers code-owned runners, and recovers
     /// every durable nonterminal generation before service publication.
     pub async fn open(
         paths: &LocalPaths,
-        runners: Vec<Arc<dyn JobRunner>>,
+        runners: Vec<JobRunnerRegistration>,
         at: Timestamp,
     ) -> Result<Self, InstalledJobError> {
-        let config =
-            JobRepositoryConfig::try_new(JOB_DATABASE_BUSY_TIMEOUT, JOB_WRITER_QUEUE_CAPACITY)?;
+        let config = Self::repository_config()?;
         let limits = SchedulerLimits::try_new(
             MAXIMUM_QUEUED_JOBS,
             MAXIMUM_RUNNING_JOBS,
@@ -390,6 +438,10 @@ impl InstalledJobAuthority {
     pub async fn shutdown_repository(&self) -> Result<(), InstalledJobError> {
         self.repository.shutdown().await.map_err(Into::into)
     }
+}
+
+fn mutation_registration(runner: Arc<dyn JobRunner>) -> JobRunnerRegistration {
+    JobRunnerRegistration::new(runner, JobActivityClass::Mutation)
 }
 
 /// Installed job composition, recovery, or shutdown failure.

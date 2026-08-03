@@ -414,6 +414,70 @@ impl AuthoritativeSourceRegistry {
         authority_state_from_history(&self.history, self.budgets.policies())
     }
 
+    /// Captures a non-consuming clean-restart image under the registry owner's mutation fence.
+    ///
+    /// The caller must retain its composition-level registry fence while invoking this method.
+    /// Later mutations cannot affect the returned immutable bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects in-memory registries, active source sessions, active provider requests, mismatched
+    /// durable checkpoints, unavailable trusted time, and invalid persisted authority state.
+    pub fn retain_clean_restart_backup_bytes(&self) -> Result<Box<[u8]>, RegistryError> {
+        self.retain_clean_restart_backup()
+            .map(|backup| Box::from(backup.as_bytes()))
+    }
+
+    /// Validates and canonicalizes an opaque registry clean-restart image without opening runtime
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, in-use, future-dated, or non-clean budget state.
+    pub fn validate_clean_restart_backup_bytes(bytes: &[u8]) -> Result<Box<[u8]>, RegistryError> {
+        RegistryCleanRestartBackup::try_from_bytes(bytes).map(|backup| Box::from(backup.as_bytes()))
+    }
+
+    /// Restores an opaque clean-restart image only into an absent production registry store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an occupied target or any payload that fails clean-restart validation.
+    pub fn restore_clean_restart_backup_fresh(
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        bytes: &[u8],
+    ) -> Result<(), RegistryError> {
+        RegistryCleanRestartBackup::try_from_bytes(bytes)?.restore_fresh(store)
+    }
+
+    fn retain_clean_restart_backup(&self) -> Result<RegistryCleanRestartBackup, RegistryError> {
+        if self.entries.values().any(|entry| entry.active.is_some()) {
+            return Err(RegistryError::ActiveAuthorityAtShutdown);
+        }
+        let AuthorityComposition::Durable(durability) = &self.composition else {
+            return Err(RegistryError::AuthorityPersistence);
+        };
+        if durability.recovered_unclean() {
+            return Err(RegistryError::UncleanAuthorityPredecessor);
+        }
+        if self
+            .budgets
+            .has_active_requests()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?
+        {
+            return Err(RegistryError::ActiveAuthorityAtShutdown);
+        }
+        let proof = self
+            .budgets
+            .validate_clean_shutdown(durability)
+            .map_err(|_error| RegistryError::ActiveAuthorityAtShutdown)?;
+        let observed = self.clock.observe()?;
+        let bytes = durability
+            .export_clean_restart_backup(proof, self.export_authority_state()?, observed.wall())
+            .map_err(map_authority_persistence_error)?;
+        RegistryCleanRestartBackup::try_from_bytes(&bytes)
+    }
+
     /// Durably marks this run clean after every source session and provider request reconciles.
     ///
     /// Consuming the registry prevents authority minting after the clean marker. Retained durable

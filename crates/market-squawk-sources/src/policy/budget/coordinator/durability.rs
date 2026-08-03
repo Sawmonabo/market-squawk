@@ -64,6 +64,26 @@ impl std::fmt::Debug for ProviderBudgetPool {
 }
 
 impl ProviderBudgetPool {
+    pub(crate) fn has_active_requests(&self) -> Result<bool, CleanShutdownValidationError> {
+        for (index, registered) in self.budgets.iter().enumerate() {
+            if self.budgets[..index].iter().any(|earlier| {
+                Arc::ptr_eq(&earlier.budget.allocation, &registered.budget.allocation)
+            }) {
+                continue;
+            }
+            let state = registered
+                .budget
+                .allocation
+                .state
+                .lock()
+                .map_err(|_| CleanShutdownValidationError::StateUnavailable)?;
+            if state.in_flight != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn new() -> Result<Self, BudgetPoolError> {
         Ok(Self {
             budgets: Vec::new(),

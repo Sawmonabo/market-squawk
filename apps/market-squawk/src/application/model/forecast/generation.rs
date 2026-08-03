@@ -460,7 +460,8 @@ fn map_forecast_error(error: ForecastApplicationError) -> ServiceError {
         }
         ForecastApplicationError::Artifact(ArtifactError::Unavailable)
         | ForecastApplicationError::State(_)
-        | ForecastApplicationError::Unavailable => ServiceError::Unavailable,
+        | ForecastApplicationError::Unavailable
+        | ForecastApplicationError::RestoreTargetNotFresh => ServiceError::Unavailable,
         ForecastApplicationError::Conflict | ForecastApplicationError::CorruptIndex => {
             ServiceError::Internal
         }

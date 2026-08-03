@@ -29,7 +29,7 @@ const MAXIMUM_PREVIEW_BYTES: usize = 64 * 1024;
 #[derive(Debug)]
 pub(super) enum PreviewPayload {
     BackupRetention(BackupRetentionPreview),
-    Restore(RestorePreviewEvidence),
+    Restore(Box<RestorePreviewEvidence>),
     Workspace(WorkspaceSwitchPreview),
     Update(UpdatePreview),
     ProgramRollback(ProgramRollbackPreviewEvidence),

@@ -252,18 +252,28 @@ export type ModelControlRequest =
       authorityTicketId: string
     }
 
-export type GovernanceQueryRequest = {
-  query: "principals"
-  after?: string
-  limit?: number
-}
+export type GovernanceQueryRequest =
+  | { query: "provisioningStatus" }
+  | {
+      query: "principals"
+      after?: string
+      limit?: number
+    }
 
-export type GovernanceControlRequest = {
-  action: "authenticateAction"
-  previewId: string
-  principalId: string
-  credential: string
-}
+export type GovernanceControlRequest =
+  | {
+      action: "provisionPrincipalSet"
+      primaryDisplayName: string
+      primaryCredential: string
+      reviewerDisplayName: string
+      reviewerCredential: string
+    }
+  | {
+      action: "authenticateAction"
+      previewId: string
+      principalId: string
+      credential: string
+    }
 
 export type DecisionControlRequest =
   | {

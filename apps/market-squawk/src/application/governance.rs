@@ -28,6 +28,7 @@ pub use identity::{
     GovernancePrincipalRegistration, GovernanceReceiptId, GovernanceRequestBinding, GovernanceRole,
     GovernanceRoleSet, GovernanceTicketId, GovernanceTimestamp,
 };
+pub(crate) use identity::{governance_principal_secret_key, governance_secret_operation_control};
 
 #[cfg(test)]
 use authority::TestPrincipal;

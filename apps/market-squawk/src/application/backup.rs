@@ -68,7 +68,7 @@ impl MaterializedProductComponents {
     }
 }
 
-/// Retained fixed-cutoff lease over every non-analytical product authority.
+/// Retained lease over every non-analytical product authority.
 #[async_trait]
 pub trait ProductBackupSnapshotLease: std::fmt::Debug + Send {
     /// Writes one exact authority-issued snapshot below the retained bundle root.
@@ -96,13 +96,12 @@ pub trait ProductBackupSnapshotLease: std::fmt::Debug + Send {
 /// Application composition boundary that retains every non-analytical product authority.
 #[async_trait]
 pub trait ProductBackupSnapshotAuthority: std::fmt::Debug + Send + Sync {
-    /// Acquires all producer snapshot leases in fixed order before analytical capture begins.
+    /// Acquires all producer snapshot leases in fixed order before a cutoff is allocated.
     ///
-    /// The returned lease must keep source generations stable or retain exact as-of exports until
+    /// The returned lease must fence mutations or retain an exact export capability until
     /// post-write revalidation completes. Dropping it abandons the snapshot without publication.
     async fn retain(
         &self,
-        cutoff: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<Box<dyn ProductBackupSnapshotLease>, ProductBackupError>;
 }
@@ -130,13 +129,17 @@ impl ProductBackupService {
     pub async fn create(
         &self,
         destination: AnalyticalBackupLocation,
-        cutoff: Timestamp,
         limits: AnalyticalBackupLimits,
         ownership: ProductBackupOwnership,
         cancellation: &CancellationToken,
+        allocate_cutoff: impl FnOnce() -> Result<Timestamp, ProductBackupError>,
     ) -> Result<VerifiedProductBackup, ProductBackupError> {
         let product_root = destination.artifacts().clone();
-        let mut retained = self.components.retain(cutoff, cancellation).await?;
+        let mut retained = self.components.retain(cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Err(ProductBackupError::Cancelled);
+        }
+        let cutoff = allocate_cutoff()?;
         let analytical = self
             .analytical
             .create(destination, cutoff, limits, cancellation)
@@ -352,6 +355,39 @@ pub enum ProductBackupSensitivity {
     SecretPayload,
 }
 
+/// Exact artifact evidence supplied by one product backup component authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductBackupArtifactEvidence {
+    reference: String,
+    byte_length: u64,
+    sha256: [u8; 32],
+    sensitivity: ProductBackupSensitivity,
+}
+
+impl ProductBackupArtifactEvidence {
+    /// Admits one controlled bundle-relative artifact with exact integrity evidence.
+    pub fn try_new(
+        reference: impl Into<String>,
+        byte_length: u64,
+        sha256: [u8; 32],
+        sensitivity: ProductBackupSensitivity,
+    ) -> Result<Self, ProductBackupError> {
+        let reference = reference.into();
+        if !controlled_component_reference(&reference)
+            || byte_length > MAXIMUM_COMPONENT_BYTES
+            || sha256 == [0; 32]
+        {
+            return Err(ProductBackupError::InvalidComponent);
+        }
+        Ok(Self {
+            reference,
+            byte_length,
+            sha256,
+            sensitivity,
+        })
+    }
+}
+
 /// Exact controlled-bundle contribution produced by one product authority.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -373,28 +409,18 @@ impl ProductBackupComponent {
         kind: ProductBackupComponentKind,
         producer: SourceIdentifier,
         schema: ProductBackupComponentSchema,
-        artifact_reference: impl Into<String>,
-        byte_length: u64,
-        sha256: [u8; 32],
-        sensitivity: ProductBackupSensitivity,
+        artifact: ProductBackupArtifactEvidence,
     ) -> Result<Self, ProductBackupError> {
-        let artifact_reference = artifact_reference.into();
         schema.verify()?;
-        if !controlled_component_reference(&artifact_reference)
-            || byte_length > MAXIMUM_COMPONENT_BYTES
-            || sha256 == [0; 32]
-        {
-            return Err(ProductBackupError::InvalidComponent);
-        }
         Ok(Self {
             snapshot,
             kind,
             producer,
             schema,
-            artifact_reference,
-            byte_length,
-            sha256,
-            sensitivity,
+            artifact_reference: artifact.reference,
+            byte_length: artifact.byte_length,
+            sha256: artifact.sha256,
+            sensitivity: artifact.sensitivity,
         })
     }
 
@@ -703,8 +729,24 @@ fn private_regular_file(_metadata: &std::fs::Metadata) -> bool {
 pub struct StagedProductRestoreTarget {
     workspace: WorkspaceDescriptor,
     analytical: AnalyticalRestoreTarget,
+    finalizer: Box<dyn ProductRestoreFinalizer>,
     source_workspace: WorkspaceId,
     active_workspace: WorkspaceId,
+}
+
+/// Non-analytical owner finalization that runs only after the analytical authority is restored.
+///
+/// The capability is consumed exactly once. Implementations restore through fresh-owner APIs and
+/// validate every semantic relationship that depends on the restored analytical catalog before
+/// the workspace can be registered or selected.
+#[async_trait]
+pub trait ProductRestoreFinalizer: std::fmt::Debug + Send {
+    /// Finalizes all staged non-analytical authorities against the restored analytical service.
+    async fn finalize(
+        self: Box<Self>,
+        analytical: &AnalyticalDataService,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProductBackupError>;
 }
 
 impl StagedProductRestoreTarget {
@@ -712,6 +754,7 @@ impl StagedProductRestoreTarget {
     pub fn try_new(
         workspace: WorkspaceDescriptor,
         analytical: AnalyticalRestoreTarget,
+        finalizer: Box<dyn ProductRestoreFinalizer>,
         source_workspace: WorkspaceId,
         active_workspace: WorkspaceId,
     ) -> Result<Self, ProductBackupError> {
@@ -724,6 +767,7 @@ impl StagedProductRestoreTarget {
         Ok(Self {
             workspace,
             analytical,
+            finalizer,
             source_workspace,
             active_workspace,
         })
@@ -829,11 +873,17 @@ impl VerifiedProductBackup {
             }
         };
         match restored {
-            Ok(analytical) => Ok(PreparedProductRestore {
-                workspace: target.workspace,
-                analytical,
-                manifest: self.manifest,
-            }),
+            Ok(analytical) => {
+                if let Err(error) = target.finalizer.finalize(&analytical, cancellation).await {
+                    components.abandon(workspace_id, cancellation).await?;
+                    return Err(error);
+                }
+                Ok(PreparedProductRestore {
+                    workspace: target.workspace,
+                    analytical,
+                    manifest: self.manifest,
+                })
+            }
             Err(error) => {
                 components.abandon(workspace_id, cancellation).await?;
                 Err(ProductBackupError::Analytical(error))
@@ -982,6 +1032,8 @@ fn manifest_digest(
 /// Typed product-manifest admission failure.
 #[derive(Debug, Error)]
 pub enum ProductBackupError {
+    #[error("product backup execution cutoff could not be allocated")]
+    CutoffUnavailable,
     #[error("product backup snapshot identity is invalid")]
     InvalidSnapshot,
     #[error("product backup components do not share the exact requested snapshot")]
@@ -1063,10 +1115,12 @@ mod tests {
                         "test-producer-{index}"
                     ))?,
                     schema.clone(),
-                    format!("product-components/component-{index}.json"),
-                    1,
-                    [u8::try_from(index + 1)?; 32],
-                    ProductBackupSensitivity::NonSecret,
+                    ProductBackupArtifactEvidence::try_new(
+                        format!("product-components/component-{index}.json"),
+                        1,
+                        [u8::try_from(index + 1)?; 32],
+                        ProductBackupSensitivity::NonSecret,
+                    )?,
                 )
                 .map_err(Into::into)
             })
@@ -1100,14 +1154,16 @@ mod tests {
                     kind,
                     SourceIdentifier::try_from(format!("test-producer-{index}"))?,
                     schema.clone(),
-                    format!("product-components/component-{index}.json"),
-                    1,
-                    [u8::try_from(index + 1)?; 32],
-                    if kind == ProductBackupComponentKind::Configuration {
-                        ProductBackupSensitivity::SecretPayload
-                    } else {
-                        ProductBackupSensitivity::NonSecret
-                    },
+                    ProductBackupArtifactEvidence::try_new(
+                        format!("product-components/component-{index}.json"),
+                        1,
+                        [u8::try_from(index + 1)?; 32],
+                        if kind == ProductBackupComponentKind::Configuration {
+                            ProductBackupSensitivity::SecretPayload
+                        } else {
+                            ProductBackupSensitivity::NonSecret
+                        },
+                    )?,
                 )
                 .map_err(Into::into)
             })

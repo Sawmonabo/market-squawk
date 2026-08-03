@@ -1410,7 +1410,7 @@ pub enum ProductionPaperBotStartError {
     #[error("production paper-bot startup failed and worker rollback was incomplete")]
     Rollback {
         startup: Box<ProductionPaperBotStartError>,
-        rollback: ProductionPaperBotRollback,
+        rollback: Box<ProductionPaperBotRollback>,
     },
 }
 
@@ -1876,7 +1876,7 @@ fn with_rollback(
     } else {
         ProductionPaperBotStartError::Rollback {
             startup: Box::new(startup),
-            rollback,
+            rollback: Box::new(rollback),
         }
     }
 }

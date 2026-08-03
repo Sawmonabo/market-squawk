@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
+use fs2::FileExt as _;
 use olpc_cjson::CanonicalFormatter;
 use serde::de::{DeserializeOwned, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -18,6 +19,7 @@ use thiserror::Error;
 const SPEC_VERSION: &str = "1.0.35";
 const STATE_SCHEMA_VERSION: u32 = 1;
 const STATE_FILE: &str = "trusted-update-metadata.json";
+const STATE_LOCK_FILE: &str = ".trusted-update-metadata.lock";
 const MAXIMUM_METADATA_BYTES: usize = 1024 * 1024;
 const MAXIMUM_STATE_BYTES: usize = 2 * MAXIMUM_METADATA_BYTES;
 const MAXIMUM_ROOT_CHAIN: usize = 32;
@@ -129,6 +131,12 @@ pub struct TrustedUpdateStore {
 }
 
 impl TrustedUpdateStore {
+    /// Returns the exact currently trusted root version used to request only sequential updates.
+    #[must_use]
+    pub const fn current_root_version(&self) -> u64 {
+        self.trusted_root.signed.version
+    }
+
     /// Loads protected trust state or prepares an in-memory bootstrap from the pinned root.
     ///
     /// Bootstrap does not write anything. Trust advances only through
@@ -350,6 +358,7 @@ impl PendingTrustedUpdate {
 
     /// Atomically advances trusted metadata. There is deliberately no rollback operation.
     pub fn persist(self) -> Result<TrustedUpdateReceipt, UpdateMetadataError> {
+        let _lock = acquire_state_lock(&self.root)?;
         let path = self.root.join(STATE_FILE);
         let current = read_state(&path)?.map(|(_, digest)| digest);
         if current != self.base_digest {
@@ -979,6 +988,25 @@ fn read_state(path: &Path) -> Result<Option<(TrustedState, [u8; 32])>, UpdateMet
     {
         return Err(UpdateMetadataError::UnsafeStatePath);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(UpdateMetadataError::UnsafeStatePath);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(UpdateMetadataError::UnsafeStatePath);
+        }
+    }
     let file = File::open(path).map_err(|source| UpdateMetadataError::Io {
         operation: "open trusted update state",
         source,
@@ -1046,7 +1074,103 @@ fn private_open_options() -> OpenOptions {
     options
 }
 
+fn acquire_state_lock(root: &Path) -> Result<File, UpdateMetadataError> {
+    verify_private_root(root)?;
+    let path = root.join(STATE_LOCK_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(UpdateMetadataError::UnsafeStatePath);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    configure_state_lock_options(&mut options);
+    let lock = options
+        .open(path)
+        .map_err(|source| UpdateMetadataError::Io {
+            operation: "open trusted update state lock",
+            source,
+        })?;
+    lock.try_lock_exclusive().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            UpdateMetadataError::ConcurrentStateChange
+        } else {
+            UpdateMetadataError::Io {
+                operation: "lock trusted update state",
+                source,
+            }
+        }
+    })?;
+    validate_state_lock(&lock)?;
+    Ok(lock)
+}
+
+#[cfg(unix)]
+fn configure_state_lock_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_state_lock_options(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(unix)]
+fn validate_state_lock(lock: &File) -> Result<(), UpdateMetadataError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = lock.metadata().map_err(|source| UpdateMetadataError::Io {
+        operation: "inspect trusted update state lock",
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(UpdateMetadataError::UnsafeStatePath);
+    }
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| UpdateMetadataError::Io {
+            operation: "secure trusted update state lock",
+            source,
+        })?;
+    let secured = lock.metadata().map_err(|source| UpdateMetadataError::Io {
+        operation: "verify trusted update state lock",
+        source,
+    })?;
+    if secured.uid() != rustix::process::geteuid().as_raw()
+        || secured.permissions().mode() & 0o077 != 0
+    {
+        return Err(UpdateMetadataError::UnsafeStatePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_state_lock(lock: &File) -> Result<(), UpdateMetadataError> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = lock.metadata().map_err(|source| UpdateMetadataError::Io {
+        operation: "inspect trusted update state lock",
+        source,
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(UpdateMetadataError::UnsafeStatePath);
+    }
+    Ok(())
+}
+
 fn verify_private_root(root: &Path) -> Result<(), UpdateMetadataError> {
+    crate::store::validate_store_parent(root).map_err(|_| UpdateMetadataError::UnsafeStatePath)?;
     let metadata = fs::symlink_metadata(root).map_err(|source| UpdateMetadataError::Io {
         operation: "inspect trusted update root",
         source,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -7,7 +7,7 @@ use market_squawk_domain::SourceIdentifier;
 use thiserror::Error;
 use tokio::sync::Notify;
 
-use crate::{JobGeneration, JobId};
+use crate::{JobActivitySnapshot, JobGeneration, JobId};
 
 /// Global and per-kind queue/running ceilings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,9 +116,11 @@ struct SchedulerState {
     queued: usize,
     running: usize,
     running_by_kind: BTreeMap<SourceIdentifier, usize>,
+    running_jobs: BTreeMap<(JobId, JobGeneration), SourceIdentifier>,
     reserved: usize,
     reserved_by_kind: BTreeMap<SourceIdentifier, usize>,
     closed: bool,
+    snapshot_fenced: bool,
 }
 
 impl FairJobScheduler {
@@ -145,6 +147,7 @@ impl FairJobScheduler {
         let kind_count = state.queues.get(&kind).map_or(0, VecDeque::len)
             + state.reserved_by_kind.get(&kind).copied().unwrap_or(0);
         if state.closed
+            || state.snapshot_fenced
             || state.queued + state.reserved >= self.inner.limits.maximum_queued
             || kind_count >= self.inner.limits.maximum_queued_per_kind
         {
@@ -181,7 +184,7 @@ impl FairJobScheduler {
                 if state.closed && state.queued == 0 {
                     return None;
                 }
-                if state.running < self.inner.limits.maximum_running {
+                if !state.snapshot_fenced && state.running < self.inner.limits.maximum_running {
                     let visits = state.kinds.len();
                     for _ in 0..visits {
                         let Some(kind) = state.kinds.pop_front() else {
@@ -206,6 +209,9 @@ impl FairJobScheduler {
                         state.queued -= 1;
                         state.running += 1;
                         *state.running_by_kind.entry(kind.clone()).or_default() += 1;
+                        state
+                            .running_jobs
+                            .insert((job.id(), job.generation()), kind.clone());
                         return Some(JobLease {
                             job,
                             kind,
@@ -219,10 +225,51 @@ impl FairJobScheduler {
         }
     }
 
+    pub(crate) fn activity(
+        &self,
+        mutation_kinds: &BTreeSet<SourceIdentifier>,
+    ) -> JobActivitySnapshot {
+        let state = self.inner.lock_state();
+        let running_mutations = mutation_kinds
+            .iter()
+            .filter_map(|kind| state.running_by_kind.get(kind))
+            .copied()
+            .sum();
+        JobActivitySnapshot::new(state.running, running_mutations)
+    }
+
+    pub(crate) fn retain_exclusive(
+        &self,
+        active_kind: &SourceIdentifier,
+    ) -> Option<(ScheduledJob, SchedulerSnapshotFence)> {
+        let mut state = self.inner.lock_state();
+        if state.closed
+            || state.snapshot_fenced
+            || state.reserved != 0
+            || state.queued != 0
+            || state.running_jobs.len() != 1
+        {
+            return None;
+        }
+        let (&(id, generation), kind) = state.running_jobs.first_key_value()?;
+        if kind != active_kind {
+            return None;
+        }
+        let kind = kind.clone();
+        state.snapshot_fenced = true;
+        Some((
+            ScheduledJob::new(id, generation, kind),
+            SchedulerSnapshotFence {
+                scheduler: self.inner.clone(),
+                released: false,
+            },
+        ))
+    }
+
     /// Prevents new work, removes queued generations, and wakes blocked claimers.
     pub fn close(&self) -> Result<Vec<ScheduledJob>, SchedulerError> {
         let mut state = self.inner.lock_state();
-        if state.reserved != 0 {
+        if state.reserved != 0 || state.snapshot_fenced {
             return Err(SchedulerError::ReservationsActive);
         }
         state.closed = true;
@@ -326,6 +373,9 @@ impl JobLease {
                 state.running_by_kind.remove(&self.kind);
             }
         }
+        state
+            .running_jobs
+            .remove(&(self.job.id(), self.job.generation()));
         self.released = true;
         drop(state);
         self.scheduler.notify.notify_one();
@@ -333,6 +383,32 @@ impl JobLease {
 }
 
 impl Drop for JobLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+/// Scheduler dispatch fence retained across one coherent logical snapshot.
+#[derive(Debug)]
+pub(crate) struct SchedulerSnapshotFence {
+    scheduler: Arc<SchedulerInner>,
+    released: bool,
+}
+
+impl SchedulerSnapshotFence {
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self.scheduler.lock_state();
+        state.snapshot_fenced = false;
+        self.released = true;
+        drop(state);
+        self.scheduler.notify.notify_waiters();
+    }
+}
+
+impl Drop for SchedulerSnapshotFence {
     fn drop(&mut self) {
         self.release_inner();
     }

@@ -8,9 +8,7 @@ use std::{
     sync::Mutex,
 };
 
-use cap_fs_ext::{
-    DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _,
-};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::ControlRoot;
@@ -738,6 +736,7 @@ fn parse_segment_name(name: &str) -> Result<u64, StructuredLogError> {
         .ok_or(StructuredLogError::UnsafeFilesystemEntry)
 }
 
+#[cfg(unix)]
 fn sync_directory(directory: &Dir) -> Result<(), StructuredLogError> {
     directory
         .try_clone()
@@ -745,4 +744,19 @@ fn sync_directory(directory: &Dir) -> Result<(), StructuredLogError> {
         .into_std_file()
         .sync_all()
         .map_err(|source| StructuredLogError::Io { source })
+}
+
+#[cfg(windows)]
+fn sync_directory(directory: &Dir) -> Result<(), StructuredLogError> {
+    directory
+        .dir_metadata()
+        .map_err(|source| StructuredLogError::Io { source })?
+        .is_dir()
+        .then_some(())
+        .ok_or(StructuredLogError::UnsafeFilesystemEntry)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_directory: &Dir) -> Result<(), StructuredLogError> {
+    Err(StructuredLogError::UnsafeFilesystemEntry)
 }

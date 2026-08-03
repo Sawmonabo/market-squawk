@@ -1,10 +1,16 @@
 //! Local governance-principal authority for sensitive application actions.
 
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use market_squawk_domain::Timestamp;
-use market_squawk_platform::{SecretRef, SecretValue};
+use market_squawk_platform::{
+    LocalSecretStoreError, SecretCancellation, SecretInteractionPolicy, SecretKey,
+    SecretOperationControl, SecretRef, SecretValue,
+};
 use market_squawk_runtime::{ClientId, ServiceGeneration, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +22,32 @@ pub(super) const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAXIMUM_PRINCIPAL_DISPLAY_BYTES: usize = 128;
 const MAXIMUM_ROLES: usize = 8;
 pub(super) const MAXIMUM_DISTINCT_PRINCIPALS: u8 = 2;
+
+pub(crate) fn governance_principal_secret_key(
+    id: GovernancePrincipalId,
+) -> Result<SecretKey, GovernanceError> {
+    SecretKey::try_new(GOVERNANCE_SECRET_SCOPE, &id.as_uuid().to_string()).map_err(map_secret_error)
+}
+
+pub(crate) fn governance_secret_operation_control(
+    owner: &'static str,
+) -> Result<SecretOperationControl, GovernanceError> {
+    let deadline = Instant::now()
+        .checked_add(SECRET_OPERATION_TIMEOUT)
+        .ok_or(GovernanceError::SecretStoreUnavailable)?;
+    SecretOperationControl::try_new(
+        owner,
+        deadline,
+        1,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )
+    .map_err(map_secret_error)
+}
+
+fn map_secret_error(_error: LocalSecretStoreError) -> GovernanceError {
+    GovernanceError::SecretStoreUnavailable
+}
 
 macro_rules! uuid_identity {
     ($(#[$metadata:meta])* $name:ident) => {
@@ -227,7 +259,6 @@ pub struct GovernanceRequestBinding {
 
 impl GovernanceRequestBinding {
     /// Creates an exact authenticated workspace, generation, and named-client binding.
-    #[must_use]
     pub const fn try_new(
         workspace_id: WorkspaceId,
         service_generation: ServiceGeneration,

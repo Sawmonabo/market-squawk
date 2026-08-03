@@ -19,9 +19,12 @@ import { Link } from "react-router-dom"
 
 import { ProviderStep } from "@/components/setup/provider-step"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
+import { governanceProvisioningStatusSchema } from "@/lib/schemas"
 import type {
   DesktopBootstrap,
+  GovernanceProvisioningStatus,
   SetupStep,
 } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
@@ -150,6 +153,12 @@ export function SetupFlow({
           />
         ) : current.id === "mcp" ? (
           <McpStep step={current} onClose={onClose} />
+        ) : current.id === "system" ? (
+          <GovernanceProvisioningStep
+            step={current}
+            transport={transport}
+            onRefresh={onRefresh}
+          />
         ) : current.id === "review" ? (
           <ReviewStep steps={steps} onRefresh={onRefresh} />
         ) : (
@@ -196,6 +205,254 @@ export function SetupFlow({
       </div>
     </section>
   )
+}
+
+function GovernanceProvisioningStep({
+  step,
+  transport,
+  onRefresh,
+}: {
+  step: SetupStep
+  transport: ProductTransport
+  onRefresh: () => void
+}) {
+  const [status, setStatus] =
+    React.useState<GovernanceProvisioningStatus | null>(null)
+  const [statusError, setStatusError] = React.useState<string | null>(null)
+  const [primaryDisplayName, setPrimaryDisplayName] = React.useState("")
+  const [primaryCredential, setPrimaryCredential] = React.useState("")
+  const [reviewerDisplayName, setReviewerDisplayName] = React.useState("")
+  const [reviewerCredential, setReviewerCredential] = React.useState("")
+  const [confirmed, setConfirmed] = React.useState(false)
+  const [isSubmitting, setIsSubmitting] = React.useState(false)
+  const [submissionError, setSubmissionError] = React.useState<string | null>(null)
+
+  const refreshProvisioningStatus = React.useCallback(async () => {
+    try {
+      const result = await transport.governanceQuery({
+        query: "provisioningStatus",
+      })
+      setStatus(governanceProvisioningStatusSchema.parse(result.data))
+      setStatusError(null)
+    } catch (error) {
+      setStatusError(messageFrom(error))
+    }
+  }, [transport])
+
+  React.useEffect(() => {
+    void refreshProvisioningStatus()
+  }, [refreshProvisioningStatus])
+
+  async function provision(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmissionError(null)
+
+    const request = {
+      action: "provisionPrincipalSet" as const,
+      primaryDisplayName: primaryDisplayName.trim(),
+      primaryCredential,
+      reviewerDisplayName: reviewerDisplayName.trim(),
+      reviewerCredential,
+    }
+    setPrimaryCredential("")
+    setReviewerCredential("")
+    setIsSubmitting(true)
+
+    try {
+      await transport.governanceControl(request, confirmed)
+      await refreshProvisioningStatus()
+      onRefresh()
+      setConfirmed(false)
+    } catch (error) {
+      setSubmissionError(messageFrom(error))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const readyToProvision =
+    primaryDisplayName.trim().length > 0 &&
+    primaryCredential.length > 0 &&
+    reviewerDisplayName.trim().length > 0 &&
+    reviewerCredential.length > 0 &&
+    confirmed
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-5 py-4">
+      <StepStatus step={step} />
+      <section className="rounded-lg border border-border bg-background/35 p-4">
+        <div className="flex items-start gap-3">
+          <ShieldCheck
+            className="mt-0.5 size-5 shrink-0 text-primary"
+            aria-hidden="true"
+          />
+          <div>
+            <h3 className="text-sm font-semibold">
+              Set up independent governance
+            </h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              Market Squawk needs two people with separate credentials before governed market work
+              can begin. The primary manages the V1 governance responsibilities, while the
+              reviewer independently holds market-access responsibility. The service assigns
+              those roles; this setup screen never lets you choose them.
+            </p>
+          </div>
+        </div>
+
+        {status?.configured ? (
+          <PrincipalSummary status={status} />
+        ) : (
+          <form
+            className="mt-5 space-y-5"
+            onSubmit={(event) => void provision(event)}
+          >
+            <fieldset className="space-y-3">
+              <legend className="text-xs font-medium">
+                Primary governance person
+              </legend>
+              <label className="block space-y-1.5 text-xs text-muted-foreground">
+                Display name
+                <Input
+                  value={primaryDisplayName}
+                  onChange={(event) => setPrimaryDisplayName(event.target.value)}
+                  autoComplete="name"
+                  disabled={isSubmitting}
+                  required
+                />
+              </label>
+              <label className="block space-y-1.5 text-xs text-muted-foreground">
+                Private credential
+                <Input
+                  type="password"
+                  value={primaryCredential}
+                  onChange={(event) => setPrimaryCredential(event.target.value)}
+                  autoComplete="new-password"
+                  disabled={isSubmitting}
+                  required
+                />
+              </label>
+            </fieldset>
+
+            <fieldset className="space-y-3 border-t border-border pt-5">
+              <legend className="text-xs font-medium">
+                Independent market-access reviewer
+              </legend>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                Use a second person and their own credential. This separates review from the
+                person who manages the wider governance responsibilities.
+              </p>
+              <label className="block space-y-1.5 text-xs text-muted-foreground">
+                Display name
+                <Input
+                  value={reviewerDisplayName}
+                  onChange={(event) => setReviewerDisplayName(event.target.value)}
+                  autoComplete="name"
+                  disabled={isSubmitting}
+                  required
+                />
+              </label>
+              <label className="block space-y-1.5 text-xs text-muted-foreground">
+                Private credential
+                <Input
+                  type="password"
+                  value={reviewerCredential}
+                  onChange={(event) => setReviewerCredential(event.target.value)}
+                  autoComplete="new-password"
+                  disabled={isSubmitting}
+                  required
+                />
+              </label>
+            </fieldset>
+
+            <label className="flex items-start gap-2 text-xs leading-relaxed text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={confirmed}
+                onChange={(event) => setConfirmed(event.target.checked)}
+                disabled={isSubmitting}
+                className="mt-0.5 size-3.5 accent-primary"
+              />
+              I confirm these are two independent people with separate credentials.
+            </label>
+
+            {submissionError ? <SetupError message={submissionError} /> : null}
+
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!readyToProvision || isSubmitting}
+            >
+              {isSubmitting ? (
+                <RefreshCw className="animate-spin" aria-hidden="true" />
+              ) : (
+                <ShieldCheck aria-hidden="true" />
+              )}
+              Provision governance
+            </Button>
+          </form>
+        )}
+
+        {statusError ? <SetupError message={statusError} /> : null}
+
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="mt-4"
+          onClick={() => void refreshProvisioningStatus()}
+          disabled={isSubmitting}
+        >
+          <RefreshCw aria-hidden="true" />
+          Refresh governance status
+        </Button>
+      </section>
+    </div>
+  )
+}
+
+function PrincipalSummary({ status }: { status: GovernanceProvisioningStatus }) {
+  return (
+    <div className="mt-5 space-y-3">
+      <div className="rounded-md border border-emerald-400/25 bg-emerald-400/5 p-3">
+        <p className="text-xs font-medium text-emerald-300">Governance is active</p>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          The service has provisioned the principal set below. Credentials are never shown here.
+        </p>
+      </div>
+      <ul className="divide-y divide-border rounded-md border border-border bg-black/25">
+        {status.principals.map((principal) => (
+          <li key={principal.principalId} className="px-3 py-2.5">
+            <p className="text-xs font-medium">{principal.displayName}</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {principal.roles.join(" · ")}
+            </p>
+          </li>
+        ))}
+      </ul>
+      {status.missingRoles.length > 0 ? (
+        <p className="text-xs text-amber-300">
+          Still required: {status.missingRoles.join(", ")}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function SetupError({ message }: { message: string }) {
+  return (
+    <p
+      role="alert"
+      className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs leading-relaxed text-destructive"
+    >
+      {message}
+    </p>
+  )
+}
+
+function messageFrom(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "The governance request could not be completed."
 }
 
 function McpStep({

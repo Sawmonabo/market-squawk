@@ -37,7 +37,7 @@ use crate::application::lifecycle::{
     UpdateActivitySnapshot, UpdateApproval, UpdateError, UpdateOutcome,
 };
 use crate::application::operations::{
-    PreparedOperation, TrustedStagedUpdate, UpdateStatusEvidence,
+    PreparedOperation, TrustedStagedUpdate, UpdateAvailabilityEvidence, UpdateStatusEvidence,
 };
 use crate::jobs::{
     LifecycleJobExecutionError, LifecycleJobPublication, LifecycleJobPublicationError,
@@ -54,6 +54,7 @@ const UPDATE_MEDIA_TYPE: &str = "application/json";
 const TARGET_MEDIA_TYPE: &str = "application/octet-stream";
 const DIAGNOSTIC_FAILURE: &str = "trusted-update-operation-failed";
 const DIAGNOSTIC_PUBLICATION: &str = "trusted-update-publication-failed";
+const DIAGNOSTIC_UNAVAILABLE: &str = "installed-update-channel-unavailable";
 
 type ActivityReader =
     dyn Fn(u64) -> Result<UpdateActivitySnapshot, ServiceError> + Send + Sync + 'static;
@@ -271,14 +272,13 @@ impl ManagedUpdateOperations {
         {
             Some((DurableOutcome::RolledBack, current_value))
         } else if current_value == transition.previous_generation {
-            if candidate_active {
-                if market_squawk_installer::rollback(RollbackRequest::new(
+            if candidate_active
+                && market_squawk_installer::rollback(RollbackRequest::new(
                     self.install_root.clone(),
                 ))
                 .is_err()
-                {
-                    return;
-                }
+            {
+                return;
             }
             let Ok(recovered_status) = self.installer_status() else {
                 return;
@@ -309,10 +309,10 @@ impl ManagedUpdateOperations {
         });
         let retired = state.staged.take();
         state.transition = None;
-        if self.store_state(&state).is_ok() {
-            if let Some(retired) = retired {
-                let _ignored = self.remove_stage(&retired.directory);
-            }
+        if self.store_state(&state).is_ok()
+            && let Some(retired) = retired
+        {
+            let _ignored = self.remove_stage(&retired.directory);
         }
     }
 
@@ -852,6 +852,7 @@ impl crate::application::operations::ManagedUpdateOperations for ManagedUpdateOp
             .ok_or(ServiceError::Unavailable)?;
         let staged_candidate = state.staged.as_ref().map(|stage| stage.candidate.clone());
         UpdateStatusEvidence::try_new(
+            UpdateAvailabilityEvidence::Available,
             current,
             known_good,
             staged_candidate,
@@ -1098,6 +1099,85 @@ impl fmt::Debug for ManagedUpdateOperations {
             .field("repository", &"[pinned HTTPS origin]")
             .field("limits", &self.limits)
             .finish_non_exhaustive()
+    }
+}
+
+/// Fail-closed Operations adapter for a valid execution without packaged update authority.
+pub(crate) struct UnavailableUpdateOperations {
+    availability: UpdateAvailabilityEvidence,
+    current_version: Box<str>,
+}
+
+impl UnavailableUpdateOperations {
+    /// Creates a truthful status provider that cannot perform update network or mutation work.
+    pub(crate) fn try_new(
+        availability: UpdateAvailabilityEvidence,
+        current_version: impl Into<Box<str>>,
+    ) -> Result<Self, ServiceError> {
+        let current_version = current_version.into();
+        if availability == UpdateAvailabilityEvidence::Available
+            || current_version.is_empty()
+            || current_version.len() > 128
+            || current_version.chars().any(char::is_control)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(Self {
+            availability,
+            current_version,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::application::operations::ManagedUpdateOperations for UnavailableUpdateOperations {
+    fn status(&self, current: ProgramGeneration) -> Result<UpdateStatusEvidence, ServiceError> {
+        UpdateStatusEvidence::try_new(
+            self.availability,
+            current,
+            self.current_version.to_string(),
+            None,
+            None,
+            false,
+        )
+    }
+
+    async fn check_and_stage(
+        &self,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<TrustedStagedUpdate, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn current_staged(&self) -> Result<TrustedStagedUpdate, ServiceError> {
+        Err(ServiceError::NotFound)
+    }
+
+    fn prepare_update(&self, _approval: UpdateApproval) -> Result<PreparedOperation, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn revoke(&self, _operation: &PreparedOperation) {}
+
+    async fn execute(
+        &self,
+        _command: UpdateJobCommand,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+        _publication: Arc<dyn LifecycleJobPublication>,
+    ) -> Result<(), LifecycleJobExecutionError> {
+        Err(execution_failure(DIAGNOSTIC_UNAVAILABLE, false))
+    }
+}
+
+impl fmt::Debug for UnavailableUpdateOperations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnavailableUpdateOperations")
+            .field("availability", &self.availability)
+            .field("current_version", &self.current_version)
+            .finish()
     }
 }
 

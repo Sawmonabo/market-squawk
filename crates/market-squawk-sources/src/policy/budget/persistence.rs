@@ -490,7 +490,7 @@ impl DurableBudgetGroup {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DurableAuthorityEnvelope {
+pub(crate) struct DurableAuthorityEnvelope {
     format_version: u16,
     run_generation: u64,
     run_state: DurableRunState,
@@ -498,6 +498,39 @@ struct DurableAuthorityEnvelope {
     wall_high_water: Timestamp,
     registry: crate::RegistryAuthorityState,
     budgets: BoundedVec<DurableBudgetGroup, MAX_PROCESS_BUDGET_SCOPES>,
+}
+
+pub(crate) fn deserialize_clean_restart_backup(
+    payload: &[u8],
+    now: Timestamp,
+) -> Result<DurableAuthorityEnvelope, AuthorityPersistenceError> {
+    let envelope = deserialize_canonical_envelope(payload)?;
+    envelope.validate(now)?;
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    Ok(envelope)
+}
+
+pub(crate) fn serialize_clean_restart_backup(
+    envelope: &DurableAuthorityEnvelope,
+) -> Result<Vec<u8>, AuthorityPersistenceError> {
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    serialize_canonical_envelope(envelope)
 }
 
 impl DurableAuthorityEnvelope {
@@ -824,6 +857,33 @@ impl AuthorityDurabilitySession {
             envelope.registry = registry;
             Ok(())
         })
+    }
+
+    pub(crate) fn export_clean_restart_backup(
+        self: &Arc<Self>,
+        proof: CleanShutdownProof,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<Vec<u8>, AuthorityPersistenceError> {
+        if !proof.belongs_to(self) || !self.is_available() {
+            proof.invalidate_bound_session();
+            self.invalidate();
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        let mut envelope = self
+            .envelope
+            .lock()
+            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?
+            .clone();
+        if wall < envelope.wall_high_water {
+            return Err(AuthorityPersistenceError::WallRollback);
+        }
+        envelope.run_state = DurableRunState::Clean;
+        envelope.saved_at_wall = wall;
+        envelope.wall_high_water = wall;
+        envelope.registry = registry;
+        envelope.validate(wall)?;
+        serialize_clean_restart_backup(&envelope)
     }
 
     pub(crate) fn close_clean(

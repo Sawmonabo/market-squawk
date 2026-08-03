@@ -212,6 +212,18 @@ impl std::fmt::Debug for InstalledMcpControl {
 }
 
 impl InstalledMcpControl {
+    /// Returns the exact number of MCP client identities with active requests.
+    pub(super) fn active_client_count(&self) -> Result<usize, McpControlError> {
+        let state = self.state.read();
+        state.entries.values().try_fold(0_usize, |total, entry| {
+            if entry.identity.active_requests() == 0 {
+                Ok(total)
+            } else {
+                total.checked_add(1).ok_or(McpControlError::InvalidState)
+            }
+        })
+    }
+
     /// Current non-secret credential registration for one MCP client.
     pub(super) fn registration(
         &self,
@@ -744,10 +756,8 @@ impl From<McpLimitSpec> for RuntimeLimits {
             maximum_inline_items: spec.maximum_inline_items,
             maximum_result_bytes: spec.maximum_result_bytes,
             maximum_result_items: spec.maximum_result_items,
-            request_timeout_milliseconds: match u64::try_from(spec.request_timeout.as_millis()) {
-                Ok(milliseconds) => milliseconds,
-                Err(_overflow) => u64::MAX,
-            },
+            request_timeout_milliseconds: u64::try_from(spec.request_timeout.as_millis())
+                .unwrap_or(u64::MAX),
         }
     }
 }

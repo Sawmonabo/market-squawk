@@ -156,6 +156,19 @@ export const applicationResultSchema = z.object({
   }),
 })
 
+export const governanceProvisioningStatusSchema = z.object({
+  state: z.enum(["unprovisioned", "active"]),
+  configured: z.boolean(),
+  principals: z.array(
+    z.object({
+      principalId: z.string().min(1),
+      displayName: z.string().min(1),
+      roles: z.array(z.string().min(1)),
+    }),
+  ),
+  missingRoles: z.array(z.string().min(1)),
+})
+
 export const providerBootstrapSchema = z.object({
   profiles: z.array(providerProfileSchema),
   sessions: z.array(providerSessionSchema),
@@ -253,6 +266,8 @@ export const mcpClientsStatusSchema = z.object({
           serverName: z.string().min(1).max(128),
           toolCount: z.number().int().nonnegative(),
           resourceCount: z.number().int().nonnegative(),
+          toolDomains: z.array(z.string().min(1).max(64)).min(1).max(32),
+          resourceNames: z.array(z.string().min(1).max(64)).min(1).max(32),
           safeReadTool: z.string().min(1).max(128),
           verifiedAtUnixSeconds: z.number().int().nonnegative(),
         })
@@ -291,6 +306,9 @@ export type InstallationControlResult = z.infer<
 >
 export type InstallationStatus = z.infer<typeof installationStatusSchema>
 export type InputTicket = z.infer<typeof inputTicketSchema>
+export type GovernanceProvisioningStatus = z.infer<
+  typeof governanceProvisioningStatusSchema
+>
 export type McpClientsStatus = z.infer<typeof mcpClientsStatusSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>

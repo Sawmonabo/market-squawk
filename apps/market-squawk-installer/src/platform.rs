@@ -172,19 +172,30 @@ impl ProgramName {
     }
 }
 
-/// Returns the platform-native per-user program root.
+/// Returns the platform-native per-user Market Squawk data root.
 ///
-/// This root is distinct from Market Squawk's mutable data root so ordinary uninstall can remove
-/// programs without deleting configuration, credentials, portfolios, datasets, models, or logs.
+/// Mutable application data lives beneath this root. The separately returned program root is its
+/// `program` child so an ordinary uninstall can preserve configuration, credentials, portfolios,
+/// datasets, models, and logs.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::StandardDirectoriesUnavailable`] when the operating system does not
+/// expose a per-user application-data location.
+pub fn default_installation_data_root() -> Result<PathBuf, PlatformError> {
+    let directories = ProjectDirs::from("com", "MarketSquawk", "Market Squawk")
+        .ok_or(PlatformError::StandardDirectoriesUnavailable)?;
+    Ok(directories.data_local_dir().to_path_buf())
+}
+
+/// Returns the platform-native per-user program root.
 ///
 /// # Errors
 ///
 /// Returns [`PlatformError::StandardDirectoriesUnavailable`] when the operating system does not
 /// expose a per-user application-data location.
 pub fn default_install_root() -> Result<PathBuf, PlatformError> {
-    let directories = ProjectDirs::from("com", "MarketSquawk", "Market Squawk")
-        .ok_or(PlatformError::StandardDirectoriesUnavailable)?;
-    Ok(directories.data_local_dir().join("program"))
+    Ok(default_installation_data_root()?.join("program"))
 }
 
 /// Platform selection or per-user path failure.

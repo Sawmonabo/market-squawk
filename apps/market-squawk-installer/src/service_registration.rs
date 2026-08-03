@@ -35,7 +35,7 @@ use crate::platform::{ProgramName, SupportedTarget};
 use crate::store::InstallStore;
 
 const RECEIPT_FILE: &str = "service-registration.json";
-const RECEIPT_SCHEMA_VERSION: u32 = 1;
+const RECEIPT_SCHEMA_VERSION: u32 = 2;
 const REGISTRATION_OWNER: &str = "market-squawk-installer-v1";
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_RECEIPT_BYTES: usize = 64 * 1024;
@@ -170,6 +170,7 @@ impl RestartInstalledServiceRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProgramIdentity {
     path: PathBuf,
+    size: u64,
     sha256: Box<str>,
 }
 
@@ -545,6 +546,7 @@ fn program_identity(
         return Err(ServiceRegistrationError::UnsafePath);
     }
     Ok(ProgramIdentity {
+        size: metadata.len(),
         sha256: stable_file_sha256(&canonical)?.into(),
         path: canonical,
     })
@@ -672,13 +674,15 @@ fn write_receipt(
         .map_err(|error| {
             let source: std::io::Error = error.into();
             ServiceRegistrationError::io("publish service receipt", source)
-        })
+        })?;
+    sync_receipt_parent(root)
 }
 
 fn remove_receipt(root: &Path) -> Result<(), ServiceRegistrationError> {
     let path = receipt_path(root);
     fs::remove_file(path)
-        .map_err(|source| ServiceRegistrationError::io("remove service receipt", source))
+        .map_err(|source| ServiceRegistrationError::io("remove service receipt", source))?;
+    sync_receipt_parent(root)
 }
 
 #[cfg(not(test))]
@@ -689,7 +693,7 @@ fn restore_receipt(
     match receipt {
         Some(receipt) => write_receipt(root, receipt),
         None => match fs::remove_file(receipt_path(root)) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_receipt_parent(root),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(ServiceRegistrationError::io(
                 "remove failed activation receipt",
@@ -697,6 +701,16 @@ fn restore_receipt(
             )),
         },
     }
+}
+
+fn sync_receipt_parent(root: &Path) -> Result<(), ServiceRegistrationError> {
+    #[cfg(unix)]
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| {
+            ServiceRegistrationError::io("synchronize service receipt directory", source)
+        })?;
+    Ok(())
 }
 
 fn validate_receipt_identity(
@@ -718,7 +732,12 @@ fn validate_receipt_identity(
             .is_some_and(|digest| !is_lower_sha256(digest))
         || [&receipt.service, &receipt.mcp_relay, &receipt.cli]
             .iter()
-            .any(|identity| !identity.path.is_absolute() || !is_lower_sha256(&identity.sha256))
+            .any(|identity| {
+                !identity.path.is_absolute()
+                    || identity.size == 0
+                    || identity.size > MAXIMUM_EXECUTABLE_BYTES
+                    || !is_lower_sha256(&identity.sha256)
+            })
     {
         return Err(ServiceRegistrationError::Receipt);
     }

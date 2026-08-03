@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use super::{
     McpClientKind, McpClientRegistration, McpClientRegistrationError, McpCommandSpec,
-    ObservedRegistration, SERVER_NAME,
+    McpRegistrationScope, ObservedRegistration, SERVER_NAME,
 };
 
 pub(super) const EXECUTABLE_NAME: &str = "codex";
@@ -69,6 +69,7 @@ pub(super) fn parse_registration(
             env_vars,
             cwd,
         } => Ok(ObservedRegistration::Present {
+            scope: McpRegistrationScope::Host,
             transport: "stdio".to_owned(),
             command,
             arguments: args,
@@ -77,6 +78,7 @@ pub(super) fn parse_registration(
                 || cwd.is_some(),
         }),
         CodexTransport::Other => Ok(ObservedRegistration::Present {
+            scope: McpRegistrationScope::Host,
             transport: "other".to_owned(),
             command: String::new(),
             arguments: Vec::new(),

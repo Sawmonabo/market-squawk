@@ -96,7 +96,7 @@ pub enum ProductionExecutionAuditReadError {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProductionExecutionAuditReadView {
+pub(super) struct ProductionExecutionAuditReadView {
     image: Arc<Mutex<ExecutionAuditReadImage>>,
 }
 
@@ -114,7 +114,7 @@ impl ProductionExecutionAuditReadView {
         })
     }
 
-    pub fn snapshot_after(
+    pub(super) fn snapshot_after(
         &self,
         cursor: Option<u64>,
         maximum_items: usize,
@@ -868,7 +868,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop() {
+    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop()
+    -> Result<(), ProductionExecutionAuditReadError> {
         let expected = ProductionAuditEvidence {
             execution_records: 7,
             paper_records: 11,
@@ -886,11 +887,12 @@ mod tests {
             control,
             worker: Some(worker),
             drop_deadline: Duration::from_secs(1),
-            execution_read_view: ProductionExecutionAuditReadView::try_new().expect("read view"),
+            execution_read_view: ProductionExecutionAuditReadView::try_new()?,
         };
         let shutdown = service.shutdown(tokio::time::Instant::now(), true).await;
 
         assert!(shutdown.is_complete());
         assert_eq!(shutdown.evidence(), Some(expected));
+        Ok(())
     }
 }

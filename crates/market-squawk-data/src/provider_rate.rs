@@ -32,6 +32,10 @@ const MAXIMUM_COLLISION_KEYS: usize = 64;
 const COLLISION_KEY_BYTES: usize = 33;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const OWNER_LOCK_FILE: &str = "provider-rate-authority.owner.lock";
+const PROVIDER_RATE_LOGICAL_CHECKPOINT_SCHEMA: &str =
+    "market-squawk.provider-rate-logical-checkpoint";
+const PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION: u16 = 1;
+const MAXIMUM_LOGICAL_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
 CREATE TABLE provider_rate_runs (
@@ -115,6 +119,151 @@ impl std::fmt::Debug for ProviderRateOwnerLease {
     }
 }
 
+/// Non-cloneable owner lease over one exact logical provider-rate checkpoint.
+///
+/// It retains SQLite's writer transaction until post-materialization revalidation succeeds or the
+/// lease is dropped. The logical payload contains rate policy state and authorization evidence,
+/// never a live process run, permit, connection, or filesystem handle.
+pub struct RetainedProviderRateCheckpoint {
+    connection: Option<Connection>,
+    checkpoint: ProviderRateLogicalCheckpoint,
+}
+
+impl RetainedProviderRateCheckpoint {
+    /// Returns the canonical bounded logical export for the retained authority revision.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.checkpoint.bytes
+    }
+
+    /// Returns the domain-separated durable authority identity of the logical export.
+    #[must_use]
+    pub const fn authority_revision_sha256(&self) -> [u8; 32] {
+        self.checkpoint.authority_revision_sha256
+    }
+
+    /// Returns the SHA-256 digest of the exact emitted logical bytes.
+    #[must_use]
+    pub const fn content_sha256(&self) -> [u8; 32] {
+        self.checkpoint.content_sha256
+    }
+
+    /// Revalidates the emitted receipt and commits the retained writer transaction.
+    ///
+    /// Consuming the lease prevents a second materialization/revalidation cycle from reusing an
+    /// authority snapshot after its writer fence has been released.
+    pub fn revalidate_emitted(
+        mut self,
+        byte_length: u64,
+        content_sha256: [u8; 32],
+    ) -> Result<(), ProviderRateStoreError> {
+        if usize::try_from(byte_length).ok() != Some(self.checkpoint.bytes.len())
+            || content_sha256 != self.checkpoint.content_sha256
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        let current = checkpoint_from_connection(connection)?;
+        if current.bytes != self.checkpoint.bytes
+            || current.authority_revision_sha256 != self.checkpoint.authority_revision_sha256
+            || current.content_sha256 != self.checkpoint.content_sha256
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let connection = self
+            .connection
+            .take()
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        connection.execute_batch("COMMIT").map_err(map_sql)
+    }
+}
+
+impl std::fmt::Debug for RetainedProviderRateCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProviderRateCheckpoint")
+            .field("byte_length", &self.checkpoint.bytes.len())
+            .field("authority_revision_sha256", &"[SHA-256]")
+            .field("content_sha256", &"[SHA-256]")
+            .finish()
+    }
+}
+
+impl Drop for RetainedProviderRateCheckpoint {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ignored = connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+struct ProviderRateLogicalCheckpoint {
+    bytes: Vec<u8>,
+    authority_revision_sha256: [u8; 32],
+    content_sha256: [u8; 32],
+    envelope: ProviderRateLogicalCheckpointEnvelope,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateLogicalCheckpointEnvelope {
+    schema: String,
+    schema_version: u16,
+    sqlite_application_id: i64,
+    sqlite_user_version: i64,
+    sqlite_schema_sha256: [u8; 32],
+    capacities: ProviderRateCheckpointCapacities,
+    groups: Vec<ProviderRateCheckpointGroup>,
+    declarations: Vec<ProviderRateCheckpointDeclaration>,
+    authorization_subjects: Vec<ProviderRateCheckpointAuthorizationSubject>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateCheckpointCapacities {
+    maximum_groups: i64,
+    maximum_declarations: i64,
+    maximum_authorization_subjects: i64,
+    maximum_collision_keys: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateCheckpointGroup {
+    group_id: [u8; 16],
+    policy_digest: [u8; 32],
+    policy_json: Vec<u8>,
+    state_json: Vec<u8>,
+    state_digest: [u8; 32],
+    state_version: i64,
+    updated_at_ns: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateCheckpointDeclaration {
+    declaration_digest: [u8; 32],
+    group_id: [u8; 16],
+    policy_digest: [u8; 32],
+    collision_keys: Vec<u8>,
+    row_digest: [u8; 32],
+    created_at_ns: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRateCheckpointAuthorizationSubject {
+    authorization_mode: i64,
+    evidence_algorithm: i64,
+    evidence_digest: [u8; 32],
+    subject: String,
+    row_digest: [u8; 32],
+    created_at_ns: i64,
+}
+
 impl SqliteProviderRateStore {
     /// Creates or opens one hardened provider-rate database at a controlled local path.
     ///
@@ -137,6 +286,57 @@ impl SqliteProviderRateStore {
         verify_connection_configuration(&connection)?;
         verify_database_integrity(&connection)?;
         Ok(Self { path, owner })
+    }
+
+    /// Retains one bounded logical export while holding SQLite's real writer fence.
+    ///
+    /// The returned lease owns an `IMMEDIATE` transaction. It deliberately excludes process-era
+    /// runs and permits, so every restored store must establish fresh process authority through
+    /// [`ProviderRateStore::start_run`]. No store writer can commit between this retention,
+    /// materialization, and [`RetainedProviderRateCheckpoint::revalidate_emitted`].
+    pub fn retain_logical_checkpoint(
+        &self,
+    ) -> Result<RetainedProviderRateCheckpoint, ProviderRateStoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_sql)?;
+        let checkpoint = match checkpoint_from_connection(&connection) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ignored = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        Ok(RetainedProviderRateCheckpoint {
+            connection: Some(connection),
+            checkpoint,
+        })
+    }
+
+    /// Restores an exact logical checkpoint only into a database root that has never contained a
+    /// provider-rate database or one of its SQLite/owner sidecars.
+    ///
+    /// The checkpoint is decoded and completely validated before a target is opened. Its process
+    /// run and permit tables remain empty; callers must reopen normal authority through
+    /// [`ProviderRateAuthority`](market_squawk_sources::ProviderRateAuthority), which calls
+    /// [`ProviderRateStore::start_run`].
+    pub fn restore_logical_fresh(
+        path: impl Into<PathBuf>,
+        bytes: &[u8],
+        expected_authority_revision_sha256: [u8; 32],
+    ) -> Result<Self, ProviderRateStoreError> {
+        let checkpoint = decode_checkpoint(bytes)?;
+        if checkpoint.authority_revision_sha256 != expected_authority_revision_sha256 {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let path = prepare_fresh_restore_path(path.into())?;
+        let store = Self::try_open(path)?;
+        let result = restore_checkpoint(&store, &checkpoint);
+        if result.is_err() {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        Ok(store)
     }
 
     fn connection(&self) -> Result<Connection, ProviderRateStoreError> {
@@ -886,6 +1086,487 @@ fn prepare_path(path: PathBuf) -> Result<PathBuf, ProviderRateStoreError> {
     Ok(prepared)
 }
 
+fn prepare_fresh_restore_path(path: PathBuf) -> Result<PathBuf, ProviderRateStoreError> {
+    let prepared = prepare_path(path)?;
+    let parent = prepared
+        .parent()
+        .ok_or(ProviderRateStoreError::Unavailable)?;
+    let file_name = prepared
+        .file_name()
+        .ok_or(ProviderRateStoreError::Unavailable)?;
+    let mut wal_name = file_name.to_os_string();
+    wal_name.push("-wal");
+    let mut shm_name = file_name.to_os_string();
+    shm_name.push("-shm");
+    for entry in [
+        prepared.clone(),
+        parent.join(wal_name),
+        parent.join(shm_name),
+        parent.join(OWNER_LOCK_FILE),
+    ] {
+        match fs::symlink_metadata(entry) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ProviderRateStoreError::Conflict),
+        }
+    }
+    Ok(prepared)
+}
+
+fn checkpoint_from_connection(
+    connection: &Connection,
+) -> Result<ProviderRateLogicalCheckpoint, ProviderRateStoreError> {
+    verify_connection_configuration(connection)?;
+    verify_exact_schema(connection)?;
+    verify_database_integrity(connection)?;
+    verify_foreign_keys(connection)?;
+    let envelope = ProviderRateLogicalCheckpointEnvelope {
+        schema: PROVIDER_RATE_LOGICAL_CHECKPOINT_SCHEMA.to_owned(),
+        schema_version: PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION,
+        sqlite_application_id: PROVIDER_RATE_APPLICATION_ID,
+        sqlite_user_version: PROVIDER_RATE_SCHEMA_VERSION,
+        sqlite_schema_sha256: provider_rate_schema_sha256()?,
+        capacities: ProviderRateCheckpointCapacities {
+            maximum_groups: MAXIMUM_GROUPS,
+            maximum_declarations: MAXIMUM_DECLARATIONS,
+            maximum_authorization_subjects: MAXIMUM_AUTHORIZATION_SUBJECTS,
+            maximum_collision_keys: MAXIMUM_COLLISION_KEYS,
+        },
+        groups: checkpoint_groups(connection)?,
+        declarations: checkpoint_declarations(connection)?,
+        authorization_subjects: checkpoint_authorization_subjects(connection)?,
+    };
+    checkpoint_from_envelope(envelope)
+}
+
+fn checkpoint_from_envelope(
+    envelope: ProviderRateLogicalCheckpointEnvelope,
+) -> Result<ProviderRateLogicalCheckpoint, ProviderRateStoreError> {
+    validate_checkpoint_envelope(&envelope)?;
+    let bytes = serde_json::to_vec(&envelope).map_err(|_| ProviderRateStoreError::Corrupt)?;
+    if bytes.is_empty() || bytes.len() > MAXIMUM_LOGICAL_CHECKPOINT_BYTES {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    let content_sha256 = Sha256::digest(&bytes).into();
+    let mut authority = Sha256::new();
+    authority.update(b"market-squawk/provider-rate-logical-checkpoint-authority/v1\0");
+    authority.update(content_sha256);
+    Ok(ProviderRateLogicalCheckpoint {
+        bytes,
+        authority_revision_sha256: authority.finalize().into(),
+        content_sha256,
+        envelope,
+    })
+}
+
+fn decode_checkpoint(
+    bytes: &[u8],
+) -> Result<ProviderRateLogicalCheckpoint, ProviderRateStoreError> {
+    if bytes.is_empty() || bytes.len() > MAXIMUM_LOGICAL_CHECKPOINT_BYTES {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    let envelope = serde_json::from_slice(bytes).map_err(|_| ProviderRateStoreError::Corrupt)?;
+    let checkpoint = checkpoint_from_envelope(envelope)?;
+    if checkpoint.bytes != bytes {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(checkpoint)
+}
+
+fn checkpoint_groups(
+    connection: &Connection,
+) -> Result<Vec<ProviderRateCheckpointGroup>, ProviderRateStoreError> {
+    let count = bounded_table_count(connection, "provider_rate_groups", MAXIMUM_GROUPS)?;
+    let capacity = usize::try_from(count).map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(capacity)
+        .map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT group_id, policy_digest, policy_json, state_json, state_digest, \
+             state_version, updated_at_ns FROM provider_rate_groups ORDER BY group_id",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        groups.push(ProviderRateCheckpointGroup {
+            group_id: fixed_bytes(row.get(0).map_err(map_sql)?)?,
+            policy_digest: fixed_bytes(row.get(1).map_err(map_sql)?)?,
+            policy_json: row.get(2).map_err(map_sql)?,
+            state_json: row.get(3).map_err(map_sql)?,
+            state_digest: fixed_bytes(row.get(4).map_err(map_sql)?)?,
+            state_version: row.get(5).map_err(map_sql)?,
+            updated_at_ns: row.get(6).map_err(map_sql)?,
+        });
+    }
+    if groups.len() != capacity {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(groups)
+}
+
+fn checkpoint_declarations(
+    connection: &Connection,
+) -> Result<Vec<ProviderRateCheckpointDeclaration>, ProviderRateStoreError> {
+    let count = bounded_table_count(
+        connection,
+        "provider_rate_declarations",
+        MAXIMUM_DECLARATIONS,
+    )?;
+    let capacity = usize::try_from(count).map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut declarations = Vec::new();
+    declarations
+        .try_reserve_exact(capacity)
+        .map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT declaration_digest, group_id, policy_digest, collision_keys, row_digest, \
+             created_at_ns FROM provider_rate_declarations ORDER BY declaration_digest",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        declarations.push(ProviderRateCheckpointDeclaration {
+            declaration_digest: fixed_bytes(row.get(0).map_err(map_sql)?)?,
+            group_id: fixed_bytes(row.get(1).map_err(map_sql)?)?,
+            policy_digest: fixed_bytes(row.get(2).map_err(map_sql)?)?,
+            collision_keys: row.get(3).map_err(map_sql)?,
+            row_digest: fixed_bytes(row.get(4).map_err(map_sql)?)?,
+            created_at_ns: row.get(5).map_err(map_sql)?,
+        });
+    }
+    if declarations.len() != capacity {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(declarations)
+}
+
+fn checkpoint_authorization_subjects(
+    connection: &Connection,
+) -> Result<Vec<ProviderRateCheckpointAuthorizationSubject>, ProviderRateStoreError> {
+    let count = bounded_table_count(
+        connection,
+        "provider_authorization_subjects",
+        MAXIMUM_AUTHORIZATION_SUBJECTS,
+    )?;
+    let capacity = usize::try_from(count).map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut subjects = Vec::new();
+    subjects
+        .try_reserve_exact(capacity)
+        .map_err(|_| ProviderRateStoreError::Capacity)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT authorization_mode, evidence_algorithm, evidence_digest, subject, row_digest, \
+             created_at_ns FROM provider_authorization_subjects \
+             ORDER BY authorization_mode, evidence_algorithm, evidence_digest",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        subjects.push(ProviderRateCheckpointAuthorizationSubject {
+            authorization_mode: row.get(0).map_err(map_sql)?,
+            evidence_algorithm: row.get(1).map_err(map_sql)?,
+            evidence_digest: fixed_bytes(row.get(2).map_err(map_sql)?)?,
+            subject: row.get(3).map_err(map_sql)?,
+            row_digest: fixed_bytes(row.get(4).map_err(map_sql)?)?,
+            created_at_ns: row.get(5).map_err(map_sql)?,
+        });
+    }
+    if subjects.len() != capacity {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(subjects)
+}
+
+fn bounded_table_count(
+    connection: &Connection,
+    table: &str,
+    maximum: i64,
+) -> Result<i64, ProviderRateStoreError> {
+    let count: i64 = connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sql)?;
+    if !(0..=maximum).contains(&count) {
+        return Err(ProviderRateStoreError::Capacity);
+    }
+    Ok(count)
+}
+
+fn validate_checkpoint_envelope(
+    checkpoint: &ProviderRateLogicalCheckpointEnvelope,
+) -> Result<(), ProviderRateStoreError> {
+    if checkpoint.schema != PROVIDER_RATE_LOGICAL_CHECKPOINT_SCHEMA
+        || checkpoint.schema_version != PROVIDER_RATE_LOGICAL_CHECKPOINT_VERSION
+        || checkpoint.sqlite_application_id != PROVIDER_RATE_APPLICATION_ID
+        || checkpoint.sqlite_user_version != PROVIDER_RATE_SCHEMA_VERSION
+        || checkpoint.sqlite_schema_sha256 != provider_rate_schema_sha256()?
+        || checkpoint.capacities.maximum_groups != MAXIMUM_GROUPS
+        || checkpoint.capacities.maximum_declarations != MAXIMUM_DECLARATIONS
+        || checkpoint.capacities.maximum_authorization_subjects != MAXIMUM_AUTHORIZATION_SUBJECTS
+        || checkpoint.capacities.maximum_collision_keys != MAXIMUM_COLLISION_KEYS
+        || i64::try_from(checkpoint.groups.len()).map_or(true, |count| count > MAXIMUM_GROUPS)
+        || i64::try_from(checkpoint.declarations.len())
+            .map_or(true, |count| count > MAXIMUM_DECLARATIONS)
+        || i64::try_from(checkpoint.authorization_subjects.len())
+            .map_or(true, |count| count > MAXIMUM_AUTHORIZATION_SUBJECTS)
+    {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    let mut groups = std::collections::BTreeMap::new();
+    let mut previous_group = None;
+    for group in &checkpoint.groups {
+        if group.group_id == [0; 16]
+            || group.state_version < 1
+            || group.policy_json.is_empty()
+            || group.state_json.is_empty()
+            || group.policy_json.len() > MAXIMUM_LOGICAL_CHECKPOINT_BYTES
+            || group.state_json.len() > MAXIMUM_LOGICAL_CHECKPOINT_BYTES
+            || previous_group.is_some_and(|previous| previous >= group.group_id)
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let policy: ProviderBudgetPolicy = serde_json::from_slice(&group.policy_json)
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if serde_json::to_vec(&policy).map_err(|_| ProviderRateStoreError::Corrupt)?
+            != group.policy_json
+            || sha256_bytes(
+                ProviderRateDeclaration::policy_digest_for(&policy)
+                    .map_err(|_| ProviderRateStoreError::Corrupt)?,
+            )? != group.policy_digest
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let state: RateState = serde_json::from_slice(&group.state_json)
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        let last_observed_ns = state.last_observed_ns;
+        if serde_json::to_vec(&state).map_err(|_| ProviderRateStoreError::Corrupt)?
+            != group.state_json
+            || group.updated_at_ns < last_observed_ns
+            || state
+                .windows
+                .iter()
+                .any(|window| window.started_at_ns > last_observed_ns)
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let mut state_at_last_observation = state;
+        state_at_last_observation
+            .advance(&policy, Timestamp::from_unix_nanos(last_observed_ns))
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if state_digest(
+            group.group_id,
+            group.policy_digest,
+            group.state_version,
+            &group.state_json,
+        ) != group.state_digest
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        if groups.insert(group.group_id, group.policy_digest).is_some() {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        previous_group = Some(group.group_id);
+    }
+
+    let mut previous_declaration = None;
+    let mut declarations_per_group = std::collections::BTreeMap::new();
+    for declaration in &checkpoint.declarations {
+        if declaration.declaration_digest == [0; 32]
+            || declaration.group_id == [0; 16]
+            || declaration.collision_keys.len() > MAXIMUM_COLLISION_KEYS * COLLISION_KEY_BYTES
+            || previous_declaration
+                .is_some_and(|previous| previous >= declaration.declaration_digest)
+            || decode_collision_keys(&declaration.collision_keys).is_err()
+            || groups.get(&declaration.group_id) != Some(&declaration.policy_digest)
+            || declaration_row_digest(
+                declaration.declaration_digest,
+                declaration.group_id,
+                declaration.policy_digest,
+                &declaration.collision_keys,
+            ) != declaration.row_digest
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let declaration_count = declarations_per_group
+            .entry(declaration.group_id)
+            .or_insert(0_u64);
+        *declaration_count = declaration_count
+            .checked_add(1)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+        previous_declaration = Some(declaration.declaration_digest);
+    }
+    if groups
+        .keys()
+        .any(|group_id| !declarations_per_group.contains_key(group_id))
+    {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+
+    let mut previous_subject = None;
+    for subject in &checkpoint.authorization_subjects {
+        let key = (
+            subject.authorization_mode,
+            subject.evidence_algorithm,
+            subject.evidence_digest,
+        );
+        if !matches!(subject.authorization_mode, 1 | 2)
+            || !matches!(subject.evidence_algorithm, 1 | 2)
+            || subject.subject.is_empty()
+            || subject.subject.len() > 512
+            || previous_subject.is_some_and(|previous| previous >= key)
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        let source = market_squawk_domain::SourceIdentifier::try_from(subject.subject.clone())
+            .map_err(|_| ProviderRateStoreError::Corrupt)?;
+        if authorization_subject_row_digest(
+            subject.authorization_mode,
+            subject.evidence_algorithm,
+            subject.evidence_digest,
+            &source,
+        ) != subject.row_digest
+        {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        previous_subject = Some(key);
+    }
+    Ok(())
+}
+
+fn restore_checkpoint(
+    store: &SqliteProviderRateStore,
+    checkpoint: &ProviderRateLogicalCheckpoint,
+) -> Result<(), ProviderRateStoreError> {
+    let mut connection = store.connection()?;
+    verify_exact_schema(&connection)?;
+    verify_database_integrity(&connection)?;
+    verify_foreign_keys(&connection)?;
+    let transaction = immediate(&mut connection)?;
+    for table in [
+        "provider_rate_runs",
+        "provider_rate_groups",
+        "provider_rate_declarations",
+        "provider_rate_permits",
+        "provider_authorization_subjects",
+    ] {
+        let count: i64 = transaction
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .map_err(map_sql)?;
+        if count != 0 {
+            return Err(ProviderRateStoreError::Conflict);
+        }
+    }
+    for group in &checkpoint.envelope.groups {
+        transaction
+            .execute(
+                "INSERT INTO provider_rate_groups(
+                    group_id, policy_digest, policy_json, state_json, state_digest,
+                    state_version, updated_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    group.group_id,
+                    group.policy_digest,
+                    group.policy_json,
+                    group.state_json,
+                    group.state_digest,
+                    group.state_version,
+                    group.updated_at_ns,
+                ],
+            )
+            .map_err(map_sql)?;
+    }
+    for declaration in &checkpoint.envelope.declarations {
+        transaction
+            .execute(
+                "INSERT INTO provider_rate_declarations(
+                    declaration_digest, group_id, policy_digest, collision_keys, row_digest,
+                    created_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    declaration.declaration_digest,
+                    declaration.group_id,
+                    declaration.policy_digest,
+                    declaration.collision_keys,
+                    declaration.row_digest,
+                    declaration.created_at_ns,
+                ],
+            )
+            .map_err(map_sql)?;
+    }
+    for subject in &checkpoint.envelope.authorization_subjects {
+        transaction
+            .execute(
+                "INSERT INTO provider_authorization_subjects(
+                    authorization_mode, evidence_algorithm, evidence_digest, subject, row_digest,
+                    created_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    subject.authorization_mode,
+                    subject.evidence_algorithm,
+                    subject.evidence_digest,
+                    subject.subject,
+                    subject.row_digest,
+                    subject.created_at_ns,
+                ],
+            )
+            .map_err(map_sql)?;
+    }
+    verify_foreign_keys(&transaction)?;
+    transaction.commit().map_err(map_sql)?;
+    verify_connection_configuration(&connection)?;
+    verify_exact_schema(&connection)?;
+    verify_database_integrity(&connection)?;
+    verify_foreign_keys(&connection)
+}
+
+fn provider_rate_schema_sha256() -> Result<[u8; 32], ProviderRateStoreError> {
+    let connection = Connection::open_in_memory().map_err(map_sql)?;
+    connection.execute_batch(SCHEMA).map_err(map_sql)?;
+    schema_sha256(&connection)
+}
+
+fn verify_exact_schema(connection: &Connection) -> Result<(), ProviderRateStoreError> {
+    if schema_sha256(connection)? != provider_rate_schema_sha256()? {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn schema_sha256(connection: &Connection) -> Result<[u8; 32], ProviderRateStoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema \
+             WHERE name NOT LIKE 'sqlite_%' \
+             ORDER BY type COLLATE BINARY, name COLLATE BINARY, tbl_name COLLATE BINARY, \
+             COALESCE(sql, '') COLLATE BINARY",
+        )
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-rate-sqlite-schema/v1\0");
+    let mut count = 0_u64;
+    while let Some(row) = rows.next().map_err(map_sql)? {
+        for index in 0..4 {
+            let value: String = row.get(index).map_err(map_sql)?;
+            digest.update(
+                u64::try_from(value.len())
+                    .map_err(|_| ProviderRateStoreError::Corrupt)?
+                    .to_be_bytes(),
+            );
+            digest.update(value.as_bytes());
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(ProviderRateStoreError::Corrupt)?;
+    }
+    digest.update(count.to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
 fn harden_connection(connection: &Connection) -> Result<(), ProviderRateStoreError> {
     connection.busy_timeout(BUSY_TIMEOUT).map_err(map_sql)?;
     connection
@@ -965,6 +1646,17 @@ fn verify_database_integrity(connection: &Connection) -> Result<(), ProviderRate
         .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
         .map_err(map_sql)?;
     if integrity != "ok" {
+        return Err(ProviderRateStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verify_foreign_keys(connection: &Connection) -> Result<(), ProviderRateStoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(map_sql)?;
+    let mut rows = statement.query([]).map_err(map_sql)?;
+    if rows.next().map_err(map_sql)?.is_some() {
         return Err(ProviderRateStoreError::Corrupt);
     }
     Ok(())
@@ -1436,4 +2128,80 @@ fn checked_timestamp_add(
 
 fn map_sql(_error: rusqlite::Error) -> ProviderRateStoreError {
     ProviderRateStoreError::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+
+    use market_squawk_sources::{
+        BackoffPolicy, BudgetScope, EndpointPolicy, ProviderBudgetPolicy, ProviderRateDecision,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    use super::*;
+
+    #[test]
+    fn logical_checkpoint_restores_durable_budget_without_process_run_or_permit_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_root = tempfile::tempdir()?;
+        let source_path = source_root.path().join("provider-rate.sqlite3");
+        let source = SqliteProviderRateStore::try_open(&source_path)?;
+        let now = Timestamp::from_unix_nanos(1_000_000_000);
+        let run_id = source.start_run(now)?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::new(market_squawk_domain::SourceIdentifier::try_from(
+                "checkpoint-test",
+            )?),
+            NonZeroU32::new(1).ok_or("nonzero request limit")?,
+            NonZeroU64::new(60_000_000_000).ok_or("nonzero window")?,
+            NonZeroU16::new(1).ok_or("nonzero concurrency")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("nonzero backoff")?,
+                NonZeroU64::new(60_000_000_000).ok_or("nonzero backoff maximum")?,
+                0,
+            )?,
+        )?;
+        let declaration = ProviderRateDeclaration::try_for_endpoint(
+            policy,
+            &EndpointPolicy::try_new(["https://provider-rate.test/"])?,
+        )?;
+        let registration = source.register(run_id, &declaration, now)?;
+        assert!(matches!(
+            source.try_acquire(run_id, registration, now)?,
+            ProviderRateDecision::Ready(_)
+        ));
+
+        let retained = source.retain_logical_checkpoint()?;
+        let checkpoint = retained.bytes().to_vec();
+        let authority_revision_sha256 = retained.authority_revision_sha256();
+        retained.revalidate_emitted(
+            u64::try_from(checkpoint.len())?,
+            Sha256::digest(&checkpoint).into(),
+        )?;
+        drop(source);
+
+        let restore_root = tempfile::tempdir()?;
+        let restored = SqliteProviderRateStore::restore_logical_fresh(
+            restore_root.path().join("provider-rate.sqlite3"),
+            &checkpoint,
+            authority_revision_sha256,
+        )?;
+        let connection = restored.connection()?;
+        let active_runs: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM provider_rate_runs WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(active_runs, 0);
+        drop(connection);
+
+        let restored_run = restored.start_run(now)?;
+        let restored_registration = restored.register(restored_run, &declaration, now)?;
+        assert!(matches!(
+            restored.try_acquire(restored_run, restored_registration, now)?,
+            ProviderRateDecision::WaitUntil(_)
+        ));
+        Ok(())
+    }
 }

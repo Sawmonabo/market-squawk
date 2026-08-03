@@ -34,6 +34,31 @@ impl PaperSourceLifecycleControl {
         Self { controller }
     }
 
+    /// Returns the exact number of currently healthy paper-owned live source runtimes.
+    pub(crate) fn active_source_count(&self) -> Result<usize, ServiceError> {
+        let state = self
+            .controller
+            .state
+            .try_lock()
+            .map_err(|_busy| ServiceError::Unavailable)?;
+        match &*state {
+            PaperState::Stopped { .. } => Ok(0),
+            PaperState::Starting { .. } | PaperState::Stopping => Err(ServiceError::Unavailable),
+            PaperState::Running {
+                runtime,
+                exports,
+                cancellation,
+                ..
+            } if !cancellation.is_cancelled()
+                && runtime.source_is_healthy()
+                && exports.is_healthy() =>
+            {
+                Ok(1)
+            }
+            PaperState::Running { .. } => Err(ServiceError::Unavailable),
+        }
+    }
+
     /// Returns actual current runtime evidence for the exact provider surface.
     pub(crate) async fn verify(
         &self,

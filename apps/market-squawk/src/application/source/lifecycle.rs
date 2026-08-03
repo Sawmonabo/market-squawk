@@ -602,6 +602,15 @@ pub enum SourceLifecycleError {
 /// Sole source lifecycle owner injected by live/paper application composition.
 #[async_trait]
 pub trait SourceLifecycleAuthority: Send + Sync {
+    /// Returns the exact number of currently active source runtimes when the owner can sample a
+    /// coherent synchronous view.
+    ///
+    /// Implementations without a synchronous runtime-activity authority fail closed. Operations
+    /// preflight must never infer zero from that absence.
+    fn active_source_count(&self) -> Result<usize, SourceLifecycleError> {
+        Err(SourceLifecycleError::Unavailable)
+    }
+
     /// Returns the exact current lifecycle revision and runtime identity for one provider.
     async fn status(
         &self,

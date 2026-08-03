@@ -854,8 +854,10 @@ impl SharedProviderBudget {
                         return BudgetDecision::Unavailable(reason);
                     }
                     Ok(ProviderRateDecision::Ready(_)) => {
-                        return self
-                            .terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation);
+                        return self.terminal_unavailable(
+                            BudgetUnavailableReason::StateCorrupt,
+                            &operation,
+                        );
                     }
                     Err(reason) => return self.terminal_unavailable(reason, &operation),
                 }
@@ -978,8 +980,10 @@ impl SharedProviderBudget {
                         return BudgetDecision::Unavailable(reason);
                     }
                     Ok(ProviderRateDecision::Ready(_)) => {
-                        return self
-                            .terminal_unavailable(BudgetUnavailableReason::StateCorrupt, &operation);
+                        return self.terminal_unavailable(
+                            BudgetUnavailableReason::StateCorrupt,
+                            &operation,
+                        );
                     }
                     Err(reason) => return self.terminal_unavailable(reason, &operation),
                 }

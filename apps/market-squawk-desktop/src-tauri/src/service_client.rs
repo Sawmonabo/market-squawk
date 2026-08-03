@@ -374,17 +374,29 @@ pub(crate) async fn governance_query(
     request: GovernanceQueryCommand,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    let GovernanceQueryCommand::Principals { after, limit } = request;
-    let mut arguments = Map::new();
-    insert_optional(&mut arguments, "after", after);
-    insert_optional(&mut arguments, "limit", limit);
-    invoke_private_application(
-        "Governance.ListPrincipals",
-        arguments,
-        &state,
-        InvocationAuthority::ReadOnly,
-    )
-    .await
+    match request {
+        GovernanceQueryCommand::ProvisioningStatus => {
+            invoke_private_application(
+                "Governance.ProvisioningStatus",
+                Map::new(),
+                &state,
+                InvocationAuthority::ReadOnly,
+            )
+            .await
+        }
+        GovernanceQueryCommand::Principals { after, limit } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "after", after);
+            insert_optional(&mut arguments, "limit", limit);
+            invoke_private_application(
+                "Governance.ListPrincipals",
+                arguments,
+                &state,
+                InvocationAuthority::ReadOnly,
+            )
+            .await
+        }
+    }
 }
 
 #[tauri::command]
@@ -395,23 +407,57 @@ pub(crate) async fn governance_control(
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
     require_confirmation(confirmed)?;
-    let GovernanceControlCommand::AuthenticateAction {
-        preview_id,
-        principal_id,
-        credential,
-    } = request;
-    let mut arguments = Map::new();
-    arguments.insert("previewId".to_owned(), json!(preview_id));
-    arguments.insert("principalId".to_owned(), json!(principal_id));
-    arguments.insert("credential".to_owned(), Value::String(credential));
-    let result = invoke_private_application(
-        "Governance.AuthenticateAction",
-        arguments,
-        &state,
-        InvocationAuthority::ExactConfirmed("Governance.AuthenticateAction"),
-    )
-    .await?;
-    state.retain_governance_authorization(window.label(), result)
+    match request {
+        GovernanceControlCommand::ProvisionPrincipalSet {
+            primary_display_name,
+            primary_credential,
+            reviewer_display_name,
+            reviewer_credential,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert(
+                "primaryDisplayName".to_owned(),
+                Value::String(primary_display_name),
+            );
+            arguments.insert(
+                "primaryCredential".to_owned(),
+                Value::String(primary_credential),
+            );
+            arguments.insert(
+                "reviewerDisplayName".to_owned(),
+                Value::String(reviewer_display_name),
+            );
+            arguments.insert(
+                "reviewerCredential".to_owned(),
+                Value::String(reviewer_credential),
+            );
+            invoke_private_application(
+                "Governance.ProvisionPrincipalSet",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Governance.ProvisionPrincipalSet"),
+            )
+            .await
+        }
+        GovernanceControlCommand::AuthenticateAction {
+            preview_id,
+            principal_id,
+            credential,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("previewId".to_owned(), json!(preview_id));
+            arguments.insert("principalId".to_owned(), json!(principal_id));
+            arguments.insert("credential".to_owned(), Value::String(credential));
+            let result = invoke_private_application(
+                "Governance.AuthenticateAction",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Governance.AuthenticateAction"),
+            )
+            .await?;
+            state.retain_governance_authorization(window.label(), result)
+        }
+    }
 }
 
 #[tauri::command]

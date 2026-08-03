@@ -9,7 +9,7 @@ mod cli_transport;
 mod executable;
 mod fair_value_producer;
 mod governance;
-mod operations;
+pub(crate) mod operations;
 mod provider_activation_state;
 mod source_lifecycle;
 
@@ -49,7 +49,9 @@ use self::executable::{
 };
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
-use self::provider_activation_state::DurableProviderActivationState;
+use self::provider_activation_state::{
+    DurableProviderActivationState, ProviderMetadataBackupAuthority,
+};
 use self::source_lifecycle::ProductionSourceLifecycleAuthority;
 use crate::application::analysis::{
     AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority,
@@ -62,6 +64,9 @@ use crate::application::decision::{DecisionApplication, DecisionApplicationError
 use crate::application::governance::{
     DecisionGovernanceActionFactory, FairValueGovernanceActionFactory,
 };
+use crate::application::model::backup::{
+    ModelBackupAuthority, ModelBackupError, ModelBackupLimits,
+};
 use crate::application::model::runtime::{
     ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
 };
@@ -69,21 +74,23 @@ use crate::application::model::{
     ForecastApplicationError, ForecastApplicationLimits, ForecastApplicationService,
     ModelDomainService, ModelDomainServiceError,
 };
+use crate::application::settings::SettingsSeed;
 use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
-    LiveFairValueObservationBufferError, PaperApplicationServices,
+    LiveFairValueObservationBufferError, PaperApplicationServices, PaperRuntimeActivityAuthority,
     PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
-    SourceLifecycleAuthority,
+    SourceLifecycleAuthority, backup::ProductBackupError,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
 use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
+use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
@@ -142,6 +149,8 @@ pub struct LocalProduct {
     application: Arc<Application>,
     research: Arc<ResearchService>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
+    source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
+    paper_activity: Arc<dyn PaperRuntimeActivityAuthority>,
     provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
     provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
@@ -156,6 +165,9 @@ pub struct LocalProduct {
     backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar>,
     backtests: Arc<dyn GovernedBacktestAuthority>,
     model_runtime: Option<Arc<ProductionModelRuntime>>,
+    model_runtime_limits: ProductionModelRuntimeLimits,
+    forecasts: Arc<ForecastApplicationService>,
+    fair_value: Arc<FairValueDomainService>,
     fair_value_inputs: ProductionFairValueInputAuthority,
 }
 
@@ -168,6 +180,18 @@ impl LocalProduct {
     pub fn try_new(config: AppConfig) -> Result<Self, LocalProductError> {
         Self::try_new_with_prepublished_research_sources(
             config,
+            std::iter::empty::<PrepublishedResearchSourceRegistration>(),
+        )
+    }
+
+    /// Opens the product through an already selected workspace path capability.
+    pub(crate) fn try_new_at_paths(
+        config: AppConfig,
+        paths: LocalPaths,
+    ) -> Result<Self, LocalProductError> {
+        Self::try_new_with_paths_and_prepublished_research_sources(
+            config,
+            paths,
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
         )
     }
@@ -189,6 +213,17 @@ impl LocalProduct {
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
         let paths = LocalPaths::prepare(config.data_dir())?;
+        Self::try_new_with_paths_and_prepublished_research_sources(config, paths, registrations)
+    }
+
+    fn try_new_with_paths_and_prepublished_research_sources<I>(
+        config: AppConfig,
+        paths: LocalPaths,
+        registrations: I,
+    ) -> Result<Self, LocalProductError>
+    where
+        I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
+    {
         let research = Arc::new(open_research(&paths)?);
         let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
             .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
@@ -276,6 +311,7 @@ impl LocalProduct {
                 provider_activation_state.clone(),
                 paper.source_lifecycle_control(),
             ));
+        let paper_activity = paper.runtime_activity_authority();
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
@@ -284,7 +320,7 @@ impl LocalProduct {
             source_discovery,
             portal_activation.clone(),
             portal_activation,
-            source_lifecycle,
+            Arc::clone(&source_lifecycle),
         )?);
         let research_domains = ResearchApplicationServices::new_with_artifacts(
             Arc::clone(&research),
@@ -348,7 +384,8 @@ impl LocalProduct {
             Arc::clone(&artifact_repository),
             forecast_limits,
         )?);
-        let (model_runtime, model) = open_model_domain(&paths, &config, model_limits, forecasts)?;
+        let (model_runtime, model) =
+            open_model_domain(&paths, &config, model_limits, Arc::clone(&forecasts))?;
 
         let fair_value_inputs =
             ProductionFairValueInputAuthority::try_new(FairValueInputAuthorityLimits::standard())?;
@@ -385,7 +422,7 @@ impl LocalProduct {
             portfolio.clone(),
             analysis.clone(),
             model.clone(),
-            fair_value,
+            fair_value.clone(),
             &paper,
             config.source_shutdown(),
         )?);
@@ -395,6 +432,8 @@ impl LocalProduct {
             application,
             research,
             research_ingest,
+            source_lifecycle,
+            paper_activity,
             provider_onboarding: onboarding,
             provider_activation,
             provider_portal_activation,
@@ -409,6 +448,9 @@ impl LocalProduct {
             backtest_registrar,
             backtests,
             model_runtime,
+            model_runtime_limits: model_limits,
+            forecasts,
+            fair_value,
             fair_value_inputs,
         })
     }
@@ -445,6 +487,10 @@ impl LocalProduct {
     /// Returns the sole controlled path-free artifact authority shared by local transports.
     pub fn artifacts(&self) -> Arc<dyn ArtifactRepository> {
         Arc::clone(&self.artifacts) as Arc<dyn ArtifactRepository>
+    }
+
+    pub(crate) fn controlled_artifacts(&self) -> Arc<ControlledArtifactRepository> {
+        Arc::clone(&self.artifacts)
     }
 
     /// Returns one authority that resolves and reads its own verified artifact references.
@@ -553,6 +599,73 @@ impl LocalProduct {
     /// Returns model-admission authority when a signed training release was configured.
     pub fn model_runtime(&self) -> Option<Arc<ProductionModelRuntime>> {
         self.model_runtime.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn model_backup_authority(
+        &self,
+    ) -> Result<Arc<ModelBackupAuthority>, LocalProductError> {
+        Ok(ModelBackupAuthority::new(
+            self.model_runtime.as_ref().map(Arc::clone),
+            self.model_runtime_limits,
+            Arc::clone(&self.forecasts),
+            ModelBackupLimits::standard()?,
+        ))
+    }
+
+    pub(crate) fn fair_value_service(&self) -> Arc<FairValueDomainService> {
+        Arc::clone(&self.fair_value)
+    }
+
+    pub(in crate::local_product) fn provider_metadata_backup_authority(
+        &self,
+    ) -> ProviderMetadataBackupAuthority {
+        ProviderMetadataBackupAuthority::new(
+            self.provider_activation_state.clone(),
+            Arc::clone(&self.provider_onboarding),
+            Arc::clone(&self.research_ingest),
+        )
+    }
+
+    pub(crate) fn source_lifecycle_authority(&self) -> Arc<dyn SourceLifecycleAuthority> {
+        Arc::clone(&self.source_lifecycle)
+    }
+
+    pub(crate) fn paper_runtime_activity_authority(
+        &self,
+    ) -> Arc<dyn PaperRuntimeActivityAuthority> {
+        Arc::clone(&self.paper_activity)
+    }
+
+    pub(crate) fn workspace_restore_policy(
+        &self,
+        settings_seed: SettingsSeed,
+        settings_lifecycle: SettingsLifecycleAuthority,
+        jobs: market_squawk_jobs::JobRepositoryConfig,
+    ) -> Result<Arc<WorkspaceRestorePolicy>, LocalProductError> {
+        let objects = ObjectStoreConfig::try_new(
+            MAXIMUM_STAGING_BYTES,
+            MAXIMUM_ROW_GROUP_ROWS,
+            ORPHAN_GRACE,
+        )?;
+        let maximum_controlled_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
+            .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+        let maximum_buffered_component_bytes =
+            NonZeroUsize::new(512 * 1024 * 1024).ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+        WorkspaceRestorePolicy::try_new(
+            settings_seed,
+            settings_lifecycle,
+            PortfolioApplicationLimits::standard(),
+            self.model_backup_authority()?,
+            decision_repository_limits()?,
+            jobs,
+            fair_value_limits()?,
+            objects,
+            MAXIMUM_OBJECTS_PER_DATASET_GENERATION,
+            maximum_controlled_artifact_bytes,
+            maximum_buffered_component_bytes,
+        )
+        .map(Arc::new)
+        .map_err(LocalProductError::ProductBackup)
     }
 
     /// Returns separated genuine-producer fair-value publication handles.
@@ -821,6 +934,12 @@ pub enum LocalProductError {
     /// Durable forecast authority recovery or publication configuration failed.
     #[error(transparent)]
     Forecast(#[from] ForecastApplicationError),
+    /// Model and forecast backup authority construction failed.
+    #[error(transparent)]
+    ModelBackup(#[from] ModelBackupError),
+    /// Fresh workspace restore policy construction failed.
+    #[error(transparent)]
+    ProductBackup(#[from] ProductBackupError),
     /// Fair-value input authority construction failed.
     #[error(transparent)]
     FairValueInput(#[from] FairValueInputAuthorityError),

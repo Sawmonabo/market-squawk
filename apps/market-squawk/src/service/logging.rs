@@ -6,7 +6,8 @@ use std::{
 };
 
 use market_squawk_domain::Timestamp;
-use market_squawk_platform::{AppConfig, LocalPaths, PathError};
+use market_squawk_installer::{PlatformError, default_installation_data_root};
+use market_squawk_platform::{LocalPaths, PathError};
 use thiserror::Error;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _};
 
@@ -37,22 +38,16 @@ pub struct InstalledServiceLogging {
 impl InstalledServiceLogging {
     /// Opens bounded storage and installs one subscriber containing persistence and terminal layers.
     ///
-    /// The effective configuration must already be loaded so the structured store is confined to
-    /// the selected workspace. Calling this more than once fails without replacing the process
-    /// subscriber.
+    /// The store is installation-global so startup, workspace transitions, and recovery failures
+    /// remain visible through one process-owned history. Calling this more than once fails without
+    /// replacing the process subscriber.
     pub fn install(
-        config: &AppConfig,
         filter: &str,
         terminal_format: TerminalLogFormat,
     ) -> Result<Self, InstalledServiceLoggingError> {
         let filter =
             EnvFilter::try_new(filter).map_err(|_| InstalledServiceLoggingError::InvalidFilter)?;
-        let paths = LocalPaths::prepare(config.data_dir())?;
-        let store = Arc::new(StructuredLogStore::try_open(
-            paths.control_root()?,
-            LogStoragePolicy::default(),
-            current_timestamp()?,
-        )?);
+        let store = open_installation_log_store()?;
         let (structured, drain, mut worker) =
             StructuredLogLayer::try_spawn(Arc::clone(&store), STRUCTURED_LOG_QUEUE_CAPACITY)?;
         let formatter = match terminal_format {
@@ -105,6 +100,22 @@ impl InstalledServiceLogging {
     }
 }
 
+pub(super) fn open_installation_log_store()
+-> Result<Arc<StructuredLogStore>, InstalledServiceLoggingError> {
+    let paths = LocalPaths::prepare(default_installation_data_root()?)?;
+    open_log_store(&paths)
+}
+
+pub(super) fn open_log_store(
+    paths: &LocalPaths,
+) -> Result<Arc<StructuredLogStore>, InstalledServiceLoggingError> {
+    Ok(Arc::new(StructuredLogStore::try_open(
+        paths.control_root()?,
+        LogStoragePolicy::default(),
+        current_timestamp()?,
+    )?))
+}
+
 fn current_timestamp() -> Result<Timestamp, InstalledServiceLoggingError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -136,6 +147,9 @@ pub enum InstalledServiceLoggingError {
     /// The selected workspace cannot provide the required controlled paths.
     #[error("the installed-service logging workspace is unavailable")]
     Path(#[from] PathError),
+    /// The operating system did not expose the per-user installation-data location.
+    #[error(transparent)]
+    Platform(#[from] PlatformError),
     /// The bounded structured-log pipeline failed.
     #[error("the installed-service structured-log pipeline failed")]
     Structured(#[from] StructuredLogError),

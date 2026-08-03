@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::{
     McpClientKind, McpClientRegistration, McpClientRegistrationError, McpCommandSpec,
-    ObservedRegistration, SERVER_NAME,
+    McpRegistrationScope, ObservedRegistration, SERVER_NAME,
 };
 
 pub(super) const EXECUTABLE_NAME: &str = "claude";
@@ -77,7 +77,19 @@ pub(super) fn parse_registration(
         .map(|value| value.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default();
     let environment = field(&combined, "Environment:").unwrap_or_default();
+    let scope = field(&combined, "Scope:")
+        .map(|value| {
+            if value.to_ascii_lowercase().starts_with("user") {
+                McpRegistrationScope::User
+            } else {
+                McpRegistrationScope::Other
+            }
+        })
+        .ok_or(McpClientRegistrationError::InvalidClientOutput {
+            client: McpClientKind::ClaudeCode,
+        })?;
     Ok(ObservedRegistration::Present {
+        scope,
         transport: kind.to_owned(),
         command: command.to_owned(),
         arguments,

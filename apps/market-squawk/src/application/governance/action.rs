@@ -356,7 +356,6 @@ pub struct GovernanceLimits {
 
 impl GovernanceLimits {
     /// Production-safe local default; callers may only choose smaller operational bounds.
-    #[must_use]
     pub fn standard() -> Result<Self, GovernanceError> {
         Self::try_new(
             64,

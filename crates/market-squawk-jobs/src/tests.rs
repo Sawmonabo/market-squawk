@@ -162,6 +162,37 @@ impl JobRunner for StartSignalRunner {
     }
 }
 
+#[derive(Debug)]
+struct HeldRunner {
+    kind: SourceIdentifier,
+    started: StdMutex<Option<oneshot::Sender<()>>>,
+    release: Notify,
+    failure: JobFailure,
+}
+
+#[async_trait]
+impl JobRunner for HeldRunner {
+    fn kind(&self) -> &SourceIdentifier {
+        &self.kind
+    }
+
+    async fn run(&self, _context: JobRunContext) -> Result<JobCompletion, JobRunError> {
+        self.started
+            .lock()
+            .map_err(|_error| JobRunError::Recovery)?
+            .take()
+            .ok_or(JobRunError::Recovery)?
+            .send(())
+            .map_err(|()| JobRunError::Recovery)?;
+        self.release.notified().await;
+        Err(JobRunError::Failed(self.failure.clone()))
+    }
+
+    fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
+        JobRecoveryDisposition::MarkInterrupted
+    }
+}
+
 async fn terminal_snapshot(
     repository: &SqliteJobRepository,
     id: JobId,
@@ -177,6 +208,125 @@ async fn terminal_snapshot(
         }
     })
     .await??)
+}
+
+#[tokio::test]
+async fn activity_snapshot_counts_the_registered_mutation_subset() -> Result<(), TestError> {
+    let temp = TempDir::new()?;
+    let repository = repository(&temp).await?;
+    let read_spec = job_spec("read-job")?;
+    let mutation_spec = job_spec("mutation-job")?;
+    let (read_started_tx, read_started_rx) = oneshot::channel();
+    let read_runner = Arc::new(HeldRunner {
+        kind: read_spec.kind().clone(),
+        started: StdMutex::new(Some(read_started_tx)),
+        release: Notify::new(),
+        failure: JobFailure::new(source("activity-test")?, source("released")?, false),
+    });
+    let (mutation_started_tx, mutation_started_rx) = oneshot::channel();
+    let mutation_runner = Arc::new(HeldRunner {
+        kind: mutation_spec.kind().clone(),
+        started: StdMutex::new(Some(mutation_started_tx)),
+        release: Notify::new(),
+        failure: JobFailure::new(source("activity-test")?, source("released")?, false),
+    });
+    let authority = JobAuthority::try_new(
+        Arc::clone(&repository),
+        SchedulerLimits::try_new(2, 2, 1, 1)?,
+        vec![
+            JobRunnerRegistration::new(read_runner.clone(), JobActivityClass::ReadOnly),
+            JobRunnerRegistration::new(mutation_runner.clone(), JobActivityClass::Mutation),
+        ],
+    )?;
+
+    authority.start(&read_spec).await?;
+    authority.start(&mutation_spec).await?;
+    read_started_rx.await?;
+    mutation_started_rx.await?;
+
+    let activity = authority.activity();
+    assert_eq!(activity.running(), 2);
+    assert_eq!(activity.running_mutations(), 1);
+
+    read_runner.release.notify_one();
+    mutation_runner.release.notify_one();
+    let _read =
+        terminal_snapshot(repository.as_ref(), read_spec.id(), read_spec.generation()).await?;
+    let _mutation = terminal_snapshot(
+        repository.as_ref(),
+        mutation_spec.id(),
+        mutation_spec.generation(),
+    )
+    .await?;
+    assert_eq!(authority.activity(), JobActivitySnapshot::new(0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_backup_retains_the_mutation_cut_and_restores_by_replay() -> Result<(), TestError> {
+    let source_temp = TempDir::new()?;
+    let repository = repository(&source_temp).await?;
+    let spec = job_spec("product-backup")?;
+    let (started_tx, started_rx) = oneshot::channel();
+    let runner = Arc::new(HeldRunner {
+        kind: spec.kind().clone(),
+        started: StdMutex::new(Some(started_tx)),
+        release: Notify::new(),
+        failure: JobFailure::new(source("backup-test")?, source("released")?, false),
+    });
+    let authority = Arc::new(JobAuthority::try_new(
+        Arc::clone(&repository),
+        SchedulerLimits::try_new(1, 1, 1, 1)?,
+        vec![JobRunnerRegistration::new(
+            runner.clone(),
+            JobActivityClass::ReadOnly,
+        )],
+    )?);
+    authority.start(&spec).await?;
+    started_rx.await?;
+
+    let binding = JobsAndReceiptsBackupBinding::try_new(Timestamp::from_unix_nanos(20), [42; 32])?;
+    let mut lease = authority
+        .retain_jobs_and_receipts_backup(spec.kind())
+        .await?;
+    let export = lease.materialize(binding).await?;
+    let receipt = export.receipt();
+    let encoded = export.into_bytes();
+    let cancellation_authority = Arc::clone(&authority);
+    let cancel = tokio::spawn(async move {
+        cancellation_authority
+            .cancel(
+                spec.id(),
+                spec.generation(),
+                JobEventSequence::new(2),
+                Timestamp::from_unix_nanos(21),
+            )
+            .await
+    });
+    tokio::pin!(cancel);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut cancel)
+            .await
+            .is_err()
+    );
+    lease.revalidate(binding, receipt)?;
+    drop(lease);
+    let cancelling = cancel.await??;
+    assert_eq!(cancelling.state(), JobState::Cancelling);
+
+    let restored_temp = TempDir::new()?;
+    let restored_paths = LocalPaths::prepare(restored_temp.path().join("data"))?;
+    let restored_location = restored_paths.control_root()?.job_database_location();
+    let config = JobRepositoryConfig::try_new(Duration::from_millis(250), 16)?;
+    SqliteJobRepository::restore_fresh(restored_location.clone(), config, &encoded).await?;
+    let restored = SqliteJobRepository::open(restored_location, config).await?;
+    let interrupted =
+        recover_one(&restored, runner.as_ref(), Timestamp::from_unix_nanos(22)).await?;
+    assert_eq!(interrupted.state(), JobState::Interrupted);
+
+    runner.release.notify_one();
+    let _terminal = terminal_snapshot(repository.as_ref(), spec.id(), spec.generation()).await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -200,7 +350,10 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
     let cancellation_authority = JobAuthority::try_new(
         Arc::clone(&cancellation_repository),
         limits,
-        vec![cancellation_runner.clone()],
+        vec![JobRunnerRegistration::new(
+            cancellation_runner.clone(),
+            JobActivityClass::ReadOnly,
+        )],
     )?;
     cancellation_authority.start(&cancellation_spec).await?;
     let running = cancellation_running.await?;
@@ -250,7 +403,10 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
     let publication_authority = JobAuthority::try_new(
         Arc::clone(&publication_repository),
         limits,
-        vec![publication_runner.clone()],
+        vec![JobRunnerRegistration::new(
+            publication_runner.clone(),
+            JobActivityClass::ReadOnly,
+        )],
     )?;
     publication_authority.start(&publication_spec).await?;
     let running = publication_running.await?;
@@ -306,7 +462,10 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
     let reconciliation_authority = JobAuthority::try_new(
         Arc::clone(&reconciliation_repository),
         SchedulerLimits::try_new(2, 1, 2, 1)?,
-        vec![reconciliation_runner.clone(), sentinel_runner],
+        vec![
+            JobRunnerRegistration::new(reconciliation_runner.clone(), JobActivityClass::ReadOnly),
+            JobRunnerRegistration::new(sentinel_runner, JobActivityClass::ReadOnly),
+        ],
     )?;
     reconciliation_authority.start(&reconciliation_spec).await?;
     let running = reconciliation_running.await?;

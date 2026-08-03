@@ -2,10 +2,15 @@
 
 mod advanced;
 mod analytics;
+mod backup;
 mod import;
 mod model;
 mod read;
 
+pub(crate) use backup::{
+    PORTFOLIO_BACKUP_PRODUCER, PORTFOLIO_BACKUP_SCHEMA, PortfolioBackupAuthority,
+    PortfolioBackupComponent, RetainedPortfolioBackupSnapshot, TRANSACTION_BACKUP_SCHEMA,
+};
 pub(crate) use import::{
     GovernedImportCommitReceipt, PortfolioImportInterpretation, PortfolioImportPreview,
     ServerHeldPortfolioImportResolution,
@@ -132,13 +137,19 @@ pub enum PortfolioApplicationServiceError {
     /// Immutable revision construction or publication failed.
     #[error("portfolio revision publication failed")]
     Publication,
+    /// A consistent backup cannot be retained while a governed import is pending.
+    #[error("portfolio backup snapshot is unavailable while an import is pending")]
+    SnapshotUnavailable,
+    /// Restore was directed at a workspace that already contains portfolio authority state.
+    #[error("portfolio restore target is not fresh")]
+    RestoreTargetNotFresh,
     /// A Task 12 analytical kernel rejected the available evidence.
     #[error("portfolio analytical calculation failed")]
     Analytics,
 }
 
 impl PortfolioApplicationServiceError {
-    fn as_service_error(&self) -> ServiceError {
+    pub(crate) fn as_service_error(&self) -> ServiceError {
         match self {
             Self::InvalidLimits | Self::InvalidRequest | Self::Import => {
                 ServiceError::InvalidRequest
@@ -147,7 +158,10 @@ impl PortfolioApplicationServiceError {
             Self::ResourceExhausted => ServiceError::ResourceExhausted,
             Self::Cancelled => ServiceError::Cancelled,
             Self::DeadlineExceeded => ServiceError::DeadlineExceeded,
-            Self::Path | Self::Authority => ServiceError::Unavailable,
+            Self::Path
+            | Self::Authority
+            | Self::SnapshotUnavailable
+            | Self::RestoreTargetNotFresh => ServiceError::Unavailable,
             Self::CorruptPublication | Self::Publication | Self::Analytics => {
                 ServiceError::Internal
             }
@@ -181,7 +195,16 @@ impl PortfolioApplicationService {
             .map_err(|_| PortfolioApplicationServiceError::Path)?;
         let (authority, image) =
             ImportAuthority::restore(artifacts.clone(), control.root(), limits)?;
-        Ok(Self {
+        Ok(Self::from_restored(artifacts, limits, authority, image))
+    }
+
+    fn from_restored(
+        artifacts: market_squawk_platform::ArtifactRoot,
+        limits: PortfolioApplicationLimits,
+        authority: ImportAuthority,
+        image: PortfolioReadImage,
+    ) -> Self {
+        Self {
             runtime: Arc::new(Runtime {
                 artifacts,
                 limits,
@@ -192,7 +215,47 @@ impl PortfolioApplicationService {
                 active: AtomicUsize::new(0),
                 idle: Notify::new(),
             }),
-        })
+        }
+    }
+
+    /// Returns a paired backup capability without exposing import or publication authority.
+    pub(crate) fn backup_authority(&self) -> PortfolioBackupAuthority {
+        PortfolioBackupAuthority {
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Maximum verified bytes the staged-input boundary may transfer to this authority.
+    pub(crate) fn maximum_staged_import_bytes(&self) -> usize {
+        self.runtime.limits.max_artifact_bytes
+    }
+
+    fn restore_backup(
+        paths: &LocalPaths,
+        limits: PortfolioApplicationLimits,
+        portfolios: &[u8],
+        transactions: &[u8],
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        let artifacts = paths
+            .artifacts()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?
+            .clone();
+        let control = paths
+            .control_root()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?;
+        control
+            .try_clone_directory()
+            .map_err(|_| PortfolioApplicationServiceError::Path)?
+            .create_dir_all("portfolio")
+            .map_err(|_| PortfolioApplicationServiceError::Path)?;
+        let (authority, image) = ImportAuthority::restore_backup(
+            artifacts.clone(),
+            control.root(),
+            limits,
+            portfolios,
+            transactions,
+        )?;
+        Ok(Self::from_restored(artifacts, limits, authority, image))
     }
 
     /// Returns read-only access to genuine immutable portfolio revisions.
@@ -231,6 +294,24 @@ impl PortfolioApplicationService {
             input_ticket_id,
             bytes,
         )?;
+        ensure_live(&self.runtime, context)?;
+        Ok(preview)
+    }
+
+    /// Rebuilds the bounded projection for one exact server-held prepared import.
+    pub(crate) fn prepared_import_preview(
+        &self,
+        preview_id: &str,
+        context: &RequestContext,
+    ) -> Result<PortfolioImportPreview, PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let preview = authority.prepared_import_preview(&self.runtime.artifacts, preview_id)?;
         ensure_live(&self.runtime, context)?;
         Ok(preview)
     }
@@ -285,6 +366,52 @@ impl PortfolioApplicationService {
         ensure_live(&self.runtime, context)?;
         self.runtime.image.store(Arc::new(image));
         Ok(())
+    }
+
+    /// Resumes one approved import after a process interruption. The exact server-held approval
+    /// may be replayed only to finish the same durable transition; a completed publication is
+    /// recognized through its immutable governed receipt.
+    pub(crate) fn resume_approved_import(
+        &self,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let image = authority.resume_approved_import(
+            &self.runtime.artifacts,
+            preview_id,
+            interpretations,
+            resolution,
+        )?;
+        ensure_live(&self.runtime, context)?;
+        self.runtime.image.store(Arc::new(image));
+        Ok(())
+    }
+
+    /// Discards an unapproved prepared import. A promotion that has consumed approval cannot be
+    /// discarded and must complete through recovery.
+    pub(crate) fn discard_prepared_import(
+        &self,
+        preview_id: &str,
+        context: &RequestContext,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let _guard = self.runtime.admit()?;
+        ensure_live(&self.runtime, context)?;
+        let mut authority = self
+            .runtime
+            .authority
+            .lock()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        authority.discard_prepared_import(preview_id)?;
+        ensure_live(&self.runtime, context)
     }
 }
 

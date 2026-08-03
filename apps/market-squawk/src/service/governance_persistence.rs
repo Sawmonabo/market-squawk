@@ -13,19 +13,24 @@ use cap_std::fs::{Dir, OpenOptions};
 use chrono::{DateTime, SecondsFormat, Utc};
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
+    SecretGeneration, SecretMutationPlan, SecretStore, SecretValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::application::governance::{
-    GovernanceAuditError, GovernanceAuditReceipt, GovernanceAuditSink,
-    GovernancePrincipalRegistration, GovernanceRoleSet,
+    GovernanceAuditError, GovernanceAuditReceipt, GovernanceAuditSink, GovernanceAuthority,
+    GovernanceError, GovernanceLimits, GovernancePrincipal, GovernancePrincipalId,
+    GovernancePrincipalRegistration, GovernanceRole, GovernanceRoleSet,
+    governance_principal_secret_key, governance_secret_operation_control,
 };
 
 const REGISTRATION_DIRECTORY: &str = "governance-principals";
-const REGISTRATION_SCHEMA_VERSION: u16 = 1;
+const LEGACY_REGISTRATION_SCHEMA_VERSION: u16 = 1;
+const REGISTRATION_SCHEMA_VERSION: u16 = 2;
 const MAXIMUM_REGISTRATIONS: usize = 64;
 const MAXIMUM_REGISTRATION_BYTES: usize = 64 * 1024;
 
@@ -45,6 +50,28 @@ const MAXIMUM_AUDIT_PRINCIPALS: usize = 2;
 pub(crate) struct GovernancePersistence {
     registrations: LocalAuthorityStateStore,
     audit: Arc<GovernanceAuditJournal>,
+    provisioning: Mutex<()>,
+}
+
+pub(super) struct GovernanceProvisioningRequest {
+    pub(super) primary_display_name: String,
+    pub(super) primary_credential: SecretValue,
+    pub(super) reviewer_display_name: String,
+    pub(super) reviewer_credential: SecretValue,
+    pub(super) limits: GovernanceLimits,
+}
+
+impl std::fmt::Debug for GovernanceProvisioningRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GovernanceProvisioningRequest")
+            .field("primary_display_name", &self.primary_display_name)
+            .field("primary_credential", &"[REDACTED]")
+            .field("reviewer_display_name", &self.reviewer_display_name)
+            .field("reviewer_credential", &"[REDACTED]")
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for GovernancePersistence {
@@ -68,6 +95,7 @@ impl GovernancePersistence {
         Ok(Self {
             registrations,
             audit,
+            provisioning: Mutex::new(()),
         })
     }
 
@@ -75,58 +103,290 @@ impl GovernancePersistence {
     pub(crate) fn load_registrations(
         &self,
     ) -> Result<Option<Box<[GovernancePrincipalRegistration]>>, GovernancePersistenceError> {
-        self.registrations
-            .load()?
-            .map(|bytes| decode_registrations(&bytes))
-            .transpose()
+        let _guard = self
+            .provisioning
+            .lock()
+            .map_err(|_| GovernancePersistenceError::StateUnavailable)?;
+        match self.load_state()? {
+            ProvisioningState::Unprovisioned => Ok(None),
+            ProvisioningState::Preparing { .. } => {
+                Err(GovernancePersistenceError::ProvisioningRecoveryRequired)
+            }
+            ProvisioningState::Active { registrations } => Ok(Some(registrations)),
+        }
     }
 
-    /// Durably replaces the complete non-secret registration set in canonical principal order.
-    pub(crate) fn store_registrations(
+    /// Removes only exact secret generations retained by an interrupted provisioning plan.
+    pub(crate) fn recover_pending(
         &self,
-        registrations: &[GovernancePrincipalRegistration],
+        store: &dyn SecretStore,
     ) -> Result<(), GovernancePersistenceError> {
-        let registrations = canonical_registrations(registrations)?;
-        let bytes = encode_registrations(&registrations)?;
-        self.registrations.store(&bytes)?;
-        Ok(())
+        let _guard = self
+            .provisioning
+            .lock()
+            .map_err(|_| GovernancePersistenceError::StateUnavailable)?;
+        let ProvisioningState::Preparing { principals } = self.load_state()? else {
+            return Ok(());
+        };
+        cleanup_prepared(store, &principals)?;
+        self.store_state(&ProvisioningState::Unprovisioned)
+    }
+
+    /// Durably provisions the fixed two-person V1 governance set and returns its live authority.
+    pub(crate) fn provision_principal_set<T>(
+        &self,
+        store: Arc<dyn SecretStore>,
+        request: GovernanceProvisioningRequest,
+        compose: impl FnOnce(GovernanceAuthority) -> Result<T, ()>,
+    ) -> Result<T, GovernancePersistenceError> {
+        let GovernanceProvisioningRequest {
+            primary_display_name,
+            primary_credential,
+            reviewer_display_name,
+            reviewer_credential,
+            limits,
+        } = request;
+        let _guard = self
+            .provisioning
+            .lock()
+            .map_err(|_| GovernancePersistenceError::StateUnavailable)?;
+        match self.load_state()? {
+            ProvisioningState::Unprovisioned => {}
+            ProvisioningState::Preparing { .. } => {
+                return Err(GovernancePersistenceError::ProvisioningRecoveryRequired);
+            }
+            ProvisioningState::Active { .. } => {
+                return Err(GovernancePersistenceError::AlreadyProvisioned);
+            }
+        }
+        if primary_display_name == reviewer_display_name
+            || credentials_match(&primary_credential, &reviewer_credential)
+        {
+            return Err(GovernancePersistenceError::InvalidPrincipalSet);
+        }
+
+        let primary = GovernancePrincipal::try_new(
+            next_principal_id()?,
+            primary_display_name,
+            GovernanceRoleSet::try_new([
+                GovernanceRole::DecisionReviewer,
+                GovernanceRole::DecisionInvalidator,
+                GovernanceRole::FairValueApprover,
+                GovernanceRole::FairValueOverrideApprover,
+                GovernanceRole::FairValueRevoker,
+                GovernanceRole::FairValueMarketAccessApprover,
+                GovernanceRole::PortfolioImportResolver,
+            ])?,
+        )?;
+        let reviewer = GovernancePrincipal::try_new(
+            next_distinct_principal_id(primary.id())?,
+            reviewer_display_name,
+            GovernanceRoleSet::try_new([GovernanceRole::FairValueMarketAccessApprover])?,
+        )?;
+        let generation =
+            SecretGeneration::new(1).map_err(|_| GovernancePersistenceError::SecretOperation)?;
+        let planning = governance_secret_operation_control("governance-provision-plan")?;
+        let primary_key = governance_principal_secret_key(primary.id())?;
+        let reviewer_key = governance_principal_secret_key(reviewer.id())?;
+        let primary_plan = store
+            .plan_create(&primary_key, generation, &planning)
+            .map_err(|_| GovernancePersistenceError::SecretOperation)?;
+        let reviewer_plan = store
+            .plan_create(&reviewer_key, generation, &planning)
+            .map_err(|_| GovernancePersistenceError::SecretOperation)?;
+        if primary_plan.target() == reviewer_plan.target() {
+            return Err(GovernancePersistenceError::InvalidPrincipalSet);
+        }
+        let principals = vec![
+            PreparedPrincipal {
+                principal: primary,
+                credential_plan: primary_plan,
+            },
+            PreparedPrincipal {
+                principal: reviewer,
+                credential_plan: reviewer_plan,
+            },
+        ]
+        .into_boxed_slice();
+        self.store_state(&ProvisioningState::Preparing {
+            principals: principals.clone(),
+        })?;
+
+        let mutation = governance_secret_operation_control("governance-provision-commit")?;
+        if store
+            .execute_planned(
+                &primary_key,
+                &principals[0].credential_plan,
+                primary_credential,
+                &mutation,
+            )
+            .is_err()
+            || store
+                .execute_planned(
+                    &reviewer_key,
+                    &principals[1].credential_plan,
+                    reviewer_credential,
+                    &mutation,
+                )
+                .is_err()
+        {
+            return self.rollback_failed_provision(store.as_ref(), &principals);
+        }
+
+        let registrations = canonical_registrations(&[
+            GovernancePrincipalRegistration::new(
+                principals[0].principal.clone(),
+                principals[0].credential_plan.target().clone(),
+            ),
+            GovernancePrincipalRegistration::new(
+                principals[1].principal.clone(),
+                principals[1].credential_plan.target().clone(),
+            ),
+        ])?;
+        let authority = match GovernanceAuthority::try_load(
+            Arc::clone(&store),
+            registrations.clone(),
+            self.audit_sink(),
+            limits,
+        ) {
+            Ok(authority) => authority,
+            Err(_error) => return self.rollback_failed_provision(store.as_ref(), &principals),
+        };
+        let composed = match compose(authority) {
+            Ok(composed) => composed,
+            Err(()) => return self.rollback_failed_provision(store.as_ref(), &principals),
+        };
+        if self
+            .store_state(&ProvisioningState::Active {
+                registrations: registrations.clone(),
+            })
+            .is_err()
+        {
+            return self.rollback_failed_provision(store.as_ref(), &principals);
+        }
+        Ok(composed)
     }
 
     /// Returns the shared append-and-sync sink consumed by `GovernanceAuthority`.
     pub(crate) fn audit_sink(&self) -> Arc<dyn GovernanceAuditSink> {
         self.audit.clone()
     }
+
+    fn load_state(&self) -> Result<ProvisioningState, GovernancePersistenceError> {
+        self.registrations
+            .load()?
+            .map(|bytes| decode_state(&bytes))
+            .transpose()
+            .map(|state| state.unwrap_or(ProvisioningState::Unprovisioned))
+    }
+
+    fn store_state(&self, state: &ProvisioningState) -> Result<(), GovernancePersistenceError> {
+        let bytes = encode_state(state)?;
+        self.registrations.store(&bytes)?;
+        Ok(())
+    }
+
+    fn rollback_failed_provision<T>(
+        &self,
+        store: &dyn SecretStore,
+        principals: &[PreparedPrincipal],
+    ) -> Result<T, GovernancePersistenceError> {
+        cleanup_prepared(store, principals)?;
+        self.store_state(&ProvisioningState::Unprovisioned)?;
+        Err(GovernancePersistenceError::SecretOperation)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct RegistrationState {
+struct DurableRegistrationState {
+    schema_version: u16,
+    state: ProvisioningState,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum ProvisioningState {
+    Unprovisioned,
+    Preparing {
+        principals: Box<[PreparedPrincipal]>,
+    },
+    Active {
+        registrations: Box<[GovernancePrincipalRegistration]>,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PreparedPrincipal {
+    principal: GovernancePrincipal,
+    credential_plan: SecretMutationPlan,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyRegistrationState {
     schema_version: u16,
     registrations: Box<[GovernancePrincipalRegistration]>,
 }
 
-fn decode_registrations(
-    bytes: &[u8],
-) -> Result<Box<[GovernancePrincipalRegistration]>, GovernancePersistenceError> {
+fn decode_state(bytes: &[u8]) -> Result<ProvisioningState, GovernancePersistenceError> {
     if bytes.is_empty() || bytes.len() > MAXIMUM_REGISTRATION_BYTES {
         return Err(GovernancePersistenceError::InvalidRegistrationState);
     }
-    let state: RegistrationState = serde_json::from_slice(bytes)
+    if let Ok(durable) = serde_json::from_slice::<DurableRegistrationState>(bytes) {
+        if durable.schema_version != REGISTRATION_SCHEMA_VERSION {
+            return Err(GovernancePersistenceError::InvalidRegistrationState);
+        }
+        validate_state(&durable.state)?;
+        let canonical = serde_json::to_vec(&durable)
+            .map_err(|_| GovernancePersistenceError::InvalidRegistrationState)?;
+        if canonical != bytes {
+            return Err(GovernancePersistenceError::InvalidRegistrationState);
+        }
+        return Ok(durable.state);
+    }
+
+    let legacy: LegacyRegistrationState = serde_json::from_slice(bytes)
         .map_err(|_| GovernancePersistenceError::InvalidRegistrationState)?;
-    if state.schema_version != REGISTRATION_SCHEMA_VERSION
-        || state.registrations.is_empty()
-        || state.registrations.len() > MAXIMUM_REGISTRATIONS
-        || !registration_order_is_canonical(&state.registrations)
-    {
+    if legacy.schema_version != LEGACY_REGISTRATION_SCHEMA_VERSION {
         return Err(GovernancePersistenceError::InvalidRegistrationState);
     }
-    validate_registrations(&state.registrations)?;
-    let canonical = serde_json::to_vec(&state)
+    validate_registrations(&legacy.registrations)?;
+    let canonical = serde_json::to_vec(&legacy)
         .map_err(|_| GovernancePersistenceError::InvalidRegistrationState)?;
     if canonical != bytes {
         return Err(GovernancePersistenceError::InvalidRegistrationState);
     }
-    Ok(state.registrations)
+    Ok(ProvisioningState::Active {
+        registrations: legacy.registrations,
+    })
+}
+
+fn validate_state(state: &ProvisioningState) -> Result<(), GovernancePersistenceError> {
+    match state {
+        ProvisioningState::Unprovisioned => Ok(()),
+        ProvisioningState::Preparing { principals } => validate_prepared(principals),
+        ProvisioningState::Active { registrations } => validate_registrations(registrations),
+    }
+}
+
+fn validate_prepared(principals: &[PreparedPrincipal]) -> Result<(), GovernancePersistenceError> {
+    if principals.len() != 2
+        || principals[0].principal.id() == principals[1].principal.id()
+        || principals[0].credential_plan.target() == principals[1].credential_plan.target()
+    {
+        return Err(GovernancePersistenceError::InvalidRegistrationState);
+    }
+    for principal in principals {
+        GovernancePrincipal::try_new(
+            principal.principal.id(),
+            principal.principal.display_name().to_owned(),
+            principal.principal.roles().clone(),
+        )
+        .map_err(|_| GovernancePersistenceError::InvalidRegistrationState)?;
+    }
+    Ok(())
 }
 
 fn canonical_registrations(
@@ -182,13 +442,11 @@ fn registration_order_is_canonical(registrations: &[GovernancePrincipalRegistrat
         .all(|pair| pair[0].principal().id() < pair[1].principal().id())
 }
 
-fn encode_registrations(
-    registrations: &[GovernancePrincipalRegistration],
-) -> Result<Vec<u8>, GovernancePersistenceError> {
-    validate_registrations(registrations)?;
-    let bytes = serde_json::to_vec(&RegistrationState {
+fn encode_state(state: &ProvisioningState) -> Result<Vec<u8>, GovernancePersistenceError> {
+    validate_state(state)?;
+    let bytes = serde_json::to_vec(&DurableRegistrationState {
         schema_version: REGISTRATION_SCHEMA_VERSION,
-        registrations: registrations.to_vec().into_boxed_slice(),
+        state: state.clone(),
     })
     .map_err(|_| GovernancePersistenceError::InvalidRegistrationState)?;
     if bytes.len() > MAXIMUM_REGISTRATION_BYTES
@@ -197,6 +455,42 @@ fn encode_registrations(
         return Err(GovernancePersistenceError::Capacity);
     }
     Ok(bytes)
+}
+
+fn cleanup_prepared(
+    store: &dyn SecretStore,
+    principals: &[PreparedPrincipal],
+) -> Result<(), GovernancePersistenceError> {
+    let control = governance_secret_operation_control("governance-provision-recovery")?;
+    for prepared in principals {
+        let key = governance_principal_secret_key(prepared.principal.id())?;
+        store
+            .delete_planned(&key, &prepared.credential_plan, &control)
+            .map_err(|_| GovernancePersistenceError::ProvisioningRecoveryRequired)?;
+    }
+    Ok(())
+}
+
+fn credentials_match(left: &SecretValue, right: &SecretValue) -> bool {
+    let left_digest = Sha256::digest(left.expose_secret().as_bytes());
+    let right_digest = Sha256::digest(right.expose_secret().as_bytes());
+    bool::from(left_digest.ct_eq(&right_digest))
+}
+
+fn next_principal_id() -> Result<GovernancePrincipalId, GovernancePersistenceError> {
+    GovernancePrincipalId::try_from_uuid(Uuid::new_v4()).map_err(Into::into)
+}
+
+fn next_distinct_principal_id(
+    other: GovernancePrincipalId,
+) -> Result<GovernancePrincipalId, GovernancePersistenceError> {
+    for _ in 0..8 {
+        let candidate = next_principal_id()?;
+        if candidate != other {
+            return Ok(candidate);
+        }
+    }
+    Err(GovernancePersistenceError::InvalidPrincipalSet)
 }
 
 /// Private, lifetime-locked governance journal; its debug form never exposes durable content.
@@ -858,6 +1152,24 @@ pub(crate) enum GovernancePersistenceError {
     /// The two-copy principal authority was unavailable or corrupt.
     #[error(transparent)]
     State(#[from] LocalAuthorityStateStoreError),
+    /// The in-process provisioning serialization boundary was poisoned.
+    #[error("governance provisioning state is unavailable")]
+    StateUnavailable,
+    /// Principal names, credentials, or generated identities cannot form the fixed V1 set.
+    #[error("governance principal set is invalid")]
+    InvalidPrincipalSet,
+    /// Governance is already durably provisioned and cannot be overwritten by setup.
+    #[error("governance principal set is already provisioned")]
+    AlreadyProvisioned,
+    /// An interrupted secret mutation must be recovered before setup can continue.
+    #[error("governance principal provisioning requires recovery")]
+    ProvisioningRecoveryRequired,
+    /// A protected secret-store operation failed without exposing provider or credential details.
+    #[error("governance protected credential operation failed")]
+    SecretOperation,
+    /// Canonical governance validation rejected the fixed principal set or protected authority.
+    #[error(transparent)]
+    Governance(#[from] GovernanceError),
     /// Principal metadata was malformed, noncanonical, unsupported, or internally inconsistent.
     #[error("governance principal registration state is invalid")]
     InvalidRegistrationState,
@@ -877,9 +1189,11 @@ pub(crate) enum GovernancePersistenceError {
     #[error("governance audit endpoint owner does not match the service owner")]
     AuditOwnerMismatch,
     /// The platform could not prove an owner-only audit access policy.
+    #[cfg(not(unix))]
     #[error("governance audit endpoint privacy cannot be proven")]
     AuditPermissionProofUnavailable,
     /// The platform cannot durably synchronize the audit endpoint's directory entry.
+    #[cfg(not(any(unix, windows)))]
     #[error("governance audit parent-directory durability cannot be established")]
     DirectoryDurabilityUnavailable,
     /// Another process already owns the governance journal.

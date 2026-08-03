@@ -7,16 +7,15 @@ use std::{
 };
 
 use market_squawk_domain::Timestamp;
-use market_squawk_platform::{
-    LocalSecretStoreError, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
-    SecretKey, SecretOperationControl, SecretStore, SecretValue,
-};
+use market_squawk_platform::{LocalSecretStoreError, SecretGeneration, SecretStore, SecretValue};
 use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
 #[cfg(test)]
 use super::GovernanceAuditError;
-use super::identity::{GOVERNANCE_SECRET_SCOPE, GovernanceEffect, SECRET_OPERATION_TIMEOUT};
+use super::identity::{
+    GovernanceEffect, governance_principal_secret_key, governance_secret_operation_control,
+};
 use super::{
     GovernanceActionDigest, GovernanceActionPreview, GovernanceAuditKind, GovernanceAuditReceipt,
     GovernanceAuditSink, GovernanceAuthenticationTicket, GovernanceAuthorizedPrincipal,
@@ -107,7 +106,7 @@ impl GovernanceAuthority {
             let credential = store
                 .read(
                     registration.credential(),
-                    &secret_control("governance-load")?,
+                    &governance_secret_operation_control("governance-load")?,
                 )
                 .map_err(map_secret_error)?;
             principals.insert(
@@ -147,12 +146,12 @@ impl GovernanceAuthority {
             .try_reserve_exact(admissions.len())
             .map_err(|_| GovernanceError::CapacityExceeded)?;
         for admission in admissions {
-            let key = principal_secret_key(admission.principal.id)?;
+            let key = governance_principal_secret_key(admission.principal.id)?;
             let created = store.create(
                 &key,
                 generation,
                 admission.credential,
-                &secret_control("governance-provision")?,
+                &governance_secret_operation_control("governance-provision")?,
             );
             match created {
                 Ok(credential) => registrations.push(GovernancePrincipalRegistration::new(
@@ -603,29 +602,11 @@ fn next_receipt_id() -> Result<GovernanceReceiptId, GovernanceError> {
     GovernanceReceiptId::try_from_uuid(Uuid::new_v4())
 }
 
-fn principal_secret_key(id: GovernancePrincipalId) -> Result<SecretKey, GovernanceError> {
-    SecretKey::try_new(GOVERNANCE_SECRET_SCOPE, &id.as_uuid().to_string()).map_err(map_secret_error)
-}
-
-fn secret_control(owner: &'static str) -> Result<SecretOperationControl, GovernanceError> {
-    let deadline = Instant::now()
-        .checked_add(SECRET_OPERATION_TIMEOUT)
-        .ok_or(GovernanceError::SecretStoreUnavailable)?;
-    SecretOperationControl::try_new(
-        owner,
-        deadline,
-        1,
-        SecretInteractionPolicy::Forbid,
-        SecretCancellation::new(),
-    )
-    .map_err(map_secret_error)
-}
-
 fn cleanup_registrations(
     store: &Arc<dyn SecretStore>,
     registrations: &[GovernancePrincipalRegistration],
 ) {
-    let Ok(control) = secret_control("governance-provision-cleanup") else {
+    let Ok(control) = governance_secret_operation_control("governance-provision-cleanup") else {
         return;
     };
     for registration in registrations {

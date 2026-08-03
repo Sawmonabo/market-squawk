@@ -41,9 +41,9 @@ fn state_from_code(value: i64) -> Result<JobState, JobRepositoryError> {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct StoredSnapshot {
+pub(super) struct StoredSnapshot {
     id: Uuid,
     generation: u64,
     kind: SourceIdentifier,
@@ -69,14 +69,14 @@ struct StoredSnapshot {
     cancellation_requested: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 enum StoredRequestId {
     Integer(i64),
     String(String),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredProgress {
     phase: SourceIdentifier,
@@ -85,7 +85,7 @@ struct StoredProgress {
     recorded_at: Timestamp,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredConfirmation {
     identity: SourceIdentifier,
@@ -93,7 +93,7 @@ struct StoredConfirmation {
     expires_at: Timestamp,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredResult {
     authority: SourceIdentifier,
@@ -102,7 +102,7 @@ struct StoredResult {
     artifacts: Vec<StoredArtifact>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredArtifact {
     id: String,
@@ -111,7 +111,7 @@ struct StoredArtifact {
     media_type: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredFailure {
     class: SourceIdentifier,
@@ -119,9 +119,9 @@ struct StoredFailure {
     retryable: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct StoredEvent {
+pub(super) struct StoredEvent {
     state: i64,
     occurred_at: Timestamp,
     progress: Option<StoredProgress>,

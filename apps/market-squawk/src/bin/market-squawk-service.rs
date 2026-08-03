@@ -89,8 +89,8 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     } else {
         TerminalLogFormat::Human
     };
-    let mut logging = InstalledServiceLogging::install(&config, &arguments.log, terminal_format)?;
-    let result = run_installed_service(config).await;
+    let mut logging = InstalledServiceLogging::install(&arguments.log, terminal_format)?;
+    let result = run_installed_service(config, logging.store()).await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
         if evidence.accepted == evidence.persisted
             && evidence.dropped_overflow == 0
@@ -112,9 +112,12 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     }
 }
 
-async fn run_installed_service(config: AppConfig) -> Result<InstalledServiceRunOutcome> {
+async fn run_installed_service(
+    config: AppConfig,
+    logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
+) -> Result<InstalledServiceRunOutcome> {
     let mut termination = TerminationSignals::install()?;
-    let service = InstalledService::start(config).await?;
+    let service = InstalledService::start_with_logging_store(config, logs).await?;
     let cancellation = CancellationToken::new();
     let mut serving = Box::pin(service.run(cancellation.clone()));
     tokio::select! {

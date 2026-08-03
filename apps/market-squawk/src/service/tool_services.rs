@@ -12,13 +12,14 @@ use uuid::Uuid;
 
 use crate::{
     LocalProduct,
-    application::Application,
+    application::{Application, operations::OperationsApplicationServices},
     jobs::{InstalledJobAuthority, InstalledJobRunners},
 };
 
 use super::{
     analysis::InstalledAnalysisOperations, decision::InstalledDecisionOperations,
-    jobs::InstalledJobOperations,
+    jobs::InstalledJobOperations, operations::InstalledOperations,
+    portfolio_import::InstalledPortfolioImportOperations,
 };
 
 const START_INGEST: &str = "Research.StartIngestSource";
@@ -40,24 +41,44 @@ pub(super) struct InstalledToolServices {
     inputs: Arc<InputStager>,
     analysis: InstalledAnalysisOperations,
     decisions: InstalledDecisionOperations,
+    operations: InstalledOperations,
+    portfolio_import: InstalledPortfolioImportOperations,
 }
 
 impl InstalledToolServices {
     pub(super) fn try_new(
         application: Arc<Application>,
+        operations: Arc<OperationsApplicationServices>,
         product: &LocalProduct,
         jobs: &InstalledJobAuthority,
         runners: Arc<InstalledJobRunners>,
         inputs: Arc<InputStager>,
+        portfolio_import: InstalledPortfolioImportOperations,
     ) -> Result<Self, ServiceError> {
+        let installed_operations = InstalledOperations::new(
+            operations,
+            jobs,
+            Arc::clone(runners.backup()),
+            Arc::clone(runners.recovery()),
+            Arc::clone(runners.update()),
+        );
         Ok(Self {
             application,
             jobs: InstalledJobOperations::new(jobs),
             runners,
-            inputs,
+            inputs: Arc::clone(&inputs),
             analysis: InstalledAnalysisOperations::new(product, jobs),
             decisions: InstalledDecisionOperations::try_new(product.decisions())?,
+            operations: installed_operations,
+            portfolio_import,
         })
+    }
+
+    pub(super) fn recover_promoting_portfolio_imports(
+        &self,
+        context: &RequestContext,
+    ) -> Result<(), ServiceError> {
+        self.portfolio_import.recover_promoting(context)
     }
 
     async fn start_job(
@@ -283,6 +304,8 @@ impl std::fmt::Debug for InstalledToolServices {
             .field("inputs", &"[ONE-SHOT NATIVE INPUT STAGER]")
             .field("analysis", &self.analysis)
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
+            .field("operations", &self.operations)
+            .field("portfolio_import", &self.portfolio_import)
             .finish()
     }
 }
@@ -349,6 +372,24 @@ impl ToolServices for InstalledToolServices {
                 .map_err(ServiceError::from)?;
             return Ok(result);
         }
+        if InstalledPortfolioImportOperations::owns(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.portfolio_import.call(request, context).await?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
         if InstalledAnalysisOperations::owns(request.name()) {
             let descriptor = self
                 .application
@@ -362,6 +403,24 @@ impl ToolServices for InstalledToolServices {
                 return Err(ServiceError::InvalidRequest);
             }
             let result = self.analysis.call(&request, &context).await?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if InstalledOperations::owns(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.operations.call(&request, &context).await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;

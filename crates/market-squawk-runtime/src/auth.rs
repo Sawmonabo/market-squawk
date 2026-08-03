@@ -239,6 +239,24 @@ impl fmt::Debug for CredentialRegistry {
 }
 
 impl CredentialRegistry {
+    /// Returns the complete registered client set for bounded runtime activity accounting.
+    ///
+    /// The identities are non-secret and sorted so the transport can preallocate one fixed slot
+    /// per admitted client before it accepts requests.
+    pub fn registered_client_ids(&self) -> Result<Box<[ClientId]>, CredentialError> {
+        let active = self
+            .active
+            .read()
+            .map_err(|_| CredentialError::Unavailable)?;
+        let mut clients = Vec::new();
+        clients
+            .try_reserve_exact(active.len())
+            .map_err(|_| CredentialError::Unavailable)?;
+        clients.extend(active.keys().copied());
+        clients.sort_unstable();
+        Ok(clients.into_boxed_slice())
+    }
+
     /// Freezes exact first-generation secret targets before any credential bytes are written.
     pub fn plan_set(
         store: &dyn SecretStore,

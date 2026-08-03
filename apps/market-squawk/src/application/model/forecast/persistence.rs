@@ -72,6 +72,26 @@ impl VintageRecord {
         self.payload.points.first().map(|point| point.decimal_scale)
     }
 
+    pub(in crate::application::model) fn artifact_reference(
+        &self,
+    ) -> Result<ArtifactReference, ForecastApplicationError> {
+        ArtifactReference::try_new(
+            self.controlled_artifact.artifact_id.clone(),
+            self.controlled_artifact.sha256.clone(),
+            self.controlled_artifact.byte_count,
+            self.controlled_artifact.media_type.clone(),
+        )
+        .map_err(ForecastApplicationError::from)
+    }
+
+    pub(in crate::application::model) fn model_coordinate(&self) -> (&str, &str, u64) {
+        (
+            &self.payload.model_id,
+            &self.payload.bundle_id,
+            self.payload.bundle_version,
+        )
+    }
+
     fn validate(&self) -> bool {
         valid_digest(&self.vintage_id)
             && valid_digest(&self.request_hash)
@@ -617,7 +637,7 @@ impl OutcomeRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub(super) struct ForecastIndex {
+pub(in crate::application::model) struct ForecastIndex {
     schema_version: u32,
     pub(super) vintages: Vec<VintageRecord>,
     pub(super) outcomes: Vec<OutcomeRecord>,
@@ -678,6 +698,72 @@ impl ForecastIndex {
             }
         }
         Ok(())
+    }
+
+    pub(in crate::application::model) fn canonical_bytes(
+        &self,
+        limits: ForecastApplicationLimits,
+    ) -> Result<Vec<u8>, ForecastApplicationError> {
+        self.validate(limits)?;
+        let mut canonical = self.clone();
+        canonical
+            .vintages
+            .sort_unstable_by(|left, right| left.vintage_id.cmp(&right.vintage_id));
+        canonical.outcomes.sort_unstable_by(|left, right| {
+            left.vintage_id
+                .cmp(&right.vintage_id)
+                .then_with(|| left.target_at_unix_nanos.cmp(&right.target_at_unix_nanos))
+                .then_with(|| left.outcome_id.cmp(&right.outcome_id))
+        });
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        if bytes.len() > limits.maximum_index_bytes.get() {
+            return Err(ForecastApplicationError::Capacity);
+        }
+        Ok(bytes)
+    }
+
+    pub(in crate::application::model) fn decode_canonical(
+        bytes: &[u8],
+        limits: ForecastApplicationLimits,
+    ) -> Result<Self, ForecastApplicationError> {
+        let index = serde_json::from_slice::<Self>(bytes)
+            .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        if index.canonical_bytes(limits)? != bytes {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(index)
+    }
+
+    pub(in crate::application::model) fn artifact_references(
+        &self,
+    ) -> Result<Vec<ArtifactReference>, ForecastApplicationError> {
+        let mut references = self
+            .vintages
+            .iter()
+            .map(VintageRecord::artifact_reference)
+            .collect::<Result<Vec<_>, _>>()?;
+        if references.iter().enumerate().any(|(position, reference)| {
+            references[position + 1..].iter().any(|other| {
+                (reference.sha256() == other.sha256() || reference.id() == other.id())
+                    && reference != other
+            })
+        }) {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        references.sort_unstable_by(|left, right| {
+            left.sha256()
+                .cmp(right.sha256())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+        references.dedup();
+        Ok(references)
+    }
+
+    pub(in crate::application::model) fn model_coordinates(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, u64)> {
+        self.vintages.iter().map(VintageRecord::model_coordinate)
     }
 }
 

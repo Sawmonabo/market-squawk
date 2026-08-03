@@ -362,6 +362,72 @@ pub struct RegistryAuthorityState {
     budget_policies: BoundedVec<PersistedProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
 }
 
+/// Canonical clean-restart image for registry tombstones and durable provider-budget checkpoints.
+///
+/// The opaque payload contains no registry handles, active sessions, request permits, health
+/// authority, runtime clock handles, or in-use run marker. It can only be minted after the live
+/// registry proves that every durable budget allocation has zero in-flight requests.
+pub(crate) struct RegistryCleanRestartBackup {
+    bytes: Box<[u8]>,
+}
+
+impl RegistryCleanRestartBackup {
+    /// Validates one canonical owner-issued clean-restart image.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, in-use, future-dated, or non-clean budget state.
+    pub(crate) fn try_from_bytes(bytes: &[u8]) -> Result<Self, RegistryError> {
+        let now = current_registry_wall_time()?;
+        let envelope = crate::policy::deserialize_clean_restart_backup(bytes, now)
+            .map_err(map_authority_persistence_error)?;
+        let canonical = crate::policy::serialize_clean_restart_backup(&envelope)
+            .map_err(map_authority_persistence_error)?;
+        Ok(Self {
+            bytes: canonical.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the exact canonical clean-restart bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Seeds an absent production store without opening registry or runtime authority.
+    ///
+    /// Normal startup must subsequently reconstruct the registry and adapters through their usual
+    /// constructors. Existing authority state is never overwritten.
+    pub(crate) fn restore_fresh(
+        &self,
+        store: market_squawk_platform::LocalAuthorityStateStore,
+    ) -> Result<(), RegistryError> {
+        if store
+            .load()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?
+            .is_some()
+        {
+            return Err(RegistryError::InvalidAuthorityState);
+        }
+        store
+            .store(&self.bytes)
+            .map_err(|_error| RegistryError::AuthorityPersistence)
+    }
+}
+
+impl std::fmt::Debug for RegistryCleanRestartBackup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryCleanRestartBackup")
+            .field("byte_length", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn current_registry_wall_time() -> Result<Timestamp, RegistryError> {
+    let clock = SealedRegistryClock::new(Arc::new(SystemRawRegistryClock::try_new()?));
+    clock.observe().map(TrustedRegistryTime::wall)
+}
+
 impl RegistryAuthorityState {
     pub(crate) fn empty() -> Self {
         Self {

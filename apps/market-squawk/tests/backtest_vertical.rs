@@ -56,7 +56,7 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, UniverseMembershipObservation,
 };
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
-use market_squawk_jobs::{JobOrigin, JobRunner, JobState};
+use market_squawk_jobs::{JobActivityClass, JobOrigin, JobRunner, JobRunnerRegistration, JobState};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, ResultCompleteness, ServiceError,
@@ -170,7 +170,10 @@ async fn job_domain_start_backtest_returns_before_completion_and_survives_discon
     let runner_trait: Arc<dyn JobRunner> = runner.clone();
     let jobs = market_squawk::jobs::InstalledJobAuthority::open(
         &paths,
-        vec![runner_trait],
+        vec![JobRunnerRegistration::new(
+            runner_trait,
+            JobActivityClass::Mutation,
+        )],
         Timestamp::from_unix_nanos(100),
     )
     .await?;
@@ -238,7 +241,10 @@ async fn job_domain_explicit_backtest_cancel_cannot_publish_a_governed_record() 
     let runner_trait: Arc<dyn JobRunner> = runner.clone();
     let jobs = market_squawk::jobs::InstalledJobAuthority::open(
         &paths,
-        vec![runner_trait],
+        vec![JobRunnerRegistration::new(
+            runner_trait,
+            JobActivityClass::Mutation,
+        )],
         Timestamp::from_unix_nanos(100),
     )
     .await?;

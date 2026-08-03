@@ -5,7 +5,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -21,6 +21,7 @@ use market_squawk_services::ServiceError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     application::{
@@ -37,67 +38,24 @@ use crate::{
         workspace::DurableWorkspaceRegistry,
     },
     jobs::{
-        LifecycleJobExecutionError, LifecycleJobPublication, RecoveryJobAction, RecoveryJobCommand,
-        RecoveryJobRunner,
+        LifecycleJobExecutionError, LifecycleJobPublication, LifecycleJobPublicationError,
+        RecoveryJobAction, RecoveryJobCommand, RecoveryJobRunner,
     },
 };
 
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const AUTHORITY_DIRECTORY: &str = "installed-recovery-authority";
 const MAXIMUM_PREVIEWS: usize = 64;
 const MAXIMUM_OPERATIONS: usize = 128;
 const MAXIMUM_RECEIPTS: usize = 256;
 
-/// Live, bounded facts published by the sole installed composition owner.
-///
-/// The registry is deliberately concrete: application composition publishes snapshots after
-/// consulting the job, source, paper, execution, client, disk, and schema authorities. Recovery
-/// never reconstructs those facts from presentation state.
-#[derive(Default)]
-pub struct RecoveryRuntimeActivity {
-    snapshots: RwLock<BTreeMap<WorkspaceId, WorkspaceActivitySnapshot>>,
-}
-
-impl RecoveryRuntimeActivity {
-    /// Replaces the exact current snapshot for one known workspace.
-    pub fn publish(
-        &self,
-        workspace_id: WorkspaceId,
-        snapshot: WorkspaceActivitySnapshot,
-    ) -> Result<(), ServiceError> {
-        self.snapshots
-            .write()
-            .map_err(|_| ServiceError::Unavailable)?
-            .insert(workspace_id, snapshot);
-        Ok(())
-    }
-
-    /// Removes facts when a workspace has been permanently retired.
-    pub fn remove(&self, workspace_id: WorkspaceId) -> Result<(), ServiceError> {
-        self.snapshots
-            .write()
-            .map_err(|_| ServiceError::Unavailable)?
-            .remove(&workspace_id);
-        Ok(())
-    }
-
+/// Exact live activity facts consulted for every recovery preflight.
+pub(crate) trait RecoveryActivityAuthority: fmt::Debug + Send + Sync {
+    /// Samples the current bounded activity for one workspace.
     fn snapshot(
         &self,
         workspace_id: WorkspaceId,
-    ) -> Result<WorkspaceActivitySnapshot, ServiceError> {
-        self.snapshots
-            .read()
-            .map_err(|_| ServiceError::Unavailable)?
-            .get(&workspace_id)
-            .copied()
-            .ok_or(ServiceError::Unavailable)
-    }
-}
-
-impl fmt::Debug for RecoveryRuntimeActivity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RecoveryRuntimeActivity([COMPOSITION-OWNED FACTS])")
-    }
+    ) -> Result<WorkspaceActivitySnapshot, ServiceError>;
 }
 
 /// Exact root-composition hooks for a supervisor-restart workspace transition.
@@ -105,7 +63,7 @@ impl fmt::Debug for RecoveryRuntimeActivity {
 /// `request_restart` signals the outer service lifecycle only after the durable selector commits.
 /// It must not invoke native service control, in-process recomposition, or same-process health.
 #[async_trait]
-pub trait InstalledServiceRecoveryHooks: fmt::Debug + Send + Sync {
+pub(crate) trait InstalledServiceRecoveryHooks: fmt::Debug + Send + Sync {
     /// Rejects new mutation work, drains running work and sources, stops paper execution, and
     /// completes execution reconciliation before the selector may change.
     async fn drain_and_reconcile(&self, deadline: Instant) -> Result<(), LifecycleError>;
@@ -115,6 +73,22 @@ pub trait InstalledServiceRecoveryHooks: fmt::Debug + Send + Sync {
         &self,
         expected: market_squawk_runtime::RuntimeIdentity,
     ) -> Result<(), LifecycleError>;
+}
+
+/// Installation-global workspace-selection authority used by a recovery restart.
+///
+/// Implementations must stage the exact selector-owned handoff and durably correlate it to the
+/// already armed recovery operation before returning the candidate identity.
+pub(crate) trait RecoveryWorkspaceSelectionAuthority: fmt::Debug + Send + Sync {
+    /// Stages one idempotent activation handoff from the exact active generation.
+    fn stage_activation(
+        &self,
+        expected_active: WorkspaceRuntimeIdentity,
+        target: WorkspaceId,
+    ) -> Result<WorkspaceRuntimeIdentity, LifecycleError>;
+
+    /// Returns whether selector publication may already require replacement-process recovery.
+    fn has_pending_handoff(&self) -> Result<bool, LifecycleError>;
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -133,12 +107,62 @@ enum SelectorDisposition {
     RolledBack,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Recovery-journal interpretation of one selector-owned supervisor handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceRecoveryDisposition {
+    /// The requested target workspace became the selector candidate.
+    Activated,
+    /// The selector restored the prior workspace under a newer generation.
+    RolledBack,
+}
+
+impl From<WorkspaceRecoveryDisposition> for SelectorDisposition {
+    fn from(disposition: WorkspaceRecoveryDisposition) -> Self {
+        match disposition {
+            WorkspaceRecoveryDisposition::Activated => Self::Activated,
+            WorkspaceRecoveryDisposition::RolledBack => Self::RolledBack,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PendingWorkspaceSelector {
+struct PendingWorkspaceHandoffEvidence {
+    handoff_id: Uuid,
     previous: WorkspaceRuntimeIdentity,
+    attempted: WorkspaceRuntimeIdentity,
     candidate: WorkspaceRuntimeIdentity,
     disposition: SelectorDisposition,
+}
+
+/// Exact selector handoff retained only as recovery-operation evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryWorkspaceHandoff {
+    handoff_id: Uuid,
+    candidate: WorkspaceRuntimeIdentity,
+}
+
+impl RecoveryWorkspaceHandoff {
+    /// Opaque selector handoff identity.
+    #[must_use]
+    pub(crate) const fn handoff_id(self) -> Uuid {
+        self.handoff_id
+    }
+
+    /// Current selector candidate, which may be the rollback generation.
+    #[must_use]
+    pub(crate) const fn candidate(self) -> WorkspaceRuntimeIdentity {
+        self.candidate
+    }
+}
+
+impl From<PendingWorkspaceHandoffEvidence> for RecoveryWorkspaceHandoff {
+    fn from(pending: PendingWorkspaceHandoffEvidence) -> Self {
+        Self {
+            handoff_id: pending.handoff_id,
+            candidate: pending.candidate,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -186,9 +210,8 @@ impl DurableRecoveryReceipt {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RecoveryDocument {
     format_version: u16,
-    active_workspace: WorkspaceRuntimeIdentity,
-    pending_workspace: Option<PendingWorkspaceSelector>,
     armed_workspace: Option<ArmedWorkspaceOperation>,
+    pending_workspace_handoff: Option<PendingWorkspaceHandoffEvidence>,
     program_generation: ProgramGeneration,
     pending_program: Option<PendingProgramRollback>,
     program_recovery_required: bool,
@@ -196,15 +219,11 @@ struct RecoveryDocument {
 }
 
 impl RecoveryDocument {
-    fn initial(
-        active_workspace: WorkspaceRuntimeIdentity,
-        program_generation: ProgramGeneration,
-    ) -> Self {
+    fn initial(program_generation: ProgramGeneration) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            active_workspace,
-            pending_workspace: None,
             armed_workspace: None,
+            pending_workspace_handoff: None,
             program_generation,
             pending_program: None,
             program_recovery_required: false,
@@ -215,16 +234,17 @@ impl RecoveryDocument {
     fn validate(self) -> Result<Self, ServiceError> {
         if self.format_version != FORMAT_VERSION
             || self.receipts.len() > MAXIMUM_RECEIPTS
-            || self.pending_workspace.as_ref().is_some_and(|pending| {
-                pending.previous != self.active_workspace
-                    || pending.candidate.workspace_id() == pending.previous.workspace_id()
-                    || pending.candidate.generation().get() <= pending.previous.generation().get()
-            })
             || self.armed_workspace.as_ref().is_some_and(|armed| {
                 armed.evidence_sha256 == [0; 32]
                     || armed.operation_identity.is_empty()
                     || armed.target == armed.original.workspace_id()
             })
+            || self
+                .pending_workspace_handoff
+                .as_ref()
+                .is_some_and(|pending| {
+                    !valid_workspace_handoff(pending, self.armed_workspace.as_ref())
+                })
             || self.pending_program.as_ref().is_some_and(|pending| {
                 pending.evidence_sha256 == [0; 32]
                     || pending.operation_identity.is_empty()
@@ -239,17 +259,44 @@ impl RecoveryDocument {
     }
 }
 
-/// Two-copy crash-safe selector, program-generation, and terminal-receipt authority.
-pub struct DurableRecoveryState {
+fn valid_workspace_handoff(
+    pending: &PendingWorkspaceHandoffEvidence,
+    armed: Option<&ArmedWorkspaceOperation>,
+) -> bool {
+    let Some(armed) = armed else {
+        return false;
+    };
+    if pending.handoff_id.is_nil()
+        || pending.previous != armed.original
+        || pending.attempted.workspace_id() != armed.target
+        || pending.previous.generation().get().checked_add(1)
+            != Some(pending.attempted.generation().get())
+    {
+        return false;
+    }
+    match pending.disposition {
+        SelectorDisposition::Activated => pending.candidate == pending.attempted,
+        SelectorDisposition::RolledBack => {
+            pending.candidate.workspace_id() == pending.previous.workspace_id()
+                && pending.attempted.generation().get().checked_add(1)
+                    == Some(pending.candidate.generation().get())
+        }
+    }
+}
+
+/// Two-copy crash-safe recovery-operation journal and terminal-receipt authority.
+///
+/// This authority deliberately does not select an active workspace. It retains only approval-bound
+/// recovery evidence correlated to the installation-global workspace selector's exact handoff.
+pub(crate) struct DurableRecoveryState {
     store: LocalAuthorityStateStore,
     document: Mutex<RecoveryDocument>,
 }
 
 impl DurableRecoveryState {
     /// Opens or initializes recovery state beneath the prepared control root.
-    pub fn try_open(
+    pub(crate) fn try_open(
         control_root: &Path,
-        initial_workspace: WorkspaceRuntimeIdentity,
         initial_program_generation: ProgramGeneration,
     ) -> Result<Self, ServiceError> {
         let store = LocalAuthorityStateStore::try_open(control_root.join(AUTHORITY_DIRECTORY))
@@ -259,15 +306,13 @@ impl DurableRecoveryState {
                 .map_err(|_| ServiceError::Unavailable)?
                 .validate()?,
             None => {
-                let document =
-                    RecoveryDocument::initial(initial_workspace, initial_program_generation);
+                let document = RecoveryDocument::initial(initial_program_generation);
                 store_document(&store, &document)?;
                 document
             }
         };
-        if document.pending_workspace.is_none() && document.active_workspace != initial_workspace
-            || document.program_generation != initial_program_generation
-                && document.pending_program.is_none()
+        if document.program_generation != initial_program_generation
+            && document.pending_program.is_none()
         {
             return Err(ServiceError::Unavailable);
         }
@@ -275,92 +320,6 @@ impl DurableRecoveryState {
             store,
             document: Mutex::new(document),
         })
-    }
-
-    /// Returns the identity startup must compose: a durable pending selector wins over active.
-    pub fn startup_identity(&self) -> Result<WorkspaceRuntimeIdentity, ServiceError> {
-        let document = self
-            .document
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?;
-        Ok(document
-            .pending_workspace
-            .as_ref()
-            .map_or(document.active_workspace, |pending| pending.candidate))
-    }
-
-    /// Finalizes a supervisor-started pending selector only after authenticated health succeeds.
-    pub fn startup_healthy(&self, observed: WorkspaceRuntimeIdentity) -> Result<(), ServiceError> {
-        let mut document = self
-            .document
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?;
-        if document.pending_workspace.is_none() && document.active_workspace == observed {
-            return Ok(());
-        }
-        let pending = document
-            .pending_workspace
-            .as_ref()
-            .filter(|pending| pending.candidate == observed)
-            .cloned()
-            .ok_or(ServiceError::InvalidRequest)?;
-        let mut candidate = document.clone();
-        candidate.active_workspace = observed;
-        candidate.pending_workspace = None;
-        if let Some(armed) = candidate.armed_workspace.as_ref() {
-            upsert_receipt(
-                &mut candidate.receipts,
-                DurableRecoveryReceipt::Workspace {
-                    operation_identity: armed.operation_identity.clone(),
-                    evidence_sha256: armed.evidence_sha256,
-                    active: observed,
-                    disposition: pending.disposition,
-                },
-            );
-        }
-        store_document(&self.store, &candidate)?;
-        *document = candidate;
-        Ok(())
-    }
-
-    /// Converts a failed attempted startup into a rollback selector under a strictly newer fence.
-    ///
-    /// The caller must then return startup failure so the installed supervisor starts again.
-    pub fn startup_failed(
-        &self,
-        failed: WorkspaceRuntimeIdentity,
-    ) -> Result<WorkspaceRuntimeIdentity, ServiceError> {
-        let mut document = self
-            .document
-            .lock()
-            .map_err(|_| ServiceError::Unavailable)?;
-        let pending = document
-            .pending_workspace
-            .as_ref()
-            .filter(|pending| pending.candidate == failed)
-            .cloned()
-            .ok_or(ServiceError::InvalidRequest)?;
-        if pending.disposition == SelectorDisposition::RolledBack {
-            return Err(ServiceError::Unavailable);
-        }
-        let generation = pending
-            .candidate
-            .generation()
-            .get()
-            .checked_add(1)
-            .ok_or(ServiceError::ResourceExhausted)?;
-        let rollback =
-            WorkspaceRuntimeIdentity::try_new(pending.previous.workspace_id(), generation)
-                .map_err(|_| ServiceError::Unavailable)?;
-        let mut candidate = document.clone();
-        candidate.pending_workspace = Some(PendingWorkspaceSelector {
-            previous: pending.previous,
-            candidate: rollback,
-            disposition: SelectorDisposition::RolledBack,
-        });
-        store_document(&self.store, &candidate)?;
-        *document = candidate;
-        Ok(rollback)
     }
 
     fn arm_workspace(
@@ -373,10 +332,7 @@ impl DurableRecoveryState {
             .document
             .lock()
             .map_err(|_| ServiceError::Unavailable)?;
-        if document.armed_workspace.is_some()
-            || document.pending_workspace.is_some()
-            || document.active_workspace != original
-        {
+        if document.armed_workspace.is_some() || document.pending_workspace_handoff.is_some() {
             return Err(ServiceError::Unavailable);
         }
         let mut candidate = document.clone();
@@ -391,105 +347,83 @@ impl DurableRecoveryState {
         Ok(())
     }
 
-    fn stage_workspace(
+    pub(crate) fn record_workspace_handoff(
         &self,
-        target: WorkspaceId,
-    ) -> Result<WorkspaceRuntimeIdentity, ServiceError> {
+        handoff_id: Uuid,
+        previous: WorkspaceRuntimeIdentity,
+        attempted: WorkspaceRuntimeIdentity,
+        candidate_identity: WorkspaceRuntimeIdentity,
+        disposition: WorkspaceRecoveryDisposition,
+    ) -> Result<(), ServiceError> {
         let mut document = self
             .document
             .lock()
             .map_err(|_| ServiceError::Unavailable)?;
-        if let Some(pending) = &document.pending_workspace {
-            if pending.candidate.workspace_id() == target {
-                return Ok(pending.candidate);
-            }
-            if pending.previous.workspace_id() != target
-                || pending.disposition == SelectorDisposition::RolledBack
-            {
-                return Err(ServiceError::InvalidRequest);
-            }
-            let generation = pending
-                .candidate
-                .generation()
-                .get()
-                .checked_add(1)
-                .ok_or(ServiceError::ResourceExhausted)?;
-            let rollback = WorkspaceRuntimeIdentity::try_new(target, generation)
-                .map_err(|_| ServiceError::Unavailable)?;
-            let mut candidate = document.clone();
-            candidate.pending_workspace = Some(PendingWorkspaceSelector {
-                previous: pending.previous,
-                candidate: rollback,
-                disposition: SelectorDisposition::RolledBack,
-            });
-            store_document(&self.store, &candidate)?;
-            *document = candidate;
-            return Ok(rollback);
-        }
-        let armed = document
-            .armed_workspace
-            .as_ref()
-            .filter(|armed| armed.target == target || armed.original.workspace_id() == target)
-            .ok_or(ServiceError::InvalidRequest)?;
-        if document.active_workspace.workspace_id() == target {
-            return Ok(document.active_workspace);
-        }
-        let generation = document
-            .active_workspace
-            .generation()
-            .get()
-            .checked_add(1)
-            .ok_or(ServiceError::ResourceExhausted)?;
-        let selected = WorkspaceRuntimeIdentity::try_new(target, generation)
-            .map_err(|_| ServiceError::Unavailable)?;
-        let disposition = if armed.target == target {
-            SelectorDisposition::Activated
-        } else {
-            SelectorDisposition::RolledBack
+        let pending = PendingWorkspaceHandoffEvidence {
+            handoff_id,
+            previous,
+            attempted,
+            candidate: candidate_identity,
+            disposition: disposition.into(),
         };
+        if document.pending_workspace_handoff == Some(pending) {
+            return Ok(());
+        }
+        if !valid_workspace_handoff(&pending, document.armed_workspace.as_ref()) {
+            return Err(ServiceError::InvalidRequest);
+        }
         let mut candidate = document.clone();
-        candidate.pending_workspace = Some(PendingWorkspaceSelector {
-            previous: document.active_workspace,
-            candidate: selected,
-            disposition,
-        });
+        candidate.pending_workspace_handoff = Some(pending);
         store_document(&self.store, &candidate)?;
         *document = candidate;
-        Ok(selected)
+        Ok(())
     }
 
-    fn selected_for(
+    pub(crate) fn pending_workspace_handoff(
         &self,
-        workspace_id: WorkspaceId,
-    ) -> Result<WorkspaceRuntimeIdentity, ServiceError> {
+    ) -> Result<Option<RecoveryWorkspaceHandoff>, ServiceError> {
         let document = self
             .document
             .lock()
             .map_err(|_| ServiceError::Unavailable)?;
-        document
-            .pending_workspace
-            .as_ref()
-            .map(|pending| pending.candidate)
-            .filter(|identity| identity.workspace_id() == workspace_id)
-            .or_else(|| {
-                (document.active_workspace.workspace_id() == workspace_id)
-                    .then_some(document.active_workspace)
-            })
-            .ok_or(ServiceError::InvalidRequest)
+        Ok(document
+            .pending_workspace_handoff
+            .map(RecoveryWorkspaceHandoff::from))
     }
 
-    fn complete_workspace(&self) -> Result<(), ServiceError> {
+    pub(crate) fn complete_workspace_handoff(
+        &self,
+        handoff_id: Uuid,
+        active: WorkspaceRuntimeIdentity,
+    ) -> Result<(), ServiceError> {
         let mut document = self
             .document
             .lock()
             .map_err(|_| ServiceError::Unavailable)?;
-        if document.pending_workspace.is_some() {
-            return Err(ServiceError::Unavailable);
+        let pending = document
+            .pending_workspace_handoff
+            .filter(|pending| pending.handoff_id == handoff_id)
+            .ok_or(ServiceError::InvalidRequest)?;
+        if active.workspace_id() != pending.candidate.workspace_id()
+            || active.generation().get() < pending.candidate.generation().get()
+        {
+            return Err(ServiceError::InvalidRequest);
         }
-        if document.armed_workspace.is_none() {
-            return Ok(());
-        }
+        let armed = document
+            .armed_workspace
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
         let mut candidate = document.clone();
+        upsert_receipt(
+            &mut candidate.receipts,
+            DurableRecoveryReceipt::Workspace {
+                operation_identity: armed.operation_identity.clone(),
+                evidence_sha256: armed.evidence_sha256,
+                active,
+                disposition: pending.disposition,
+            },
+        );
+        candidate.pending_workspace_handoff = None;
         candidate.armed_workspace = None;
         store_document(&self.store, &candidate)?;
         *document = candidate;
@@ -501,7 +435,7 @@ impl DurableRecoveryState {
             .document
             .lock()
             .map_err(|_| ServiceError::Unavailable)?;
-        if document.pending_workspace.is_some() {
+        if document.pending_workspace_handoff.is_some() {
             return Err(ServiceError::Unavailable);
         }
         let mut candidate = document.clone();
@@ -606,7 +540,7 @@ impl DurableRecoveryState {
 
 impl fmt::Debug for DurableRecoveryState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("DurableRecoveryState([TWO-COPY SELECTOR AND RECEIPTS])")
+        formatter.write_str("DurableRecoveryState([RECOVERY EVIDENCE AND RECEIPTS])")
     }
 }
 
@@ -630,25 +564,32 @@ fn upsert_receipt(receipts: &mut Vec<DurableRecoveryReceipt>, receipt: DurableRe
 }
 
 /// Workspace transition that publishes a durable selector and requests outer-process shutdown.
-pub struct SupervisorRestartWorkspaceTransition {
-    state: Arc<DurableRecoveryState>,
+pub(crate) struct SupervisorRestartWorkspaceTransition {
+    selection: Arc<dyn RecoveryWorkspaceSelectionAuthority>,
     hooks: Arc<dyn InstalledServiceRecoveryHooks>,
     installation_id: InstallationId,
+    active: WorkspaceRuntimeIdentity,
 }
 
 impl SupervisorRestartWorkspaceTransition {
     /// Binds the durable selector to the installed service supervisor authority.
     #[must_use]
-    pub fn new(
-        state: Arc<DurableRecoveryState>,
+    pub(crate) fn new(
+        selection: Arc<dyn RecoveryWorkspaceSelectionAuthority>,
         hooks: Arc<dyn InstalledServiceRecoveryHooks>,
         installation_id: InstallationId,
+        active: WorkspaceRuntimeIdentity,
     ) -> Self {
         Self {
-            state,
+            selection,
             hooks,
             installation_id,
+            active,
         }
+    }
+
+    fn can_abandon_unstarted_operation(&self) -> Result<bool, LifecycleError> {
+        self.selection.has_pending_handoff().map(|pending| !pending)
     }
 }
 
@@ -669,10 +610,7 @@ impl WorkspaceRestartTransition for SupervisorRestartWorkspaceTransition {
         if deadline <= Instant::now() {
             return Err(LifecycleError::InvalidTimeout);
         }
-        let selected = self
-            .state
-            .stage_workspace(workspace_id)
-            .map_err(map_service_lifecycle)?;
+        let selected = self.selection.stage_activation(self.active, workspace_id)?;
         let runtime = selected.to_runtime(self.installation_id)?;
         self.hooks.request_restart(runtime)?;
         Ok(selected)
@@ -682,14 +620,6 @@ impl WorkspaceRestartTransition for SupervisorRestartWorkspaceTransition {
 impl fmt::Debug for SupervisorRestartWorkspaceTransition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SupervisorRestartWorkspaceTransition([DURABLE RESTART SELECTOR])")
-    }
-}
-
-fn map_service_lifecycle(error: ServiceError) -> LifecycleError {
-    match error {
-        ServiceError::InvalidRequest => LifecycleError::InvalidTarget,
-        ServiceError::ResourceExhausted => LifecycleError::GenerationExhausted,
-        _ => LifecycleError::AuthorityUnavailable,
     }
 }
 
@@ -737,6 +667,16 @@ enum RecoveryPlan {
     },
 }
 
+struct WorkspaceExecutionContext {
+    action: RecoveryJobAction,
+    operation: PreparedOperation,
+    approval: WorkspaceSwitchApproval,
+    target: WorkspaceId,
+    cancellation: CancellationToken,
+    deadline: Instant,
+    _publication: Arc<dyn LifecycleJobPublication>,
+}
+
 impl RecoveryPlan {
     fn operation(&self) -> &PreparedOperation {
         match self {
@@ -756,18 +696,18 @@ struct PlanState {
 }
 
 /// Concrete installed recovery authority used by the operations service and recovery job runner.
-pub struct InstalledRecoveryOperations {
+pub(crate) struct InstalledRecoveryOperations {
     backup_repository_root: PathBuf,
     workspace_repository_root: PathBuf,
     backup_limits: AnalyticalBackupLimits,
     minimum_schema_version: u32,
     maximum_schema_version: u32,
-    install_root: PathBuf,
+    install_root: Option<PathBuf>,
     workspaces: Arc<DurableWorkspaceRegistry>,
     lifecycle: Arc<WorkspaceLifecycleAuthority>,
     transition: Arc<SupervisorRestartWorkspaceTransition>,
     restore_components: Arc<dyn ProductRestoreComponentAuthority>,
-    activity: Arc<RecoveryRuntimeActivity>,
+    activity: Arc<dyn RecoveryActivityAuthority>,
     durable: Arc<DurableRecoveryState>,
     plans: Mutex<PlanState>,
     sequence: AtomicU64,
@@ -779,31 +719,35 @@ impl InstalledRecoveryOperations {
         clippy::too_many_arguments,
         reason = "every installed recovery authority and compatibility bound is explicit"
     )]
-    pub fn try_new(
+    pub(crate) fn try_new(
         backup_repository_root: PathBuf,
         workspace_repository_root: PathBuf,
         backup_limits: AnalyticalBackupLimits,
         minimum_schema_version: u32,
         maximum_schema_version: u32,
-        install_root: PathBuf,
+        install_root: Option<PathBuf>,
         workspaces: Arc<DurableWorkspaceRegistry>,
         lifecycle: Arc<WorkspaceLifecycleAuthority>,
         transition: Arc<SupervisorRestartWorkspaceTransition>,
         restore_components: Arc<dyn ProductRestoreComponentAuthority>,
-        activity: Arc<RecoveryRuntimeActivity>,
+        activity: Arc<dyn RecoveryActivityAuthority>,
         durable: Arc<DurableRecoveryState>,
     ) -> Result<Self, ServiceError> {
         if minimum_schema_version == 0
             || minimum_schema_version > maximum_schema_version
             || !backup_repository_root.is_absolute()
             || !workspace_repository_root.is_absolute()
-            || !install_root.is_absolute()
+            || install_root
+                .as_ref()
+                .is_some_and(|root| !root.is_absolute())
             || !backup_repository_root.is_dir()
             || !workspace_repository_root.is_dir()
         {
             return Err(ServiceError::InvalidRequest);
         }
-        durable.reconcile_program(&install_root)?;
+        if let Some(install_root) = &install_root {
+            durable.reconcile_program(install_root)?;
+        }
         Ok(Self {
             backup_repository_root,
             workspace_repository_root,
@@ -868,14 +812,17 @@ impl InstalledRecoveryOperations {
 
     async fn execute_workspace(
         &self,
-        action: RecoveryJobAction,
-        operation: PreparedOperation,
-        approval: WorkspaceSwitchApproval,
-        target: WorkspaceId,
-        cancellation: CancellationToken,
-        deadline: Instant,
-        _publication: Arc<dyn LifecycleJobPublication>,
+        context: WorkspaceExecutionContext,
     ) -> Result<(), LifecycleJobExecutionError> {
+        let WorkspaceExecutionContext {
+            action,
+            operation,
+            approval,
+            target,
+            cancellation,
+            deadline,
+            _publication,
+        } = context;
         pre_mutation_boundary(&cancellation, deadline)?;
         let original = self
             .lifecycle
@@ -886,11 +833,27 @@ impl InstalledRecoveryOperations {
             .map_err(|_| execution_failure("workspace-selector-unavailable", true))?;
         let timeout = remaining(deadline)
             .map_err(|_| execution_failure("workspace-deadline-elapsed", false))?;
-        let handoff = self
+        let handoff = match self
             .lifecycle
             .request_switch(approval, &*self.transition, timeout)
             .await
-            .map_err(|_| execution_failure("workspace-transition-failed", true))?;
+        {
+            Ok(handoff) => handoff,
+            Err(_error) => {
+                if self
+                    .transition
+                    .can_abandon_unstarted_operation()
+                    .map_err(|_| {
+                        execution_failure("workspace-transition-recovery-required", true)
+                    })?
+                {
+                    self.durable.abandon_unstarted_workspace().map_err(|_| {
+                        execution_failure("workspace-transition-recovery-required", true)
+                    })?;
+                }
+                return Err(execution_failure("workspace-transition-failed", true));
+            }
+        };
         if handoff.previous() != original
             || handoff.candidate().workspace_id() != target
             || !matches!(
@@ -926,7 +889,11 @@ impl InstalledRecoveryOperations {
         {
             return Err(execution_failure("program-approval-stale", false));
         }
-        let installed = status(&self.install_root)
+        let install_root = self
+            .install_root
+            .as_ref()
+            .ok_or_else(|| execution_failure("program-not-installed", false))?;
+        let installed = status(install_root)
             .map_err(|_| execution_failure("installer-status-unavailable", true))?;
         let source_version = installed
             .active_version()
@@ -949,21 +916,21 @@ impl InstalledRecoveryOperations {
         // The installer owns atomic selector replacement and exact known-good revalidation. Once
         // invoked it must run to a terminal installer state; cancellation/deadline are observed at
         // the safe pre-mutation boundary above rather than by abandoning an in-flight selector.
-        let root = self.install_root.clone();
+        let root = install_root.clone();
         let result = tokio::task::spawn_blocking(move || rollback(RollbackRequest::new(root)))
             .await
             .map_err(|_| execution_failure("installer-worker-failed", true))?;
         if result.is_err() {
             let committed = self
                 .durable
-                .reconcile_program(&self.install_root)
+                .reconcile_program(install_root)
                 .map_err(|_| execution_failure("program-recovery-required", true))?;
             if !committed {
                 return Err(execution_failure("program-rollback-failed", true));
             }
         } else if !self
             .durable
-            .reconcile_program(&self.install_root)
+            .reconcile_program(install_root)
             .map_err(|_| execution_failure("program-receipt-unavailable", true))?
         {
             return Err(execution_failure("program-rollback-indeterminate", true));
@@ -1184,7 +1151,11 @@ impl ManagedRecoveryOperations for InstalledRecoveryOperations {
         if self.durable.program_generation()? != current {
             return Err(ServiceError::InvalidRequest);
         }
-        let installed = status(&self.install_root).map_err(|_| ServiceError::Unavailable)?;
+        let install_root = self
+            .install_root
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let installed = status(install_root).map_err(|_| ServiceError::Unavailable)?;
         let target_version = installed
             .previous_version()
             .ok_or(ServiceError::NotFound)?
@@ -1283,15 +1254,15 @@ impl ManagedRecoveryOperations for InstalledRecoveryOperations {
                     approval,
                 },
             ) => {
-                self.execute_workspace(
+                self.execute_workspace(WorkspaceExecutionContext {
                     action,
                     operation,
                     approval,
                     target,
                     cancellation,
                     deadline,
-                    publication,
-                )
+                    _publication: publication,
+                })
                 .await
             }
             (
@@ -1302,15 +1273,15 @@ impl ManagedRecoveryOperations for InstalledRecoveryOperations {
                     approval,
                 },
             ) => {
-                self.execute_workspace(
+                self.execute_workspace(WorkspaceExecutionContext {
                     action,
                     operation,
                     approval,
                     target,
                     cancellation,
                     deadline,
-                    publication,
-                )
+                    _publication: publication,
+                })
                 .await
             }
             (
@@ -1477,10 +1448,8 @@ fn pre_mutation_boundary(
 fn execution_failure(diagnostic: &'static str, retryable: bool) -> LifecycleJobExecutionError {
     match SourceIdentifier::try_from(diagnostic) {
         Ok(diagnostic) => LifecycleJobExecutionError::failed(diagnostic, retryable),
-        Err(_error) => LifecycleJobExecutionError::failed(
-            SourceIdentifier::try_from("recovery-failure")
-                .expect("code-owned recovery diagnostic must be valid"),
-            false,
-        ),
+        Err(_error) => {
+            LifecycleJobExecutionError::Publication(LifecycleJobPublicationError::Revoked)
+        }
     }
 }

@@ -778,7 +778,8 @@ mod tests {
 
     use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
     use market_squawk_jobs::{
-        AdmittedProcessProgram, JobOrigin, JobRunner, JobState, ProcessProgramError,
+        AdmittedProcessProgram, JobActivityClass, JobOrigin, JobRunner, JobRunnerRegistration,
+        JobState, ProcessProgramError,
     };
     use market_squawk_platform::LocalPaths;
     use market_squawk_services::RequestId;
@@ -840,7 +841,10 @@ mod tests {
         let runner_trait: Arc<dyn JobRunner> = runner;
         let jobs = InstalledJobAuthority::open(
             &paths,
-            vec![runner_trait],
+            vec![JobRunnerRegistration::new(
+                runner_trait,
+                JobActivityClass::Mutation,
+            )],
             Timestamp::from_unix_nanos(100),
         )
         .await?;

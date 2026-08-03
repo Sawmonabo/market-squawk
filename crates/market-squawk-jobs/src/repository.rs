@@ -13,8 +13,14 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::TaskTracker;
 
+mod backup;
 mod codec;
 mod engine;
+
+pub use backup::{
+    JOBS_AND_RECEIPTS_BACKUP_SCHEMA, JobsAndReceiptsBackupBinding, JobsAndReceiptsBackupExport,
+    JobsAndReceiptsBackupReceipt,
+};
 
 use codec::{decode_event, decode_snapshot};
 use engine::{
@@ -29,6 +35,7 @@ use crate::{
 };
 
 const SCHEMA_VERSION: i64 = 1;
+const JOB_DATABASE_APPLICATION_ID: i64 = 0x4d53_514a;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounded SQLite writer configuration.
@@ -95,6 +102,14 @@ enum WriteCommand {
         failed: Box<JobSnapshot>,
         at: Timestamp,
         reply: oneshot::Sender<Result<JobSnapshot, JobRepositoryError>>,
+    },
+    Snapshot {
+        binding: JobsAndReceiptsBackupBinding,
+        backup_id: JobId,
+        backup_generation: JobGeneration,
+        backup_kind: SourceIdentifier,
+        reply: oneshot::Sender<Result<JobsAndReceiptsBackupExport, JobRepositoryError>>,
+        release: std::sync::mpsc::Receiver<()>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -197,6 +212,45 @@ impl SqliteJobRepository {
         })
         .await
         .map_err(|_| JobRepositoryError::Unavailable)?
+    }
+
+    pub(crate) async fn retain_logical_snapshot(
+        &self,
+        binding: JobsAndReceiptsBackupBinding,
+        backup_id: JobId,
+        backup_generation: JobGeneration,
+        backup_kind: SourceIdentifier,
+    ) -> Result<(JobsAndReceiptsBackupExport, RepositorySnapshotFence), JobRepositoryError> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(JobRepositoryError::Unavailable);
+        }
+        let (reply, receiver) = oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        self.inner
+            .writer
+            .send(WriteCommand::Snapshot {
+                binding,
+                backup_id,
+                backup_generation,
+                backup_kind,
+                reply,
+                release: release_receiver,
+            })
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)?;
+        let export = receiver
+            .await
+            .map_err(|_| JobRepositoryError::Unavailable)??;
+        Ok((export, RepositorySnapshotFence(Some(release))))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RepositorySnapshotFence(Option<std::sync::mpsc::Sender<()>>);
+
+impl RepositorySnapshotFence {
+    pub(crate) fn release(&mut self) {
+        self.0.take();
     }
 }
 

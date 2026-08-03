@@ -789,8 +789,8 @@ fn program_receipt(
 /// mutable-data path.
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
     let prepared_deletions = preflight_deletions(&request.deletions, &request.root)?;
-    remove_owned_registration(&request.root, crate::platform::SupportedTarget::current()?)?;
     let store = InstallStore::open_existing(&request.root)?;
+    remove_owned_registration(&request.root, crate::platform::SupportedTarget::current()?)?;
     let removed_program = if let Some(store) = store.as_ref() {
         let detached = store.quarantine_for_uninstall()?;
         remove_tree(&detached)?;

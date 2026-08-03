@@ -1,5 +1,6 @@
 //! Transport-neutral access to the sole durable decision workflow authority.
 
+mod backup;
 mod codec;
 mod persistence;
 
@@ -17,10 +18,12 @@ use market_squawk_platform::DecisionDatabaseLocation;
 use self::codec::{EncodedRecord, RecoveryContext};
 use self::persistence::DecisionJournal;
 
+pub(crate) use self::backup::RetainedDecisionBackupSnapshot;
+
 /// Typed application failure that does not leak SQLite, lock, or filesystem internals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecisionApplicationError {
-    /// The single-writer state is poisoned or its lock is unavailable.
+    /// The single-writer state is poisoned, retained by backup, or its lock is unavailable.
     Unavailable,
     /// A bounded result allocation failed.
     Allocation,
@@ -61,6 +64,8 @@ impl From<DecisionRepositoryError> for DecisionApplicationError {
 struct DecisionState {
     authority: DecisionAuthority,
     journal: DecisionJournal,
+    limits: DecisionRepositoryLimits,
+    backup_retained: bool,
     poisoned: bool,
 }
 
@@ -81,11 +86,13 @@ impl DecisionApplication {
         let repository = DecisionRepository::try_new(limits)?;
         let mut authority = DecisionAuthority::new(repository);
         let mut recovery = RecoveryContext::try_new()?;
-        journal.recover(&mut authority, &mut recovery)?;
+        let _semantic_sha256 = journal.recover(&mut authority, &mut recovery)?;
         Ok(Self {
             state: Mutex::new(DecisionState {
                 authority,
                 journal,
+                limits,
+                backup_retained: false,
                 poisoned: false,
             }),
         })
@@ -134,7 +141,7 @@ impl DecisionApplication {
         if maximum == 0 {
             return Err(DecisionRepositoryError::InvalidLimits.into());
         }
-        let state = self.writer()?;
+        let state = self.reader()?;
         let count = state.authority.list_screens().count().min(maximum);
         let mut result = Vec::new();
         result
@@ -149,7 +156,7 @@ impl DecisionApplication {
         &self,
         run_id: &ScreenRunId,
     ) -> Result<Vec<CandidateAssessment>, DecisionApplicationError> {
-        let state = self.writer()?;
+        let state = self.reader()?;
         let candidates = state.authority.get_candidates(run_id)?;
         let mut result = Vec::new();
         result
@@ -174,7 +181,7 @@ impl DecisionApplication {
         after: Option<&ScreenRunId>,
         maximum: usize,
     ) -> Result<Vec<market_squawk_decisions::ScreenRunIndexEntry>, DecisionApplicationError> {
-        self.writer()?
+        self.reader()?
             .authority
             .list_screen_runs_after(after, maximum)
             .map_err(Into::into)
@@ -196,7 +203,7 @@ impl DecisionApplication {
         &self,
         id: &market_squawk_decisions::DossierId,
     ) -> Result<DecisionDossier, DecisionApplicationError> {
-        Ok(self.writer()?.authority.get_dossier(id)?.clone())
+        Ok(self.reader()?.authority.get_dossier(id)?.clone())
     }
 
     /// `Decision.ListCandidateDossiers` discovery implementation.
@@ -218,7 +225,7 @@ impl DecisionApplication {
         after: Option<&market_squawk_decisions::DossierId>,
         maximum: usize,
     ) -> Result<Vec<DecisionDossier>, DecisionApplicationError> {
-        self.writer()?
+        self.reader()?
             .authority
             .list_candidate_dossiers_after(candidate_id, after, maximum)
             .map_err(Into::into)
@@ -241,7 +248,7 @@ impl DecisionApplication {
         id: &InvestmentTargetSetId,
         revision: RevisionNumber,
     ) -> Result<TargetState, DecisionApplicationError> {
-        self.writer()?
+        self.reader()?
             .authority
             .get_target(id, revision)
             .map_err(Into::into)
@@ -252,7 +259,7 @@ impl DecisionApplication {
         &self,
         id: &InvestmentTargetSetId,
     ) -> Result<Vec<TargetState>, DecisionApplicationError> {
-        let state = self.writer()?;
+        let state = self.reader()?;
         let count = state.authority.list_targets(id).count();
         let mut result = Vec::new();
         result
@@ -281,7 +288,7 @@ impl DecisionApplication {
         after: Option<&InvestmentTargetSetId>,
         maximum: usize,
     ) -> Result<Vec<TargetIndexEntry>, DecisionApplicationError> {
-        self.writer()?
+        self.reader()?
             .authority
             .list_target_index_after(after, maximum)
             .map_err(Into::into)
@@ -327,7 +334,7 @@ impl DecisionApplication {
         id: &InvestmentTargetSetId,
         revision: RevisionNumber,
     ) -> Result<TargetStatus, DecisionApplicationError> {
-        self.writer()?
+        self.reader()?
             .authority
             .target_status(id, revision)
             .map_err(Into::into)
@@ -339,10 +346,22 @@ impl DecisionApplication {
         id: &ScreenId,
         revision: RevisionNumber,
     ) -> Result<SavedScreen, DecisionApplicationError> {
-        Ok(self.writer()?.authority.get_screen(id, revision)?.clone())
+        Ok(self.reader()?.authority.get_screen(id, revision)?.clone())
     }
 
     fn writer(&self) -> Result<std::sync::MutexGuard<'_, DecisionState>, DecisionApplicationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_error| DecisionApplicationError::Unavailable)?;
+        if state.poisoned || state.backup_retained {
+            Err(DecisionApplicationError::Unavailable)
+        } else {
+            Ok(state)
+        }
+    }
+
+    fn reader(&self) -> Result<std::sync::MutexGuard<'_, DecisionState>, DecisionApplicationError> {
         let state = self
             .state
             .lock()

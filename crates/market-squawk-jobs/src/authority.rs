@@ -1,8 +1,13 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use tokio::{
-    sync::{RwLock, oneshot},
+    sync::{OwnedRwLockWriteGuard, RwLock, oneshot},
     task::AbortHandle,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -11,8 +16,9 @@ use crate::{
     AdmittedJobSpec, FairJobScheduler, JobCancellationClaim, JobCompletion, JobConfirmation,
     JobContractError, JobEvent, JobEventSequence, JobFailure, JobGeneration, JobId, JobLease,
     JobRecoveryDisposition, JobRepository, JobRepositoryError, JobRunContext, JobRunError,
-    JobRunner, JobSnapshot, JobState, JobTerminalPublicationFence, ScheduledJob, SchedulerError,
-    SchedulerLimits,
+    JobRunner, JobSnapshot, JobState, JobTerminalPublicationFence, JobsAndReceiptsBackupBinding,
+    JobsAndReceiptsBackupExport, JobsAndReceiptsBackupReceipt, RepositorySnapshotFence,
+    ScheduledJob, SchedulerError, SchedulerLimits, SchedulerSnapshotFence, SqliteJobRepository,
 };
 
 const PUBLICATION_RECONCILIATION_WAIT: Duration = Duration::from_secs(30);
@@ -47,6 +53,70 @@ pub enum JobShutdownOutcome {
         /// Number of still-owned generations durably ended as interrupted.
         interrupted_generations: usize,
     },
+}
+
+/// Runtime activity effect declared for one code-owned job kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobActivityClass {
+    /// The runner observes durable state without publishing a product mutation.
+    ReadOnly,
+    /// The runner may publish a durable product mutation.
+    Mutation,
+}
+
+/// One code-owned runner and its explicit runtime activity classification.
+pub struct JobRunnerRegistration {
+    runner: Arc<dyn JobRunner>,
+    activity_class: JobActivityClass,
+}
+
+impl JobRunnerRegistration {
+    /// Binds a runner kind to its compile-time product activity classification.
+    #[must_use]
+    pub fn new(runner: Arc<dyn JobRunner>, activity_class: JobActivityClass) -> Self {
+        Self {
+            runner,
+            activity_class,
+        }
+    }
+}
+
+impl fmt::Debug for JobRunnerRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobRunnerRegistration")
+            .field("kind", self.runner.kind())
+            .field("activity_class", &self.activity_class)
+            .finish()
+    }
+}
+
+/// Coherent bounded snapshot of the scheduler-owned running set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobActivitySnapshot {
+    running: usize,
+    running_mutations: usize,
+}
+
+impl JobActivitySnapshot {
+    pub(crate) const fn new(running: usize, running_mutations: usize) -> Self {
+        Self {
+            running,
+            running_mutations,
+        }
+    }
+
+    /// Total generations currently holding scheduler running capacity.
+    #[must_use]
+    pub const fn running(self) -> usize {
+        self.running
+    }
+
+    /// Running generations whose registered kind may publish a product mutation.
+    #[must_use]
+    pub const fn running_mutations(self) -> usize {
+        self.running_mutations
+    }
 }
 
 /// Recovers one orphaned generation according to the registered runner's closed policy.
@@ -142,6 +212,7 @@ pub struct JobAuthority<R: JobRepository + 'static> {
     repository: Arc<R>,
     scheduler: FairJobScheduler,
     runners: Arc<BTreeMap<SourceIdentifier, Arc<dyn JobRunner>>>,
+    mutation_kinds: Arc<BTreeSet<SourceIdentifier>>,
     cancellations: Arc<RwLock<BTreeMap<(JobId, JobGeneration), CancellationToken>>>,
     publication_gates: Arc<RwLock<BTreeMap<(JobId, JobGeneration), JobTerminalPublicationFence>>>,
     tasks: Arc<RwLock<BTreeMap<(JobId, JobGeneration), AbortHandle>>>,
@@ -156,6 +227,7 @@ impl<R: JobRepository + 'static> std::fmt::Debug for JobAuthority<R> {
             .field("repository", &"[DURABLE JOB REPOSITORY]")
             .field("scheduler", &self.scheduler)
             .field("runner_count", &self.runners.len())
+            .field("mutation_kind_count", &self.mutation_kinds.len())
             .field("cancellations", &"[GENERATION CANCELLATIONS]")
             .field("publication_gates", &"[GENERATION PUBLICATION GATES]")
             .field("tasks", &"[GENERATION TASK HANDLES]")
@@ -168,11 +240,16 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
     pub fn try_new(
         repository: Arc<R>,
         limits: SchedulerLimits,
-        runners: Vec<Arc<dyn JobRunner>>,
+        registrations: Vec<JobRunnerRegistration>,
     ) -> Result<Self, JobAuthorityError> {
         let mut registry = BTreeMap::new();
-        for runner in runners {
-            if registry.insert(runner.kind().clone(), runner).is_some() {
+        let mut mutation_kinds = BTreeSet::new();
+        for registration in registrations {
+            let kind = registration.runner.kind().clone();
+            if registration.activity_class == JobActivityClass::Mutation {
+                mutation_kinds.insert(kind.clone());
+            }
+            if registry.insert(kind, registration.runner).is_some() {
                 return Err(JobAuthorityError::UnknownKind);
             }
         }
@@ -182,6 +259,7 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
             repository,
             scheduler,
             runners: Arc::new(registry),
+            mutation_kinds: Arc::new(mutation_kinds),
             cancellations: Arc::new(RwLock::new(BTreeMap::new())),
             publication_gates: Arc::new(RwLock::new(BTreeMap::new())),
             tasks: Arc::new(RwLock::new(BTreeMap::new())),
@@ -190,6 +268,12 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
         };
         authority.start_dispatch();
         Ok(authority)
+    }
+
+    /// Reads the exact scheduler-owned running set without storage or asynchronous work.
+    #[must_use]
+    pub fn activity(&self) -> JobActivitySnapshot {
+        self.scheduler.activity(self.mutation_kinds.as_ref())
     }
 
     /// Durably creates and fairly schedules one admitted job.
@@ -221,6 +305,7 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
         expected: JobEventSequence,
         at: Timestamp,
     ) -> Result<JobSnapshot, JobAuthorityError> {
+        let _admission = self.admission.read().await;
         self.cancel_with_wait(
             id,
             generation,
@@ -643,6 +728,125 @@ impl<R: JobRepository + 'static> JobAuthority<R> {
                 let _ignored = start.send(());
             }
         });
+    }
+}
+
+/// Non-cloneable owner lease retaining admission, dispatch, and sole-writer snapshot fences.
+pub struct RetainedJobsAndReceiptsSnapshot {
+    repository: Arc<SqliteJobRepository>,
+    backup: ScheduledJob,
+    _admission: OwnedRwLockWriteGuard<()>,
+    _scheduler: SchedulerSnapshotFence,
+    writer: Option<RepositorySnapshotFence>,
+    receipt: Option<JobsAndReceiptsBackupReceipt>,
+}
+
+/// Non-cloneable admission and dispatch fence for one sole lifecycle job.
+pub struct RetainedJobLifecycleFence {
+    active: ScheduledJob,
+    _admission: OwnedRwLockWriteGuard<()>,
+    _scheduler: SchedulerSnapshotFence,
+}
+
+impl fmt::Debug for RetainedJobLifecycleFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedJobLifecycleFence")
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: JobRepository + 'static> JobAuthority<R> {
+    /// Fences new admission and dispatch only when `active_kind` is the sole running generation.
+    pub async fn retain_lifecycle_fence(
+        &self,
+        active_kind: &SourceIdentifier,
+    ) -> Result<RetainedJobLifecycleFence, JobAuthorityError> {
+        let admission = Arc::clone(&self.admission).write_owned().await;
+        let (active, scheduler) = self
+            .scheduler
+            .retain_exclusive(active_kind)
+            .ok_or(JobAuthorityError::Capacity)?;
+        Ok(RetainedJobLifecycleFence {
+            active,
+            _admission: admission,
+            _scheduler: scheduler,
+        })
+    }
+}
+
+impl fmt::Debug for RetainedJobsAndReceiptsSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedJobsAndReceiptsSnapshot")
+            .field("backup", &self.backup)
+            .field("materialized", &self.receipt.is_some())
+            .field("writer_fenced", &self.writer.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedJobsAndReceiptsSnapshot {
+    /// Materializes the exact logical repository cut and retains its sole-writer fence.
+    pub async fn materialize(
+        &mut self,
+        binding: JobsAndReceiptsBackupBinding,
+    ) -> Result<JobsAndReceiptsBackupExport, JobRepositoryError> {
+        if self.receipt.is_some() || self.writer.is_some() {
+            return Err(JobRepositoryError::Conflict);
+        }
+        let (export, writer) = self
+            .repository
+            .retain_logical_snapshot(
+                binding,
+                self.backup.id(),
+                self.backup.generation(),
+                self.backup.kind().clone(),
+            )
+            .await?;
+        self.receipt = Some(export.receipt());
+        self.writer = Some(writer);
+        Ok(export)
+    }
+
+    /// Revalidates the exact binding and owner receipt before releasing the repository writer.
+    pub fn revalidate(
+        &mut self,
+        binding: JobsAndReceiptsBackupBinding,
+        receipt: JobsAndReceiptsBackupReceipt,
+    ) -> Result<(), JobRepositoryError> {
+        if receipt.binding() != binding || self.receipt != Some(receipt) {
+            return Err(JobRepositoryError::Conflict);
+        }
+        self.writer
+            .as_mut()
+            .ok_or(JobRepositoryError::Conflict)?
+            .release();
+        self.writer = None;
+        Ok(())
+    }
+}
+
+impl JobAuthority<SqliteJobRepository> {
+    /// Retains a JobsAndReceipts snapshot only for the sole currently running backup kind.
+    pub async fn retain_jobs_and_receipts_backup(
+        &self,
+        backup_kind: &SourceIdentifier,
+    ) -> Result<RetainedJobsAndReceiptsSnapshot, JobAuthorityError> {
+        let admission = Arc::clone(&self.admission).write_owned().await;
+        let (backup, scheduler) = self
+            .scheduler
+            .retain_exclusive(backup_kind)
+            .ok_or(JobAuthorityError::Capacity)?;
+        Ok(RetainedJobsAndReceiptsSnapshot {
+            repository: Arc::clone(&self.repository),
+            backup,
+            _admission: admission,
+            _scheduler: scheduler,
+            writer: None,
+            receipt: None,
+        })
     }
 }
 

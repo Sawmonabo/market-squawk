@@ -284,6 +284,30 @@ struct RuntimeGate {
     index: ModelRuntimeIndex,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RuntimeBackupCoordinate {
+    pub(super) candidate_directory: Box<str>,
+    pub(super) metadata_path: Box<str>,
+    pub(super) model_id: ModelId,
+    pub(super) bundle_id: BundleId,
+    pub(super) bundle_version: std::num::NonZeroU64,
+}
+
+pub(super) struct RetainedRuntimeBackup {
+    pub(super) canonical_index: Box<[u8]>,
+    pub(super) models: Vec<(RuntimeBackupCoordinate, Arc<ModelBundle>)>,
+}
+
+impl fmt::Debug for RetainedRuntimeBackup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedRuntimeBackup")
+            .field("canonical_index", &"[CANONICAL MODEL RUNTIME INDEX]")
+            .field("model_count", &self.models.len())
+            .finish()
+    }
+}
+
 /// Application-owned durable model admission and backend recovery authority.
 pub struct ProductionModelRuntime {
     paths: LocalPaths,
@@ -299,6 +323,17 @@ pub struct ProductionModelRuntime {
 }
 
 impl ProductionModelRuntime {
+    pub(super) fn empty_backup(
+        limits: ProductionModelRuntimeLimits,
+    ) -> Result<RetainedRuntimeBackup, ProductionModelRuntimeError> {
+        Ok(RetainedRuntimeBackup {
+            canonical_index: ModelRuntimeIndex::empty()
+                .encode(limits.index)?
+                .into_boxed_slice(),
+            models: Vec::new(),
+        })
+    }
+
     /// Returns the exact sealed environment shared by training execution and candidate admission.
     ///
     /// # Errors
@@ -517,6 +552,97 @@ impl ProductionModelRuntime {
         Ok(ModelRuntimeSnapshot {
             read_image: Arc::clone(&self.read_image),
         })
+    }
+
+    pub(super) fn retain_backup(
+        &self,
+    ) -> Result<RetainedRuntimeBackup, ProductionModelRuntimeError> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        let canonical_index = gate.index.encode(self.limits.index)?.into_boxed_slice();
+        let image = self.read_image.load();
+        if image.registry.len()? != gate.index.entries().len() {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        }
+        let mut models = Vec::new();
+        models
+            .try_reserve_exact(gate.index.entries().len())
+            .map_err(|_| ProductionModelRuntimeError::ResourceExhausted)?;
+        for admission in gate.index.entries() {
+            let bundle = image
+                .registry
+                .get(&admission.bundle_id, admission.bundle_version)?
+                .ok_or(ProductionModelRuntimeError::CorruptRuntime)?;
+            validate_recovered_bundle(&bundle, admission)?;
+            models.push((
+                RuntimeBackupCoordinate {
+                    candidate_directory: admission.candidate_directory.clone(),
+                    metadata_path: admission.metadata_path.clone(),
+                    model_id: admission.model_id,
+                    bundle_id: admission.bundle_id.clone(),
+                    bundle_version: admission.bundle_version,
+                },
+                bundle,
+            ));
+        }
+        Ok(RetainedRuntimeBackup {
+            canonical_index,
+            models,
+        })
+    }
+
+    pub(super) fn restore_capabilities(
+        &self,
+    ) -> Result<
+        (
+            VerifiedTrainingEnvironment,
+            Option<OnnxWorkerProgram>,
+            ProductionModelRuntimeLimits,
+        ),
+        ProductionModelRuntimeError,
+    > {
+        Ok((
+            self.training_environment()?.clone(),
+            self.onnx_worker.clone(),
+            self.limits,
+        ))
+    }
+
+    pub(super) fn backup_coordinates(
+        canonical_index: &[u8],
+        limits: ProductionModelRuntimeLimits,
+    ) -> Result<Vec<RuntimeBackupCoordinate>, ProductionModelRuntimeError> {
+        let index = ModelRuntimeIndex::decode(canonical_index, limits.index)?;
+        Ok(index
+            .entries()
+            .iter()
+            .map(|admission| RuntimeBackupCoordinate {
+                candidate_directory: admission.candidate_directory.clone(),
+                metadata_path: admission.metadata_path.clone(),
+                model_id: admission.model_id,
+                bundle_id: admission.bundle_id.clone(),
+                bundle_version: admission.bundle_version,
+            })
+            .collect())
+    }
+
+    pub(super) fn stage_backup_index(
+        paths: &LocalPaths,
+        canonical_index: &[u8],
+        limits: ProductionModelRuntimeLimits,
+    ) -> Result<(), ProductionModelRuntimeError> {
+        let decoded = ModelRuntimeIndex::decode(canonical_index, limits.index)?;
+        if decoded.encode(limits.index)? != canonical_index {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        }
+        let (store, existing) = open_runtime_index(paths, limits)?;
+        if !existing.entries().is_empty() || store.load()?.is_some() {
+            return Err(ProductionModelRuntimeError::RestoreTargetNotFresh);
+        }
+        store.store(canonical_index)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -857,6 +983,9 @@ pub enum ProductionModelRuntimeError {
     /// Registry/backend state synchronization failed closed.
     #[error("production model runtime is unavailable")]
     RuntimeUnavailable,
+    /// Restore attempted to reuse an authority outside a fresh inactive workspace.
+    #[error("production model restore target is not fresh")]
+    RestoreTargetNotFresh,
     /// No admitted generation exists; a usable model service cannot be composed.
     #[error("production model runtime has no admitted generation")]
     EmptyRuntime,

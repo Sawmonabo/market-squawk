@@ -4,7 +4,7 @@ use std::{collections::HashSet, fmt, str::FromStr, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::DateTime;
-use market_squawk_data::DatasetId;
+use market_squawk_data::{DatasetId, FairValueCatalogCapability};
 use market_squawk_domain::{
     AccountId, Currency, FairValueHierarchy, InstrumentId, Money, Timestamp, VenueId,
 };
@@ -15,7 +15,7 @@ use market_squawk_services::{
 use market_squawk_valuation::{
     ActorId, ApprovalStatus, ApprovedMarketAccess, AuditEventId, AuditEventKind,
     ClassificationRuleset, DecisionBasis, DecisionId, EvidenceOrigin, FairValueAuditCursor,
-    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueService,
+    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueLimits, FairValueService,
     InputSignificance, MarketAccess, MarketAccessAssessmentId, MarketPriceSelection, MeasurementId,
     OverrideProposal, RulesetHash, ValuationAmount, ValuationApprovalId, ValuationInput,
     ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
@@ -23,7 +23,7 @@ use market_squawk_valuation::{
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -59,6 +59,9 @@ const GET_MARKET_ACCESS: &str = "FairValue.GetMarketAccess";
 const PROPOSE_OVERRIDE: &str = "FairValue.ProposeOverride";
 const REVOKE_APPROVAL: &str = "FairValue.RevokeApproval";
 const LIST_AUDIT_EVENTS: &str = "FairValue.ListAuditEvents";
+const BACKUP_ATTESTATION_MAGIC: [u8; 8] = *b"MSQFVA01";
+const BACKUP_ATTESTATION_FORMAT_VERSION: u16 = 1;
+const BACKUP_ATTESTATION_BYTES: usize = 115;
 
 /// Producer family named by one opaque, application-resolved receipt selector.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -380,13 +383,192 @@ pub trait FairValueInputResolver: Send + Sync + 'static {
 
 /// Application-owned fair-value surface over one durable catalog writer and receipt resolver.
 pub struct FairValueDomainService {
-    state: Mutex<FairValueService>,
+    state: Arc<Mutex<FairValueService>>,
     resolver: Arc<dyn FairValueInputResolver>,
     selection_authority: Arc<dyn FairValueProducerSelectionAuthority>,
     ruleset: ClassificationRuleset,
     maximum_inputs: usize,
     maximum_query_results: usize,
     lifecycle: Arc<DomainLifecycle>,
+}
+
+/// Versioned owner-issued proof that service state and analytical catalog share one exact head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FairValueBackupAttestation {
+    catalog_digest: [u8; 32],
+    records: u64,
+    operations: u64,
+    memberships: u64,
+    links: u64,
+    last_audit_sequence: u64,
+    last_audit_id: Option<[u8; 32]>,
+}
+
+impl FairValueBackupAttestation {
+    fn try_from_service(service: &FairValueService) -> Result<Self, FairValueBackupError> {
+        let (position, catalog_digest) = service.backup_attestation()?;
+        Ok(Self {
+            catalog_digest,
+            records: u64::try_from(position.record_count())
+                .map_err(|_| FairValueBackupError::InvalidEncoding)?,
+            operations: u64::try_from(position.operation_count())
+                .map_err(|_| FairValueBackupError::InvalidEncoding)?,
+            memberships: u64::try_from(position.membership_count())
+                .map_err(|_| FairValueBackupError::InvalidEncoding)?,
+            links: u64::try_from(position.link_count())
+                .map_err(|_| FairValueBackupError::InvalidEncoding)?,
+            last_audit_sequence: position.last_audit_sequence(),
+            last_audit_id: position.last_audit_id(),
+        })
+    }
+
+    /// Returns the fixed v1 canonical artifact consumed by product backup and restore.
+    pub(crate) fn canonical_bytes(self) -> [u8; BACKUP_ATTESTATION_BYTES] {
+        let mut output = [0_u8; BACKUP_ATTESTATION_BYTES];
+        output[..8].copy_from_slice(&BACKUP_ATTESTATION_MAGIC);
+        output[8..10].copy_from_slice(&BACKUP_ATTESTATION_FORMAT_VERSION.to_be_bytes());
+        output[10..42].copy_from_slice(&self.catalog_digest);
+        output[42..50].copy_from_slice(&self.records.to_be_bytes());
+        output[50..58].copy_from_slice(&self.operations.to_be_bytes());
+        output[58..66].copy_from_slice(&self.memberships.to_be_bytes());
+        output[66..74].copy_from_slice(&self.links.to_be_bytes());
+        output[74..82].copy_from_slice(&self.last_audit_sequence.to_be_bytes());
+        if let Some(last_audit_id) = self.last_audit_id {
+            output[82] = 1;
+            output[83..115].copy_from_slice(&last_audit_id);
+        }
+        output
+    }
+
+    /// Decodes only the fixed canonical v1 attestation artifact.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, FairValueBackupError> {
+        if bytes.len() != BACKUP_ATTESTATION_BYTES {
+            return Err(FairValueBackupError::InvalidEncoding);
+        }
+        let mut decoder = FairValueBackupAttestationDecoder::new(bytes);
+        if decoder.fixed::<8>()? != BACKUP_ATTESTATION_MAGIC
+            || u16::from_be_bytes(decoder.fixed::<2>()?) != BACKUP_ATTESTATION_FORMAT_VERSION
+        {
+            return Err(FairValueBackupError::InvalidEncoding);
+        }
+        let catalog_digest = decoder.fixed::<32>()?;
+        let records = u64::from_be_bytes(decoder.fixed::<8>()?);
+        let operations = u64::from_be_bytes(decoder.fixed::<8>()?);
+        let memberships = u64::from_be_bytes(decoder.fixed::<8>()?);
+        let links = u64::from_be_bytes(decoder.fixed::<8>()?);
+        let last_audit_sequence = u64::from_be_bytes(decoder.fixed::<8>()?);
+        let has_last_audit_id = decoder.fixed::<1>()?[0];
+        let last_audit_bytes = decoder.fixed::<32>()?;
+        if !decoder.finished() {
+            return Err(FairValueBackupError::InvalidEncoding);
+        }
+        let last_audit_id = match has_last_audit_id {
+            0 if last_audit_bytes == [0; 32] => None,
+            1 if last_audit_bytes != [0; 32] => Some(last_audit_bytes),
+            _ => return Err(FairValueBackupError::InvalidEncoding),
+        };
+        if (last_audit_sequence == 0) != last_audit_id.is_none()
+            || operations != last_audit_sequence
+        {
+            return Err(FairValueBackupError::InvalidEncoding);
+        }
+        Ok(Self {
+            catalog_digest,
+            records,
+            operations,
+            memberships,
+            links,
+            last_audit_sequence,
+            last_audit_id,
+        })
+    }
+
+    /// Reopens a fresh restored catalog and recomputes its complete logical identity.
+    pub(crate) fn validate_restored_catalog(
+        self,
+        catalog: FairValueCatalogCapability,
+        limits: FairValueLimits,
+    ) -> Result<FairValueService, FairValueBackupError> {
+        let restored = FairValueService::open(catalog, limits)?;
+        if Self::try_from_service(&restored)? != self {
+            return Err(FairValueBackupError::CatalogMismatch);
+        }
+        Ok(restored)
+    }
+}
+
+/// Non-cloneable mutation fence retained across Fair Value backup materialization.
+pub(crate) struct FairValueBackupAttestationLease {
+    state: OwnedMutexGuard<FairValueService>,
+    attestation: FairValueBackupAttestation,
+}
+
+impl FairValueBackupAttestationLease {
+    /// Returns the exact owner-issued attestation captured before the common cutoff.
+    pub(crate) const fn attestation(&self) -> FairValueBackupAttestation {
+        self.attestation
+    }
+
+    /// Proves that the retained owner and catalog still match the emitted attestation.
+    pub(crate) fn revalidate(&self) -> Result<(), FairValueBackupError> {
+        if FairValueBackupAttestation::try_from_service(&self.state)? != self.attestation {
+            return Err(FairValueBackupError::CatalogMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FairValueBackupAttestationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FairValueBackupAttestationLease([RETAINED FAIR-VALUE WRITER])")
+    }
+}
+
+/// Caller-safe backup attestation failure.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum FairValueBackupError {
+    /// The Fair Value writer could not recompute a complete catalog position.
+    #[error("fair-value backup catalog verification failed")]
+    FairValue(#[from] FairValueError),
+    /// Cancellation won before the mutation fence was acquired.
+    #[error("fair-value backup attestation was cancelled")]
+    Cancelled,
+    /// The fixed versioned attestation artifact is malformed.
+    #[error("fair-value backup attestation encoding is invalid")]
+    InvalidEncoding,
+    /// The restored or retained catalog differs from the owner-issued attestation.
+    #[error("fair-value backup attestation does not match the catalog")]
+    CatalogMismatch,
+}
+
+struct FairValueBackupAttestationDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> FairValueBackupAttestationDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn fixed<const LENGTH: usize>(&mut self) -> Result<[u8; LENGTH], FairValueBackupError> {
+        let end = self
+            .offset
+            .checked_add(LENGTH)
+            .ok_or(FairValueBackupError::InvalidEncoding)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(FairValueBackupError::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| FairValueBackupError::InvalidEncoding)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 /// Immutable fair-value evidence retained by a governed approval or override preview.
@@ -419,10 +601,6 @@ impl GovernedFairValueDecisionEvidence {
 
     pub(crate) const fn hierarchy(&self) -> FairValueHierarchy {
         self.hierarchy
-    }
-
-    pub(crate) const fn basis(&self) -> DecisionBasis {
-        self.basis
     }
 }
 
@@ -494,13 +672,34 @@ impl FairValueDomainService {
     ) -> Result<Self, FairValueError> {
         let limits = service.limits();
         Ok(Self {
-            state: Mutex::new(service),
+            state: Arc::new(Mutex::new(service)),
             resolver,
             selection_authority,
             ruleset: ClassificationRuleset::current(maximum_quote_age_nanos)?,
             maximum_inputs: limits.max_inputs_per_measurement(),
             maximum_query_results: limits.max_query_results(),
             lifecycle: DomainLifecycle::new(),
+        })
+    }
+
+    /// Retains the sole Fair Value writer and captures its exact analytical-catalog attestation.
+    pub(crate) async fn retain_backup_attestation(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+    ) -> Result<FairValueBackupAttestationLease, FairValueBackupError> {
+        let state = Arc::clone(&self.state);
+        let guard = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(FairValueBackupError::Cancelled),
+            guard = state.lock_owned() => guard,
+        };
+        if cancellation.is_cancelled() {
+            return Err(FairValueBackupError::Cancelled);
+        }
+        let attestation = FairValueBackupAttestation::try_from_service(&guard)?;
+        Ok(FairValueBackupAttestationLease {
+            state: guard,
+            attestation,
         })
     }
 

@@ -2,13 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use market_squawk_adapter_portfolio::{
     AccountObservation, HoldingObservation, PortfolioExtractionSource, PortfolioImport,
     PortfolioImportLimits, PortfolioTransaction,
 };
-use market_squawk_data::{DatasetId, DatasetManifestRef, Sha256Digest, extraction_batch_digest};
+use market_squawk_data::{
+    CorporateActionLimits, DatasetId, DatasetManifestRef, Sha256Digest, extraction_batch_digest,
+};
 use market_squawk_domain::{
     AccountId, DataQuality, DigestAlgorithm, MetadataRevision, Money, NormalizedPortfolioLotMethod,
     NormalizedPortfolioTransactionClass, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
@@ -26,6 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use super::backup::{
+    BACKUP_SCHEMA_VERSION, ImmutableBackupObject, PortfolioBackupEnvelope,
+    RetainedPortfolioBackupSnapshot, TransactionBackupEnvelope, authority_revision, decode_pair,
+};
 use super::model::{
     AccountHistory, PortfolioReadImage, PublicationEntry, PublicationManifest, PublishedRevision,
     SourceKey,
@@ -151,21 +158,57 @@ struct PendingImport {
     phase: PendingImportPhase,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PersistedGovernedReceipt {
+    schema_version: u16,
+    preview_id: String,
+    preview_digest: String,
+    account_id: String,
+    governance: GovernedImportCommitReceipt,
+    interpretations: Vec<PortfolioImportInterpretation>,
+    specific_lot_ids: BTreeMap<String, Vec<String>>,
+    corporate_action_plan_reference: Option<String>,
+    corporate_action_plan_sha256: Option<String>,
+    corporate_action_content_digest: Option<String>,
+    corporate_action_audit_digest: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum PendingImportPhase {
     /// Preview exists; no raw archive or public revision can have changed.
     Prepared,
     /// Governance passed and the adapter/publication transition must be completed on recovery.
-    Promoting {
-        interpretations: Vec<PortfolioImportInterpretation>,
-        receipt: GovernedImportCommitReceipt,
-        specific_lot_ids: BTreeMap<String, Vec<String>>,
-        corporate_action_plan_reference: Option<String>,
-        corporate_action_plan_sha256: Option<[u8; 32]>,
-        corporate_action_content_digest: Option<[u8; 32]>,
-        corporate_action_audit_digest: Option<[u8; 32]>,
-    },
+    Promoting(Box<PendingImportPromotion>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingImportPromotion {
+    interpretations: Vec<PortfolioImportInterpretation>,
+    receipt: GovernedImportCommitReceipt,
+    specific_lot_ids: BTreeMap<String, Vec<String>>,
+    corporate_action_plan_reference: Option<String>,
+    corporate_action_plan_sha256: Option<[u8; 32]>,
+    corporate_action_content_digest: Option<[u8; 32]>,
+    corporate_action_audit_digest: Option<[u8; 32]>,
+}
+
+struct GovernedBatchApplication<'a> {
+    artifacts: &'a ArtifactRoot,
+    pending_index: usize,
+    account_id: AccountId,
+    batch: &'a ExtractionBatch,
+    artifact_sha256: [u8; 32],
+    instructions: &'a [Task10TransactionInstruction],
+    corporate_action_plan: Option<&'a market_squawk_data::CorporateActionPlan>,
+}
+
+struct PersistedPlanMaterial {
+    reference: Option<String>,
+    sha256: Option<[u8; 32]>,
+    bytes: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -290,34 +333,120 @@ impl ImportAuthority {
             if Sha256::digest(&bytes).as_slice() != entry.artifact_sha256 {
                 return Err(PortfolioApplicationServiceError::CorruptPublication);
             }
-            match (
+            let governance_receipt = match (
                 entry.governance_receipt_reference.as_deref(),
                 entry.governance_receipt_sha256,
             ) {
                 (Some(reference), Some(digest)) => {
                     let expected = format!("{IMMUTABLE_RECEIPT_NAMESPACE}/{}.json", hex(&digest));
-                    if reference != expected
-                        || Sha256::digest(&read_artifact(
-                            &artifacts,
-                            reference,
-                            limits.max_artifact_bytes,
-                        )?)
-                        .as_slice()
-                            != digest
-                    {
+                    let receipt = read_artifact(&artifacts, reference, limits.max_artifact_bytes)?;
+                    if reference != expected || Sha256::digest(&receipt).as_slice() != digest {
                         return Err(PortfolioApplicationServiceError::CorruptPublication);
                     }
+                    Some(receipt)
                 }
-                (None, None) => {}
+                (None, None) => None,
                 _ => return Err(PortfolioApplicationServiceError::CorruptPublication),
-            }
+            };
             let batch: ExtractionBatch = serde_json::from_slice(&bytes)
                 .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
-            authority.apply_batch(entry.account_id, &batch, entry.artifact_sha256)?;
+            match governance_receipt {
+                Some(receipt) => authority.apply_restored_governed_batch(
+                    &artifacts,
+                    entry.account_id,
+                    &batch,
+                    entry.artifact_sha256,
+                    &receipt,
+                )?,
+                None => authority.apply_batch(entry.account_id, &batch, entry.artifact_sha256)?,
+            }
             authority.manifest.entries.push(entry.clone());
         }
         let image =
             PortfolioReadImage::try_from_accounts(authority.accounts.clone(), authority.limits)?;
+        Ok((authority, image))
+    }
+
+    pub(super) fn backup_snapshot(
+        &self,
+        artifacts: &ArtifactRoot,
+    ) -> Result<RetainedPortfolioBackupSnapshot, PortfolioApplicationServiceError> {
+        if !self.pending_manifest.entries.is_empty() {
+            return Err(PortfolioApplicationServiceError::SnapshotUnavailable);
+        }
+        let manifest = self.manifest.encode()?;
+        let (imports, governance) =
+            inventory_for_manifest(artifacts, &self.manifest, self.limits.max_artifact_bytes)?;
+        let transaction_state_sha256 = transaction_state_digest(&self.accounts)?;
+        let revision =
+            authority_revision(&manifest, transaction_state_sha256, &imports, &governance)?;
+        let portfolios = serde_json::to_vec(&PortfolioBackupEnvelope {
+            schema_version: BACKUP_SCHEMA_VERSION,
+            authority_revision_sha256: revision,
+            publication_manifest: manifest.clone(),
+            immutable_imports: imports,
+        })
+        .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        let transactions = serde_json::to_vec(&TransactionBackupEnvelope {
+            schema_version: BACKUP_SCHEMA_VERSION,
+            authority_revision_sha256: revision,
+            publication_manifest_sha256: Sha256::digest(&manifest).into(),
+            transaction_state_sha256,
+            governance_objects: governance,
+        })
+        .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        RetainedPortfolioBackupSnapshot::try_new(revision, portfolios, transactions)
+    }
+
+    pub(super) fn restore_backup(
+        artifacts: ArtifactRoot,
+        control_root: &Path,
+        limits: PortfolioApplicationLimits,
+        portfolios: &[u8],
+        transactions: &[u8],
+    ) -> Result<(Self, PortfolioReadImage), PortfolioApplicationServiceError> {
+        let (portfolio, transaction) = decode_pair(portfolios, transactions, limits)?;
+        let manifest = PublicationManifest::decode(&portfolio.publication_manifest)?;
+        validate_backup_inventory(
+            &manifest,
+            &portfolio.immutable_imports,
+            &transaction.governance_objects,
+            limits,
+        )?;
+        let publication =
+            LocalAuthorityStateStore::try_open(control_root.join(PUBLICATION_AUTHORITY_DIRECTORY))
+                .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        let pending = LocalAuthorityStateStore::try_open(
+            control_root.join(PENDING_IMPORT_AUTHORITY_DIRECTORY),
+        )
+        .map_err(|_| PortfolioApplicationServiceError::Authority)?;
+        if publication
+            .load()
+            .map_err(|_| PortfolioApplicationServiceError::Authority)?
+            .is_some()
+            || pending
+                .load()
+                .map_err(|_| PortfolioApplicationServiceError::Authority)?
+                .is_some()
+        {
+            return Err(PortfolioApplicationServiceError::RestoreTargetNotFresh);
+        }
+        for object in portfolio
+            .immutable_imports
+            .iter()
+            .chain(&transaction.governance_objects)
+        {
+            persist_fresh_immutable(&artifacts, &object.reference, &object.bytes)?;
+        }
+        publication
+            .store(&portfolio.publication_manifest)
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        drop(pending);
+        drop(publication);
+        let (authority, image) = Self::restore(artifacts, control_root, limits)?;
+        if transaction_state_digest(&authority.accounts)? != transaction.transaction_state_sha256 {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
         Ok((authority, image))
     }
 
@@ -510,6 +639,60 @@ impl ImportAuthority {
         })
     }
 
+    pub(super) fn prepared_import_preview(
+        &mut self,
+        artifacts: &ArtifactRoot,
+        preview_id: &str,
+    ) -> Result<PortfolioImportPreview, PortfolioApplicationServiceError> {
+        let pending = self
+            .pending_manifest
+            .entries
+            .iter()
+            .find(|entry| entry.preview_id == preview_id)
+            .cloned()
+            .ok_or(PortfolioApplicationServiceError::NotFound)?;
+        let bytes = read_artifact(
+            artifacts,
+            &pending.artifact_reference,
+            self.limits.max_artifact_bytes,
+        )?;
+        if Sha256::digest(&bytes).as_slice() != pending.artifact_sha256 {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        let batch: ExtractionBatch = serde_json::from_slice(&bytes)
+            .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+        let imported = self.preview_batch(&batch)?;
+        validate_account_binding(pending.account_id, &imported)?;
+        let result = preview_projection(
+            pending.account_id,
+            &imported,
+            self.accounts
+                .get(&pending.account_id)
+                .and_then(|history| history.revisions.last()),
+        )?;
+        let digest: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(&json!({
+                "accountId": pending.account_id.to_string(),
+                "artifactSha256": hex(&pending.artifact_sha256),
+                "preview": result,
+            }))
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?,
+        )
+        .into();
+        if digest != pending.preview_digest || hex(&digest) != pending.preview_id {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        Ok(PortfolioImportPreview {
+            preview_id: pending.preview_id,
+            preview_digest: digest,
+            result: json!({
+                "previewId": hex(&digest),
+                "digest": hex(&digest),
+                "preview": result,
+            }),
+        })
+    }
+
     fn preview_batch(
         &mut self,
         batch: &ExtractionBatch,
@@ -640,28 +823,17 @@ impl ImportAuthority {
                 (Some(content), Some(audit))
             });
         let specific_lot_ids = persisted_specific_lot_ids(resolution);
-        let (corporate_action_plan_reference, corporate_action_plan_sha256, plan_bytes) =
-            persisted_plan_material(resolution)?;
-        if let PendingImportPhase::Promoting {
-            interpretations: retained_interpretations,
-            receipt,
-            specific_lot_ids: retained_lot_ids,
-            corporate_action_plan_reference: retained_plan_reference,
-            corporate_action_plan_sha256: retained_plan_sha256,
-            corporate_action_content_digest: retained_content_digest,
-            corporate_action_audit_digest: retained_audit_digest,
-        } = &pending.phase
+        let plan_material = persisted_plan_material(resolution)?;
+        if let PendingImportPhase::Promoting(retained) = &pending.phase
+            && (retained.interpretations.as_slice() != interpretations
+                || retained.receipt != resolution.receipt
+                || retained.specific_lot_ids != specific_lot_ids
+                || retained.corporate_action_plan_reference != plan_material.reference
+                || retained.corporate_action_plan_sha256 != plan_material.sha256
+                || retained.corporate_action_content_digest != corporate_action_content_digest
+                || retained.corporate_action_audit_digest != corporate_action_audit_digest)
         {
-            if retained_interpretations.as_slice() != interpretations
-                || receipt != &resolution.receipt
-                || retained_lot_ids != &specific_lot_ids
-                || retained_plan_reference != &corporate_action_plan_reference
-                || retained_plan_sha256 != &corporate_action_plan_sha256
-                || retained_content_digest != &corporate_action_content_digest
-                || retained_audit_digest != &corporate_action_audit_digest
-            {
-                return Err(PortfolioApplicationServiceError::InvalidRequest);
-            }
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
         }
         let mut pending_candidate = self.pending_manifest.clone();
         let candidate = pending_candidate
@@ -671,18 +843,18 @@ impl ImportAuthority {
         if candidate.preview_digest != digest {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
         }
-        candidate.phase = PendingImportPhase::Promoting {
+        candidate.phase = PendingImportPhase::Promoting(Box::new(PendingImportPromotion {
             interpretations: interpretations.to_vec(),
             receipt: resolution.receipt.clone(),
             specific_lot_ids,
-            corporate_action_plan_reference,
-            corporate_action_plan_sha256,
+            corporate_action_plan_reference: plan_material.reference,
+            corporate_action_plan_sha256: plan_material.sha256,
             corporate_action_content_digest,
             corporate_action_audit_digest,
-        };
+        }));
         if let (Some(reference), Some(bytes)) = (
             candidate_corporate_plan_reference(candidate),
-            plan_bytes.as_deref(),
+            plan_material.bytes.as_deref(),
         ) {
             persist_immutable(artifacts, reference, bytes)?;
         }
@@ -697,15 +869,15 @@ impl ImportAuthority {
         }) {
             return self.complete_pending_publication(pending_index);
         }
-        self.apply_governed_batch(
+        self.apply_governed_batch(GovernedBatchApplication {
             artifacts,
             pending_index,
-            pending.account_id,
-            &batch,
-            pending.artifact_sha256,
-            &instructions,
-            resolution.corporate_action_plan.as_ref(),
-        )
+            account_id: pending.account_id,
+            batch: &batch,
+            artifact_sha256: pending.artifact_sha256,
+            instructions: &instructions,
+            corporate_action_plan: resolution.corporate_action_plan.as_ref(),
+        })
     }
 
     /// Completes an interrupted `Promoting` transition using the exact server-held governance
@@ -725,16 +897,7 @@ impl ImportAuthority {
             .position(|entry| entry.preview_id == preview_id)
             .ok_or(PortfolioApplicationServiceError::NotFound)?;
         let pending = self.pending_manifest.entries[pending_index].clone();
-        let PendingImportPhase::Promoting {
-            interpretations,
-            receipt,
-            specific_lot_ids,
-            corporate_action_plan_reference,
-            corporate_action_plan_sha256,
-            corporate_action_content_digest,
-            corporate_action_audit_digest,
-        } = &pending.phase
-        else {
+        let PendingImportPhase::Promoting(promotion) = &pending.phase else {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
         };
         resolution.receipt.validate()?;
@@ -746,14 +909,13 @@ impl ImportAuthority {
             .corporate_action_plan
             .as_ref()
             .map(|plan| plan.audit_hash().bytes());
-        let (candidate_plan_reference, candidate_plan_sha256, _) =
-            persisted_plan_material(resolution)?;
-        if receipt != &resolution.receipt
-            || specific_lot_ids != &persisted_specific_lot_ids(resolution)
-            || corporate_action_plan_reference != &candidate_plan_reference
-            || corporate_action_plan_sha256 != &candidate_plan_sha256
-            || corporate_action_content_digest != &candidate_content
-            || corporate_action_audit_digest != &candidate_audit
+        let candidate_plan = persisted_plan_material(resolution)?;
+        if promotion.receipt != resolution.receipt
+            || promotion.specific_lot_ids != persisted_specific_lot_ids(resolution)
+            || promotion.corporate_action_plan_reference != candidate_plan.reference
+            || promotion.corporate_action_plan_sha256 != candidate_plan.sha256
+            || promotion.corporate_action_content_digest != candidate_content
+            || promotion.corporate_action_audit_digest != candidate_audit
         {
             return Err(PortfolioApplicationServiceError::InvalidRequest);
         }
@@ -774,7 +936,7 @@ impl ImportAuthority {
             self.accounts
                 .get(&pending.account_id)
                 .and_then(|history| history.revisions.last()),
-            interpretations,
+            &promotion.interpretations,
             resolution,
         )?;
         if self.manifest.entries.iter().any(|entry| {
@@ -783,27 +945,131 @@ impl ImportAuthority {
         }) {
             return self.complete_pending_publication(pending_index);
         }
-        self.apply_governed_batch(
+        self.apply_governed_batch(GovernedBatchApplication {
             artifacts,
             pending_index,
-            pending.account_id,
-            &batch,
-            pending.artifact_sha256,
-            &instructions,
-            resolution.corporate_action_plan.as_ref(),
-        )
+            account_id: pending.account_id,
+            batch: &batch,
+            artifact_sha256: pending.artifact_sha256,
+            instructions: &instructions,
+            corporate_action_plan: resolution.corporate_action_plan.as_ref(),
+        })
+    }
+
+    pub(super) fn resume_approved_import(
+        &mut self,
+        artifacts: &ArtifactRoot,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+    ) -> Result<PortfolioReadImage, PortfolioApplicationServiceError> {
+        let pending_is_prepared = self
+            .pending_manifest
+            .entries
+            .iter()
+            .find(|entry| entry.preview_id == preview_id)
+            .map(|entry| matches!(&entry.phase, PendingImportPhase::Prepared));
+        if let Some(is_prepared) = pending_is_prepared {
+            return match is_prepared {
+                true => {
+                    self.commit_prepared_import(artifacts, preview_id, interpretations, resolution)
+                }
+                false => self.recover_promoting_import(artifacts, preview_id, resolution),
+            };
+        }
+        if self.completed_import_matches(artifacts, preview_id, interpretations, resolution)? {
+            return PortfolioReadImage::try_from_accounts(self.accounts.clone(), self.limits);
+        }
+        Err(PortfolioApplicationServiceError::NotFound)
+    }
+
+    pub(super) fn discard_prepared_import(
+        &mut self,
+        preview_id: &str,
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let index = self
+            .pending_manifest
+            .entries
+            .iter()
+            .position(|entry| entry.preview_id == preview_id)
+            .ok_or(PortfolioApplicationServiceError::NotFound)?;
+        if !matches!(
+            &self.pending_manifest.entries[index].phase,
+            PendingImportPhase::Prepared
+        ) {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let mut candidate = self.pending_manifest.clone();
+        candidate.entries.remove(index);
+        self.pending
+            .store(&candidate.encode()?)
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        self.pending_manifest = candidate;
+        Ok(())
+    }
+
+    fn completed_import_matches(
+        &self,
+        artifacts: &ArtifactRoot,
+        preview_id: &str,
+        interpretations: &[PortfolioImportInterpretation],
+        resolution: &ServerHeldPortfolioImportResolution,
+    ) -> Result<bool, PortfolioApplicationServiceError> {
+        let specific_lot_ids = persisted_specific_lot_ids(resolution);
+        let plan_material = persisted_plan_material(resolution)?;
+        let content_digest = resolution
+            .corporate_action_plan
+            .as_ref()
+            .map(|plan| hex(&plan.content_hash().bytes()));
+        let audit_digest = resolution
+            .corporate_action_plan
+            .as_ref()
+            .map(|plan| hex(&plan.audit_hash().bytes()));
+        for entry in &self.manifest.entries {
+            let Some(reference) = entry.governance_receipt_reference.as_deref() else {
+                continue;
+            };
+            let digest = entry
+                .governance_receipt_sha256
+                .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+            if reference != format!("{IMMUTABLE_RECEIPT_NAMESPACE}/{}.json", hex(&digest)) {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            let receipt = read_artifact(artifacts, reference, self.limits.max_artifact_bytes)?;
+            if Sha256::digest(&receipt).as_slice() != digest {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            let retained: PersistedGovernedReceipt = serde_json::from_slice(&receipt)
+                .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+            if retained.preview_id != preview_id {
+                continue;
+            }
+            return Ok(retained.preview_digest == preview_id
+                && retained.governance == resolution.receipt
+                && retained.interpretations.as_slice() == interpretations
+                && retained.specific_lot_ids == specific_lot_ids
+                && retained.corporate_action_plan_reference == plan_material.reference
+                && retained.corporate_action_plan_sha256
+                    == plan_material.sha256.map(|digest| hex(&digest))
+                && retained.corporate_action_content_digest == content_digest
+                && retained.corporate_action_audit_digest == audit_digest);
+        }
+        Ok(false)
     }
 
     fn apply_governed_batch(
         &mut self,
-        artifacts: &ArtifactRoot,
-        pending_index: usize,
-        account_id: AccountId,
-        batch: &ExtractionBatch,
-        artifact_sha256: [u8; 32],
-        instructions: &[Task10TransactionInstruction],
-        corporate_action_plan: Option<&market_squawk_data::CorporateActionPlan>,
+        application: GovernedBatchApplication<'_>,
     ) -> Result<PortfolioReadImage, PortfolioApplicationServiceError> {
+        let GovernedBatchApplication {
+            artifacts,
+            pending_index,
+            account_id,
+            batch,
+            artifact_sha256,
+            instructions,
+            corporate_action_plan,
+        } = application;
         match self.accounts.get(&account_id) {
             Some(history) if history.revisions.len() >= self.limits.max_history_per_account => {
                 return Err(PortfolioApplicationServiceError::ResourceExhausted);
@@ -813,6 +1079,151 @@ impl ImportAuthority {
             }
             _ => {}
         }
+        let published = self.build_governed_revision(
+            account_id,
+            batch,
+            artifact_sha256,
+            instructions,
+            corporate_action_plan,
+        )?;
+        let mut candidate_accounts = self.accounts.clone();
+        candidate_accounts
+            .entry(account_id)
+            .or_default()
+            .revisions
+            .push(published);
+        let image = PortfolioReadImage::try_from_accounts(candidate_accounts.clone(), self.limits)?;
+        let canonical_reference = format!(
+            "{IMMUTABLE_IMPORT_NAMESPACE}/{}.json",
+            hex(&artifact_sha256)
+        );
+        let mut candidate_manifest = self.manifest.clone();
+        let receipt = governed_receipt_bytes(
+            self.pending_manifest
+                .entries
+                .get(pending_index)
+                .ok_or(PortfolioApplicationServiceError::CorruptPublication)?,
+        )?;
+        let receipt_sha256: [u8; 32] = Sha256::digest(&receipt).into();
+        let receipt_reference = format!(
+            "{IMMUTABLE_RECEIPT_NAMESPACE}/{}.json",
+            hex(&receipt_sha256)
+        );
+        candidate_manifest.entries.push(PublicationEntry {
+            account_id,
+            artifact_reference: canonical_reference.clone(),
+            artifact_sha256,
+            governance_receipt_reference: Some(receipt_reference.clone()),
+            governance_receipt_sha256: Some(receipt_sha256),
+        });
+        persist_immutable(
+            artifacts,
+            &canonical_reference,
+            &read_artifact(
+                artifacts,
+                &self.pending_manifest.entries[pending_index].artifact_reference,
+                self.limits.max_artifact_bytes,
+            )?,
+        )?;
+        persist_immutable(artifacts, &receipt_reference, &receipt)?;
+        self.publication
+            .store(&candidate_manifest.encode()?)
+            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+        self.accounts = candidate_accounts;
+        self.manifest = candidate_manifest;
+        self.complete_pending_publication(pending_index)
+            .map(|_| image)
+    }
+
+    fn apply_restored_governed_batch(
+        &mut self,
+        artifacts: &ArtifactRoot,
+        account_id: AccountId,
+        batch: &ExtractionBatch,
+        artifact_sha256: [u8; 32],
+        receipt_bytes: &[u8],
+    ) -> Result<(), PortfolioApplicationServiceError> {
+        let retained: PersistedGovernedReceipt = serde_json::from_slice(receipt_bytes)
+            .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+        if retained.schema_version != 1
+            || retained.account_id != account_id.to_string()
+            || retained.preview_id != retained.preview_digest
+        {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        retained
+            .governance
+            .validate()
+            .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+        let imported = self.preview_batch(batch)?;
+        validate_account_binding(account_id, &imported)?;
+        // The source authority may already classify this immutable batch as a replay after a
+        // restart. The original preview disposition is therefore not recomputed from mutable
+        // source state; its content digest remains bound by the immutable governed receipt and
+        // publication-manifest digest. All economic instructions are rebuilt and checked below.
+        let preview_digest = decode_hex_digest(&retained.preview_digest)?;
+        let corporate_action_plan =
+            restored_corporate_action_plan(artifacts, &retained, self.limits)?;
+        let resolution = ServerHeldPortfolioImportResolution {
+            receipt: retained.governance.clone(),
+            corporate_action_plan,
+            specific_lot_ids: retained
+                .specific_lot_ids
+                .iter()
+                .map(|(record, lots)| {
+                    let values = lots
+                        .iter()
+                        .map(|value| {
+                            SourceIdentifier::try_from(value.clone())
+                                .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((record.clone(), values))
+                })
+                .collect::<Result<BTreeMap<_, _>, PortfolioApplicationServiceError>>()?,
+        };
+        let instructions = governed_instructions(
+            &imported,
+            self.accounts
+                .get(&account_id)
+                .and_then(|history| history.revisions.last()),
+            &retained.interpretations,
+            &resolution,
+        )
+        .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+        verify_restored_receipt(
+            receipt_bytes,
+            account_id,
+            artifact_sha256,
+            preview_digest,
+            &retained,
+            &resolution,
+        )?;
+        let published = self
+            .build_governed_revision(
+                account_id,
+                batch,
+                artifact_sha256,
+                &instructions,
+                resolution.corporate_action_plan.as_ref(),
+            )
+            .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+        let history = self.accounts.entry(account_id).or_default();
+        if history.revisions.len() >= self.limits.max_history_per_account {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        history.revisions.push(published);
+        Ok(())
+    }
+
+    fn build_governed_revision(
+        &mut self,
+        account_id: AccountId,
+        batch: &ExtractionBatch,
+        artifact_sha256: [u8; 32],
+        instructions: &[Task10TransactionInstruction],
+        corporate_action_plan: Option<&market_squawk_data::CorporateActionPlan>,
+    ) -> Result<PublishedRevision, PortfolioApplicationServiceError> {
         let imported = {
             let source = self.source_for_batch(batch)?;
             source
@@ -861,7 +1272,7 @@ impl ImportAuthority {
             source_coverage.push(key.source_id.clone());
             source_coverage.sort_unstable();
         }
-        let published = PublishedRevision {
+        Ok(PublishedRevision {
             core,
             account,
             holdings,
@@ -872,54 +1283,7 @@ impl ImportAuthority {
             effective_at: maximum_effective(batch)?,
             available_at: maximum_conservative_availability(batch),
             artifact_sha256,
-        };
-        let mut candidate_accounts = self.accounts.clone();
-        candidate_accounts
-            .entry(account_id)
-            .or_default()
-            .revisions
-            .push(published);
-        let image = PortfolioReadImage::try_from_accounts(candidate_accounts.clone(), self.limits)?;
-        let canonical_reference = format!(
-            "{IMMUTABLE_IMPORT_NAMESPACE}/{}.json",
-            hex(&artifact_sha256)
-        );
-        let mut candidate_manifest = self.manifest.clone();
-        let receipt = governed_receipt_bytes(
-            self.pending_manifest
-                .entries
-                .get(pending_index)
-                .ok_or(PortfolioApplicationServiceError::CorruptPublication)?,
-        )?;
-        let receipt_sha256: [u8; 32] = Sha256::digest(&receipt).into();
-        let receipt_reference = format!(
-            "{IMMUTABLE_RECEIPT_NAMESPACE}/{}.json",
-            hex(&receipt_sha256)
-        );
-        candidate_manifest.entries.push(PublicationEntry {
-            account_id,
-            artifact_reference: canonical_reference.clone(),
-            artifact_sha256,
-            governance_receipt_reference: Some(receipt_reference.clone()),
-            governance_receipt_sha256: Some(receipt_sha256),
-        });
-        persist_immutable(
-            artifacts,
-            &canonical_reference,
-            &read_artifact(
-                artifacts,
-                &self.pending_manifest.entries[pending_index].artifact_reference,
-                self.limits.max_artifact_bytes,
-            )?,
-        )?;
-        persist_immutable(artifacts, &receipt_reference, &receipt)?;
-        self.publication
-            .store(&candidate_manifest.encode()?)
-            .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-        self.accounts = candidate_accounts;
-        self.manifest = candidate_manifest;
-        self.complete_pending_publication(pending_index)
-            .map(|_| image)
+        })
     }
 
     fn complete_pending_publication(
@@ -1051,6 +1415,315 @@ impl ImportAuthority {
             available_at,
             artifact_sha256,
         })
+    }
+}
+
+fn inventory_for_manifest(
+    artifacts: &ArtifactRoot,
+    manifest: &PublicationManifest,
+    maximum_object_bytes: usize,
+) -> Result<
+    (Vec<ImmutableBackupObject>, Vec<ImmutableBackupObject>),
+    PortfolioApplicationServiceError,
+> {
+    let mut imports = BTreeMap::new();
+    let mut governance = BTreeMap::new();
+    for entry in &manifest.entries {
+        retain_inventory_object(
+            artifacts,
+            &entry.artifact_reference,
+            entry.artifact_sha256,
+            maximum_object_bytes,
+            &mut imports,
+        )?;
+        match (
+            entry.governance_receipt_reference.as_deref(),
+            entry.governance_receipt_sha256,
+        ) {
+            (Some(reference), Some(digest)) => {
+                let receipt = retain_inventory_object(
+                    artifacts,
+                    reference,
+                    digest,
+                    maximum_object_bytes,
+                    &mut governance,
+                )?;
+                let retained: PersistedGovernedReceipt = serde_json::from_slice(&receipt)
+                    .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+                match (
+                    retained.corporate_action_plan_reference.as_deref(),
+                    retained.corporate_action_plan_sha256.as_deref(),
+                ) {
+                    (Some(plan_reference), Some(plan_sha256)) => {
+                        retain_inventory_object(
+                            artifacts,
+                            plan_reference,
+                            decode_hex_digest(plan_sha256)?,
+                            maximum_object_bytes,
+                            &mut governance,
+                        )?;
+                    }
+                    (None, None) => {}
+                    _ => return Err(PortfolioApplicationServiceError::CorruptPublication),
+                }
+            }
+            (None, None) => {}
+            _ => return Err(PortfolioApplicationServiceError::CorruptPublication),
+        }
+    }
+    Ok((
+        imports.into_values().collect(),
+        governance.into_values().collect(),
+    ))
+}
+
+fn transaction_state_digest(
+    accounts: &BTreeMap<AccountId, AccountHistory>,
+) -> Result<[u8; 32], PortfolioApplicationServiceError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/portfolio-transaction-state/v1\0");
+    for (account_id, history) in accounts {
+        digest.update(account_id.to_string().as_bytes());
+        digest.update(
+            u64::try_from(history.revisions.len())
+                .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?
+                .to_be_bytes(),
+        );
+        for revision in &history.revisions {
+            digest.update(revision.token().bytes());
+            let transactions = serde_json::to_vec(&revision.transactions)
+                .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+            digest.update(
+                u64::try_from(transactions.len())
+                    .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?
+                    .to_be_bytes(),
+            );
+            digest.update(Sha256::digest(transactions));
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+fn retain_inventory_object(
+    artifacts: &ArtifactRoot,
+    reference: &str,
+    expected_sha256: [u8; 32],
+    maximum_bytes: usize,
+    inventory: &mut BTreeMap<String, ImmutableBackupObject>,
+) -> Result<Vec<u8>, PortfolioApplicationServiceError> {
+    let bytes = read_artifact(artifacts, reference, maximum_bytes)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected_sha256 {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    match inventory.entry(reference.to_owned()) {
+        Entry::Occupied(existing) if existing.get().bytes != bytes => {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        Entry::Occupied(_) => {}
+        Entry::Vacant(entry) => {
+            entry.insert(ImmutableBackupObject {
+                reference: reference.to_owned(),
+                sha256: expected_sha256,
+                bytes: bytes.clone(),
+            });
+        }
+    }
+    Ok(bytes)
+}
+
+fn validate_backup_inventory(
+    manifest: &PublicationManifest,
+    imports: &[ImmutableBackupObject],
+    governance: &[ImmutableBackupObject],
+    limits: PortfolioApplicationLimits,
+) -> Result<(), PortfolioApplicationServiceError> {
+    if manifest.entries.len()
+        > limits
+            .max_accounts
+            .saturating_mul(limits.max_history_per_account)
+    {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    let imports = imports
+        .iter()
+        .map(|object| (object.reference.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    let governance = governance
+        .iter()
+        .map(|object| (object.reference.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_imports = BTreeSet::new();
+    let mut expected_governance = BTreeSet::new();
+    for entry in &manifest.entries {
+        let expected_reference = format!(
+            "{IMMUTABLE_IMPORT_NAMESPACE}/{}.json",
+            hex(&entry.artifact_sha256)
+        );
+        if entry.artifact_reference != expected_reference
+            || imports
+                .get(entry.artifact_reference.as_str())
+                .is_none_or(|object| object.sha256 != entry.artifact_sha256)
+        {
+            return Err(PortfolioApplicationServiceError::CorruptPublication);
+        }
+        expected_imports.insert(entry.artifact_reference.clone());
+        match (
+            entry.governance_receipt_reference.as_deref(),
+            entry.governance_receipt_sha256,
+        ) {
+            (Some(reference), Some(digest)) => {
+                let expected = format!("{IMMUTABLE_RECEIPT_NAMESPACE}/{}.json", hex(&digest));
+                let receipt = governance
+                    .get(reference)
+                    .filter(|object| object.sha256 == digest)
+                    .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+                if reference != expected || !expected_governance.insert(reference.to_owned()) {
+                    return Err(PortfolioApplicationServiceError::CorruptPublication);
+                }
+                let retained: PersistedGovernedReceipt = serde_json::from_slice(&receipt.bytes)
+                    .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+                match (
+                    retained.corporate_action_plan_reference.as_deref(),
+                    retained.corporate_action_plan_sha256.as_deref(),
+                ) {
+                    (Some(plan_reference), Some(plan_sha256)) => {
+                        let digest = decode_hex_digest(plan_sha256)?;
+                        if governance
+                            .get(plan_reference)
+                            .is_none_or(|object| object.sha256 != digest)
+                        {
+                            return Err(PortfolioApplicationServiceError::CorruptPublication);
+                        }
+                        expected_governance.insert(plan_reference.to_owned());
+                    }
+                    (None, None) => {}
+                    _ => return Err(PortfolioApplicationServiceError::CorruptPublication),
+                }
+            }
+            (None, None) => {}
+            _ => return Err(PortfolioApplicationServiceError::CorruptPublication),
+        }
+    }
+    if expected_imports.len() != imports.len() || expected_governance.len() != governance.len() {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    Ok(())
+}
+
+fn restored_corporate_action_plan(
+    artifacts: &ArtifactRoot,
+    receipt: &PersistedGovernedReceipt,
+    limits: PortfolioApplicationLimits,
+) -> Result<Option<market_squawk_data::CorporateActionPlan>, PortfolioApplicationServiceError> {
+    match (
+        receipt.corporate_action_plan_reference.as_deref(),
+        receipt.corporate_action_plan_sha256.as_deref(),
+        receipt.corporate_action_content_digest.as_deref(),
+        receipt.corporate_action_audit_digest.as_deref(),
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(reference), Some(sha256), Some(content), Some(audit)) => {
+            let bytes = read_artifact(artifacts, reference, limits.max_artifact_bytes)?;
+            let digest = decode_hex_digest(sha256)?;
+            if <[u8; 32]>::from(Sha256::digest(&bytes)) != digest
+                || reference
+                    != format!(
+                        "{IMMUTABLE_RESOLUTION_PLAN_NAMESPACE}/{}.json",
+                        hex(&digest)
+                    )
+            {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            let action_limit = NonZeroUsize::new(limits.max_result_items.min(1_000_000))
+                .ok_or(PortfolioApplicationServiceError::InvalidLimits)?;
+            let byte_limit = NonZeroUsize::new(limits.max_retained_bytes.min(512 * 1024 * 1024))
+                .ok_or(PortfolioApplicationServiceError::InvalidLimits)?;
+            let plan = market_squawk_data::CorporateActionPlan::decode_recovery_material(
+                &bytes,
+                CorporateActionLimits::try_new(action_limit, byte_limit)
+                    .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?,
+            )
+            .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+            if plan.content_hash().bytes() != decode_hex_digest(content)?
+                || plan.audit_hash().bytes() != decode_hex_digest(audit)?
+            {
+                return Err(PortfolioApplicationServiceError::CorruptPublication);
+            }
+            Ok(Some(plan))
+        }
+        _ => Err(PortfolioApplicationServiceError::CorruptPublication),
+    }
+}
+
+fn verify_restored_receipt(
+    original: &[u8],
+    account_id: AccountId,
+    artifact_sha256: [u8; 32],
+    preview_digest: [u8; 32],
+    retained: &PersistedGovernedReceipt,
+    resolution: &ServerHeldPortfolioImportResolution,
+) -> Result<(), PortfolioApplicationServiceError> {
+    let pending = PendingImport {
+        preview_id: hex(&preview_digest),
+        preview_digest,
+        account_id,
+        input_ticket_id: "restored-governed-publication".to_owned(),
+        artifact_reference: format!(
+            "{IMMUTABLE_PREVIEW_NAMESPACE}/{}.json",
+            hex(&artifact_sha256)
+        ),
+        artifact_sha256,
+        phase: PendingImportPhase::Promoting(Box::new(PendingImportPromotion {
+            interpretations: retained.interpretations.clone(),
+            receipt: retained.governance.clone(),
+            specific_lot_ids: retained.specific_lot_ids.clone(),
+            corporate_action_plan_reference: retained.corporate_action_plan_reference.clone(),
+            corporate_action_plan_sha256: retained
+                .corporate_action_plan_sha256
+                .as_deref()
+                .map(decode_hex_digest)
+                .transpose()?,
+            corporate_action_content_digest: retained
+                .corporate_action_content_digest
+                .as_deref()
+                .map(decode_hex_digest)
+                .transpose()?,
+            corporate_action_audit_digest: retained
+                .corporate_action_audit_digest
+                .as_deref()
+                .map(decode_hex_digest)
+                .transpose()?,
+        })),
+    };
+    let encoded = governed_receipt_bytes(&pending)?;
+    if encoded != original
+        || persisted_specific_lot_ids(resolution) != retained.specific_lot_ids
+        || persisted_plan_material(resolution)?.reference
+            != retained.corporate_action_plan_reference
+    {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    Ok(())
+}
+
+fn decode_hex_digest(value: &str) -> Result<[u8; 32], PortfolioApplicationServiceError> {
+    if value.len() != 64 {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, PortfolioApplicationServiceError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(PortfolioApplicationServiceError::CorruptPublication),
     }
 }
 
@@ -1223,30 +1896,33 @@ fn persisted_specific_lot_ids(
 
 fn persisted_plan_material(
     resolution: &ServerHeldPortfolioImportResolution,
-) -> Result<(Option<String>, Option<[u8; 32]>, Option<Vec<u8>>), PortfolioApplicationServiceError> {
+) -> Result<PersistedPlanMaterial, PortfolioApplicationServiceError> {
     let Some(plan) = resolution.corporate_action_plan.as_ref() else {
-        return Ok((None, None, None));
+        return Ok(PersistedPlanMaterial {
+            reference: None,
+            sha256: None,
+            bytes: None,
+        });
     };
     let bytes = plan
         .encode_recovery_material()
         .map_err(|_| PortfolioApplicationServiceError::Publication)?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    Ok((
-        Some(format!(
+    Ok(PersistedPlanMaterial {
+        reference: Some(format!(
             "{IMMUTABLE_RESOLUTION_PLAN_NAMESPACE}/{}.json",
             hex(&digest)
         )),
-        Some(digest),
-        Some(bytes),
-    ))
+        sha256: Some(digest),
+        bytes: Some(bytes),
+    })
 }
 
 fn candidate_corporate_plan_reference(pending: &PendingImport) -> Option<&str> {
     match &pending.phase {
-        PendingImportPhase::Promoting {
-            corporate_action_plan_reference,
-            ..
-        } => corporate_action_plan_reference.as_deref(),
+        PendingImportPhase::Promoting(promotion) => {
+            promotion.corporate_action_plan_reference.as_deref()
+        }
         PendingImportPhase::Prepared => None,
     }
 }
@@ -1254,16 +1930,7 @@ fn candidate_corporate_plan_reference(pending: &PendingImport) -> Option<&str> {
 fn governed_receipt_bytes(
     pending: &PendingImport,
 ) -> Result<Vec<u8>, PortfolioApplicationServiceError> {
-    let PendingImportPhase::Promoting {
-        interpretations,
-        receipt,
-        specific_lot_ids,
-        corporate_action_plan_reference,
-        corporate_action_plan_sha256,
-        corporate_action_content_digest,
-        corporate_action_audit_digest,
-    } = &pending.phase
-    else {
+    let PendingImportPhase::Promoting(promotion) = &pending.phase else {
         return Err(PortfolioApplicationServiceError::CorruptPublication);
     };
     serde_json::to_vec(&json!({
@@ -1271,13 +1938,13 @@ fn governed_receipt_bytes(
         "previewId": pending.preview_id,
         "previewDigest": hex(&pending.preview_digest),
         "accountId": pending.account_id.to_string(),
-        "governance": receipt,
-        "interpretations": interpretations,
-        "specificLotIds": specific_lot_ids,
-        "corporateActionPlanReference": corporate_action_plan_reference,
-        "corporateActionPlanSha256": corporate_action_plan_sha256.map(|value| hex(&value)),
-        "corporateActionContentDigest": corporate_action_content_digest.map(|value| hex(&value)),
-        "corporateActionAuditDigest": corporate_action_audit_digest.map(|value| hex(&value)),
+        "governance": promotion.receipt,
+        "interpretations": promotion.interpretations,
+        "specificLotIds": promotion.specific_lot_ids,
+        "corporateActionPlanReference": promotion.corporate_action_plan_reference,
+        "corporateActionPlanSha256": promotion.corporate_action_plan_sha256.map(|value| hex(&value)),
+        "corporateActionContentDigest": promotion.corporate_action_content_digest.map(|value| hex(&value)),
+        "corporateActionAuditDigest": promotion.corporate_action_audit_digest.map(|value| hex(&value)),
     }))
     .map_err(|_| PortfolioApplicationServiceError::Publication)
 }
@@ -1955,6 +2622,23 @@ fn persist_immutable(
         }
         Err(_) => Err(PortfolioApplicationServiceError::Publication),
     }
+}
+
+fn persist_fresh_immutable(
+    artifacts: &ArtifactRoot,
+    reference: &str,
+    bytes: &[u8],
+) -> Result<(), PortfolioApplicationServiceError> {
+    let resolved = artifacts
+        .resolve(reference)
+        .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
+    let mut file = resolved
+        .create_new()
+        .map_err(|_| PortfolioApplicationServiceError::RestoreTargetNotFresh)?;
+    file.write_all(bytes)
+        .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    file.sync_all()
+        .map_err(|_| PortfolioApplicationServiceError::Publication)
 }
 
 pub(super) fn hex(bytes: &[u8; 32]) -> String {

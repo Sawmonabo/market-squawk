@@ -183,6 +183,20 @@ impl DurableWorkspaceRegistry {
             .map_err(|_| WorkspaceRegistryError::Unavailable)
     }
 
+    /// Returns the exact durable descriptor for one registered workspace.
+    pub fn descriptor(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<WorkspaceDescriptor>, WorkspaceRegistryError> {
+        Ok(self
+            .document
+            .lock()
+            .map_err(|_| WorkspaceRegistryError::Unavailable)?
+            .workspaces
+            .get(&workspace_id)
+            .cloned())
+    }
+
     /// Registers one fully prepared workspace without changing the active workspace.
     pub fn register_prepared(
         &self,
