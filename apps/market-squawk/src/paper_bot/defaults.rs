@@ -27,9 +27,9 @@ use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
     BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
     BookImbalancePaperStrategyConfigInput, ExecutionAuditConfig, ExecutionDispatcherConfig,
-    ExecutionLiveActionHook, MAX_PAPER_FEE_BASIS_POINTS, PortfolioReadCapability,
-    PortfolioReadLimits, RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskServiceConfig,
-    Strategy,
+    ExecutionLiveActionHook, MAX_PAPER_FEE_BASIS_POINTS, ManualPaperDraftIngress,
+    ManualPaperStrategy, PortfolioReadCapability, PortfolioReadLimits, RiskLimits, RiskLimitsInput,
+    RiskPolicyIdentity, RiskServiceConfig, Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, DepthLimit, DirectBookLimits, LiveRouteConfig, LiveRouteConfigInput,
@@ -60,11 +60,12 @@ use crate::{
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const LOCAL_PAPER_STRATEGY_ID: &str = "454b500a-22ce-4a6d-a174-7320c724f78f";
-const LOCAL_PAPER_REASON_CODE: &str = "paper.book-imbalance.buy";
+const LOCAL_PAPER_REASON_CODE: &str = "paper.manual.target";
+const BOOK_IMBALANCE_PAPER_REASON_CODE: &str = "paper.book-imbalance.buy";
 const LOCAL_PAPER_MAXIMUM_SPREAD_TICKS: i64 = 5;
 const LOCAL_PAPER_MINIMUM_IMBALANCE_NUMERATOR: i128 = 1;
 const LOCAL_PAPER_MINIMUM_IMBALANCE_DENOMINATOR: u128 = 5;
-const LOCAL_PAPER_REQUIRED_FEATURES: [RequiredLiveFeature; 2] = [
+const BOOK_IMBALANCE_PAPER_REQUIRED_FEATURES: [RequiredLiveFeature; 2] = [
     RequiredLiveFeature::Spread,
     RequiredLiveFeature::BookImbalance,
 ];
@@ -126,6 +127,25 @@ pub(crate) fn local_paper_bot_with_provider_rate(
     fee_basis_points: u32,
     provider_rate: ProviderRateAuthority,
 ) -> Result<ProductionPaperBotComposition> {
+    local_paper_bot_with_provider_rate_and_strategy_mode(
+        config,
+        provider,
+        initial_cash,
+        fee_basis_points,
+        provider_rate,
+        PaperStrategyMode::Manual,
+    )
+}
+
+/// Builds one public paper source with an explicitly selected, closed strategy mode.
+pub(crate) fn local_paper_bot_with_provider_rate_and_strategy_mode(
+    config: AppConfig,
+    provider: ProductionSourceProvider,
+    initial_cash: Decimal,
+    fee_basis_points: u32,
+    provider_rate: ProviderRateAuthority,
+    strategy_mode: PaperStrategyMode,
+) -> Result<ProductionPaperBotComposition> {
     let source = configured_source(&config, provider)?;
     build_local_paper_bot(
         config,
@@ -137,17 +157,19 @@ pub(crate) fn local_paper_bot_with_provider_rate(
         initial_cash,
         fee_basis_points,
         0,
-        controlled_paper_strategy,
+        move |route| strategy_mode.for_route(route),
     )
 }
 
-pub(crate) async fn local_coinbase_direct_paper_bot_with_activation(
+/// Builds one activated Coinbase Direct paper source with an explicitly selected closed strategy.
+pub(crate) async fn local_coinbase_direct_paper_bot_with_activation_and_strategy_mode(
     config: AppConfig,
     provider_session_id: Uuid,
     initial_cash: Decimal,
     fee_basis_points: u32,
     provider_activation: &ProviderAdapterActivation,
     cancellation: CancellationToken,
+    strategy_mode: PaperStrategyMode,
 ) -> Result<ProductionPaperBotComposition> {
     let source = configured_source(&config, ProductionSourceProvider::Coinbase)?;
     let request = coinbase_direct_activation_request(&config, &source)?;
@@ -164,7 +186,7 @@ pub(crate) async fn local_coinbase_direct_paper_bot_with_activation(
         initial_cash,
         fee_basis_points,
         0,
-        controlled_paper_strategy,
+        move |route| strategy_mode.for_route(route),
     )
 }
 
@@ -187,6 +209,62 @@ struct ConfiguredPaperSource {
     routes: Vec<LiveRouteConfig>,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
+}
+
+/// Closed production paper-strategy selection.
+///
+/// Manual operation is the default and only exposes a route-bound draft ingress. Automated
+/// operation is retained for explicit operator configuration; it never creates a manual ingress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaperStrategyMode {
+    Manual,
+    BookImbalance,
+}
+
+impl PaperStrategyMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::BookImbalance => "book_imbalance",
+        }
+    }
+
+    fn for_route(self, route: &LiveRouteConfig) -> Result<PaperRouteStrategy> {
+        match self {
+            Self::Manual => PaperRouteStrategy::manual(route),
+            Self::BookImbalance => {
+                book_imbalance_paper_strategy(route).map(PaperRouteStrategy::automated)
+            }
+        }
+    }
+}
+
+/// One strategy transferred into its route with an optional paired manual-draft sender.
+///
+/// The sender stays inside production composition and is never exposed by a strategy factory.
+pub(super) struct PaperRouteStrategy {
+    strategy: Box<dyn Strategy>,
+    required_features: Vec<RequiredLiveFeature>,
+    manual_draft_ingress: Option<ManualPaperDraftIngress>,
+}
+
+impl PaperRouteStrategy {
+    pub(super) fn automated(strategy: Box<dyn Strategy>) -> Self {
+        Self {
+            strategy,
+            required_features: BOOK_IMBALANCE_PAPER_REQUIRED_FEATURES.to_vec(),
+            manual_draft_ingress: None,
+        }
+    }
+
+    fn manual(route: &LiveRouteConfig) -> Result<Self> {
+        let (ingress, strategy) = ManualPaperStrategy::try_new(route.route().clone())?;
+        Ok(Self {
+            strategy: Box::new(strategy),
+            required_features: Vec::new(),
+            manual_draft_ingress: Some(ingress),
+        })
+    }
 }
 
 enum PaperBotBuildSource {
@@ -334,7 +412,7 @@ fn build_local_paper_bot<F>(
     mut strategy_for_route: F,
 ) -> Result<ProductionPaperBotComposition>
 where
-    F: FnMut(&LiveRouteConfig) -> Result<Box<dyn Strategy>>,
+    F: FnMut(&LiveRouteConfig) -> Result<PaperRouteStrategy>,
 {
     let ConfiguredPaperSource {
         routes,
@@ -431,7 +509,11 @@ where
     strategies.try_reserve_exact(routes.len())?;
     let mut maximum_action_hook_bytes_per_route = 0_usize;
     for route in &routes {
-        let strategy = strategy_for_route(route)?;
+        let PaperRouteStrategy {
+            strategy,
+            required_features,
+            manual_draft_ingress,
+        } = strategy_for_route(route)?;
         let hook_retained_bytes = ExecutionLiveActionHook::retained_bytes_for_composition(
             strategy.as_ref(),
             &risk_limits,
@@ -442,17 +524,22 @@ where
         .ok_or_else(|| anyhow!("paper action-hook retained bytes overflowed"))?;
         let route_retained_bytes = RouteActionHook::retained_bytes_for_composition(
             route.route(),
-            LOCAL_PAPER_REQUIRED_FEATURES.len(),
+            required_features.len(),
             hook_retained_bytes,
         )?;
         maximum_action_hook_bytes_per_route =
             maximum_action_hook_bytes_per_route.max(route_retained_bytes);
-        strategies.push(ProductionPaperBotRoute::new(
+        let strategy = ProductionPaperBotRoute::new(
             route.route().clone(),
             strategy,
-            LOCAL_PAPER_REQUIRED_FEATURES.to_vec(),
+            required_features,
             ActionAuthorityIssueLimit::MIN,
-        ));
+        );
+        let strategy = match manual_draft_ingress {
+            Some(ingress) => strategy.with_manual_draft_ingress(ingress),
+            None => strategy,
+        };
+        strategies.push(strategy);
     }
     let (runtime_config, runtime_peak_bytes) = live_runtime_config(
         &routes,
@@ -539,7 +626,7 @@ pub(super) fn release_benchmark_paper_bot<F>(
     strategy_for_route: F,
 ) -> Result<ProductionPaperBotComposition>
 where
-    F: FnMut(&LiveRouteConfig) -> Result<Box<dyn Strategy>>,
+    F: FnMut(&LiveRouteConfig) -> Result<PaperRouteStrategy>,
 {
     build_local_paper_bot(
         config,
@@ -713,6 +800,7 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
         |_route| {
             strategy
                 .take()
+                .map(PaperRouteStrategy::automated)
                 .ok_or_else(|| anyhow!("Kraken test profile unexpectedly contains multiple routes"))
         },
     )
@@ -859,7 +947,7 @@ fn paper_config(
     })?)
 }
 
-pub(super) fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<dyn Strategy>> {
+pub(super) fn book_imbalance_paper_strategy(route: &LiveRouteConfig) -> Result<Box<dyn Strategy>> {
     let order_uuid = Uuid::new_v4();
     let config =
         BookImbalancePaperStrategyConfig::try_new(BookImbalancePaperStrategyConfigInput {
@@ -868,7 +956,7 @@ pub(super) fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<d
             order_id: OrderId::try_from(order_uuid)?,
             client_order_id: ClientOrderId::try_from(format!("paper-book-imbalance-{order_uuid}"))?,
             strategy_id: StrategyId::from_str(LOCAL_PAPER_STRATEGY_ID)?,
-            reason_code: OrderReasonCode::try_from(LOCAL_PAPER_REASON_CODE)?,
+            reason_code: OrderReasonCode::try_from(BOOK_IMBALANCE_PAPER_REASON_CODE)?,
             maximum_spread: PriceTicks::new(LOCAL_PAPER_MAXIMUM_SPREAD_TICKS),
             minimum_book_imbalance: ExactFeatureRatio::try_new(
                 LOCAL_PAPER_MINIMUM_IMBALANCE_NUMERATOR,
@@ -876,6 +964,18 @@ pub(super) fn controlled_paper_strategy(route: &LiveRouteConfig) -> Result<Box<d
             )?,
         })?;
     Ok(Box::new(BookImbalancePaperStrategy::try_new(config)?))
+}
+
+pub(crate) fn manual_paper_account_id() -> Result<AccountId> {
+    AccountId::from_str(LOCAL_PAPER_ACCOUNT_ID).map_err(Into::into)
+}
+
+pub(crate) fn manual_paper_strategy_id() -> Result<StrategyId> {
+    StrategyId::from_str(LOCAL_PAPER_STRATEGY_ID).map_err(Into::into)
+}
+
+pub(crate) fn manual_paper_reason_code() -> Result<OrderReasonCode> {
+    OrderReasonCode::try_from(LOCAL_PAPER_REASON_CODE).map_err(Into::into)
 }
 
 fn nonzero_usize(value: usize) -> Result<NonZeroUsize> {

@@ -137,6 +137,7 @@ const paperStatusSchema = z.discriminatedUnion("state", [
   }),
   z.object({
     state: z.literal("running"),
+    strategyMode: z.enum(["manual", "book_imbalance"]),
     sequence: z.number().int().nonnegative(),
     complete: z.boolean(),
     reconciliationRequired: z.boolean(),
@@ -178,6 +179,15 @@ const paperOrderSchema = z
     eligibleAt: timestampSchema.optional(),
     expiresAt: timestampSchema.optional(),
     revision: z.number().int().nonnegative().optional(),
+    targetReference: z
+      .object({
+        targetId: z.string().regex(/^[a-z][a-z0-9._-]{0,127}$/),
+        revision: z.number().int().positive(),
+        contentSha256: z.string().regex(/^[0-9a-f]{64}$/),
+      })
+      .strict()
+      .nullable()
+      .optional(),
   })
   .loose()
 

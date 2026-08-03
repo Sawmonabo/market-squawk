@@ -2,7 +2,7 @@ import { z } from "zod"
 
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 
-import type { ApplicationResult } from "@/lib/schemas"
+import { applicationResultSchema, type ApplicationResult } from "@/lib/schemas"
 
 const exactDecimalSchema = z.string().regex(/^-?\d+(?:\.\d+)?$/)
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
@@ -319,6 +319,105 @@ export type PortfolioScenarioBatchResult = z.infer<
 export type PortfolioRebalance = z.infer<typeof portfolioRebalanceSchema>
 export type PortfolioCandidateImpact = z.infer<typeof portfolioCandidateImpactSchema>
 export type Money = z.infer<typeof moneySchema>
+
+const portfolioImportTransactionSchema = z.object({
+  recordId: z.string().min(1),
+  brokerTransactionId: z.string().min(1),
+  sourceReference: z.string().min(1),
+  rawPayloadDigest: z.object({
+    algorithm: z.enum(["sha256", "blake3"]),
+    value: digestSchema,
+  }),
+  sourceRevision: z.string().min(1),
+  supersedesSourceRevision: z.string().min(1).nullable(),
+  classification: z.enum([
+    "trade",
+    "cash_transfer",
+    "income",
+    "fee",
+    "corporate_action",
+  ]),
+  amount: z.object({
+    value: exactDecimalSchema,
+    currency: z.string().min(1),
+  }),
+  quantity: exactDecimalSchema.nullable(),
+  occurredAtUnixNanos: losslessIntegerSchema,
+  lotMethod: z.string().min(1).nullable(),
+  allowedInterpretations: z.array(z.string().min(1)),
+  eligibleOpeningLotIds: z.array(z.string().min(1)),
+})
+
+const portfolioImportPreviewSchema = z.object({
+  previewId: digestSchema,
+  digest: digestSchema,
+  preview: z.object({
+    accountId: z.string().min(1),
+    disposition: z.enum(["applied", "replay"]),
+    rawRecords: z.array(
+      z.object({
+        sourceReference: z.string().min(1),
+        payloadDigest: z.object({
+          algorithm: z.enum(["sha256", "blake3"]),
+          value: digestSchema,
+        }),
+      }),
+    ),
+    transactions: z.array(portfolioImportTransactionSchema),
+    reconciliationDiscrepancies: z.array(z.unknown()),
+    corporateActionRequirements: z.array(
+      z.object({
+        recordId: z.string().min(1),
+        sourceReference: z.string().min(1),
+        instrumentId: z.string().min(1).nullable(),
+      }),
+    ),
+    resolutionRequirements: z.object({
+      requiresGovernedInterpretation: z.boolean(),
+      requiresServerHeldCorporateActionPlan: z.boolean(),
+      specificIdentificationUsesOnlyServerEnumeratedLots: z.literal(true),
+    }),
+  }),
+})
+
+const portfolioImportCommitSchema = z.object({
+  approvalId: z.string().uuid(),
+  previewId: digestSchema,
+  previewDigest: digestSchema,
+  receipt: z.record(z.string(), z.unknown()),
+  status: z.literal("committed"),
+})
+
+export type PortfolioImportPreview = z.infer<typeof portfolioImportPreviewSchema>
+export type PortfolioImportTransaction = z.infer<typeof portfolioImportTransactionSchema>
+export type PortfolioImportCommit = z.infer<typeof portfolioImportCommitSchema>
+
+export function parsePortfolioImportPreview(value: unknown): PortfolioImportPreview {
+  const parsed = applicationResultSchema
+    .extend({ data: portfolioImportPreviewSchema })
+    .safeParse(value)
+  if (!parsed.success || parsed.data.data.previewId !== parsed.data.data.digest) {
+    throw new Error(
+      "The installed service returned an import preview this dashboard cannot safely interpret.",
+    )
+  }
+  return parsed.data.data
+}
+
+export function parsePortfolioImportCommit(value: unknown): PortfolioImportCommit {
+  const parsed = applicationResultSchema
+    .extend({ data: portfolioImportCommitSchema })
+    .safeParse(value)
+  if (
+    !parsed.success ||
+    parsed.data.data.previewId !== parsed.data.data.previewDigest
+  ) {
+    throw new Error(
+      "The installed service returned an import receipt this dashboard cannot safely interpret.",
+    )
+  }
+  return parsed.data.data
+}
 
 export function parsePortfolioResult<Schema extends z.ZodType>(
   result: ApplicationResult,

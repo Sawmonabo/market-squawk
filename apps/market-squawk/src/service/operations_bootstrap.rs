@@ -244,17 +244,6 @@ impl PreparedInstalledOperations {
             SetupPlanAuthority::try_open(control_path, selection.identity().workspace_id())
                 .map_err(|_error| InstalledServiceError::CompositionStage("setup plan"))?,
         );
-        let pending = PendingOperationsComposition::new(OperationsApplicationDependencies {
-            backups: Arc::clone(&backups),
-            workspaces: Arc::clone(&workspaces),
-            workspace_lifecycle: Arc::clone(&workspace_lifecycle),
-            updates: Arc::clone(&update_lifecycle),
-            logs,
-            log_artifacts,
-            settings,
-            settings_operations: settings_operations.clone(),
-            setup,
-        });
         let activity = Arc::new(RuntimeActivityCoordinator::new(
             RuntimeActivityLimits::try_new(
                 4_096,
@@ -266,6 +255,18 @@ impl PreparedInstalledOperations {
             )
             .map_err(|_error| InstalledServiceError::CompositionStage("activity coordinator"))?,
         ));
+        let pending = PendingOperationsComposition::new(OperationsApplicationDependencies {
+            backups: Arc::clone(&backups),
+            workspaces: Arc::clone(&workspaces),
+            workspace_lifecycle: Arc::clone(&workspace_lifecycle),
+            activity: Arc::clone(&activity),
+            updates: Arc::clone(&update_lifecycle),
+            logs,
+            log_artifacts,
+            settings,
+            settings_operations: settings_operations.clone(),
+            setup,
+        });
         let backup_limits = AnalyticalBackupLimits::try_new(
             MAXIMUM_BACKUP_ARTIFACTS,
             MAXIMUM_BACKUP_REFERENCES,

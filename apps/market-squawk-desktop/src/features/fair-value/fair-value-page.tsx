@@ -56,6 +56,7 @@ import {
 } from "./fair-value-contracts"
 import { FairValueDetail } from "./fair-value-detail"
 import { FairValueGovernanceWorkflow } from "./fair-value-governance"
+import { PortfolioMeasurementWorkflow } from "./portfolio-measurement-workflow"
 
 export function FairValuePage() {
   const product = useProduct()
@@ -150,6 +151,14 @@ function FairValueWorkspace({
         </Button>
       }
     >
+      <PortfolioMeasurementWorkflow
+        bootstrap={bootstrap}
+        transport={transport}
+        onCreated={async (measurementId) => {
+          setSelectedId(measurementId)
+          await measurements.refetch()
+        }}
+      />
       {measurements.isPending ? (
         <FairValueContentLoading />
       ) : measurements.isError ? (

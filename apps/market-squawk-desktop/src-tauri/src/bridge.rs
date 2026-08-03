@@ -730,10 +730,16 @@ pub(crate) async fn invoke_application(
 /// bootstrap and match the exact native authority supplied by the caller.
 pub(crate) async fn invoke_private_application(
     operation: &'static str,
-    arguments: Map<String, Value>,
+    mut arguments: Map<String, Value>,
     state: &DesktopState,
     authority: InvocationAuthority,
 ) -> Result<Value, DesktopCommandError> {
+    if matches!(
+        authority,
+        InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
+    ) {
+        arguments.insert("confirm".to_owned(), Value::Bool(true));
+    }
     invoke_service_operation(state, operation, arguments, authority).await
 }
 

@@ -16,6 +16,7 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { BundleEvidence } from "./bundle-evidence"
+import { ForecastPreparation } from "./forecast-preparation"
 import { ForecastReview } from "./forecast-review"
 import { ModelJobActivity } from "./model-jobs"
 import { ModelWorkflows } from "./model-workflows"
@@ -290,6 +291,25 @@ function ModelsWorkspace({
             bootstrap={bootstrap}
             transport={transport}
             metadata={metadata.data ?? null}
+          />
+          <ForecastPreparation
+            bootstrap={bootstrap}
+            transport={transport}
+            selectedModel={
+              selectedBundle
+                ? {
+                    modelId: selectedBundle.modelId,
+                    bundleId: selectedBundle.bundleId,
+                    bundleVersion: selectedBundle.bundleVersion,
+                  }
+                : null
+            }
+            onStarted={async () => {
+              await Promise.all([
+                jobsAvailable ? jobs.refetch() : Promise.resolve(),
+                forecastsAvailable ? forecasts.refetch() : Promise.resolve(),
+              ])
+            }}
           />
           <ForecastReview
             bootstrap={bootstrap}

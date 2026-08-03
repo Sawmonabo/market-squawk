@@ -1,10 +1,10 @@
 //! Cloneable least-authority capabilities over the sole analytical catalog writer.
 
-use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
+use std::{collections::BTreeSet, fmt};
 
-use market_squawk_domain::{InstrumentId, Timestamp};
+use market_squawk_domain::{InstrumentDefinition, InstrumentId, Timestamp};
 use market_squawk_sources::{CapabilityRegistrationOutcome, OnboardingEvent, ProviderCapability};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -57,10 +57,62 @@ impl InstrumentDefinitionReadCapability {
         )
     }
 
+    /// Returns the newest verified definition for each requested stable identity.
+    ///
+    /// The operation is bounded by `maximum_instruments`, checks cancellation and deadline around
+    /// every catalog read, and never substitutes a definition for a missing identity.
+    pub fn latest(
+        &self,
+        instrument_ids: &[InstrumentId],
+        maximum_instruments: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InstrumentDefinition>, CatalogError> {
+        CatalogLimit::new(maximum_instruments)?;
+        if instrument_ids.len() > maximum_instruments
+            || instrument_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != instrument_ids.len()
+        {
+            return Err(CatalogError::InvalidLimit);
+        }
+        let authority = self.lock()?;
+        let one = CatalogLimit::new(1)?;
+        let mut definitions = Vec::new();
+        definitions
+            .try_reserve_exact(instrument_ids.len())
+            .map_err(|_| CatalogError::Allocation)?;
+        for instrument_id in instrument_ids {
+            check_read(deadline, cancellation)?;
+            if let Some(definition) = authority
+                .instrument_history(*instrument_id, one)?
+                .into_iter()
+                .next()
+            {
+                definitions.push(definition);
+            }
+        }
+        check_read(deadline, cancellation)?;
+        Ok(definitions)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
         self.authority
             .lock()
             .map_err(|_| CatalogError::AuthorityLockPoisoned)
+    }
+}
+
+fn check_read(deadline: Instant, cancellation: &CancellationToken) -> Result<(), CatalogError> {
+    if cancellation.is_cancelled() {
+        Err(CatalogError::InstrumentDefinitionReadCancelled)
+    } else if Instant::now() >= deadline {
+        Err(CatalogError::InstrumentDefinitionReadDeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 

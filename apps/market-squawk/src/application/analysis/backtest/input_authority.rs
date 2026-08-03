@@ -1,6 +1,7 @@
 //! Restart-safe registration and fresh resolution of governed-backtest inputs.
 
 mod index;
+mod preparation;
 mod recipe;
 mod resolution;
 
@@ -31,6 +32,11 @@ use index::{
 use recipe::{InputRecipe, RecipeError, RegistrationRecipe};
 use resolution::BacktestInputMaterializer;
 
+pub use preparation::{
+    BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
+    BacktestPreparationLimits, BacktestPreparationOptions, BacktestPreparationPreview,
+    BacktestPreparationReceipt, BacktestPreparationSelection, GovernedBacktestPreparationAuthority,
+};
 pub use recipe::{
     GovernedBacktestCohortCandidateRegistrationInput,
     GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,

@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -19,10 +19,14 @@ use market_squawk_adapter_paper::{
     PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionSnapshot, PaperFillSnapshot,
     PaperOrderSnapshot, PaperPosition,
 };
-use market_squawk_domain::{OrderId, OrderSide};
+use market_squawk_decisions::{InvestmentTargetSetId, TargetState, TargetStatus};
+use market_squawk_domain::{
+    BasisPoints, DigestAlgorithm, Money, OrderId, OrderSide, OrderType, PriceTicks, QuantityLots,
+    RevisionNumber, TimeInForce, Timestamp,
+};
 use market_squawk_execution::{
     CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionDispatchError, ExecutionState,
-    RiskLimitsSnapshot,
+    ManualPaperDraft, ManualPaperDraftInput, OrderTargetReference, RiskLimitsSnapshot,
 };
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
@@ -35,15 +39,18 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::decision::DecisionApplication;
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
 use super::source::SourceRuntimeView;
 use super::{ApplicationDomainService, effective_service_limits};
 use crate::{
     AppConfig, ProductionSourceProvider, ProviderAdapterActivation,
     paper_bot::{
-        ProductionExecutionAuditRecord, ProductionExecutionAuditSnapshot,
-        ProductionPaperBotRuntime, local_coinbase_direct_paper_bot_with_activation,
-        local_paper_bot_with_provider_rate,
+        PaperStrategyMode, ProductionExecutionAuditRecord, ProductionExecutionAuditSnapshot,
+        ProductionManualPaperIngressError, ProductionPaperBotRuntime,
+        local_coinbase_direct_paper_bot_with_activation_and_strategy_mode,
+        local_paper_bot_with_provider_rate_and_strategy_mode, manual_paper_account_id,
+        manual_paper_reason_code, manual_paper_strategy_id,
     },
 };
 
@@ -57,6 +64,11 @@ const EXECUTION_GET_ORDERS: &str = "Execution.GetOrders";
 const EXECUTION_GET_FILLS: &str = "Execution.GetFills";
 const EXECUTION_CANCEL: &str = "Execution.Cancel";
 const EXECUTION_RECONCILE: &str = "Execution.Reconcile";
+const EXECUTION_GET_MANUAL_PAPER_TARGETS: &str = "Execution.GetManualPaperTargets";
+const EXECUTION_SUBMIT_MANUAL_PAPER_DRAFT: &str = "Execution.SubmitManualPaperDraft";
+const MANUAL_PAPER_DRAFT_LIFETIME: Duration = Duration::from_secs(60);
+/// Upper bound inherited from the local decision catalog's installed-product capacity.
+const MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES: usize = 4_096;
 
 /// Shared paper lifecycle exposed as distinct Bot and Execution domain services.
 pub struct PaperApplicationServices {
@@ -122,6 +134,7 @@ impl PaperApplicationServices {
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
         provider_rate: ProviderRateAuthority,
         provider_activation: Arc<ProviderAdapterActivation>,
+        decisions: Arc<DecisionApplication>,
     ) -> Self {
         Self {
             controller: Arc::new(PaperController::new(
@@ -129,6 +142,7 @@ impl PaperApplicationServices {
                 live_fair_value,
                 provider_rate,
                 provider_activation,
+                decisions,
             )),
         }
     }
@@ -273,6 +287,16 @@ impl ApplicationDomainService for ExecutionDomainService {
                     .fills(&context, limits.maximum_result_items())
                     .await?
             }
+            EXECUTION_GET_MANUAL_PAPER_TARGETS => {
+                self.controller
+                    .manual_paper_targets(&context, limits.maximum_result_items())
+                    .await?
+            }
+            EXECUTION_SUBMIT_MANUAL_PAPER_DRAFT => {
+                self.controller
+                    .submit_manual_paper_order(&request, &context)
+                    .await?
+            }
             EXECUTION_CANCEL => {
                 let order = required_string(&request, "orderId")?;
                 let order =
@@ -309,6 +333,7 @@ struct PaperController {
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
     provider_rate: ProviderRateAuthority,
     provider_activation: Arc<ProviderAdapterActivation>,
+    decisions: Arc<DecisionApplication>,
     accepting: AtomicBool,
     lifecycle: CancellationToken,
     state: Mutex<PaperState>,
@@ -322,6 +347,7 @@ impl PaperController {
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
         provider_rate: ProviderRateAuthority,
         provider_activation: Arc<ProviderAdapterActivation>,
+        decisions: Arc<DecisionApplication>,
     ) -> Self {
         let (changed, _initial_receiver) = watch::channel(0);
         Self {
@@ -329,6 +355,7 @@ impl PaperController {
             live_fair_value,
             provider_rate,
             provider_activation,
+            decisions,
             accepting: AtomicBool::new(true),
             lifecycle: CancellationToken::new(),
             state: Mutex::new(PaperState::Stopped {
@@ -355,6 +382,7 @@ impl PaperController {
             PaperState::Stopping => Ok(json!({"state": "stopping"})),
             PaperState::Running {
                 provider,
+                strategy_mode,
                 runtime,
                 exports,
                 cancellation,
@@ -379,6 +407,7 @@ impl PaperController {
                     .map_err(|_error| ServiceError::Unavailable)?;
                 Ok(json!({
                     "state": "running",
+                    "strategyMode": strategy_mode.as_str(),
                     "sequence": snapshot.sequence(),
                     "complete": snapshot.complete(),
                     "reconciliationRequired": snapshot.reconciliation_required(),
@@ -418,6 +447,7 @@ impl PaperController {
             return Err(ServiceError::Unavailable);
         }
         let provider = PaperProvider::from_request(request)?;
+        let strategy_mode = paper_strategy_mode(request)?;
         let initial_cash = required_string(request, "initialCash")?
             .parse::<Decimal>()
             .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -443,14 +473,17 @@ impl PaperController {
         *self.restart_request.lock().await = Some(request.clone());
 
         let composition = match provider {
-            PaperProvider::Public(provider) => local_paper_bot_with_provider_rate(
-                self.config.clone(),
-                provider,
-                initial_cash,
-                fee_basis_points,
-                self.provider_rate.clone(),
-            )
-            .map_err(|_error| ServiceError::Unavailable),
+            PaperProvider::Public(provider) => {
+                local_paper_bot_with_provider_rate_and_strategy_mode(
+                    self.config.clone(),
+                    provider,
+                    initial_cash,
+                    fee_basis_points,
+                    self.provider_rate.clone(),
+                    strategy_mode,
+                )
+                .map_err(|_error| ServiceError::Unavailable)
+            }
             PaperProvider::CoinbaseDirect {
                 provider_session_id,
             } => {
@@ -460,13 +493,14 @@ impl PaperController {
                     () = tokio::time::sleep_until(
                         tokio::time::Instant::from_std(deadline)
                     ) => Err(ServiceError::DeadlineExceeded),
-                    result = local_coinbase_direct_paper_bot_with_activation(
+                    result = local_coinbase_direct_paper_bot_with_activation_and_strategy_mode(
                         self.config.clone(),
                         provider_session_id,
                         initial_cash,
                         fee_basis_points,
                         self.provider_activation.as_ref(),
                         run_cancellation.clone(),
+                        strategy_mode,
                     ) => result.map_err(|_error| ServiceError::Unavailable),
                 }
             }
@@ -554,6 +588,7 @@ impl PaperController {
                 {
                     *state = PaperState::Running {
                         provider,
+                        strategy_mode,
                         runtime: Box::new(runtime),
                         exports,
                         cancellation: run_cancellation,
@@ -563,6 +598,7 @@ impl PaperController {
                     return Ok(json!({
                         "state": "running",
                         "provider": provider.name(),
+                        "strategyMode": strategy_mode.as_str(),
                     }));
                 }
                 if current_start {
@@ -649,6 +685,189 @@ impl PaperController {
             .map_err(|_error| ServiceError::ResourceExhausted)?;
         values.extend(snapshot.fills()[..returned].iter().copied().map(fill_value));
         Ok((Value::Array(values), returned, available))
+    }
+
+    async fn manual_paper_targets(
+        &self,
+        context: &RequestContext,
+        maximum_items: usize,
+    ) -> Result<(Value, usize, usize), ServiceError> {
+        ensure_live(context)?;
+        let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
+        let PaperState::Running {
+            runtime,
+            exports,
+            cancellation,
+            ..
+        } = &*state
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy() {
+            return Err(ServiceError::Unavailable);
+        }
+        let now = current_timestamp()?;
+        let entries = self
+            .decisions
+            .list_target_index(MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES)
+            .map_err(map_decision_error)?;
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(entries.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for entry in entries {
+            if entry.status() != TargetStatus::Active {
+                continue;
+            }
+            let target = self
+                .decisions
+                .get_target(entry.id(), entry.revision())
+                .map_err(map_decision_error)?;
+            if !target_currently_usable(&target, now) {
+                continue;
+            }
+            let Ok(route) = sole_compatible_manual_route(runtime, &target) else {
+                continue;
+            };
+            targets.push(manual_paper_target_value(&target, route)?);
+        }
+        if targets.len() > maximum_items {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let count = targets.len();
+        Ok((json!({"targets": targets}), count, count))
+    }
+
+    async fn submit_manual_paper_order(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<(Value, usize, usize), ServiceError> {
+        ensure_live(context)?;
+        let target_id = InvestmentTargetSetId::try_new(required_string(request, "targetId")?)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        let target_revision = request
+            .arguments()
+            .get("targetRevision")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .and_then(|value| RevisionNumber::new(value).ok())
+            .ok_or(ServiceError::InvalidRequest)?;
+        let side = manual_order_side(required_string(request, "side")?)?;
+        let order_type = manual_order_type(required_string(request, "orderType")?)?;
+        let time_in_force = manual_time_in_force(required_string(request, "timeInForce")?)?;
+        let quantity = required_string(request, "quantityLots")?
+            .parse::<i64>()
+            .map_err(|_error| ServiceError::InvalidRequest)
+            .and_then(|lots| {
+                QuantityLots::new(lots).map_err(|_error| ServiceError::InvalidRequest)
+            })?;
+        let state = bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
+        let PaperState::Running {
+            runtime,
+            exports,
+            cancellation,
+            ..
+        } = &*state
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy() {
+            return Err(ServiceError::Unavailable);
+        }
+        let now = current_timestamp()?;
+        let target = self.current_active_target(&target_id, target_revision, now)?;
+        let manual_route = sole_compatible_manual_route(runtime, &target)?;
+        let route = manual_route.route();
+        let terms = manual_route.execution_terms();
+        let target_core = target.target().target();
+        if target_core.reference_mark().price().currency() != terms.quote_currency() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let limit_price =
+            selected_target_price(request, "limitTargetLevel", &target, terms, order_type)?;
+        let stop_price =
+            selected_target_price(request, "stopTargetLevel", &target, terms, order_type)?;
+        let content_digest = target_core.content_identity().evidence_digest();
+        if content_digest.algorithm() != DigestAlgorithm::Sha256 {
+            return Err(ServiceError::Unavailable);
+        }
+        let target_reference = OrderTargetReference::try_new(
+            target_core.id().as_str(),
+            std::num::NonZeroU64::new(u64::from(target_core.revision().get()))
+                .ok_or(ServiceError::Unavailable)?,
+            content_digest.bytes(),
+        )
+        .map_err(|_error| ServiceError::Unavailable)?;
+        let expires_at = now
+            .checked_add_nanos(
+                i64::try_from(MANUAL_PAPER_DRAFT_LIFETIME.as_nanos())
+                    .map_err(|_error| ServiceError::Unavailable)?,
+            )
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let order_id =
+            OrderId::try_from(Uuid::new_v4()).map_err(|_error| ServiceError::Unavailable)?;
+        let client_order_id =
+            market_squawk_domain::ClientOrderId::try_from(format!("paper-manual-{order_id}"))
+                .map_err(|_error| ServiceError::Unavailable)?;
+        let draft = ManualPaperDraft::try_new(ManualPaperDraftInput {
+            order_id,
+            client_order_id,
+            strategy_id: manual_paper_strategy_id().map_err(|_error| ServiceError::Unavailable)?,
+            account_id: manual_paper_account_id().map_err(|_error| ServiceError::Unavailable)?,
+            side,
+            order_type,
+            quantity,
+            limit_price,
+            stop_price,
+            time_in_force,
+            expires_at,
+            reason_code: manual_paper_reason_code().map_err(|_error| ServiceError::Unavailable)?,
+            maximum_slippage: BasisPoints::new(100),
+            target_reference,
+        })
+        .map_err(|_error| ServiceError::InvalidRequest)?;
+        runtime
+            .try_submit_manual_paper_draft(route, draft)
+            .map_err(map_manual_paper_ingress_error)?;
+        Ok((
+            json!({
+                "state": "accepted",
+                "targetId": target_core.id().as_str(),
+                "targetRevision": target_core.revision().get(),
+            }),
+            1,
+            1,
+        ))
+    }
+
+    fn current_active_target(
+        &self,
+        target_id: &InvestmentTargetSetId,
+        requested_revision: RevisionNumber,
+        now: Timestamp,
+    ) -> Result<TargetState, ServiceError> {
+        let entries = self
+            .decisions
+            .list_target_index(MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES)
+            .map_err(map_decision_error)?;
+        let entry = entries
+            .iter()
+            .find(|candidate| {
+                candidate.id() == target_id
+                    && candidate.revision() == requested_revision
+                    && candidate.status() == TargetStatus::Active
+            })
+            .ok_or(ServiceError::NotFound)?;
+        let target = self
+            .decisions
+            .get_target(entry.id(), entry.revision())
+            .map_err(map_decision_error)?;
+        if target_currently_usable(&target, now) {
+            Ok(target)
+        } else {
+            Err(ServiceError::InvalidRequest)
+        }
     }
 
     async fn snapshot(
@@ -796,6 +1015,253 @@ impl PaperController {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetLadderSelector {
+    Downside,
+    Add,
+    EntryLower,
+    EntryUpper,
+    Base,
+    TrimLower,
+    TrimUpper,
+    ExitLower,
+    ExitUpper,
+    Upside,
+}
+
+impl TargetLadderSelector {
+    fn parse(value: &str) -> Result<Self, ServiceError> {
+        match value {
+            "downside" => Ok(Self::Downside),
+            "add" => Ok(Self::Add),
+            "entry_lower" => Ok(Self::EntryLower),
+            "entry_upper" => Ok(Self::EntryUpper),
+            "base" => Ok(Self::Base),
+            "trim_lower" => Ok(Self::TrimLower),
+            "trim_upper" => Ok(Self::TrimUpper),
+            "exit_lower" => Ok(Self::ExitLower),
+            "exit_upper" => Ok(Self::ExitUpper),
+            "upside" => Ok(Self::Upside),
+            _ => Err(ServiceError::InvalidRequest),
+        }
+    }
+
+    const fn level(self) -> &'static str {
+        match self {
+            Self::Downside => "downside",
+            Self::Add => "add",
+            Self::EntryLower => "entry_lower",
+            Self::EntryUpper => "entry_upper",
+            Self::Base => "base",
+            Self::TrimLower => "trim_lower",
+            Self::TrimUpper => "trim_upper",
+            Self::ExitLower => "exit_lower",
+            Self::ExitUpper => "exit_upper",
+            Self::Upside => "upside",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Downside => "Downside",
+            Self::Add => "Add",
+            Self::EntryLower => "Entry lower",
+            Self::EntryUpper => "Entry upper",
+            Self::Base => "Base",
+            Self::TrimLower => "Trim lower",
+            Self::TrimUpper => "Trim upper",
+            Self::ExitLower => "Exit lower",
+            Self::ExitUpper => "Exit upper",
+            Self::Upside => "Upside",
+        }
+    }
+
+    fn price(self, state: &TargetState) -> Money {
+        let target = state.target().target();
+        match self {
+            Self::Downside => target.cases().downside(),
+            Self::Add => state.target().add_case(),
+            Self::EntryLower => target.entry_range().lower(),
+            Self::EntryUpper => target.entry_range().upper(),
+            Self::Base => target.cases().base(),
+            Self::TrimLower => target.trim_range().lower(),
+            Self::TrimUpper => target.trim_range().upper(),
+            Self::ExitLower => target.exit_range().lower(),
+            Self::ExitUpper => target.exit_range().upper(),
+            Self::Upside => target.cases().upside(),
+        }
+    }
+}
+
+fn manual_order_side(value: &str) -> Result<OrderSide, ServiceError> {
+    match value {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        _ => Err(ServiceError::InvalidRequest),
+    }
+}
+
+fn manual_order_type(value: &str) -> Result<OrderType, ServiceError> {
+    match value {
+        "market" => Ok(OrderType::Market),
+        "limit" => Ok(OrderType::Limit),
+        "stop" => Ok(OrderType::Stop),
+        "stop_limit" => Ok(OrderType::StopLimit),
+        _ => Err(ServiceError::InvalidRequest),
+    }
+}
+
+fn manual_time_in_force(value: &str) -> Result<TimeInForce, ServiceError> {
+    match value {
+        "day" => Ok(TimeInForce::Day),
+        "good_til_cancelled" => Ok(TimeInForce::GoodTilCancelled),
+        "immediate_or_cancel" => Ok(TimeInForce::ImmediateOrCancel),
+        "fill_or_kill" => Ok(TimeInForce::FillOrKill),
+        _ => Err(ServiceError::InvalidRequest),
+    }
+}
+
+fn selected_target_price(
+    request: &TypedToolRequest,
+    field: &str,
+    target: &TargetState,
+    terms: market_squawk_domain::InstrumentExecutionTerms,
+    order_type: OrderType,
+) -> Result<Option<PriceTicks>, ServiceError> {
+    let required = match field {
+        "limitTargetLevel" => matches!(order_type, OrderType::Limit | OrderType::StopLimit),
+        "stopTargetLevel" => matches!(order_type, OrderType::Stop | OrderType::StopLimit),
+        _ => return Err(ServiceError::Internal),
+    };
+    let selector = request.arguments().get(field).and_then(Value::as_str);
+    if required != selector.is_some() {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+    let price = TargetLadderSelector::parse(selector)?.price(target);
+    if price.currency() != terms.quote_currency() {
+        return Err(ServiceError::InvalidRequest);
+    }
+    PriceTicks::try_from_decimal(price.amount(), terms.price_tick())
+        .map(Some)
+        .map_err(|_error| ServiceError::InvalidRequest)
+}
+
+fn target_currently_usable(target: &TargetState, now: Timestamp) -> bool {
+    target.status() == TargetStatus::Active
+        && target.target().effective_at() <= now
+        && now < target.target().target().expires_at()
+}
+
+fn manual_paper_target_value(
+    target: &TargetState,
+    route: &crate::paper_bot::ManualPaperRoute,
+) -> Result<Value, ServiceError> {
+    let target_core = target.target().target();
+    let mut ladder = Vec::new();
+    ladder
+        .try_reserve_exact(10)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for level in [
+        TargetLadderSelector::Downside,
+        TargetLadderSelector::Add,
+        TargetLadderSelector::EntryLower,
+        TargetLadderSelector::EntryUpper,
+        TargetLadderSelector::Base,
+        TargetLadderSelector::TrimLower,
+        TargetLadderSelector::TrimUpper,
+        TargetLadderSelector::ExitLower,
+        TargetLadderSelector::ExitUpper,
+        TargetLadderSelector::Upside,
+    ] {
+        ladder.push(json!({
+            "level": level.level(),
+            "label": level.label(),
+            "value": level.price(target),
+        }));
+    }
+    Ok(json!({
+        "targetId": target_core.id().as_str(),
+        "targetRevision": target_core.revision().get(),
+        "instrumentId": target_core.instrument_id(),
+        "status": "active",
+        "thesis": target.target().thesis().as_str(),
+        "expiresAt": target_core.expires_at(),
+        "reviewDueAt": target.target().review_due_at(),
+        "route": {
+            "venueId": route.route().venue(),
+            "instrumentId": route.route().instrument(),
+        },
+        "ladder": ladder,
+    }))
+}
+
+/// Resolves the only active manual route that can trade an exact governed target.
+///
+/// A target never chooses a venue. More than one compatible route is ambiguous and therefore
+/// rejected rather than resolved by an incidental route order.
+fn sole_compatible_manual_route<'a>(
+    runtime: &'a ProductionPaperBotRuntime,
+    target: &TargetState,
+) -> Result<&'a crate::paper_bot::ManualPaperRoute, ServiceError> {
+    let target_core = target.target().target();
+    let reference_currency = target_core.reference_mark().price().currency();
+    let mut compatible = None;
+    for route in runtime.manual_paper_routes() {
+        let terms = route.execution_terms();
+        if route.route().instrument() != target_core.instrument_id()
+            || terms.quote_currency() != reference_currency
+        {
+            continue;
+        }
+        if compatible.replace(route).is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+    }
+    compatible.ok_or(ServiceError::InvalidRequest)
+}
+
+fn current_timestamp() -> Result<Timestamp, ServiceError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_error| ServiceError::Unavailable)?
+        .as_nanos();
+    let nanos = i64::try_from(nanos).map_err(|_error| ServiceError::Unavailable)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
+}
+
+fn map_decision_error(
+    error: crate::application::decision::DecisionApplicationError,
+) -> ServiceError {
+    use crate::application::decision::DecisionApplicationError;
+    use market_squawk_decisions::DecisionRepositoryError;
+
+    match error {
+        DecisionApplicationError::Repository(DecisionRepositoryError::NotFound) => {
+            ServiceError::NotFound
+        }
+        DecisionApplicationError::Repository(
+            DecisionRepositoryError::Capacity | DecisionRepositoryError::InvalidLimits,
+        )
+        | DecisionApplicationError::Allocation
+        | DecisionApplicationError::Capacity => ServiceError::ResourceExhausted,
+        DecisionApplicationError::Repository(_)
+        | DecisionApplicationError::Unavailable
+        | DecisionApplicationError::Persistence => ServiceError::Unavailable,
+        DecisionApplicationError::InvalidPersistentState => ServiceError::Internal,
+    }
+}
+
+const fn map_manual_paper_ingress_error(error: ProductionManualPaperIngressError) -> ServiceError {
+    match error {
+        ProductionManualPaperIngressError::RouteUnavailable => ServiceError::InvalidRequest,
+        ProductionManualPaperIngressError::Occupied => ServiceError::ResourceExhausted,
+        ProductionManualPaperIngressError::Closed => ServiceError::Unavailable,
+    }
+}
+
 impl fmt::Debug for PaperController {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -822,6 +1288,7 @@ enum PaperState {
     },
     Running {
         provider: PaperProvider,
+        strategy_mode: PaperStrategyMode,
         runtime: Box<ProductionPaperBotRuntime>,
         exports: PaperRuntimeExports,
         cancellation: CancellationToken,
@@ -847,6 +1314,18 @@ async fn bounded_runtime_shutdown(
             let exports_complete = exports.finish_before(deadline, cancellation).await;
             Ok(runtime_complete && exports_complete)
         },
+    }
+}
+
+/// Parses the only two supported paper strategy modes; absence preserves manual operation.
+fn paper_strategy_mode(request: &TypedToolRequest) -> Result<PaperStrategyMode, ServiceError> {
+    match request.arguments().get("strategyMode") {
+        None => Ok(PaperStrategyMode::Manual),
+        Some(Value::String(value)) if value == "manual" => Ok(PaperStrategyMode::Manual),
+        Some(Value::String(value)) if value == "book_imbalance" => {
+            Ok(PaperStrategyMode::BookImbalance)
+        }
+        Some(_) => Err(ServiceError::InvalidRequest),
     }
 }
 
@@ -1055,6 +1534,11 @@ fn order_value(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value
         "eligibleAt": order.eligible_at(),
         "expiresAt": order.expires_at(),
         "revision": order.revision(),
+        "targetReference": order.target_reference().map(|target| json!({
+            "targetId": target.target_id(),
+            "revision": target.revision().get(),
+            "contentSha256": hex(target.content_sha256()),
+        })),
         "observed": observed_order_evidence(order, fills),
     })
 }

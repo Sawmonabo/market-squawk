@@ -6,11 +6,11 @@ use tauri::State;
 use crate::{
     bridge::{DesktopState, InvocationAuthority, invoke_application, invoke_private_application},
     contracts::{
-        ApplicationInvocation, DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
-        FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
-        JobControlCommand, ModelControlCommand, OperationLogDomain, OperationLogSeverity,
-        OperationSettingValue, OperationsControlCommand, PaperControlCommand,
-        ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
+        AnalysisControlCommand, ApplicationInvocation, DashboardQueryCommand,
+        DecisionControlCommand, DesktopCommandError, FairValueControlCommand,
+        GovernanceControlCommand, GovernanceQueryCommand, JobControlCommand, ModelControlCommand,
+        OperationLogDomain, OperationLogSeverity, OperationSettingValue, OperationsControlCommand,
+        PaperControlCommand, ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
@@ -29,6 +29,18 @@ pub(crate) async fn dashboard_query(
         }
         DashboardQueryCommand::MarketSnapshot => ("Market.GetSnapshot", Map::new()),
         DashboardQueryCommand::MarketQuality => ("Market.GetQuality", Map::new()),
+        DashboardQueryCommand::MarketTrades { instrument_id } => {
+            ("Market.GetTrades", instrument_arguments(instrument_id))
+        }
+        DashboardQueryCommand::MarketQuotes { instrument_id } => {
+            ("Market.GetQuotes", instrument_arguments(instrument_id))
+        }
+        DashboardQueryCommand::MarketBooks { instrument_id } => {
+            ("Market.GetBooks", instrument_arguments(instrument_id))
+        }
+        DashboardQueryCommand::MarketComparisons { instrument_id } => {
+            ("Market.GetComparisons", instrument_arguments(instrument_id))
+        }
         DashboardQueryCommand::SourceStatus { source_ids } => {
             ("Source.GetStatus", source_arguments(source_ids))
         }
@@ -52,6 +64,10 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::ResearchAlternativeData { dataset } => {
             ("Research.GetAlternativeData", dataset_arguments(dataset))
         }
+        DashboardQueryCommand::ResearchSourceObjects { provider, dataset } => (
+            "Source.ListObjects",
+            source_discovery_arguments(provider, dataset),
+        ),
         DashboardQueryCommand::PortfolioAccounts { after_account_id } => {
             let mut arguments = Map::new();
             insert_optional(&mut arguments, "afterAccountId", after_account_id);
@@ -141,6 +157,15 @@ pub(crate) async fn dashboard_query(
             arguments.insert("limit".to_owned(), json!(limit));
             ("Decision.ListScreens", arguments)
         }
+        DashboardQueryCommand::AnalysisFeatureDatasets {
+            dataset,
+            after_dataset,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "dataset", dataset);
+            insert_optional(&mut arguments, "afterDataset", after_dataset);
+            ("Analysis.GetFeatureDatasets", arguments)
+        }
         DashboardQueryCommand::DecisionScreenRuns {
             after_run_id,
             limit,
@@ -159,6 +184,11 @@ pub(crate) async fn dashboard_query(
             let mut arguments = Map::new();
             arguments.insert("dossierId".to_owned(), json!(dossier_id));
             ("Decision.GetDossier", arguments)
+        }
+        DashboardQueryCommand::DecisionTargetPreparation { dossier_id } => {
+            let mut arguments = Map::new();
+            arguments.insert("dossierId".to_owned(), json!(dossier_id));
+            ("Decision.GetTargetPreparation", arguments)
         }
         DashboardQueryCommand::DecisionCandidateDossiers {
             candidate_id,
@@ -260,6 +290,9 @@ pub(crate) async fn dashboard_query(
             insert_optional(&mut arguments, "afterJobId", after_job_id);
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.List", arguments)
+        }
+        DashboardQueryCommand::OperationRuntimeStatus => {
+            ("Operations.GetRuntimeStatus", Map::new())
         }
         DashboardQueryCommand::OperationBackups {
             after_backup_id,
@@ -509,6 +542,11 @@ pub(crate) async fn fair_value_control(
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
     match request {
+        FairValueControlCommand::Measure { measurement } => {
+            let mut arguments = Map::new();
+            arguments.insert("measurement".to_owned(), Value::Object(measurement));
+            invoke_narrow("FairValue.Measure", arguments, true, confirmed, &state).await
+        }
         FairValueControlCommand::Classify { measurement_id } => {
             invoke_narrow(
                 "FairValue.Classify",
@@ -562,9 +600,60 @@ pub(crate) async fn decision_control(
     state: State<'_, DesktopState>,
     window: tauri::Window,
 ) -> Result<Value, DesktopCommandError> {
-    require_confirmation(confirmed)?;
     match request {
+        DecisionControlCommand::SaveScreen {
+            expected_revision,
+            screen,
+        } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "expectedRevision", expected_revision);
+            arguments.insert("screen".to_owned(), Value::Object(screen));
+            invoke_private_application(
+                "Decision.SaveScreen",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.SaveScreen"),
+            )
+            .await
+        }
+        DecisionControlCommand::PrepareTargetSet { draft } => {
+            let mut arguments = Map::new();
+            arguments.insert("draft".to_owned(), Value::Object(draft));
+            invoke_private_application(
+                "Decision.PrepareTargetSet",
+                arguments,
+                &state,
+                InvocationAuthority::ReadOnly,
+            )
+            .await
+        }
+        DecisionControlCommand::CreateTargetSet { receipt_id } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("receiptId".to_owned(), json!(receipt_id));
+            invoke_private_application(
+                "Decision.CreateTargetSet",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.CreateTargetSet"),
+            )
+            .await
+        }
+        DecisionControlCommand::ReevaluateTargetSet { receipt_id } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("receiptId".to_owned(), json!(receipt_id));
+            invoke_private_application(
+                "Decision.ReevaluateTargetSet",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.ReevaluateTargetSet"),
+            )
+            .await
+        }
         DecisionControlCommand::PreviewGovernanceAction { proposal } => {
+            require_confirmation(confirmed)?;
             let mut arguments = Map::new();
             arguments.insert("proposal".to_owned(), json!(proposal));
             invoke_private_application(
@@ -579,6 +668,7 @@ pub(crate) async fn decision_control(
             preview_id,
             authorization_handles,
         } => {
+            require_confirmation(confirmed)?;
             let ticket_ids = state.consume_governance_authorizations(
                 window.label(),
                 preview_id,
@@ -695,41 +785,92 @@ pub(crate) async fn paper_control(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    if !confirmed {
-        return Err(DesktopCommandError::new(
-            "confirmation_required",
-            "Confirm the requested paper-operation change before continuing.",
-        ));
-    }
-    let (operation, arguments, risk_mediated) = match request {
+    let (operation, arguments, authority) = match request {
+        PaperControlCommand::Targets => (
+            "Execution.GetManualPaperTargets",
+            Map::new(),
+            InvocationAuthority::ReadOnly,
+        ),
+        PaperControlCommand::Submit {
+            target_id,
+            target_revision,
+            side,
+            order_type,
+            quantity_lots,
+            limit_target_level,
+            stop_target_level,
+            time_in_force,
+        } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("targetId".to_owned(), json!(target_id));
+            arguments.insert("targetRevision".to_owned(), json!(target_revision));
+            arguments.insert("side".to_owned(), json!(side));
+            arguments.insert("orderType".to_owned(), json!(order_type));
+            arguments.insert("quantityLots".to_owned(), json!(quantity_lots));
+            insert_optional(&mut arguments, "limitTargetLevel", limit_target_level);
+            insert_optional(&mut arguments, "stopTargetLevel", stop_target_level);
+            arguments.insert("timeInForce".to_owned(), json!(time_in_force));
+            (
+                "Execution.SubmitManualPaperDraft",
+                arguments,
+                InvocationAuthority::RiskMediated("Execution.SubmitManualPaperDraft"),
+            )
+        }
         PaperControlCommand::Start {
             provider,
             provider_session_id,
+            strategy_mode,
             initial_cash,
             fee_basis_points,
         } => {
+            require_confirmation(confirmed)?;
             let mut arguments = Map::new();
             arguments.insert("provider".to_owned(), json!(provider));
             insert_optional(&mut arguments, "providerSessionId", provider_session_id);
+            arguments.insert("strategyMode".to_owned(), json!(strategy_mode));
             arguments.insert("initialCash".to_owned(), json!(initial_cash));
             arguments.insert("feeBasisPoints".to_owned(), json!(fee_basis_points));
-            ("Bot.Start", arguments, false)
+            (
+                "Bot.Start",
+                arguments,
+                InvocationAuthority::ExactConfirmed("Bot.Start"),
+            )
         }
-        PaperControlCommand::Stop { reason } => ("Bot.Stop", reason_arguments(reason), false),
+        PaperControlCommand::Stop { reason } => {
+            require_confirmation(confirmed)?;
+            (
+                "Bot.Stop",
+                reason_arguments(reason),
+                InvocationAuthority::ExactConfirmed("Bot.Stop"),
+            )
+        }
         PaperControlCommand::Cancel { order_id } => {
+            require_confirmation(confirmed)?;
             let mut arguments = Map::new();
             arguments.insert("orderId".to_owned(), json!(order_id));
-            ("Execution.Cancel", arguments, true)
+            (
+                "Execution.Cancel",
+                arguments,
+                InvocationAuthority::RiskMediated("Execution.Cancel"),
+            )
         }
-        PaperControlCommand::Reconcile => ("Execution.Reconcile", Map::new(), true),
+        PaperControlCommand::Reconcile => {
+            require_confirmation(confirmed)?;
+            (
+                "Execution.Reconcile",
+                Map::new(),
+                InvocationAuthority::RiskMediated("Execution.Reconcile"),
+            )
+        }
         PaperControlCommand::TriggerKillSwitch { reason } => {
-            ("Risk.TriggerKillSwitch", reason_arguments(reason), false)
+            require_confirmation(confirmed)?;
+            (
+                "Risk.TriggerKillSwitch",
+                reason_arguments(reason),
+                InvocationAuthority::ExactConfirmed("Risk.TriggerKillSwitch"),
+            )
         }
-    };
-    let authority = if risk_mediated {
-        InvocationAuthority::RiskMediated(operation)
-    } else {
-        InvocationAuthority::ExactConfirmed(operation)
     };
     invoke_application(
         ApplicationInvocation {
@@ -743,16 +884,53 @@ pub(crate) async fn paper_control(
 }
 
 #[tauri::command]
+pub(crate) async fn analysis_control(
+    request: AnalysisControlCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    let (operation, arguments, mutation) = match request {
+        AnalysisControlCommand::FeatureDatasetOptions => (
+            "Analysis.GetFeatureDatasetPreparationOptions",
+            Map::new(),
+            false,
+        ),
+        AnalysisControlCommand::PreviewFeatureDataset { selection } => {
+            ("Analysis.PreviewFeatureDatasetBuild", selection, false)
+        }
+        AnalysisControlCommand::StartPreparedFeatureDataset { receipt } => {
+            let mut arguments = Map::new();
+            arguments.insert("receipt".to_owned(), Value::Object(receipt));
+            ("Analysis.StartPreparedFeatureDatasetBuild", arguments, true)
+        }
+        AnalysisControlCommand::BacktestOptions => {
+            ("Analysis.GetBacktestPreparation", Map::new(), false)
+        }
+        AnalysisControlCommand::PreviewBacktest { selection } => {
+            let mut arguments = Map::new();
+            arguments.insert("selection".to_owned(), Value::Object(selection));
+            ("Analysis.PreviewBacktest", arguments, false)
+        }
+        AnalysisControlCommand::StartPreparedBacktest { receipt } => {
+            let mut arguments = Map::new();
+            arguments.insert("receipt".to_owned(), Value::Object(receipt));
+            ("Analysis.StartPreparedBacktest", arguments, true)
+        }
+    };
+    invoke_narrow(operation, arguments, mutation, confirmed, &state).await
+}
+
+#[tauri::command]
 pub(crate) async fn model_control(
     request: ModelControlCommand,
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    let (operation, arguments) = match request {
+    let (operation, arguments, mutation) = match request {
         ModelControlCommand::Evaluate { model_id, input } => {
             let mut arguments = model_arguments(model_id);
             arguments.insert("input".to_owned(), Value::Object(input));
-            ("Model.Evaluate", arguments)
+            ("Model.Evaluate", arguments, true)
         }
         ModelControlCommand::StartTraining {
             config_ticket_id,
@@ -761,10 +939,23 @@ pub(crate) async fn model_control(
             let mut arguments = Map::new();
             arguments.insert("configTicketId".to_owned(), json!(config_ticket_id));
             arguments.insert("authorityTicketId".to_owned(), json!(authority_ticket_id));
-            ("Model.StartTraining", arguments)
+            ("Model.StartTraining", arguments, true)
+        }
+        ModelControlCommand::ForecastPreparationOptions => {
+            ("Model.GetForecastPreparation", Map::new(), false)
+        }
+        ModelControlCommand::PrepareForecast { selection } => {
+            let mut arguments = Map::new();
+            arguments.insert("selection".to_owned(), Value::Object(selection));
+            ("Model.PrepareForecast", arguments, false)
+        }
+        ModelControlCommand::StartPreparedForecast { receipt } => {
+            let mut arguments = Map::new();
+            arguments.insert("receipt".to_owned(), Value::Object(receipt));
+            ("Model.StartPreparedForecast", arguments, true)
         }
     };
-    invoke_narrow(operation, arguments, true, confirmed, &state).await
+    invoke_narrow(operation, arguments, mutation, confirmed, &state).await
 }
 
 #[tauri::command]
@@ -774,6 +965,23 @@ pub(crate) async fn research_control(
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let (operation, arguments) = match request {
+        ResearchControlCommand::DiscoverSourceObjects { provider, dataset } => (
+            "Source.Discover",
+            source_discovery_arguments(provider, dataset),
+        ),
+        ResearchControlCommand::StartIngestSource {
+            provider,
+            object,
+            dataset,
+            discovery_receipt,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("provider".to_owned(), json!(provider));
+            arguments.insert("object".to_owned(), json!(object));
+            arguments.insert("dataset".to_owned(), json!(dataset));
+            arguments.insert("discoveryReceipt".to_owned(), json!(discovery_receipt));
+            ("Research.StartIngestSource", arguments)
+        }
         ResearchControlCommand::StartExport { dataset } => {
             ("Research.StartExport", dataset_arguments(dataset))
         }
@@ -936,6 +1144,20 @@ fn map_with_job_id(job_id: uuid::Uuid) -> Map<String, Value> {
 fn account_arguments(account_id: String) -> Map<String, Value> {
     let mut arguments = Map::new();
     arguments.insert("accountId".to_owned(), json!(account_id));
+    arguments
+}
+
+fn instrument_arguments(instrument_id: uuid::Uuid) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("instrumentIds".to_owned(), json!([instrument_id]));
+    arguments
+}
+
+fn source_discovery_arguments(provider: String, dataset: String) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("provider".to_owned(), json!(provider.clone()));
+    arguments.insert("dataset".to_owned(), json!(dataset));
+    arguments.insert("sourceCoverage".to_owned(), json!([provider]));
     arguments
 }
 

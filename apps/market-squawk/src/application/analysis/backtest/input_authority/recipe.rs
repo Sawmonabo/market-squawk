@@ -223,6 +223,18 @@ impl RegistrationRecipe {
     pub(super) fn core(&self) -> &InputCoreWire {
         &self.wire
     }
+
+    /// Returns the canonical bytes bound by a guided-preparation receipt before materialization.
+    pub(super) fn canonical_core_bytes(&self) -> Result<Vec<u8>, RecipeError> {
+        serde_json::to_vec(&self.wire).map_err(|_| RecipeError::Invalid)
+    }
+
+    /// Reconstructs the exact registration after a preparation receipt has been consumed.
+    pub(super) fn into_registration_input(
+        self,
+    ) -> Result<GovernedBacktestInputRegistrationInput, RecipeError> {
+        self.wire.into_registration_input()
+    }
 }
 
 #[derive(Clone, Debug)]

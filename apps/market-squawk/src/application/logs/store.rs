@@ -739,10 +739,8 @@ fn parse_segment_name(name: &str) -> Result<u64, StructuredLogError> {
 #[cfg(unix)]
 fn sync_directory(directory: &Dir) -> Result<(), StructuredLogError> {
     directory
-        .try_clone()
-        .map_err(|source| StructuredLogError::Io { source })?
-        .into_std_file()
-        .sync_all()
+        .open(".")
+        .and_then(|opened| opened.into_std().sync_all())
         .map_err(|source| StructuredLogError::Io { source })
 }
 

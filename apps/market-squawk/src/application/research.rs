@@ -30,8 +30,16 @@ use serde_json::{Value, json};
 use super::{ApplicationDomainService, domain_support::DomainLifecycle, effective_service_limits};
 use crate::ResearchService;
 
+mod dataset_preparation;
+mod forecast_evidence;
 mod ingest;
 
+pub(crate) use dataset_preparation::{
+    DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
+    DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
+    DatasetPreparationSelection,
+};
+pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchExtractionLimits, ResearchIngestCompositionError,
@@ -899,6 +907,10 @@ fn map_read_error(error: AnalyticalReadError) -> ServiceError {
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
         | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
+        AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
+        AnalyticalReadError::Parquet(_) | AnalyticalReadError::PythonDataset(_) => {
+            ServiceError::Unavailable
+        }
         AnalyticalReadError::Manifest(error) => map_manifest_error(error),
         AnalyticalReadError::Query(error) => map_query_error(error),
     }

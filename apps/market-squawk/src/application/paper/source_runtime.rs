@@ -57,6 +57,7 @@ impl SourceRuntimeView for PaperSourceRuntimeView {
                     runtime,
                     exports,
                     cancellation,
+                    ..
                 } => {
                     if cancellation.is_cancelled()
                         || !runtime.source_is_healthy()

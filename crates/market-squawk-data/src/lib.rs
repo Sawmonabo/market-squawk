@@ -39,7 +39,9 @@ pub use analytical_read::{
     AnalyticalFeatureDataset, AnalyticalFeatureDatasetPage, AnalyticalFeatureDatasetSelection,
     AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalObservationOutput,
     AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, ObservationKnowledgeRange,
+    AnalyticalReadError, AnalyticalReadLimit, ForecastDatasetEvidence,
+    ForecastDatasetEvidenceFence, ForecastDatasetReadLimits, ForecastFeatureRow,
+    ForecastFeatureValue, ObservationKnowledgeRange,
 };
 pub use arrow_convert::{
     ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,

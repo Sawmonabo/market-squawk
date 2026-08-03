@@ -10,7 +10,8 @@ use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence as DomainAvailabilityEvidence, DataQuality,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, PayloadReference,
     ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTime, RevisionNumber, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier, Timestamp,
+    UniverseMembershipObservation, VersionPinnedSourceLocator,
 };
 use market_squawk_platform::{
     BoundedInput, ControlledInputFileError, InputReadCheckpoint, InputReadControl,
@@ -31,7 +32,7 @@ use crate::clock::{ExtractionClock, RequestDeadline, SystemExtractionClock};
 use crate::contracts::{
     ExtractionLimits, FileAdapterError, ParseBudget, ParsedRow, ParserLimit, SourceRowLimit,
 };
-use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest, MANIFEST_SCHEMA_VERSION};
+use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest};
 use crate::representation::FileRepresentationAuthority;
 use crate::{csv, database, excel, json, ofx, parquet, xml};
 
@@ -590,6 +591,9 @@ impl FileExtractionSource {
         let expected = rows
             .len()
             .checked_mul(specification.row_policy.fields.len())
+            .and_then(|records| {
+                records.checked_add(usize::from(specification.universe_membership.is_some()))
+            })
             .ok_or(FileAdapterError::LimitExceeded(ParserLimit::Records))?;
         if expected > maximum_records {
             return Err(FileAdapterError::ExtractionContract(
@@ -600,6 +604,74 @@ impl FileExtractionSource {
         }
         let mut batch = ExtractionBatchAccumulator::try_new(request)
             .map_err(FileAdapterError::ExtractionContract)?;
+        if let Some(membership) = &specification.universe_membership {
+            let instrument_id = specification
+                .instrument_binding
+                .instrument_id()
+                .ok_or(FileAdapterError::InvalidManifest)?;
+            let interval = EffectiveInterval::new(membership.starts_at, membership.ends_at)
+                .map_err(|_| FileAdapterError::InvalidManifest)?;
+            let source_record = membership_reference(specification)?;
+            let context = ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: self.metadata.source_id().clone(),
+                    instrument_id: Some(instrument_id),
+                    venue_id: None,
+                    source_identifier: source_record,
+                    source_timestamp: None,
+                    received_at,
+                    ingested_at,
+                    quality: self.metadata.quality_ceiling(),
+                    payload_reference: PayloadReference::SourceReference(
+                        specification.object_id.clone(),
+                    ),
+                    availability: domain_availability.clone(),
+                })
+                .map_err(|_| FileAdapterError::Contract)?,
+                ResearchTime::try_new_with_coordinates(
+                    ResearchTemporalCoordinate::exact(membership.starts_at),
+                    specification
+                        .published_at
+                        .map(ResearchTemporalCoordinate::exact),
+                    RevisionNumber::new(specification.revision_number)
+                        .map_err(|_| FileAdapterError::InvalidManifest)?,
+                    specification
+                        .superseded_at
+                        .map(ResearchTemporalCoordinate::exact),
+                )
+                .map_err(|_| FileAdapterError::Contract)?,
+            )
+            .map_err(|_| FileAdapterError::Contract)?;
+            let observation = ResearchObservation::UniverseMembership(
+                UniverseMembershipObservation::new(context, membership.universe.clone(), interval)
+                    .map_err(|_| FileAdapterError::Contract)?,
+            );
+            let payload =
+                serde_json::to_vec(&observation).map_err(|_| FileAdapterError::Contract)?;
+            let evidence =
+                EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
+            batch
+                .push(
+                    ExtractionRecord::try_new_with_time(
+                        request,
+                        SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
+                            .map_err(|_| FileAdapterError::Contract)?,
+                        ExactPayloadEvidence::from_content_digest(evidence),
+                        ResearchTemporalCoordinate::exact(membership.starts_at),
+                        specification
+                            .published_at
+                            .map(ResearchTemporalCoordinate::exact),
+                        record_availability.clone(),
+                        specification.revision.clone(),
+                        specification
+                            .superseded_at
+                            .map(ResearchTemporalCoordinate::exact),
+                        Bytes::from(payload),
+                    )
+                    .map_err(FileAdapterError::ExtractionContract)?,
+                )
+                .map_err(FileAdapterError::ExtractionContract)?;
+        }
         for row in rows {
             self.check_control(cancellation, deadline)?;
             let row_id = row
@@ -764,7 +836,7 @@ fn row_reference(
 ) -> Result<SourceIdentifier, FileAdapterError> {
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/local-file-row/v2");
-    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
     hash_identifier(&mut hasher, &specification.dataset)?;
     hash_identifier(&mut hasher, &specification.object_id)?;
     specification.instrument_binding.bind_identity(&mut hasher);
@@ -777,13 +849,42 @@ fn row_reference(
     SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
 }
 
+fn membership_reference(
+    specification: &FileObjectSpec,
+) -> Result<SourceIdentifier, FileAdapterError> {
+    let membership = specification
+        .universe_membership
+        .as_ref()
+        .ok_or(FileAdapterError::InvalidManifest)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/local-file-universe-membership/v1");
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
+    hash_identifier(&mut hasher, &specification.dataset)?;
+    hash_identifier(&mut hasher, &specification.object_id)?;
+    specification.instrument_binding.bind_identity(&mut hasher);
+    hash_identifier(&mut hasher, &membership.universe)?;
+    hasher.update(membership.starts_at.unix_nanos().to_be_bytes());
+    match membership.ends_at {
+        Some(ends_at) => {
+            hasher.update([1]);
+            hasher.update(ends_at.unix_nanos().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    let mut reference = String::from("local-object-membership:sha256:");
+    for byte in hasher.finalize() {
+        write!(&mut reference, "{byte:02x}").map_err(|_| FileAdapterError::Contract)?;
+    }
+    SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
+}
+
 fn object_evidence(
     specification: &FileObjectSpec,
     content_digest: EvidenceDigest,
 ) -> Result<ExactPayloadEvidence, FileAdapterError> {
     let mut hasher = Sha256::new();
     hasher.update(b"market-squawk/local-file-object-binding/v1");
-    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hasher.update(specification.manifest_schema_version.to_be_bytes());
     hash_identifier(&mut hasher, &specification.dataset)?;
     hash_identifier(&mut hasher, &specification.object_id)?;
     specification.instrument_binding.bind_identity(&mut hasher);

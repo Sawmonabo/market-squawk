@@ -75,6 +75,7 @@ impl PaperSourceLifecycleControl {
                 runtime,
                 exports,
                 cancellation: runtime_cancellation,
+                ..
             } => {
                 if !provider_matches(provider, *current)
                     || runtime_cancellation.is_cancelled()

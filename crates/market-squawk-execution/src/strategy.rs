@@ -16,12 +16,17 @@ use thiserror::Error;
 use crate::{ExecutionMarketReference, OrderIntent};
 
 mod book_imbalance;
+mod manual_paper;
 
 pub use book_imbalance::{
     BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
     BookImbalancePaperStrategyConfigError, BookImbalancePaperStrategyConfigInput,
     PAPER_BOOK_IMBALANCE_INTENT_LIFETIME_NANOS, PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS,
     PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS,
+};
+pub use manual_paper::{
+    ManualPaperDraft, ManualPaperDraftError, ManualPaperDraftIngress, ManualPaperDraftInput,
+    ManualPaperIngressError, ManualPaperStrategy,
 };
 
 /// Hard output bound kept equal to live's per-observation authority ceiling.
@@ -461,14 +466,19 @@ pub enum StrategyError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use market_squawk_analytics::{
         FeatureError, FeatureKey, FeatureScalar, FeatureValue, LiveFeatureView,
     };
-    use market_squawk_domain::{MarketEvent, Timestamp};
+    use market_squawk_domain::{
+        AccountId, BasisPoints, ClientOrderId, DataQuality, LiveEventClass, MarketEvent, OrderId,
+        OrderReasonCode, OrderSide, OrderType, PriceTicks, QualificationAssessmentId, QuantityLots,
+        SourceIdentifier, StrategyId, TimeInForce, Timestamp, VenueId,
+    };
     use market_squawk_modeling::{
         BundleError, InferenceError, ModelFailure, ModelInputError, ModelOutput,
         ModelRegistryError, NativeBackendError,
@@ -476,13 +486,62 @@ mod tests {
 
     use crate::live_hook::record_audited_no_action;
     use crate::{
-        ExecutionAuditConfig, ExecutionAuditWriter, StrategyNoActionDomain, StrategyNoActionPhase,
+        ExecutionAuditConfig, ExecutionAuditWriter, ExecutionMarketReference, ManualPaperDraft,
+        ManualPaperDraftInput, ManualPaperIngressError, ManualPaperStrategy, OrderTargetReference,
+        StrategyNoActionDomain, StrategyNoActionPhase,
     };
 
     use super::{
-        BoundedOrderIntents, ModelDecisionMapper, ModelInferencePath, ModelStrategy,
+        BoundedOrderIntents, ModelDecisionMapper, ModelInferencePath, ModelStrategy, Strategy,
         StrategyContext, StrategyError,
     };
+
+    fn manual_route_and_market() -> Result<
+        (
+            market_squawk_live::ShardKey,
+            ExecutionMarketReference,
+            QualificationAssessmentId,
+            MarketEvent,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let execution_terms = super::book_imbalance::tests::paper_execution_terms()?;
+        let route = market_squawk_live::ShardKey::new(
+            VenueId::try_from("paper-test")?,
+            execution_terms.instrument_id(),
+        );
+        let observed_at = Timestamp::from_unix_nanos(1_000_000_000);
+        let market =
+            ExecutionMarketReference::for_strategy_test(execution_terms, observed_at, &[], &[]);
+        let assessment =
+            QualificationAssessmentId::new(SourceIdentifier::try_from("manual-paper-assessment")?);
+        let event = super::book_imbalance::tests::paper_market_event(LiveEventClass::BookSnapshot)?;
+        Ok((route, market, assessment, event))
+    }
+
+    fn manual_draft(order_suffix: u8) -> Result<ManualPaperDraft, Box<dyn std::error::Error>> {
+        ManualPaperDraft::try_new(ManualPaperDraftInput {
+            order_id: OrderId::from_str(&format!("20000000-0000-0000-0000-{order_suffix:012}"))?,
+            client_order_id: ClientOrderId::try_from(format!("manual-paper-{order_suffix}"))?,
+            strategy_id: StrategyId::from_str("30000000-0000-0000-0000-000000000091")?,
+            account_id: AccountId::from_str("50000000-0000-0000-0000-000000000091")?,
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            quantity: QuantityLots::new(2)?,
+            limit_price: Some(PriceTicks::new(101)),
+            stop_price: None,
+            time_in_force: TimeInForce::Day,
+            expires_at: Timestamp::from_unix_nanos(1_000_001_000),
+            reason_code: OrderReasonCode::try_from("manual.target-derived.buy")?,
+            maximum_slippage: BasisPoints::new(50),
+            target_reference: OrderTargetReference::try_new(
+                "target.manual-alpha",
+                NonZeroU64::new(7).ok_or("zero target revision")?,
+                [9; 32],
+            )?,
+        })
+        .map_err(Into::into)
+    }
 
     #[derive(Debug)]
     struct EmptyFeatureView;
@@ -516,6 +575,52 @@ mod tests {
     #[derive(Debug)]
     struct UnreachableDecisionMapper {
         called: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn empty_manual_paper_slot_never_emits_an_intent() -> Result<(), Box<dyn std::error::Error>> {
+        let (route, market, assessment, event) = manual_route_and_market()?;
+        let (_ingress, mut strategy) = ManualPaperStrategy::try_new(route.clone())?;
+        let context =
+            StrategyContext::from_committed(&route, &assessment, market, &EmptyFeatureView);
+
+        assert!(strategy.on_market_event(&context, &event)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn submitted_manual_paper_draft_emits_once_with_direct_target_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (route, market, assessment, event) = manual_route_and_market()?;
+        let expected_terms = market.execution_terms();
+        let expected_time = market.observed_at();
+        let (ingress, mut strategy) = ManualPaperStrategy::try_new(route.clone())?;
+        ingress.try_submit(manual_draft(91)?)?;
+        assert_eq!(
+            ingress.try_submit(manual_draft(92)?),
+            Err(ManualPaperIngressError::Occupied)
+        );
+        let context =
+            StrategyContext::from_committed(&route, &assessment, market, &EmptyFeatureView);
+
+        let output = strategy.on_market_event(&context, &event)?;
+        assert_eq!(output.len(), 1);
+        let intent = output
+            .into_iter()
+            .next()
+            .ok_or("manual paper strategy omitted its submitted draft")?;
+        assert_eq!(intent.execution_terms(), expected_terms);
+        assert_eq!(intent.signal_at(), expected_time);
+        assert_eq!(intent.required_quality(), DataQuality::DirectVerified);
+        let target = intent
+            .target_reference()
+            .ok_or("manual paper intent lost its target provenance")?;
+        assert_eq!(target.target_id(), "target.manual-alpha");
+        let expected_revision = NonZeroU64::new(7).ok_or("revision fixture must be nonzero")?;
+        assert_eq!(target.revision(), expected_revision);
+        assert_eq!(target.content_sha256(), [9; 32]);
+        assert!(strategy.on_market_event(&context, &event)?.is_empty());
+        Ok(())
     }
 
     impl ModelDecisionMapper for UnreachableDecisionMapper {

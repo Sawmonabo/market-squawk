@@ -257,6 +257,14 @@ pub(super) async fn build(
     )
 }
 
+pub(super) fn validate_request_authority(
+    builder: &DatasetBuilderService<'_>,
+    request: &DatasetBuildRequest,
+    cancellation: &CancellationToken,
+) -> Result<(), DatasetBuildError> {
+    authorize_research_use(builder, request, cancellation).map(|_authorization| ())
+}
+
 fn admit_result(
     builder: &DatasetBuilderService<'_>,
     dataset: FeatureLabelDataset,
@@ -504,7 +512,7 @@ async fn prepare_rows<'request>(
         let feature_request = point_in_time_request(
             request,
             example.cutoff_at(),
-            example.cutoff_at(),
+            example.effective_cutoff().clone(),
             None,
             budget.remaining()?,
         )?;
@@ -516,8 +524,8 @@ async fn prepare_rows<'request>(
         let label_request = point_in_time_request(
             request,
             example.label_cutoff_at(),
-            example.cutoff_at(),
-            Some(example.label_cutoff_at()),
+            example.effective_cutoff().clone(),
+            Some(example.label_effective_cutoff().clone()),
             budget.remaining()?,
         )?;
         let labels = selector
@@ -525,11 +533,23 @@ async fn prepare_rows<'request>(
             .await
             .map_err(|_| DatasetBuildError::PointInTime)?;
         budget.charge(labels.retained_bytes())?;
+        let universe_request = point_in_time_request(
+            request,
+            example.cutoff_at(),
+            ResearchTemporalCoordinate::exact(example.cutoff_at()),
+            None,
+            budget.remaining()?,
+        )?;
+        let universe_evidence = selector
+            .select(&universe_request, candidates, cancellation, deadline)
+            .await
+            .map_err(|_| DatasetBuildError::PointInTime)?;
+        budget.charge(universe_evidence.retained_bytes())?;
         let universe_limits = bounded_universe_limits(request, budget.remaining()?)?;
         let universe = UniverseSnapshot::try_build(
             request.inputs().universe_id().clone(),
             example.cutoff_at(),
-            validated_universe_memberships(request, &features, budget.remaining()?)?,
+            validated_universe_memberships(request, &universe_evidence, budget.remaining()?)?,
             universe_limits,
         )?;
         budget.charge(universe.retained_bytes())?;
@@ -614,6 +634,7 @@ async fn prepare_rows<'request>(
         budget.release(label_actions.retained_bytes())?;
         budget.release(feature_actions.retained_bytes())?;
         budget.release(universe.retained_bytes())?;
+        budget.release(universe_evidence.retained_bytes())?;
         budget.release(labels.retained_bytes())?;
         budget.release(features.retained_bytes())?;
     }
@@ -697,8 +718,8 @@ fn validate_component_adjustment(
 fn point_in_time_request(
     request: &DatasetBuildRequest,
     as_of: market_squawk_domain::Timestamp,
-    effective_cutoff: market_squawk_domain::Timestamp,
-    label_cutoff: Option<market_squawk_domain::Timestamp>,
+    effective_cutoff: ResearchTemporalCoordinate,
+    label_cutoff: Option<ResearchTemporalCoordinate>,
     remaining_bytes: usize,
 ) -> Result<PointInTimeRequest, DatasetBuildError> {
     let configured = request.limits().point_in_time();
@@ -714,9 +735,9 @@ fn point_in_time_request(
     PointInTimeRequest::try_new(
         request.policy().point_in_time(),
         as_of,
-        Some(ResearchTemporalCoordinate::exact(as_of)),
-        ResearchTemporalCoordinate::exact(effective_cutoff),
-        label_cutoff.map(ResearchTemporalCoordinate::exact),
+        None,
+        effective_cutoff,
+        label_cutoff,
         limits,
     )
     .map_err(|_| DatasetBuildError::InvalidRequest)

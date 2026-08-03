@@ -153,6 +153,18 @@ pub(crate) enum DashboardQueryCommand {
     },
     MarketSnapshot,
     MarketQuality,
+    MarketTrades {
+        instrument_id: Uuid,
+    },
+    MarketQuotes {
+        instrument_id: Uuid,
+    },
+    MarketBooks {
+        instrument_id: Uuid,
+    },
+    MarketComparisons {
+        instrument_id: Uuid,
+    },
     SourceStatus {
         source_ids: Option<Vec<String>>,
     },
@@ -172,6 +184,10 @@ pub(crate) enum DashboardQueryCommand {
         dataset: String,
     },
     ResearchAlternativeData {
+        dataset: String,
+    },
+    ResearchSourceObjects {
+        provider: String,
         dataset: String,
     },
     PortfolioAccounts {
@@ -234,6 +250,10 @@ pub(crate) enum DashboardQueryCommand {
     DecisionScreens {
         limit: u16,
     },
+    AnalysisFeatureDatasets {
+        dataset: Option<String>,
+        after_dataset: Option<String>,
+    },
     DecisionScreenRuns {
         after_run_id: Option<String>,
         limit: u16,
@@ -247,6 +267,9 @@ pub(crate) enum DashboardQueryCommand {
         limit: u16,
     },
     DecisionDossier {
+        dossier_id: String,
+    },
+    DecisionTargetPreparation {
         dossier_id: String,
     },
     DecisionTarget {
@@ -303,6 +326,7 @@ pub(crate) enum DashboardQueryCommand {
         after_job_id: Option<String>,
         limit: u16,
     },
+    OperationRuntimeStatus,
     OperationBackups {
         after_backup_id: Option<String>,
         limit: u16,
@@ -459,7 +483,30 @@ pub(crate) enum OperationsControlCommand {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum ResearchControlCommand {
-    StartExport { dataset: String },
+    DiscoverSourceObjects {
+        provider: String,
+        dataset: String,
+    },
+    StartIngestSource {
+        provider: String,
+        object: String,
+        dataset: String,
+        discovery_receipt: Uuid,
+    },
+    StartExport {
+        dataset: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum AnalysisControlCommand {
+    FeatureDatasetOptions,
+    PreviewFeatureDataset { selection: Map<String, Value> },
+    StartPreparedFeatureDataset { receipt: Map<String, Value> },
+    BacktestOptions,
+    PreviewBacktest { selection: Map<String, Value> },
+    StartPreparedBacktest { receipt: Map<String, Value> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -473,11 +520,21 @@ pub(crate) enum ModelControlCommand {
         config_ticket_id: Uuid,
         authority_ticket_id: Uuid,
     },
+    ForecastPreparationOptions,
+    PrepareForecast {
+        selection: Map<String, Value>,
+    },
+    StartPreparedForecast {
+        receipt: Map<String, Value>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum FairValueControlCommand {
+    Measure {
+        measurement: Map<String, Value>,
+    },
     Classify {
         measurement_id: String,
     },
@@ -537,6 +594,19 @@ pub(crate) enum MarketAccessConclusionInput {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum DecisionControlCommand {
+    SaveScreen {
+        expected_revision: Option<u32>,
+        screen: Map<String, Value>,
+    },
+    PrepareTargetSet {
+        draft: Map<String, Value>,
+    },
+    CreateTargetSet {
+        receipt_id: Uuid,
+    },
+    ReevaluateTargetSet {
+        receipt_id: Uuid,
+    },
     PreviewGovernanceAction {
         proposal: DecisionGovernanceProposal,
     },
@@ -639,9 +709,21 @@ impl fmt::Debug for GovernanceControlCommand {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
 pub(crate) enum PaperControlCommand {
+    Targets,
+    Submit {
+        target_id: String,
+        target_revision: u64,
+        side: String,
+        order_type: String,
+        quantity_lots: String,
+        limit_target_level: Option<String>,
+        stop_target_level: Option<String>,
+        time_in_force: String,
+    },
     Start {
         provider: String,
         provider_session_id: Option<String>,
+        strategy_mode: String,
         initial_cash: String,
         fee_basis_points: u16,
     },

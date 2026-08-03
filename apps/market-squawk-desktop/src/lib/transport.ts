@@ -40,12 +40,25 @@ export type DashboardQuery =
   | { query: "lookup"; text: string; categories?: string[] }
   | { query: "marketSnapshot" | "marketQuality" }
   | {
+      query:
+        | "marketTrades"
+        | "marketQuotes"
+        | "marketBooks"
+        | "marketComparisons"
+      instrumentId: string
+    }
+  | {
       query: "sourceStatus" | "sourceCoverage" | "sourceHealth"
       sourceIds?: string[]
     }
   | { query: "researchDatasets"; afterDataset?: string }
   | {
       query: "researchManifest" | "researchHistory" | "researchAlternativeData"
+      dataset: string
+    }
+  | {
+      query: "researchSourceObjects"
+      provider: string
       dataset: string
     }
   | { query: "portfolioAccounts"; afterAccountId?: string }
@@ -105,6 +118,7 @@ export type DashboardQuery =
     }
   | { query: "forecast" | "forecastOutcomes"; vintageId: string }
   | { query: "decisionScreens"; limit: number }
+  | { query: "analysisFeatureDatasets"; dataset?: string; afterDataset?: string }
   | {
       query: "decisionScreenRuns"
       afterRunId?: string
@@ -118,6 +132,7 @@ export type DashboardQuery =
       limit: number
     }
   | { query: "decisionDossier"; dossierId: string }
+  | { query: "decisionTargetPreparation"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"
       targetId: string
@@ -157,6 +172,7 @@ export type DashboardQuery =
       maximumBytes: number
     }
   | { query: "jobs"; afterJobId?: string; limit: number }
+  | { query: "operationRuntimeStatus" }
   | { query: "operationBackups"; afterBackupId?: string; limit: number }
   | { query: "operationBackup"; backupId: string }
   | { query: "operationBackupRetentionPreview"; keepLatest: number }
@@ -241,9 +257,21 @@ export interface ProductTransport {
     request: ResearchControlRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
+  datasetPreparation(
+    request: unknown,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  backtestPreparation(
+    request: unknown,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
   startBacktestFromFile(confirmed?: boolean): Promise<ApplicationResult | null>
   modelControl(
     request: ModelControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  forecastPreparation(
+    request: unknown,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   decisionControl(
@@ -261,6 +289,10 @@ export interface ProductTransport {
   ): Promise<ApplicationResult>
   paperControl(
     request: PaperControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  manualPaper(
+    request: ManualPaperRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   jobControl(request: JobControlRequest, confirmed?: boolean): Promise<ApplicationResult>
@@ -364,7 +396,16 @@ export type McpClientControlRequest = {
   client: "claude_code" | "codex"
 }
 
-export type ResearchControlRequest = { action: "startExport"; dataset: string }
+export type ResearchControlRequest =
+  | { action: "discoverSourceObjects"; provider: string; dataset: string }
+  | {
+      action: "startIngestSource"
+      provider: string
+      object: string
+      dataset: string
+      discoveryReceipt: string
+    }
+  | { action: "startExport"; dataset: string }
 
 export type ModelControlRequest =
   | {
@@ -402,6 +443,13 @@ export type GovernanceControlRequest =
     }
 
 export type DecisionControlRequest =
+  | {
+      action: "saveScreen"
+      expectedRevision?: number
+      screen: Record<string, unknown>
+    }
+  | { action: "prepareTargetSet"; draft: Record<string, unknown> }
+  | { action: "createTargetSet" | "reevaluateTargetSet"; receiptId: string }
   | {
       action: "previewGovernanceAction"
       proposal:
@@ -463,6 +511,7 @@ export type FairValueGovernanceProposal =
     }
 
 export type FairValueControlRequest =
+  | { action: "measure"; measurement: Record<string, unknown> }
   | { action: "classify"; measurementId: string }
   | {
       action: "previewGovernanceAction"
@@ -479,12 +528,43 @@ export type PaperControlRequest =
       action: "start"
       provider: "coinbase" | "coinbase-direct" | "kraken"
       providerSessionId?: string
+      strategyMode: "manual" | "book_imbalance"
       initialCash: string
       feeBasisPoints: number
     }
   | { action: "stop" | "triggerKillSwitch"; reason: string }
   | { action: "cancel"; orderId: string }
   | { action: "reconcile" }
+
+export type ManualPaperTargetLevel =
+  | "downside"
+  | "add"
+  | "entry_lower"
+  | "entry_upper"
+  | "base"
+  | "trim_lower"
+  | "trim_upper"
+  | "exit_lower"
+  | "exit_upper"
+  | "upside"
+
+export type ManualPaperRequest =
+  | { action: "targets" }
+  | {
+      action: "submit"
+      targetId: string
+      targetRevision: number
+      side: "buy" | "sell"
+      orderType: "market" | "limit" | "stop" | "stop_limit"
+      quantityLots: string
+      limitTargetLevel?: ManualPaperTargetLevel
+      stopTargetLevel?: ManualPaperTargetLevel
+      timeInForce:
+        | "day"
+        | "good_til_cancelled"
+        | "immediate_or_cancel"
+        | "fill_or_kill"
+    }
 
 export type JobControlRequest =
   | { action: "list"; afterJobId?: string; limit: number }

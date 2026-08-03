@@ -1,31 +1,45 @@
 //! One installed tool surface shared by native and MCP transports.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use market_squawk_runtime::{ClientId, InputStager, InputTicketId};
+use market_squawk_runtime::{ClientId, InputStager, InputTicketId, RuntimeIdentity};
 use market_squawk_services::{
-    RequestContext, ServiceCapabilities, ServiceError, ToolServices, TypedToolRequest,
-    TypedToolResult,
+    RequestContext, ServiceCapabilities, ServiceError, ToolResultMetadata, ToolServices,
+    TypedToolRequest, TypedToolResult,
 };
+use serde::Deserialize;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
     LocalProduct,
-    application::{Application, operations::OperationsApplicationServices},
+    application::{
+        Application, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
+        DatasetPreparationSelection, lifecycle::WorkspaceRuntimeIdentity,
+        operations::OperationsApplicationServices,
+    },
     jobs::{InstalledJobAuthority, InstalledJobRunners},
 };
 
 use super::{
-    analysis::InstalledAnalysisOperations, decision::InstalledDecisionOperations,
-    jobs::InstalledJobOperations, operations::InstalledOperations,
+    analysis::InstalledAnalysisOperations,
+    backtest_preparation::{InstalledBacktestPreparation, START_PREPARED_BACKTEST},
+    decision::InstalledDecisionOperations,
+    forecast_preparation::{InstalledForecastPreparation, START_PREPARED_FORECAST},
+    jobs::InstalledJobOperations,
+    operations::InstalledOperations,
     portfolio_import::InstalledPortfolioImportOperations,
+    research_dataset::InstalledResearchDatasetPreparation,
 };
 
 const START_INGEST: &str = "Research.StartIngestSource";
 const START_EXPORT: &str = "Research.StartExport";
 const START_DATASET: &str = "Research.StartDatasetBuild";
 const START_FEATURE_DATASET: &str = "Analysis.StartFeatureDatasetBuild";
+const GET_FEATURE_DATASET_PREPARATION: &str = "Analysis.GetFeatureDatasetPreparationOptions";
+const PREVIEW_FEATURE_DATASET: &str = "Analysis.PreviewFeatureDatasetBuild";
+const START_PREPARED_FEATURE_DATASET: &str = "Analysis.StartPreparedFeatureDatasetBuild";
 const START_SCENARIO: &str = "Analysis.StartScenarioBatch";
 const START_BACKTEST: &str = "Analysis.StartBacktest";
 const START_TRAINING: &str = "Model.StartTraining";
@@ -39,22 +53,83 @@ pub(super) struct InstalledToolServices {
     jobs: InstalledJobOperations,
     runners: Arc<InstalledJobRunners>,
     inputs: Arc<InputStager>,
+    runtime: RuntimeIdentity,
+    dataset_preparation: InstalledResearchDatasetPreparation,
+    backtest_preparation: InstalledBacktestPreparation,
+    forecast_preparation: InstalledForecastPreparation,
     analysis: InstalledAnalysisOperations,
     decisions: InstalledDecisionOperations,
     operations: InstalledOperations,
     portfolio_import: InstalledPortfolioImportOperations,
 }
 
-impl InstalledToolServices {
-    pub(super) fn try_new(
+/// Application authorities required to compose the installed tool surface.
+pub(super) struct InstalledToolServiceAuthorities<'a> {
+    application: Arc<Application>,
+    operations: Arc<OperationsApplicationServices>,
+    product: &'a LocalProduct,
+    jobs: &'a InstalledJobAuthority,
+}
+
+impl<'a> InstalledToolServiceAuthorities<'a> {
+    pub(super) fn new(
         application: Arc<Application>,
         operations: Arc<OperationsApplicationServices>,
-        product: &LocalProduct,
-        jobs: &InstalledJobAuthority,
+        product: &'a LocalProduct,
+        jobs: &'a InstalledJobAuthority,
+    ) -> Self {
+        Self {
+            application,
+            operations,
+            product,
+            jobs,
+        }
+    }
+}
+
+/// Runtime-owned resources required to compose the installed tool surface.
+pub(super) struct InstalledToolServiceRuntime {
+    runners: Arc<InstalledJobRunners>,
+    inputs: Arc<InputStager>,
+    runtime: RuntimeIdentity,
+    portfolio_import: InstalledPortfolioImportOperations,
+}
+
+impl InstalledToolServiceRuntime {
+    pub(super) fn new(
         runners: Arc<InstalledJobRunners>,
         inputs: Arc<InputStager>,
+        runtime: RuntimeIdentity,
         portfolio_import: InstalledPortfolioImportOperations,
+    ) -> Self {
+        Self {
+            runners,
+            inputs,
+            runtime,
+            portfolio_import,
+        }
+    }
+}
+
+impl InstalledToolServices {
+    pub(super) fn try_new(
+        authorities: InstalledToolServiceAuthorities<'_>,
+        runtime_resources: InstalledToolServiceRuntime,
     ) -> Result<Self, ServiceError> {
+        let InstalledToolServiceAuthorities {
+            application,
+            operations,
+            product,
+            jobs,
+        } = authorities;
+        let InstalledToolServiceRuntime {
+            runners,
+            inputs,
+            runtime,
+            portfolio_import,
+        } = runtime_resources;
+        let forecast_preparation =
+            InstalledForecastPreparation::try_new(product, &application.capabilities(), runtime)?;
         let installed_operations = InstalledOperations::new(
             operations,
             jobs,
@@ -67,8 +142,19 @@ impl InstalledToolServices {
             jobs: InstalledJobOperations::new(jobs),
             runners,
             inputs: Arc::clone(&inputs),
+            runtime,
+            dataset_preparation: InstalledResearchDatasetPreparation::new(product.research()),
+            backtest_preparation: InstalledBacktestPreparation::try_new(
+                product.research().analytical_reader(),
+                runtime,
+            )?,
+            forecast_preparation,
             analysis: InstalledAnalysisOperations::new(product, jobs),
-            decisions: InstalledDecisionOperations::try_new(product.decisions())?,
+            decisions: InstalledDecisionOperations::try_new(
+                product.decisions(),
+                product.portfolio().fair_value_reader(),
+                runtime,
+            )?,
             operations: installed_operations,
             portfolio_import,
         })
@@ -134,6 +220,30 @@ impl InstalledToolServices {
                     (admission, JobAdmissionOwner::Feature)
                 }
             }
+            START_PREPARED_FEATURE_DATASET => {
+                let input: PreparedFeatureDatasetStart =
+                    decode_without_confirmation(request.arguments())?;
+                let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+                let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
+                    .map_err(|_error| ServiceError::Unavailable)?;
+                let build = self
+                    .dataset_preparation
+                    .consume(
+                        input.receipt,
+                        origin,
+                        workspace,
+                        Instant::now(),
+                        context.deadline(),
+                        context.cancellation(),
+                    )
+                    .map_err(ServiceError::from)?;
+                let admission = self
+                    .runners
+                    .feature()
+                    .admit(build, captured_at)
+                    .map_err(map_research_admission)?;
+                (admission, JobAdmissionOwner::Feature)
+            }
             START_SCENARIO => {
                 let terminal = self.terminal_request(request, "Analysis.GetScenarios")?;
                 let admission = self
@@ -155,6 +265,22 @@ impl InstalledToolServices {
                     .admit_registration(
                         self.runners.backtest_registrar().as_ref(),
                         registration,
+                        context.cancellation().clone(),
+                        context.deadline(),
+                        captured_at,
+                    )
+                    .await
+                    .map_err(map_backtest_admission)?;
+                (admission, JobAdmissionOwner::Backtest)
+            }
+            START_PREPARED_BACKTEST => {
+                let input = self.backtest_preparation.consume(request, context).await?;
+                let admission = self
+                    .runners
+                    .backtest()
+                    .admit_prepared(
+                        self.runners.backtest_registrar().as_ref(),
+                        input,
                         context.cancellation().clone(),
                         context.deadline(),
                         captured_at,
@@ -189,6 +315,15 @@ impl InstalledToolServices {
             }
             START_FORECAST => {
                 let terminal = self.terminal_request(request, "Model.GenerateForecast")?;
+                let admission = self
+                    .runners
+                    .forecast()
+                    .admit(terminal, limits, captured_at)
+                    .map_err(map_forecast_admission)?;
+                (admission, JobAdmissionOwner::Forecast)
+            }
+            START_PREPARED_FORECAST => {
+                let terminal = self.forecast_preparation.consume(request, context).await?;
                 let admission = self
                     .runners
                     .forecast()
@@ -302,6 +437,19 @@ impl std::fmt::Debug for InstalledToolServices {
             .field("jobs", &self.jobs)
             .field("runners", &self.runners)
             .field("inputs", &"[ONE-SHOT NATIVE INPUT STAGER]")
+            .field("runtime", &self.runtime)
+            .field(
+                "dataset_preparation",
+                &"[ONE-USE DATASET PREPARATION AUTHORITY]",
+            )
+            .field(
+                "backtest_preparation",
+                &"[ONE-USE BACKTEST PREPARATION AUTHORITY]",
+            )
+            .field(
+                "forecast_preparation",
+                &"[ONE-USE FORECAST PREPARATION AUTHORITY]",
+            )
             .field("analysis", &self.analysis)
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("operations", &self.operations)
@@ -349,6 +497,105 @@ impl ToolServices for InstalledToolServices {
             result
                 .validate_against(context.limits())
                 .map_err(ServiceError::from)?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if matches!(
+            request.name(),
+            GET_FEATURE_DATASET_PREPARATION | PREVIEW_FEATURE_DATASET
+        ) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            ensure_live(&context)?;
+            let (content, item_count) = match request.name() {
+                GET_FEATURE_DATASET_PREPARATION => {
+                    let options = self
+                        .dataset_preparation
+                        .options(context.deadline(), context.cancellation().clone())
+                        .await
+                        .map_err(ServiceError::from)?;
+                    let item_count = options.datasets.len().max(1);
+                    (encode(&options)?, item_count)
+                }
+                PREVIEW_FEATURE_DATASET => {
+                    let selection: DatasetPreparationSelection = decode(request.arguments())?;
+                    let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+                    let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
+                        .map_err(|_error| ServiceError::Unavailable)?;
+                    let observed_at = super::runtime::current_timestamp()
+                        .map_err(|_error| ServiceError::Unavailable)?;
+                    let preview = self
+                        .dataset_preparation
+                        .preview(DatasetPreparationPreviewRequest {
+                            selection,
+                            origin,
+                            workspace,
+                            now: Instant::now(),
+                            observed_at,
+                            deadline: context.deadline(),
+                            cancellation: context.cancellation().clone(),
+                        })
+                        .await
+                        .map_err(ServiceError::from)?;
+                    (encode(&preview)?, 1)
+                }
+                _ => return Err(ServiceError::NotFound),
+            };
+            ensure_live(&context)?;
+            let result = TypedToolResult::try_new(
+                content,
+                item_count,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(ServiceError::from)?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if InstalledForecastPreparation::owns(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.forecast_preparation.call(&request, &context).await?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if InstalledBacktestPreparation::owns(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.backtest_preparation.call(&request, &context).await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;
@@ -427,6 +674,39 @@ impl ToolServices for InstalledToolServices {
             return Ok(result);
         }
         self.application.call(request, context).await
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreparedFeatureDatasetStart {
+    receipt: DatasetPreparationReceipt,
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
+    serde_json::from_value(Value::Object(arguments.clone()))
+        .map_err(|_error| ServiceError::InvalidRequest)
+}
+
+fn decode_without_confirmation<T: for<'de> Deserialize<'de>>(
+    arguments: &Map<String, Value>,
+) -> Result<T, ServiceError> {
+    let mut admitted = arguments.clone();
+    admitted.remove("confirm");
+    decode(&admitted)
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Value, ServiceError> {
+    serde_json::to_value(value).map_err(|_error| ServiceError::Internal)
+}
+
+fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {
+    if context.cancellation().is_cancelled() {
+        Err(ServiceError::Cancelled)
+    } else if Instant::now() >= context.deadline() {
+        Err(ServiceError::DeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 

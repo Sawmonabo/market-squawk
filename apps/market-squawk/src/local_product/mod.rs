@@ -293,6 +293,10 @@ impl LocalProduct {
         let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
             portal_activation.clone();
 
+        let decisions = Arc::new(DecisionApplication::open(
+            paths.control_root()?.decision_database_location(),
+            decision_repository_limits()?,
+        )?);
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
         )?);
@@ -301,6 +305,7 @@ impl LocalProduct {
             Arc::clone(&live_fair_value),
             provider_rate,
             Arc::clone(&provider_activation),
+            Arc::clone(&decisions),
         );
         let source_lifecycle: Arc<dyn SourceLifecycleAuthority> =
             Arc::new(ProductionSourceLifecycleAuthority::new(
@@ -331,10 +336,6 @@ impl LocalProduct {
         let portfolio = Arc::new(PortfolioApplicationService::try_new(
             &paths,
             PortfolioApplicationLimits::standard(),
-        )?);
-        let decisions = Arc::new(DecisionApplication::open(
-            paths.control_root()?.decision_database_location(),
-            decision_repository_limits()?,
         )?);
         let executable_sha256 = current_executable_sha256()?;
         let strategies = production_backtest_strategy_registry(executable_sha256)?;

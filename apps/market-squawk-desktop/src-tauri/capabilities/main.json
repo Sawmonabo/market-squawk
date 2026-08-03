@@ -9,6 +9,9 @@
     "allow-desktop-bootstrap",
     "allow-open-official-provider-page",
     "allow-open-protected-provider-setup",
+    "allow-preview-portfolio-import",
+    "allow-commit-portfolio-import",
+    "allow-discard-portfolio-import",
     "allow-provider-onboarding"
   ]
 }

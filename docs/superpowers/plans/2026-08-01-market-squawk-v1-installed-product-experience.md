@@ -1961,7 +1961,8 @@ working product. This task does not publish or merge it.
   python3 -I scripts/build_python_release.py \
     --refresh-source-closure --lock python/wheelhouse-lock.json
   python3 -m unittest \
-    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_repository_lock_admits_the_complete_source_closure
+    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_source_refresh_changes_only_the_complete_source_closure \
+    scripts.tests.test_build_python_release.PythonReleaseBuilderContracts.test_repository_source_closure_contains_required_inputs
   ```
 
   The mode uses the existing deterministic complete-source inventory and atomically writes only the

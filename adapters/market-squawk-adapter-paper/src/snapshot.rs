@@ -8,7 +8,9 @@ use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Money, OrderId, OrderSide, PriceTicks, QuantityLots,
     Timestamp,
 };
-use market_squawk_execution::{ReconciliationBatchBinding, ReconciliationBatchId};
+use market_squawk_execution::{
+    OrderTargetReference, ReconciliationBatchBinding, ReconciliationBatchId,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,8 @@ use crate::{
     LiquidityRole, PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionConfig, PaperLedger,
     PaperOrderState, PaperPosition,
 };
+
+const PREVIOUS_CHECKPOINT_SCHEMA_VERSION: u32 = 10;
 
 /// Immutable simulation terms that governed the complete paper state image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +100,7 @@ impl PaperSimulationSnapshot {
 pub struct PaperOrderSnapshot {
     order_id: OrderId,
     account_id: AccountId,
+    target_reference: Option<OrderTargetReference>,
     state: PaperOrderState,
     requested: QuantityLots,
     cumulative_filled: QuantityLots,
@@ -117,6 +122,7 @@ impl PaperOrderSnapshot {
         Self {
             order_id: order.order_id,
             account_id: order.account_id,
+            target_reference: order.target_reference.clone(),
             state: order.lifecycle.state(),
             requested: order.quantity,
             cumulative_filled: order.lifecycle.cumulative_filled(),
@@ -139,6 +145,10 @@ impl PaperOrderSnapshot {
     }
     pub const fn account_id(&self) -> AccountId {
         self.account_id
+    }
+    /// Returns exact target/decision provenance when this order was target-derived.
+    pub const fn target_reference(&self) -> Option<&OrderTargetReference> {
+        self.target_reference.as_ref()
     }
     pub const fn state(&self) -> PaperOrderState {
         self.state
@@ -411,6 +421,11 @@ struct CheckpointWire {
     idempotency: Vec<IdempotencyRecoveryWire>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct CheckpointHeaderWire {
+    schema_version: u32,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FillRecoveryWire {
@@ -529,6 +544,11 @@ impl PaperExecutionCheckpoint {
         repository_id: [u8; 32],
         generation: NonZeroU64,
     ) {
+        // A version-10 artifact is first reserialized and verified in its original schema by the
+        // repository. Only that exact manifest-authority boundary may normalize it to version 11.
+        if self.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION {
+            self.schema_version = crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION;
+        }
         self.durable_sequence = self.sequence;
         self.accepted_repository_id = repository_id;
         self.accepted_repository_generation = generation.get();
@@ -617,6 +637,18 @@ impl PaperExecutionCheckpoint {
         if bytes.is_empty() || bytes.len() > maximum_bytes || maximum_bytes == 0 {
             return Err(PaperCheckpointError::TooLarge);
         }
+        let header: CheckpointHeaderWire =
+            serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
+        if !matches!(
+            header.schema_version,
+            PREVIOUS_CHECKPOINT_SCHEMA_VERSION
+                | crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
+        ) {
+            return Err(PaperCheckpointError::IncompatibleSchema {
+                expected: crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
+                actual: header.schema_version,
+            });
+        }
         let wire: CheckpointWire =
             serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
         let limits = config.input();
@@ -630,9 +662,14 @@ impl PaperExecutionCheckpoint {
             .get()
             .checked_add(limits.maximum_archived_orders.get())
             .ok_or(PaperCheckpointError::InvalidHeader)?;
-        if wire.schema_version != crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-            || wire.configuration_digest != config.digest()
+        if wire.configuration_digest != config.digest()
             || !wire.complete
+            || (wire.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION
+                && wire
+                    .orders
+                    .iter()
+                    .chain(&wire.archived_orders)
+                    .any(PaperOrderRecoveryWire::has_target_reference))
             || wire.orders.len() > limits.maximum_orders.get()
             || wire.fills.len() > limits.maximum_fills.get()
             || wire.archived_orders.len() > limits.maximum_archived_orders.get()
@@ -1019,6 +1056,8 @@ const fn is_terminal(state: PaperOrderState) -> bool {
 pub enum PaperCheckpointError {
     #[error("paper checkpoint exceeds its byte bound")]
     TooLarge,
+    #[error("paper checkpoint schema {actual} is incompatible with required schema {expected}")]
+    IncompatibleSchema { expected: u32, actual: u32 },
     #[error("paper checkpoint header, schema, completeness, or configuration is invalid")]
     InvalidHeader,
     #[error("paper checkpoint order state is invalid")]

@@ -33,9 +33,13 @@ const DISCOVERY_LIMIT = 100
 export function CandidateDossierWorkspace({
   transport,
   scope,
+  selectedTargetDossierId,
+  onSelectTargetDossier,
 }: {
   transport: ProductTransport
   scope: ProductScope
+  selectedTargetDossierId: string | null
+  onSelectTargetDossier: (dossier: DecisionDossierView) => void
 }) {
   const [runId, setRunId] = React.useState("")
   const [candidateId, setCandidateId] = React.useState("")
@@ -183,7 +187,12 @@ export function CandidateDossierWorkspace({
           ) : (
             <div className="mt-4 grid gap-3">
               {dossierEntries.map((dossier) => (
-                <DossierCard key={dossier.id} dossier={dossier} />
+                <DossierCard
+                  key={dossier.id}
+                  dossier={dossier}
+                  selected={dossier.id === selectedTargetDossierId}
+                  onSelect={() => onSelectTargetDossier(dossier)}
+                />
               ))}
               {dossiers.hasNextPage && (
                 <Button
@@ -325,9 +334,21 @@ function CandidateCard({
   )
 }
 
-function DossierCard({ dossier }: { dossier: DecisionDossierView }) {
+function DossierCard({
+  dossier,
+  selected,
+  onSelect,
+}: {
+  dossier: DecisionDossierView
+  selected: boolean
+  onSelect: () => void
+}) {
   return (
-    <article className="mt-4 rounded-xl border border-border bg-background/45 p-4">
+    <article
+      className={`mt-4 rounded-xl border bg-background/45 p-4 ${
+        selected ? "border-primary/60" : "border-border"
+      }`}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="truncate text-sm font-semibold" title={dossier.instrumentId}>
@@ -385,6 +406,10 @@ function DossierCard({ dossier }: { dossier: DecisionDossierView }) {
         </span>
         <EvidenceIdentity value={digestHex(dossier.evidence.contentIdentity)} />
       </div>
+      <Button type="button" className="mt-4" variant="outline" size="sm" onClick={onSelect}>
+        <BookOpenCheck aria-hidden="true" />
+        {selected ? "Selected for investment target" : "Use for investment target"}
+      </Button>
     </article>
   )
 }

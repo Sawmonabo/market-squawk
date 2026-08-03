@@ -24,6 +24,63 @@ use crate::jobs::{
 
 const MAXIMUM_RESTORE_BLOCKERS: usize = 64;
 
+/// One complete path-free view of the installed service and active workspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RuntimeStatusSnapshot {
+    ready: bool,
+    workspace: WorkspaceRuntimeIdentity,
+    workspace_schema_version: u32,
+    available_disk_bytes: u64,
+    running_jobs: u32,
+    running_mutation_jobs: u32,
+    active_sources: u32,
+    connected_clients: u32,
+    paper_execution_active: bool,
+    execution_reconciliation_pending: bool,
+}
+
+impl RuntimeStatusSnapshot {
+    /// Captures a fully bound, ceiling-validated sample from the installed runtime authorities.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each operational fact is independently authoritative"
+    )]
+    pub(crate) const fn ready(
+        workspace: WorkspaceRuntimeIdentity,
+        workspace_schema_version: u32,
+        available_disk_bytes: u64,
+        running_jobs: u32,
+        running_mutation_jobs: u32,
+        active_sources: u32,
+        connected_clients: u32,
+        paper_execution_active: bool,
+        execution_reconciliation_pending: bool,
+    ) -> Self {
+        Self {
+            ready: true,
+            workspace,
+            workspace_schema_version,
+            available_disk_bytes,
+            running_jobs,
+            running_mutation_jobs,
+            active_sources,
+            connected_clients,
+            paper_execution_active,
+            execution_reconciliation_pending,
+        }
+    }
+}
+
+/// Synchronous authority for the current installed runtime status.
+pub trait RuntimeStatusAuthority: fmt::Debug + Send + Sync {
+    /// Samples one complete fact set for the exact active workspace fence.
+    fn snapshot(
+        &self,
+        active: WorkspaceRuntimeIdentity,
+    ) -> Result<RuntimeStatusSnapshot, ServiceError>;
+}
+
 /// Exact path-free identity of one operation retained by a concrete lifecycle authority.
 #[derive(Clone, Debug)]
 pub struct PreparedOperation {

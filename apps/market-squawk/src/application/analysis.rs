@@ -32,15 +32,18 @@ mod catalog;
 mod serialization;
 
 pub use backtest::{
-    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCohortCandidateRegistrationInput,
+    BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationError,
+    BacktestPreparationLimits, BacktestPreparationOptions, BacktestPreparationPreview,
+    BacktestPreparationReceipt, BacktestPreparationSelection, BacktestScope,
+    GovernedBacktestAuthority, GovernedBacktestCohortCandidateRegistrationInput,
     GovernedBacktestCohortMemberRegistrationInput, GovernedBacktestCohortRegistrationInput,
     GovernedBacktestCommand, GovernedBacktestCorporateActionsInput,
     GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
     GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationJsonError,
     GovernedBacktestInputRegistrationReceipt, GovernedBacktestInputResolver,
-    GovernedBacktestPortfolioSeedInput, GovernedBacktestPrepublishAuthority,
-    GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestReportReference,
-    GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
+    GovernedBacktestPortfolioSeedInput, GovernedBacktestPreparationAuthority,
+    GovernedBacktestPrepublishAuthority, GovernedBacktestQueryLimitsInput, GovernedBacktestRecord,
+    GovernedBacktestReportReference, GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
     MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionBacktestAuthority,
     ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
@@ -1053,9 +1056,11 @@ fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
             | QueryError::ArtifactStoreRequired
             | QueryError::ArtifactAuthorityRequired,
         ) => ServiceError::ResourceExhausted,
-        AnalyticalReadError::Manifest(_) | AnalyticalReadError::Query(_) => {
-            ServiceError::Unavailable
-        }
+        AnalyticalReadError::ForecastDatasetUnavailable => ServiceError::NotFound,
+        AnalyticalReadError::Manifest(_)
+        | AnalyticalReadError::Parquet(_)
+        | AnalyticalReadError::PythonDataset(_)
+        | AnalyticalReadError::Query(_) => ServiceError::Unavailable,
     }
 }
 

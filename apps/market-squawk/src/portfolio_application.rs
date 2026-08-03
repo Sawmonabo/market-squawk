@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use market_squawk_domain::AccountId;
+use market_squawk_domain::{AccountId, Money};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
 use market_squawk_portfolio::PortfolioRevision;
 use market_squawk_services::{
@@ -455,6 +455,68 @@ impl PortfolioFairValueReadCapability {
             return Err(PortfolioApplicationServiceError::DeadlineExceeded);
         }
         Ok(revision)
+    }
+
+    /// Clones producer-owned price evidence from every current immutable account revision.
+    ///
+    /// The result grants no portfolio mutation authority and retains the exact instrument, money,
+    /// observation time, and source identities emitted by the portfolio owner.
+    pub fn current_price_evidence(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<market_squawk_portfolio::PriceEvidence>, PortfolioApplicationServiceError> {
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if !self.runtime.accepting.load(Ordering::Acquire) {
+            return Err(PortfolioApplicationServiceError::Authority);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        let image = self.runtime.image.load();
+        let count = image
+            .accounts
+            .values()
+            .filter_map(|history| history.revisions.last())
+            .try_fold(0_usize, |count, revision| {
+                count.checked_add(revision.holdings.len())
+            })
+            .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?;
+        let mut prices = Vec::new();
+        prices
+            .try_reserve_exact(count)
+            .map_err(|_error| PortfolioApplicationServiceError::ResourceExhausted)?;
+        for revision in image
+            .accounts
+            .values()
+            .filter_map(|history| history.revisions.last())
+        {
+            for holding in &revision.holdings {
+                let quantity = holding.quantity().as_decimal().abs();
+                let amount = holding.market_value().amount().abs();
+                let unit_price = amount
+                    .checked_div(quantity)
+                    .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+                prices.push(
+                    market_squawk_portfolio::PriceEvidence::try_new(
+                        holding.instrument_id(),
+                        Money::new(unit_price, holding.currency()),
+                        holding.as_of(),
+                        holding.source_reference().clone(),
+                    )
+                    .map_err(|_error| PortfolioApplicationServiceError::CorruptPublication)?,
+                );
+            }
+        }
+        if cancellation.is_cancelled() || self.runtime.cancellation.is_cancelled() {
+            return Err(PortfolioApplicationServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(PortfolioApplicationServiceError::DeadlineExceeded);
+        }
+        Ok(prices)
     }
 }
 

@@ -25,7 +25,9 @@ import { Skeleton } from "@/components/ui/skeleton"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
 
+import { DatasetBuilder } from "./dataset-builder"
 import { DatasetEvidence } from "./dataset-evidence"
+import { ResearchIngestion } from "./research-ingestion"
 import {
   parseResearchDatasetPage,
   parseResearchJobs,
@@ -181,6 +183,25 @@ function ResearchWorkspace({
         </Button>
       </header>
 
+      <ResearchIngestion
+        bootstrap={bootstrap}
+        transport={transport}
+        onStarted={() => {
+          void queryClient.invalidateQueries({ queryKey: jobKey })
+        }}
+      />
+
+      <DatasetBuilder
+        bootstrap={bootstrap}
+        transport={transport}
+        onStarted={async () => {
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: jobKey }),
+            queryClient.invalidateQueries({ queryKey: datasetKey }),
+          ])
+        }}
+      />
+
       {datasets.isPending ? (
         <ResearchContentLoading />
       ) : datasets.isError ? (
@@ -189,7 +210,34 @@ function ResearchWorkspace({
           retry={() => void datasets.refetch()}
         />
       ) : allDatasets.length === 0 ? (
-        <EmptyResearch />
+        <>
+          <EmptyResearch />
+          <div className="mt-4">
+            <ResearchActivity
+              jobs={jobs.data ?? []}
+              loading={jobs.isPending}
+              error={jobs.isError ? messageFrom(jobs.error) : null}
+              pendingJobId={
+                jobMutation.isPending
+                  ? jobMutation.variables.request.jobId
+                  : null
+              }
+              mutationError={
+                jobMutation.isError ? messageFrom(jobMutation.error) : null
+              }
+              act={(job, action) =>
+                jobMutation.mutate({
+                  request: {
+                    action,
+                    jobId: job.jobId,
+                    generation: job.generation,
+                    expectedSequence: job.sequence,
+                  },
+                })
+              }
+            />
+          </div>
+        </>
       ) : (
         <>
           <section

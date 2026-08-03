@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use market_squawk_domain::{
-    InstrumentId, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier,
-    Timestamp,
+    EffectiveInterval, InstrumentId, ResearchTemporalCoordinate, ResearchTime, RevisionNumber,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -14,7 +14,8 @@ use std::marker::PhantomData;
 
 use crate::{ExtractionLimits, FileAdapterError};
 
-pub(super) const MANIFEST_SCHEMA_VERSION: u16 = 3;
+pub(super) const MANIFEST_SCHEMA_VERSION: u16 = 4;
+const PREVIOUS_MANIFEST_SCHEMA_VERSION: u16 = 3;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
 pub(super) const MAX_MAPPINGS: usize = 1_024;
 
@@ -29,12 +30,19 @@ pub(crate) struct FileSourceManifest {
 impl FileSourceManifest {
     pub(crate) fn parse(bytes: &[u8], limits: ExtractionLimits) -> Result<Self, FileAdapterError> {
         crate::manifest_bounds::admit(bytes, limits)?;
-        serde_json::from_slice(bytes).map_err(|_| FileAdapterError::InvalidManifest)
+        let mut manifest: Self =
+            serde_json::from_slice(bytes).map_err(|_| FileAdapterError::InvalidManifest)?;
+        for object in &mut manifest.objects {
+            object.manifest_schema_version = manifest.schema_version;
+        }
+        Ok(manifest)
     }
 
     pub(crate) fn validate(&self) -> Result<(), FileAdapterError> {
-        if self.schema_version != MANIFEST_SCHEMA_VERSION
-            || self.objects.is_empty()
+        if !matches!(
+            self.schema_version,
+            PREVIOUS_MANIFEST_SCHEMA_VERSION | MANIFEST_SCHEMA_VERSION
+        ) || self.objects.is_empty()
             || self.objects.len() > MAX_MANIFEST_OBJECTS
         {
             return Err(FileAdapterError::InvalidManifest);
@@ -48,6 +56,16 @@ impl FileSourceManifest {
                     .superseded_at
                     .is_some_and(|value| value <= object.effective_at)
                 || object.revision_number == 0
+                || (self.schema_version == PREVIOUS_MANIFEST_SCHEMA_VERSION
+                    && object.universe_membership.is_some())
+                || object
+                    .universe_membership
+                    .as_ref()
+                    .is_some_and(|membership| {
+                        object.instrument_binding.instrument_id().is_none()
+                            || EffectiveInterval::new(membership.starts_at, membership.ends_at)
+                                .is_err()
+                    })
                 || ResearchTime::try_new_with_coordinates(
                     object.record_time.effective.clone(),
                     object.record_time.published.clone(),
@@ -70,6 +88,8 @@ impl FileSourceManifest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileObjectSpec {
+    #[serde(skip)]
+    pub(crate) manifest_schema_version: u16,
     pub(crate) dataset: SourceIdentifier,
     pub(crate) object_id: SourceIdentifier,
     pub(crate) path: String,
@@ -82,7 +102,18 @@ pub(crate) struct FileObjectSpec {
     /// Record coordinates retained independently from the exact discovery-object interval.
     pub(crate) record_time: FileRecordTimeSpec,
     pub(crate) instrument_binding: InstrumentBinding,
+    /// Optional explicit source-authored historical-universe evidence for this exact object.
+    #[serde(default)]
+    pub(crate) universe_membership: Option<UniverseMembershipSpec>,
     pub(crate) row_policy: RowPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UniverseMembershipSpec {
+    pub(crate) universe: SourceIdentifier,
+    pub(crate) starts_at: Timestamp,
+    pub(crate) ends_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize)]

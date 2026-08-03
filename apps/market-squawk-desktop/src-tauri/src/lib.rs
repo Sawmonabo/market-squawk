@@ -30,12 +30,15 @@ use bridge::{
     open_protected_provider_setup, provider_onboarding,
 };
 use events::subscribe_service_events;
-use input_staging::{stage_training_input, start_backtest_from_file};
+use input_staging::{
+    commit_portfolio_import, discard_portfolio_import, preview_portfolio_import,
+    stage_training_input, start_backtest_from_file,
+};
 use mcp_clients::{DesktopMcpClientState, mcp_client_control, mcp_status};
 use service_client::{
-    dashboard_query, decision_control, fair_value_control, governance_control, governance_query,
-    job_control, model_control, operations_control, paper_control, research_control,
-    source_control,
+    analysis_control, dashboard_query, decision_control, fair_value_control, governance_control,
+    governance_query, job_control, model_control, operations_control, paper_control,
+    research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -195,9 +198,11 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            analysis_control,
             dashboard_query,
             decision_control,
             desktop_bootstrap,
+            discard_portfolio_import,
             fair_value_control,
             governance_control,
             governance_query,
@@ -210,11 +215,13 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             open_official_provider_page,
             open_protected_provider_setup,
             paper_control,
+            preview_portfolio_import,
             provider_onboarding,
             research_control,
             source_control,
             stage_training_input,
             start_backtest_from_file,
+            commit_portfolio_import,
             subscribe_service_events
         ])
         .build(tauri::generate_context!())?;

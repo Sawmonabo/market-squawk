@@ -1,8 +1,10 @@
 //! Single per-user installed-service composition and lifecycle authority.
 
 mod analysis;
+mod backtest_preparation;
 mod decision;
 mod dispatch;
+mod forecast_preparation;
 mod governance;
 mod governance_persistence;
 mod jobs;
@@ -16,6 +18,7 @@ mod operations_activity_bindings;
 mod operations_bootstrap;
 mod operations_composition;
 mod portfolio_import;
+mod research_dataset;
 mod resources;
 mod runtime;
 mod tool_services;
@@ -50,7 +53,9 @@ use market_squawk_services::{
 use resources::InstalledResourceProvider;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tool_services::InstalledToolServices;
+use tool_services::{
+    InstalledToolServiceAuthorities, InstalledToolServiceRuntime, InstalledToolServices,
+};
 use uuid::Uuid;
 
 use mcp_client::InstalledMcpRelayTransport;
@@ -629,13 +634,18 @@ fn compose_transport(
     .map_err(|error| InstalledServiceError::PortfolioImportState(error.to_string()))?;
     let services = Arc::new(
         InstalledToolServices::try_new(
-            Arc::clone(&application),
-            operations.application(),
-            product,
-            jobs,
-            runners,
-            Arc::clone(&inputs),
-            portfolio_import,
+            InstalledToolServiceAuthorities::new(
+                Arc::clone(&application),
+                operations.application(),
+                product,
+                jobs,
+            ),
+            InstalledToolServiceRuntime::new(
+                runners,
+                Arc::clone(&inputs),
+                runtime.runtime(),
+                portfolio_import,
+            ),
         )
         .map_err(|_error| InstalledServiceError::CompositionStage("installed tool services"))?,
     );

@@ -14,6 +14,7 @@ import { PortfolioPlanning } from "./portfolio-planning"
 import { PortfolioScenarios } from "./portfolio-scenarios"
 import type { PortfolioAccount } from "./portfolio-contracts"
 import { shortIdentity } from "./portfolio-format"
+import { PortfolioImportWorkflow } from "./portfolio-import-workflow"
 import {
   AllocationPanel,
   ExposurePanel,
@@ -86,6 +87,11 @@ function PortfolioWorkspace({
     return (
       <PortfolioFrame>
         <UnavailablePortfolio />
+        <PortfolioImportWorkflow
+          bootstrap={bootstrap}
+          selectedAccountId={null}
+          onCommitted={() => accounts.query.refetch()}
+        />
       </PortfolioFrame>
     )
   }
@@ -120,6 +126,15 @@ function PortfolioWorkspace({
           Refresh evidence
         </Button>
       </header>
+
+      <PortfolioImportWorkflow
+        bootstrap={bootstrap}
+        selectedAccountId={selected?.accountId ?? null}
+        onCommitted={async () => {
+          await accounts.query.refetch()
+          await details.refresh()
+        }}
+      />
 
       {accounts.query.isPending ? (
         <PortfolioLoading />
@@ -395,9 +410,8 @@ function EmptyPortfolio() {
       <BriefcaseBusiness className="size-6 text-muted-foreground" aria-hidden="true" />
       <h2 className="mt-4 text-lg font-semibold">No portfolio account has been imported</h2>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-        This dashboard does not yet receive a protected portfolio-file import action. It will not
-        show a button that cannot preserve the source file, reconciliation evidence, and immutable
-        publication receipt.
+        Use the protected local import above to select a portfolio extraction batch, review its
+        normalized records and reconciliation evidence, and commit an immutable revision.
       </p>
     </section>
   )

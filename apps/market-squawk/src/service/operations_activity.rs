@@ -9,7 +9,10 @@ use market_squawk_runtime::WorkspaceId;
 use market_squawk_services::ServiceError;
 use thiserror::Error;
 
-use crate::application::lifecycle::{UpdateActivitySnapshot, WorkspaceActivitySnapshot};
+use crate::application::{
+    lifecycle::{UpdateActivitySnapshot, WorkspaceActivitySnapshot, WorkspaceRuntimeIdentity},
+    operations::{RuntimeStatusAuthority, RuntimeStatusSnapshot},
+};
 use crate::local_product::operations::RecoveryActivityAuthority;
 
 /// Synchronous, path-free view of the installed scheduler's exact running set.
@@ -254,6 +257,32 @@ impl RuntimeActivityCoordinator {
         ))
     }
 
+    /// Samples and validates one complete installed-runtime status snapshot.
+    fn runtime_status(
+        &self,
+        active: WorkspaceRuntimeIdentity,
+    ) -> Result<RuntimeStatusSnapshot, ServiceError> {
+        let readers = self.readers()?;
+        let jobs = (readers.jobs)()?;
+        let active_sources = (readers.sources)()?;
+        let execution = (readers.execution)()?;
+        let connected_clients = (readers.clients)()?;
+        let workspace = (readers.workspace)(active.workspace_id())?;
+        self.validate_facts(jobs, active_sources, connected_clients, workspace)?;
+
+        Ok(RuntimeStatusSnapshot::ready(
+            active,
+            workspace.schema_version,
+            workspace.available_disk_bytes,
+            jobs.running_jobs,
+            jobs.running_mutation_jobs,
+            active_sources,
+            connected_clients,
+            execution.paper_execution_active,
+            execution.reconciliation_pending,
+        ))
+    }
+
     fn readers(&self) -> Result<&RuntimeActivityReaders, ServiceError> {
         self.readers.get().ok_or(ServiceError::Unavailable)
     }
@@ -311,6 +340,15 @@ impl RecoveryActivityAuthority for RuntimeActivityCoordinator {
         workspace_id: WorkspaceId,
     ) -> Result<WorkspaceActivitySnapshot, ServiceError> {
         self.recovery_snapshot(workspace_id, 1, 1, self.limits.maximum_schema_version)
+    }
+}
+
+impl RuntimeStatusAuthority for RuntimeActivityCoordinator {
+    fn snapshot(
+        &self,
+        active: WorkspaceRuntimeIdentity,
+    ) -> Result<RuntimeStatusSnapshot, ServiceError> {
+        self.runtime_status(active)
     }
 }
 

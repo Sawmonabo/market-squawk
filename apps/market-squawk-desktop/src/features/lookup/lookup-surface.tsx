@@ -279,17 +279,18 @@ function detailFor(match: LookupMatch) {
 
 function routeFor(match: LookupMatch) {
   if (match.category === "provider") return "/sources"
-  if (match.category === "dataset" || match.category === "screen") return "/research"
+  if (match.category === "dataset") return "/research"
+  if (match.category === "screen") return "/decisions"
   if (match.category === "model") return "/models"
   if (match.category === "portfolio") return "/portfolios"
-  if (match.category === "target") return "/fair-value"
+  if (match.category === "target") return "/decisions"
   if (match.category === "job") return "/overview"
   if (match.category === "command" && typeof match.detail.domain === "string") {
     const domain = match.detail.domain.toLowerCase()
     const paths: Record<string, string> = {
       analysis: "/backtests",
       bot: "/risk",
-      decision: "/research",
+      decision: "/decisions",
       execution: "/paper-execution",
       fairvalue: "/fair-value",
       fundamental: "/research",

@@ -930,6 +930,29 @@ impl ResearchProviderRuntimeMutationAuthority {
 }
 
 impl ProductionResearchIngestCoordinator {
+    /// Returns one coherent, nonblocking count of callable provider runtime generations.
+    pub fn active_provider_runtime_count(&self) -> Result<usize, ResearchIngestCompositionError> {
+        if self.lifecycle.shutdown_token().is_cancelled() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let authority = self
+            .authority
+            .try_lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        authority
+            .sources
+            .values()
+            .try_fold(0_usize, |count, source| {
+                if source.generation.is_some() && source.admission.ensure_live().is_ok() {
+                    count
+                        .checked_add(1)
+                        .ok_or(ResearchIngestCompositionError::AuthorityUnavailable)
+                } else {
+                    Ok(count)
+                }
+            })
+    }
+
     /// Returns the exact callable generation currently published for one provider profile.
     pub fn provider_runtime_generation(
         &self,

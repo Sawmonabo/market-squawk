@@ -10,6 +10,7 @@ import {
 import {
   useInfiniteQuery,
   useMutation,
+  useQuery,
   useQueryClient,
 } from "@tanstack/react-query"
 
@@ -35,6 +36,7 @@ import {
   digestHex,
   isActiveJob,
   parseJobPage,
+  parseRuntimeStatus,
   type JobView,
   type PendingJobAction,
 } from "./contracts"
@@ -43,7 +45,7 @@ import {
   EmptyJobs,
   LoadingState,
   SummaryFact,
-  UnavailableOperationalFacts,
+  OperationalHealth,
 } from "./operations-status"
 
 const JOB_PAGE_LIMIT = 50
@@ -104,6 +106,19 @@ function ReadyOperations({
       pages.length < MAXIMUM_JOB_PAGES
         ? (lastPage.next ?? undefined)
         : undefined,
+    refetchInterval: 5_000,
+  })
+  const runtimeQuery = useQuery({
+    queryKey: productKeys.operation(
+      scope,
+      "operations",
+      "Operations.GetRuntimeStatus",
+      {},
+    ),
+    queryFn: async () =>
+      parseRuntimeStatus(
+        await transport.query({ query: "operationRuntimeStatus" }),
+      ),
     refetchInterval: 5_000,
   })
   const mutation = useMutation({
@@ -250,7 +265,13 @@ function ReadyOperations({
           )}
       </section>
 
-      <UnavailableOperationalFacts />
+      <OperationalHealth
+        status={runtimeQuery.data}
+        pending={runtimeQuery.isPending}
+        refreshing={runtimeQuery.isFetching}
+        error={runtimeQuery.isError ? messageFrom(runtimeQuery.error) : null}
+        onRefresh={() => void runtimeQuery.refetch()}
+      />
 
       {mutation.isError && (
         <Alert variant="destructive" className="mt-5">

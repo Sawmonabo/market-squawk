@@ -416,15 +416,30 @@ async fn dataset(
             )
             .await
         }
-        DatasetCommand::Build { request, confirm } => {
-            let value = cli_dataset::build_point_in_time_dataset(
-                authority.local_for("Research.BuildDataset")?,
-                &request,
-                confirm,
-            )
-            .await?;
-            direct_result(value, "point-in-time dataset published")
-        }
+        DatasetCommand::Build { request, confirm } => match authority {
+            CliAuthority::Local(product) => {
+                let value =
+                    cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
+                direct_result(value, "point-in-time dataset published")
+            }
+            CliAuthority::Installed(_) => {
+                require_confirmation(confirm)?;
+                let mut arguments = Map::new();
+                arguments.insert(
+                    "registration".to_owned(),
+                    Value::Object(read_json_object(&request)?),
+                );
+                arguments.insert("confirm".to_owned(), Value::Bool(true));
+                invoke(
+                    authority,
+                    "Research.StartDatasetBuild",
+                    &mut arguments,
+                    Some(1),
+                    "point-in-time dataset build started",
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -507,15 +522,30 @@ async fn feature(
             )
             .await
         }
-        FeatureCommand::Build { request, confirm } => {
-            let value = cli_dataset::build_point_in_time_dataset(
-                authority.local_for("Analysis.BuildFeatureDataset")?,
-                &request,
-                confirm,
-            )
-            .await?;
-            direct_result(value, "point-in-time feature dataset published")
-        }
+        FeatureCommand::Build { request, confirm } => match authority {
+            CliAuthority::Local(product) => {
+                let value =
+                    cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
+                direct_result(value, "point-in-time feature dataset published")
+            }
+            CliAuthority::Installed(_) => {
+                require_confirmation(confirm)?;
+                let mut arguments = Map::new();
+                arguments.insert(
+                    "registration".to_owned(),
+                    Value::Object(read_json_object(&request)?),
+                );
+                arguments.insert("confirm".to_owned(), Value::Bool(true));
+                invoke(
+                    authority,
+                    "Analysis.StartFeatureDatasetBuild",
+                    &mut arguments,
+                    Some(1),
+                    "point-in-time feature dataset build started",
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -609,10 +639,14 @@ async fn backtest(
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         BacktestCommand::Run { request, confirm } => {
-            authority.local_for("Analysis.RunBacktest")?;
             let value = cli_backtest::register_backtest_input(&request, confirm).await?;
             let arguments = json_object(value)?;
-            ("Analysis.RunBacktest", arguments, "backtest completed")
+            match authority {
+                CliAuthority::Local(_) => ("Analysis.RunBacktest", arguments, "backtest completed"),
+                CliAuthority::Installed(_) => {
+                    ("Analysis.StartBacktest", arguments, "backtest job started")
+                }
+            }
         }
         BacktestCommand::Show { run } => (
             "Analysis.GetBacktests",

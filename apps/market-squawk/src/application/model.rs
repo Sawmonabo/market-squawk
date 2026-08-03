@@ -33,6 +33,7 @@ use super::{
 
 pub mod backup;
 pub mod forecast;
+pub mod forecast_preparation;
 mod read_image;
 pub mod runtime;
 

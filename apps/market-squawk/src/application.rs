@@ -51,6 +51,12 @@ pub use fair_value::{
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{PaperRuntimeActivityAuthority, PaperSourceLifecycleControl};
+pub(crate) use research::{
+    AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
+    DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
+    DatasetPreparationReceipt, DatasetPreparationSelection,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+};
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
@@ -58,9 +64,6 @@ pub use research::{
     ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
     ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
     ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
-};
-pub(crate) use research::{
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use source::{
     EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,

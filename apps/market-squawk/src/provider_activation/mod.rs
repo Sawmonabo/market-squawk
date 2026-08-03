@@ -289,6 +289,15 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
+    /// Returns one coherent nonblocking count of callable research provider runtimes.
+    pub(crate) fn active_research_runtime_count(
+        &self,
+    ) -> Result<usize, ProviderAdapterActivationError> {
+        self.research
+            .active_provider_runtime_count()
+            .map_err(Into::into)
+    }
+
     /// Returns the exact fixed discovery dataset carried by one callable research adapter.
     pub(crate) fn registered_discovery_dataset(
         &self,

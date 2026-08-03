@@ -70,6 +70,7 @@ function StartPaperForm({
     "coinbase" | "coinbase-direct" | "kraken"
   >("coinbase")
   const [sessionId, setSessionId] = React.useState("")
+  const [strategyMode, setStrategyMode] = React.useState<"manual" | "book_imbalance">("manual")
   const [initialCash, setInitialCash] = React.useState("100000")
   const [feeBasisPoints, setFeeBasisPoints] = React.useState("5")
   const directSessions = sessions.filter(
@@ -90,6 +91,7 @@ function StartPaperForm({
       action: "start",
       provider,
       ...(provider === "coinbase-direct" ? { providerSessionId: sessionId } : {}),
+      strategyMode,
       initialCash,
       feeBasisPoints: fee,
     })
@@ -135,6 +137,23 @@ function StartPaperForm({
             ) : null}
           </Field>
         ) : null}
+        <Field label="Operation mode" htmlFor="paper-strategy-mode">
+          <select
+            id="paper-strategy-mode"
+            value={strategyMode}
+            onChange={(event) =>
+              setStrategyMode(event.target.value as "manual" | "book_imbalance")
+            }
+            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <option value="manual">Controlled manual drafts (recommended)</option>
+            <option value="book_imbalance">Automated book-imbalance strategy</option>
+          </select>
+          <FieldMessage>
+            Automated mode is explicit and still uses verified market data, central risk, loss
+            limits, durable audit, and the same stop controls.
+          </FieldMessage>
+        </Field>
         <Field label="Starting cash" htmlFor="paper-initial-cash">
           <Input
             id="paper-initial-cash"
@@ -300,6 +319,7 @@ function ConfirmationFacts({ request }: { request: PaperControlRequest }) {
     return (
       <dl className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 sm:grid-cols-2">
         <Fact label="Source" value={request.provider} />
+        <Fact label="Operation mode" value={request.strategyMode} />
         <Fact label="Starting cash" value={request.initialCash} />
         <Fact label="Fee basis points" value={request.feeBasisPoints.toLocaleString()} />
         {request.providerSessionId ? (

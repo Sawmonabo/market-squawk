@@ -82,9 +82,15 @@ function transport(
     query,
     researchControl: async () =>
       query({ query: "researchDatasets" }),
+    datasetPreparation: async () =>
+      query({ query: "analysisFeatureDatasets" }),
+    backtestPreparation: async () =>
+      query({ query: "jobs", limit: 25 }),
     startBacktestFromFile: async () =>
       query({ query: "jobs", limit: 25 }),
     modelControl: async () =>
+      query({ query: "jobs", limit: 25 }),
+    forecastPreparation: async () =>
       query({ query: "jobs", limit: 25 }),
     decisionControl: async () =>
       query({ query: "decisionScreens", limit: 25 }),
@@ -95,6 +101,8 @@ function transport(
     fairValueControl: async () =>
       query({ query: "fairValueMeasurements" }),
     paperControl: async () =>
+      query({ query: "paperStatus" }),
+    manualPaper: async () =>
       query({ query: "paperStatus" }),
     jobControl: async (request) =>
       query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),

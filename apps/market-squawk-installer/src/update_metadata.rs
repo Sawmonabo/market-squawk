@@ -1324,9 +1324,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::error::Error;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::Read as _;
 
     use chrono::{DateTime, Utc};
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1340,6 +1341,160 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    pub(crate) struct SignedRepositoryFixture {
+        pub(crate) trusted_time: DateTime<Utc>,
+        pub(crate) pinned_root: Vec<u8>,
+        pub(crate) rotated_root: Vec<u8>,
+        pub(crate) timestamp: Vec<u8>,
+        pub(crate) snapshot: Vec<u8>,
+        pub(crate) targets: Vec<u8>,
+        pub(crate) manifest: Vec<u8>,
+        pub(crate) manifest_target_path: String,
+        pub(crate) archive_target_path: String,
+        pub(crate) manifest_download_path: String,
+        pub(crate) archive_download_path: String,
+        pub(crate) archive_sha256: [u8; 32],
+    }
+
+    impl SignedRepositoryFixture {
+        pub(crate) fn for_release(
+            manifest: Vec<u8>,
+            archive: &std::path::Path,
+            target_name: &str,
+            release_version: &str,
+        ) -> Result<Self, Box<dyn Error>> {
+            let trusted_time = "2026-08-03T12:00:00Z".parse()?;
+            let expires = "2099-01-01T00:00:00Z";
+            let keys = [key(41), key(42), key(43)];
+            let pinned_root = envelope(
+                root_signed_with_expiry(
+                    1,
+                    expires,
+                    &[&keys[0], &keys[1]],
+                    &[
+                        ("root", &[&keys[0], &keys[1]], 2),
+                        ("targets", &[&keys[0]], 1),
+                        ("snapshot", &[&keys[1]], 1),
+                        ("timestamp", &[&keys[0]], 1),
+                    ],
+                ),
+                &[&keys[0], &keys[1]],
+            )?;
+            let rotated_root = envelope(
+                root_signed_with_expiry(
+                    2,
+                    expires,
+                    &[&keys[1], &keys[2]],
+                    &[
+                        ("root", &[&keys[1], &keys[2]], 2),
+                        ("targets", &[&keys[1]], 1),
+                        ("snapshot", &[&keys[2]], 1),
+                        ("timestamp", &[&keys[1]], 1),
+                    ],
+                ),
+                &[&keys[0], &keys[1], &keys[2]],
+            )?;
+            let manifest_target_path = format!("channels/stable/{target_name}/manifest.json");
+            let archive_target_path = format!("channels/stable/{target_name}/bundle.zip");
+            let manifest_sha256: [u8; 32] = Sha256::digest(&manifest).into();
+            let archive_metadata = fs::symlink_metadata(archive)?;
+            if !archive_metadata.file_type().is_file() || archive_metadata.file_type().is_symlink()
+            {
+                return Err("candidate archive must be one regular file".into());
+            }
+            let archive_sha256 = sha256_file(archive)?;
+            let archive_length = usize::try_from(archive_metadata.len())?;
+            let compatibility = json!({
+                "marketSquawk": {
+                    "schemaVersion": 1,
+                    "releaseVersion": release_version,
+                    "minimumSchemaVersion": 1,
+                    "maximumSchemaVersion": 1
+                }
+            });
+            let targets = envelope(
+                json!({
+                    "_type": "targets", "spec_version": "1.0.35", "version": 5,
+                    "expires": expires,
+                    "targets": {
+                        manifest_target_path.clone(): target_with_custom(
+                            manifest.len(), manifest_sha256, compatibility
+                        ),
+                        archive_target_path.clone(): target(archive_length, archive_sha256)
+                    }
+                }),
+                &[&keys[1]],
+            )?;
+            let snapshot = envelope(
+                json!({
+                    "_type": "snapshot", "spec_version": "1.0.35", "version": 4,
+                    "expires": expires,
+                    "meta": {"targets.json": metadata_description(5, &targets)}
+                }),
+                &[&keys[2]],
+            )?;
+            let timestamp = envelope(
+                json!({
+                    "_type": "timestamp", "spec_version": "1.0.35", "version": 3,
+                    "expires": expires,
+                    "meta": {"snapshot.json": metadata_description(4, &snapshot)}
+                }),
+                &[&keys[1]],
+            )?;
+            let manifest_download_path = consistent_path(&manifest_target_path, manifest_sha256);
+            let archive_download_path = consistent_path(&archive_target_path, archive_sha256);
+            Ok(Self {
+                trusted_time,
+                pinned_root,
+                rotated_root,
+                timestamp,
+                snapshot,
+                targets,
+                manifest,
+                manifest_target_path,
+                archive_target_path,
+                manifest_download_path,
+                archive_download_path,
+                archive_sha256,
+            })
+        }
+
+        pub(crate) fn pending(
+            &self,
+            install_root: &std::path::Path,
+            archive: &std::path::Path,
+        ) -> Result<super::PendingTrustedUpdate, super::UpdateMetadataError> {
+            let pinned = TrustedRoot::from_pinned(&self.pinned_root)?;
+            let store =
+                TrustedUpdateStore::open_or_bootstrap(install_root, pinned, self.trusted_time)?;
+            let roots = [self.rotated_root.as_slice()];
+            let supplied = [
+                SuppliedTarget {
+                    metadata_path: &self.manifest_target_path,
+                    download_path: &self.manifest_download_path,
+                    source: TargetSource::Bytes(&self.manifest),
+                },
+                SuppliedTarget {
+                    metadata_path: &self.archive_target_path,
+                    download_path: &self.archive_download_path,
+                    source: TargetSource::File(archive),
+                },
+            ];
+            store.admit(
+                SuppliedMetadata {
+                    root_chain: &roots,
+                    timestamp: &self.timestamp,
+                    snapshot_path: "4.snapshot.json",
+                    snapshot: &self.snapshot,
+                    targets_path: "5.targets.json",
+                    targets: &self.targets,
+                },
+                &supplied,
+                self.trusted_time,
+            )
+        }
+    }
 
     #[test]
     fn canonical_signed_json_uses_olpc_control_escapes_and_utf8() -> TestResult {
@@ -1386,6 +1541,24 @@ mod tests {
                 fixture.now,
             )?
             .persist()?;
+
+        let release_root = private_directory()?;
+        let archive = release_root.path().join("candidate.zip");
+        fs::write(&archive, b"candidate complete release archive")?;
+        let release = SignedRepositoryFixture::for_release(
+            b"candidate release manifest".to_vec(),
+            &archive,
+            "aarch64-apple-darwin",
+            "1.0.1",
+        )?;
+        assert_eq!(
+            release
+                .pending(release_root.path(), &archive)?
+                .target(&release.manifest_target_path)
+                .ok_or("signed fixture manifest target is missing")?
+                .sha256(),
+            <[u8; 32]>::from(Sha256::digest(&release.manifest))
+        );
         Ok(())
     }
 
@@ -1607,6 +1780,15 @@ mod tests {
     }
 
     fn root_signed(version: u64, keys: &[&TestKey], roles: &[(&str, &[&TestKey], u64)]) -> Value {
+        root_signed_with_expiry(version, "2026-09-01T00:00:00Z", keys, roles)
+    }
+
+    fn root_signed_with_expiry(
+        version: u64,
+        expires: &str,
+        keys: &[&TestKey],
+        roles: &[(&str, &[&TestKey], u64)],
+    ) -> Value {
         let key_map = keys
             .iter()
             .map(|key| (key.key_id.clone(), key.value.clone()))
@@ -1625,7 +1807,7 @@ mod tests {
             .collect::<serde_json::Map<_, _>>();
         json!({
             "_type": "root", "spec_version": "1.0.35", "version": version,
-            "expires": "2026-09-01T00:00:00Z", "consistent_snapshot": true,
+            "expires": expires, "consistent_snapshot": true,
             "keys": key_map, "roles": role_map
         })
     }
@@ -1653,6 +1835,28 @@ mod tests {
 
     fn target(length: usize, digest: [u8; 32]) -> Value {
         json!({"length": length, "hashes": {"sha256": hex(&digest)}})
+    }
+
+    fn target_with_custom(length: usize, digest: [u8; 32], custom: Value) -> Value {
+        json!({
+            "length": length,
+            "hashes": {"sha256": hex(&digest)},
+            "custom": custom
+        })
+    }
+
+    fn sha256_file(path: &std::path::Path) -> Result<[u8; 32], std::io::Error> {
+        let mut file = File::open(path)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(digest.finalize().into())
     }
 
     fn consistent_path(path: &str, digest: [u8; 32]) -> String {

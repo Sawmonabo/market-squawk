@@ -9,7 +9,7 @@ approximately one-hour Linux verification feedback loop.
 | Audience | Maintainers, CI owners, release reviewers |
 | Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-31 |
+| Last substantive review | 2026-08-01 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
 | Latest diagnosed candidate | `49ff79d10877516fc403796fe31771ac0e3ad014` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
@@ -961,6 +961,35 @@ The first corrected cold run is projected at 28–32 minutes because the measure
 26m08s and the independent leaves can run concurrently. This is a planning estimate, not a
 performance claim. Cache benefit remains unquantified until measured.
 
+### 8. Classify the event delta and isolate package evidence
+
+An ordinary pull-request synchronization must classify the commits introduced by that specific
+head update, not the complete accumulated difference from the pull request's base. GitHub's
+`pull_request` event runs by default for `opened`, `synchronize`, and `reopened`; the official
+generated `synchronize` payload includes the prior and current head identities as `before` and
+`after`. Market Squawk therefore uses `before..head` for a normal synchronization, the pull-request
+base for an opened or reopened request, and the push event's `before..head` range on `main`. A
+missing, zero, or unavailable comparison remains fail-broad. Explicit frozen-candidate dispatches
+continue to select the complete matrix regardless of the event delta.
+
+This distinction makes a later documentation-only synchronization inexpensive without allowing an
+unknown event shape, initial pull request, or final candidate to inherit a narrow classification.
+The classifier still checks out and freezes the exact selected head before it computes the range.
+
+Installed-package test receipts are evidence, not release assets. The complete-release builder
+admits an exact closed platform asset set, so native update/rollback receipts are uploaded as
+separate target- and commit-bound artifacts. Adding an unrecognized receipt to the platform asset
+directory would correctly make aggregation fail.
+
+Documentation link validation uses the maintained Lychee action only when the classifier observes
+a documentation change. The action and its Lychee binary version are pinned; concurrency is
+bounded to four; retries are disabled to avoid amplifying provider rate limits; and transient
+`429` and `5xx` responses are excluded from the one-day response cache. Cache restores are usable
+on pull requests, while cache publication is limited to trusted `main` pushes. This keeps ordinary
+code-only changes out of the link lane and avoids turning external-site instability into broad
+build churn. The action's default fail behavior remains enabled, so a genuine broken link fails the
+documentation job.
+
 ## Acceptance evidence
 
 The correction is acceptable only when all of the following are true:
@@ -1074,11 +1103,16 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [GitHub Actions metrics](https://docs.github.com/en/actions/concepts/metrics)
 - [GitHub Actions dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 - [GitHub Actions workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- [GitHub Actions `pull_request` event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
+- [Official generated `pull_request.synchronize` payload](https://raw.githubusercontent.com/octokit/webhooks/main/payload-examples/api.github.com/pull_request/synchronize.payload.json)
 - [GitHub Actions job variations](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)
 - [GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 - [GitHub Actions billing and usage](https://docs.github.com/en/actions/concepts/billing-and-usage)
 - [Swatinem/rust-cache](https://github.com/Swatinem/rust-cache)
 - [actions/cache](https://github.com/actions/cache)
+- [Lychee action v2.9.0](https://github.com/lycheeverse/lychee-action/tree/e7477775783ea5526144ba13e8db5eec57747ce8)
+- [Lychee GitHub Actions guidance](https://lychee.cli.rs/continuous-integration/github/)
+- [Lychee rate-limit guidance](https://lychee.cli.rs/troubleshooting/rate-limits/)
 - [Mozilla sccache](https://github.com/mozilla/sccache)
 - [cargo-nextest](https://github.com/nextest-rs/nextest)
 - [Pinned Tauri CLI bundle command](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-cli/src/bundle.rs)

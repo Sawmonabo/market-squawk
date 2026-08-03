@@ -1,5 +1,6 @@
 import {
   CheckCircle2,
+  FileText,
   RotateCcw,
   Square,
 } from "lucide-react"
@@ -18,11 +19,17 @@ import { cn } from "@/lib/utils"
 import {
   canCancel,
   canRetry,
+  parseArtifactChunk,
   parseCurrentConfirmation,
+  previewableMediaType,
+  type JobArtifact,
   type JobState,
   type JobView,
   type PendingJobAction,
 } from "./contracts"
+
+const ARTIFACT_PREVIEW_BYTES = 64 * 1024
+const ARTIFACT_CHUNK_BYTES = 32 * 1024
 
 export function JobCard({
   job,
@@ -160,10 +167,18 @@ export function JobCard({
               ? ` with ${job.result.artifacts.length} controlled artifact${job.result.artifacts.length === 1 ? "" : "s"}.`
               : "."}
           </p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Opening artifacts is unavailable until the desktop exposes a closed,
-            controlled artifact-read command.
-          </p>
+          {job.result.artifacts.length > 0 && (
+            <div className="mt-3 grid gap-3">
+              {job.result.artifacts.map((artifact) => (
+                <JobArtifactPreview
+                  key={`${artifact.id}:${artifact.sha256}`}
+                  artifact={artifact}
+                  transport={transport}
+                  scope={scope}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
       {confirmationQuery.isError && job.state === "awaiting_confirmation" && (
@@ -182,6 +197,153 @@ export function JobCard({
         )}
     </article>
   )
+}
+
+function JobArtifactPreview({
+  artifact,
+  transport,
+  scope,
+}: {
+  artifact: JobArtifact
+  transport: ProductTransport
+  scope: ProductScope
+}) {
+  const previewBytes = Math.min(artifact.byteCount, ARTIFACT_PREVIEW_BYTES)
+  const mediaType = previewableMediaType(artifact)
+  const previewQuery = useQuery({
+    queryKey: productKeys.operation(scope, "analysis", "Analysis.ReadArtifact", {
+      artifactId: artifact.id,
+      sha256: artifact.sha256,
+      byteCount: artifact.byteCount,
+      mediaType: artifact.mediaType,
+      maximumBytes: previewBytes,
+    }),
+    enabled: false,
+    queryFn: async () => {
+      if (!mediaType) {
+        throw new Error("This artifact does not have a previewable media type.")
+      }
+      const firstMaximum = Math.min(previewBytes, ARTIFACT_CHUNK_BYTES)
+      const first = parseArtifactChunk(
+        await transport.query({
+          query: "analysisArtifact",
+          artifactId: artifact.id,
+          sha256: artifact.sha256,
+          byteCount: artifact.byteCount,
+          mediaType,
+          offset: 0,
+          maximumBytes: firstMaximum,
+        }),
+        artifact,
+        0,
+        firstMaximum,
+      )
+      if (first.complete || first.returnedBytes >= previewBytes) {
+        return {
+          chunksBase64: [first.contentBase64],
+          returnedBytes: first.returnedBytes,
+          complete: first.complete,
+        }
+      }
+      if (first.returnedBytes === 0) {
+        throw new Error("The service returned an empty non-terminal artifact chunk.")
+      }
+      const secondMaximum = Math.min(
+        previewBytes - first.returnedBytes,
+        ARTIFACT_CHUNK_BYTES,
+      )
+      const second = parseArtifactChunk(
+        await transport.query({
+          query: "analysisArtifact",
+          artifactId: artifact.id,
+          sha256: artifact.sha256,
+          byteCount: artifact.byteCount,
+          mediaType,
+          offset: first.nextOffset,
+          maximumBytes: secondMaximum,
+        }),
+        artifact,
+        first.nextOffset,
+        secondMaximum,
+      )
+      return {
+        chunksBase64: [first.contentBase64, second.contentBase64],
+        returnedBytes: first.returnedBytes + second.returnedBytes,
+        complete: second.complete,
+      }
+    },
+  })
+  const preview = previewQuery.data
+  const content = preview ? decodeUtf8(preview.chunksBase64) : null
+
+  return (
+    <section className="rounded-md border border-border/70 bg-background/25 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="flex items-center gap-2 text-xs font-medium">
+            <FileText className="size-3.5" aria-hidden="true" />
+            Controlled artifact
+          </p>
+          <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+            {artifact.id} · sha256:{artifact.sha256} · {artifact.byteCount.toLocaleString()} bytes
+          </p>
+        </div>
+        {mediaType && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={previewQuery.isFetching}
+            onClick={() => void previewQuery.refetch()}
+          >
+            {previewQuery.isFetching
+              ? "Retrieving preview…"
+              : "View controlled preview"}
+          </Button>
+        )}
+      </div>
+      {!mediaType && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Viewing is unavailable: this dashboard can safely render only JSON or NDJSON artifact previews.
+        </p>
+      )}
+      {previewQuery.isError && (
+        <p className="mt-2 text-xs text-destructive">
+          The controlled preview could not be retrieved: {messageFrom(previewQuery.error)}
+        </p>
+      )}
+      {preview && content !== null && (
+        <div className="mt-3">
+          <p className="text-[11px] text-muted-foreground">
+            {preview.complete
+              ? `Verified complete artifact (${preview.returnedBytes.toLocaleString()} bytes).`
+              : `Verified first ${preview.returnedBytes.toLocaleString()} bytes; the remaining artifact is not loaded into the dashboard.`}
+          </p>
+          <pre className="mt-2 max-h-64 overflow-auto rounded border border-border bg-background p-3 text-xs leading-relaxed text-foreground">
+            {content}
+          </pre>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function decodeUtf8(chunksBase64: string[]): string {
+  try {
+    const chunks = chunksBase64.map((contentBase64) => {
+      const binary = atob(contentBase64)
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0))
+    })
+    const byteCount = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+    const bytes = new Uint8Array(byteCount)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+  } catch {
+    return "The service returned a bounded artifact chunk that is not valid UTF-8 text."
+  }
 }
 
 function JobProgress({ job }: { job: JobView }) {

@@ -376,8 +376,14 @@ impl FeatureLabelComponentInput {
 pub struct DatasetExample {
     example_id: Box<str>,
     instrument_id: InstrumentId,
+    /// Exact knowledge-time boundary used for availability and split admission.
     cutoff_at: Timestamp,
+    /// Exact knowledge-time boundary used for label availability and split admission.
     label_cutoff_at: Timestamp,
+    /// Source-precision feature/effective boundary; never inferred from knowledge time.
+    effective_cutoff: ResearchTemporalCoordinate,
+    /// Source-precision label/effective boundary; never inferred from knowledge time.
+    label_effective_cutoff: ResearchTemporalCoordinate,
     components: Box<[FeatureLabelComponentInput]>,
 }
 
@@ -388,11 +394,40 @@ impl DatasetExample {
         instrument_id: InstrumentId,
         cutoff_at: Timestamp,
         label_cutoff_at: Timestamp,
+        components: Vec<FeatureLabelComponentInput>,
+    ) -> Result<Self, DatasetBuildError> {
+        Self::try_new_with_temporal_cutoffs(
+            example_id,
+            instrument_id,
+            cutoff_at,
+            label_cutoff_at,
+            ResearchTemporalCoordinate::exact(cutoff_at),
+            ResearchTemporalCoordinate::exact(label_cutoff_at),
+            components,
+        )
+    }
+
+    /// Constructs one leakage-bounded example while preserving source temporal precision.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "knowledge-time and source-effective boundaries are independent semantics"
+    )]
+    pub fn try_new_with_temporal_cutoffs(
+        example_id: impl AsRef<str>,
+        instrument_id: InstrumentId,
+        cutoff_at: Timestamp,
+        label_cutoff_at: Timestamp,
+        effective_cutoff: ResearchTemporalCoordinate,
+        label_effective_cutoff: ResearchTemporalCoordinate,
         mut components: Vec<FeatureLabelComponentInput>,
     ) -> Result<Self, DatasetBuildError> {
         let example_id = example_id.as_ref();
         if !canonical_identifier(example_id, MAX_EXAMPLE_ID_BYTES)
             || label_cutoff_at <= cutoff_at
+            || !matches!(
+                label_effective_cutoff.partial_cmp(&effective_cutoff),
+                Some(Ordering::Greater)
+            )
             || components.is_empty()
             || components.len() > MAX_COMPONENTS_PER_EXAMPLE
         {
@@ -410,6 +445,8 @@ impl DatasetExample {
             instrument_id,
             cutoff_at,
             label_cutoff_at,
+            effective_cutoff,
+            label_effective_cutoff,
             components: components.into_boxed_slice(),
         })
     }
@@ -424,14 +461,24 @@ impl DatasetExample {
         self.instrument_id
     }
 
-    /// Returns the feature knowledge/effective cutoff.
+    /// Returns the exact feature knowledge cutoff used for availability and split admission.
     pub const fn cutoff_at(&self) -> Timestamp {
         self.cutoff_at
     }
 
-    /// Returns the exclusive knowledge horizon and inclusive label-effective cutoff.
+    /// Returns the exact label knowledge cutoff used for availability and split admission.
     pub const fn label_cutoff_at(&self) -> Timestamp {
         self.label_cutoff_at
+    }
+
+    /// Returns the feature-effective boundary with its source precision intact.
+    pub const fn effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.effective_cutoff
+    }
+
+    /// Returns the inclusive label-effective boundary with its source precision intact.
+    pub const fn label_effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.label_effective_cutoff
     }
 
     /// Returns components in canonical contract order.
@@ -943,7 +990,8 @@ impl DatasetBuildRequest {
         self.universe_digest
     }
 
-    pub(super) const fn retained_bytes(&self) -> usize {
+    /// Returns the checked Rust-visible bytes retained by this complete request.
+    pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
 }
@@ -1090,6 +1138,16 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
     for example in &inputs.examples {
         retained = retained
             .checked_add(example.example_id.len())
+            .and_then(|value| {
+                coordinate_dynamic_bytes(&example.effective_cutoff)
+                    .ok()
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .and_then(|value| {
+                coordinate_dynamic_bytes(&example.label_effective_cutoff)
+                    .ok()
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
             .and_then(|value| {
                 retained_array_bytes::<FeatureLabelComponentInput>(example.components.len())
                     .ok()

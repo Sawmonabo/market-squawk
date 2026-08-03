@@ -298,6 +298,21 @@ pub(super) struct RetainedRuntimeBackup {
     pub(super) models: Vec<(RuntimeBackupCoordinate, Arc<ModelBundle>)>,
 }
 
+pub(super) struct RetainedForecastRuntime {
+    pub(super) generation_sha256: Sha256Digest,
+    pub(super) backends: Box<[Arc<dyn InferenceBackend>]>,
+}
+
+impl fmt::Debug for RetainedForecastRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedForecastRuntime")
+            .field("generation_sha256", &self.generation_sha256)
+            .field("backend_count", &self.backends.len())
+            .finish()
+    }
+}
+
 impl fmt::Debug for RetainedRuntimeBackup {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -591,6 +606,58 @@ impl ProductionModelRuntime {
             canonical_index,
             models,
         })
+    }
+
+    pub(super) fn retain_forecast_runtime(
+        &self,
+    ) -> Result<RetainedForecastRuntime, ProductionModelRuntimeError> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        let encoded = gate.index.encode(self.limits.index)?;
+        let image = self.read_image.load();
+        if image.backends.len() != gate.index.entries().len()
+            || image.registry.len()? != image.backends.len()
+        {
+            return Err(ProductionModelRuntimeError::CorruptRuntime);
+        }
+        for admission in gate.index.entries() {
+            let matching = image.backends.iter().filter(|backend| {
+                let metadata = backend.metadata();
+                metadata.model_id() == admission.model_id
+                    && metadata.bundle_id() == &admission.bundle_id
+                    && metadata.bundle_version() == admission.bundle_version
+                    && metadata.metadata_hash() == admission.metadata_sha256
+                    && metadata.artifact_hash() == admission.artifact_sha256
+                    && metadata.training_run_hash() == admission.training_run_sha256
+                    && metadata.dataset().export_digest() == admission.dataset_export_sha256
+                    && metadata.dataset().selection_digest() == admission.dataset_selection_sha256
+            });
+            if matching.count() != 1 {
+                return Err(ProductionModelRuntimeError::CorruptRuntime);
+            }
+        }
+        Ok(RetainedForecastRuntime {
+            generation_sha256: Sha256Digest::new(Sha256::digest(encoded).into()),
+            backends: image.backends.to_vec().into_boxed_slice(),
+        })
+    }
+
+    pub(super) fn validate_forecast_runtime_generation(
+        &self,
+        expected: Sha256Digest,
+    ) -> Result<(), ProductionModelRuntimeError> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| ProductionModelRuntimeError::RuntimeUnavailable)?;
+        let observed =
+            Sha256Digest::new(Sha256::digest(gate.index.encode(self.limits.index)?).into());
+        if observed != expected {
+            return Err(ProductionModelRuntimeError::StaleForecastGeneration);
+        }
+        Ok(())
     }
 
     pub(super) fn restore_capabilities(
@@ -977,6 +1044,9 @@ pub enum ProductionModelRuntimeError {
     /// Persisted record fields disagree with the independently reloaded bundle.
     #[error("production model runtime state is corrupt")]
     CorruptRuntime,
+    /// A prepared forecast names a model generation that is no longer current.
+    #[error("production model forecast generation is stale")]
+    StaleForecastGeneration,
     /// Aggregate startup or admission verification exceeded its bound.
     #[error("production model validation deadline elapsed")]
     ValidationDeadline,

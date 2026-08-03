@@ -161,6 +161,12 @@ row and handoff receipt are verified.
 4. Confirm the installer-owned per-user service is registered once and reaches authenticated
    readiness.
 
+The Windows program store is rooted beneath the operating system's per-user Local AppData known
+folder. Market Squawk rejects reparse points throughout the supplied path and verifies its owned
+descendants against replacement, creation, deletion, and permission changes. Windows-managed
+ancestors above that known-folder boundary retain their normal inherited access controls; a custom
+root outside that boundary must satisfy the stricter complete-ancestor policy.
+
 ### Linux
 
 1. Verify the AppImage or DEB digest and trust state.
@@ -382,6 +388,9 @@ cross-platform evidence.
 - [Tauri updater and distribution guidance](https://v2.tauri.app/distribute/)
 - [GitHub Actions workflow-artifact documentation](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts)
 - [GitHub CLI artifact attestation verification](https://cli.github.com/manual/gh_attestation_verify)
+- [Microsoft Known Folder IDs](https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid)
+- [Microsoft access-control inheritance](https://learn.microsoft.com/en-us/windows/win32/ad/access-control-inheritance)
+- [Microsoft `SetSecurityInfo`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo)
 
 External sources were reviewed on 2026-08-03. They describe distribution mechanics; the repository's
 closed manifests, installer authority, and exact package receipts remain the product truth.

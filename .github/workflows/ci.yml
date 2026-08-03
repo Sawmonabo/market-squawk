@@ -7,10 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       platform_verification:
-        description: Run complete platform verification on a frozen release branch
+        description: Run the complete locked matrix on an admitted frozen candidate
         required: true
         default: false
         type: boolean
+      candidate_sha:
+        description: Exact 40-character commit at the selected remote branch tip
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
@@ -21,7 +25,7 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: "0"
-  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   classify:
@@ -29,7 +33,15 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.changes.outputs.code }}
+      documentation: ${{ steps.changes.outputs.documentation }}
+      rust: ${{ steps.changes.outputs.rust }}
+      python: ${{ steps.changes.outputs.python }}
+      desktop: ${{ steps.changes.outputs.desktop }}
+      scripts: ${{ steps.changes.outputs.scripts }}
+      package: ${{ steps.changes.outputs.package }}
+      linux_matrix: ${{ steps.changes.outputs.linux_matrix }}
       platform: ${{ steps.release_scope.outputs.platform }}
+      tree_sha: ${{ steps.freeze.outputs.tree_sha }}
     steps:
       - id: release_scope
         name: Admit explicit release platform verification
@@ -38,17 +50,28 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PLATFORM_VERIFICATION: ${{ inputs.platform_verification || false }}
           WORKFLOW_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ env.CANDIDATE_SHA }}
         run: |
           set -euo pipefail
 
           platform=false
           if [[ "$PLATFORM_VERIFICATION" == "true" ]]; then
-            if [[ "$EVENT_NAME" != "workflow_dispatch" \
-              || "$WORKFLOW_REF" != refs/heads/release/* ]]; then
-              echo "Complete platform verification requires an explicit release-branch dispatch." \
-                >&2
+            if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "Complete platform verification requires an explicit dispatch." >&2
               exit 1
             fi
+            if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Complete platform verification requires an exact lowercase commit SHA." >&2
+              exit 1
+            fi
+            case "$WORKFLOW_REF" in
+              refs/heads/feature/v1-installed-product-experience|refs/heads/release/*) ;;
+              *)
+                echo "Complete platform verification requires an admitted frozen candidate branch." \
+                  >&2
+                exit 1
+                ;;
+            esac
             platform=true
           fi
           echo "platform=$platform" >> "$GITHUB_OUTPUT"
@@ -58,47 +81,147 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      - id: freeze
+        name: Freeze the explicit candidate identity
+        shell: bash
+        env:
+          PLATFORM_VERIFICATION: ${{ steps.release_scope.outputs.platform }}
+          WORKFLOW_REF: ${{ github.ref }}
+          CANDIDATE_SHA: ${{ env.CANDIDATE_SHA }}
+        run: |
+          set -euo pipefail
+
+          observed_head="$(git rev-parse HEAD)"
+          [[ "$observed_head" == "$CANDIDATE_SHA" ]]
+          git diff --quiet
+          git diff --cached --quiet
+          if [[ "$PLATFORM_VERIFICATION" == "true" ]]; then
+            remote_head="$(git ls-remote --exit-code origin "$WORKFLOW_REF" | awk 'NR == 1 {print $1}')"
+            [[ "$remote_head" == "$CANDIDATE_SHA" ]]
+          fi
+          echo "tree_sha=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
       - id: changes
         name: Classify the exact change set
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ env.CANDIDATE_SHA }}
+          FULL_CANDIDATE: ${{ steps.release_scope.outputs.platform }}
         run: |
           set -euo pipefail
 
-          code=false
+          documentation=false
+          rust=false
+          python=false
+          desktop=false
+          scripts=false
+          package=false
           resolved=true
+          base_sha=""
 
-          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
-            || ! git cat-file -e "${BASE_SHA}^{commit}" \
+          case "$EVENT_NAME:$EVENT_ACTION" in
+            pull_request:synchronize)
+              base_sha="$EVENT_BEFORE"
+              ;;
+            pull_request:*)
+              base_sha="$PR_BASE_SHA"
+              ;;
+            push:*)
+              base_sha="$EVENT_BEFORE"
+              ;;
+          esac
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] \
+            || ! git cat-file -e "${base_sha}^{commit}" \
             || ! git cat-file -e "${HEAD_SHA}^{commit}"; then
             resolved=false
           fi
 
-          if "$resolved"; then
+          if [[ "$FULL_CANDIDATE" == "true" ]]; then
+            documentation=true
+            rust=true
+            python=true
+            desktop=true
+            scripts=true
+            package=true
+          elif "$resolved"; then
             while IFS= read -r -d '' path; do
               case "$path" in
-                LICENSE-APACHE|LICENSE-MIT|\
-                docs/licenses/geist-ofl-license.txt|\
-                docs/licenses/geist-mono-ofl-license.txt|\
-                docs/licenses/tauri-mpl-notice.md|\
-                docs/licenses/tract-onnx-notice.md)
-                  code=true
+                .github/workflows/release.yml)
+                  documentation=true; rust=true; python=true; desktop=true; scripts=true; package=true
                   ;;
                 docs/*|*.md)
+                  documentation=true
+                  ;;
+                LICENSE-APACHE|LICENSE-MIT|deny.toml|Cargo.toml|Cargo.lock|\
+                rust-toolchain.toml|rustfmt.toml|vendor/*)
+                  rust=true; package=true
+                  ;;
+                crates/market-squawk-python/*)
+                  rust=true; python=true
+                  ;;
+                crates/*|adapters/*|apps/market-squawk/*|apps/market-squawk-installer/*|fuzz/*)
+                  rust=true
+                  ;;
+                apps/market-squawk-desktop/src-tauri/*)
+                  rust=true; desktop=true; package=true
+                  ;;
+                apps/market-squawk-desktop/*)
+                  desktop=true; package=true
+                  ;;
+                python/*)
+                  python=true; scripts=true; package=true
+                  ;;
+                scripts/verify.sh)
+                  rust=true; python=true; desktop=true; scripts=true
+                  ;;
+                scripts/build_complete_release.py|scripts/build_python_release.py)
+                  python=true; scripts=true; package=true
+                  ;;
+                distribution/*|dist-workspace.toml)
+                  scripts=true; package=true
+                  ;;
+                scripts/*|.github/*)
+                  scripts=true
                   ;;
                 *)
-                  code=true
+                  documentation=true; rust=true; python=true; desktop=true; scripts=true; package=true
                   ;;
               esac
-            done < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
+            done < <(git diff --name-only -z "$base_sha" "$HEAD_SHA")
           else
-            # An unresolved comparison is never treated as documentation-only.
-            code=true
+            # An unresolved comparison is never treated as a narrow change.
+            documentation=true; rust=true; python=true; desktop=true; scripts=true; package=true
           fi
 
-          echo "code=$code" >> "$GITHUB_OUTPUT"
+          include=()
+          "$scripts" && include+=('{"name":"script contracts","lane":"scripts","rust":true,"frontend":false,"system_dependencies":false,"timeout":20}')
+          "$desktop" && include+=('{"name":"frontend","lane":"frontend","rust":false,"frontend":true,"system_dependencies":false,"timeout":20}')
+          if "$rust"; then
+            include+=('{"name":"Clippy","lane":"clippy","rust":true,"frontend":false,"system_dependencies":true,"timeout":60}')
+            include+=('{"name":"workspace tests","lane":"tests","rust":true,"frontend":false,"system_dependencies":true,"timeout":60}')
+            include+=('{"name":"UI and Trybuild","lane":"ui","rust":true,"frontend":false,"system_dependencies":false,"timeout":45}')
+            include+=('{"name":"exact Loom inventories","lane":"loom","rust":true,"frontend":false,"system_dependencies":false,"timeout":60}')
+          fi
+          [[ "$FULL_CANDIDATE" == "true" ]] \
+            && include+=('{"name":"release and Rustdoc","lane":"release","rust":true,"frontend":false,"system_dependencies":true,"timeout":60}')
+          joined=""
+          printf -v joined ',%s' "${include[@]}"
+          code=false
+          ((${#include[@]} > 0)) && code=true
+          {
+            echo "code=$code"
+            echo "documentation=$documentation"
+            echo "rust=$rust"
+            echo "python=$python"
+            echo "desktop=$desktop"
+            echo "scripts=$scripts"
+            echo "package=$package"
+            printf 'linux_matrix={"include":[%s]}\n' "${joined:1}"
+          } >> "$GITHUB_OUTPUT"
 
   policy:
     name: Policy and security
@@ -112,12 +235,29 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Check documentation whitespace
+        if: needs.classify.outputs.documentation == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ env.CANDIDATE_SHA }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] \
+            && git cat-file -e "${BASE_SHA}^{commit}"; then
+            git diff --check "$BASE_SHA" "$HEAD_SHA"
+          else
+            git show --check --format= "$HEAD_SHA"
+          fi
       # dtolnay/rust-toolchain generic action, verified commit (2026-07-15).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        if: needs.classify.outputs.rust == 'true'
         with:
           toolchain: 1.97.1
       # taiki-e/install-action v2.85.3, verified release commit (2026-07-24).
       - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68
+        if: needs.classify.outputs.rust == 'true'
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: Install pinned Gitleaks CLI
@@ -133,7 +273,100 @@ jobs:
           mkdir -p "$binary_dir"
           tar -xzf "$archive" -C "$binary_dir" gitleaks
           echo "$binary_dir" >> "$GITHUB_PATH"
-      - run: ./scripts/verify.sh --policy-only
+      - name: Check repository inputs and secrets
+        run: |
+          python3 scripts/check_generated_artifacts.py
+          gitleaks dir --redact --no-banner .
+          gitleaks git --redact --no-banner
+      - name: Check Rust workspace and dependency policy
+        if: needs.classify.outputs.rust == 'true'
+        run: |
+          python3 scripts/check_workspace_boundaries.py
+          cargo deny check
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2024-0370 \
+            --ignore RUSTSEC-2024-0411 \
+            --ignore RUSTSEC-2024-0412 \
+            --ignore RUSTSEC-2024-0413 \
+            --ignore RUSTSEC-2024-0415 \
+            --ignore RUSTSEC-2024-0416 \
+            --ignore RUSTSEC-2024-0418 \
+            --ignore RUSTSEC-2024-0419 \
+            --ignore RUSTSEC-2024-0420 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2025-0075 \
+            --ignore RUSTSEC-2025-0080 \
+            --ignore RUSTSEC-2025-0081 \
+            --ignore RUSTSEC-2025-0098 \
+            --ignore RUSTSEC-2025-0100
+
+  documentation-links:
+    name: Documentation links
+    needs: classify
+    if: needs.classify.outputs.documentation == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      # actions/cache v4.2.4, verified release commit (2025-08-07).
+      - name: Restore Lychee response cache
+        id: lychee-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: .lycheecache
+          key: lychee-v1-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            lychee-v1-${{ runner.os }}-
+      # lycheeverse/lychee-action v2.9.0, verified release commit (2026-07-09).
+      - name: Check Markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          lycheeVersion: v0.24.2
+          args: >-
+            --verbose --no-progress
+            --root-dir "$GITHUB_WORKSPACE"
+            --cache --max-cache-age 1d
+            --cache-exclude-status '429,500..=599'
+            --max-concurrency 4
+            --max-retries 0
+            'README.md' 'docs/**/*.md'
+      - name: Save Lychee response cache
+        if: >-
+          ${{
+            always() &&
+            github.event_name == 'push' &&
+            github.ref == 'refs/heads/main'
+          }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: .lycheecache
+          key: ${{ steps.lychee-cache.outputs.cache-primary-key }}
+
+  python:
+    name: Python source contracts
+    needs: classify
+    if: needs.classify.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+      # actions/setup-python v7.0.0, verified release commit (2026-07-13).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: 3.14.6
+      - name: Compile every Python product and test module
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/python-ci-pycache
+        run: python3 -m compileall -q python/market_squawk python/tests
 
   linux:
     name: Linux ${{ matrix.name }}
@@ -141,50 +374,7 @@ jobs:
     if: needs.classify.outputs.code == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: script contracts
-            lane: scripts
-            rust: true
-            frontend: false
-            system_dependencies: false
-            timeout: 20
-          - name: frontend
-            lane: frontend
-            rust: false
-            frontend: true
-            system_dependencies: false
-            timeout: 20
-          - name: Clippy
-            lane: clippy
-            rust: true
-            frontend: false
-            system_dependencies: true
-            timeout: 60
-          - name: workspace tests
-            lane: tests
-            rust: true
-            frontend: false
-            system_dependencies: true
-            timeout: 60
-          - name: UI and Trybuild
-            lane: ui
-            rust: true
-            frontend: false
-            system_dependencies: false
-            timeout: 45
-          - name: exact Loom inventories
-            lane: loom
-            rust: true
-            frontend: false
-            system_dependencies: false
-            timeout: 60
-          - name: release and Rustdoc
-            lane: release
-            rust: true
-            frontend: false
-            system_dependencies: true
-            timeout: 60
+      matrix: ${{ fromJSON(needs.classify.outputs.linux_matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -243,7 +433,7 @@ jobs:
   macos:
     name: macOS workspace
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.rust == 'true'
     runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
@@ -260,6 +450,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           workspaces: ". -> target"
+          shared-key: ci-${{ runner.os }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}-dev
           cache-targets: "true"
           cache-on-failure: "false"
           cache-all-crates: "false"
@@ -270,12 +461,23 @@ jobs:
                  github.event.pull_request.head.repo.full_name == github.repository) }}
       - run: rustc --version
       - run: cargo --version
-      - run: cargo test --workspace --all-features --locked --no-fail-fast
+      - name: Run the locked workspace tests within the Cargo target ceiling
+        shell: bash
+        run: |
+          check_target() {
+            local usage_kib=0
+            [[ ! -d target ]] || usage_kib="$(du -sk target | awk '{print $1}')"
+            df -h .
+            (( usage_kib <= 20 * 1024 * 1024 ))
+          }
+          check_target
+          cargo test --workspace --all-features --locked --no-fail-fast
+          check_target
 
   windows:
     name: Windows workspace
     needs: classify
-    if: needs.classify.outputs.code == 'true'
+    if: needs.classify.outputs.rust == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -292,6 +494,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           workspaces: ". -> target"
+          shared-key: ci-${{ runner.os }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}-dev
           cache-targets: "true"
           cache-on-failure: "false"
           cache-all-crates: "false"
@@ -304,12 +507,25 @@ jobs:
       - run: cargo --version
       # The optional capture-benchmark evidence runner requires Linux/macOS process-group
       # containment. Windows validates the complete shipping/default workspace instead.
-      - run: cargo test --workspace --locked --no-fail-fast
+      - name: Run the locked workspace tests within the Cargo target ceiling
+        shell: bash
+        run: |
+          check_target() {
+            local usage_kib=0
+            [[ ! -d target ]] || usage_kib="$(du -sk target | awk '{print $1}')"
+            df -h .
+            (( usage_kib <= 20 * 1024 * 1024 ))
+          }
+          check_target
+          cargo test --workspace --locked --no-fail-fast
+          check_target
 
   desktop-packages:
     name: Desktop package (${{ matrix.name }})
     needs: classify
-    if: needs.classify.outputs.platform == 'true'
+    if: >-
+      needs.classify.outputs.platform == 'true' &&
+      needs.classify.outputs.package == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -361,11 +577,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends \
             build-essential \
+            dbus-x11 \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
-            libxdo-dev
+            libxdo-dev \
+            xvfb
       # pnpm/action-setup v6.0.9, verified release commit (2026-07-18).
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
         with:
@@ -402,6 +620,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           workspaces: ". -> target"
+          shared-key: ci-${{ runner.os }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}-release-${{ matrix.target }}
           cache-targets: "true"
           cache-on-failure: "false"
           cache-all-crates: "false"
@@ -410,6 +629,14 @@ jobs:
             ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
                 (github.event_name == 'pull_request' &&
                  github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Enforce the pre-build Cargo target ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          usage_kib=0
+          [[ ! -d target ]] || usage_kib="$(du -sk target | awk '{print $1}')"
+          df -h .
+          (( usage_kib <= 20 * 1024 * 1024 ))
       - name: Build the sealed Python 3.14 product
         shell: bash
         env:
@@ -461,7 +688,10 @@ jobs:
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk-desktop --features tauri/custom-protocol
           cargo build --release --locked --offline --target "$TARGET" \
-            -p market-squawk --bin market-squawk-capture-helper
+            -p market-squawk \
+            --bin market-squawk-capture-helper \
+            --bin market-squawk-service \
+            --bin market-squawk-mcp-relay
           cargo build --release --locked --offline --target "$TARGET" \
             -p market-squawk-installer
           version="$(cargo metadata --format-version 1 --no-deps --locked --offline \
@@ -476,6 +706,10 @@ jobs:
             "$native/market-squawk-desktop$EXE"
           cp "target/$TARGET/release/market-squawk-capture-helper$EXE" \
             "$native/market-squawk-capture-helper$EXE"
+          cp "target/$TARGET/release/market-squawk-service$EXE" \
+            "$native/market-squawk-service$EXE"
+          cp "target/$TARGET/release/market-squawk-mcp-relay$EXE" \
+            "$native/market-squawk-mcp-relay$EXE"
           cp "target/$TARGET/release/market-squawk-installer$EXE" \
             "$native/market-squawk-installer$EXE"
           cp "$MARKET_SQUAWK_COMPONENT_ROOT/expanded/uv/$UV_RELATIVE" \
@@ -531,7 +765,7 @@ jobs:
             --no-sign \
             --bundles app,dmg \
             --verbose
-      - name: Verify the installed complete product
+      - name: Verify the terminal ZIP installation route
         shell: bash
         env:
           EXE: ${{ matrix.executable_suffix }}
@@ -558,21 +792,590 @@ jobs:
             --manifest "$manifest" \
             --bundle "$bundle"
           "$bootstrap" --root "$install_root" status --json
-          "$bootstrap" --root "$install_root" repair
-
-          application="$(find "$install_root/versions" -type f \
-            -name "market-squawk$EXE" -print)"
-          runtime="$(find "$install_root/versions" -type f \
-            \( -path '*/bin/python' -o -path '*/python.exe' \) -print)"
-          [[ -n "$application" && "$application" != *$'\n'* ]]
-          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
-          "$application" doctor \
-            --data-dir "$RUNNER_TEMP/doctor-data" \
-            --output json
-          "$runtime" -I -B -c \
-            'import market_squawk, pyarrow; print(pyarrow.__version__)'
-          python3 scripts/smoke_mcp.py "$application"
           "$bootstrap" --root "$install_root" uninstall
+          [[ ! -e "$install_root" ]]
+      - name: Install and verify the local DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          dmg="$(find "target/$TARGET/release/bundle/dmg" \
+            -maxdepth 1 -type f -name '*.dmg' -print)"
+          [[ -n "$dmg" && "$dmg" != *$'\n'* ]]
+          package_sha="$(shasum -a 256 "$dmg" | awk '{print $1}')"
+          [[ "$package_sha" =~ ^[0-9a-f]{64}$ ]]
+          hdiutil verify "$dmg"
+
+          mount="$RUNNER_TEMP/market-squawk-dmg"
+          application="$RUNNER_TEMP/Applications/Market Squawk.app"
+          release_version="$MARKET_SQUAWK_RELEASE_VERSION"
+          home="$HOME"
+          state_search_root="$HOME/Library/Application Support"
+          requested_data="$RUNNER_TEMP/native-data"
+          log="$RUNNER_TEMP/native-desktop.log"
+          desktop_pid=""
+          install -d -m 700 \
+            "$mount" \
+            "$RUNNER_TEMP/Applications" \
+            "$requested_data"
+          mkdir -p "$state_search_root"
+          cleanup() {
+            if [[ -n "$desktop_pid" ]] && kill -0 "$desktop_pid" 2>/dev/null; then
+              kill "$desktop_pid" 2>/dev/null || true
+              wait "$desktop_pid" 2>/dev/null || true
+            fi
+            if mount | rg -F -q "on $mount "; then
+              hdiutil detach "$mount"
+            fi
+          }
+          trap cleanup EXIT
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
+          packaged="$mount/Market Squawk.app"
+          [[ -d "$packaged" && ! -L "$packaged" ]]
+          ditto "$packaged" "$application"
+          hdiutil detach "$mount"
+
+          unset \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
+          HOME="$home" "$application/Contents/MacOS/market-squawk-desktop" \
+            --data-dir "$requested_data" >"$log" 2>&1 &
+          desktop_pid=$!
+          state=""
+          for _attempt in {1..120}
+          do
+            state="$(find "$state_search_root" -type f \
+              -path '*/program/installation.json' \
+              -print -quit)"
+            if [[ -n "$state" ]]; then
+              break
+            fi
+            if ! kill -0 "$desktop_pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          [[ -n "$state" ]]
+          sleep 3
+          kill -0 "$desktop_pid"
+          kill "$desktop_pid"
+          wait "$desktop_pid" || true
+          desktop_pid=""
+
+          root="$(dirname "$state")"
+          data_root="$(dirname "$root")"
+          installer="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-installer' -print)"
+          application_cli="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk' -print)"
+          relay="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-mcp-relay' -print)"
+          runtime="$(find "$root/versions" -type f -path '*/bin/python' -print)"
+          [[ -n "$installer" && "$installer" != *$'\n'* ]]
+          [[ -n "$application_cli" && "$application_cli" != *$'\n'* ]]
+          [[ -n "$relay" && "$relay" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+
+          sentinel="$data_root/portfolios/native-package-smoke.txt"
+          sentinel_content='native-package-user-data-v1'
+          install -d -m 700 "$(dirname "$sentinel")"
+          printf '%s' "$sentinel_content" > "$sentinel"
+          HOME="$home" "$installer" --root "$root" status --json
+          HOME="$home" "$installer" --root "$root" repair
+          HOME="$home" "$installer" --root "$root" service status --json
+          HOME="$home" "$application_cli" --data-dir "$data_root" \
+            --output json doctor
+          HOME="$home" "$application_cli" --data-dir "$data_root" \
+            --output json setup status
+          HOME="$home" "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          HOME="$home" python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client claude-code
+          HOME="$home" python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client codex
+
+          update_request="$RUNNER_TEMP/signed-update-request.json"
+          update_evidence="$RUNNER_TEMP/signed-update-evidence"
+          jq -n \
+            --arg install_root "$root" \
+            --arg manifest "$RUNNER_TEMP/complete-release/market-squawk-release.json" \
+            --arg bundle "$RUNNER_TEMP/complete-release/market-squawk-$release_version-$TARGET.zip" \
+            --arg evidence_directory "$update_evidence" \
+            '{
+              installRoot: $install_root,
+              manifest: $manifest,
+              bundle: $bundle,
+              evidenceDirectory: $evidence_directory
+            }' > "$update_request"
+          MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST="$update_request" \
+            cargo test -p market-squawk-installer \
+              tests::signed_update_fixture_activates_and_rolls_back_an_installed_package \
+              --locked -- --ignored --exact
+          [[ -f "$update_evidence/receipt.json" ]]
+          HOME="$home" "$installer" --root "$root" status --json
+          HOME="$home" "$installer" --root "$root" service status --json
+          HOME="$home" "$application_cli" --data-dir "$data_root" \
+            --output json doctor
+
+          HOME="$home" "$application/Contents/MacOS/market-squawk-desktop" \
+            --native-uninstall
+          [[ ! -e "$root" ]]
+          [[ -f "$sentinel" ]]
+          [[ "$(cat "$sentinel")" == "$sentinel_content" ]]
+          /bin/rm -rf -- "$application"
+          [[ ! -e "$application" ]]
+          [[ "$(shasum -a 256 "$dmg" | awk '{print $1}')" == "$package_sha" ]]
+          printf 'verified DMG sha256=%s\n' "$package_sha"
+      - name: Install and verify the local NSIS package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ((git rev-parse HEAD).Trim() -ne $env:CANDIDATE_SHA) {
+            throw "The native package smoke is not running at the frozen candidate."
+          }
+          $packages = @(
+            Get-ChildItem `
+              -Path "target/$env:TARGET/release/bundle/nsis" `
+              -Filter "*.exe" `
+              -File
+          )
+          if ($packages.Count -ne 1) {
+            throw "The Windows build did not produce exactly one NSIS package."
+          }
+          $package = $packages[0]
+          $packageSha = (Get-FileHash -Algorithm SHA256 $package.FullName).Hash.ToLowerInvariant()
+          if ($packageSha -notmatch '^[0-9a-f]{64}$') {
+            throw "The NSIS package digest is invalid."
+          }
+          if ((Get-AuthenticodeSignature $package.FullName).Status -ne "NotSigned") {
+            throw "The provenance-only NSIS package has unexpected publisher state."
+          }
+          $install = Start-Process `
+            -FilePath $package.FullName `
+            -ArgumentList "/S" `
+            -Wait `
+            -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "The local NSIS package installation failed."
+          }
+
+          $desktopNames = @("market-squawk-desktop.exe", "Market Squawk.exe")
+          $desktops = @(
+            Get-ChildItem `
+              -Path $env:LOCALAPPDATA, $env:ProgramFiles `
+              -File `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in $desktopNames }
+          )
+          $desktops = @($desktops | Sort-Object FullName -Unique)
+          if ($desktops.Count -ne 1) {
+            throw "The NSIS package did not install exactly one desktop executable."
+          }
+          $desktop = $desktops[0]
+          $releaseVersion = $env:MARKET_SQUAWK_RELEASE_VERSION
+          @(
+            "MARKET_SQUAWK_COMPONENT_ROOT",
+            "MARKET_SQUAWK_PYTHON_PRODUCT",
+            "MARKET_SQUAWK_RELEASE_OUTPUT",
+            "MARKET_SQUAWK_RELEASE_VERSION",
+            "MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT"
+          ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+
+          $requestedData = Join-Path $env:RUNNER_TEMP "native-data"
+          $stdout = Join-Path $env:RUNNER_TEMP "native-desktop.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "native-desktop.stderr.log"
+          $packageProcess = Start-Process `
+            -FilePath $desktop.FullName `
+            -ArgumentList @("--data-dir", $requestedData) `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+          $managedProcess = $null
+          try {
+            $state = @()
+            foreach ($attempt in 1..120) {
+              $state = @(
+                Get-ChildItem `
+                  -Path $env:LOCALAPPDATA `
+                  -Filter installation.json `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DirectoryName -like "*Market*Squawk*program" }
+              )
+              if ($state.Count -gt 1) {
+                throw "The NSIS package created ambiguous managed program state."
+              }
+              if ($state.Count -eq 1) {
+                $managedDesktops = @(
+                  Get-ChildItem `
+                    -Path (Join-Path $state[0].DirectoryName "versions") `
+                    -Filter market-squawk-desktop.exe `
+                    -File `
+                    -Recurse
+                )
+                if ($managedDesktops.Count -gt 1) {
+                  throw "The managed Windows release contains ambiguous desktops."
+                }
+                if ($managedDesktops.Count -eq 1) {
+                  $managedProcesses = @(
+                    Get-Process `
+                      -Name market-squawk-desktop `
+                      -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Path -eq $managedDesktops[0].FullName }
+                  )
+                  if ($managedProcesses.Count -gt 1) {
+                    throw "Multiple managed Windows desktops are running."
+                  }
+                  if ($managedProcesses.Count -eq 1) {
+                    $managedProcess = $managedProcesses[0]
+                    break
+                  }
+                }
+              }
+              if ($packageProcess.HasExited -and $packageProcess.ExitCode -ne 0) {
+                Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+                throw "The NSIS desktop exited before activation completed."
+              }
+              Start-Sleep -Seconds 1
+            }
+            if ($state.Count -ne 1 -or $null -eq $managedProcess) {
+              Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+              throw "The NSIS desktop did not activate and launch its managed release."
+            }
+            Start-Sleep -Seconds 3
+            $managedProcess.Refresh()
+            if ($managedProcess.HasExited) {
+              throw "The managed Windows desktop did not remain operational."
+            }
+          } finally {
+            if ($null -ne $managedProcess) {
+              $managedProcess.Refresh()
+              if (-not $managedProcess.HasExited) {
+                Stop-Process -Id $managedProcess.Id -Force
+                $managedProcess.WaitForExit()
+              }
+            }
+            if (-not $packageProcess.HasExited) {
+              Stop-Process -Id $packageProcess.Id -Force
+              $packageProcess.WaitForExit()
+            }
+          }
+
+          $root = $state[0].DirectoryName
+          $dataRoot = Split-Path $root -Parent
+          $installer = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk-installer.exe `
+              -File `
+              -Recurse
+          )
+          $application = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk.exe `
+              -File `
+              -Recurse
+          )
+          $relay = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk-mcp-relay.exe `
+              -File `
+              -Recurse
+          )
+          $runtime = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter python.exe `
+              -File `
+              -Recurse
+          )
+          if (
+            $installer.Count -ne 1 -or
+            $application.Count -ne 1 -or
+            $relay.Count -ne 1 -or
+            $runtime.Count -ne 1
+          ) {
+            throw "The installed Windows product component set is incomplete."
+          }
+
+          $sentinel = Join-Path $dataRoot "portfolios/native-package-smoke.txt"
+          $sentinelContent = "native-package-user-data-v1"
+          New-Item -ItemType Directory -Force (Split-Path $sentinel -Parent) | Out-Null
+          [IO.File]::WriteAllText($sentinel, $sentinelContent)
+          & $installer[0].FullName --root $root status --json
+          if ($LASTEXITCODE -ne 0) { throw "Installed-product status failed." }
+          & $installer[0].FullName --root $root repair
+          if ($LASTEXITCODE -ne 0) { throw "Installed-product repair failed." }
+          & $installer[0].FullName --root $root service status --json
+          if ($LASTEXITCODE -ne 0) { throw "Installed-service health failed." }
+          & $application[0].FullName --data-dir $dataRoot --output json doctor
+          if ($LASTEXITCODE -ne 0) { throw "Installed CLI doctor failed." }
+          & $application[0].FullName --data-dir $dataRoot --output json setup status
+          if ($LASTEXITCODE -ne 0) { throw "Installed setup status failed." }
+          & $runtime[0].FullName -I -B -c `
+            "import market_squawk, pyarrow; print(pyarrow.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Managed Python admission failed." }
+          python scripts/smoke_mcp.py $relay[0].FullName `
+            --installed-relay --running-service --data-dir $dataRoot `
+            --client claude-code
+          if ($LASTEXITCODE -ne 0) { throw "Claude Code MCP smoke failed." }
+          python scripts/smoke_mcp.py $relay[0].FullName `
+            --installed-relay --running-service --data-dir $dataRoot `
+            --client codex
+          if ($LASTEXITCODE -ne 0) { throw "Codex MCP smoke failed." }
+
+          $updateEvidence = Join-Path $env:RUNNER_TEMP "signed-update-evidence"
+          $updateRequest = Join-Path $env:RUNNER_TEMP "signed-update-request.json"
+          $fixtureRequest = [ordered]@{
+            installRoot = $root
+            manifest = Join-Path $env:RUNNER_TEMP `
+              "complete-release/market-squawk-release.json"
+            bundle = Join-Path $env:RUNNER_TEMP `
+              "complete-release/market-squawk-$releaseVersion-$env:TARGET.zip"
+            evidenceDirectory = $updateEvidence
+          }
+          $fixtureRequest |
+            ConvertTo-Json -Depth 3 |
+            Set-Content -LiteralPath $updateRequest -Encoding utf8
+          $env:MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST = $updateRequest
+          try {
+            cargo test -p market-squawk-installer `
+              tests::signed_update_fixture_activates_and_rolls_back_an_installed_package `
+              --locked -- --ignored --exact
+            if ($LASTEXITCODE -ne 0) {
+              throw "The installed signed update and rollback scenario failed."
+            }
+          } finally {
+            Remove-Item Env:MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST `
+              -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path (Join-Path $updateEvidence "receipt.json") -PathType Leaf)) {
+            throw "The signed update scenario did not publish its evidence receipt."
+          }
+          & $installer[0].FullName --root $root status --json
+          if ($LASTEXITCODE -ne 0) { throw "Post-rollback product status failed." }
+          & $installer[0].FullName --root $root service status --json
+          if ($LASTEXITCODE -ne 0) { throw "Post-rollback service health failed." }
+          & $application[0].FullName --data-dir $dataRoot --output json doctor
+          if ($LASTEXITCODE -ne 0) { throw "Post-rollback CLI doctor failed." }
+
+          $uninstallers = @(
+            Get-ChildItem `
+              -Path $desktop.DirectoryName `
+              -Filter "*uninstall*.exe" `
+              -File `
+              -Recurse `
+              -ErrorAction SilentlyContinue
+          )
+          if ($uninstallers.Count -ne 1) {
+            throw "The NSIS package uninstaller is unavailable."
+          }
+          $remove = Start-Process `
+            -FilePath $uninstallers[0].FullName `
+            -ArgumentList "/S" `
+            -Wait `
+            -PassThru
+          if ($remove.ExitCode -ne 0) {
+            throw "The NSIS package uninstall failed."
+          }
+          if (Test-Path $root) {
+            throw "The NSIS uninstall left managed program state behind."
+          }
+          if (
+            -not (Test-Path $sentinel -PathType Leaf) -or
+            [IO.File]::ReadAllText($sentinel) -ne $sentinelContent
+          ) {
+            throw "The NSIS uninstall did not preserve user data."
+          }
+          $observedPackageSha = (Get-FileHash -Algorithm SHA256 $package.FullName).Hash.ToLowerInvariant()
+          if ($observedPackageSha -ne $packageSha) {
+            throw "The tested NSIS package changed before collection."
+          }
+          Write-Output "verified NSIS sha256=$packageSha"
+      - name: Install and verify the local AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          mapfile -d '' appimages \
+            < <(find "target/$TARGET/release/bundle/appimage" -maxdepth 1 \
+              -type f -name '*.AppImage' -print0)
+          [[ "${#appimages[@]}" -eq 1 ]]
+          package_sha="$(sha256sum "${appimages[0]}" | awk '{print $1}')"
+          [[ "$package_sha" =~ ^[0-9a-f]{64}$ ]]
+          desktop="$RUNNER_TEMP/Market-Squawk.AppImage"
+          release_version="$MARKET_SQUAWK_RELEASE_VERSION"
+          cp "${appimages[0]}" "$desktop"
+          chmod u+x "$desktop"
+
+          unset \
+            MARKET_SQUAWK_COMPONENT_ROOT \
+            MARKET_SQUAWK_PYTHON_PRODUCT \
+            MARKET_SQUAWK_RELEASE_OUTPUT \
+            MARKET_SQUAWK_RELEASE_VERSION \
+            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
+          home="$HOME"
+          requested_data="$RUNNER_TEMP/native-data"
+          xdg="${XDG_DATA_HOME:-$HOME/.local/share}"
+          log="$RUNNER_TEMP/native-desktop.log"
+          desktop_pid=""
+          cleanup() {
+            if [[ -n "$desktop_pid" ]] && kill -0 "$desktop_pid" 2>/dev/null; then
+              pkill -TERM -P "$desktop_pid" 2>/dev/null || true
+              kill "$desktop_pid" 2>/dev/null || true
+              wait "$desktop_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          install -d -m 700 "$requested_data"
+          mkdir -p "$xdg"
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            HOME="$home" \
+            XDG_DATA_HOME="$xdg" \
+            xvfb-run -a "$desktop" --data-dir "$requested_data" >"$log" 2>&1 &
+          desktop_pid=$!
+          state=""
+          for _attempt in {1..120}
+          do
+            state="$(find "$xdg" "$home" -type f \
+              -path '*/program/installation.json' -print -quit)"
+            if [[ -n "$state" ]]; then
+              break
+            fi
+            if ! kill -0 "$desktop_pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          [[ -n "$state" ]]
+          sleep 3
+          kill -0 "$desktop_pid"
+          pkill -TERM -P "$desktop_pid" 2>/dev/null || true
+          kill "$desktop_pid" 2>/dev/null || true
+          wait "$desktop_pid" || true
+          desktop_pid=""
+
+          root="$(dirname "$state")"
+          data_root="$(dirname "$root")"
+          installer="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-installer' -print)"
+          application="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk' -print)"
+          relay="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-mcp-relay' -print)"
+          runtime="$(find "$root/versions" -type f -path '*/bin/python' -print)"
+          [[ -n "$installer" && "$installer" != *$'\n'* ]]
+          [[ -n "$application" && "$application" != *$'\n'* ]]
+          [[ -n "$relay" && "$relay" != *$'\n'* ]]
+          [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+
+          sentinel="$data_root/portfolios/native-package-smoke.txt"
+          sentinel_content='native-package-user-data-v1'
+          install -d -m 700 "$(dirname "$sentinel")"
+          printf '%s' "$sentinel_content" > "$sentinel"
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$installer" --root "$root" status --json
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$installer" --root "$root" repair
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$installer" --root "$root" service status --json
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$application" --data-dir "$data_root" --output json doctor
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$application" --data-dir "$data_root" --output json setup status
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$runtime" -I -B -c \
+            'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client claude-code
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            python3 scripts/smoke_mcp.py "$relay" \
+            --installed-relay --running-service --data-dir "$data_root" \
+            --client codex
+
+          update_request="$RUNNER_TEMP/signed-update-request.json"
+          update_evidence="$RUNNER_TEMP/signed-update-evidence"
+          jq -n \
+            --arg install_root "$root" \
+            --arg manifest "$RUNNER_TEMP/complete-release/market-squawk-release.json" \
+            --arg bundle "$RUNNER_TEMP/complete-release/market-squawk-$release_version-$TARGET.zip" \
+            --arg evidence_directory "$update_evidence" \
+            '{
+              installRoot: $install_root,
+              manifest: $manifest,
+              bundle: $bundle,
+              evidenceDirectory: $evidence_directory
+            }' > "$update_request"
+          MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST="$update_request" \
+            cargo test -p market-squawk-installer \
+              tests::signed_update_fixture_activates_and_rolls_back_an_installed_package \
+              --locked -- --ignored --exact
+          [[ -f "$update_evidence/receipt.json" ]]
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$installer" --root "$root" status --json
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$installer" --root "$root" service status --json
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$application" --data-dir "$data_root" --output json doctor
+
+          help="$(APPIMAGE_EXTRACT_AND_RUN=1 "$desktop" --help)"
+          if rg -F -- '--stdio-mcp' <<<"$help"; then
+            echo "hidden AppImage MCP transport appeared in ordinary help" >&2
+            exit 1
+          fi
+          stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
+          stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
+          if "target/$TARGET/release/market-squawk-desktop" \
+            --stdio-mcp \
+            --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
+            >"$stdout" 2>"$stderr"; then
+            echo "hidden MCP transport ran outside a verified AppImage" >&2
+            exit 1
+          fi
+          [[ ! -s "$stdout" ]]
+          rg -F 'installed MCP transport is unavailable' "$stderr"
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            HOME="$home" \
+            XDG_DATA_HOME="$xdg" \
+            python3 scripts/smoke_mcp.py "$desktop" --desktop-appimage \
+            --data-dir "$data_root"
+
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            HOME="$home" \
+            XDG_DATA_HOME="$xdg" \
+            "$desktop" --native-uninstall
+          [[ ! -e "$root" ]]
+          [[ -f "$sentinel" ]]
+          [[ "$(cat "$sentinel")" == "$sentinel_content" ]]
+          rm -- "$desktop"
+          [[ ! -e "$desktop" ]]
+          [[ "$(sha256sum "${appimages[0]}" | awk '{print $1}')" == "$package_sha" ]]
+          printf 'verified AppImage sha256=%s\n' "$package_sha"
       - name: Collect the closed platform artifact set
         shell: bash
         env:
@@ -587,50 +1390,100 @@ jobs:
             --native-bundle "target/$TARGET/release/bundle" \
             --native-package-trust-mode provenance-only \
             --output "$RUNNER_TEMP/platform-publish"
-      - name: Verify Linux AppImage MCP dispatch
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          unset \
-            MARKET_SQUAWK_COMPONENT_ROOT \
-            MARKET_SQUAWK_PYTHON_PRODUCT \
-            MARKET_SQUAWK_RELEASE_OUTPUT \
-            MARKET_SQUAWK_RELEASE_VERSION \
-            MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT
-          mapfile -d '' appimages \
-            < <(find "target/${{ matrix.target }}/release/bundle/appimage" -maxdepth 1 \
-              -type f -name '*.AppImage' -print0)
-          [[ "${#appimages[@]}" -eq 1 ]]
-          appimage="${appimages[0]}"
-          chmod u+x "$appimage"
-
-          help="$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help)"
-          if grep -F -- '--stdio-mcp' <<<"$help"; then
-            echo "hidden AppImage MCP transport appeared in ordinary help" >&2
-            exit 1
-          fi
-
-          stdout="$RUNNER_TEMP/appimage-mcp-outside.stdout"
-          stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
-          if "target/${{ matrix.target }}/release/market-squawk-desktop" \
-            --stdio-mcp \
-            --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
-            >"$stdout" 2>"$stderr"; then
-            echo "hidden MCP transport ran outside a verified AppImage" >&2
-            exit 1
-          fi
-          [[ ! -s "$stdout" ]]
-          grep -F 'installed MCP transport is unavailable' "$stderr"
-
-          APPIMAGE_EXTRACT_AND_RUN=1 \
-            python3 scripts/smoke_mcp.py --desktop-appimage "$appimage"
       # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: market-squawk-${{ matrix.target }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/platform-publish/*
+          if-no-files-found: error
+          retention-days: 7
+      # Keep test evidence separate from the builder's exact platform asset set.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: installed-update-${{ matrix.target }}-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/signed-update-evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Enforce the post-build Cargo target ceiling
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          usage_kib=0
+          [[ ! -d target ]] || usage_kib="$(du -sk target | awk '{print $1}')"
+          df -h .
+          (( usage_kib <= 20 * 1024 * 1024 ))
+
+  owner-test-aggregate:
+    name: Assemble the unpublished four-target candidate
+    needs:
+      - classify
+      - desktop-packages
+    if: >-
+      needs.classify.outputs.platform == 'true' &&
+      needs.desktop-packages.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v7.0.1, verified release commit (2026-07-22).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      # actions/download-artifact v8.0.1, verified release commit (2026-07-23).
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: market-squawk-*-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/platform
+      - name: Aggregate and verify the exact candidate without publication
+        shell: bash
+        env:
+          TREE_SHA: ${{ needs.classify.outputs.tree_sha }}
+        run: |
+          set -euo pipefail
+
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$TREE_SHA" ]]
+          git diff --quiet
+          git diff --cached --quiet
+          mapfile -d '' inputs \
+            < <(find "$RUNNER_TEMP/platform" -mindepth 1 -maxdepth 1 \
+              -type d -name "market-squawk-*-$CANDIDATE_SHA" -print0 | sort -z)
+          [[ "${#inputs[@]}" -eq 4 ]]
+          arguments=()
+          for input in "${inputs[@]}"
+          do
+            arguments+=(--input "$input")
+          done
+          python3 scripts/build_complete_release.py aggregate \
+            "${arguments[@]}" \
+            --install-template distribution/install.sh \
+            --output "$RUNNER_TEMP/owner-test-candidate"
+          (
+            cd "$RUNNER_TEMP/owner-test-candidate"
+            sha256sum --check --strict SHA256SUMS
+          )
+          jq -e \
+            --arg commit "$CANDIDATE_SHA" \
+            --arg tree "$TREE_SHA" \
+            '.commit_sha == $commit
+             and .tree_sha == $tree
+             and .schema_version == 2
+             and (.targets | length) == 4
+             and ([.targets[].target] | unique | length) == 4' \
+            "$RUNNER_TEMP/owner-test-candidate/market-squawk-release.json"
+          sh -n "$RUNNER_TEMP/owner-test-candidate/install.sh"
+          if rg -n '__MARKET_SQUAWK_[A-Z0-9_]+__' \
+            "$RUNNER_TEMP/owner-test-candidate/install.sh"; then
+            echo "The rendered installer retains release-builder tokens." >&2
+            exit 1
+          fi
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: market-squawk-owner-test-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/owner-test-candidate/*
           if-no-files-found: error
           retention-days: 7
 
@@ -640,41 +1493,68 @@ jobs:
     needs:
       - classify
       - policy
+      - documentation-links
+      - python
       - linux
       - macos
       - windows
       - desktop-packages
+      - owner-test-aggregate
     runs-on: ubuntu-24.04
     steps:
       - name: Require every scheduled lane
         shell: bash
         env:
           CODE: ${{ needs.classify.outputs.code }}
+          DOCUMENTATION: ${{ needs.classify.outputs.documentation }}
+          RUST: ${{ needs.classify.outputs.rust }}
+          PYTHON: ${{ needs.classify.outputs.python }}
           PLATFORM: ${{ needs.classify.outputs.platform }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
+          DOCUMENTATION_LINKS_RESULT: ${{ needs.documentation-links.result }}
+          PYTHON_RESULT: ${{ needs.python.result }}
           LINUX_RESULT: ${{ needs.linux.result }}
           MACOS_RESULT: ${{ needs.macos.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           DESKTOP_RESULT: ${{ needs.desktop-packages.result }}
+          AGGREGATE_RESULT: ${{ needs.owner-test-aggregate.result }}
         run: |
           set -euo pipefail
 
           [[ "$CLASSIFY_RESULT" == "success" ]]
           [[ "$POLICY_RESULT" == "success" ]]
 
+          if [[ "$DOCUMENTATION" == "true" ]]; then
+            [[ "$DOCUMENTATION_LINKS_RESULT" == "success" ]]
+          else
+            [[ "$DOCUMENTATION_LINKS_RESULT" == "skipped" ]]
+          fi
+
+          if [[ "$PYTHON" == "true" ]]; then
+            [[ "$PYTHON_RESULT" == "success" ]]
+          else
+            [[ "$PYTHON_RESULT" == "skipped" ]]
+          fi
+
           if [[ "$CODE" == "true" ]]; then
             [[ "$LINUX_RESULT" == "success" ]]
+          else
+            [[ "$LINUX_RESULT" == "skipped" ]]
+          fi
+
+          if [[ "$RUST" == "true" ]]; then
             [[ "$MACOS_RESULT" == "success" ]]
             [[ "$WINDOWS_RESULT" == "success" ]]
           else
-            [[ "$LINUX_RESULT" == "skipped" ]]
             [[ "$MACOS_RESULT" == "skipped" ]]
             [[ "$WINDOWS_RESULT" == "skipped" ]]
           fi
 
           if [[ "$PLATFORM" == "true" ]]; then
             [[ "$DESKTOP_RESULT" == "success" ]]
+            [[ "$AGGREGATE_RESULT" == "success" ]]
           else
             [[ "$DESKTOP_RESULT" == "skipped" ]]
+            [[ "$AGGREGATE_RESULT" == "skipped" ]]
           fi

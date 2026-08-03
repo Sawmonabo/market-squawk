@@ -85,6 +85,13 @@ const FEATURE_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("dataset", ArgumentKind::Identifier),
     ArgumentSpec::optional("afterDataset", ArgumentKind::Identifier),
 ];
+const FEATURE_DATASET_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("catalogGeneration", ArgumentKind::Sha256),
+    ArgumentSpec::required("dataset", ArgumentKind::Identifier),
+    ArgumentSpec::required("intendedUse", ArgumentKind::Identifier),
+];
+const FEATURE_DATASET_PREPARED_START_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receipt", ArgumentKind::Object)];
 const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("query", ArgumentKind::Text),
     ArgumentSpec::optional("categories", ArgumentKind::Array),
@@ -200,6 +207,10 @@ const MODEL_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("modelId", ArgumentKind::Identifier),
     ArgumentSpec::required("request", ArgumentKind::ForecastRequest),
 ];
+const MODEL_FORECAST_PREPARATION_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("selection", ArgumentKind::Object)];
+const MODEL_FORECAST_PREPARED_START_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receipt", ArgumentKind::Object)];
 const MODEL_FORECAST_ID_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("vintageId", ArgumentKind::Sha256)];
 const DECISION_SAVE_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
@@ -251,8 +262,14 @@ const DECISION_DOSSIER_LIST_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
-const DECISION_TARGET_CREATE_ARGUMENTS: &[ArgumentSpec] =
-    &[ArgumentSpec::required("target", ArgumentKind::Object)];
+const DECISION_TARGET_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "dossierId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_TARGET_PREVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("draft", ArgumentKind::Object)];
+const DECISION_TARGET_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receiptId", ArgumentKind::Uuid)];
 const DECISION_TARGET_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("targetId", ArgumentKind::Identifier),
     ArgumentSpec::required(
@@ -277,16 +294,6 @@ const DECISION_TARGET_INDEX_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const DECISION_TARGET_REVIEW_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("review", ArgumentKind::Object)];
-const DECISION_TARGET_REEVALUATE_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required(
-        "expectedRevision",
-        ArgumentKind::Unsigned {
-            minimum: 1,
-            maximum: u32::MAX as u64,
-        },
-    ),
-    ArgumentSpec::required("successor", ArgumentKind::Object),
-];
 const OPERATIONS_BACKUP_LIST_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("afterBackupId", ArgumentKind::Sha256),
     ArgumentSpec::required(
@@ -474,6 +481,10 @@ const FAIR_VALUE_MARKET_ACCESS_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("registration", ArgumentKind::Object)];
+const BACKTEST_PREPARATION_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("selection", ArgumentKind::Object)];
+const BACKTEST_PREPARED_START_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receipt", ArgumentKind::Object)];
 const DATASET_BUILD_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("registration", ArgumentKind::Object)];
 const RUN_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
@@ -516,6 +527,10 @@ const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
         ArgumentKind::Enumeration(&["coinbase", "coinbase-direct", "kraken"]),
     ),
     ArgumentSpec::optional("providerSessionId", ArgumentKind::Identifier),
+    ArgumentSpec::optional(
+        "strategyMode",
+        ArgumentKind::Enumeration(&["manual", "book_imbalance"]),
+    ),
     ArgumentSpec::required("initialCash", ArgumentKind::Decimal),
     ArgumentSpec::required(
         "feeBasisPoints",
@@ -526,6 +541,51 @@ const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
     ),
 ];
 const BOT_STOP_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required("reason", ArgumentKind::Text)];
+const MANUAL_PAPER_DRAFT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("targetId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "targetRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("side", ArgumentKind::Enumeration(&["buy", "sell"])),
+    ArgumentSpec::required(
+        "orderType",
+        ArgumentKind::Enumeration(&["market", "limit", "stop", "stop_limit"]),
+    ),
+    ArgumentSpec::required("quantityLots", ArgumentKind::PositiveLotQuantity),
+    ArgumentSpec::optional(
+        "limitTargetLevel",
+        ArgumentKind::Enumeration(MANUAL_PAPER_TARGET_LEVELS),
+    ),
+    ArgumentSpec::optional(
+        "stopTargetLevel",
+        ArgumentKind::Enumeration(MANUAL_PAPER_TARGET_LEVELS),
+    ),
+    ArgumentSpec::required(
+        "timeInForce",
+        ArgumentKind::Enumeration(&[
+            "day",
+            "good_til_cancelled",
+            "immediate_or_cancel",
+            "fill_or_kill",
+        ]),
+    ),
+];
+const MANUAL_PAPER_TARGET_LEVELS: &[&str] = &[
+    "downside",
+    "add",
+    "entry_lower",
+    "entry_upper",
+    "base",
+    "trim_lower",
+    "trim_upper",
+    "exit_lower",
+    "exit_upper",
+    "upside",
+];
 const ORDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("orderId", ArgumentKind::Identifier)];
 const INGEST_SOURCE_ARGUMENTS: &[ArgumentSpec] = &[
@@ -1060,6 +1120,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         FEATURE_DATASET_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
+    read(
+        "Analysis.GetFeatureDatasetPreparationOptions",
+        "Return bounded point-in-time feature-dataset build choices derived by the data owner.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.PreviewFeatureDatasetBuild",
+        "Validate one guided dataset choice and retain its exact build behind a one-use receipt.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        FEATURE_DATASET_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Analysis.StartPreparedFeatureDatasetBuild",
+        "Consume one exact dataset-build receipt and start its durable job.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        FEATURE_DATASET_PREPARED_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
     mutation(
         "Analysis.StartFeatureDatasetBuild",
         "Start one durable point-in-time feature and label dataset publication.",
@@ -1075,6 +1159,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         RUN_ARGUMENT,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.GetBacktestPreparation",
+        "Return bounded guided choices over current point-in-time feature datasets.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.PreviewBacktest",
+        "Prepare one exact governed backtest registration behind a one-use receipt.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Analysis.StartPreparedBacktest",
+        "Consume one exact backtest receipt and start its durable job.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_PREPARED_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     mutation(
         "Analysis.StartBacktest",
@@ -1135,6 +1243,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Model,
         LOCAL_SCOPE,
         MODEL_TRAINING_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Model.GetForecastPreparation",
+        "Return admitted models and data-owner-qualified forecast choices.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.PrepareForecast",
+        "Prepare exact point-in-time forecast evidence behind a one-use receipt.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Model.StartPreparedForecast",
+        "Consume one exact forecast receipt and start its durable job.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_PREPARED_START_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     mutation(
@@ -1233,12 +1365,28 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         DECISION_DOSSIER_LIST_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
-    idempotent_mutation(
-        "Decision.CreateTargetSet",
-        "Create one immutable governed investment target revision.",
+    read(
+        "Decision.GetTargetPreparation",
+        "Return bounded producer-owned evidence available for one target judgment.",
         ServiceDomain::Decision,
         LOCAL_SCOPE,
-        DECISION_TARGET_CREATE_ARGUMENTS,
+        DECISION_TARGET_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.PrepareTargetSet",
+        "Validate one human target judgment and return a bounded one-use preview.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.CreateTargetSet",
+        "Consume one exact preparation receipt and create its immutable target series.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_COMMIT_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     read(
@@ -1275,10 +1423,10 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     idempotent_mutation(
         "Decision.ReevaluateTargetSet",
-        "Create a governed successor after evidence or assumption invalidation.",
+        "Consume one exact preparation receipt and append its governed successor revision.",
         ServiceDomain::Decision,
         LOCAL_SCOPE,
-        DECISION_TARGET_REEVALUATE_ARGUMENTS,
+        DECISION_TARGET_COMMIT_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     read(
@@ -1376,6 +1524,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.GetRuntimeStatus",
+        "Return one complete path-free snapshot of installed service and workspace activity.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
     ),
     read(
         "Operations.GetUpdateStatus",
@@ -1648,6 +1804,22 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         NO_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Execution.GetManualPaperTargets",
+        "Return active governed investment targets compatible with the running manual paper routes.",
+        ServiceDomain::Execution,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Execution.SubmitManualPaperDraft",
+        "Submit one governed target-backed draft to a bounded manual paper route; central risk still decides whether any order may dispatch.",
+        ServiceDomain::Execution,
+        LOCAL_SCOPE,
+        MANUAL_PAPER_DRAFT_ARGUMENTS,
+        ToolAuthorization::RiskMediated,
     ),
     mutation(
         "Execution.Cancel",
@@ -1969,6 +2141,7 @@ enum ArgumentKind {
     Sha256,
     Text,
     Decimal,
+    PositiveLotQuantity,
     Object,
     Array,
     Timestamp,
@@ -2120,6 +2293,12 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "type": "string",
             "minLength": 1,
             "maxLength": 128
+        }),
+        ArgumentKind::PositiveLotQuantity => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 19,
+            "pattern": "^[1-9][0-9]{0,18}$"
         }),
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
         ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
@@ -2334,6 +2513,18 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .as_str()
             .filter(|value| value.len() <= 128)
             .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::PositiveLotQuantity => value
+            .as_str()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 19
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && !value.starts_with('0')
+            })
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Object => value

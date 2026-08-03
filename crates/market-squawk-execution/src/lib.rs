@@ -47,8 +47,9 @@ pub use dispatcher::{
     ExecutionDispatcherShutdown,
 };
 pub use intent::{
-    MAX_INTENT_SLIPPAGE_BASIS_POINTS, MAX_ORDER_REASON_CODES, OrderIntent, OrderIntentDigest,
-    OrderIntentError, OrderIntentInput,
+    MAX_INTENT_SLIPPAGE_BASIS_POINTS, MAX_ORDER_REASON_CODES, MAX_ORDER_TARGET_ID_BYTES,
+    OrderIntent, OrderIntentDigest, OrderIntentError, OrderIntentInput, OrderTargetReference,
+    OrderTargetReferenceError,
 };
 pub use limits::{
     AccountRiskViolation, MAX_PAPER_FEE_BASIS_POINTS, MAX_RISK_INSTRUMENTS, RiskLimits,
@@ -66,11 +67,13 @@ pub use risk::{
 pub use strategy::{
     BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
     BookImbalancePaperStrategyConfigError, BookImbalancePaperStrategyConfigInput,
-    BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS,
-    ModelDecisionMapper, ModelInferencePath, ModelStrategy, NativeModelInferencePath,
-    PAPER_BOOK_IMBALANCE_INTENT_LIFETIME_NANOS, PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS,
-    PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS, Strategy, StrategyContext, StrategyError,
-    StrategyNoAction, StrategyNoActionDomain, StrategyNoActionPhase,
+    BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS, ManualPaperDraft,
+    ManualPaperDraftError, ManualPaperDraftIngress, ManualPaperDraftInput, ManualPaperIngressError,
+    ManualPaperStrategy, ModelDecisionMapper, ModelInferencePath, ModelStrategy,
+    NativeModelInferencePath, PAPER_BOOK_IMBALANCE_INTENT_LIFETIME_NANOS,
+    PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS, PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS,
+    Strategy, StrategyContext, StrategyError, StrategyNoAction, StrategyNoActionDomain,
+    StrategyNoActionPhase,
 };
 pub use task_reaper::{
     ExecutionTask, ExecutionTaskDrain, ExecutionTaskPermit, ExecutionTaskReaper,

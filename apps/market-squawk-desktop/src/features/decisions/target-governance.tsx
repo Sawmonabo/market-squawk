@@ -21,20 +21,24 @@ import {
   digestHex,
   parseDecisionTargetIndexPage,
   parseDecisionTargets,
+  type DecisionDossierView,
   type TargetIndexView,
   type TargetStateView,
 } from "./contracts"
 import { EvidenceIdentity, StateLabel } from "./decision-boundaries"
 import { TargetGovernanceWorkflow } from "./governance-workflow"
+import { TargetBuilder } from "./target-builder"
 
 const DISCOVERY_LIMIT = 100
 
 export function TargetGovernanceWorkspace({
   transport,
   scope,
+  dossier,
 }: {
   transport: ProductTransport
   scope: ProductScope
+  dossier: DecisionDossierView | null
 }) {
   const [targetId, setTargetId] = React.useState("")
   const targetIndex = useInfiniteQuery({
@@ -87,6 +91,19 @@ export function TargetGovernanceWorkspace({
           Prices below are research judgment ranges. They are neither forecasts nor executable orders.
         </div>
       </div>
+
+      <TargetBuilder
+        key={dossier?.id ?? "no-dossier"}
+        transport={transport}
+        scope={scope}
+        dossier={dossier}
+        targetIndex={targetEntries}
+        onCommitted={async (committedTargetId) => {
+          setTargetId(committedTargetId)
+          await targetIndex.refetch()
+          if (committedTargetId === targetId) await targets.refetch()
+        }}
+      />
 
       {targetIndex.isPending ? (
         <TargetLoading />

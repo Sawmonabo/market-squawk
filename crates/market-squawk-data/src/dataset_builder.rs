@@ -77,6 +77,18 @@ impl<'service> DatasetBuilderService<'service> {
     ) -> Result<PythonDatasetAdmission, DatasetBuildError> {
         admission::register(self, dataset)
     }
+
+    /// Re-resolves the exact parent graph and validates its current research-use authority.
+    ///
+    /// This is an admission-only preflight for guided preparation. Publication performs the same
+    /// validation again before reading inputs and at its durable commit boundary.
+    pub fn validate_request_authority(
+        &self,
+        request: &DatasetBuildRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(), DatasetBuildError> {
+        build::validate_request_authority(self, request, cancellation)
+    }
 }
 
 /// Asynchronous bounded dataset-construction service.

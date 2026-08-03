@@ -53,4 +53,15 @@ impl PointInTimeService {
         tokio::task::yield_now().await;
         select::select(request, candidates, cancellation, deadline)
     }
+
+    /// Computes the exact canonical payload identity used by point-in-time evidence matching.
+    pub fn payload_identity<'a>(
+        &self,
+        candidate: &'a PointInTimeCandidate,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<crate::Sha256Digest, PointInTimeError<'a>> {
+        let mut control = retained::OperationControl::new(cancellation, deadline)?;
+        canonical::payload_identity(candidate, &mut control)
+    }
 }

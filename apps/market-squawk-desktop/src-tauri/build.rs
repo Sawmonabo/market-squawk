@@ -4,6 +4,9 @@ fn main() {
         "desktop_bootstrap",
         "open_official_provider_page",
         "open_protected_provider_setup",
+        "preview_portfolio_import",
+        "commit_portfolio_import",
+        "discard_portfolio_import",
         "provider_onboarding",
     ]);
     if let Err(error) =

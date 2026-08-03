@@ -40,12 +40,15 @@ pub use self::update_metadata::{
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::error::Error;
     use std::fs::{self, File};
     use std::io::{Read as _, Write as _};
     use std::path::{Path, PathBuf};
 
-    use serde_json::json;
+    use semver::Version;
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
     use tempfile::TempDir;
     use zip::write::SimpleFileOptions;
@@ -53,13 +56,14 @@ mod tests {
 
     use super::{
         ComponentRole, InstallError, InstallRequest, MutableDataClass, ProgramName, RepairRequest,
-        RollbackRequest, StoreError, SupportedTarget, UninstallRequest, UpdateRequest, install,
-        program_install_snapshot, repair, rollback, status, uninstall, update,
+        RollbackRequest, StoreError, SupportedTarget, UninstallRequest, UpdateRequest,
+        active_release_root, install, program_install_snapshot, repair, rollback, status,
+        uninstall, update,
     };
     #[cfg(unix)]
     use super::{
-        active_release_root, active_release_root_for_installed_program,
-        installation_root_for_installed_program, stable_program_path,
+        active_release_root_for_installed_program, installation_root_for_installed_program,
+        stable_program_path,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -442,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run only from the isolated installed-package evidence lane"]
+    fn signed_update_fixture_activates_and_rolls_back_an_installed_package() -> TestResult {
+        let request_path = env::var_os("MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST")
+            .ok_or("MARKET_SQUAWK_UPDATE_FIXTURE_REQUEST is required")?;
+        let request = SignedUpdateFixtureRequest::load(Path::new(&request_path))?;
+        let receipt = run_signed_update_fixture(request)?;
+        receipt.persist()?;
+        Ok(())
+    }
+
+    #[test]
     fn failed_service_health_restores_the_known_good_release() -> TestResult {
         let temporary = test_directory()?;
         let root = temporary.path().join("program");
@@ -693,6 +708,295 @@ mod tests {
         DigestMismatch,
         MisplacedRequiredRole,
         ServiceHealthFailure,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct SignedUpdateFixtureRequest {
+        install_root: PathBuf,
+        manifest: PathBuf,
+        bundle: PathBuf,
+        evidence_directory: PathBuf,
+    }
+
+    impl SignedUpdateFixtureRequest {
+        fn load(path: &Path) -> TestResult<Self> {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() == 0
+                || metadata.len() > 64 * 1024
+            {
+                return Err("fixture request must be one bounded regular file".into());
+            }
+            let request: Self = serde_json::from_slice(&fs::read(path)?)?;
+            if !request.install_root.is_absolute()
+                || !request.manifest.is_absolute()
+                || !request.bundle.is_absolute()
+                || !request.evidence_directory.is_absolute()
+                || request.evidence_directory.exists()
+            {
+                return Err("fixture request paths are not isolated absolute paths".into());
+            }
+            Ok(request)
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SignedUpdateFixtureReceipt {
+        schema_version: u16,
+        evidence_kind: &'static str,
+        production_update_availability: &'static str,
+        target: &'static str,
+        initial_version: String,
+        activated_version: String,
+        rolled_back_version: String,
+        root_version: u64,
+        timestamp_version: u64,
+        snapshot_version: u64,
+        targets_version: u64,
+        pinned_root_sha256: String,
+        rotated_root_sha256: String,
+        timestamp_sha256: String,
+        snapshot_sha256: String,
+        targets_sha256: String,
+        manifest_sha256: String,
+        archive_sha256: String,
+        #[serde(skip)]
+        path: PathBuf,
+    }
+
+    impl SignedUpdateFixtureReceipt {
+        fn persist(&self) -> TestResult {
+            let mut encoded = serde_json::to_vec_pretty(self)?;
+            encoded.push(b'\n');
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)?;
+            output.write_all(&encoded)?;
+            output.sync_all()?;
+            Ok(())
+        }
+    }
+
+    fn run_signed_update_fixture(
+        request: SignedUpdateFixtureRequest,
+    ) -> TestResult<SignedUpdateFixtureReceipt> {
+        let initial = status(&request.install_root)?;
+        let initial_version = initial
+            .active_version()
+            .ok_or("fixture install root has no active version")?
+            .to_owned();
+        if !initial.is_healthy() || initial.previous_version().is_some() {
+            return Err("fixture requires one healthy initial installed generation".into());
+        }
+        let baseline_manifest = bounded_regular_file(&request.manifest, 8 * 1024 * 1024)?;
+        let baseline_manifest_sha256 = sha256_bytes(&baseline_manifest);
+        if initial.manifest_sha256.as_deref() != Some(baseline_manifest_sha256.as_str()) {
+            return Err("fixture manifest does not identify the installed generation".into());
+        }
+        assert_production_updates_unavailable(&request.install_root)?;
+
+        prepare_private_evidence_directory(&request.evidence_directory)?;
+        let candidate_version = next_patch_version(&initial_version)?;
+        let candidate_manifest = derive_candidate_manifest(&baseline_manifest, &candidate_version)?;
+        let target = SupportedTarget::current()?;
+        let fixture = crate::update_metadata::tests::SignedRepositoryFixture::for_release(
+            candidate_manifest,
+            &request.bundle,
+            target.as_str(),
+            &candidate_version,
+        )?;
+        let repository = request.evidence_directory.join("repository");
+        write_signed_repository(&repository, &fixture, &request.bundle)?;
+
+        let pending = fixture.pending(&request.install_root, &request.bundle)?;
+        let activated = update(UpdateRequest::from_trusted_local(
+            request.install_root.clone(),
+            &fixture.manifest,
+            &request.bundle,
+            pending,
+            &fixture.manifest_target_path,
+            &fixture.archive_target_path,
+        )?)?;
+        let activated_status = status(&request.install_root)?;
+        if activated.version() != candidate_version
+            || activated_status.active_version() != Some(candidate_version.as_str())
+            || activated_status.previous_version() != Some(initial_version.as_str())
+            || !activated_status.is_healthy()
+        {
+            return Err("signed fixture did not activate the expected immutable generation".into());
+        }
+
+        let rolled_back = rollback(RollbackRequest::new(request.install_root.clone()))?;
+        let final_status = status(&request.install_root)?;
+        if rolled_back.version() != initial_version
+            || final_status.active_version() != Some(initial_version.as_str())
+            || final_status.previous_version() != Some(candidate_version.as_str())
+            || !final_status.is_healthy()
+        {
+            return Err("signed fixture did not restore the retained known-good generation".into());
+        }
+        let trust = fixture
+            .pending(&request.install_root, &request.bundle)?
+            .persist()?;
+        Ok(SignedUpdateFixtureReceipt {
+            schema_version: 1,
+            evidence_kind: "installed-package-signed-update-rollback",
+            production_update_availability: "production-signing-material-unavailable",
+            target: target.as_str(),
+            initial_version: initial_version.clone(),
+            activated_version: candidate_version,
+            rolled_back_version: initial_version,
+            root_version: trust.root_version(),
+            timestamp_version: trust.timestamp_version(),
+            snapshot_version: trust.snapshot_version(),
+            targets_version: trust.targets_version(),
+            pinned_root_sha256: sha256_bytes(&fixture.pinned_root),
+            rotated_root_sha256: sha256_bytes(&fixture.rotated_root),
+            timestamp_sha256: sha256_bytes(&fixture.timestamp),
+            snapshot_sha256: sha256_bytes(&fixture.snapshot),
+            targets_sha256: sha256_bytes(&fixture.targets),
+            manifest_sha256: sha256_bytes(&fixture.manifest),
+            archive_sha256: hex_sha256(fixture.archive_sha256),
+            path: request.evidence_directory.join("receipt.json"),
+        })
+    }
+
+    fn assert_production_updates_unavailable(install_root: &Path) -> TestResult {
+        let channel_path =
+            active_release_root(install_root)?.join("share/market-squawk/update/channel.json");
+        let channel: Value =
+            serde_json::from_slice(&bounded_regular_file(&channel_path, 64 * 1024)?)?;
+        if channel
+            != json!({
+                "availability": "unavailable",
+                "reason": "production-signing-material-unavailable",
+                "schemaVersion": 1
+            })
+        {
+            return Err("shipping package must retain the unavailable production channel".into());
+        }
+        Ok(())
+    }
+
+    fn next_patch_version(current: &str) -> TestResult<String> {
+        let current = Version::parse(current)?;
+        let patch = current.patch.checked_add(1).ok_or("version overflow")?;
+        Ok(format!("{}.{}.{patch}", current.major, current.minor))
+    }
+
+    fn derive_candidate_manifest(baseline_manifest: &[u8], version: &str) -> TestResult<Vec<u8>> {
+        let mut manifest: Value = serde_json::from_slice(baseline_manifest)?;
+        let object = manifest
+            .as_object_mut()
+            .ok_or("release manifest is not an object")?;
+        object.insert("version".to_owned(), Value::String(version.to_owned()));
+        object.insert("tag".to_owned(), Value::String(format!("v{version}")));
+        let targets = object
+            .get_mut("targets")
+            .and_then(Value::as_array_mut)
+            .ok_or("release manifest has no target array")?;
+        let selected = SupportedTarget::current()?.as_str();
+        let mut selected_found = false;
+        for target in targets {
+            let target_object = target.as_object_mut().ok_or("target is not an object")?;
+            let target_name = target_object
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or("target identity is absent")?
+                .to_owned();
+            let archive_object = target_object
+                .get_mut("archive")
+                .and_then(Value::as_object_mut)
+                .ok_or("target archive identity is absent")?;
+            archive_object.insert(
+                "url".to_owned(),
+                Value::String(format!(
+                    "https://github.com/Sawmonabo/market-squawk/releases/download/v{version}/market-squawk-update-fixture-{target_name}.zip"
+                )),
+            );
+            selected_found |= target_name == selected;
+        }
+        if !selected_found {
+            return Err("release manifest does not contain the current target".into());
+        }
+        let mut encoded = serde_json::to_vec_pretty(&manifest)?;
+        encoded.push(b'\n');
+        crate::ReleaseManifest::admit_current(&encoded)?;
+        Ok(encoded)
+    }
+
+    fn prepare_private_evidence_directory(path: &Path) -> TestResult {
+        let parent = path.parent().ok_or("evidence directory has no parent")?;
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err("evidence parent is not a regular directory".into());
+        }
+        fs::create_dir(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    fn write_signed_repository(
+        root: &Path,
+        fixture: &crate::update_metadata::tests::SignedRepositoryFixture,
+        candidate_bundle: &Path,
+    ) -> TestResult {
+        fs::create_dir(root)?;
+        for (relative, bytes) in [
+            ("1.root.json", fixture.pinned_root.as_slice()),
+            ("2.root.json", fixture.rotated_root.as_slice()),
+            ("timestamp.json", fixture.timestamp.as_slice()),
+            ("4.snapshot.json", fixture.snapshot.as_slice()),
+            ("5.targets.json", fixture.targets.as_slice()),
+            (&fixture.manifest_download_path, fixture.manifest.as_slice()),
+        ] {
+            write_repository_file(root, relative, bytes)?;
+        }
+        let archive = root.join(&fixture.archive_download_path);
+        let parent = archive.parent().ok_or("archive target has no parent")?;
+        fs::create_dir_all(parent)?;
+        fs::copy(candidate_bundle, &archive)?;
+        if sha256_file(&archive)? != hex_sha256(fixture.archive_sha256) {
+            return Err("written archive target changed identity".into());
+        }
+        Ok(())
+    }
+
+    fn write_repository_file(root: &Path, relative: &str, bytes: &[u8]) -> TestResult {
+        let path = root.join(relative);
+        let parent = path.parent().ok_or("repository target has no parent")?;
+        fs::create_dir_all(parent)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        Ok(())
+    }
+
+    fn bounded_regular_file(path: &Path, maximum: u64) -> TestResult<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() == 0
+            || metadata.len() > maximum
+        {
+            return Err("fixture input is not a bounded regular file".into());
+        }
+        Ok(fs::read(path)?)
+    }
+
+    fn hex_sha256(bytes: [u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     struct BundleFixture {

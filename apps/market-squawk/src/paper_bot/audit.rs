@@ -22,6 +22,9 @@ use market_squawk_execution::{
 use serde::Serialize;
 use thiserror::Error;
 
+// Version 2 is retained intentionally: target-reference evidence is an optional additive field on
+// the existing append-only execution record. Audit output is never replayed for recovery, so old
+// v2 records remain valid historical evidence and require no rewrite or migration.
 const EXECUTION_AUDIT_SCHEMA_VERSION: u16 = 2;
 const PAPER_AUDIT_SCHEMA_VERSION: u16 = 1;
 const MAXIMUM_ENCODED_RECORD_BYTES: usize = 64 * 1024;
@@ -577,6 +580,7 @@ struct ExecutionAuditEventV2 {
     assessment_digest_sha256: Option<String>,
     evidence_binding_digest_sha256: Option<String>,
     execution_identity_digest_sha256: Option<String>,
+    target_reference_digest_sha256: Option<String>,
     risk_policy_digest_sha256: String,
     risk_policy_ruleset_version: u32,
     market_observed_at_unix_nanos: i64,
@@ -600,6 +604,7 @@ impl From<&ExecutionAuditEvent> for ExecutionAuditEventV2 {
             assessment_digest_sha256: event.assessment_digest().map(hex),
             evidence_binding_digest_sha256: event.evidence_binding_digest().map(hex),
             execution_identity_digest_sha256: event.execution_identity_digest().map(hex),
+            target_reference_digest_sha256: event.target_reference_digest().map(hex),
             risk_policy_digest_sha256: hex(policy.digest()),
             risk_policy_ruleset_version: policy.ruleset_version().get(),
             market_observed_at_unix_nanos: event.market_observed_at().unix_nanos(),

@@ -606,6 +606,7 @@ impl DurableSettingsStore {
             return Err(SettingsError::RestoreTargetExists);
         }
         store.store(&encode(&backup.document)?)?;
+        drop(store);
         let reopened = Self::try_open(control_root, seed)?;
         if reopened.snapshot()?.revision() != backup.document.revision {
             return Err(SettingsError::CorruptState);
@@ -1004,6 +1005,7 @@ mod tests {
 
         assert_eq!(restored.snapshot()?.revision(), expected.revision());
         assert_eq!(restored.snapshot()?.digest(), expected.digest());
+        drop(restored);
         assert!(matches!(
             DurableSettingsStore::restore_workspace_backup_absent(
                 target_directory.path(),

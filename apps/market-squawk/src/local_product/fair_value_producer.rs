@@ -288,6 +288,9 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
             FairValueProducerSelectionError::InvalidSelection
         }
         AnalyticalReadError::Manifest(_)
+        | AnalyticalReadError::ForecastDatasetUnavailable
+        | AnalyticalReadError::Parquet(_)
+        | AnalyticalReadError::PythonDataset(_)
         | AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange

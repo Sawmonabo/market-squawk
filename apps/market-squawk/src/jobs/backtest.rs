@@ -157,6 +157,22 @@ impl BacktestJobRunner {
         self.admit(receipt.into_command(), captured_at)
     }
 
+    /// Registers and admits one server-prepared exact governed input without JSON reconstruction.
+    pub async fn admit_prepared(
+        &self,
+        registrar: &dyn GovernedBacktestInputRegistrar,
+        input: GovernedBacktestInputRegistrationInput,
+        cancellation: tokio_util::sync::CancellationToken,
+        deadline: std::time::Instant,
+        captured_at: Timestamp,
+    ) -> Result<JobAdmission, BacktestJobRunnerError> {
+        let receipt = registrar
+            .register_input(input, cancellation, deadline)
+            .await
+            .map_err(map_admission_error)?;
+        self.admit(receipt.into_command(), captured_at)
+    }
+
     /// Releases one pending admission when durable job creation did not succeed.
     pub fn revoke(&self, admission: &JobAdmission) -> Result<(), BacktestJobRunnerError> {
         if admission.kind() != &self.kind || admission.input().authority() != &self.input_authority

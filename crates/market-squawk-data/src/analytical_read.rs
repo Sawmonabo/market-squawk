@@ -9,6 +9,14 @@ use market_squawk_domain::{InstrumentId, SourceId, Timestamp};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+#[path = "analytical_read/forecast.rs"]
+mod forecast;
+
+pub use forecast::{
+    ForecastDatasetEvidence, ForecastDatasetEvidenceFence, ForecastDatasetReadLimits,
+    ForecastFeatureRow, ForecastFeatureValue,
+};
+
 use crate::manifest::{
     CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
     CatalogGenerationPage,
@@ -797,10 +805,19 @@ pub enum AnalyticalReadError {
     /// Fixed observation templates require the canonical research-observation schema.
     #[error("analytical observation schema is invalid")]
     InvalidObservationSchema,
+    /// An exact Python-admitted forecast dataset was not found.
+    #[error("analytical forecast dataset is unavailable")]
+    ForecastDatasetUnavailable,
     /// Immutable generation lookup failed.
     #[error("analytical manifest read failed: {0}")]
     Manifest(#[from] ManifestCatalogError),
     /// Fixed-template query construction or execution failed.
     #[error("analytical fixed-template query failed: {0}")]
     Query(#[from] QueryError),
+    /// Bounded immutable-object reading failed.
+    #[error("analytical forecast object read failed: {0}")]
+    Parquet(#[from] crate::ParquetStoreError),
+    /// Canonical feature-row verification failed.
+    #[error("analytical forecast row verification failed: {0}")]
+    PythonDataset(#[from] crate::PythonDatasetCatalogError),
 }

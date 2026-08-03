@@ -1,5 +1,7 @@
 //! Closed transport adapter over the sole durable investment-decision authority.
 
+mod target_preparation;
+
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     str::FromStr as _,
@@ -11,12 +13,10 @@ use market_squawk_decisions::{
     AppendOutcome, AsOfSemantics, CandidateAssessment, CandidateFlag, CandidateId, CandidateInput,
     ComparisonOperator, DecisionActorId, DecisionContentDigest, DecisionDossier,
     DecisionRepositoryError, DecisionText, DossierId, DossierSection, GovernedTargetSet,
-    InvestmentTargetSet, InvestmentTargetSetId, NullPolicy, RankingDirection, ReferenceMark,
-    SavedScreen, ScreenConstraints, ScreenFeatureBinding, ScreenFeatureObservation, ScreenId,
-    ScreenPredicate, ScreenRanking, ScreenRevision, ScreenRun, ScreenRunId, TargetAssumption,
-    TargetDecisionContext, TargetEvidence, TargetGovernanceInput, TargetMethod, TargetPriceCases,
-    TargetPriceRange, TargetReview, TargetReviewDisposition, TargetReviewId, TargetState,
-    TargetStatus,
+    InvestmentTargetSet, InvestmentTargetSetId, NullPolicy, RankingDirection, SavedScreen,
+    ScreenConstraints, ScreenFeatureBinding, ScreenFeatureObservation, ScreenId, ScreenPredicate,
+    ScreenRanking, ScreenRevision, ScreenRun, ScreenRunId, TargetMethod, TargetReview,
+    TargetReviewDisposition, TargetReviewId, TargetState, TargetStatus,
 };
 use market_squawk_domain::{
     Currency, DataQuality, EvidenceDigest, InstrumentId, Money, RevisionNumber, Timestamp,
@@ -26,12 +26,14 @@ use market_squawk_portfolio::PortfolioRevisionToken;
 use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
-use market_squawk_valuation::DecisionId;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::application::decision::{DecisionApplication, DecisionApplicationError};
+use crate::portfolio_application::PortfolioFairValueReadCapability;
+
+use self::target_preparation::TargetPreparationOperations;
 
 const SAVE_SCREEN: &str = "Decision.SaveScreen";
 const RUN_SCREEN: &str = "Decision.RunScreen";
@@ -40,48 +42,55 @@ const GET_CANDIDATES: &str = "Decision.GetCandidates";
 const LIST_SCREEN_RUNS: &str = "Decision.ListScreenRuns";
 const GET_DOSSIER: &str = "Decision.GetDossier";
 const LIST_CANDIDATE_DOSSIERS: &str = "Decision.ListCandidateDossiers";
-const CREATE_TARGET: &str = "Decision.CreateTargetSet";
 const GET_TARGET: &str = "Decision.GetTargetSet";
 const LIST_TARGETS: &str = "Decision.ListTargetSets";
 const LIST_TARGET_INDEX: &str = "Decision.ListTargetIndex";
 const REVIEW_TARGET: &str = "Decision.ReviewTargetSet";
-const REEVALUATE_TARGET: &str = "Decision.ReevaluateTargetSet";
 const TARGET_STATUS: &str = "Decision.GetTargetSetStatus";
 
 /// Closed decision operation surface shared by installed native and MCP transports.
 pub(super) struct InstalledDecisionOperations {
     decisions: Arc<DecisionApplication>,
     features: ProductionFeatureRegistry,
+    target_preparation: TargetPreparationOperations,
 }
 
 impl InstalledDecisionOperations {
-    pub(super) fn try_new(decisions: Arc<DecisionApplication>) -> Result<Self, ServiceError> {
+    pub(super) fn try_new(
+        decisions: Arc<DecisionApplication>,
+        portfolio: PortfolioFairValueReadCapability,
+        runtime: market_squawk_runtime::RuntimeIdentity,
+    ) -> Result<Self, ServiceError> {
         let features =
             ProductionFeatureRegistry::try_new().map_err(|_error| ServiceError::Unavailable)?;
         Ok(Self {
+            target_preparation: TargetPreparationOperations::new(
+                Arc::clone(&decisions),
+                portfolio,
+                runtime,
+            ),
             decisions,
             features,
         })
     }
 
     pub(super) fn owns(operation: &str) -> bool {
-        matches!(
-            operation,
-            SAVE_SCREEN
-                | RUN_SCREEN
-                | LIST_SCREENS
-                | GET_CANDIDATES
-                | LIST_SCREEN_RUNS
-                | GET_DOSSIER
-                | LIST_CANDIDATE_DOSSIERS
-                | CREATE_TARGET
-                | GET_TARGET
-                | LIST_TARGETS
-                | LIST_TARGET_INDEX
-                | REVIEW_TARGET
-                | REEVALUATE_TARGET
-                | TARGET_STATUS
-        )
+        TargetPreparationOperations::owns(operation)
+            || matches!(
+                operation,
+                SAVE_SCREEN
+                    | RUN_SCREEN
+                    | LIST_SCREENS
+                    | GET_CANDIDATES
+                    | LIST_SCREEN_RUNS
+                    | GET_DOSSIER
+                    | LIST_CANDIDATE_DOSSIERS
+                    | GET_TARGET
+                    | LIST_TARGETS
+                    | LIST_TARGET_INDEX
+                    | REVIEW_TARGET
+                    | TARGET_STATUS
+            )
     }
 
     pub(super) fn call(
@@ -90,6 +99,9 @@ impl InstalledDecisionOperations {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
+        if TargetPreparationOperations::owns(request.name()) {
+            return self.target_preparation.call(request, context);
+        }
         let arguments = mutation_arguments(request.arguments());
         let (content, item_count) = match request.name() {
             SAVE_SCREEN => {
@@ -199,15 +211,6 @@ impl InstalledDecisionOperations {
                     count,
                 )
             }
-            CREATE_TARGET => {
-                let input: CreateTargetRequest = decode(&arguments)?;
-                let target = input.target.decode()?;
-                let outcome = self
-                    .decisions
-                    .create_target(target)
-                    .map_err(map_application)?;
-                (append_outcome_value(outcome), 1)
-            }
             GET_TARGET => {
                 let input: TargetIdentityRequest = decode(&arguments)?;
                 let state = self
@@ -264,15 +267,6 @@ impl InstalledDecisionOperations {
                     .map_err(map_application)?;
                 (append_outcome_value(outcome), 1)
             }
-            REEVALUATE_TARGET => {
-                let input: ReevaluateTargetRequest = decode(&arguments)?;
-                let successor = input.successor.decode()?;
-                let outcome = self
-                    .decisions
-                    .reevaluate_target(revision(input.expected_revision)?, successor)
-                    .map_err(map_application)?;
-                (append_outcome_value(outcome), 1)
-            }
             TARGET_STATUS => {
                 let input: TargetIdentityRequest = decode(&arguments)?;
                 let status = self
@@ -300,6 +294,7 @@ impl std::fmt::Debug for InstalledDecisionOperations {
             .debug_struct("InstalledDecisionOperations")
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("features", &"[CODE-OWNED FEATURE REGISTRY]")
+            .field("target_preparation", &self.target_preparation)
             .finish()
     }
 }
@@ -353,12 +348,6 @@ struct CandidateDossierListRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateTargetRequest {
-    target: TargetInput,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct TargetIdentityRequest {
     target_id: String,
@@ -382,13 +371,6 @@ struct TargetIndexListRequest {
 #[serde(deny_unknown_fields)]
 struct ReviewTargetRequest {
     review: ReviewInput,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ReevaluateTargetRequest {
-    expected_revision: u32,
-    successor: TargetInput,
 }
 
 #[derive(Deserialize)]
@@ -689,149 +671,6 @@ impl From<TargetMethodInput> for TargetMethod {
             TargetMethodInput::ForecastDistribution => Self::ForecastDistribution,
             TargetMethodInput::FairValueMeasurement => Self::FairValueMeasurement,
         }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct AssumptionInput {
-    text: String,
-    evidence_identity: EvidenceDigest,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct SupersessionInput {
-    revision: u32,
-    superseded_at: Timestamp,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct TargetInput {
-    id: String,
-    revision: u32,
-    dossier_id: String,
-    instrument_id: InstrumentId,
-    reference_price: MoneyInput,
-    reference_observed_at: Timestamp,
-    reference_identity: EvidenceDigest,
-    downside: MoneyInput,
-    base: MoneyInput,
-    upside: MoneyInput,
-    entry_lower: MoneyInput,
-    entry_upper: MoneyInput,
-    trim_lower: MoneyInput,
-    trim_upper: MoneyInput,
-    exit_lower: MoneyInput,
-    exit_upper: MoneyInput,
-    created_at: Timestamp,
-    horizon_at: Timestamp,
-    expires_at: Timestamp,
-    target_identity: EvidenceDigest,
-    add_case: MoneyInput,
-    method: TargetMethodInput,
-    assumptions: Vec<AssumptionInput>,
-    portfolio_revision: Option<[u8; 32]>,
-    effective_at: Timestamp,
-    review_due_at: Timestamp,
-    supersedes: Option<SupersessionInput>,
-    thesis: String,
-    risks: Vec<String>,
-    invalidation_conditions: Vec<String>,
-    forecast: Option<EvidenceDigest>,
-    fair_value: Option<String>,
-    mark_quality: DataQuality,
-    author: String,
-    ruleset_version: u32,
-}
-
-impl TargetInput {
-    fn decode(self) -> Result<GovernedTargetSet, ServiceError> {
-        let dossier_id = DossierId::try_new(&self.dossier_id).map_err(invalid)?;
-        let target = InvestmentTargetSet::try_new(
-            target_id(&self.id)?,
-            revision(self.revision)?,
-            dossier_id.clone(),
-            self.instrument_id,
-            ReferenceMark::try_new(
-                self.reference_price.decode()?,
-                self.reference_observed_at,
-                content_digest(self.reference_identity)?,
-            )
-            .map_err(invalid)?,
-            TargetPriceCases::try_new(
-                self.downside.decode()?,
-                self.base.decode()?,
-                self.upside.decode()?,
-            )
-            .map_err(invalid)?,
-            TargetPriceRange::try_new(self.entry_lower.decode()?, self.entry_upper.decode()?)
-                .map_err(invalid)?,
-            TargetPriceRange::try_new(self.trim_lower.decode()?, self.trim_upper.decode()?)
-                .map_err(invalid)?,
-            TargetPriceRange::try_new(self.exit_lower.decode()?, self.exit_upper.decode()?)
-                .map_err(invalid)?,
-            self.created_at,
-            self.horizon_at,
-            self.expires_at,
-            content_digest(self.target_identity)?,
-        )
-        .map_err(invalid)?;
-        let assumptions = self
-            .assumptions
-            .into_iter()
-            .map(|assumption| {
-                Ok(TargetAssumption::new(
-                    DecisionText::try_new(assumption.text).map_err(invalid)?,
-                    content_digest(assumption.evidence_identity)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ServiceError>>()?;
-        let supersedes = self
-            .supersedes
-            .map(|value| -> Result<_, ServiceError> {
-                Ok((revision(value.revision)?, value.superseded_at))
-            })
-            .transpose()?;
-        GovernedTargetSet::try_new(TargetGovernanceInput {
-            target,
-            add_case: self.add_case.decode()?,
-            method: self.method.into(),
-            assumptions,
-            decision_context: TargetDecisionContext::new(
-                dossier_id,
-                self.portfolio_revision
-                    .map(PortfolioRevisionToken::from_bytes),
-            ),
-            effective_at: self.effective_at,
-            review_due_at: self.review_due_at,
-            supersedes,
-            thesis: DecisionText::try_new(self.thesis).map_err(invalid)?,
-            risks: self
-                .risks
-                .into_iter()
-                .map(|value| DecisionText::try_new(value).map_err(invalid))
-                .collect::<Result<Vec<_>, _>>()?,
-            invalidation_conditions: self
-                .invalidation_conditions
-                .into_iter()
-                .map(|value| DecisionText::try_new(value).map_err(invalid))
-                .collect::<Result<Vec<_>, _>>()?,
-            evidence: TargetEvidence::new(
-                self.forecast.map(content_digest).transpose()?,
-                self.fair_value
-                    .as_deref()
-                    .map(DecisionId::from_str)
-                    .transpose()
-                    .map_err(invalid)?,
-            ),
-            mark_quality: self.mark_quality,
-            author: DecisionActorId::try_new(self.author).map_err(invalid)?,
-            ruleset_version: NonZeroU32::new(self.ruleset_version)
-                .ok_or(ServiceError::InvalidRequest)?,
-        })
-        .map_err(invalid)
     }
 }
 

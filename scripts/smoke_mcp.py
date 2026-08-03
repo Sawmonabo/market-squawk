@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import queue
@@ -15,6 +16,37 @@ from typing import TextIO
 REQUEST_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 25.0
 SERVICE_START_TIMEOUT_SECONDS = 20.0
+MCP_PROTOCOL_VERSION = "2026-07-28"
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Exercise one named Market Squawk MCP relay over stdio."
+    )
+    parser.add_argument("binary", nargs="?", default="target/debug/market-squawk")
+    parser.add_argument("--client", choices=("claude-code", "codex"), default="codex")
+    parser.add_argument("--data-dir", type=pathlib.Path)
+    parser.add_argument(
+        "--running-service",
+        action="store_true",
+        help="Use the already-ready installed service instead of starting a sibling service.",
+    )
+    parser.add_argument(
+        "--installed-relay",
+        action="store_true",
+        help="Treat binary as the installed market-squawk-mcp-relay executable.",
+    )
+    parser.add_argument("--desktop-appimage", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.desktop_appimage and (
+        arguments.running_service or arguments.installed_relay
+    ):
+        parser.error("--desktop-appimage cannot use --running-service or --installed-relay")
+    if arguments.running_service and arguments.data_dir is None:
+        parser.error("--running-service requires --data-dir")
+    if arguments.installed_relay and not arguments.running_service:
+        parser.error("--installed-relay requires --running-service")
+    return arguments
 
 
 def require(condition: bool, message: str) -> None:
@@ -106,26 +138,15 @@ def wait_for_service(
 
 
 def main() -> int:
-    arguments = sys.argv[1:]
-    desktop_appimage = bool(arguments and arguments[0] == "--desktop-appimage")
-    if desktop_appimage:
-        arguments = arguments[1:]
-    if len(arguments) > 1:
-        print(
-            "usage: smoke_mcp.py [--desktop-appimage] [/path/to/executable]",
-            file=sys.stderr,
-        )
-        return 2
-
-    binary = pathlib.Path(
-        arguments[0] if arguments else "target/debug/market-squawk"
-    ).resolve()
+    arguments = parse_arguments()
+    binary = pathlib.Path(arguments.binary).resolve()
     require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
     with (
-        tempfile.TemporaryDirectory() as data_dir,
+        tempfile.TemporaryDirectory() as temporary_data_dir,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
     ):
+        data_dir = str(arguments.data_dir or temporary_data_dir)
         service: subprocess.Popen[str] | None = None
         command = [
             str(binary),
@@ -134,11 +155,20 @@ def main() -> int:
             "mcp",
             "serve",
             "--client",
-            "codex",
+            arguments.client,
         ]
-        if desktop_appimage:
+        if arguments.desktop_appimage:
             command = [str(binary), "--stdio-mcp", "--data-dir", data_dir]
-        else:
+        elif arguments.installed_relay:
+            relay_client = "claude" if arguments.client == "claude-code" else "codex"
+            command = [
+                str(binary),
+                "--client",
+                relay_client,
+                "--data-dir",
+                data_dir,
+            ]
+        if not arguments.desktop_appimage and not arguments.running_service:
             service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
             require(
                 service_binary.is_file(),
@@ -173,7 +203,7 @@ def main() -> int:
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": "2025-11-25",
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {},
                         "clientInfo": {"name": "smoke-test", "version": "1"},
                     },
@@ -183,6 +213,11 @@ def main() -> int:
                 initialized.get("result", {}).get("serverInfo", {}).get("name")
                 == "market-squawk",
                 "MCP initialize response has the wrong server identity",
+            )
+            require(
+                initialized.get("result", {}).get("protocolVersion")
+                == MCP_PROTOCOL_VERSION,
+                "MCP initialize response has the wrong protocol version",
             )
             require(process.stdin is not None, "MCP process stdin is unavailable")
             process.stdin.write(

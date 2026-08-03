@@ -32,7 +32,7 @@ use market_squawk_adapter_paper::{
     PaperStartError,
 };
 use market_squawk_analytics::RequiredLiveFeature;
-use market_squawk_domain::OrderId;
+use market_squawk_domain::{InstrumentExecutionTerms, OrderId};
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError, AccountRecoveryBootstrap,
     AccountRiskCoordinator, CancelReceipt, ExecutionAdapter, ExecutionAuditConfig,
@@ -40,9 +40,9 @@ use market_squawk_execution::{
     ExecutionDispatcherConfig, ExecutionDispatcherError, ExecutionDispatcherQuiesce,
     ExecutionDispatcherShutdown, ExecutionLiveActionHook, ExecutionLiveActionHookError,
     ExecutionMarketSink, ExecutionState, ExecutionTaskDrain, ExecutionTaskReaper,
-    ExecutionTaskReaperError, PortfolioReadCapability, ReconciledOrderStatus,
-    RecoveredDispatchOrder, RiskLimits, RiskLimitsSnapshot, RiskService, RiskServiceConfig,
-    RiskServiceError, Strategy,
+    ExecutionTaskReaperError, ManualPaperDraft, ManualPaperDraftIngress, ManualPaperIngressError,
+    PortfolioReadCapability, ReconciledOrderStatus, RecoveredDispatchOrder, RiskLimits,
+    RiskLimitsSnapshot, RiskService, RiskServiceConfig, RiskServiceError, Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, LiveActionHook, LiveRouteConfig, LiveRuntimeConfig,
@@ -73,7 +73,9 @@ struct ProductionPaperRecovery {
 }
 
 pub(crate) use defaults::{
-    local_coinbase_direct_paper_bot_with_activation, local_paper_bot_with_provider_rate,
+    PaperStrategyMode, local_coinbase_direct_paper_bot_with_activation_and_strategy_mode,
+    local_paper_bot_with_provider_rate_and_strategy_mode, manual_paper_account_id,
+    manual_paper_reason_code, manual_paper_strategy_id,
 };
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
 #[cfg(test)]
@@ -105,6 +107,36 @@ pub struct ProductionPaperBotRoute {
     strategy: Box<dyn Strategy>,
     required_features: Vec<RequiredLiveFeature>,
     maximum_intents: ActionAuthorityIssueLimit,
+    manual_draft_ingress: Option<ManualPaperDraftIngress>,
+}
+
+/// Immutable execution terms for one route that accepts manual drafts.
+///
+/// This is an authority-free route description. It neither admits a draft nor exposes live market
+/// observations, central risk, dispatch, an adapter, or a broker.
+#[derive(Clone, Debug)]
+pub struct ManualPaperRoute {
+    route: ShardKey,
+    execution_terms: InstrumentExecutionTerms,
+    ingress: ManualPaperDraftIngress,
+}
+
+impl ManualPaperRoute {
+    /// Returns the exact active route that owns the capacity-one draft ingress.
+    pub const fn route(&self) -> &ShardKey {
+        &self.route
+    }
+
+    /// Returns the immutable route definition used for exact target-price normalization.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.execution_terms
+    }
+
+    fn try_submit(&self, draft: ManualPaperDraft) -> Result<(), ProductionManualPaperIngressError> {
+        self.ingress
+            .try_submit(draft)
+            .map_err(ProductionManualPaperIngressError::from)
+    }
 }
 
 impl ProductionPaperBotRoute {
@@ -120,7 +152,17 @@ impl ProductionPaperBotRoute {
             strategy,
             required_features,
             maximum_intents,
+            manual_draft_ingress: None,
         }
+    }
+
+    /// Transfers the paired route-bound manual-draft sender with its sole strategy consumer.
+    ///
+    /// This constructor is crate-private because composition, rather than a caller, establishes
+    /// the only route-to-ingress association.
+    pub(crate) fn with_manual_draft_ingress(mut self, ingress: ManualPaperDraftIngress) -> Self {
+        self.manual_draft_ingress = Some(ingress);
+        self
     }
 
     /// Returns the exact route that will own this strategy.
@@ -136,6 +178,7 @@ pub struct ProductionPaperBotComposition {
     runtime_config: LiveRuntimeConfig,
     execution: ProductionPaperBotExecutionConfig,
     strategies: Vec<ProductionPaperBotRoute>,
+    manual_paper_routes: Vec<ManualPaperRoute>,
 }
 
 #[derive(Debug)]
@@ -276,6 +319,7 @@ impl ProductionPaperBotComposition {
         strategies: Vec<ProductionPaperBotRoute>,
     ) -> Result<Self, ProductionPaperBotCompositionError> {
         validate_strategy_routes(source.routes(), &strategies)?;
+        let manual_paper_routes = manual_paper_routes(source.routes(), &strategies)?;
         if execution.paper_control_timeout.is_zero() {
             return Err(ProductionPaperBotCompositionError::ZeroPaperControlTimeout);
         }
@@ -285,6 +329,7 @@ impl ProductionPaperBotComposition {
             runtime_config,
             execution,
             strategies,
+            manual_paper_routes,
         })
     }
 
@@ -370,6 +415,7 @@ impl ProductionPaperBotComposition {
             runtime_config,
             execution,
             strategies,
+            manual_paper_routes,
         } = self;
         let risk_limits = execution.risk_limits.snapshot();
         let startup_deadline = tokio::time::Instant::now()
@@ -918,6 +964,7 @@ impl ProductionPaperBotComposition {
                 risk_limits,
                 execution_audit_read_view,
                 audit_service,
+                manual_paper_routes,
             },
             #[cfg(feature = "release-evidence")]
             benchmark_producer,
@@ -947,6 +994,7 @@ pub struct ProductionPaperBotRuntime {
     risk_limits: RiskLimitsSnapshot,
     execution_audit_read_view: audit::ProductionExecutionAuditReadView,
     audit_service: ProductionAuditService,
+    manual_paper_routes: Vec<ManualPaperRoute>,
 }
 
 #[derive(Debug)]
@@ -1055,6 +1103,29 @@ impl ProductionPaperBotRuntime {
             .snapshot_after(cursor, maximum_items)
     }
 
+    /// Immediately admits one authority-free manual draft to its exact active route.
+    ///
+    /// This is deliberately nonblocking: it only performs a bounded route scan and the
+    /// capacity-one sender's `try_send`. It does not expose a live hook, dispatcher, risk
+    /// service, adapter, broker, or any execution approval authority.
+    pub fn try_submit_manual_paper_draft(
+        &self,
+        route: &ShardKey,
+        draft: ManualPaperDraft,
+    ) -> Result<(), ProductionManualPaperIngressError> {
+        let route = self
+            .manual_paper_routes
+            .iter()
+            .find(|candidate| candidate.route() == route)
+            .ok_or(ProductionManualPaperIngressError::RouteUnavailable)?;
+        route.try_submit(draft)
+    }
+
+    /// Returns the bounded active manual route set for target compatibility checks.
+    pub fn manual_paper_routes(&self) -> &[ManualPaperRoute] {
+        &self.manual_paper_routes
+    }
+
     /// Returns a complete paper state image without exposing the paper adapter.
     ///
     /// The effective deadline is the earlier of the caller deadline and the startup-configured
@@ -1155,6 +1226,7 @@ impl ProductionPaperBotRuntime {
             risk_limits: _,
             execution_audit_read_view: _,
             audit_service,
+            manual_paper_routes: _,
         } = self;
         let source_and_live = live.shutdown().await;
         let supervisor = supervisor.shutdown().await;
@@ -1238,6 +1310,26 @@ pub enum ProductionPaperControlError {
     Paper(PaperControlError),
     #[error(transparent)]
     Dispatch(ExecutionDispatchError),
+}
+
+/// Immediate manual-draft admission failure without an execution authority surface.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProductionManualPaperIngressError {
+    #[error("the requested manual paper route is not active")]
+    RouteUnavailable,
+    #[error("the route's manual paper draft slot is occupied")]
+    Occupied,
+    #[error("the route's manual paper draft slot is closed")]
+    Closed,
+}
+
+impl From<ManualPaperIngressError> for ProductionManualPaperIngressError {
+    fn from(error: ManualPaperIngressError) -> Self {
+        match error {
+            ManualPaperIngressError::Occupied => Self::Occupied,
+            ManualPaperIngressError::Closed => Self::Closed,
+        }
+    }
 }
 
 impl From<PaperControlError> for ProductionPaperControlError {
@@ -1354,6 +1446,10 @@ pub enum ProductionPaperBotCompositionError {
     StrategyRouteSetMismatch,
     #[error("production paper bot contains duplicate strategy route ownership")]
     DuplicateStrategyRoute,
+    #[error("manual paper ingress does not match its strategy route")]
+    ManualIngressRouteMismatch,
+    #[error("production paper bot contains duplicate manual paper ingress ownership")]
+    DuplicateManualIngressRoute,
     #[error("paper control timeout must be positive")]
     ZeroPaperControlTimeout,
     #[error("risk and paper account bootstraps do not describe the same canonical state")]
@@ -1541,6 +1637,44 @@ fn validate_strategy_routes(
         }
     }
     Ok(())
+}
+
+fn manual_paper_routes(
+    routes: &[LiveRouteConfig],
+    strategies: &[ProductionPaperBotRoute],
+) -> Result<Vec<ManualPaperRoute>, ProductionPaperBotCompositionError> {
+    let count = strategies
+        .iter()
+        .filter(|strategy| strategy.manual_draft_ingress.is_some())
+        .count();
+    let mut manual_routes = Vec::new();
+    manual_routes
+        .try_reserve_exact(count)
+        .map_err(|_error| ProductionPaperBotCompositionError::Allocation)?;
+    for strategy in strategies {
+        let Some(ingress) = strategy.manual_draft_ingress.as_ref() else {
+            continue;
+        };
+        if ingress.route() != strategy.route() {
+            return Err(ProductionPaperBotCompositionError::ManualIngressRouteMismatch);
+        }
+        if manual_routes
+            .iter()
+            .any(|candidate: &ManualPaperRoute| candidate.route() == ingress.route())
+        {
+            return Err(ProductionPaperBotCompositionError::DuplicateManualIngressRoute);
+        }
+        let route = routes
+            .iter()
+            .find(|candidate| candidate.route() == ingress.route())
+            .ok_or(ProductionPaperBotCompositionError::ManualIngressRouteMismatch)?;
+        manual_routes.push(ManualPaperRoute {
+            route: route.route().clone(),
+            execution_terms: route.definition().execution_terms(),
+            ingress: ingress.clone(),
+        });
+    }
+    Ok(manual_routes)
 }
 
 fn validate_canonical_accounts(

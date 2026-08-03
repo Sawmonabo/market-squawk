@@ -505,7 +505,12 @@ impl ResearchArrowBatch {
         Self::validate_and_decode_record_batch(batch, usize::MAX).map(|(candidate, _, _)| candidate)
     }
 
-    pub(crate) fn decode_record_batch_bounded(
+    /// Decodes one canonical research-observation batch under an exact retained-memory ceiling.
+    ///
+    /// The batch schema, per-row payload digest, and canonical observation invariants are verified
+    /// before any observation is returned. This is the only supported application boundary for
+    /// interpreting an inline canonical research query result.
+    pub fn decode_record_batch_bounded(
         batch: RecordBatch,
         max_additional_bytes: usize,
     ) -> Result<(Vec<ResearchObservation>, usize), ArrowConversionError> {

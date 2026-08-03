@@ -30,6 +30,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
 import {
   digestHex,
   parseJobPage,
@@ -41,12 +42,20 @@ import { humanize } from "@/lib/formatters"
 import { compareLosslessIntegers } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
+import type { ApplicationResult } from "@/lib/schemas"
 import { cn } from "@/lib/utils"
 
 import {
   BACKTEST_JOB_KIND,
   BACKTEST_RESULT_AUTHORITY,
+  parseBacktestJobReceipt,
+  parseBacktestPreparationOptions,
+  parseBacktestPreparationPreview,
   parseBacktestRecord,
+  type BacktestPreparationOptions,
+  type BacktestPreparationPreview,
+  type BacktestPreparationReceipt,
+  type BacktestPreparationSelection,
   type BacktestMetric,
   type BacktestRecord,
 } from "./contracts"
@@ -172,6 +181,7 @@ function BacktestsWorkspace({
       <BuilderAvailability
         operations={operations}
         transport={transport}
+        scope={scope}
         onStarted={() => queryClient.invalidateQueries({ queryKey: jobsKey })}
       />
 
@@ -300,21 +310,102 @@ function BacktestsWorkspace({
 function BuilderAvailability({
   operations,
   transport,
+  scope,
   onStarted,
 }: {
   operations: ReadonlySet<string>
   transport: ProductTransport
+  scope: ProductScope
   onStarted: () => Promise<unknown>
 }) {
-  const [confirmationOpen, setConfirmationOpen] = React.useState(false)
-  const mutation = useMutation({
+  const [builderOpen, setBuilderOpen] = React.useState(false)
+  const [advancedOpen, setAdvancedOpen] = React.useState(false)
+  const [selection, setSelection] =
+    React.useState<BacktestPreparationSelection | null>(null)
+  const [preview, setPreview] =
+    React.useState<BacktestPreparationPreview | null>(null)
+  const guidedTransport = asGuidedBacktestTransport(transport)
+  const guidedOperationsAvailable = [
+    "Analysis.GetBacktestPreparation",
+    "Analysis.PreviewBacktest",
+    "Analysis.StartPreparedBacktest",
+  ].every((operation) => operations.has(operation))
+  const optionsQuery = useQuery({
+    queryKey: productKeys.operation(
+      scope,
+      "analysis",
+      "Analysis.GetBacktestPreparation",
+      {},
+    ),
+    enabled: guidedTransport !== null && guidedOperationsAvailable,
+    queryFn: async () => {
+      if (!guidedTransport) throw new Error("Guided backtest preparation is unavailable.")
+      return parseBacktestPreparationOptions(
+        await guidedTransport.backtestPreparation({ action: "options" }),
+      )
+    },
+    staleTime: 30_000,
+  })
+  React.useEffect(() => {
+    const options = optionsQuery.data
+    if (!options) return
+    if (options.datasets.length === 0) {
+      if (selection) setSelection(null)
+      return
+    }
+    const dataset = options.datasets.find(
+      (candidate) => candidate.id === selection?.dataset,
+    )
+    const stillValid =
+      dataset?.periods.some((period) => period.id === selection?.period) &&
+      options.strategies.some((option) => option.id === selection?.strategy) &&
+      options.costPolicies.some((option) => option.id === selection?.costPolicy) &&
+      options.seeds.some((option) => option.id === selection?.seed) &&
+      options.portfolios.some((option) => option.id === selection?.portfolio) &&
+      options.comparisons.some((option) => option.id === selection?.comparison)
+    if (!stillValid) setSelection(defaultPreparationSelection(options))
+  }, [optionsQuery.data, selection])
+  const previewMutation = useMutation({
+    mutationFn: async (draft: BacktestPreparationSelection) => {
+      if (!guidedTransport) throw new Error("Guided backtest preparation is unavailable.")
+      return parseBacktestPreparationPreview(
+        await guidedTransport.backtestPreparation({
+          action: "preview",
+          selection: draft,
+        }),
+      )
+    },
+    onSuccess: setPreview,
+  })
+  const startMutation = useMutation({
+    mutationFn: async (receipt: BacktestPreparationReceipt) => {
+      if (!guidedTransport) throw new Error("Guided backtest preparation is unavailable.")
+      return parseBacktestJobReceipt(
+        await guidedTransport.backtestPreparation(
+          { action: "start", receipt },
+          true,
+        ),
+      )
+    },
+    onSuccess: async () => {
+      setBuilderOpen(false)
+      setPreview(null)
+      await onStarted()
+    },
+  })
+  const advancedMutation = useMutation({
     mutationFn: () => transport.startBacktestFromFile(true),
     onSuccess: async (result) => {
-      setConfirmationOpen(false)
+      setAdvancedOpen(false)
       if (result !== null) await onStarted()
     },
   })
-  const available = operations.has("Analysis.StartBacktest")
+  const advancedAvailable = operations.has("Analysis.StartBacktest")
+  const guidedAvailable =
+    guidedOperationsAvailable &&
+    guidedTransport !== null &&
+    optionsQuery.data !== undefined &&
+    optionsQuery.data.datasets.length > 0
 
   return (
     <section className="rounded-2xl border border-border bg-card/45 p-5">
@@ -330,65 +421,426 @@ function BuilderAvailability({
           </p>
         </div>
         <Button
-          disabled={!available || mutation.isPending}
+          disabled={!guidedAvailable || optionsQuery.isFetching}
           onClick={() => {
-            mutation.reset()
-            setConfirmationOpen(true)
+            previewMutation.reset()
+            startMutation.reset()
+            setPreview(null)
+            setBuilderOpen(true)
           }}
         >
-          Configure backtest
+          {optionsQuery.isFetching ? "Loading choices…" : "Configure backtest"}
         </Button>
       </div>
-      {!available && (
+      {!guidedOperationsAvailable || guidedTransport === null ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>Starting a run is unavailable</AlertTitle>
+          <AlertTitle>Guided preparation is unavailable</AlertTitle>
           <AlertDescription>
-            The installed service did not advertise the closed Analysis.StartBacktest operation.
+            The installed service did not advertise the closed preparation, preview, and
+            receipt-bound start operations required by this release.
           </AlertDescription>
         </Alert>
-      )}
-      {mutation.isError && (
+      ) : optionsQuery.isError ? (
         <Alert variant="destructive" className="mt-4">
           <AlertCircle aria-hidden="true" />
-          <AlertTitle>The backtest was not started</AlertTitle>
-          <AlertDescription>{messageFrom(mutation.error)}</AlertDescription>
+          <AlertTitle>Backtest choices could not be loaded</AlertTitle>
+          <AlertDescription>{messageFrom(optionsQuery.error)}</AlertDescription>
         </Alert>
-      )}
+      ) : optionsQuery.data?.datasets.length === 0 ? (
+        <Alert className="mt-4">
+          <Database aria-hidden="true" />
+          <AlertTitle>No point-in-time feature dataset is ready</AlertTitle>
+          <AlertDescription>
+            Build or publish a governed feature dataset first. The builder will expose it only
+            after its universe, instruments, source coverage, and immutable period are admitted.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <details className="mt-5 rounded-xl border border-border/70 bg-background/35 p-4">
+        <summary className="cursor-pointer text-sm font-medium">
+          Advanced: import an administrator-prepared registration
+        </summary>
+        <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+          This protected file workflow is for auditing, recovery, and administrator-authored
+          experiments. The guided builder above is the normal path and never asks for SQL,
+          registration JSON, manifest hashes, or evidence identifiers.
+        </p>
+        <Button
+          className="mt-3"
+          size="sm"
+          variant="outline"
+          disabled={!advancedAvailable || advancedMutation.isPending}
+          onClick={() => {
+            advancedMutation.reset()
+            setAdvancedOpen(true)
+          }}
+        >
+          Choose protected file
+        </Button>
+      </details>
+
+      {advancedMutation.isError ? (
+        <Alert variant="destructive" className="mt-4">
+          <AlertCircle aria-hidden="true" />
+          <AlertTitle>The advanced registration was not started</AlertTitle>
+          <AlertDescription>{messageFrom(advancedMutation.error)}</AlertDescription>
+        </Alert>
+      ) : null}
+
       <Dialog
-        open={confirmationOpen}
+        open={builderOpen}
         onOpenChange={(open) => {
-          if (!mutation.isPending) setConfirmationOpen(open)
+          if (!previewMutation.isPending && !startMutation.isPending) {
+            setBuilderOpen(open)
+            if (!open) setPreview(null)
+          }
+        }}
+      >
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>
+              {preview ? "Review the governed backtest" : "Configure a governed backtest"}
+            </DialogTitle>
+            <DialogDescription>
+              {preview
+                ? "This preview is bound to the current workspace, client, dataset generation, and exact code-owned registration. Starting consumes it once."
+                : "Choose plain-language research inputs. Market Squawk constructs and validates the point-in-time query and all governed registration evidence inside the service."}
+            </DialogDescription>
+          </DialogHeader>
+          {optionsQuery.data && selection ? (
+            preview ? (
+              <BacktestPreviewReview preview={preview} />
+            ) : (
+              <BacktestPreparationFields
+                options={optionsQuery.data}
+                selection={selection}
+                disabled={previewMutation.isPending}
+                onChange={(next) => {
+                  previewMutation.reset()
+                  setSelection(next)
+                }}
+              />
+            )
+          ) : (
+            <LoadingCard label="Loading bounded preparation choices…" />
+          )}
+          {previewMutation.isError || startMutation.isError ? (
+            <Alert variant="destructive">
+              <AlertCircle aria-hidden="true" />
+              <AlertTitle>
+                {startMutation.isError
+                  ? "The governed backtest was not started"
+                  : "The governed preview could not be prepared"}
+              </AlertTitle>
+              <AlertDescription>
+                {messageFrom(startMutation.error ?? previewMutation.error)}
+              </AlertDescription>
+            </Alert>
+          ) : null}
+          <DialogFooter>
+            {preview ? (
+              <Button
+                variant="outline"
+                disabled={startMutation.isPending}
+                onClick={() => {
+                  startMutation.reset()
+                  setPreview(null)
+                }}
+              >
+                Change choices
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                disabled={previewMutation.isPending}
+                onClick={() => setBuilderOpen(false)}
+              >
+                Cancel
+              </Button>
+            )}
+            {preview ? (
+              <Button
+                disabled={startMutation.isPending}
+                onClick={() => startMutation.mutate(preview.receipt)}
+              >
+                {startMutation.isPending ? "Starting governed job…" : "Start this backtest"}
+              </Button>
+            ) : (
+              <Button
+                disabled={!selection || previewMutation.isPending}
+                onClick={() => {
+                  if (selection) previewMutation.mutate(selection)
+                }}
+              >
+                {previewMutation.isPending ? "Preparing exact preview…" : "Review assumptions"}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={advancedOpen}
+        onOpenChange={(open) => {
+          if (!advancedMutation.isPending) setAdvancedOpen(open)
         }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Start a governed backtest?</DialogTitle>
+            <DialogTitle>Use the advanced registration path?</DialogTitle>
             <DialogDescription>
               Market Squawk will open the protected native file picker. Select a canonical JSON
               registration that binds the admitted universe, point-in-time dataset, strategy or
               model, evaluation period, execution costs, cohort plan, and deterministic seed.
-              Exact integer evidence is parsed and validated entirely in Rust.
+              This is not the normal guided workflow. Exact integer evidence is parsed and
+              validated entirely in Rust.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button
               variant="outline"
-              disabled={mutation.isPending}
-              onClick={() => setConfirmationOpen(false)}
+              disabled={advancedMutation.isPending}
+              onClick={() => setAdvancedOpen(false)}
             >
               Cancel
             </Button>
             <Button
-              disabled={mutation.isPending}
-              onClick={() => mutation.mutate()}
+              disabled={advancedMutation.isPending}
+              onClick={() => advancedMutation.mutate()}
             >
-              {mutation.isPending ? "Opening secure picker…" : "Choose registration"}
+              {advancedMutation.isPending ? "Opening secure picker…" : "Continue to picker"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </section>
+  )
+}
+
+type BacktestPreparationRequest =
+  | { action: "options" }
+  | { action: "preview"; selection: BacktestPreparationSelection }
+  | { action: "start"; receipt: BacktestPreparationReceipt }
+
+type GuidedBacktestTransport = ProductTransport & {
+  backtestPreparation(
+    request: BacktestPreparationRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+}
+
+function asGuidedBacktestTransport(
+  transport: ProductTransport,
+): GuidedBacktestTransport | null {
+  const candidate = transport as ProductTransport & {
+    backtestPreparation?: unknown
+  }
+  return typeof candidate.backtestPreparation === "function"
+    ? (candidate as GuidedBacktestTransport)
+    : null
+}
+
+function defaultPreparationSelection(
+  options: BacktestPreparationOptions,
+): BacktestPreparationSelection | null {
+  const dataset = options.datasets[0]
+  const period = dataset?.periods[0]
+  const strategy = options.strategies[0]
+  const costPolicy = options.costPolicies[0]
+  const seed = options.seeds[0]
+  const portfolio = options.portfolios[0]
+  const comparison = options.comparisons[0]
+  if (!dataset || !period || !strategy || !costPolicy || !seed || !portfolio || !comparison) {
+    return null
+  }
+  return {
+    dataset: dataset.id,
+    period: period.id,
+    strategy: strategy.id,
+    costPolicy: costPolicy.id,
+    seed: seed.id,
+    portfolio: portfolio.id,
+    comparison: comparison.id,
+  }
+}
+
+function BacktestPreparationFields({
+  options,
+  selection,
+  disabled,
+  onChange,
+}: {
+  options: BacktestPreparationOptions
+  selection: BacktestPreparationSelection
+  disabled: boolean
+  onChange: (selection: BacktestPreparationSelection) => void
+}) {
+  const dataset =
+    options.datasets.find((candidate) => candidate.id === selection.dataset) ??
+    options.datasets[0]
+  if (!dataset) return null
+  const fields: Array<{
+    id: string
+    label: string
+    value: string
+    options: Array<{ id: string; label: string; description?: string }>
+    onValue: (value: string) => void
+  }> = [
+    {
+      id: "backtest-dataset",
+      label: "Point-in-time dataset and universe",
+      value: selection.dataset,
+      options: options.datasets.map((option) => ({
+        id: option.id,
+        label: `${option.label} · generation ${option.immutableGeneration} · ${option.instrumentCount.toLocaleString()} instruments`,
+      })),
+      onValue: (value: string) => {
+        const nextDataset =
+          options.datasets.find((candidate) => candidate.id === value) ??
+          options.datasets[0]
+        const nextPeriod = nextDataset?.periods[0]
+        if (!nextDataset || !nextPeriod) return
+        onChange({
+          ...selection,
+          dataset: nextDataset.id,
+          period: nextPeriod.id,
+        })
+      },
+    },
+    {
+      id: "backtest-period",
+      label: "Evaluation period",
+      value: selection.period,
+      options: dataset.periods,
+      onValue: (value: string) => onChange({ ...selection, period: value }),
+    },
+    {
+      id: "backtest-strategy",
+      label: "Strategy",
+      value: selection.strategy,
+      options: options.strategies,
+      onValue: (value: string) => onChange({ ...selection, strategy: value }),
+    },
+    {
+      id: "backtest-cost-policy",
+      label: "Fees, spread, slippage, and liquidity",
+      value: selection.costPolicy,
+      options: options.costPolicies,
+      onValue: (value: string) => onChange({ ...selection, costPolicy: value }),
+    },
+    {
+      id: "backtest-seed",
+      label: "Deterministic seed",
+      value: selection.seed,
+      options: options.seeds,
+      onValue: (value: string) => onChange({ ...selection, seed: value }),
+    },
+    {
+      id: "backtest-portfolio",
+      label: "Research portfolio",
+      value: selection.portfolio,
+      options: options.portfolios,
+      onValue: (value: string) => onChange({ ...selection, portfolio: value }),
+    },
+    {
+      id: "backtest-comparison",
+      label: "Comparison and robustness evidence",
+      value: selection.comparison,
+      options: options.comparisons,
+      onValue: (value: string) => onChange({ ...selection, comparison: value }),
+    },
+  ]
+
+  return (
+    <div className="grid gap-4 py-2 sm:grid-cols-2">
+      {fields.map((field) => (
+        <div key={field.id} className="space-y-2">
+          <Label htmlFor={field.id}>{field.label}</Label>
+          <select
+            id={field.id}
+            className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+            value={field.value}
+            disabled={disabled}
+            onChange={(event) => field.onValue(event.target.value)}
+          >
+            {field.options.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          {field.options.find((option) => option.id === field.value)
+            ?.description ? (
+            <p className="text-xs leading-5 text-muted-foreground">
+              {field.options.find((option) => option.id === field.value)?.description}
+            </p>
+          ) : null}
+        </div>
+      ))}
+      <div className="sm:col-span-2 rounded-xl border border-border/70 bg-muted/20 p-4">
+        <p className="text-xs font-medium uppercase tracking-wider text-primary">
+          Fixed safety and resource policy
+        </p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          {options.defaultLimitPolicy}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function BacktestPreviewReview({
+  preview,
+}: {
+  preview: BacktestPreparationPreview
+}) {
+  const facts = [
+    ["Dataset and universe", preview.dataset],
+    ["Period", preview.period],
+    ["Strategy", preview.strategy],
+    ["Cost policy", preview.costPolicy],
+    ["Seed", preview.deterministicSeed],
+    ["Portfolio", preview.portfolio],
+    ["Comparison", preview.comparison],
+  ] as const
+  return (
+    <div className="space-y-4 py-2">
+      <div className="grid gap-3 sm:grid-cols-2">
+        {facts.map(([label, value]) => (
+          <div key={label} className="rounded-xl border border-border/70 bg-muted/20 p-3">
+            <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              {label}
+            </p>
+            <p className="mt-1 text-sm font-medium">{value}</p>
+          </div>
+        ))}
+      </div>
+      <ReviewList title="Point-in-time evidence" items={preview.evidence} />
+      <ReviewList title="Execution and interpretation assumptions" items={preview.assumptions} />
+      <p className="text-xs text-muted-foreground">
+        This review expires {new Date(preview.expiresAt).toLocaleString()}. Starting it consumes
+        the receipt once and revalidates the active workspace generation and exact dataset
+        catalog.
+      </p>
+    </div>
+  )
+}
+
+function ReviewList({ title, items }: { title: string; items: readonly string[] }) {
+  return (
+    <div className="rounded-xl border border-border/70 bg-background/45 p-4">
+      <p className="text-sm font-semibold">{title}</p>
+      <ul className="mt-2 space-y-2 text-sm leading-6 text-muted-foreground">
+        {items.map((item) => (
+          <li key={item} className="flex gap-2">
+            <ShieldCheck className="mt-1 size-4 shrink-0 text-primary" aria-hidden="true" />
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   )
 }
 

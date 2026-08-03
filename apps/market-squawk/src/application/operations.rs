@@ -7,8 +7,9 @@ mod requests;
 pub use contracts::{
     ManagedBackupOperations, ManagedRecoveryOperations, ManagedSettingsOperations,
     ManagedSettingsRollbackApproval, ManagedSettingsRollbackPreview, ManagedUpdateOperations,
-    PreparedOperation, ProgramRollbackPreviewEvidence, RestorePreviewEvidence, TrustedStagedUpdate,
-    UpdateAvailabilityEvidence, UpdateStatusEvidence,
+    PreparedOperation, ProgramRollbackPreviewEvidence, RestorePreviewEvidence,
+    RuntimeStatusAuthority, RuntimeStatusSnapshot, TrustedStagedUpdate, UpdateAvailabilityEvidence,
+    UpdateStatusEvidence,
 };
 
 use std::{fmt, sync::Arc, time::Instant};
@@ -43,6 +44,7 @@ const PREVIEW_BACKUP_RETENTION: &str = "Operations.PreviewBackupRetention";
 const PREVIEW_RESTORE: &str = "Operations.PreviewRestore";
 const LIST_WORKSPACES: &str = "Operations.ListWorkspaces";
 const PREVIEW_WORKSPACE_SWITCH: &str = "Operations.PreviewWorkspaceSwitch";
+const GET_RUNTIME_STATUS: &str = "Operations.GetRuntimeStatus";
 const GET_UPDATE_STATUS: &str = "Operations.GetUpdateStatus";
 const CHECK_FOR_UPDATES: &str = "Operations.CheckForUpdates";
 const PREVIEW_UPDATE: &str = "Operations.PreviewUpdate";
@@ -99,6 +101,7 @@ pub struct OperationsApplicationServices {
     backup_operations: Arc<dyn ManagedBackupOperations>,
     workspaces: Arc<DurableWorkspaceRegistry>,
     workspace_lifecycle: Arc<WorkspaceLifecycleAuthority>,
+    runtime_status: Arc<dyn RuntimeStatusAuthority>,
     recovery_operations: Arc<dyn ManagedRecoveryOperations>,
     updates: Arc<TrustedUpdateAuthority>,
     update_operations: Arc<dyn ManagedUpdateOperations>,
@@ -121,6 +124,7 @@ impl OperationsApplicationServices {
         backup_operations: Arc<dyn ManagedBackupOperations>,
         workspaces: Arc<DurableWorkspaceRegistry>,
         workspace_lifecycle: Arc<WorkspaceLifecycleAuthority>,
+        runtime_status: Arc<dyn RuntimeStatusAuthority>,
         recovery_operations: Arc<dyn ManagedRecoveryOperations>,
         updates: Arc<TrustedUpdateAuthority>,
         update_operations: Arc<dyn ManagedUpdateOperations>,
@@ -136,6 +140,7 @@ impl OperationsApplicationServices {
             backup_operations,
             workspaces,
             workspace_lifecycle,
+            runtime_status,
             recovery_operations,
             updates,
             update_operations,
@@ -173,6 +178,7 @@ impl OperationsApplicationServices {
                     | PREVIEW_RESTORE
                     | LIST_WORKSPACES
                     | PREVIEW_WORKSPACE_SWITCH
+                    | GET_RUNTIME_STATUS
                     | GET_UPDATE_STATUS
                     | CHECK_FOR_UPDATES
                     | PREVIEW_UPDATE
@@ -463,6 +469,8 @@ impl ApplicationDomainService for OperationsApplicationServices {
                     PreviewPayload::Workspace(preview.clone()),
                 )?
             }
+            GET_RUNTIME_STATUS => serde_json::to_value(self.runtime_status.snapshot(active)?)
+                .map_err(|_| ServiceError::Internal)?,
             GET_UPDATE_STATUS => serde_json::to_value(
                 self.update_operations
                     .status(self.updates.current().map_err(map_update_error)?)?,

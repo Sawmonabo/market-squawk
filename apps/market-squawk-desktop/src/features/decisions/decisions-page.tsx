@@ -1,3 +1,4 @@
+import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { AlertCircle, RefreshCw } from "lucide-react"
 
@@ -9,9 +10,10 @@ import { Skeleton } from "@/components/ui/skeleton"
 import type { ProductTransport } from "@/lib/transport"
 
 import { CandidateDossierWorkspace } from "./candidate-dossier"
-import { parseDecisionScreens } from "./contracts"
+import { parseDecisionScreens, type DecisionDossierView } from "./contracts"
 import { DecisionBoundaries } from "./decision-boundaries"
 import { SavedScreens } from "./saved-screens"
+import { ScreenBuilder } from "./screen-builder"
 import { TargetGovernanceWorkspace } from "./target-governance"
 
 const SCREEN_LIMIT = 100
@@ -68,6 +70,7 @@ function ReadyDecisions({
   transport: ProductTransport
   scope: ProductScope
 }) {
+  const [targetDossier, setTargetDossier] = useState<DecisionDossierView | null>(null)
   const screens = useQuery({
     queryKey: productKeys.operation(scope, "decision", "screens", {
       limit: SCREEN_LIMIT,
@@ -129,11 +132,30 @@ function ReadyDecisions({
           </AlertDescription>
         </Alert>
       ) : (
-        <SavedScreens screens={screens.data} />
+        <>
+          <ScreenBuilder
+            transport={transport}
+            scope={scope}
+            screens={screens.data}
+            onSaved={async () => {
+              await screens.refetch()
+            }}
+          />
+          <SavedScreens screens={screens.data} />
+        </>
       )}
 
-      <CandidateDossierWorkspace transport={transport} scope={scope} />
-      <TargetGovernanceWorkspace transport={transport} scope={scope} />
+      <CandidateDossierWorkspace
+        transport={transport}
+        scope={scope}
+        selectedTargetDossierId={targetDossier?.id ?? null}
+        onSelectTargetDossier={setTargetDossier}
+      />
+      <TargetGovernanceWorkspace
+        transport={transport}
+        scope={scope}
+        dossier={targetDossier}
+      />
     </DecisionsFrame>
   )
 }

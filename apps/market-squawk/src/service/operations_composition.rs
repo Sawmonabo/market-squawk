@@ -34,6 +34,7 @@ use crate::{
         BackupJobCommand, LifecycleJobExecutionError, LifecycleJobPublication,
         LifecycleJobPublicationError, RecoveryJobCommand, UpdateJobCommand,
     },
+    service::operations_activity::RuntimeActivityCoordinator,
 };
 
 const UNBOUND_DIAGNOSTIC: &str = "operations-authority-not-bound";
@@ -43,6 +44,7 @@ pub(super) struct OperationsApplicationDependencies {
     pub(super) backups: Arc<ProductBackupInventory>,
     pub(super) workspaces: Arc<DurableWorkspaceRegistry>,
     pub(super) workspace_lifecycle: Arc<WorkspaceLifecycleAuthority>,
+    pub(super) activity: Arc<RuntimeActivityCoordinator>,
     pub(super) updates: Arc<TrustedUpdateAuthority>,
     pub(super) logs: Arc<StructuredLogStore>,
     pub(super) log_artifacts: Arc<dyn DiagnosticArtifactPublisher>,
@@ -117,6 +119,7 @@ impl PendingOperationsComposition {
             backup_operations,
             dependencies.workspaces,
             dependencies.workspace_lifecycle,
+            dependencies.activity,
             recovery_operations,
             dependencies.updates,
             update_operations,

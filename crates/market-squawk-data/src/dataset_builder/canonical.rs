@@ -73,7 +73,7 @@ pub(super) fn build_spec_digest(
     universe_digest: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-build-spec/v2");
+    hash.update(b"market-squawk/feature-label-build-spec/v3");
     put_str(&mut hash, output_dataset.as_str());
     put_str(&mut hash, output_source.as_str());
     hash.update(policy_digest.bytes());
@@ -97,6 +97,8 @@ pub(super) fn build_spec_digest(
         hash.update(example.instrument_id().as_uuid().as_bytes());
         hash.update(example.cutoff_at().unix_nanos().to_be_bytes());
         hash.update(example.label_cutoff_at().unix_nanos().to_be_bytes());
+        encode_temporal(&mut hash, example.effective_cutoff());
+        encode_temporal(&mut hash, example.label_effective_cutoff());
         put_len(&mut hash, example.components().len());
         for component in example.components() {
             encode_component(&mut hash, component);
@@ -123,7 +125,7 @@ pub(super) fn row_lineage_digest(
     action_audit: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-row-lineage/v2");
+    hash.update(b"market-squawk/feature-label-row-lineage/v3");
     hash.update(request.build_spec_digest().digest().bytes());
     hash.update(request.policy_digest().bytes());
     hash.update(request.universe_digest().bytes());
@@ -131,6 +133,8 @@ pub(super) fn row_lineage_digest(
     hash.update(example.instrument_id().as_uuid().as_bytes());
     hash.update(example.cutoff_at().unix_nanos().to_be_bytes());
     hash.update(example.label_cutoff_at().unix_nanos().to_be_bytes());
+    encode_temporal(&mut hash, example.effective_cutoff());
+    encode_temporal(&mut hash, example.label_effective_cutoff());
     put_str(&mut hash, split.name());
     encode_component(&mut hash, component);
     hash.update(selection_content.bytes());

@@ -33,6 +33,7 @@ import {
   PaperControlPanel,
   paperActionCompleted,
 } from "./paper-controls"
+import { ManualPaperDraftPanel } from "./manual-paper-draft"
 
 export function PaperExecutionPage() {
   const product = useProduct()
@@ -64,6 +65,10 @@ function ReadyPaperExecution({
   const queryClient = useQueryClient()
   const [pendingAction, setPendingAction] = React.useState<PaperControlRequest | null>(null)
   const [controlMessage, setControlMessage] = React.useState<string | null>(null)
+  const operationNames = new Set(bootstrap.operations.map((operation) => operation.name))
+  const manualPaperAvailable =
+    operationNames.has("Execution.GetManualPaperTargets") &&
+    operationNames.has("Execution.SubmitManualPaperDraft")
   const status = useQuery({
     queryKey: productKeys.operation(bootstrap.runtime, "Bot", "Bot.GetStatus", {}),
     queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
@@ -145,6 +150,26 @@ function ReadyPaperExecution({
           <FinancialEvidence status={status.data?.value} />
           <SimulationAndReconciliationEvidence status={status.data?.value} />
           <PaperRiskEvidence status={status.data?.value} />
+          <ManualPaperDraftPanel
+            transport={transport}
+            scope={bootstrap.runtime}
+            enabled={
+              status.data?.value.state === "running" &&
+              status.data.value.strategyMode === "manual" &&
+              manualPaperAvailable
+            }
+            busy={control.isPending}
+            onAccepted={async () => {
+              await Promise.all([
+                queryClient.invalidateQueries({
+                  queryKey: productKeys.domain(bootstrap.runtime, "Bot"),
+                }),
+                queryClient.invalidateQueries({
+                  queryKey: productKeys.domain(bootstrap.runtime, "Execution"),
+                }),
+              ])
+            }}
+          />
           <PaperControlPanel
             status={status.data?.value}
             sessions={bootstrap.providerSessions}
@@ -407,12 +432,13 @@ function OrdersPanel({
         <InlineEmpty detail="No paper orders were returned for the active workspace." />
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-xs">
+          <table className="w-full min-w-[860px] text-left text-xs">
             <thead className="border-b border-border text-[10px] uppercase tracking-wider text-muted-foreground">
               <tr>
                 <th className="pb-3 pr-4 font-medium">Order</th>
                 <th className="pb-3 pr-4 font-medium">State</th>
                 <th className="pb-3 pr-4 font-medium">Fill progress</th>
+                <th className="pb-3 pr-4 font-medium">Target provenance</th>
                 <th className="pb-3 pr-4 font-medium">Price evidence</th>
                 <th className="pb-3 pr-4 font-medium">Fees</th>
                 <th className="pb-3 font-medium">Timing</th>
@@ -464,6 +490,20 @@ function OrderRow({
       <td className="py-3 pr-4 font-mono">
         {filled === undefined ? "Not reported" : `${filled.toLocaleString()} / `}
         {order.requestedLots.toLocaleString()} lots
+      </td>
+      <td className="py-3 pr-4 text-muted-foreground">
+        {order.targetReference ? (
+          <>
+            <span className="block font-mono text-[11px] text-foreground">
+              {shortId(order.targetReference.targetId)} · revision {order.targetReference.revision}
+            </span>
+            <span className="block font-mono text-[10px]">
+              {shortId(order.targetReference.contentSha256)}
+            </span>
+          </>
+        ) : (
+          "No governed target recorded"
+        )}
       </td>
       <td className="py-3 pr-4 text-muted-foreground">
         {order.averageFillPriceTicks === undefined || order.averageFillPriceTicks === null

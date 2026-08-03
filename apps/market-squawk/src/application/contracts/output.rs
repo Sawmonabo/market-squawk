@@ -169,6 +169,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Research.StartExport"
         | "Analysis.StartScenarioBatch"
         | "Analysis.StartFeatureDatasetBuild"
+        | "Analysis.StartPreparedFeatureDatasetBuild"
+        | "Analysis.StartPreparedBacktest"
         | "Analysis.StartBacktest" => job_receipt(),
         "Research.IngestSource" => closed(
             vec![
@@ -354,6 +356,47 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             "kind",
             enumeration(&["feature_contract", "feature_dataset"]),
         )]))),
+        "Analysis.GetFeatureDatasetPreparationOptions" => closed(
+            vec![
+                ("catalogGeneration", text()),
+                ("datasets", bounded_array(record(), 256)),
+            ],
+            &["catalogGeneration", "datasets"],
+        ),
+        "Analysis.PreviewFeatureDatasetBuild" => closed(
+            vec![
+                ("receipt", record()),
+                ("dataset", text()),
+                ("source", text()),
+                ("instrumentId", uuid()),
+                ("intendedUse", enumeration(&["local_analysis", "train"])),
+                ("examples", unsigned()),
+                ("trainExamples", unsigned()),
+                ("validationExamples", unsigned()),
+                ("testExamples", unsigned()),
+                ("observedFrom", timestamp()),
+                ("observedThrough", timestamp()),
+                ("buildSpecSha256", text()),
+                ("evidence", bounded_array(text(), 4_096)),
+            ],
+            &[
+                "receipt",
+                "dataset",
+                "source",
+                "instrumentId",
+                "intendedUse",
+                "examples",
+                "trainExamples",
+                "validationExamples",
+                "testExamples",
+                "observedFrom",
+                "observedThrough",
+                "buildSpecSha256",
+                "evidence",
+            ],
+        ),
+        "Analysis.GetBacktestPreparation" => backtest_preparation_options(),
+        "Analysis.PreviewBacktest" => backtest_preparation_preview(),
         "Analysis.GetBacktests" | "Analysis.RunBacktest" => backtest_record(),
         "Analysis.ReadArtifact" => closed(
             vec![
@@ -397,7 +440,18 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         ),
         "Model.Evaluate" => model_output(true),
         "Model.Predict" => model_output(false),
-        "Model.StartTraining" => job_receipt(),
+        "Model.StartTraining" | "Model.StartPreparedForecast" => job_receipt(),
+        "Model.GetForecastPreparation" => closed(
+            vec![
+                ("runtimeGenerationSha256", text()),
+                ("models", bounded_array(record(), 4_096)),
+            ],
+            &["runtimeGenerationSha256", "models"],
+        ),
+        "Model.PrepareForecast" => closed(
+            vec![("receipt", record()), ("preview", record())],
+            &["receipt", "preview"],
+        ),
         "Model.StartForecast" => job_receipt(),
         "Model.GenerateForecast" | "Model.GetForecast" => forecast_vintage(),
         "Model.ListForecasts" => closed(
@@ -436,6 +490,84 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("evidence", record()),
             ("references", array(record())),
         ]),
+        "Decision.GetTargetPreparation" => closed(
+            vec![
+                ("dossierId", text()),
+                ("instrumentId", uuid()),
+                ("assembledAt", timestamp()),
+                ("forecastOptions", bounded_array(record(), 4_096)),
+                ("fairValueAvailable", boolean()),
+                ("portfolioAvailable", boolean()),
+                ("referenceMarks", bounded_array(record(), 4_096)),
+            ],
+            &[
+                "dossierId",
+                "instrumentId",
+                "assembledAt",
+                "forecastOptions",
+                "fairValueAvailable",
+                "portfolioAvailable",
+                "referenceMarks",
+            ],
+        ),
+        "Decision.PrepareTargetSet" => closed(
+            vec![
+                ("receiptId", uuid()),
+                ("receiptExpiresAt", timestamp()),
+                ("targetId", text()),
+                ("revision", unsigned()),
+                ("dossierId", text()),
+                ("instrumentId", uuid()),
+                ("intent", enumeration(&["buy", "sell", "hold"])),
+                ("referenceMark", record()),
+                ("referenceMarkObservedAt", timestamp()),
+                ("referenceMarkQuality", text()),
+                ("referenceMarkSource", text()),
+                ("prices", record()),
+                ("method", text()),
+                ("assumptions", bounded_array(record(), 4_096)),
+                ("thesis", text()),
+                ("risks", bounded_array(text(), 4_096)),
+                ("invalidationConditions", bounded_array(text(), 4_096)),
+                ("createdAt", timestamp()),
+                ("horizonAt", timestamp()),
+                ("expiresAt", timestamp()),
+                ("reviewDueAt", timestamp()),
+                ("author", text()),
+                ("rulesetVersion", unsigned()),
+                ("forecastSelected", boolean()),
+                ("fairValueSelected", boolean()),
+                ("portfolioSelected", boolean()),
+            ],
+            &[
+                "receiptId",
+                "receiptExpiresAt",
+                "targetId",
+                "revision",
+                "dossierId",
+                "instrumentId",
+                "intent",
+                "referenceMark",
+                "referenceMarkObservedAt",
+                "referenceMarkQuality",
+                "referenceMarkSource",
+                "prices",
+                "method",
+                "assumptions",
+                "thesis",
+                "risks",
+                "invalidationConditions",
+                "createdAt",
+                "horizonAt",
+                "expiresAt",
+                "reviewDueAt",
+                "author",
+                "rulesetVersion",
+                "forecastSelected",
+                "fairValueSelected",
+                "portfolioSelected",
+            ],
+        ),
         "Decision.GetTargetSet" => closed(
             vec![
                 ("target", record()),
@@ -561,6 +693,44 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "components",
                 "encryption",
                 "manifestSha256",
+            ],
+        ),
+        "Operations.GetRuntimeStatus" => closed(
+            vec![
+                ("ready", constant_bool(true)),
+                (
+                    "workspace",
+                    closed(
+                        vec![
+                            ("workspaceId", uuid()),
+                            ("generation", bounded_unsigned_range(1, u64::MAX)),
+                        ],
+                        &["workspaceId", "generation"],
+                    ),
+                ),
+                (
+                    "workspaceSchemaVersion",
+                    bounded_unsigned_range(1, u64::from(u32::MAX)),
+                ),
+                ("availableDiskBytes", unsigned()),
+                ("runningJobs", bounded_unsigned(u64::from(u32::MAX))),
+                ("runningMutationJobs", bounded_unsigned(u64::from(u32::MAX))),
+                ("activeSources", bounded_unsigned(u64::from(u32::MAX))),
+                ("connectedClients", bounded_unsigned(u64::from(u32::MAX))),
+                ("paperExecutionActive", boolean()),
+                ("executionReconciliationPending", boolean()),
+            ],
+            &[
+                "ready",
+                "workspace",
+                "workspaceSchemaVersion",
+                "availableDiskBytes",
+                "runningJobs",
+                "runningMutationJobs",
+                "activeSources",
+                "connectedClients",
+                "paperExecutionActive",
+                "executionReconciliationPending",
             ],
         ),
         "Operations.GetUpdateStatus" => closed(
@@ -788,8 +958,12 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         }
         "Bot.GetStatus" => bot_status(),
         "Bot.Start" => closed(
-            vec![("state", constant("running")), ("provider", text())],
-            &["state", "provider"],
+            vec![
+                ("state", constant("running")),
+                ("provider", text()),
+                ("strategyMode", enumeration(&["manual", "book_imbalance"])),
+            ],
+            &["state", "provider", "strategyMode"],
         ),
         "Bot.Stop" | "Risk.TriggerKillSwitch" => closed(
             vec![
@@ -803,12 +977,28 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("orderId", text()),
             ("state", text()),
             ("requestedLots", unsigned()),
+            ("targetReference", nullable(manual_paper_target_reference())),
         ])),
         "Execution.GetFills" => nullable_rows(signature(vec![
             ("sequence", unsigned()),
             ("orderId", text()),
             ("quantityLots", unsigned()),
         ])),
+        "Execution.GetManualPaperTargets" => closed(
+            vec![("targets", bounded_array(manual_paper_target(), 100))],
+            &["targets"],
+        ),
+        "Execution.SubmitManualPaperDraft" => closed(
+            vec![
+                ("state", constant("accepted")),
+                ("targetId", bounded_text(128)),
+                (
+                    "targetRevision",
+                    bounded_unsigned_range(1, u64::from(u32::MAX)),
+                ),
+            ],
+            &["state", "targetId", "targetRevision"],
+        ),
         "Execution.Cancel" => closed(
             vec![
                 ("orderId", text()),
@@ -1485,6 +1675,112 @@ fn forecast_vintage() -> Value {
     ])
 }
 
+fn backtest_preparation_options() -> Value {
+    closed(
+        vec![
+            (
+                "datasets",
+                bounded_array(
+                    closed(
+                        vec![
+                            ("id", bounded_text(256)),
+                            ("label", bounded_text(160)),
+                            ("immutableGeneration", bounded_text(64)),
+                            ("instrumentCount", unsigned()),
+                            (
+                                "periods",
+                                bounded_array(
+                                    closed(
+                                        vec![
+                                            ("id", bounded_text(256)),
+                                            ("label", bounded_text(256)),
+                                            ("startsAt", timestamp()),
+                                            ("endsAt", timestamp()),
+                                        ],
+                                        &["id", "label", "startsAt", "endsAt"],
+                                    ),
+                                    2,
+                                ),
+                            ),
+                        ],
+                        &[
+                            "id",
+                            "label",
+                            "immutableGeneration",
+                            "instrumentCount",
+                            "periods",
+                        ],
+                    ),
+                    4_096,
+                ),
+            ),
+            ("strategies", bounded_array(backtest_named_option(), 16)),
+            ("costPolicies", bounded_array(backtest_named_option(), 16)),
+            ("seeds", bounded_array(backtest_named_option(), 16)),
+            ("portfolios", bounded_array(backtest_named_option(), 16)),
+            ("comparisons", bounded_array(backtest_named_option(), 16)),
+            ("defaultLimitPolicy", bounded_text(1_024)),
+        ],
+        &[
+            "datasets",
+            "strategies",
+            "costPolicies",
+            "seeds",
+            "portfolios",
+            "comparisons",
+            "defaultLimitPolicy",
+        ],
+    )
+}
+
+fn backtest_named_option() -> Value {
+    closed(
+        vec![
+            ("id", bounded_text(256)),
+            ("label", bounded_text(256)),
+            ("description", bounded_text(1_024)),
+        ],
+        &["id", "label", "description"],
+    )
+}
+
+fn backtest_preparation_preview() -> Value {
+    closed(
+        vec![
+            (
+                "receipt",
+                closed(
+                    vec![("receiptId", uuid()), ("preparationDigest", sha256())],
+                    &["receiptId", "preparationDigest"],
+                ),
+            ),
+            ("expiresAt", timestamp()),
+            ("dataset", bounded_text(512)),
+            ("period", bounded_text(512)),
+            ("strategy", bounded_text(256)),
+            ("costPolicy", bounded_text(256)),
+            ("deterministicSeed", bounded_text(256)),
+            ("portfolio", bounded_text(256)),
+            ("comparison", bounded_text(256)),
+            ("evidence", bounded_array(bounded_text(2_048), 64)),
+            ("assumptions", bounded_array(bounded_text(2_048), 64)),
+        ],
+        &[
+            "receipt",
+            "expiresAt",
+            "dataset",
+            "period",
+            "strategy",
+            "costPolicy",
+            "deterministicSeed",
+            "portfolio",
+            "comparison",
+            "evidence",
+            "assumptions",
+        ],
+    )
+}
+
 fn measurement() -> Value {
     signature(vec![
         ("measurementId", text()),
@@ -1508,6 +1804,78 @@ fn money() -> Value {
     closed(
         vec![("amount", text()), ("currency", text())],
         &["amount", "currency"],
+    )
+}
+
+fn manual_paper_target() -> Value {
+    closed(
+        vec![
+            ("targetId", bounded_text(128)),
+            (
+                "targetRevision",
+                bounded_unsigned_range(1, u64::from(u32::MAX)),
+            ),
+            ("instrumentId", uuid()),
+            ("status", constant("active")),
+            ("thesis", bounded_text(4_096)),
+            ("expiresAt", integer()),
+            ("reviewDueAt", integer()),
+            (
+                "route",
+                closed(
+                    vec![("venueId", bounded_text(128)), ("instrumentId", uuid())],
+                    &["venueId", "instrumentId"],
+                ),
+            ),
+            ("ladder", fixed_array(manual_paper_ladder_entry(), 10)),
+        ],
+        &[
+            "targetId",
+            "targetRevision",
+            "instrumentId",
+            "status",
+            "thesis",
+            "expiresAt",
+            "reviewDueAt",
+            "route",
+            "ladder",
+        ],
+    )
+}
+
+fn manual_paper_ladder_entry() -> Value {
+    closed(
+        vec![
+            (
+                "level",
+                enumeration(&[
+                    "downside",
+                    "add",
+                    "entry_lower",
+                    "entry_upper",
+                    "base",
+                    "trim_lower",
+                    "trim_upper",
+                    "exit_lower",
+                    "exit_upper",
+                    "upside",
+                ]),
+            ),
+            ("label", bounded_text(96)),
+            ("value", money()),
+        ],
+        &["level", "label", "value"],
+    )
+}
+
+fn manual_paper_target_reference() -> Value {
+    closed(
+        vec![
+            ("targetId", bounded_text(128)),
+            ("revision", bounded_unsigned_range(1, u64::MAX)),
+            ("contentSha256", sha256()),
+        ],
+        &["targetId", "revision", "contentSha256"],
     )
 }
 
@@ -1568,6 +1936,7 @@ fn bot_status() -> Value {
         closed(
             vec![
                 ("state", constant("running")),
+                ("strategyMode", enumeration(&["manual", "book_imbalance"])),
                 ("sequence", unsigned()),
                 ("complete", boolean()),
                 ("reconciliationRequired", boolean()),
@@ -1578,6 +1947,7 @@ fn bot_status() -> Value {
             ],
             &[
                 "state",
+                "strategyMode",
                 "sequence",
                 "complete",
                 "reconciliationRequired",
@@ -1646,6 +2016,14 @@ fn text() -> Value {
 
 fn bounded_text(maximum: usize) -> Value {
     json!({"type": "string", "minLength": 1, "maxLength": maximum})
+}
+
+fn sha256() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64
+    })
 }
 
 fn uuid() -> Value {

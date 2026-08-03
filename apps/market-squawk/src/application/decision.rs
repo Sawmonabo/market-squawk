@@ -3,14 +3,15 @@
 mod backup;
 mod codec;
 mod persistence;
+pub(crate) mod target_preparation;
 
 use std::{fmt, sync::Mutex};
 
 use market_squawk_decisions::{
     AppendOutcome, CandidateAssessment, CandidateInput, DecisionAuthority, DecisionDossier,
-    DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits, GovernedTargetSet,
-    InvestmentTargetSetId, SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId,
-    TargetIndexEntry, TargetInvalidation, TargetReview, TargetState, TargetStatus,
+    DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits, InvestmentTargetSetId,
+    SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry,
+    TargetInvalidation, TargetReview, TargetState, TargetStatus,
 };
 use market_squawk_domain::{RevisionNumber, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
@@ -19,6 +20,11 @@ use self::codec::{EncodedRecord, RecoveryContext};
 use self::persistence::DecisionJournal;
 
 pub(crate) use self::backup::RetainedDecisionBackupSnapshot;
+use self::target_preparation::{
+    PreparedTargetPreview, TargetEvidenceInventory, TargetPreparationCommitKind,
+    TargetPreparationDraft, TargetPreparationError, TargetPreparationFence,
+    TargetPreparationReceipt, TargetReferenceMarkSelector,
+};
 
 /// Typed application failure that does not leak SQLite, lock, or filesystem internals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +70,7 @@ impl From<DecisionRepositoryError> for DecisionApplicationError {
 struct DecisionState {
     authority: DecisionAuthority,
     journal: DecisionJournal,
+    preparation: target_preparation::TargetPreparationAuthority,
     limits: DecisionRepositoryLimits,
     backup_retained: bool,
     poisoned: bool,
@@ -91,6 +98,7 @@ impl DecisionApplication {
             state: Mutex::new(DecisionState {
                 authority,
                 journal,
+                preparation: target_preparation::TargetPreparationAuthority::default(),
                 limits,
                 backup_retained: false,
                 poisoned: false,
@@ -231,15 +239,66 @@ impl DecisionApplication {
             .map_err(Into::into)
     }
 
-    /// Immutable `CreateTargetSet` implementation committed before acknowledgment.
-    pub fn create_target(
+    /// Admits one exact producer-owned portfolio price as selectable target reference evidence.
+    ///
+    /// The application derives the evidence identity and opaque selector; presentation callers do
+    /// not submit either value.
+    pub fn admit_target_reference_mark(
         &self,
-        target: GovernedTargetSet,
-    ) -> Result<AppendOutcome, DecisionApplicationError> {
-        let encoded = codec::target(&target)?;
+        evidence: &market_squawk_portfolio::PriceEvidence,
+        quality: market_squawk_domain::DataQuality,
+        admitted_at: Timestamp,
+    ) -> Result<TargetReferenceMarkSelector, TargetPreparationError> {
+        self.writer()?
+            .preparation
+            .admit_reference_mark(evidence, quality, admitted_at)
+    }
+
+    /// Enumerates bounded authoritative target evidence for one retained dossier.
+    pub fn target_evidence_inventory(
+        &self,
+        dossier_id: &market_squawk_decisions::DossierId,
+        now: Timestamp,
+    ) -> Result<TargetEvidenceInventory, TargetPreparationError> {
+        let state = self.reader()?;
+        let dossier = state
+            .authority
+            .get_dossier(dossier_id)
+            .map_err(|_error| TargetPreparationError::NotFound)?;
+        state.preparation.inventory(dossier, now)
+    }
+
+    /// Validates a human target judgment and retains its exact typed target behind a receipt.
+    pub fn prepare_target(
+        &self,
+        fence: TargetPreparationFence,
+        draft: TargetPreparationDraft,
+        now: Timestamp,
+    ) -> Result<PreparedTargetPreview, TargetPreparationError> {
         let mut state = self.writer()?;
-        let outcome = state.authority.create_target(target)?;
-        persist_outcome(&mut state, &encoded, outcome)
+        let DecisionState {
+            authority,
+            preparation,
+            ..
+        } = &mut *state;
+        preparation.prepare(
+            &target_preparation::DecisionStateView { authority },
+            fence,
+            draft,
+            now,
+        )
+    }
+
+    /// Consumes one preparation receipt and revalidates its complete authority fence before append.
+    pub fn consume_target_preparation(
+        &self,
+        receipt: TargetPreparationReceipt,
+        fence: TargetPreparationFence,
+        expected: TargetPreparationCommitKind,
+        now: Timestamp,
+    ) -> Result<AppendOutcome, TargetPreparationError> {
+        let mut state = self.writer()?;
+        target_preparation::consume_prepared(&mut state, receipt, fence, expected, now)
     }
 
     /// Immutable `GetTargetSet` implementation.
@@ -302,18 +361,6 @@ impl DecisionApplication {
         let encoded = codec::review(&review)?;
         let mut state = self.writer()?;
         let outcome = state.authority.review_target(review)?;
-        persist_outcome(&mut state, &encoded, outcome)
-    }
-
-    /// Compare-and-append `ReevaluateTargetSet` implementation.
-    pub fn reevaluate_target(
-        &self,
-        expected: RevisionNumber,
-        successor: GovernedTargetSet,
-    ) -> Result<AppendOutcome, DecisionApplicationError> {
-        let encoded = codec::target(&successor)?;
-        let mut state = self.writer()?;
-        let outcome = state.authority.reevaluate_target(expected, successor)?;
         persist_outcome(&mut state, &encoded, outcome)
     }
 

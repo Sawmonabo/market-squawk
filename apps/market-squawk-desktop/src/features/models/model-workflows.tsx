@@ -42,7 +42,6 @@ export function ModelWorkflows({
   )
   const canEvaluate = operations.has("Model.Evaluate")
   const canTrain = operations.has("Model.StartTraining")
-  const canForecast = operations.has("Model.StartForecast")
   const [featureValues, setFeatureValues] = React.useState<Record<string, string>>({})
   const [configuration, setConfiguration] = React.useState<InputTicket | null>(null)
   const [authority, setAuthority] = React.useState<InputTicket | null>(null)
@@ -255,14 +254,6 @@ export function ModelWorkflows({
           ) : null}
           {stageError ? <WorkflowError text={stageError} /> : null}
         </div>
-      </div>
-
-      <div className="mt-4 rounded-lg border border-border bg-background/20 p-3 text-[11px] leading-5 text-muted-foreground">
-        {canForecast
-          ? "Model.StartForecast is installed, but this view has no governed observed-history/PIT input matrix from which to construct its closed request. It is intentionally not exposed as a raw JSON form."
-          : "Model.StartForecast is not registered by this service generation."}
-        {" "}Compare, admit, and reject controls are also omitted because no matching closed desktop
-        actions are advertised.
       </div>
 
       <Dialog open={pending !== null} onOpenChange={(open) => { if (!open && !mutation.isPending) setPending(null) }}>

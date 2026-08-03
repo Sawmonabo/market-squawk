@@ -22,6 +22,7 @@ import type {
   InstallationControlRequest,
   ModelControlRequest,
   McpClientControlRequest,
+  ManualPaperRequest,
   OperationsControlRequest,
   PaperControlRequest,
   ProductTransport,
@@ -64,6 +65,30 @@ class TauriTransport implements ProductTransport {
     return applicationResultSchema.parse(value)
   }
 
+  async datasetPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("analysis_control", {
+      request: mapPreparationAction(request, {
+        options: "featureDatasetOptions",
+        preview: "previewFeatureDataset",
+        start: "startPreparedFeatureDataset",
+      }),
+      confirmed,
+    })
+    return applicationResultSchema.parse(value)
+  }
+
+  async backtestPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("analysis_control", {
+      request: mapPreparationAction(request, {
+        options: "backtestOptions",
+        preview: "previewBacktest",
+        start: "startPreparedBacktest",
+      }),
+      confirmed,
+    })
+    return applicationResultSchema.parse(value)
+  }
+
   async startBacktestFromFile(confirmed = false) {
     const value = await invoke("start_backtest_from_file", { confirmed })
     return value === null ? null : applicationResultSchema.parse(value)
@@ -71,6 +96,18 @@ class TauriTransport implements ProductTransport {
 
   async modelControl(request: ModelControlRequest, confirmed = false) {
     const value = await invoke("model_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async forecastPreparation(request: unknown, confirmed = false) {
+    const value = await invoke("model_control", {
+      request: mapPreparationAction(request, {
+        options: "forecastPreparationOptions",
+        preview: "prepareForecast",
+        start: "startPreparedForecast",
+      }),
+      confirmed,
+    })
     return applicationResultSchema.parse(value)
   }
 
@@ -95,6 +132,11 @@ class TauriTransport implements ProductTransport {
   }
 
   async paperControl(request: PaperControlRequest, confirmed = false) {
+    const value = await invoke("paper_control", { request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async manualPaper(request: ManualPaperRequest, confirmed = false) {
     const value = await invoke("paper_control", { request, confirmed })
     return applicationResultSchema.parse(value)
   }
@@ -161,6 +203,25 @@ class TauriTransport implements ProductTransport {
   }
 }
 
+function mapPreparationAction(
+  request: unknown,
+  operations: Readonly<Record<"options" | "preview" | "start", string>>,
+): Record<string, unknown> {
+  if (
+    typeof request !== "object" ||
+    request === null ||
+    Array.isArray(request) ||
+    !("action" in request)
+  ) {
+    throw new Error("The guided preparation request is invalid.")
+  }
+  const action = request.action
+  if (action !== "options" && action !== "preview" && action !== "start") {
+    throw new Error("The guided preparation action is unsupported.")
+  }
+  return { ...request, action: operations[action] }
+}
+
 function parseProviderResult<Request extends ProviderOnboardingRequest>(
   request: Request,
   value: unknown,
@@ -202,11 +263,23 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
+  datasetPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  backtestPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
   startBacktestFromFile(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
   modelControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  forecastPreparation(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
@@ -227,6 +300,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   paperControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  manualPaper(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
