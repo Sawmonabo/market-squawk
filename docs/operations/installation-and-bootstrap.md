@@ -367,11 +367,24 @@ and the hosted script, manifests, packages, and endpoint redirects are downloade
 
 ## Contributor source mode
 
-Source development is separate from installed-product evidence. Contributors need the pinned Rust
-toolchain, Node.js/pnpm, and host Tauri prerequisites, then follow the repository
-[Development instructions](../../README.md#development). A source build may demonstrate a code path;
-it does not inherit package receipt, trust, clean-machine, service-registration, uninstall, or
-cross-platform evidence.
+Source development is separate from installed-product evidence. Contributors need exact `just`
+`1.57.0`, the pinned Rust/Node.js/pnpm/uv inputs, and the host Tauri prerequisites, then run:
+
+```bash
+just setup
+just dev
+```
+
+The complete development desktop uses the ignored repository-local
+`.market-squawk/development` data root. It builds and discovers its required debug sibling programs
+without admitting that fallback into non-debug packages. The shared development service may outlive
+the desktop so CLI and MCP clients can use the same runtime. Stop the desktop and service before
+using the confirmed `just reset-dev` command. `just dev-web` runs only Vite and cannot demonstrate
+service, MCP, data, model, risk, or execution readiness.
+
+See the repository [Development instructions](../../README.md#development) for installation and the
+complete command index. A source build may demonstrate a code path; it does not inherit package
+receipt, trust, clean-machine, service-registration, uninstall, or cross-platform evidence.
 
 ## Related documentation and sources
 

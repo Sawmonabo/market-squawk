@@ -258,10 +258,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         tauri::async_runtime::block_on(service::connect_or_start(&config, config_path.as_deref()))?;
     let local_paths = LocalPaths::open_existing(config.data_dir())
         .map_err(|_error| DesktopStartupError::McpClientAuthority)?;
-    let relay_snapshot = program_install_snapshot(&installation.root, ProgramName::McpRelay)?;
-    let relay_program = relay_snapshot
-        .program_path()
-        .ok_or(DesktopStartupError::McpClientAuthority)?;
+    let relay_program = mcp_relay_program(&installation.root)?;
     let state = DesktopState::try_new(
         service.application,
         service.bootstrap,
@@ -304,6 +301,45 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         _ => {}
     });
     Ok(exit_code)
+}
+
+fn mcp_relay_program(installation_root: &Path) -> Result<PathBuf, DesktopStartupError> {
+    let installed = program_install_snapshot(installation_root, ProgramName::McpRelay)?;
+    #[cfg(debug_assertions)]
+    {
+        let current =
+            std::env::current_exe().map_err(|_source| DesktopStartupError::McpClientAuthority)?;
+        mcp_relay_program_for(installed.program_path(), &current)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        mcp_relay_program_for(installed.program_path(), Path::new(""))
+    }
+}
+
+fn mcp_relay_program_for(
+    installed_program: Option<&Path>,
+    current_executable: &Path,
+) -> Result<PathBuf, DesktopStartupError> {
+    if let Some(installed_program) = installed_program {
+        return Ok(installed_program.to_path_buf());
+    }
+    #[cfg(debug_assertions)]
+    {
+        let directory = current_executable
+            .parent()
+            .filter(|directory| current_executable.is_absolute() && directory.is_absolute())
+            .ok_or(DesktopStartupError::McpClientAuthority)?;
+        Ok(directory.join(format!(
+            "market-squawk-mcp-relay{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = current_executable;
+        Err(DesktopStartupError::McpClientAuthority)
+    }
 }
 
 fn handoff_to_selected_release(program: &Path) -> Result<i32, DesktopStartupError> {
@@ -399,4 +435,39 @@ pub(crate) fn appimage_mcp_launcher(
         return Err(AppImageMcpLauncherError);
     }
     Ok(Some(AppImageMcpLauncher { cli_program }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use super::mcp_relay_program_for;
+
+    #[test]
+    fn debug_relay_selection_prefers_installation_and_uses_only_the_desktop_sibling() {
+        let executable = env::temp_dir()
+            .join("market-squawk-desktop-test")
+            .join(format!("market-squawk-desktop{}", env::consts::EXE_SUFFIX));
+        let installed = env::temp_dir()
+            .join("market-squawk-managed-test")
+            .join(format!(
+                "market-squawk-mcp-relay{}",
+                env::consts::EXE_SUFFIX
+            ));
+        let sibling = executable.with_file_name(format!(
+            "market-squawk-mcp-relay{}",
+            env::consts::EXE_SUFFIX
+        ));
+
+        assert_eq!(
+            mcp_relay_program_for(Some(&installed), &executable)
+                .ok()
+                .as_deref(),
+            Some(installed.as_path())
+        );
+        assert_eq!(
+            mcp_relay_program_for(None, &executable).ok().as_deref(),
+            Some(sibling.as_path())
+        );
+    }
 }

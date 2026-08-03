@@ -297,20 +297,28 @@ lockfile. Crates are grouped by product responsibility:
 
 ### Build from source
 
-Source development requires Git, the repository-pinned Rust `1.97.1` toolchain, Node.js `24.18.0`,
-pnpm `10.31.0`, and the official
-[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform.
+Source development requires Git, exact `just` `1.57.0`, the repository-pinned Rust `1.97.1`
+toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.1`, and the official
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform. Install
+`just` once through the already-required Rust toolchain, then use the repository-owned commands:
 
 ```bash
 git clone https://github.com/Sawmonabo/market-squawk.git
 cd market-squawk
-rustup show active-toolchain
-pnpm --dir apps/market-squawk-desktop install --frozen-lockfile
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk"
+cargo install just --version 1.57.0 --locked
+just setup
+just dev
 ```
 
-Build the headless Rust application and its required helpers with:
+`just dev` incrementally builds the required CLI, service, MCP relay, capture helper, and ONNX
+worker before starting the Tauri desktop with Vite hot reload. Its ignored
+`.market-squawk/development` data root is separate from installed-product data. The one shared
+service may remain available after the desktop exits so the development CLI and MCP clients can
+reuse it. `just dev-web` is frontend-only diagnostic mode, not the complete product.
+
+Use `just --list` to see the supported developer commands and `just doctor` to inspect the active
+tool and Tauri host-prerequisite state. For a focused headless release build, the underlying locked
+commands remain:
 
 ```bash
 CARGO_INCREMENTAL=0 cargo build --locked --release \
@@ -331,7 +339,8 @@ Before contributing:
 2. Keep provider-specific schemas in adapters and keep analytical or control-plane work outside the
    live event-to-action path.
 3. Run focused checks while developing.
-4. Run the repository gate before submitting an integration change:
+4. Use `just check`, `just test-package <crate>`, or `just test` during development.
+5. Run the repository gate before submitting an integration change:
 
 ```bash
 CARGO_INCREMENTAL=0 ./scripts/verify.sh
