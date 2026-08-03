@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import queue
 import re
@@ -22,6 +23,51 @@ SERVICE_BOOTSTRAP_TIMEOUT_SECONDS = 45.0
 SERVICE_START_TIMEOUT_SECONDS = 60.0
 MCP_PROTOCOL_VERSION = "2026-07-28"
 MAXIMUM_DIAGNOSTIC_BYTES = 8 * 1024
+
+
+def isolated_child_environment(root: pathlib.Path) -> dict[str, str]:
+    home = root / "home"
+    temporary = root / "tmp"
+    xdg_config = root / "xdg" / "config"
+    xdg_data = root / "xdg" / "data"
+    xdg_state = root / "xdg" / "state"
+    xdg_cache = root / "xdg" / "cache"
+    for directory in (home, temporary, xdg_config, xdg_data, xdg_state, xdg_cache):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    environment = {
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "TMP": str(temporary),
+        "TEMP": str(temporary),
+        "XDG_CONFIG_HOME": str(xdg_config),
+        "XDG_DATA_HOME": str(xdg_data),
+        "XDG_STATE_HOME": str(xdg_state),
+        "XDG_CACHE_HOME": str(xdg_cache),
+    }
+    path = os.environ.get("PATH")
+    if path:
+        environment["PATH"] = path
+    if os.name == "nt":
+        app_data = root / "appdata"
+        local_app_data = root / "localappdata"
+        app_data.mkdir(parents=True, exist_ok=True)
+        local_app_data.mkdir(parents=True, exist_ok=True)
+        home_drive, home_path = os.path.splitdrive(str(home))
+        environment.update(
+            {
+                "APPDATA": str(app_data),
+                "LOCALAPPDATA": str(local_app_data),
+                "USERPROFILE": str(home),
+                "HOMEDRIVE": home_drive,
+                "HOMEPATH": home_path,
+            }
+        )
+        for name in ("SystemRoot", "ComSpec", "PATHEXT"):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+    return environment
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -144,6 +190,7 @@ def bootstrap_service(
     binary: pathlib.Path,
     data_dir: str,
     requirement: str,
+    environment: dict[str, str],
 ) -> None:
     unlock = secrets.token_urlsafe(32) if requirement == "encrypted_fallback_locked" else ""
     command = [
@@ -172,6 +219,7 @@ def bootstrap_service(
             stderr=stderr,
             text=True,
             check=False,
+            env=environment,
             timeout=SERVICE_BOOTSTRAP_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
@@ -186,6 +234,7 @@ def wait_for_service(
     binary: pathlib.Path,
     data_dir: str,
     service: subprocess.Popen[str],
+    environment: dict[str, str],
 ) -> None:
     deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
     bootstrap_attempted = False
@@ -211,6 +260,7 @@ def wait_for_service(
                 stdout=probe_stdout,
                 stderr=probe_stderr,
                 check=False,
+                env=environment,
                 timeout=SERVICE_STATUS_TIMEOUT_SECONDS,
                 text=True,
             )
@@ -231,7 +281,9 @@ def wait_for_service(
                     and isinstance(bootstrap.get("requirement"), str)
                 ):
                     bootstrap_attempted = True
-                    bootstrap_service(binary, data_dir, bootstrap["requirement"])
+                    bootstrap_service(
+                        binary, data_dir, bootstrap["requirement"], environment
+                    )
         time.sleep(0.1)
     raise TimeoutError(
         f"installed service did not reach readiness in {SERVICE_START_TIMEOUT_SECONDS:.3f}s"
@@ -244,11 +296,20 @@ def main() -> int:
     require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
     with (
         tempfile.TemporaryDirectory() as temporary_data_dir,
+        tempfile.TemporaryDirectory(
+            prefix="market-squawk-smoke-user-"
+        ) as temporary_user_root,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
     ):
         data_dir = str(arguments.data_dir or temporary_data_dir)
+        environment = (
+            None
+            if arguments.running_service
+            else isolated_child_environment(pathlib.Path(temporary_user_root))
+        )
         service: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[str] | None = None
         command = [
             str(binary),
             "--data-dir",
@@ -269,34 +330,33 @@ def main() -> int:
                 "--data-dir",
                 data_dir,
             ]
-        if not arguments.desktop_appimage and not arguments.running_service:
-            service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
-            require(
-                service_binary.is_file(),
-                f"Market Squawk service binary does not exist: {service_binary}",
-            )
-            service = subprocess.Popen(
-                [str(service_binary), "--data-dir", data_dir],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=service_stderr,
-                text=True,
-            )
-            try:
-                wait_for_service(binary, data_dir, service)
-            except BaseException:
-                stop_process(service)
-                raise
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr_log,
-            text=True,
-            bufsize=1,
-        )
         failure: BaseException | None = None
         try:
+            if not arguments.desktop_appimage and not arguments.running_service:
+                service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
+                require(
+                    service_binary.is_file(),
+                    f"Market Squawk service binary does not exist: {service_binary}",
+                )
+                service = subprocess.Popen(
+                    [str(service_binary), "--data-dir", data_dir],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=service_stderr,
+                    text=True,
+                    env=environment,
+                )
+                require(environment is not None, "isolated service environment is unavailable")
+                wait_for_service(binary, data_dir, service, environment)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_log,
+                text=True,
+                bufsize=1,
+                env=environment,
+            )
             initialized = request(
                 process,
                 {
@@ -459,12 +519,12 @@ def main() -> int:
         except BaseException as error:
             failure = error
         finally:
-            if failure is None:
+            if process is not None and failure is None:
                 try:
                     finish_process(process)
                 except BaseException as error:
                     failure = error
-            else:
+            elif process is not None:
                 stop_process(process)
             if service is not None:
                 stop_process(service)
