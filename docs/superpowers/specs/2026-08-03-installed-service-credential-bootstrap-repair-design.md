@@ -179,19 +179,30 @@ sequenceDiagram
 ## Platform enforcement
 
 The implementation uses `interprocess` 2.4.3 with its Tokio feature rather than repository-owned
-unsafe OS bindings.
+unsafe OS bindings. Bounded framing uses the already admitted `tokio-util` 0.7.19 with `codec` and
+`rt`. Windows also uses `win-security-identifier` 0.2.0 and `widestring` 1.2.1 through safe APIs.
 
-- **macOS and Linux:** a filesystem-namespaced local socket is created under the owner-only control
-  root with mode `0600`, no overwrite of a live endpoint, and exact peer effective-UID comparison.
-  The service removes only the endpoint it created for its bootstrap generation.
+- **Linux:** a filesystem-namespaced local socket is created under the validated owner-only control
+  root. `interprocess` applies mode `0600` before bind through its supported Linux path. The client
+  and server each require the peer effective UID to match their own.
+- **macOS:** the socket is created inside a prevalidated owner-only `0700` directory, then its node
+  is set to and verified as `0600`; `interprocess` does not claim its pre-bind mode extension on
+  macOS. The private directory is the creation-race boundary. Client and server each require the
+  peer effective UID to match their own.
 - **Windows:** a local-only named pipe uses a protected DACL containing only the current logon SID.
   The default Windows pipe DACL is prohibited because it grants read access to Everyone and
-  anonymous users. The server additionally verifies the connected client's effective token under
-  named-pipe impersonation against the service logon SID. `accept_remote` remains false.
+  anonymous users. The listener first accepts a synchronous `interprocess` stream, reads one fixed
+  non-secret preface, verifies the impersonated client token contains the service logon SID under
+  the dependency's RAII guard, then safely transfers the authenticated handle to the Tokio stream.
+  The all-Tokio stream cannot perform that client-token check. Remote clients remain rejected and
+  first-instance creation fails closed on name preemption.
 
 `win-security-identifier` 0.2.0 supplies the safe current-user and logon-SID operations used to
-construct and verify the Windows boundary. The repository keeps `unsafe_code = "forbid"`; all OS
-FFI stays inside reviewed dependencies.
+construct and verify the Windows boundary. `widestring` 1.2.1 supplies the checked UTF-16 SDDL
+boundary required by `interprocess`. The repository keeps `unsafe_code = "forbid"`; all OS FFI
+stays inside reviewed dependencies. The Windows DACL admits the exact logon session, but the
+duplex library client requests generic write access; the product therefore does not claim a
+stronger same-session isolation boundary than the underlying API provides.
 
 Endpoint names are deterministic only within an owner-protected namespace and include the
 installation identity. Endpoint discoverability is not treated as authentication.
@@ -282,10 +293,14 @@ Reviewed 2026-08-03:
   current-session isolation in
   [Named Pipe Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
 - [`interprocess` 2.4.3](https://docs.rs/interprocess/2.4.3/interprocess/) supplies maintained Tokio
-  local sockets, Unix socket modes, peer credentials, Windows named-pipe security descriptors,
-  local-only pipes, and client impersonation under Apache-2.0/0BSD licensing.
+  local sockets, Unix peer credentials, Windows named-pipe security descriptors, local-only pipes,
+  and safe synchronous client impersonation under Apache-2.0/0BSD licensing. Its
+  [pinned Windows source](https://github.com/kotauskas/interprocess/tree/2.4.3/src/os/windows/named_pipe)
+  establishes why authentication precedes the safe handoff to Tokio.
 - [`win-security-identifier` 0.2.0](https://docs.rs/win-security-identifier/0.2.0/win_security_identifier/)
   supplies safe current-user/logon-SID handling under MIT/Apache-2.0 licensing.
+- [`tokio-util` 0.7.19](https://docs.rs/tokio-util/0.7.19/tokio_util/codec/length_delimited/struct.LengthDelimitedCodec.html)
+  supplies explicitly bounded framing; its default frame maximum is not used as product policy.
 - [`keyring` 4.1.5](https://docs.rs/keyring/4.1.5/keyring/) is the admitted cross-platform credential
   abstraction; Market Squawk retains explicit operation policy because construction alone does not
   prove unattended usability.
@@ -296,4 +311,3 @@ Reviewed 2026-08-03:
 - uv documents its [installer](https://docs.astral.sh/uv/reference/installer/) and
   [Python-version management](https://docs.astral.sh/uv/concepts/python-versions/); acquisition
   verification does not replace Market Squawk's installed-tree verification.
-

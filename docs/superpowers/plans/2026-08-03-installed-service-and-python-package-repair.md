@@ -22,9 +22,10 @@ and the approved
   general RPC, rendezvous state, logs, artifacts, or a plaintext file.
 - The native bootstrap endpoint is short lived and exposes only status, foreground-keyring retry,
   and encrypted-fallback unlock. It is not another application API.
-- Use `interprocess = "=2.4.3"` with `tokio`; use target-specific
-  `security-framework = "=3.7.0"` and `win-security-identifier = "=0.2.0"` only where required.
-  Recheck exact latest versions, licenses, and locked transitive impact immediately before editing
+- Use `interprocess = "=2.4.3"` with `tokio`; enable the existing `tokio-util = "=0.7.19"`
+  dependency's `codec` feature; use target-specific `security-framework = "=3.7.0"`,
+  `win-security-identifier = "=0.2.0"`, and `widestring = "=1.2.1"` only where required. Recheck
+  exact latest versions, licenses, and locked transitive impact immediately before editing
   manifests.
 - Keep `unsafe_code = "forbid"`. OS FFI remains inside admitted dependencies.
 - Extend existing behavioral test harnesses only. Add no prose test, wrapper test, file-existence
@@ -127,9 +128,12 @@ implementation workers edit the same feature worktree concurrently.
    only then does normal readiness publish.
 2. Implement the versioned binary protocol and strict limits from the design. Zeroize secret
    buffers on every path and keep response/debug/log data non-secret.
-3. On Unix create a `0600` local socket inside the owner control root and require matching effective
-   UID. On Windows create a local-only named pipe with an exact current-logon-SID DACL and verify
-   the impersonated client token contains that logon SID.
+3. On Linux create the socket as `0600` inside the owner control root. On macOS use a prevalidated
+   `0700` private parent, then set and verify the node as `0600`. Require bilateral matching
+   effective UID. On Windows create a local-only, first-instance named pipe with an exact
+   current-logon-SID DACL; authenticate a fixed non-secret preface on the synchronous stream under
+   RAII client impersonation and effective-token logon-SID membership, then safely hand the
+   authenticated handle to Tokio. Never substitute PID lookup for connection-bound identity.
 4. Make service startup hold one installation-global bootstrap guard, attempt exact runtime
    preparation, wait only on typed recoverable credential conditions, retry the unchanged durable
    plan, close the endpoint, compose, self-probe, and publish the normal rendezvous last.
@@ -223,4 +227,3 @@ implementation workers edit the same feature worktree concurrently.
 5. Hand off the owner-testable package references for the user's live E2E period. Do not publish or
    merge. Close completed GitHub issues/project items and clean only completed lane worktrees and
    merged lane branches; preserve the active feature branch and draft PR.
-

@@ -57,6 +57,10 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Installed service credential bootstrap and Python integrity](2026-08-03-installed-service-credential-bootstrap-and-python-integrity.md)
+  — evidence-verified per-user credential authority, owner-authenticated native bootstrap,
+  platform-specific local IPC composition, installed `RECORD` path semantics, and immutable
+  Python-generation release evidence.
 - [Installed Operations authority boundaries](2026-08-02-installed-operations-authority-boundaries.md)
   — exact-head source audit of the Operations composition gap and the required coherent backup,
   signed-update, settings/logging, and cross-generation recovery boundaries.
