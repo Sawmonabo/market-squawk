@@ -12,7 +12,7 @@ use market_squawk_installer::{
     InstallError, PlatformError, ProgramName, UninstallRequest, default_install_root,
     program_install_snapshot, uninstall,
 };
-use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources, LocalPaths};
+use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
 use tauri::Manager;
 use thiserror::Error;
 
@@ -26,7 +26,8 @@ mod service;
 mod service_client;
 
 use bridge::{
-    DesktopState, desktop_bootstrap, installation_control, open_official_provider_page,
+    DesktopBootstrapState, DesktopCompositionContext, DesktopState, desktop_bootstrap,
+    desktop_service_bootstrap, installation_control, open_official_provider_page,
     open_protected_provider_setup, provider_onboarding,
 };
 use events::subscribe_service_events;
@@ -34,7 +35,7 @@ use input_staging::{
     commit_portfolio_import, discard_portfolio_import, preview_portfolio_import,
     stage_training_input, start_backtest_from_file,
 };
-use mcp_clients::{DesktopMcpClientState, mcp_client_control, mcp_status};
+use mcp_clients::{mcp_client_control, mcp_status};
 use service_client::{
     analysis_control, dashboard_query, decision_control, fair_value_control, governance_control,
     governance_query, job_control, model_control, operations_control, paper_control,
@@ -202,6 +203,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             dashboard_query,
             decision_control,
             desktop_bootstrap,
+            desktop_service_bootstrap,
             discard_portfolio_import,
             fair_value_control,
             governance_control,
@@ -256,46 +258,39 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     )?;
     let service =
         tauri::async_runtime::block_on(service::connect_or_start(&config, config_path.as_deref()))?;
-    let local_paths = LocalPaths::open_existing(config.data_dir())
-        .map_err(|_error| DesktopStartupError::McpClientAuthority)?;
     let relay_program = mcp_relay_program(&installation.root)?;
-    let state = DesktopState::try_new(
-        service.application,
-        service.bootstrap,
-        config.data_dir().to_path_buf(),
-        installation.root,
-        installation.status,
+    let bootstrap_state = DesktopBootstrapState::compose(
+        app.handle(),
+        service,
+        DesktopCompositionContext::new(
+            config.data_dir().to_path_buf(),
+            installation.root,
+            installation.status,
+            relay_program,
+        ),
     )
     .map_err(|_error| DesktopStartupError::InvalidServiceBootstrap)?;
-    let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
-        state.mcp_authority_identities();
-    let mcp_clients = DesktopMcpClientState::try_new(
-        &local_paths,
-        relay_program,
-        state.runtime(),
-        endpoint_identity,
-        claude_credential_identity,
-        codex_credential_identity,
-    )
-    .map_err(|_error| DesktopStartupError::McpClientAuthority)?;
-    if !app.manage(state) || !app.manage(mcp_clients) {
+    if !app.manage(bootstrap_state) {
         return Err(DesktopStartupError::DuplicateState);
     }
     let exit_code = app.run_return(|handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
-            handle.state::<DesktopState>().begin_shutdown();
+            if let Some(state) = handle.try_state::<DesktopState>() {
+                state.begin_shutdown();
+            }
         }
         tauri::RunEvent::Exit => {
-            let state = handle.state::<DesktopState>();
-            let restart_program = state.scheduled_restart_program();
-            tauri::async_runtime::block_on(state.finish_shutdown());
-            if let Some(program) = restart_program
-                && std::process::Command::new(program)
-                    .args(std::env::args_os().skip(1))
-                    .spawn()
-                    .is_err()
-            {
-                eprintln!("market-squawk-desktop: failed to restart the selected release");
+            if let Some(state) = handle.try_state::<DesktopState>() {
+                let restart_program = state.scheduled_restart_program();
+                tauri::async_runtime::block_on(state.finish_shutdown());
+                if let Some(program) = restart_program
+                    && std::process::Command::new(program)
+                        .args(std::env::args_os().skip(1))
+                        .spawn()
+                        .is_err()
+                {
+                    eprintln!("market-squawk-desktop: failed to restart the selected release");
+                }
             }
         }
         _ => {}

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use market_squawk::service::BootstrapRequirement;
 use market_squawk_installer::{
     CommandError, InstallError, InstallStatus, RepairRequest, RollbackRequest, repair, rollback,
     status as installation_status, update_from_channel,
@@ -14,17 +15,25 @@ use market_squawk_installer::{
 use market_squawk_installer::{ProgramName, program_install_snapshot};
 #[cfg(not(target_os = "windows"))]
 use market_squawk_installer::{UninstallRequest, uninstall};
+use market_squawk_platform::{LocalPaths, SecretValue};
 use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, RuntimeIdentity};
 use market_squawk_services::RequestId;
 use serde_json::{Map, Value, json};
-use tauri::State;
+use tauri::{Manager as _, State};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
 use crate::contracts::{
-    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, InstallationControlCommand,
-    OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState,
+    ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
+    DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopStartup,
+    InstallationControlCommand, OperationSummary, ProviderOnboardingCommand, Readiness,
+    ReadinessState,
+};
+use crate::mcp_clients::DesktopMcpClientState;
+use crate::service::{
+    self, DesktopBootstrapAction, DesktopServiceBootstrap, DesktopServiceConnection,
+    DesktopServiceStartup,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -37,6 +46,110 @@ const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
+
+pub(crate) struct DesktopCompositionContext {
+    data_root: PathBuf,
+    installation_root: PathBuf,
+    installation_status: InstallStatus,
+    relay_program: PathBuf,
+}
+
+impl DesktopCompositionContext {
+    pub(crate) fn new(
+        data_root: PathBuf,
+        installation_root: PathBuf,
+        installation_status: InstallStatus,
+        relay_program: PathBuf,
+    ) -> Self {
+        Self {
+            data_root,
+            installation_root,
+            installation_status,
+            relay_program,
+        }
+    }
+}
+
+struct PendingDesktopBootstrap {
+    service: DesktopServiceBootstrap,
+    context: DesktopCompositionContext,
+}
+
+pub(crate) struct DesktopBootstrapState {
+    pending: tokio::sync::Mutex<Option<PendingDesktopBootstrap>>,
+}
+
+impl DesktopBootstrapState {
+    pub(crate) fn compose(
+        app: &tauri::AppHandle,
+        startup: DesktopServiceStartup,
+        context: DesktopCompositionContext,
+    ) -> Result<Self, DesktopCommandError> {
+        let pending = match startup {
+            DesktopServiceStartup::Ready(connection) => {
+                manage_ready_desktop(app, connection, &context)?;
+                None
+            }
+            DesktopServiceStartup::BootstrapRequired(service) => {
+                Some(PendingDesktopBootstrap { service, context })
+            }
+        };
+        Ok(Self {
+            pending: tokio::sync::Mutex::new(pending),
+        })
+    }
+
+    async fn status(&self) -> Result<DesktopServiceBootstrapStatus, DesktopCommandError> {
+        let pending = self.pending.lock().await;
+        let pending = pending.as_ref().ok_or_else(DesktopCommandError::internal)?;
+        Ok(DesktopServiceBootstrapStatus::required(
+            match pending.service.requirement() {
+                BootstrapRequirement::EncryptedFallbackLocked => {
+                    DesktopServiceBootstrapRequirement::EncryptedFallbackLocked
+                }
+                BootstrapRequirement::ForegroundKeyringRetry => {
+                    DesktopServiceBootstrapRequirement::ForegroundKeyringRetry
+                }
+            },
+        ))
+    }
+}
+
+fn manage_ready_desktop(
+    app: &tauri::AppHandle,
+    connection: DesktopServiceConnection,
+    context: &DesktopCompositionContext,
+) -> Result<(), DesktopCommandError> {
+    if app.try_state::<DesktopState>().is_some()
+        || app.try_state::<DesktopMcpClientState>().is_some()
+    {
+        return Err(DesktopCommandError::internal());
+    }
+    let local_paths = LocalPaths::open_existing(&context.data_root)
+        .map_err(|_error| DesktopCommandError::internal())?;
+    let state = DesktopState::try_new(
+        connection.application,
+        connection.bootstrap,
+        context.data_root.clone(),
+        context.installation_root.clone(),
+        context.installation_status.clone(),
+    )?;
+    let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
+        state.mcp_authority_identities();
+    let mcp_clients = DesktopMcpClientState::try_new(
+        &local_paths,
+        context.relay_program.clone(),
+        state.runtime(),
+        endpoint_identity,
+        claude_credential_identity,
+        codex_credential_identity,
+    )
+    .map_err(|_error| DesktopCommandError::internal())?;
+    if !app.manage(state) || !app.manage(mcp_clients) {
+        return Err(DesktopCommandError::internal());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum InvocationAuthority {
@@ -534,9 +647,62 @@ fn allocate_authorization_handle(
 
 #[tauri::command]
 pub(crate) async fn desktop_bootstrap(
-    state: State<'_, DesktopState>,
-) -> Result<DesktopBootstrap, DesktopCommandError> {
-    state.bootstrap().await
+    app: tauri::AppHandle,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+) -> Result<DesktopStartup, DesktopCommandError> {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        return state.bootstrap().await.map(DesktopStartup::Ready);
+    }
+    bootstrap_state
+        .status()
+        .await
+        .map(DesktopStartup::BootstrapRequired)
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_service_bootstrap(
+    request: DesktopServiceBootstrapCommand,
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    bootstrap_state: State<'_, DesktopBootstrapState>,
+) -> Result<(), DesktopCommandError> {
+    if window.label() != "main" || app.try_state::<DesktopState>().is_some() {
+        return Err(DesktopCommandError::new(
+            "service_bootstrap_unavailable",
+            "The local service bootstrap action is not available for this window.",
+        ));
+    }
+    let action = match request {
+        DesktopServiceBootstrapCommand::UnlockEncryptedFallback { unlock } => {
+            DesktopBootstrapAction::Unlock(SecretValue::new(unlock).map_err(|_error| {
+                DesktopCommandError::new(
+                    "service_bootstrap_rejected",
+                    "The local service rejected the bounded bootstrap action.",
+                )
+            })?)
+        }
+        DesktopServiceBootstrapCommand::RetryAfterForegroundKeyring => {
+            DesktopBootstrapAction::RetryAfterForegroundKeyring
+        }
+    };
+    let mut pending_guard = bootstrap_state.pending.lock().await;
+    let pending = pending_guard.as_ref().ok_or_else(|| {
+        DesktopCommandError::new(
+            "service_bootstrap_unavailable",
+            "The local service bootstrap action is no longer available.",
+        )
+    })?;
+    let connection = service::complete_bootstrap(&pending.service, action)
+        .await
+        .map_err(|_error| {
+            DesktopCommandError::new(
+                "service_bootstrap_failed",
+                "The local service could not complete credential bootstrap and reconnect.",
+            )
+        })?;
+    manage_ready_desktop(&app, connection, &pending.context)?;
+    *pending_guard = None;
+    Ok(())
 }
 
 #[tauri::command]

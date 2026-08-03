@@ -3,14 +3,18 @@
 use std::{
     path::Path,
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use market_squawk::{
-    service::{InstalledServiceConnector, InstalledServiceError},
+    service::{
+        BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceConnector,
+        InstalledServiceError,
+    },
     verified_installed_service_program,
 };
-use market_squawk_platform::AppConfig;
+use market_squawk_platform::{AppConfig, SecretValue};
 use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, NamedClient};
 use serde_json::Value;
 use thiserror::Error;
@@ -24,6 +28,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct DesktopServiceConnection {
     pub(crate) application: LoopbackApplicationClient,
     pub(crate) bootstrap: Value,
+}
+
+pub(crate) enum DesktopServiceStartup {
+    Ready(DesktopServiceConnection),
+    BootstrapRequired(DesktopServiceBootstrap),
+}
+
+pub(crate) struct DesktopServiceBootstrap {
+    connector: Arc<InstalledServiceConnector>,
+    requirement: BootstrapRequirement,
+}
+
+impl DesktopServiceBootstrap {
+    pub(crate) const fn requirement(&self) -> BootstrapRequirement {
+        self.requirement
+    }
+}
+
+pub(crate) enum DesktopBootstrapAction {
+    Unlock(SecretValue),
+    RetryAfterForegroundKeyring,
 }
 
 #[derive(Debug, Error)]
@@ -41,15 +66,20 @@ pub(crate) enum DesktopServiceError {
 pub(crate) async fn connect_or_start(
     config: &AppConfig,
     config_path: Option<&Path>,
-) -> Result<DesktopServiceConnection, DesktopServiceError> {
-    let connector = InstalledServiceConnector::try_new(config)
-        .map_err(|_error| DesktopServiceError::Discovery)?;
+) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    let connector = Arc::new(
+        InstalledServiceConnector::try_new(config)
+            .map_err(|_error| DesktopServiceError::Discovery)?,
+    );
     match connect(&connector).await {
-        Ok(connection) => return Ok(connection),
+        Ok(connection) => return Ok(DesktopServiceStartup::Ready(connection)),
         Err(ConnectionAttempt::NotRunning) => {}
         Err(ConnectionAttempt::InvalidBootstrap) => {
             return Err(DesktopServiceError::InvalidBootstrap);
         }
+    }
+    if let Some(bootstrap) = bootstrap_required(&connector).await? {
+        return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
     }
 
     let program =
@@ -73,18 +103,121 @@ pub(crate) async fn connect_or_start(
         .ok_or(DesktopServiceError::StartupDeadline)?;
     loop {
         match connect(&connector).await {
-            Ok(connection) => return Ok(connection),
+            Ok(connection) => return Ok(DesktopServiceStartup::Ready(connection)),
             Err(ConnectionAttempt::InvalidBootstrap) => {
                 stop_failed_start(&mut child);
                 return Err(DesktopServiceError::InvalidBootstrap);
             }
-            Err(ConnectionAttempt::NotRunning) => {}
+            Err(ConnectionAttempt::NotRunning) => match bootstrap_required(&connector).await {
+                Ok(Some(bootstrap)) => {
+                    return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    stop_failed_start(&mut child);
+                    return Err(error);
+                }
+            },
         }
         if Instant::now() >= deadline {
             stop_failed_start(&mut child);
             return Err(DesktopServiceError::StartupDeadline);
         }
         let _ = child.try_wait();
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+pub(crate) async fn complete_bootstrap(
+    bootstrap: &DesktopServiceBootstrap,
+    action: DesktopBootstrapAction,
+) -> Result<DesktopServiceConnection, DesktopServiceError> {
+    let action = admit_bootstrap_action(bootstrap.requirement, action)?;
+    let status = match action {
+        DesktopBootstrapAction::Unlock(unlock) => {
+            bootstrap.connector.bootstrap_unlock(unlock).await
+        }
+        DesktopBootstrapAction::RetryAfterForegroundKeyring => {
+            bootstrap
+                .connector
+                .bootstrap_retry_after_foreground_keyring()
+                .await
+        }
+    }
+    .map_err(|_error| DesktopServiceError::InvalidBootstrap)?;
+    if status.state() != InstalledServiceBootstrapState::Retrying || status.requirement().is_some()
+    {
+        return Err(DesktopServiceError::InvalidBootstrap);
+    }
+    connect_until_ready(&bootstrap.connector).await
+}
+
+fn admit_bootstrap_action(
+    requirement: BootstrapRequirement,
+    action: DesktopBootstrapAction,
+) -> Result<DesktopBootstrapAction, DesktopServiceError> {
+    if matches!(
+        (requirement, &action),
+        (
+            BootstrapRequirement::EncryptedFallbackLocked,
+            DesktopBootstrapAction::Unlock(_)
+        ) | (
+            BootstrapRequirement::ForegroundKeyringRetry,
+            DesktopBootstrapAction::RetryAfterForegroundKeyring
+        )
+    ) {
+        Ok(action)
+    } else {
+        Err(DesktopServiceError::InvalidBootstrap)
+    }
+}
+
+async fn bootstrap_required(
+    connector: &Arc<InstalledServiceConnector>,
+) -> Result<Option<DesktopServiceBootstrap>, DesktopServiceError> {
+    match connector.bootstrap_status().await {
+        Ok(status)
+            if status.state() == InstalledServiceBootstrapState::Required
+                && status.requirement().is_some() =>
+        {
+            Ok(Some(DesktopServiceBootstrap {
+                connector: Arc::clone(connector),
+                requirement: status
+                    .requirement()
+                    .ok_or(DesktopServiceError::InvalidBootstrap)?,
+            }))
+        }
+        Ok(status)
+            if status.state() == InstalledServiceBootstrapState::Retrying
+                && status.requirement().is_none() =>
+        {
+            Ok(None)
+        }
+        Err(InstalledServiceError::BootstrapUnavailable) => Ok(None),
+        Err(InstalledServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Ok(_) | Err(_) => Err(DesktopServiceError::InvalidBootstrap),
+    }
+}
+
+async fn connect_until_ready(
+    connector: &InstalledServiceConnector,
+) -> Result<DesktopServiceConnection, DesktopServiceError> {
+    let deadline = Instant::now()
+        .checked_add(STARTUP_TIMEOUT)
+        .ok_or(DesktopServiceError::StartupDeadline)?;
+    loop {
+        match connect(connector).await {
+            Ok(connection) => return Ok(connection),
+            Err(ConnectionAttempt::InvalidBootstrap) => {
+                return Err(DesktopServiceError::InvalidBootstrap);
+            }
+            Err(ConnectionAttempt::NotRunning) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(DesktopServiceError::StartupDeadline);
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
@@ -138,5 +271,44 @@ fn stop_failed_start(child: &mut Child) {
     if child.try_wait().ok().flatten().is_none() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk::service::BootstrapRequirement;
+    use market_squawk_platform::SecretValue;
+
+    use super::{DesktopBootstrapAction, admit_bootstrap_action};
+
+    #[test]
+    fn bootstrap_action_must_match_the_native_typed_requirement() {
+        assert!(matches!(
+            admit_bootstrap_action(
+                BootstrapRequirement::EncryptedFallbackLocked,
+                DesktopBootstrapAction::Unlock(
+                    SecretValue::new("process-local-test-unlock".to_owned())
+                        .expect("test unlock is valid"),
+                ),
+            ),
+            Ok(DesktopBootstrapAction::Unlock(_))
+        ));
+        assert!(
+            admit_bootstrap_action(
+                BootstrapRequirement::EncryptedFallbackLocked,
+                DesktopBootstrapAction::RetryAfterForegroundKeyring,
+            )
+            .is_err()
+        );
+        assert!(
+            admit_bootstrap_action(
+                BootstrapRequirement::ForegroundKeyringRetry,
+                DesktopBootstrapAction::Unlock(
+                    SecretValue::new("process-local-test-unlock".to_owned())
+                        .expect("test unlock is valid"),
+                ),
+            )
+            .is_err()
+        );
     }
 }

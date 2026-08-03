@@ -525,8 +525,25 @@ export const desktopEventSchema = z.object({
   ]),
 })
 
+export const desktopServiceBootstrapSchema = z.object({
+  status: z.literal("bootstrap_required"),
+  requirement: z.enum([
+    "encrypted_fallback_locked",
+    "foreground_keyring_retry",
+  ]),
+})
+
+export const desktopStartupSchema = z.union([
+  desktopBootstrapSchema,
+  desktopServiceBootstrapSchema,
+])
+
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
+export type DesktopServiceBootstrap = z.infer<
+  typeof desktopServiceBootstrapSchema
+>
+export type DesktopStartup = z.infer<typeof desktopStartupSchema>
 export type DesktopEvent = z.infer<typeof desktopEventSchema>
 export type EncryptedFileFallback = z.infer<
   typeof encryptedFileFallbackSchema

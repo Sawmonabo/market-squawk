@@ -1,7 +1,7 @@
 import type {
   ApplicationResult,
-  DesktopBootstrap,
   DesktopEvent,
+  DesktopStartup,
   EncryptedFileFallback,
   InstallationControlResult,
   InputTicket,
@@ -215,6 +215,10 @@ export type InstallationControlRequest =
   | { action: "rollback" }
   | { action: "uninstall" }
 
+export type DesktopServiceBootstrapRequest =
+  | { action: "unlock_encrypted_fallback"; unlock: string }
+  | { action: "retry_after_foreground_keyring" }
+
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }
   | {
@@ -247,7 +251,8 @@ export type ProviderOnboardingResult<
       : ProviderSession
 
 export interface ProductTransport {
-  bootstrap(): Promise<DesktopBootstrap>
+  bootstrap(): Promise<DesktopStartup>
+  bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
   installation(
     request: InstallationControlRequest,
     confirmed?: boolean,

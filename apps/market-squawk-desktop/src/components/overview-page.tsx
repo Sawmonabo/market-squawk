@@ -1,8 +1,11 @@
-import { ShieldCheck } from "lucide-react"
+import * as React from "react"
+import { KeyRound, LoaderCircle, ShieldCheck } from "lucide-react"
 
-import { useProduct } from "@/app/product-context"
+import { messageFrom, useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { SquawkSignal } from "@/components/squawk-signal"
 import { SetupOverview } from "@/components/setup/setup-overview"
@@ -15,6 +18,9 @@ export function OverviewPage() {
     return <OverviewLoading />
   }
   if (product.status === "error") {
+    if (product.serviceBootstrap) {
+      return <ServiceBootstrapRequired bootstrap={product.serviceBootstrap} />
+    }
     return (
       <div className="mx-auto max-w-3xl p-8">
         <Alert variant="destructive">
@@ -101,6 +107,96 @@ export function OverviewPage() {
           readiness.
         </span>
       </aside>
+    </div>
+  )
+}
+
+function ServiceBootstrapRequired({
+  bootstrap,
+}: {
+  bootstrap: NonNullable<ReturnType<typeof useProduct>["serviceBootstrap"]>
+}) {
+  const product = useProduct()
+  const [unlock, setUnlock] = React.useState("")
+  const [submitting, setSubmitting] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const requiresUnlock =
+    bootstrap.requirement === "encrypted_fallback_locked"
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    const submittedUnlock = unlock
+    setUnlock("")
+    setError(null)
+    if (requiresUnlock && !submittedUnlock) {
+      setError("Enter the encrypted-fallback unlock before continuing.")
+      return
+    }
+    setSubmitting(true)
+    try {
+      await product.transport.bootstrapService(
+        requiresUnlock
+          ? {
+              action: "unlock_encrypted_fallback",
+              unlock: submittedUnlock,
+            }
+          : { action: "retry_after_foreground_keyring" },
+      )
+      product.refresh()
+    } catch (requestError) {
+      setError(messageFrom(requestError))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mx-auto w-full max-w-[760px] p-5 lg:p-7">
+      <section className="rounded-xl border border-border bg-card/55 p-5">
+        <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+          Guided setup
+        </p>
+        <h1 className="mt-2 text-2xl font-semibold">Unlock the local service</h1>
+        <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+          {requiresUnlock
+            ? "The encrypted credential fallback is locked. Enter its unlock once so the native application can finish connecting."
+            : "The operating-system credential service needs one foreground retry before the native application can finish connecting."}
+        </p>
+        <form onSubmit={submit} className="mt-5 space-y-3">
+          {requiresUnlock ? (
+            <div className="space-y-1.5">
+              <Label htmlFor="service-fallback-unlock">Fallback unlock</Label>
+              <div className="relative">
+                <KeyRound
+                  className="pointer-events-none absolute top-2.5 left-3 size-4 text-muted-foreground"
+                  aria-hidden="true"
+                />
+                <Input
+                  id="service-fallback-unlock"
+                  type="password"
+                  value={unlock}
+                  onChange={(event) => setUnlock(event.currentTarget.value)}
+                  autoComplete="current-password"
+                  spellCheck={false}
+                  className="pl-9 font-mono"
+                  disabled={submitting}
+                />
+              </div>
+            </div>
+          ) : null}
+          <Button type="submit" disabled={submitting}>
+            {submitting ? (
+              <LoaderCircle className="animate-spin" aria-hidden="true" />
+            ) : null}
+            {requiresUnlock ? "Unlock local service" : "Retry local service"}
+          </Button>
+          {error ? (
+            <p role="alert" className="text-sm text-red-400">
+              {error}
+            </p>
+          ) : null}
+        </form>
+      </section>
     </div>
   )
 }

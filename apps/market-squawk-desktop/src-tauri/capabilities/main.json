@@ -7,6 +7,7 @@
     "core:default",
     "allow-application-invoke",
     "allow-desktop-bootstrap",
+    "allow-desktop-service-bootstrap",
     "allow-open-official-provider-page",
     "allow-open-protected-provider-setup",
     "allow-preview-portfolio-import",

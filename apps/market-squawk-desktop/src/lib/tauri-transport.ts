@@ -3,7 +3,7 @@ import { Channel, invoke, isTauri } from "@tauri-apps/api/core"
 import {
   applicationResultSchema,
   desktopEventSchema,
-  desktopBootstrapSchema,
+  desktopStartupSchema,
   encryptedFileFallbackSchema,
   installationControlResultSchema,
   inputTicketSchema,
@@ -44,7 +44,11 @@ export function createProductTransport(): ProductTransport {
 class TauriTransport implements ProductTransport {
   async bootstrap() {
     const value = await invoke("desktop_bootstrap")
-    return desktopBootstrapSchema.parse(value)
+    return desktopStartupSchema.parse(value)
+  }
+
+  async bootstrapService(request: Parameters<ProductTransport["bootstrapService"]>[0]) {
+    await invoke("desktop_service_bootstrap", { request })
   }
 
   async installation(request: InstallationControlRequest, confirmed = false) {
@@ -249,6 +253,10 @@ class UnavailableBrowserTransport implements ProductTransport {
         "Open this interface through the Market Squawk desktop application. Use the protected provider portal for browser fallback.",
       ),
     )
+  }
+
+  bootstrapService(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
   }
 
   installation(): Promise<never> {

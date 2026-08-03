@@ -24,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
-use market_squawk_runtime::{RuntimeIdentity, ServiceGeneration};
+use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +48,14 @@ const HEALTH_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const TEST_HEALTH_FAILURE_MARKER: &[u8] = b"market-squawk-test-service-health-failure";
+#[cfg(test)]
+const TEST_BOOTSTRAP_REQUIRED_MARKER: &[u8] = b"market-squawk-test-service-bootstrap-required";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealthProbe {
+    Ready(RuntimeIdentity),
+    BootstrapRequired,
+}
 
 /// Exact immutable release binding used for registration, repair, and verification.
 #[derive(Debug)]
@@ -235,7 +243,9 @@ fn verify_owned_material(
         if receipt != material.receipt {
             return Err(ServiceRegistrationError::Receipt);
         }
-        if file_contains_marker(&material.service_path, TEST_HEALTH_FAILURE_MARKER)? {
+        if file_contains_marker(&material.service_path, TEST_HEALTH_FAILURE_MARKER)?
+            || file_contains_marker(&material.service_path, TEST_BOOTSTRAP_REQUIRED_MARKER)?
+        {
             return Err(ServiceRegistrationError::Health);
         }
     }
@@ -434,7 +444,7 @@ fn activate_native(
 
     let attempt = apply_native(&desired)
         .and_then(|()| start_native())
-        .and_then(|()| probe_health(&material, None, HEALTH_RESTART_TIMEOUT).map(|_| ()));
+        .and_then(|()| probe_activation_health(&material, HEALTH_RESTART_TIMEOUT).map(|_| ()));
     if let Err(error) = attempt {
         restore_native(prior_native.as_ref(), &desired)?;
         restore_receipt(spec.install_root, prior_receipt.as_ref())?;
@@ -749,6 +759,25 @@ fn probe_health(
     expected: Option<RuntimeIdentity>,
     timeout: Duration,
 ) -> Result<RuntimeIdentity, ServiceRegistrationError> {
+    match probe_health_outcome(material, expected, timeout)? {
+        HealthProbe::Ready(runtime) => Ok(runtime),
+        HealthProbe::BootstrapRequired => Err(ServiceRegistrationError::Health),
+    }
+}
+
+#[cfg(not(test))]
+fn probe_activation_health(
+    material: &RegistrationMaterial,
+    timeout: Duration,
+) -> Result<HealthProbe, ServiceRegistrationError> {
+    probe_health_outcome(material, None, timeout)
+}
+
+fn probe_health_outcome(
+    material: &RegistrationMaterial,
+    expected: Option<RuntimeIdentity>,
+    timeout: Duration,
+) -> Result<HealthProbe, ServiceRegistrationError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ServiceRegistrationError::CommandTimeout)?;
@@ -761,7 +790,7 @@ fn probe_health(
             .saturating_duration_since(now)
             .min(HEALTH_COMMAND_TIMEOUT);
         match probe_health_once(material, expected, command_timeout) {
-            Ok(runtime) => return Ok(runtime),
+            Ok(outcome) => return Ok(outcome),
             Err(_) if Instant::now() < deadline => thread::sleep(HEALTH_RETRY_INTERVAL),
             Err(_) => return Err(ServiceRegistrationError::Health),
         }
@@ -772,7 +801,7 @@ fn probe_health_once(
     material: &RegistrationMaterial,
     expected: Option<RuntimeIdentity>,
     timeout: Duration,
-) -> Result<RuntimeIdentity, ServiceRegistrationError> {
+) -> Result<HealthProbe, ServiceRegistrationError> {
     let output = run_bounded_with_timeout(
         &material.receipt.cli.path,
         [
@@ -788,7 +817,7 @@ fn probe_health_once(
     )?;
     let document: Value =
         serde_json::from_slice(&output.stdout).map_err(|_| ServiceRegistrationError::Health)?;
-    validate_health_document_expected(&document, &material.receipt.version, expected)
+    classify_health_document(&document, &material.receipt.version, expected)
 }
 
 #[cfg(test)]
@@ -799,11 +828,26 @@ fn validate_health_document(
     validate_health_document_expected(document, expected_version, None)
 }
 
+#[cfg(test)]
 fn validate_health_document_expected(
     document: &Value,
     expected_version: &str,
     expected: Option<RuntimeIdentity>,
 ) -> Result<RuntimeIdentity, ServiceRegistrationError> {
+    match classify_health_document(document, expected_version, expected)? {
+        HealthProbe::Ready(runtime) => Ok(runtime),
+        HealthProbe::BootstrapRequired => Err(ServiceRegistrationError::Health),
+    }
+}
+
+fn classify_health_document(
+    document: &Value,
+    expected_version: &str,
+    expected: Option<RuntimeIdentity>,
+) -> Result<HealthProbe, ServiceRegistrationError> {
+    if document.get("status").and_then(Value::as_str) == Some("bootstrap_required") {
+        return validate_bootstrap_required_document(document, expected);
+    }
     let runtime_value = document
         .pointer("/bootstrap/runtime")
         .ok_or(ServiceRegistrationError::Health)?;
@@ -841,7 +885,46 @@ fn validate_health_document_expected(
     {
         return Err(ServiceRegistrationError::Health);
     }
-    Ok(runtime)
+    Ok(HealthProbe::Ready(runtime))
+}
+
+fn validate_bootstrap_required_document(
+    document: &Value,
+    expected: Option<RuntimeIdentity>,
+) -> Result<HealthProbe, ServiceRegistrationError> {
+    let top = document
+        .as_object()
+        .filter(|top| top.len() == 2)
+        .ok_or(ServiceRegistrationError::Health)?;
+    let bootstrap = top
+        .get("bootstrap")
+        .and_then(Value::as_object)
+        .filter(|bootstrap| bootstrap.len() == 4)
+        .ok_or(ServiceRegistrationError::Health)?;
+    let installation: InstallationId = serde_json::from_value(
+        bootstrap
+            .get("installationId")
+            .cloned()
+            .ok_or(ServiceRegistrationError::Health)?,
+    )
+    .map_err(|_| ServiceRegistrationError::Health)?;
+    let generation = bootstrap
+        .get("generation")
+        .and_then(Value::as_u64)
+        .and_then(|generation| ServiceGeneration::try_new(generation).ok())
+        .ok_or(ServiceRegistrationError::Health)?;
+    if expected.is_some()
+        || top.get("status").and_then(Value::as_str) != Some("bootstrap_required")
+        || bootstrap.get("state").and_then(Value::as_str) != Some("required")
+        || !matches!(
+            bootstrap.get("requirement").and_then(Value::as_str),
+            Some("encrypted_fallback_locked" | "foreground_keyring_retry")
+        )
+    {
+        return Err(ServiceRegistrationError::Health);
+    }
+    let _authenticated_process_identity = (installation, generation);
+    Ok(HealthProbe::BootstrapRequired)
 }
 
 #[cfg(test)]
@@ -1214,8 +1297,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::windows;
     use super::{
-        RuntimeIdentity, ServiceGeneration, validate_health_document,
-        validate_health_document_expected,
+        HealthProbe, RuntimeIdentity, ServiceGeneration, classify_health_document,
+        validate_health_document, validate_health_document_expected,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1321,6 +1404,23 @@ mod tests {
         invalid["bootstrap"]["product"]["version"] = json!("0.2.0");
         invalid["bootstrap"]["readiness"]["mcp"] = json!(false);
         assert!(validate_health_document(&invalid, "0.2.0").is_err());
+
+        let bootstrap_required = json!({
+            "status": "bootstrap_required",
+            "bootstrap": {
+                "state": "required",
+                "requirement": "encrypted_fallback_locked",
+                "installationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "generation": 9
+            }
+        });
+        assert!(matches!(
+            classify_health_document(&bootstrap_required, "0.2.0", None)?,
+            HealthProbe::BootstrapRequired
+        ));
+        let mut malformed_bootstrap = bootstrap_required;
+        malformed_bootstrap["bootstrap"]["state"] = json!("retrying");
+        assert!(classify_health_document(&malformed_bootstrap, "0.2.0", None).is_err());
         Ok(())
     }
 }

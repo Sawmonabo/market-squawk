@@ -1,21 +1,38 @@
 import * as React from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopBootstrap, DesktopServiceBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { affectedDomain, requiresResync } from "./product-events"
 import { productKeys } from "./query-client"
 
 type ProductState =
-  | { status: "loading"; bootstrap: null; error: null }
-  | { status: "ready"; bootstrap: DesktopBootstrap; error: null }
-  | { status: "error"; bootstrap: null; error: string }
+  | {
+      status: "loading"
+      bootstrap: null
+      serviceBootstrap: null
+      error: null
+    }
+  | {
+      status: "ready"
+      bootstrap: DesktopBootstrap
+      serviceBootstrap: null
+      error: null
+    }
+  | {
+      status: "error"
+      bootstrap: null
+      serviceBootstrap: DesktopServiceBootstrap | null
+      error: string
+    }
 
-type ProductContextValue = ProductState & {
+type ProductActions = {
   transport: ProductTransport
   refresh: () => void
 }
+
+type ProductContextValue = ProductState & ProductActions
 
 const ProductContext = React.createContext<ProductContextValue | null>(null)
 
@@ -35,7 +52,7 @@ export function ProductProvider({
   })
 
   React.useEffect(() => {
-    if (!bootstrap.data) return
+    if (!bootstrap.data || "status" in bootstrap.data) return
     const scope = bootstrap.data.runtime
     let active = true
     let previousSequence = 0
@@ -76,14 +93,32 @@ export function ProductProvider({
   }, [bootstrap.data, queryClient, transport])
 
   const state: ProductState = bootstrap.data
-    ? { status: "ready", bootstrap: bootstrap.data, error: null }
+    ? "status" in bootstrap.data
+      ? {
+          status: "error",
+          bootstrap: null,
+          serviceBootstrap: bootstrap.data,
+          error: "The installed service needs one foreground credential action.",
+        }
+      : {
+          status: "ready",
+          bootstrap: bootstrap.data,
+          serviceBootstrap: null,
+          error: null,
+        }
     : bootstrap.isError
       ? {
           status: "error",
           bootstrap: null,
+          serviceBootstrap: null,
           error: messageFrom(bootstrap.error),
         }
-      : { status: "loading", bootstrap: null, error: null }
+      : {
+          status: "loading",
+          bootstrap: null,
+          serviceBootstrap: null,
+          error: null,
+        }
 
   const value = React.useMemo<ProductContextValue>(
     () => ({

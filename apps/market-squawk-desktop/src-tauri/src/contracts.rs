@@ -96,6 +96,49 @@ pub(crate) struct DesktopBootstrap {
     operations: Vec<OperationSummary>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopServiceBootstrapRequirement {
+    EncryptedFallbackLocked,
+    ForegroundKeyringRetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopServiceBootstrapStatusName {
+    BootstrapRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopServiceBootstrapStatus {
+    status: DesktopServiceBootstrapStatusName,
+    requirement: DesktopServiceBootstrapRequirement,
+}
+
+impl DesktopServiceBootstrapStatus {
+    pub(crate) const fn required(requirement: DesktopServiceBootstrapRequirement) -> Self {
+        Self {
+            status: DesktopServiceBootstrapStatusName::BootstrapRequired,
+            requirement,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum DesktopStartup {
+    Ready(DesktopBootstrap),
+    BootstrapRequired(DesktopServiceBootstrapStatus),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "action")]
+pub(crate) enum DesktopServiceBootstrapCommand {
+    UnlockEncryptedFallback { unlock: String },
+    RetryAfterForegroundKeyring,
+}
+
 impl DesktopBootstrap {
     #[allow(
         clippy::too_many_arguments,

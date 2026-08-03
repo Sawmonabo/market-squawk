@@ -5,6 +5,8 @@ import argparse
 import json
 import pathlib
 import queue
+import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -15,8 +17,11 @@ from typing import TextIO
 
 REQUEST_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 25.0
-SERVICE_START_TIMEOUT_SECONDS = 20.0
+SERVICE_STATUS_TIMEOUT_SECONDS = 35.0
+SERVICE_BOOTSTRAP_TIMEOUT_SECONDS = 45.0
+SERVICE_START_TIMEOUT_SECONDS = 60.0
 MCP_PROTOCOL_VERSION = "2026-07-28"
+MAXIMUM_DIAGNOSTIC_BYTES = 8 * 1024
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -111,26 +116,122 @@ def finish_process(process: subprocess.Popen[str]) -> None:
     require(return_code == 0, f"MCP process exited with status {return_code}")
 
 
+def bounded_redacted_diagnostics(
+    stream: TextIO, sensitive_values: tuple[str, ...] = ()
+) -> str:
+    stream.seek(0)
+    encoded = stream.read(MAXIMUM_DIAGNOSTIC_BYTES + 1).encode(
+        "utf-8", errors="replace"
+    )
+    truncated = len(encoded) > MAXIMUM_DIAGNOSTIC_BYTES
+    text = encoded[:MAXIMUM_DIAGNOSTIC_BYTES].decode("utf-8", errors="replace")
+    for sensitive in sensitive_values:
+        if sensitive:
+            text = text.replace(sensitive, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(secret|credential|token|password|unlock)(\s*[:=]\s*)[^\s,;]+",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    text = "".join(character for character in text if character in "\n\r\t" or character.isprintable())
+    text = text.strip()
+    if truncated:
+        text = f"{text}\n[diagnostics truncated]" if text else "[diagnostics truncated]"
+    return text
+
+
+def bootstrap_service(
+    binary: pathlib.Path,
+    data_dir: str,
+    requirement: str,
+) -> None:
+    unlock = secrets.token_urlsafe(32) if requirement == "encrypted_fallback_locked" else ""
+    command = [
+        str(binary),
+        "--output",
+        "json",
+        "--data-dir",
+        data_dir,
+        "service",
+        "bootstrap",
+    ]
+    if unlock:
+        command.append("--stdin")
+    elif requirement == "foreground_keyring_retry":
+        command.append("--retry-after-foreground-keyring")
+    else:
+        raise RuntimeError("installed service returned an unsupported bootstrap requirement")
+    with (
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr,
+    ):
+        result = subprocess.run(
+            command,
+            input=f"{unlock}\n" if unlock else None,
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            check=False,
+            timeout=SERVICE_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            diagnostics = bounded_redacted_diagnostics(stderr, (unlock,))
+            detail = f": {diagnostics}" if diagnostics else ""
+            raise RuntimeError(
+                f"installed CLI bootstrap exited with status {result.returncode}{detail}"
+            )
+
+
 def wait_for_service(
     binary: pathlib.Path,
     data_dir: str,
     service: subprocess.Popen[str],
 ) -> None:
     deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    bootstrap_attempted = False
     while time.monotonic() < deadline:
         if service.poll() is not None:
             raise RuntimeError(
                 f"installed service exited before readiness with status {service.returncode}"
             )
-        probe = subprocess.run(
-            [str(binary), "--data-dir", data_dir, "service", "status"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        if probe.returncode == 0:
-            return
+        with (
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as probe_stdout,
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as probe_stderr,
+        ):
+            probe = subprocess.run(
+                [
+                    str(binary),
+                    "--output",
+                    "json",
+                    "--data-dir",
+                    data_dir,
+                    "service",
+                    "status",
+                ],
+                stdout=probe_stdout,
+                stderr=probe_stderr,
+                check=False,
+                timeout=SERVICE_STATUS_TIMEOUT_SECONDS,
+                text=True,
+            )
+            if probe.returncode == 0:
+                probe_stdout.seek(0)
+                try:
+                    status = json.load(probe_stdout)
+                except json.JSONDecodeError:
+                    status = None
+                if isinstance(status, dict) and status.get("status") == "ready":
+                    return
+                bootstrap = status.get("bootstrap") if isinstance(status, dict) else None
+                if (
+                    not bootstrap_attempted
+                    and isinstance(bootstrap, dict)
+                    and status.get("status") == "bootstrap_required"
+                    and bootstrap.get("state") == "required"
+                    and isinstance(bootstrap.get("requirement"), str)
+                ):
+                    bootstrap_attempted = True
+                    bootstrap_service(binary, data_dir, bootstrap["requirement"])
         time.sleep(0.1)
     raise TimeoutError(
         f"installed service did not reach readiness in {SERVICE_START_TIMEOUT_SECONDS:.3f}s"
@@ -368,12 +469,10 @@ def main() -> int:
             if service is not None:
                 stop_process(service)
         if failure is not None:
-            stderr_log.seek(0)
-            diagnostics = stderr_log.read().strip()
+            diagnostics = bounded_redacted_diagnostics(stderr_log)
             if diagnostics:
                 print(f"MCP stderr:\n{diagnostics}", file=sys.stderr)
-            service_stderr.seek(0)
-            service_diagnostics = service_stderr.read().strip()
+            service_diagnostics = bounded_redacted_diagnostics(service_stderr)
             if service_diagnostics:
                 print(f"Service stderr:\n{service_diagnostics}", file=sys.stderr)
             raise failure

@@ -65,6 +65,9 @@ function transport(
 ): ProductTransport {
   return {
     bootstrap: async () => bootstrap,
+    bootstrapService: async () => {
+      throw new Error("Service bootstrap is not configured for this test.")
+    },
     installation: async () => ({
       action: "status",
       status: {
@@ -232,6 +235,45 @@ function datasetRead(
 }
 
 describe("Market Squawk desktop boundary", () => {
+  it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {
+    const user = userEvent.setup()
+    let ready = false
+    let submittedUnlock: string | null = null
+    const bootstrapTransport = {
+      ...transport(),
+      bootstrap: async () =>
+        ready
+          ? blockedBootstrap
+          : {
+              status: "bootstrap_required" as const,
+              requirement: "encrypted_fallback_locked" as const,
+            },
+      bootstrapService: async (request: {
+        action: "unlock_encrypted_fallback"
+        unlock: string
+      }) => {
+        submittedUnlock = request.unlock
+        ready = true
+      },
+    } satisfies ProductTransport
+
+    render(
+      <MemoryRouter initialEntries={["/overview"]}>
+        <App transport={bootstrapTransport} />
+      </MemoryRouter>,
+    )
+
+    const field = await screen.findByLabelText("Fallback unlock")
+    await user.type(field, "process-local-test-unlock")
+    await user.click(screen.getByRole("button", { name: "Unlock local service" }))
+
+    expect((field as HTMLInputElement).value).toBe("")
+    expect(submittedUnlock).toBe("process-local-test-unlock")
+    expect(
+      await screen.findByRole("heading", { name: "Welcome to Market Squawk" }),
+    ).toBeTruthy()
+  })
+
   it("uses accessible product navigation to explore real research and MCP state", async () => {
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,

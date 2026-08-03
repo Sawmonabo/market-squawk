@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_service_health_restores_the_known_good_release() -> TestResult {
+    fn service_activation_rolls_back_failure_but_preserves_bootstrap_required() -> TestResult {
         let temporary = test_directory()?;
         let root = temporary.path().join("program");
         let first = BundleFixture::create(temporary.path(), "0.1.0", BundleDefect::None)?;
@@ -482,6 +482,21 @@ mod tests {
         let restored = status(&root)?;
         assert_eq!(restored.active_version(), Some("0.1.0"));
         assert!(restored.is_healthy());
+
+        let recoverable = BundleFixture::create(
+            temporary.path(),
+            "0.3.0",
+            BundleDefect::ServiceBootstrapRequired,
+        )?;
+        update(UpdateRequest::from_local(
+            root.clone(),
+            &recoverable.manifest,
+            &recoverable.bundle,
+        )?)?;
+        let awaiting_foreground = status(&root)?;
+        assert_eq!(awaiting_foreground.active_version(), Some("0.3.0"));
+        assert_eq!(awaiting_foreground.previous_version(), Some("0.1.0"));
+        assert!(!awaiting_foreground.is_healthy());
         Ok(())
     }
 
@@ -708,6 +723,7 @@ mod tests {
         DigestMismatch,
         MisplacedRequiredRole,
         ServiceHealthFailure,
+        ServiceBootstrapRequired,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1024,10 +1040,14 @@ mod tests {
                 } else {
                     expected_path
                 };
-                let bytes = if matches!(defect, BundleDefect::ServiceHealthFailure)
-                    && role == ComponentRole::Service
+                let bytes = if role == ComponentRole::Service
+                    && matches!(defect, BundleDefect::ServiceHealthFailure)
                 {
                     b"market-squawk-test-service-health-failure".to_vec()
+                } else if role == ComponentRole::Service
+                    && matches!(defect, BundleDefect::ServiceBootstrapRequired)
+                {
+                    b"market-squawk-test-service-bootstrap-required".to_vec()
                 } else {
                     format!("{version}:{path}").into_bytes()
                 };
