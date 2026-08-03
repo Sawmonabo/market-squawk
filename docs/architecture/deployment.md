@@ -505,7 +505,7 @@ must be produced on documented hardware by the final release evidence lane descr
 | [Apache DataFusion introduction](https://datafusion.apache.org/user-guide/introduction.html) | DataFusion is embedded in the local process and operates over Arrow and admitted local data. | 2026-07-23 |
 | [Tokio runtime documentation](https://docs.rs/tokio/latest/tokio/) | Defines asynchronous tasks, timers, cancellation-related primitives, and blocking-work separation used by the process topology. | 2026-07-23 |
 | [Tauri architecture](https://v2.tauri.app/concept/architecture/) | Defines the Rust core, system WebView, and IPC boundaries used by the desktop process. | 2026-07-28 |
-| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-07-28 |
+| [Tauri capabilities](https://github.com/tauri-apps/tauri-docs/blob/ed68dc003ed3ff777b5aa7398b11386412a60bf3/src/content/docs/security/capabilities.mdx) | Defines window-scoped permission composition for the five-command presentation bridge. | 2026-08-03 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the CSP control applied to bundled desktop content. | 2026-07-28 |
 | [Tauri distribution](https://v2.tauri.app/distribute/) | Defines platform packaging and the separate signing/distribution lifecycle. | 2026-07-30 |
 | [Tauri sidecars](https://v2.tauri.app/develop/sidecar/) | Defines target-triple external-program staging and native-bundle placement. | 2026-07-28 |

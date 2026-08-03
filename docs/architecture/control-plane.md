@@ -416,4 +416,4 @@ Market Squawk behavior.
 | [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) | Stateless endpoint, Host/Origin validation, POST handling, and bounded response transport | 2026-08-03 |
 | [MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) | Tool discovery, input/output schema, structured results, tool errors, and security requirements | 2026-08-03 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction boundaries and single-writer behavior for local catalog state | 2026-07-23 |
-| [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Window-scoped permission composition for the desktop presentation bridge | 2026-07-28 |
+| [Tauri capabilities](https://github.com/tauri-apps/tauri-docs/blob/ed68dc003ed3ff777b5aa7398b11386412a60bf3/src/content/docs/security/capabilities.mdx) | Window-scoped permission composition for the desktop presentation bridge | 2026-08-03 |
