@@ -313,6 +313,15 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      # lycheeverse/lychee-action v2.9.0, verified release commit (2026-07-09).
+      - name: Check all local Markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          lycheeVersion: v0.24.2
+          args: >-
+            --offline --no-progress
+            --root-dir "$GITHUB_WORKSPACE"
+            'README.md' 'docs/**/*.md'
       # actions/cache v4.2.4, verified release commit (2025-08-07).
       - name: Restore Lychee response cache
         id: lychee-cache
@@ -323,7 +332,7 @@ jobs:
           restore-keys: |
             lychee-v1-${{ runner.os }}-
       # lycheeverse/lychee-action v2.9.0, verified release commit (2026-07-09).
-      - name: Check Markdown links
+      - name: Check maintained external Markdown links
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
         with:
           lycheeVersion: v0.24.2
@@ -334,7 +343,10 @@ jobs:
             --cache-exclude-status '429,500..=599'
             --max-concurrency 4
             --max-retries 0
-            'README.md' 'docs/**/*.md'
+            'README.md' 'SECURITY.md' 'CONTRIBUTING.md'
+            'docs/README.md' 'docs/project-memory.md' 'docs/verification.md'
+            'docs/architecture/**/*.md' 'docs/operations/**/*.md'
+            'docs/reference/**/*.md' 'docs/testing/**/*.md'
       - name: Save Lychee response cache
         if: >-
           ${{

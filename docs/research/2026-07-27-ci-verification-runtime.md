@@ -982,13 +982,22 @@ separate target- and commit-bound artifacts. Adding an unrecognized receipt to t
 directory would correctly make aggregation fail.
 
 Documentation link validation uses the maintained Lychee action only when the classifier observes
-a documentation change. The action and its Lychee binary version are pinned; concurrency is
-bounded to four; retries are disabled to avoid amplifying provider rate limits; and transient
-`429` and `5xx` responses are excluded from the one-day response cache. Cache restores are usable
-on pull requests, while cache publication is limited to trusted `main` pushes. This keeps ordinary
-code-only changes out of the link lane and avoids turning external-site instability into broad
-build churn. The action's default fail behavior remains enabled, so a genuine broken link fails the
-documentation job.
+a documentation change. A blocking offline pass validates relative and local links across every
+Markdown document. A separate network pass validates external links in maintained public
+architecture, operations, reference, testing, and repository-entry documentation; dated research,
+audit, report, plan, and design evidence retains its source URLs without turning later provider
+link movement into a release failure. SEC, BLS, FRED/St. Louis Fed, and FASB endpoints are retained
+as citations but excluded from automated probes because those authoritative sites reject or fail
+headless CI clients. Lychee's official rate-limit guidance recommends excluding a whole site when
+its automated checks are blocked.
+
+The action and its Lychee binary version are pinned; concurrency is bounded to four; retries are
+disabled to avoid amplifying provider rate limits; and transient `429` and `5xx` responses are
+excluded from the one-day response cache. Cache restores are usable on pull requests, while cache
+publication is limited to trusted `main` pushes. This keeps ordinary code-only changes out of the
+link lane and avoids turning external-site instability into broad build churn. Both passes retain
+Lychee's default fail behavior, so a broken local link anywhere or a broken reachable external link
+in maintained documentation fails the job.
 
 ## Acceptance evidence
 
