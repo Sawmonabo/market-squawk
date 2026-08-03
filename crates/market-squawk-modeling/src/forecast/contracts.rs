@@ -241,8 +241,8 @@ mod observed_history_tests {
     use super::{ForecastObservedPoint, ForecastValue};
 
     #[test]
-    fn modeled_values_cannot_enter_observed_forecast_history() {
-        let value = ForecastValue::try_new(101_25, 2).expect("fixed decimal value");
+    fn modeled_values_cannot_enter_observed_forecast_history() -> Result<(), super::ForecastError> {
+        let value = ForecastValue::try_new(10_125, 2)?;
 
         let result = ForecastObservedPoint::try_new(
             Timestamp::from_unix_nanos(10),
@@ -253,6 +253,7 @@ mod observed_history_tests {
         );
 
         assert!(result.is_err());
+        Ok(())
     }
 }
 

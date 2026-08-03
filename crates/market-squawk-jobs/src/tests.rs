@@ -293,11 +293,13 @@ async fn jobs_backup_retains_the_mutation_cut_and_restores_by_replay() -> Result
     let receipt = export.receipt();
     let encoded = export.into_bytes();
     let cancellation_authority = Arc::clone(&authority);
+    let job_id = spec.id().clone();
+    let generation = spec.generation();
     let cancel = tokio::spawn(async move {
         cancellation_authority
             .cancel(
-                spec.id(),
-                spec.generation(),
+                job_id,
+                generation,
                 JobEventSequence::new(2),
                 Timestamp::from_unix_nanos(21),
             )
