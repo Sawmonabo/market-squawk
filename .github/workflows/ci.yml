@@ -282,8 +282,40 @@ jobs:
         if: needs.classify.outputs.rust == 'true'
         run: |
           python3 scripts/check_workspace_boundaries.py
-          cargo deny check
-          cargo audit --deny warnings \
+          fetched=false
+          for attempt in 1 2 3; do
+            if cargo deny fetch db; then
+              fetched=true
+              break
+            fi
+            advisory_root="${CARGO_HOME:?}/advisory-dbs"
+            if [[ -d "$advisory_root" ]]; then
+              while IFS= read -r database; do
+                if ! git -C "$database" rev-parse --verify HEAD >/dev/null 2>&1; then
+                  rm -rf -- "$database"
+                fi
+              done < <(
+                find "$advisory_root" \
+                  -mindepth 1 -maxdepth 1 -type d -name 'advisory-db-*' -print
+              )
+            fi
+            if (( attempt < 3 )); then
+              sleep "$((attempt * 5))"
+            fi
+          done
+          [[ "$fetched" == "true" ]]
+          mapfile -t advisory_dbs < <(
+            find "$CARGO_HOME/advisory-dbs" \
+              -mindepth 1 -maxdepth 1 -type d -name 'advisory-db-*' -print
+          )
+          (( ${#advisory_dbs[@]} == 1 ))
+          advisory_db="${advisory_dbs[0]}"
+          advisory_commit="$(git -C "$advisory_db" rev-parse --verify HEAD)"
+          [[ "$advisory_commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "RustSec advisory database commit: $advisory_commit"
+
+          cargo deny check --disable-fetch
+          cargo audit --db "$advisory_db" --no-fetch --deny warnings \
             --ignore RUSTSEC-2024-0370 \
             --ignore RUSTSEC-2024-0411 \
             --ignore RUSTSEC-2024-0412 \

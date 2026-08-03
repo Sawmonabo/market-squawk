@@ -293,7 +293,7 @@ impl SqliteProviderRateStore {
     /// The returned lease owns an `IMMEDIATE` transaction. It deliberately excludes process-era
     /// runs and permits, so every restored store must establish fresh process authority through
     /// [`ProviderRateStore::start_run`]. No store writer can commit between this retention,
-    /// materialization, and [`RetainedProviderRateCheckpoint::revalidate_emitted`].
+    /// materialization, and `RetainedProviderRateCheckpoint::revalidate_emitted`.
     pub fn retain_logical_checkpoint(
         &self,
     ) -> Result<RetainedProviderRateCheckpoint, ProviderRateStoreError> {

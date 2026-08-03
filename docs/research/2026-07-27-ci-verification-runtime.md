@@ -9,9 +9,9 @@ approximately one-hour Linux verification feedback loop.
 | Audience | Maintainers, CI owners, release reviewers |
 | Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-08-01 |
+| Last substantive review | 2026-08-03 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest diagnosed candidate | `49ff79d10877516fc403796fe31771ac0e3ad014` |
+| Latest diagnosed candidate | `a5c1595cc22282f4eb587cbe37d19215e10b2438` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -23,6 +23,7 @@ approximately one-hour Linux verification feedback loop.
 - [Root causes](#root-causes)
 - [Current candidate correctness follow-up](#current-candidate-correctness-follow-up)
 - [Correction design](#correction-design)
+- [Sealed Python and RustSec bootstrap correction](#sealed-python-and-rustsec-bootstrap-correction)
 - [Acceptance evidence](#acceptance-evidence)
 - [Risks and rejected shortcuts](#risks-and-rejected-shortcuts)
 - [Sources](#sources)
@@ -999,6 +1000,48 @@ link lane and avoids turning external-site instability into broad build churn. B
 Lychee's default fail behavior, so a broken local link anywhere or a broken reachable external link
 in maintained documentation fails the job.
 
+## Sealed Python and RustSec bootstrap correction
+
+The explicitly dispatched four-platform candidate
+[`a5c1595cc22282f4eb587cbe37d19215e10b2438`](https://github.com/Sawmonabo/market-squawk/actions/runs/30800376101)
+exposed two independent bootstrap failures before product packaging:
+
+1. GitHub's Python 3.14.6 toolcache did not contain `packaging 26.2`. The Linux, Windows, Apple
+   Silicon, and Intel package jobs therefore failed at the same wheel-admission boundary. This was
+   not four platform defects.
+2. The policy job received an HTTP 503 while `cargo-deny` cloned the RustSec advisory database.
+   Generated-artifact, credential, and workspace-boundary checks had already passed; no dependency
+   finding was reported.
+
+The Python builder now admits its build-time parser from the same exact `packaging 26.2` wheel that
+is already present in the repository's release lock. The wheel's filename, PyPI file URL, size, and
+SHA-256 identity must match a code-owned bootstrap identity before any wheel code is imported. The
+authorized preparation phase either copies that verified wheel from the caller's source cache or
+downloads it from `files.pythonhosted.org` into the builder-owned wheelhouse. The offline phase
+loads the same admitted wheel directly as a ZIP import and proves that the importer's archive is
+the admitted file. It does not install into or otherwise mutate the host Python environment. PyPI
+publishes `packaging 26.2` as a universal wheel, and Python documents ZIP files on `sys.path` plus
+the importer's `archive` identity as standard import behavior
+([PyPI release](https://pypi.org/project/packaging/26.2/),
+[`zipimport`](https://docs.python.org/3.14/library/zipimport.html)).
+
+The RustSec correction separates retrieval from evaluation. `cargo deny fetch db` receives a
+bounded three-attempt transport retry. A failed initial clone can leave an incomplete generated
+database directory; an isolated reproduction confirmed that a subsequent `cargo-deny` invocation
+tries to reset and fetch that non-repository rather than replacing it. Before another attempt, the
+workflow removes only generated `advisory-db-*` directories that do not have a valid Git `HEAD`.
+After one complete database is present, its exact commit is recorded and both security tools run
+against local immutable state: `cargo deny check --disable-fetch` and `cargo audit --db ...
+--no-fetch`. Vulnerability, license, source, and ban results are never retried or suppressed.
+Market Squawk's `P7D` `maximum-db-staleness` remains effective in `--disable-fetch` mode, as
+documented by cargo-deny
+([common options](https://embarkstudios.github.io/cargo-deny/cli/common.html),
+[advisory configuration](https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html),
+[RustSec cargo-audit](https://github.com/rustsec/rustsec/blob/main/cargo-audit/README.md)).
+
+These corrections are not accepted by local source tests alone. Acceptance requires a fresh exact-
+head policy job and all four complete unpublished package jobs to pass without host-package setup.
+
 ## Acceptance evidence
 
 The correction is acceptable only when all of the following are true:
@@ -1048,6 +1091,7 @@ The correction therefore does not require a paid runner under the current public
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
 The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-30.
+The sealed Python and RustSec bootstrap sources were reviewed on 2026-08-03.
 
 ### Cargo, Rust, and toolchain documentation
 

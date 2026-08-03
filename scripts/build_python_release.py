@@ -51,6 +51,19 @@ ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v1\0"
 SUPPORTED_PYTHONS = ((3, 14),)
 REQUIRED_PYTHON = (3, 14, 6)
 CANONICAL_RELEASE = "release-cp314"
+PACKAGING_VERSION = "26.2"
+PACKAGING_BOOTSTRAP = {
+    "filename": "packaging-26.2-py3-none-any.whl",
+    "project": "packaging",
+    "sha256": "5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e",
+    "size_bytes": 100_195,
+    "url": (
+        "https://files.pythonhosted.org/packages/df/b2/"
+        "87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/"
+        "packaging-26.2-py3-none-any.whl"
+    ),
+    "version": PACKAGING_VERSION,
+}
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
 ROOT_PURPOSE = "market-squawk-python-release-artifacts"
@@ -99,6 +112,132 @@ FOCUSED_TESTS = (
 
 class ReleaseBuildError(RuntimeError):
     """A release authority, source, wheel, runtime, or build contract failed."""
+
+
+def bootstrap_locked_packaging(
+    lock_path: Path,
+    wheelhouse: Path,
+    source_cache: Path | None,
+    *,
+    allow_network: bool,
+) -> None:
+    """Load the exact hash-locked build-time packaging wheel without host mutation."""
+
+    try:
+        if lock_path.is_symlink():
+            raise ReleaseBuildError("Python release lock must not be a symbolic link")
+        raw = lock_path.read_bytes()
+        if not raw or len(raw) > MAX_LOCK_BYTES:
+            raise ReleaseBuildError("Python release lock exceeds its byte bound")
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("Python release lock is unreadable") from error
+    artifacts = value.get("artifacts") if isinstance(value, dict) else None
+    if not isinstance(artifacts, list) or len(artifacts) > MAX_ARTIFACTS:
+        raise ReleaseBuildError("Python release lock has no bounded artifact inventory")
+    matches = [
+        artifact
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and artifact.get("project") == PACKAGING_BOOTSTRAP["project"]
+    ]
+    if len(matches) != 1 or any(
+        matches[0].get(field) != expected
+        for field, expected in PACKAGING_BOOTSTRAP.items()
+    ):
+        raise ReleaseBuildError("Python release lock lacks the admitted packaging bootstrap")
+
+    _admit_owned_child(wheelhouse, wheelhouse.parent, "wheelhouse")
+    destination = wheelhouse / str(PACKAGING_BOOTSTRAP["filename"])
+    expected = (
+        int(PACKAGING_BOOTSTRAP["size_bytes"]),
+        str(PACKAGING_BOOTSTRAP["sha256"]),
+    )
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file():
+            raise ReleaseBuildError("packaging bootstrap cache path is unsafe")
+        if _file_digest(destination) != expected:
+            raise ReleaseBuildError("cached packaging bootstrap identity differs")
+    else:
+        temporary = destination.with_suffix(destination.suffix + ".part")
+        temporary.unlink(missing_ok=True)
+        cached = (
+            source_cache / destination.name if source_cache is not None else None
+        )
+        if cached is not None and cached.is_file() and not cached.is_symlink():
+            shutil.copyfile(cached, temporary)
+        elif allow_network:
+            request = urllib.request.Request(
+                str(PACKAGING_BOOTSTRAP["url"]),
+                headers={
+                    "Accept": "application/octet-stream",
+                    "User-Agent": "market-squawk-release-builder",
+                },
+            )
+            observed = 0
+            digest = hashlib.sha256()
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response, temporary.open(
+                    "xb"
+                ) as output:
+                    final = urllib.parse.urlparse(response.geturl())
+                    if (
+                        final.scheme != "https"
+                        or final.hostname != "files.pythonhosted.org"
+                    ):
+                        raise ReleaseBuildError(
+                            "packaging bootstrap redirected outside PyPI files"
+                        )
+                    declared = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(declared) if declared is not None else None
+                    except ValueError as error:
+                        raise ReleaseBuildError(
+                            "packaging bootstrap response length is invalid"
+                        ) from error
+                    if declared_size is not None and declared_size != expected[0]:
+                        raise ReleaseBuildError("packaging bootstrap response length differs")
+                    while chunk := response.read(1024 * 1024):
+                        observed += len(chunk)
+                        if observed > expected[0]:
+                            raise ReleaseBuildError(
+                                "packaging bootstrap exceeded its locked size"
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except (OSError, urllib.error.URLError, ReleaseBuildError):
+                temporary.unlink(missing_ok=True)
+                raise
+            if observed != expected[0] or digest.hexdigest() != expected[1]:
+                temporary.unlink(missing_ok=True)
+                raise ReleaseBuildError("downloaded packaging bootstrap identity differs")
+        else:
+            raise ReleaseBuildError(
+                "locked packaging bootstrap is absent from the offline cache"
+            )
+        if _file_digest(temporary) != expected:
+            temporary.unlink(missing_ok=True)
+            raise ReleaseBuildError("packaging bootstrap identity differs")
+        os.replace(temporary, destination)
+
+    for module_name in tuple(sys.modules):
+        if module_name == "packaging" or module_name.startswith("packaging."):
+            del sys.modules[module_name]
+    admitted_wheel = destination.resolve(strict=True)
+    sys.path.insert(0, str(admitted_wheel))
+    try:
+        import packaging
+    except ImportError as error:
+        raise ReleaseBuildError("locked packaging bootstrap could not load") from error
+    loader_archive = getattr(getattr(packaging, "__loader__", None), "archive", None)
+    try:
+        loaded_wheel = Path(loader_archive).resolve(strict=True)
+    except (OSError, TypeError):
+        loaded_wheel = None
+    if packaging.__version__ != PACKAGING_VERSION or loaded_wheel != admitted_wheel:
+        raise ReleaseBuildError("locked packaging bootstrap identity differs")
 
 
 @dataclass(frozen=True)
@@ -1710,7 +1849,7 @@ def _locked_requirement_set(
         from packaging.requirements import InvalidRequirement, Requirement
     except ImportError as error:
         raise ReleaseBuildError("packaging 26.2 is required for lock refresh") from error
-    if packaging.__version__ != "26.2":
+    if packaging.__version__ != PACKAGING_VERSION:
         raise ReleaseBuildError("lock refresh requires exact packaging 26.2")
     try:
         if path.is_symlink():
@@ -4795,7 +4934,7 @@ def _parse_wheel(filename: str) -> tuple[object, object, object, frozenset[objec
         raise ReleaseBuildError(
             "packaging 26.2 is required for wheel admission"
         ) from error
-    if packaging.__version__ != "26.2":
+    if packaging.__version__ != PACKAGING_VERSION:
         raise ReleaseBuildError("wheel admission requires exact packaging 26.2")
     try:
         return parse_wheel_filename(filename, validate_order=False)
@@ -4826,7 +4965,7 @@ def _ordered_supported_wheel_tags(
         raise ReleaseBuildError(
             "packaging 26.2 is required for wheel admission"
         ) from error
-    if packaging.__version__ != "26.2" or version != (3, 14):
+    if packaging.__version__ != PACKAGING_VERSION or version != (3, 14):
         raise ReleaseBuildError("wheel admission requires exact packaging 26.2 and CPython 3.14")
     if profile.target == "aarch64-apple-darwin":
         platforms = tuple(mac_platforms((12, 0), "arm64"))
@@ -4941,7 +5080,7 @@ def _packaging_is_exact() -> bool:
         import packaging
     except ImportError:
         return False
-    return packaging.__version__ == "26.2"
+    return packaging.__version__ == PACKAGING_VERSION
 
 
 def _run_refresh_with_locked_packaging(requirements: Path) -> int:
@@ -4955,7 +5094,7 @@ def _run_refresh_with_locked_packaging(requirements: Path) -> int:
     selected = []
     active = False
     for line in lines:
-        if line.startswith("packaging==26.2 "):
+        if line.startswith(f"packaging=={PACKAGING_VERSION} "):
             active = True
             selected.append(line)
             continue
@@ -5079,6 +5218,17 @@ def main() -> int:
         profile = platform_profile(options.target)
         if host_profile() != profile:
             raise ReleaseBuildError("release target does not match the native build host")
+        layout = admit_artifact_root(options.artifact_root, root)
+        allow_network = (
+            options.prepare_cache_only
+            and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1"
+        )
+        bootstrap_locked_packaging(
+            lock_path,
+            layout.wheelhouse,
+            source_cache,
+            allow_network=allow_network,
+        )
         if options.component_root is not None:
             if (
                 options.python is not None
@@ -5093,8 +5243,7 @@ def main() -> int:
                 profile,
                 options.component_root,
                 root,
-                allow_network=options.prepare_cache_only
-                and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1",
+                allow_network=allow_network,
             )
             python_paths = (acquired.python,)
             uv_path = acquired.uv
@@ -5123,7 +5272,6 @@ def main() -> int:
         toolchain = admit_toolchain(root, profile, zig_path)
         runtimes = admit_runtimes(python_paths, lock)
         admit_sources(lock, root)
-        layout = admit_artifact_root(options.artifact_root, root)
         if options.prepare_cache_only:
             if options.offline:
                 raise ReleaseBuildError("cache preparation and offline build modes are exclusive")

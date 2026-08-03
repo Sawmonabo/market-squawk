@@ -4168,8 +4168,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/provider_rate.rs",
-      "sha256": "97571f9d9c6eb49a895484b746d36bbb78b79739b6d7f8d724f16bcf2c3c7854",
-      "size_bytes": 82527
+      "sha256": "1605233125f7cb0384b8009ffad802c29165418c4a629074e0f9813b7f05c398",
+      "size_bytes": 82525
     },
     {
       "path": "crates/market-squawk-data/src/publication_coordinator.rs",
@@ -6603,8 +6603,8 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "e6526aca9784dd7ffd638b216c9fc879a8ee5784224150a2de5401293536186e",
-      "size_bytes": 197741
+      "sha256": "c13f99dda893441658a1c4bb10af4f0817f2198963caa634cff947dafeb7a2eb",
+      "size_bytes": 204332
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
