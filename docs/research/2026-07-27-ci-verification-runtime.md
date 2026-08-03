@@ -851,6 +851,30 @@ wrapped child terminates the owned job. The dependency is Windows-only, keeps th
 `unsafe_code = "forbid"` boundary, and replaces the post-spawn assignment rather than adding a
 second containment layer.
 
+### Windows Job Object completion after termination
+
+Hosted Windows candidate `a5c1595c` later isolated a different failure in the contained training
+process: the worker's five-second deadline elapsed, but its test remained blocked until the
+60-minute CI job was cancelled. The locked `process-wrap 9.1.0` implementation explains the
+otherwise unbounded path. `JobObjectChild::try_wait` performs a zero-duration read from the Job
+Object completion port before polling the leader, while `JobObjectChild::wait` later waits for
+another completion-port message without a deadline. Microsoft explicitly documents that ordinary
+Job Object completion-port notifications are best effort, so the later wait is not an authoritative
+termination proof
+([completion-port association](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port),
+[`process-wrap` 9.1.0 source](https://github.com/watchexec/process-wrap/blob/v9.1.0/src/std/job_object.rs)).
+
+The corrected post-termination path keeps suspended-before-assignment containment and requires
+`TerminateJobObject` to succeed, preserving whole-tree termination. It then reaps the already
+exited leader through the inner child instead of entering a second unbounded completion-port wait.
+Microsoft defines `TerminateJobObject` as terminating every current member and specifies that job
+members cannot postpone or handle that termination
+([`TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)).
+The same rule governs normal completion, failure after spawn, and the fixed-capacity deferred
+reaper, preventing the hang from moving into shutdown cleanup. No deadline increase, retry, skipped
+test, dependency change, or leader-only termination fallback is involved. Hosted Windows green
+evidence remains required for the corrected exact candidate.
+
 ### Tokio runtime topology and paper-recovery sequence handoff
 
 The Kraken production verticals formerly used plain `#[tokio::test]`. Tokio 1.53.1 documents that
@@ -1030,11 +1054,13 @@ bounded three-attempt transport retry. A failed initial clone can leave an incom
 database directory; an isolated reproduction confirmed that a subsequent `cargo-deny` invocation
 tries to reset and fetch that non-repository rather than replacing it. Before another attempt, the
 workflow removes only generated `advisory-db-*` directories that do not have a valid Git `HEAD`.
-After one complete database is present, its exact commit is recorded and both security tools run
-against local immutable state: `cargo deny check --disable-fetch` and `cargo audit --db ...
---no-fetch`. Vulnerability, license, source, and ban results are never retried or suppressed.
-Market Squawk's `P7D` `maximum-db-staleness` remains effective in `--disable-fetch` mode, as
-documented by cargo-deny
+Before disabling network access, `cargo fetch --locked` admits the exact Cargo graph needed by
+`cargo-deny 0.20.2`; an empty-Cargo-home verification proved that omitting this step makes offline
+Cargo metadata fail before policy evaluation. After one complete database is present, its exact
+commit is recorded and both security tools run against local immutable state: `cargo deny --offline
+check` and `cargo audit --db ... --no-fetch`. Vulnerability, license, source, and ban results are
+never retried or suppressed. Market Squawk's `P7D` `maximum-db-staleness` remains effective in
+offline mode, as documented by cargo-deny
 ([common options](https://embarkstudios.github.io/cargo-deny/cli/common.html),
 [advisory configuration](https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html),
 [RustSec cargo-audit](https://github.com/rustsec/rustsec/blob/main/cargo-audit/README.md)).
@@ -1091,7 +1117,8 @@ The correction therefore does not require a paid runner under the current public
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
 The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-30.
-The sealed Python and RustSec bootstrap sources were reviewed on 2026-08-03.
+The sealed Python, RustSec bootstrap, and Windows Job Object termination sources were reviewed on
+2026-08-03.
 
 ### Cargo, Rust, and toolchain documentation
 
@@ -1134,7 +1161,9 @@ The sealed Python and RustSec bootstrap sources were reviewed on 2026-08-03.
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [Microsoft Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
 - [Microsoft Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
+- [Microsoft Job Object completion-port association](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port)
 - [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+- [Microsoft `TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)
 - [Microsoft `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
 - [Microsoft `CreateFileW` sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 - [Microsoft `GetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
@@ -1150,6 +1179,7 @@ The sealed Python and RustSec bootstrap sources were reviewed on 2026-08-03.
 - [`win32job 2.0.3` source](https://github.com/ohadravid/win32job-rs/tree/v2.0.3)
 - [`win32job` extended-limit issue](https://github.com/ohadravid/win32job-rs/issues/6)
 - [`process-wrap 9.1.0` Job Object implementation](https://docs.rs/process-wrap/9.1.0/src/process_wrap/std/job_object.rs.html)
+- [`process-wrap 9.1.0` tagged Job Object source](https://github.com/watchexec/process-wrap/blob/v9.1.0/src/std/job_object.rs)
 
 ### Official GitHub documentation and maintained tools
 

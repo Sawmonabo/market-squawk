@@ -4818,13 +4818,13 @@
     },
     {
       "path": "crates/market-squawk-jobs/src/process.rs",
-      "sha256": "d6dd0b082abd11d9e2d10f5a94eef05aaaae7a81e3d5685d229217aed1659481",
-      "size_bytes": 28256
+      "sha256": "71d9419dc38d9a417a08af01737ce785c713d7de5b13550aeaf428e984c6d195",
+      "size_bytes": 29022
     },
     {
       "path": "crates/market-squawk-jobs/src/process/reaper.rs",
-      "sha256": "4c7c3f30d4d3fbf3d9295bc239fe280c81e1fed8757bae14f84f80c18fd39a4a",
-      "size_bytes": 6535
+      "sha256": "238f948af2d5e678f22479f5a938b0139e30a812de0e9318a21ff0a6ddb95be4",
+      "size_bytes": 6536
     },
     {
       "path": "crates/market-squawk-jobs/src/repository.rs",

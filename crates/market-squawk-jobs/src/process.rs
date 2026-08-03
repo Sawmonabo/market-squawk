@@ -505,7 +505,7 @@ fn run_blocking(
     if !stdout_joined || !stderr_joined {
         failure = Some(ContainedProcessError::Unavailable);
     }
-    if child.wait().is_err() {
+    if wait_after_tree_termination(&mut *child).is_err() {
         cleanup.retain(child, Vec::new())?;
         return Err(ContainedProcessError::CleanupPending);
     }
@@ -620,6 +620,25 @@ fn join_reader(handle: thread::JoinHandle<()>) -> Result<(), ContainedProcessErr
         .map_err(|_| ContainedProcessError::Unavailable)
 }
 
+fn wait_after_tree_termination(
+    child: &mut dyn process_wrap::std::ChildWrapper,
+) -> std::io::Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        // `JobObjectChild::wait` waits without a deadline for another completion-port message.
+        // Successfully request termination of every current job member again, then reap the
+        // leader through the inner child so an already-consumed or omitted best-effort job
+        // notification cannot strand cleanup. Closing the job handle cannot release a
+        // still-terminating tree.
+        child.start_kill()?;
+        child.inner_mut().wait()
+    }
+    #[cfg(not(windows))]
+    {
+        child.wait()
+    }
+}
+
 fn fail_after_spawn(
     mut child: Box<dyn process_wrap::std::ChildWrapper>,
     cleanup: ProcessCleanupReservation,
@@ -629,7 +648,9 @@ fn fail_after_spawn(
     let started = Instant::now();
     while started.elapsed() < PROCESS_CLEANUP_DEADLINE {
         match child.try_wait() {
-            Ok(Some(_status)) if child.wait().is_ok() => return Err(failure),
+            Ok(Some(_status)) if wait_after_tree_termination(&mut *child).is_ok() => {
+                return Err(failure);
+            }
             Ok(None) | Err(_) => thread::sleep(Duration::from_millis(5)),
             Ok(Some(_status)) => thread::sleep(Duration::from_millis(5)),
         }

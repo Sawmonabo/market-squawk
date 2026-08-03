@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use super::ContainedProcessError;
+use super::{ContainedProcessError, wait_after_tree_termination};
 
 pub(super) const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 const MAXIMUM_RETAINED_PROCESS_CLEANUPS: usize = 16;
@@ -176,8 +176,7 @@ fn process_cleanup_complete() -> bool {
 
 fn reap_process_cleanup(mut cleanup: RetainedProcessCleanup) {
     loop {
-        let _kill_requested = cleanup.child.start_kill();
-        if cleanup.child.wait().is_ok() {
+        if wait_after_tree_termination(&mut *cleanup.child).is_ok() {
             break;
         }
         thread::sleep(Duration::from_millis(5));
