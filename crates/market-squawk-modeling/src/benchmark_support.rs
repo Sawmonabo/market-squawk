@@ -325,6 +325,13 @@ fn build_bundle(
     let metadata_bytes: Box<[u8]> = seed.metadata_digest.into();
     let artifact_bytes: Box<[u8]> = artifact_bytes.into();
     let training_run_bytes: Box<[u8]> = seed.training_run_digest.into();
+    let metadata_path: Box<str> = "bundle.json".into();
+    let artifact_path: Box<str> = match format {
+        ModelFormat::Onnx => "model.onnx",
+        ModelFormat::NativeLinear | ModelFormat::NativeLogistic => "artifact.json",
+    }
+    .into();
+    let training_run_path: Box<str> = "training-run.json".into();
     let retained_bytes = size_of::<ModelBundle>()
         .checked_add(
             metadata
@@ -338,10 +345,16 @@ fn build_bundle(
         .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
         .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
         .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
+        .and_then(|bytes| bytes.checked_add(metadata_path.len()))
+        .and_then(|bytes| bytes.checked_add(artifact_path.len()))
+        .and_then(|bytes| bytes.checked_add(training_run_path.len()))
         .ok_or(ReleaseEvidenceInferenceError::InvalidFixture)?;
     Ok(ModelBundle {
         metadata,
         artifact,
+        metadata_path,
+        artifact_path,
+        training_run_path,
         metadata_bytes,
         artifact_bytes,
         training_run_bytes,

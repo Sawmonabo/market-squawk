@@ -146,7 +146,9 @@ async fn run() -> Result<()> {
         | Command::Bot { .. }
         | Command::Execution { .. }
         | Command::FairValue { .. }
-        | Command::Job { .. }) => {
+        | Command::Job { .. }
+        | Command::Operations { .. }
+        | Command::Setup { .. }) => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             run_product_command(config, command, output).await?;
         }

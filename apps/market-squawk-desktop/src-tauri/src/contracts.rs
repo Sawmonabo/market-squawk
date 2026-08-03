@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use market_squawk::ProviderPortalActivationRequest;
+use market_squawk::{ProviderPortalActivationRequest, application::setup::SetupPlanSelection};
 use market_squawk_runtime::RuntimeIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -18,67 +18,6 @@ pub(crate) enum ReadinessState {
     Available,
     NotConfigured,
     Unverified,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SetupStepState {
-    Complete,
-    ActionRequired,
-    Blocked,
-    Available,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SetupStepAction {
-    ConfigureSources,
-    ConfigureResearch,
-    ConfigurePortfolio,
-    ConfigurePaper,
-    ReviewMcp,
-    ReviewStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SetupStep {
-    id: &'static str,
-    label: &'static str,
-    state: SetupStepState,
-    complete: bool,
-    detail: &'static str,
-    blocking_reason: Option<&'static str>,
-    recovery: Option<&'static str>,
-    action: Option<SetupStepAction>,
-}
-
-impl SetupStep {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the presentation contract keeps every authority-derived setup fact explicit"
-    )]
-    pub(crate) const fn new(
-        id: &'static str,
-        label: &'static str,
-        state: SetupStepState,
-        complete: bool,
-        detail: &'static str,
-        blocking_reason: Option<&'static str>,
-        recovery: Option<&'static str>,
-        action: Option<SetupStepAction>,
-    ) -> Self {
-        Self {
-            id,
-            label,
-            state,
-            complete,
-            detail,
-            blocking_reason,
-            recovery,
-            action,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -154,7 +93,6 @@ pub(crate) struct DesktopBootstrap {
     encrypted_file_fallback: Value,
     provider_profiles: Value,
     provider_sessions: Value,
-    setup_steps: Vec<SetupStep>,
     operations: Vec<OperationSummary>,
 }
 
@@ -175,7 +113,6 @@ impl DesktopBootstrap {
         encrypted_file_fallback: Value,
         provider_profiles: Value,
         provider_sessions: Value,
-        setup_steps: Vec<SetupStep>,
         operations: Vec<OperationSummary>,
     ) -> Self {
         Self {
@@ -193,7 +130,6 @@ impl DesktopBootstrap {
             encrypted_file_fallback,
             provider_profiles,
             provider_sessions,
-            setup_steps,
             operations,
         }
     }
@@ -366,6 +302,157 @@ pub(crate) enum DashboardQueryCommand {
     Jobs {
         after_job_id: Option<String>,
         limit: u16,
+    },
+    OperationBackups {
+        after_backup_id: Option<String>,
+        limit: u16,
+    },
+    OperationBackup {
+        backup_id: String,
+    },
+    OperationBackupRetentionPreview {
+        keep_latest: u16,
+    },
+    OperationRestorePreview {
+        backup_id: String,
+    },
+    OperationWorkspaces {
+        after_workspace_id: Option<Uuid>,
+        limit: u16,
+    },
+    OperationWorkspaceSwitchPreview {
+        workspace_id: Uuid,
+    },
+    OperationUpdateStatus,
+    OperationUpdatePreview,
+    OperationProgramRollbackPreview,
+    OperationLogs {
+        from_unix_nanos: Option<String>,
+        through_unix_nanos: Option<String>,
+        minimum_severity: Option<OperationLogSeverity>,
+        domain: Option<OperationLogDomain>,
+        source_id: Option<String>,
+        job_id: Option<String>,
+        correlation_id: Option<String>,
+        search: Option<String>,
+        after_sequence: Option<String>,
+        limit: u16,
+    },
+    OperationSettings,
+    OperationSettingsChangePreview {
+        expected_revision: String,
+        changes: Vec<OperationSettingValue>,
+    },
+    OperationSettingsRollbackPreview {
+        expected_revision: String,
+        target_revision: String,
+    },
+    SetupPlanStatus,
+    SetupPlanPreview {
+        expected_revision: String,
+        selection: SetupPlanSelection,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationLogSeverity {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationLogDomain {
+    Application,
+    Source,
+    Market,
+    Research,
+    Portfolio,
+    Model,
+    Backtest,
+    Execution,
+    Risk,
+    FairValue,
+    Mcp,
+    Lifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationUpdateChannel {
+    Stable,
+    Preview,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub(crate) enum OperationSettingValue {
+    LogRetentionDays(u16),
+    LogMinimumSeverity(OperationLogSeverity),
+    UpdateChannel(OperationUpdateChannel),
+    AutomaticUpdateChecks(bool),
+    StorageSoftLimitBytes(String),
+    DefaultQueryRowLimit(u32),
+    MaximumConcurrentJobs(u16),
+    MarketFreshnessMillis(u64),
+    BackupRetentionCount(u16),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+pub(crate) enum OperationsControlCommand {
+    CheckForUpdates,
+    ExportLogs {
+        from_unix_nanos: Option<String>,
+        through_unix_nanos: Option<String>,
+        minimum_severity: Option<OperationLogSeverity>,
+        domain: Option<OperationLogDomain>,
+        source_id: Option<String>,
+        job_id: Option<String>,
+        correlation_id: Option<String>,
+        search: Option<String>,
+        after_sequence: Option<String>,
+        limit: u16,
+    },
+    StartBackup,
+    StartBackupVerification {
+        backup_id: String,
+    },
+    StartBackupRetention {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    StartRestore {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    StartWorkspaceSwitch {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    StartUpdate {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    StartProgramRollback {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    ApplySettingsChange {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    RollbackSettings {
+        preview_id: Uuid,
+        preview_digest: String,
+    },
+    ApplySetupPlan {
+        preview_id: Uuid,
+        preview_sha256: String,
     },
 }
 

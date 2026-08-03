@@ -174,6 +174,20 @@ pub enum Command {
         command: JobCommand,
     },
 
+    /// Back up, restore, update, inspect logs, and manage typed product settings.
+    Operations {
+        /// Installed-product operation.
+        #[command(subcommand)]
+        command: OperationsCommand,
+    },
+
+    /// Inspect, preview, and accept the guided first-run setup plan.
+    Setup {
+        /// Guided setup operation.
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
+
     /// Produce and close exact-head release evidence.
     Release {
         /// Release operation.
@@ -744,6 +758,425 @@ pub enum JobCommand {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+/// Installed-product operational hierarchy.
+#[derive(Debug, Subcommand)]
+pub enum OperationsCommand {
+    /// Create, inspect, verify, retain, and restore product backups.
+    Backup {
+        /// Backup operation.
+        #[command(subcommand)]
+        command: BackupOperationsCommand,
+    },
+    /// List and switch between local workspaces through the service-owned fence.
+    Workspace {
+        /// Workspace operation.
+        #[command(subcommand)]
+        command: WorkspaceOperationsCommand,
+    },
+    /// Check, preview, activate, and roll back immutable program releases.
+    Update {
+        /// Update operation.
+        #[command(subcommand)]
+        command: UpdateOperationsCommand,
+    },
+    /// Query and export bounded redacted structured logs.
+    Logs {
+        /// Log operation.
+        #[command(subcommand)]
+        command: LogOperationsCommand,
+    },
+    /// Inspect, preview, apply, and roll back typed product settings.
+    Settings {
+        /// Settings operation.
+        #[command(subcommand)]
+        command: SettingsOperationsCommand,
+    },
+}
+
+/// Product-backup operation.
+#[derive(Debug, Subcommand)]
+pub enum BackupOperationsCommand {
+    /// List one bounded page of retained product backups.
+    List {
+        /// Continue strictly after this lowercase backup SHA-256.
+        #[arg(long)]
+        after_backup_id: Option<String>,
+        /// Maximum backup manifests returned.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Return one exact retained product-backup manifest.
+    Get {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+    },
+    /// Start one durable complete product-backup job.
+    Create {
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start durable verification of one exact retained backup.
+    Verify {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Preview and apply bounded backup retention.
+    Retention {
+        /// Backup-retention operation.
+        #[command(subcommand)]
+        command: BackupRetentionCommand,
+    },
+    /// Preview and start a fenced restore into a fresh workspace.
+    Restore {
+        /// Restore operation.
+        #[command(subcommand)]
+        command: RestoreCommand,
+    },
+}
+
+/// Backup-retention preview and application.
+#[derive(Debug, Subcommand)]
+pub enum BackupRetentionCommand {
+    /// Preview the exact backups retained and removed by the policy.
+    Preview {
+        /// Number of newest verified backups to retain.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=128))]
+        keep_latest: u16,
+    },
+    /// Start the durable retention job bound to one exact preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Restore preview and start.
+#[derive(Debug, Subcommand)]
+pub enum RestoreCommand {
+    /// Preview restoring one exact backup into a fresh fenced workspace.
+    Preview {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+    },
+    /// Start the durable restore bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Local-workspace operation.
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceOperationsCommand {
+    /// List one bounded page of known workspaces and active-generation evidence.
+    List {
+        /// Continue strictly after this workspace identity.
+        #[arg(long)]
+        after_workspace_id: Option<Uuid>,
+        /// Maximum workspace descriptors returned.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Preview and start a service-owned workspace switch.
+    Switch {
+        /// Workspace-switch operation.
+        #[command(subcommand)]
+        command: WorkspaceSwitchCommand,
+    },
+}
+
+/// Workspace-switch preview and start.
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceSwitchCommand {
+    /// Preview fencing, blockers, reconciliation, and client resynchronization.
+    Preview {
+        /// Exact target workspace identity.
+        workspace_id: Uuid,
+    },
+    /// Start the durable switch bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Immutable-program update and rollback operation.
+#[derive(Debug, Subcommand)]
+pub enum UpdateOperationsCommand {
+    /// Return trusted update, known-good generation, and recovery status.
+    Status,
+    /// Check trusted metadata and stage only an admitted candidate.
+    Check {
+        /// Explicitly authorize provider contact and candidate staging.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Preview activation of the currently staged trusted candidate.
+    Preview,
+    /// Start update activation bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+    /// Preview or start rollback of program files without restoring data.
+    ProgramRollback {
+        /// Program-rollback operation.
+        #[command(subcommand)]
+        command: ProgramRollbackCommand,
+    },
+}
+
+/// Program-generation rollback preview and start.
+#[derive(Debug, Subcommand)]
+pub enum ProgramRollbackCommand {
+    /// Preview the known-good program generation and data compatibility.
+    Preview,
+    /// Start program rollback bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Exact one-use Operations preview confirmation.
+#[derive(Debug, Args)]
+pub struct OperationsPreviewConfirmationArguments {
+    /// Exact preview UUID returned by the corresponding preview operation.
+    #[arg(long)]
+    pub preview_id: Uuid,
+    /// Lowercase SHA-256 returned with the exact preview.
+    #[arg(long)]
+    pub preview_digest: String,
+    /// Explicitly authorize this preview-bound mutation.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// Structured-log operation.
+#[derive(Debug, Subcommand)]
+pub enum LogOperationsCommand {
+    /// Query one bounded page of redacted structured logs.
+    Query(LogQueryArguments),
+    /// Publish a bounded redacted log export as a controlled artifact.
+    Export {
+        /// Exact bounded log selection.
+        #[command(flatten)]
+        query: LogQueryArguments,
+        /// Explicitly authorize controlled artifact publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Typed filters shared by structured-log query and controlled export.
+#[derive(Debug, Args)]
+pub struct LogQueryArguments {
+    /// Inclusive RFC 3339 lower time bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Inclusive RFC 3339 upper time bound.
+    #[arg(long)]
+    pub through: Option<String>,
+    /// Minimum retained severity.
+    #[arg(long, value_enum)]
+    pub minimum_severity: Option<LogSeverityArgument>,
+    /// Exact product domain filter.
+    #[arg(long, value_enum)]
+    pub domain: Option<LogDomainArgument>,
+    /// Exact source identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub source_id: Option<String>,
+    /// Exact durable-job identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub job_id: Option<String>,
+    /// Exact correlation identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub correlation_id: Option<String>,
+    /// Bounded redacted message search text.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Continue strictly after this monotonic local log sequence.
+    #[arg(long)]
+    pub after_sequence: Option<u64>,
+    /// Maximum records returned or exported.
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub limit: u16,
+}
+
+/// Closed structured-log severity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogSeverityArgument {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Closed structured-log product domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogDomainArgument {
+    Application,
+    Source,
+    Market,
+    Research,
+    Portfolio,
+    Model,
+    Backtest,
+    Execution,
+    Risk,
+    FairValue,
+    Mcp,
+    Lifecycle,
+}
+
+/// Typed-settings operation.
+#[derive(Debug, Subcommand)]
+pub enum SettingsOperationsCommand {
+    /// Return all effective typed settings, origins, and restart impacts.
+    Get,
+    /// Preview or apply a typed settings change.
+    Change {
+        /// Settings-change operation.
+        #[command(subcommand)]
+        command: SettingsChangeCommand,
+    },
+    /// Preview or apply restoration of a retained settings revision.
+    Rollback {
+        /// Settings-rollback operation.
+        #[command(subcommand)]
+        command: SettingsRollbackCommand,
+    },
+}
+
+/// Typed settings-change preview and application.
+#[derive(Debug, Subcommand)]
+pub enum SettingsChangeCommand {
+    /// Preview one or more closed typed settings at an exact revision.
+    Preview(SettingsChangeArguments),
+    /// Apply one exact settings-change preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Settings-rollback preview and application.
+#[derive(Debug, Subcommand)]
+pub enum SettingsRollbackCommand {
+    /// Preview restoring a retained revision as a new monotonic revision.
+    Preview {
+        /// Exact currently observed settings revision.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        expected_revision: u64,
+        /// Exact retained settings revision to restore.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        target_revision: u64,
+    },
+    /// Apply one exact settings-rollback preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Closed settings values accepted by `operations settings change preview`.
+#[derive(Debug, Args)]
+pub struct SettingsChangeArguments {
+    /// Exact currently observed settings revision.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub expected_revision: u64,
+    /// Structured-log retention in days.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=365))]
+    pub log_retention_days: Option<u16>,
+    /// Minimum structured-log severity.
+    #[arg(long, value_enum)]
+    pub log_minimum_severity: Option<LogSeverityArgument>,
+    /// Product-owned update stream.
+    #[arg(long, value_enum)]
+    pub update_channel: Option<UpdateChannelArgument>,
+    /// Whether the service performs disclosed bounded automatic update checks.
+    #[arg(long)]
+    pub automatic_update_checks: Option<bool>,
+    /// Workspace soft storage limit in bytes.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1_073_741_824..=17_592_186_044_416)
+    )]
+    pub storage_soft_limit_bytes: Option<u64>,
+    /// Default bounded analytical-query row limit.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(100..=1_000_000))]
+    pub default_query_row_limit: Option<u32>,
+    /// Maximum concurrently running durable jobs.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub maximum_concurrent_jobs: Option<u16>,
+    /// Market-data freshness threshold in milliseconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(250..=600_000))]
+    pub market_freshness_millis: Option<u64>,
+    /// Number of verified backups retained by default.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub backup_retention_count: Option<u16>,
+}
+
+/// Closed product-owned update stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UpdateChannelArgument {
+    Stable,
+    Preview,
+}
+
+/// Guided first-run setup operation.
+#[derive(Debug, Subcommand)]
+pub enum SetupCommand {
+    /// Return the closed setup catalog and exact accepted plan, if any.
+    Status,
+    /// Preview a complete workspace-bound setup plan without completing any step.
+    Preview(SetupPreviewArguments),
+    /// Accept one exact one-use setup-plan preview without completing any step.
+    Apply(SetupApplyArguments),
+}
+
+/// Closed setup-plan selection.
+#[derive(Debug, Args)]
+pub struct SetupPreviewArguments {
+    /// Exact current setup-plan revision; zero selects an unconfigured workspace.
+    #[arg(long, default_value_t = 0)]
+    pub expected_revision: u64,
+    /// One or more closed goals; repeat the option or pass a comma-separated list.
+    #[arg(
+        long = "goal",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "everything-recommended"
+    )]
+    pub goals: Vec<SetupGoalArgument>,
+    /// One code-owned starter plan compatible with the selected goals.
+    #[arg(long, value_enum, default_value = "everything-recommended")]
+    pub starter_plan: SetupStarterPlanArgument,
+}
+
+/// Exact one-use setup-plan confirmation.
+#[derive(Debug, Args)]
+pub struct SetupApplyArguments {
+    /// Exact non-nil preview UUID returned by `setup preview`.
+    #[arg(long)]
+    pub preview_id: Uuid,
+    /// Exact lowercase SHA-256 returned by `setup preview`.
+    #[arg(long)]
+    pub preview_sha256: String,
+    /// Explicitly authorize acceptance of this exact setup plan.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// Closed setup goal projected into the public application setup contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SetupGoalArgument {
+    EverythingRecommended,
+    ExplorePublicMarkets,
+    ResearchInvestments,
+    ManagePortfolio,
+    BuildAndEvaluateModels,
+    PracticePaperExecution,
+    UseClaudeCode,
+    UseCodex,
+}
+
+/// Closed setup starter plan projected into the public application setup contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SetupStarterPlanArgument {
+    EverythingRecommended,
+    PublicMarkets,
+    Research,
+    Portfolio,
+    Models,
+    PaperPractice,
+    AiClients,
 }
 
 /// Exact-head release operation.

@@ -1,10 +1,13 @@
 import { lazy, Suspense } from "react"
 import { Navigate, Route, Routes } from "react-router-dom"
 
-import { DomainPage } from "@/components/domain-page"
-import { InstallationPage } from "@/components/installation-page"
 import { McpPage } from "@/components/mcp-page"
-import { OverviewPage } from "@/components/overview-page"
+
+const OverviewPage = lazy(() =>
+  import("@/components/overview-page").then((module) => ({
+    default: module.OverviewPage,
+  })),
+)
 
 const MarketsPage = lazy(() =>
   import("@/features/markets").then((module) => ({ default: module.MarketsPage })),
@@ -39,15 +42,18 @@ const FairValuePage = lazy(() =>
 const OperationsPage = lazy(() =>
   import("@/features/operations").then((module) => ({ default: module.OperationsPage })),
 )
-
-const operatingRoutes = [
-  {
-    path: "/settings",
-    title: "Settings",
-    description:
-      "Review validated configuration origins, safety defaults, local paths, and advanced resource limits.",
-  },
-] as const
+const LifecyclePage = lazy(() =>
+  import("@/features/lifecycle").then((module) => ({ default: module.LifecyclePage })),
+)
+const BackupRecoveryPage = lazy(() =>
+  import("@/features/backup").then((module) => ({ default: module.BackupRecoveryPage })),
+)
+const LogsPage = lazy(() =>
+  import("@/features/logs").then((module) => ({ default: module.LogsPage })),
+)
+const SettingsPage = lazy(() =>
+  import("@/features/settings").then((module) => ({ default: module.SettingsPage })),
+)
 
 export function AppRoutes() {
   return (
@@ -64,17 +70,12 @@ export function AppRoutes() {
         <Route path="/paper-execution" element={<PaperExecutionPage />} />
         <Route path="/risk" element={<RiskPage />} />
         <Route path="/fair-value" element={<FairValuePage />} />
-        <Route path="/updates" element={<InstallationPage />} />
+        <Route path="/updates" element={<LifecyclePage />} />
         <Route path="/mcp" element={<McpPage />} />
-        <Route path="/logs" element={<OperationsPage />} />
-        <Route path="/backup-recovery" element={<InstallationPage recovery />} />
-        {operatingRoutes.map((route) => (
-          <Route
-            key={route.path}
-            path={route.path}
-            element={<DomainPage title={route.title} description={route.description} />}
-          />
-        ))}
+        <Route path="/operations" element={<OperationsPage />} />
+        <Route path="/logs" element={<LogsPage />} />
+        <Route path="/backup-recovery" element={<BackupRecoveryPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/overview" replace />} />
       </Routes>
     </Suspense>

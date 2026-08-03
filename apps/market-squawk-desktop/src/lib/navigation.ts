@@ -110,49 +110,9 @@ export function navigationAdmission(
   item: NavigationItem,
   bootstrap: DesktopBootstrap,
 ): NavigationAdmission {
-  const stepReady = (id: DesktopBootstrap["setupSteps"][number]["id"]) =>
-    bootstrap.setupSteps.some((step) => step.id === id && step.complete)
   const operationReady =
     !item.domain ||
     bootstrap.operations.some((operation) => operation.domain === item.domain)
-
-  const prerequisite = (() => {
-    switch (item.path) {
-      case "/markets":
-        return {
-          ready: stepReady("sources"),
-          reason: "Connect and verify a market-data source first.",
-        }
-      case "/research":
-      case "/backtests":
-        return {
-          ready: stepReady("research"),
-          reason: "Restore the complete Research services first.",
-        }
-      case "/portfolios":
-        return {
-          ready: stepReady("portfolio"),
-          reason: "Restore the complete Portfolio services first.",
-        }
-      case "/models":
-        return {
-          ready: bootstrap.modelRuntime.state === "ready",
-          reason: "Configure and admit a verified local training release first.",
-        }
-      case "/paper-execution":
-      case "/risk":
-        return {
-          ready: stepReady("paper"),
-          reason: "Restore the complete risk-controlled paper services first.",
-        }
-      default:
-        return { ready: true, reason: null }
-    }
-  })()
-
-  if (!prerequisite.ready) {
-    return { admitted: false, reason: prerequisite.reason }
-  }
   if (!operationReady) {
     return {
       admitted: false,

@@ -22,6 +22,7 @@ import type {
   InstallationControlRequest,
   ModelControlRequest,
   McpClientControlRequest,
+  OperationsControlRequest,
   PaperControlRequest,
   ProductTransport,
   ProviderOnboardingRequest,
@@ -45,10 +46,10 @@ class TauriTransport implements ProductTransport {
     return desktopBootstrapSchema.parse(value)
   }
 
-  async installation(request: InstallationControlRequest) {
+  async installation(request: InstallationControlRequest, confirmed = false) {
     const value = await invoke("installation_control", {
       request,
-      confirmed: request.action !== "status",
+      confirmed,
     })
     return installationControlResultSchema.parse(value)
   }
@@ -109,6 +110,11 @@ class TauriTransport implements ProductTransport {
     confirmed = false,
   ) {
     const value = await invoke("source_control", { action, request, confirmed })
+    return applicationResultSchema.parse(value)
+  }
+
+  async operationsControl(request: OperationsControlRequest, confirmed = false) {
+    const value = await invoke("operations_control", { request, confirmed })
     return applicationResultSchema.parse(value)
   }
 
@@ -229,6 +235,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   sourceControl(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  operationsControl(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

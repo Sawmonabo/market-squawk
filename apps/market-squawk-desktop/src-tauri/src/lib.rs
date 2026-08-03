@@ -34,7 +34,8 @@ use input_staging::{stage_training_input, start_backtest_from_file};
 use mcp_clients::{DesktopMcpClientState, mcp_client_control, mcp_status};
 use service_client::{
     dashboard_query, decision_control, fair_value_control, governance_control, governance_query,
-    job_control, model_control, paper_control, research_control, source_control,
+    job_control, model_control, operations_control, paper_control, research_control,
+    source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -205,6 +206,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             mcp_client_control,
             mcp_status,
             model_control,
+            operations_control,
             open_official_provider_page,
             open_protected_provider_setup,
             paper_control,

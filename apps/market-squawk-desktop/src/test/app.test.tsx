@@ -44,88 +44,6 @@ const blockedBootstrap: DesktopBootstrap = {
   encryptedFileFallback: "locked",
   providerProfiles: [],
   providerSessions: [],
-  setupSteps: [
-    {
-      id: "system",
-      label: "System",
-      state: "complete",
-      complete: true,
-      detail: "The local application initialized.",
-      blockingReason: null,
-      recovery: null,
-      action: null,
-    },
-    {
-      id: "storage",
-      label: "Storage",
-      state: "complete",
-      complete: true,
-      detail: "The local workspace is ready.",
-      blockingReason: null,
-      recovery: null,
-      action: null,
-    },
-    {
-      id: "sources",
-      label: "Sources",
-      state: "action_required",
-      complete: false,
-      detail: "Connect a source.",
-      blockingReason: "No source is active.",
-      recovery: "Connect a source.",
-      action: "configure_sources",
-    },
-    {
-      id: "research",
-      label: "Research",
-      state: "action_required",
-      complete: false,
-      detail: "Configure research.",
-      blockingReason: "Research is not ready.",
-      recovery: "Configure research.",
-      action: "configure_research",
-    },
-    {
-      id: "portfolio",
-      label: "Portfolio",
-      state: "action_required",
-      complete: false,
-      detail: "Configure portfolio imports.",
-      blockingReason: "Portfolio imports are not active.",
-      recovery: "Configure portfolio imports.",
-      action: "configure_portfolio",
-    },
-    {
-      id: "paper",
-      label: "Paper",
-      state: "action_required",
-      complete: false,
-      detail: "Configure paper execution.",
-      blockingReason: "The complete Paper services are unavailable.",
-      recovery: "Restore the complete risk-controlled Paper services.",
-      action: "configure_paper",
-    },
-    {
-      id: "mcp",
-      label: "MCP",
-      state: "available",
-      complete: true,
-      detail: "The local MCP service is available.",
-      blockingReason: null,
-      recovery: null,
-      action: "review_mcp",
-    },
-    {
-      id: "review",
-      label: "Review",
-      state: "blocked",
-      complete: false,
-      detail: "Review setup.",
-      blockingReason: "Required setup remains.",
-      recovery: "Resolve blockers.",
-      action: "review_status",
-    },
-  ],
   operations: [],
 }
 
@@ -182,6 +100,8 @@ function transport(
       query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
     sourceControl: async (_action, _request) =>
       query({ query: "sourceStatus" }),
+    operationsControl: async () =>
+      query({ query: "operationUpdateStatus" }),
     stageTrainingInput: async () => null,
     mcpClients: async () => {
       const claudeService = {
@@ -307,17 +227,6 @@ describe("Market Squawk desktop boundary", () => {
   it("uses accessible product navigation to explore real research and MCP state", async () => {
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
-      setupSteps: blockedBootstrap.setupSteps.map((step) =>
-        step.id === "research"
-          ? {
-              ...step,
-              state: "complete",
-              complete: true,
-              blockingReason: null,
-              recovery: null,
-            }
-          : step,
-      ),
       operations: [
         datasetRead(
           "Research.ListDatasets",
@@ -400,7 +309,7 @@ describe("Market Squawk desktop boundary", () => {
     expect(screen.queryByText("Operation arguments")).toBeNull()
 
     rendered.unmount()
-    render(
+    const mcpRendered = render(
       <MemoryRouter initialEntries={["/mcp"]}>
         <App transport={transport(readyBootstrap)} />
       </MemoryRouter>,
@@ -408,6 +317,16 @@ describe("Market Squawk desktop boundary", () => {
     expect(await screen.findByText("One authenticated local endpoint")).toBeTruthy()
     expect(screen.getByText("Claude Code and Codex")).toBeTruthy()
     expect(screen.getByText("stateless request sessions", { exact: false })).toBeTruthy()
+
+    mcpRendered.unmount()
+    render(
+      <MemoryRouter initialEntries={["/updates"]}>
+        <App transport={transport(readyBootstrap)} />
+      </MemoryRouter>,
+    )
+    expect(
+      await screen.findByRole("heading", { name: "Updates & program recovery" }),
+    ).toBeTruthy()
   })
 
   it("never promotes an unverified backend state to installation readiness", async () => {

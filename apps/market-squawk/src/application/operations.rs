@@ -29,6 +29,7 @@ use super::{
     lifecycle::{TrustedUpdateAuthority, WorkspaceLifecycleAuthority, WorkspaceRuntimeIdentity},
     logs::{DiagnosticArtifactPublisher, StructuredLogStore},
     settings::DurableSettingsStore,
+    setup::{SetupPlanAuthority, SetupPlanConfirmation, SetupPreviewId},
     workspace::DurableWorkspaceRegistry,
 };
 use crate::jobs::{
@@ -53,6 +54,9 @@ const PREVIEW_SETTINGS_CHANGE: &str = "Operations.PreviewSettingsChange";
 const APPLY_SETTINGS_CHANGE: &str = "Operations.ApplySettingsChange";
 const PREVIEW_SETTINGS_ROLLBACK: &str = "Operations.PreviewSettingsRollback";
 const ROLLBACK_SETTINGS: &str = "Operations.RollbackSettings";
+const GET_SETUP_STATUS: &str = "Setup.GetStatus";
+const PREVIEW_SETUP_PLAN: &str = "Setup.PreviewPlan";
+const APPLY_SETUP_PLAN: &str = "Setup.ApplyPlan";
 
 pub(crate) const START_BACKUP: &str = "Operations.StartBackup";
 pub(crate) const START_BACKUP_VERIFICATION: &str = "Operations.StartBackupVerification";
@@ -65,9 +69,10 @@ pub(crate) const START_PROGRAM_ROLLBACK: &str = "Operations.StartProgramRollback
 use previews::{PreviewPayload, PreviewRegistry, project_digest_fields};
 use requests::{
     BackupIdentityInput, BackupListInput, LogQueryInput, PreviewReferenceInput, RetentionInput,
-    SettingsChangeInput, SettingsRollbackInput, WorkspaceListInput, WorkspaceTargetInput, decode,
-    decode_mutation, map_backup_error, map_lifecycle_error, map_update_error, parse_sha256,
-    parse_workspace, require_confirmation, result_item_count,
+    SettingsChangeInput, SettingsRollbackInput, SetupPlanConfirmationInput, SetupPlanPreviewInput,
+    WorkspaceListInput, WorkspaceTargetInput, decode, decode_mutation, map_backup_error,
+    map_lifecycle_error, map_setup_error, map_update_error, parse_sha256, parse_workspace,
+    require_confirmation, result_item_count,
 };
 
 /// Exact job command prepared by the Operations application authority.
@@ -101,6 +106,7 @@ pub struct OperationsApplicationServices {
     log_artifacts: Arc<dyn DiagnosticArtifactPublisher>,
     settings: Arc<DurableSettingsStore>,
     settings_operations: Arc<dyn ManagedSettingsOperations>,
+    setup: Arc<SetupPlanAuthority>,
     previews: PreviewRegistry,
 }
 
@@ -122,6 +128,7 @@ impl OperationsApplicationServices {
         log_artifacts: Arc<dyn DiagnosticArtifactPublisher>,
         settings: Arc<DurableSettingsStore>,
         settings_operations: Arc<dyn ManagedSettingsOperations>,
+        setup: Arc<SetupPlanAuthority>,
     ) -> Self {
         Self {
             lifecycle: DomainLifecycle::new(),
@@ -136,6 +143,7 @@ impl OperationsApplicationServices {
             log_artifacts,
             settings,
             settings_operations,
+            setup,
             previews: PreviewRegistry::default(),
         }
     }
@@ -176,6 +184,9 @@ impl OperationsApplicationServices {
                     | APPLY_SETTINGS_CHANGE
                     | PREVIEW_SETTINGS_ROLLBACK
                     | ROLLBACK_SETTINGS
+                    | GET_SETUP_STATUS
+                    | PREVIEW_SETUP_PLAN
+                    | APPLY_SETUP_PLAN
             )
     }
 
@@ -561,6 +572,35 @@ impl ApplicationDomainService for OperationsApplicationServices {
                 };
                 serde_json::to_value(self.settings_operations.apply_rollback(preview.approve())?)
                     .map_err(|_| ServiceError::Internal)?
+            }
+            GET_SETUP_STATUS => serde_json::to_value(self.setup.status().map_err(map_setup_error)?)
+                .map_err(|_| ServiceError::Internal)?,
+            PREVIEW_SETUP_PLAN => {
+                let input: SetupPlanPreviewInput = decode(request.arguments())?;
+                serde_json::to_value(
+                    self.setup
+                        .preview_plan(
+                            active.workspace_id(),
+                            input.expected_revision,
+                            input.selection,
+                        )
+                        .map_err(map_setup_error)?,
+                )
+                .map_err(|_| ServiceError::Internal)?
+            }
+            APPLY_SETUP_PLAN => {
+                require_confirmation(request.arguments())?;
+                let input: SetupPlanConfirmationInput = decode_mutation(request.arguments())?;
+                let preview_id =
+                    SetupPreviewId::try_from_uuid(input.preview_id).map_err(map_setup_error)?;
+                let confirmation =
+                    SetupPlanConfirmation::new(preview_id, parse_sha256(&input.preview_sha256)?);
+                serde_json::to_value(
+                    self.setup
+                        .apply_plan(active.workspace_id(), confirmation)
+                        .map_err(map_setup_error)?,
+                )
+                .map_err(|_| ServiceError::Internal)?
             }
             _ if Self::is_start_operation(request.name()) => return Err(ServiceError::NotFound),
             _ => return Err(ServiceError::NotFound),

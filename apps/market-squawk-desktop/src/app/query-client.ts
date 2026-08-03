@@ -19,7 +19,7 @@ export const productKeys = {
     scope: ProductScope,
     domain: string,
     operation: string,
-    input: Readonly<Record<string, unknown>>,
+    input: Readonly<object>,
   ) => [...productKeys.domain(scope, domain), operation, input] as const,
 }
 

@@ -40,6 +40,7 @@ use crate::{
         settings::{
             DurableSettingsStore, SettingKey, SettingValue, SettingsSeed, SettingsSnapshot,
         },
+        setup::SetupPlanAuthority,
         workspace::{DurableWorkspaceRegistry, WorkspaceDescriptor, WorkspaceHealth},
     },
     jobs::{InstalledJobAuthority, InstalledJobRunners},
@@ -239,6 +240,10 @@ impl PreparedInstalledOperations {
                 NonZeroUsize::new(MAXIMUM_DIAGNOSTIC_RECORDS)
                     .ok_or(InstalledServiceError::InvalidComposition)?,
             ));
+        let setup = Arc::new(
+            SetupPlanAuthority::try_open(control_path, selection.identity().workspace_id())
+                .map_err(|_error| InstalledServiceError::CompositionStage("setup plan"))?,
+        );
         let pending = PendingOperationsComposition::new(OperationsApplicationDependencies {
             backups: Arc::clone(&backups),
             workspaces: Arc::clone(&workspaces),
@@ -248,6 +253,7 @@ impl PreparedInstalledOperations {
             log_artifacts,
             settings,
             settings_operations: settings_operations.clone(),
+            setup,
         });
         let activity = Arc::new(RuntimeActivityCoordinator::new(
             RuntimeActivityLimits::try_new(

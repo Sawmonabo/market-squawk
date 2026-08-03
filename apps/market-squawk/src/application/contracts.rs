@@ -391,6 +391,20 @@ const OPERATIONS_SETTINGS_ROLLBACK_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
+const SETUP_PLAN_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("selection", ArgumentKind::Object),
+];
+const SETUP_PLAN_CONFIRMATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewSha256", ArgumentKind::Sha256),
+];
 const MEASUREMENT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "measurementId",
     ArgumentKind::Identifier,
@@ -1465,6 +1479,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Operations,
         LOCAL_SCOPE,
         OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Setup.GetStatus",
+        "Return the closed setup catalog and exact durable accepted plan.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Setup.PreviewPlan",
+        "Preview one complete workspace-bound guided setup plan without changing authority.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        SETUP_PLAN_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Setup.ApplyPlan",
+        "Accept one exact one-use setup-plan preview after explicit local confirmation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        SETUP_PLAN_CONFIRMATION_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     read(

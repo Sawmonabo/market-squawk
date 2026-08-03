@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::application::{
     logs::{LogDomain, LogSeverity, StructuredLogQuery},
     settings::SettingValue,
+    setup::SetupPlanSelection,
 };
 
 #[derive(Deserialize)]
@@ -63,6 +64,20 @@ pub(super) struct SettingsChangeInput {
 pub(super) struct SettingsRollbackInput {
     pub(super) expected_revision: u64,
     pub(super) target_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct SetupPlanPreviewInput {
+    pub(super) expected_revision: u64,
+    pub(super) selection: SetupPlanSelection,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct SetupPlanConfirmationInput {
+    pub(super) preview_id: Uuid,
+    pub(super) preview_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -190,5 +205,26 @@ pub(super) fn map_update_error(error: super::super::lifecycle::UpdateError) -> S
         | UpdateError::HealthCheckFailed
         | UpdateError::RollbackFailed
         | UpdateError::JournalUnavailable => ServiceError::Internal,
+    }
+}
+
+pub(super) fn map_setup_error(error: super::super::setup::SetupPlanError) -> ServiceError {
+    use super::super::setup::SetupPlanError;
+    match error {
+        SetupPlanError::InvalidSelection
+        | SetupPlanError::InvalidRevision
+        | SetupPlanError::StaleRevision
+        | SetupPlanError::PreviewUnavailable
+        | SetupPlanError::PreviewExpired
+        | SetupPlanError::InvalidConfirmation
+        | SetupPlanError::CrossWorkspacePreview => ServiceError::InvalidRequest,
+        SetupPlanError::CapacityExceeded => ServiceError::ResourceExhausted,
+        SetupPlanError::Unavailable
+        | SetupPlanError::RecoveryRequired
+        | SetupPlanError::TimeUnavailable
+        | SetupPlanError::Persistence(_) => ServiceError::Unavailable,
+        SetupPlanError::RevisionExhausted
+        | SetupPlanError::CorruptState
+        | SetupPlanError::Encoding => ServiceError::Internal,
     }
 }

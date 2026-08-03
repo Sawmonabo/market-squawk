@@ -24,8 +24,7 @@ use uuid::Uuid;
 
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, InstallationControlCommand,
-    OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState, SetupStep,
-    SetupStepAction, SetupStepState,
+    OperationSummary, ProviderOnboardingCommand, Readiness, ReadinessState,
 };
 
 const MAXIMUM_APPLICATION_ARGUMENT_BYTES: usize = 256 * 1024;
@@ -38,36 +37,6 @@ const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
 const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
-const LIVE_MARKET_SETUP_SURFACES: [&str; 3] = [
-    "coinbase.public-market-data",
-    "coinbase.exchange-direct-market-data",
-    "kraken.spot-public-market-data",
-];
-const RESEARCH_SETUP_OPERATIONS: [&str; 5] = [
-    "Research.ListDatasets",
-    "Research.GetManifest",
-    "Research.GetHistory",
-    "Research.GetAlternativeData",
-    "Research.IngestSource",
-];
-const PORTFOLIO_SETUP_OPERATIONS: [&str; 6] = [
-    "Portfolio.Import",
-    "Portfolio.GetHoldings",
-    "Portfolio.GetTransactions",
-    "Portfolio.GetPerformance",
-    "Portfolio.GetExposure",
-    "Portfolio.GetRisk",
-];
-const PAPER_SETUP_OPERATIONS: [&str; 8] = [
-    "Bot.GetStatus",
-    "Bot.Start",
-    "Bot.Stop",
-    "Execution.GetOrders",
-    "Execution.GetFills",
-    "Execution.Cancel",
-    "Execution.Reconcile",
-    "Risk.TriggerKillSwitch",
-];
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum InvocationAuthority {
@@ -316,15 +285,6 @@ impl DesktopState {
     async fn bootstrap(&self) -> Result<DesktopBootstrap, DesktopCommandError> {
         let sessions = self.provider_sessions().await?;
         let capabilities = &self.service_bootstrap.operations;
-        let research_service_available = RESEARCH_SETUP_OPERATIONS
-            .iter()
-            .all(|operation| capabilities.iter().any(|entry| entry.name == *operation));
-        let portfolio_service_available = PORTFOLIO_SETUP_OPERATIONS
-            .iter()
-            .all(|operation| capabilities.iter().any(|entry| entry.name == *operation));
-        let paper_service_available = PAPER_SETUP_OPERATIONS
-            .iter()
-            .all(|operation| capabilities.iter().any(|entry| entry.name == *operation));
         let operations = capabilities
             .iter()
             .cloned()
@@ -344,13 +304,6 @@ impl DesktopState {
             )
         };
         let mcp_available = self.service_bootstrap.mcp_ready;
-        let setup_steps = setup_steps(
-            &sessions,
-            research_service_available,
-            portfolio_service_available,
-            paper_service_available,
-            mcp_available,
-        );
         let mcp = if mcp_available {
             Readiness::new(
                 ReadinessState::Available,
@@ -404,7 +357,6 @@ impl DesktopState {
             self.service_bootstrap.encrypted_file_fallback.clone(),
             self.service_bootstrap.provider_profiles.clone(),
             Value::Array(sessions),
-            setup_steps,
             operations,
         ))
     }
@@ -578,181 +530,6 @@ fn allocate_authorization_handle(
         .map(|_| Uuid::new_v4())
         .find(|candidate| !authorizations.contains_key(candidate))
         .ok_or_else(DesktopCommandError::internal)
-}
-
-fn setup_steps(
-    sessions: &[Value],
-    research_service_available: bool,
-    portfolio_service_available: bool,
-    paper_service_available: bool,
-    mcp_available: bool,
-) -> Vec<SetupStep> {
-    let sources_ready = sessions.iter().any(|session| {
-        session_surface(session)
-            .is_some_and(|surface| LIVE_MARKET_SETUP_SURFACES.contains(&surface))
-            && session_is_active(session)
-    });
-    let files_imported = has_active_session(sessions, "local.files");
-    let portfolio_imported = has_active_session(sessions, "local.portfolio-imports");
-    let research_ready = research_service_available;
-    let portfolio_ready = portfolio_service_available;
-    let paper_ready = paper_service_available;
-    let review_ready =
-        sources_ready && research_ready && portfolio_ready && paper_ready && mcp_available;
-
-    vec![
-        SetupStep::new(
-            "system",
-            "System",
-            SetupStepState::Complete,
-            true,
-            "Validated configuration, controlled paths, catalogs, and application services initialized successfully.",
-            None,
-            None,
-            None,
-        ),
-        SetupStep::new(
-            "storage",
-            "Storage",
-            SetupStepState::Complete,
-            true,
-            "The controlled workspace and catalog are open in the effective data directory.",
-            None,
-            None,
-            None,
-        ),
-        SetupStep::new(
-            "sources",
-            "Sources",
-            if sources_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            sources_ready,
-            "Activate at least one supported live market-data source.",
-            (!sources_ready)
-                .then_some("No supported live market provider session currently holds active authority."),
-            (!sources_ready).then_some(
-                "Connect Coinbase public, Coinbase Exchange direct, or Kraken and complete its provider-specific verification.",
-            ),
-            Some(SetupStepAction::ConfigureSources),
-        ),
-        SetupStep::new(
-            "research",
-            "Research",
-            if research_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            research_ready,
-            if research_service_available && files_imported {
-                "The complete Research contract is initialized and a local-file import authority is active; model-runtime admission remains separate."
-            } else if research_service_available {
-                "The complete Research contract is initialized; importing private local data is optional and no import has been recorded."
-            } else {
-                "The installed application is missing one or more required Research operations."
-            },
-            (!research_ready).then_some("The complete Research application contract is unavailable."),
-            (!research_ready).then_some(
-                "Repair or reinstall the complete native package, then refresh status.",
-            ),
-            Some(SetupStepAction::ConfigureResearch),
-        ),
-        SetupStep::new(
-            "portfolio",
-            "Portfolio",
-            if portfolio_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            portfolio_ready,
-            if portfolio_service_available && portfolio_imported {
-                "The complete Portfolio contract is initialized and a private import authority is active."
-            } else if portfolio_service_available {
-                "The complete Portfolio contract is initialized; importing private holdings or transactions is optional."
-            } else {
-                "The installed application is missing one or more required Portfolio operations."
-            },
-            (!portfolio_ready)
-                .then_some("The complete Portfolio application contract is unavailable."),
-            (!portfolio_ready)
-                .then_some("Repair or reinstall the complete native package, then refresh status."),
-            Some(SetupStepAction::ConfigurePortfolio),
-        ),
-        SetupStep::new(
-            "paper",
-            "Paper",
-            if paper_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::ActionRequired
-            },
-            paper_ready,
-            if paper_service_available {
-                "The complete local paper-only Bot and Execution contract is initialized under central risk authority."
-            } else {
-                "The installed application is missing one or more required paper bot or execution operations."
-            },
-            (!paper_ready).then_some("The complete paper application contract is unavailable."),
-            (!paper_ready)
-                .then_some("Repair or reinstall the complete native package, then refresh status."),
-            Some(SetupStepAction::ConfigurePaper),
-        ),
-        SetupStep::new(
-            "mcp",
-            "MCP",
-            if mcp_available {
-                SetupStepState::Available
-            } else {
-                SetupStepState::Blocked
-            },
-            mcp_available,
-            if mcp_available {
-                "The shared local MCP endpoint is ready for registered native clients without exposing its credential to this window."
-            } else {
-                "The local stdio MCP service requires a verified packaged CLI, representable workspace paths, and a valid tool contract."
-            },
-            (!mcp_available).then_some(
-                "The installed CLI, effective paths, or bounded MCP tool contract is unavailable.",
-            ),
-            (!mcp_available).then_some(
-                "Repair or reinstall the complete native package, then refresh setup status.",
-            ),
-            Some(SetupStepAction::ReviewMcp),
-        ),
-        SetupStep::new(
-            "review",
-            "Review",
-            if review_ready {
-                SetupStepState::Complete
-            } else {
-                SetupStepState::Blocked
-            },
-            review_ready,
-            "Final readiness is derived from every required owning authority above.",
-            (!review_ready).then_some("One or more required setup authorities remain incomplete."),
-            (!review_ready)
-                .then_some("Resolve each named blocker, refresh status, and review again."),
-            Some(SetupStepAction::ReviewStatus),
-        ),
-    ]
-}
-
-fn has_active_session(sessions: &[Value], surface_id: &str) -> bool {
-    sessions
-        .iter()
-        .any(|session| session_surface(session) == Some(surface_id) && session_is_active(session))
-}
-
-fn session_surface(session: &Value) -> Option<&str> {
-    session.get("surface_id").and_then(Value::as_str)
-}
-
-fn session_is_active(session: &Value) -> bool {
-    session.get("next_action").and_then(Value::as_str) == Some("active")
 }
 
 #[tauri::command]

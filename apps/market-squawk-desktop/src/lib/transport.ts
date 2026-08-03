@@ -11,6 +11,30 @@ import type {
   ProviderSession,
 } from "@/lib/schemas"
 
+export type SetupGoal =
+  | "everything_recommended"
+  | "explore_public_markets"
+  | "research_investments"
+  | "manage_portfolio"
+  | "build_and_evaluate_models"
+  | "practice_paper_execution"
+  | "use_claude_code"
+  | "use_codex"
+
+export type SetupStarterPlan =
+  | "everything_recommended"
+  | "public_markets"
+  | "research"
+  | "portfolio"
+  | "models"
+  | "paper_practice"
+  | "ai_clients"
+
+export type SetupPlanSelection = {
+  goals: SetupGoal[]
+  starterPlan: SetupStarterPlan
+}
+
 export type DashboardQuery =
   | { query: "overview" }
   | { query: "lookup"; text: string; categories?: string[] }
@@ -133,6 +157,40 @@ export type DashboardQuery =
       maximumBytes: number
     }
   | { query: "jobs"; afterJobId?: string; limit: number }
+  | { query: "operationBackups"; afterBackupId?: string; limit: number }
+  | { query: "operationBackup"; backupId: string }
+  | { query: "operationBackupRetentionPreview"; keepLatest: number }
+  | { query: "operationRestorePreview"; backupId: string }
+  | {
+      query: "operationWorkspaces"
+      afterWorkspaceId?: string
+      limit: number
+    }
+  | { query: "operationWorkspaceSwitchPreview"; workspaceId: string }
+  | {
+      query:
+        | "operationUpdateStatus"
+        | "operationUpdatePreview"
+        | "operationProgramRollbackPreview"
+        | "operationSettings"
+    }
+  | ({ query: "operationLogs" } & OperationLogFilter)
+  | {
+      query: "operationSettingsChangePreview"
+      expectedRevision: string
+      changes: OperationSettingValue[]
+    }
+  | {
+      query: "operationSettingsRollbackPreview"
+      expectedRevision: string
+      targetRevision: string
+    }
+  | { query: "setupPlanStatus" }
+  | {
+      query: "setupPlanPreview"
+      expectedRevision: string
+      selection: SetupPlanSelection
+    }
 
 export type InstallationControlRequest =
   | { action: "status" }
@@ -176,6 +234,7 @@ export interface ProductTransport {
   bootstrap(): Promise<DesktopBootstrap>
   installation(
     request: InstallationControlRequest,
+    confirmed?: boolean,
   ): Promise<InstallationControlResult>
   query(request: DashboardQuery): Promise<ApplicationResult>
   researchControl(
@@ -210,6 +269,10 @@ export interface ProductTransport {
     request: SourceLifecycleRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
+  operationsControl(
+    request: OperationsControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
   stageTrainingInput(kind: TrainingInputKind): Promise<InputTicket | null>
   mcpClients(): Promise<McpClientsStatus>
   mcpClientControl(
@@ -223,6 +286,69 @@ export interface ProductTransport {
   openOfficialProviderPage(providerId: string): Promise<void>
   openProtectedProviderSetup(providerId: string): Promise<void>
 }
+
+export type OperationLogSeverity = "trace" | "debug" | "info" | "warn" | "error"
+
+export type OperationLogDomain =
+  | "application"
+  | "source"
+  | "market"
+  | "research"
+  | "portfolio"
+  | "model"
+  | "backtest"
+  | "execution"
+  | "risk"
+  | "fair_value"
+  | "mcp"
+  | "lifecycle"
+
+export interface OperationLogFilter {
+  fromUnixNanos?: string
+  throughUnixNanos?: string
+  minimumSeverity?: OperationLogSeverity
+  domain?: OperationLogDomain
+  sourceId?: string
+  jobId?: string
+  correlationId?: string
+  search?: string
+  afterSequence?: string
+  limit: number
+}
+
+export type OperationSettingValue =
+  | { kind: "log_retention_days"; value: number }
+  | { kind: "log_minimum_severity"; value: OperationLogSeverity }
+  | { kind: "update_channel"; value: "stable" | "preview" }
+  | { kind: "automatic_update_checks"; value: boolean }
+  | { kind: "storage_soft_limit_bytes"; value: string }
+  | { kind: "default_query_row_limit"; value: number }
+  | { kind: "maximum_concurrent_jobs"; value: number }
+  | { kind: "market_freshness_millis"; value: number }
+  | { kind: "backup_retention_count"; value: number }
+
+type PreviewReference = {
+  previewId: string
+  previewDigest: string
+}
+
+export type OperationsControlRequest =
+  | { action: "checkForUpdates" }
+  | ({ action: "exportLogs" } & OperationLogFilter)
+  | { action: "startBackup" }
+  | { action: "startBackupVerification"; backupId: string }
+  | ({ action: "startBackupRetention" } & PreviewReference)
+  | ({ action: "startRestore" } & PreviewReference)
+  | ({ action: "startWorkspaceSwitch" } & PreviewReference)
+  | ({ action: "startUpdate" } & PreviewReference)
+  | ({ action: "startProgramRollback" } & PreviewReference)
+  | ({ action: "applySettingsChange" } & PreviewReference)
+  | ({ action: "rollbackSettings" } & PreviewReference)
+  | {
+      action: "applySetupPlan"
+      previewId: string
+      previewSha256: string
+    }
 
 export type TrainingInputKind = "configuration" | "model_authority"
 

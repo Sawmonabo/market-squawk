@@ -33,6 +33,7 @@ pub mod operations;
 mod paper;
 mod research;
 pub mod settings;
+pub mod setup;
 pub mod source;
 pub mod workspace;
 

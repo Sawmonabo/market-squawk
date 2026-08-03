@@ -8,8 +8,9 @@ use crate::{
     contracts::{
         ApplicationInvocation, DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
         FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
-        JobControlCommand, ModelControlCommand, PaperControlCommand, ResearchControlCommand,
-        SourceLifecycleAction, SourceLifecycleInput,
+        JobControlCommand, ModelControlCommand, OperationLogDomain, OperationLogSeverity,
+        OperationSettingValue, OperationsControlCommand, PaperControlCommand,
+        ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
@@ -260,6 +261,124 @@ pub(crate) async fn dashboard_query(
             arguments.insert("limit".to_owned(), json!(limit));
             ("Job.List", arguments)
         }
+        DashboardQueryCommand::OperationBackups {
+            after_backup_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "afterBackupId", after_backup_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Operations.ListBackups", arguments)
+        }
+        DashboardQueryCommand::OperationBackup { backup_id } => {
+            ("Operations.GetBackup", backup_arguments(backup_id))
+        }
+        DashboardQueryCommand::OperationBackupRetentionPreview { keep_latest } => {
+            let mut arguments = Map::new();
+            arguments.insert("keepLatest".to_owned(), json!(keep_latest));
+            ("Operations.PreviewBackupRetention", arguments)
+        }
+        DashboardQueryCommand::OperationRestorePreview { backup_id } => {
+            ("Operations.PreviewRestore", backup_arguments(backup_id))
+        }
+        DashboardQueryCommand::OperationWorkspaces {
+            after_workspace_id,
+            limit,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "afterWorkspaceId", after_workspace_id);
+            arguments.insert("limit".to_owned(), json!(limit));
+            ("Operations.ListWorkspaces", arguments)
+        }
+        DashboardQueryCommand::OperationWorkspaceSwitchPreview { workspace_id } => {
+            let mut arguments = Map::new();
+            arguments.insert("workspaceId".to_owned(), json!(workspace_id));
+            ("Operations.PreviewWorkspaceSwitch", arguments)
+        }
+        DashboardQueryCommand::OperationUpdateStatus => ("Operations.GetUpdateStatus", Map::new()),
+        DashboardQueryCommand::OperationUpdatePreview => ("Operations.PreviewUpdate", Map::new()),
+        DashboardQueryCommand::OperationProgramRollbackPreview => {
+            ("Operations.PreviewProgramRollback", Map::new())
+        }
+        DashboardQueryCommand::OperationLogs {
+            from_unix_nanos,
+            through_unix_nanos,
+            minimum_severity,
+            domain,
+            source_id,
+            job_id,
+            correlation_id,
+            search,
+            after_sequence,
+            limit,
+        } => (
+            "Operations.QueryLogs",
+            operation_log_arguments(OperationLogArguments {
+                from_unix_nanos,
+                through_unix_nanos,
+                minimum_severity,
+                domain,
+                source_id,
+                job_id,
+                correlation_id,
+                search,
+                after_sequence,
+                limit,
+            })?,
+        ),
+        DashboardQueryCommand::OperationSettings => ("Operations.GetSettings", Map::new()),
+        DashboardQueryCommand::OperationSettingsChangePreview {
+            expected_revision,
+            changes,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert(
+                "expectedRevision".to_owned(),
+                json!(parse_unsigned_decimal(
+                    expected_revision,
+                    "The settings revision must be an unsigned decimal.",
+                )?),
+            );
+            arguments.insert("changes".to_owned(), operation_setting_values(changes)?);
+            ("Operations.PreviewSettingsChange", arguments)
+        }
+        DashboardQueryCommand::OperationSettingsRollbackPreview {
+            expected_revision,
+            target_revision,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert(
+                "expectedRevision".to_owned(),
+                json!(parse_unsigned_decimal(
+                    expected_revision,
+                    "The settings revision must be an unsigned decimal.",
+                )?),
+            );
+            arguments.insert(
+                "targetRevision".to_owned(),
+                json!(parse_unsigned_decimal(
+                    target_revision,
+                    "The settings rollback revision must be an unsigned decimal.",
+                )?),
+            );
+            ("Operations.PreviewSettingsRollback", arguments)
+        }
+        DashboardQueryCommand::SetupPlanStatus => ("Setup.GetStatus", Map::new()),
+        DashboardQueryCommand::SetupPlanPreview {
+            expected_revision,
+            selection,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert(
+                "expectedRevision".to_owned(),
+                json!(parse_unsigned_decimal(
+                    expected_revision,
+                    "The setup-plan revision must be an unsigned decimal.",
+                )?),
+            );
+            arguments.insert("selection".to_owned(), json!(selection));
+            ("Setup.PreviewPlan", arguments)
+        }
     };
     invoke_application(
         ApplicationInvocation {
@@ -268,6 +387,116 @@ pub(crate) async fn dashboard_query(
         },
         &state,
         InvocationAuthority::ReadOnly,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn operations_control(
+    request: OperationsControlCommand,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    require_confirmation(confirmed)?;
+    let (operation, arguments) = match request {
+        OperationsControlCommand::CheckForUpdates => ("Operations.CheckForUpdates", Map::new()),
+        OperationsControlCommand::ExportLogs {
+            from_unix_nanos,
+            through_unix_nanos,
+            minimum_severity,
+            domain,
+            source_id,
+            job_id,
+            correlation_id,
+            search,
+            after_sequence,
+            limit,
+        } => (
+            "Operations.ExportLogs",
+            operation_log_arguments(OperationLogArguments {
+                from_unix_nanos,
+                through_unix_nanos,
+                minimum_severity,
+                domain,
+                source_id,
+                job_id,
+                correlation_id,
+                search,
+                after_sequence,
+                limit,
+            })?,
+        ),
+        OperationsControlCommand::StartBackup => ("Operations.StartBackup", Map::new()),
+        OperationsControlCommand::StartBackupVerification { backup_id } => (
+            "Operations.StartBackupVerification",
+            backup_arguments(backup_id),
+        ),
+        OperationsControlCommand::StartBackupRetention {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.StartBackupRetention",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::StartRestore {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.StartRestore",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::StartWorkspaceSwitch {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.StartWorkspaceSwitch",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::StartUpdate {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.StartUpdate",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::StartProgramRollback {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.StartProgramRollback",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::ApplySettingsChange {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.ApplySettingsChange",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::RollbackSettings {
+            preview_id,
+            preview_digest,
+        } => (
+            "Operations.RollbackSettings",
+            preview_arguments(preview_id, preview_digest),
+        ),
+        OperationsControlCommand::ApplySetupPlan {
+            preview_id,
+            preview_sha256,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("previewId".to_owned(), json!(preview_id));
+            arguments.insert("previewSha256".to_owned(), json!(preview_sha256));
+            ("Setup.ApplyPlan", arguments)
+        }
+    };
+    invoke_application(
+        ApplicationInvocation {
+            operation: operation.to_owned(),
+            arguments,
+        },
+        &state,
+        InvocationAuthority::ExactConfirmed(operation),
     )
     .await
 }
@@ -739,6 +968,118 @@ fn measurement_arguments(measurement_id: String) -> Map<String, Value> {
     let mut arguments = Map::new();
     arguments.insert("measurementId".to_owned(), json!(measurement_id));
     arguments
+}
+
+fn backup_arguments(backup_id: String) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("backupId".to_owned(), json!(backup_id));
+    arguments
+}
+
+fn preview_arguments(preview_id: uuid::Uuid, preview_digest: String) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    arguments.insert("previewId".to_owned(), json!(preview_id));
+    arguments.insert("previewDigest".to_owned(), json!(preview_digest));
+    arguments
+}
+
+struct OperationLogArguments {
+    from_unix_nanos: Option<String>,
+    through_unix_nanos: Option<String>,
+    minimum_severity: Option<OperationLogSeverity>,
+    domain: Option<OperationLogDomain>,
+    source_id: Option<String>,
+    job_id: Option<String>,
+    correlation_id: Option<String>,
+    search: Option<String>,
+    after_sequence: Option<String>,
+    limit: u16,
+}
+
+fn operation_log_arguments(
+    input: OperationLogArguments,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let mut arguments = Map::new();
+    if let Some(value) = input.from_unix_nanos {
+        arguments.insert("from".to_owned(), json!(parse_unix_nanos(value)?));
+    }
+    if let Some(value) = input.through_unix_nanos {
+        arguments.insert("through".to_owned(), json!(parse_unix_nanos(value)?));
+    }
+    insert_optional(&mut arguments, "minimumSeverity", input.minimum_severity);
+    insert_optional(&mut arguments, "domain", input.domain);
+    insert_optional(&mut arguments, "sourceId", input.source_id);
+    insert_optional(&mut arguments, "jobId", input.job_id);
+    insert_optional(&mut arguments, "correlationId", input.correlation_id);
+    insert_optional(&mut arguments, "search", input.search);
+    if let Some(value) = input.after_sequence {
+        arguments.insert(
+            "afterSequence".to_owned(),
+            json!(parse_unsigned_decimal(
+                value,
+                "The log sequence must be an unsigned decimal.",
+            )?),
+        );
+    }
+    arguments.insert("limit".to_owned(), json!(input.limit));
+    Ok(arguments)
+}
+
+fn parse_unix_nanos(value: String) -> Result<i64, DesktopCommandError> {
+    value.parse::<i64>().map_err(|_error| {
+        DesktopCommandError::invalid_request("Log time filters must be signed Unix nanoseconds.")
+    })
+}
+
+fn parse_unsigned_decimal(
+    value: String,
+    message: &'static str,
+) -> Result<u64, DesktopCommandError> {
+    value
+        .parse::<u64>()
+        .map_err(|_error| DesktopCommandError::invalid_request(message))
+}
+
+fn operation_setting_values(
+    values: Vec<OperationSettingValue>,
+) -> Result<Value, DesktopCommandError> {
+    values
+        .into_iter()
+        .map(|value| match value {
+            OperationSettingValue::StorageSoftLimitBytes(value) => Ok(json!({
+                "kind": "storage_soft_limit_bytes",
+                "value": parse_unsigned_decimal(
+                    value,
+                    "The storage limit must be an unsigned decimal.",
+                )?,
+            })),
+            OperationSettingValue::LogRetentionDays(value) => {
+                Ok(json!({ "kind": "log_retention_days", "value": value }))
+            }
+            OperationSettingValue::LogMinimumSeverity(value) => {
+                Ok(json!({ "kind": "log_minimum_severity", "value": value }))
+            }
+            OperationSettingValue::UpdateChannel(value) => {
+                Ok(json!({ "kind": "update_channel", "value": value }))
+            }
+            OperationSettingValue::AutomaticUpdateChecks(value) => {
+                Ok(json!({ "kind": "automatic_update_checks", "value": value }))
+            }
+            OperationSettingValue::DefaultQueryRowLimit(value) => {
+                Ok(json!({ "kind": "default_query_row_limit", "value": value }))
+            }
+            OperationSettingValue::MaximumConcurrentJobs(value) => {
+                Ok(json!({ "kind": "maximum_concurrent_jobs", "value": value }))
+            }
+            OperationSettingValue::MarketFreshnessMillis(value) => {
+                Ok(json!({ "kind": "market_freshness_millis", "value": value }))
+            }
+            OperationSettingValue::BackupRetentionCount(value) => {
+                Ok(json!({ "kind": "backup_retention_count", "value": value }))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
 }
 
 fn reason_arguments(reason: String) -> Map<String, Value> {

@@ -27,6 +27,7 @@ use crate::{
             UpdateStatusEvidence,
         },
         settings::DurableSettingsStore,
+        setup::SetupPlanAuthority,
         workspace::DurableWorkspaceRegistry,
     },
     jobs::{
@@ -47,6 +48,7 @@ pub(super) struct OperationsApplicationDependencies {
     pub(super) log_artifacts: Arc<dyn DiagnosticArtifactPublisher>,
     pub(super) settings: Arc<DurableSettingsStore>,
     pub(super) settings_operations: Arc<dyn ManagedSettingsOperations>,
+    pub(super) setup: Arc<SetupPlanAuthority>,
 }
 
 /// Exact installed authorities atomically published to the pre-composed application service.
@@ -122,6 +124,7 @@ impl PendingOperationsComposition {
             dependencies.log_artifacts,
             dependencies.settings,
             dependencies.settings_operations,
+            dependencies.setup,
         ));
         Self {
             application,

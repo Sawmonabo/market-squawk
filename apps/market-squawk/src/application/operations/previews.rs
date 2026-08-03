@@ -141,12 +141,15 @@ pub(super) fn project_digest_fields(value: Value) -> Result<Value, ServiceError>
         Value::Object(mut object) => {
             for (key, value) in &mut object {
                 let digest_field = key == "backupId"
+                    || key == "snapshotId"
                     || key.ends_with("BackupId")
                     || key.ends_with("BackupIds")
                     || key == "sha256"
                     || key == "digest"
                     || key.ends_with("Sha256")
-                    || key.ends_with("Digest");
+                    || key.ends_with("Digest")
+                    || key.ends_with("_sha256")
+                    || key.ends_with("_digest");
                 if digest_field {
                     *value = project_digest_value(value.take())?;
                 } else {

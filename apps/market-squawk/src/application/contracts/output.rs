@@ -646,6 +646,73 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "rolledBackFromRevision",
             ],
         ),
+        "Setup.GetStatus" => closed(
+            vec![
+                ("formatVersion", unsigned()),
+                ("catalog", setup_plan_catalog()),
+                ("currentRevision", unsigned()),
+                ("acceptedPlan", nullable(setup_accepted_plan())),
+            ],
+            &[
+                "formatVersion",
+                "catalog",
+                "currentRevision",
+                "acceptedPlan",
+            ],
+        ),
+        "Setup.PreviewPlan" => closed(
+            vec![
+                ("formatVersion", unsigned()),
+                ("previewId", uuid()),
+                ("ownerWorkspace", uuid()),
+                ("currentRevision", unsigned()),
+                ("planDigest", text()),
+                ("plan", setup_plan()),
+                (
+                    "includedCapabilities",
+                    bounded_array(setup_capability(), 17),
+                ),
+                (
+                    "externalContacts",
+                    bounded_array(setup_external_contact(), 8),
+                ),
+                (
+                    "reversibleLocalChanges",
+                    bounded_array(setup_reversible_change(), 9),
+                ),
+                ("expectedTime", setup_time_estimate()),
+                ("expectedDisk", setup_disk_estimate()),
+                ("safeSkipSteps", bounded_array(setup_step_id(), 7)),
+                ("issuedAtUnixSeconds", unsigned()),
+                ("expiresAtUnixSeconds", unsigned()),
+                ("previewSha256", text()),
+            ],
+            &[
+                "formatVersion",
+                "previewId",
+                "ownerWorkspace",
+                "currentRevision",
+                "planDigest",
+                "plan",
+                "includedCapabilities",
+                "externalContacts",
+                "reversibleLocalChanges",
+                "expectedTime",
+                "expectedDisk",
+                "safeSkipSteps",
+                "issuedAtUnixSeconds",
+                "expiresAtUnixSeconds",
+                "previewSha256",
+            ],
+        ),
+        "Setup.ApplyPlan" => closed(
+            vec![
+                ("revision", unsigned()),
+                ("digest", text()),
+                ("acceptedAtUnixSeconds", unsigned()),
+            ],
+            &["revision", "digest", "acceptedAtUnixSeconds"],
+        ),
         "FairValue.ListMeasurements" => closed(
             vec![("measurements", array(measurement()))],
             &["measurements"],
@@ -949,6 +1016,393 @@ fn operations_preview() -> Value {
         ],
         &["previewId", "previewDigest", "expiresAt", "evidence"],
     )
+}
+
+fn setup_plan_catalog() -> Value {
+    closed(
+        vec![
+            ("formatVersion", unsigned()),
+            ("goals", bounded_array(text(), 8)),
+            ("starterPlans", bounded_array(text(), 7)),
+            ("recommendedStarterPlan", text()),
+        ],
+        &[
+            "formatVersion",
+            "goals",
+            "starterPlans",
+            "recommendedStarterPlan",
+        ],
+    )
+}
+
+fn setup_accepted_plan() -> Value {
+    closed(
+        vec![
+            ("revision", unsigned()),
+            ("digest", text()),
+            ("acceptedAtUnixSeconds", unsigned()),
+            ("plan", setup_plan()),
+        ],
+        &["revision", "digest", "acceptedAtUnixSeconds", "plan"],
+    )
+}
+
+fn setup_plan() -> Value {
+    closed(
+        vec![
+            ("formatVersion", unsigned()),
+            ("revision", unsigned()),
+            ("selection", setup_plan_selection()),
+            ("steps", fixed_array(setup_plan_step(), 11)),
+        ],
+        &["formatVersion", "revision", "selection", "steps"],
+    )
+}
+
+fn setup_plan_selection() -> Value {
+    closed(
+        vec![
+            ("goals", bounded_array(setup_goal(), 8)),
+            ("starterPlan", setup_starter_plan()),
+        ],
+        &["goals", "starterPlan"],
+    )
+}
+
+fn setup_plan_step() -> Value {
+    closed(
+        vec![
+            ("id", setup_step_id()),
+            ("outcome", setup_outcome()),
+            (
+                "disposition",
+                enumeration(&["included", "available_to_finish_later"]),
+            ),
+            ("requiredInput", setup_required_input()),
+            (
+                "externalContacts",
+                bounded_array(setup_external_contact(), 8),
+            ),
+            ("reversibleLocalChange", nullable(setup_reversible_change())),
+            ("expectedActiveMinutes", unsigned()),
+            ("diskImpact", setup_disk_impact()),
+            (
+                "safeSkip",
+                enumeration(&[
+                    "not_skippable",
+                    "capability_remains_installed_and_available",
+                ]),
+            ),
+            ("choice", setup_step_choice()),
+        ],
+        &[
+            "id",
+            "outcome",
+            "disposition",
+            "requiredInput",
+            "externalContacts",
+            "reversibleLocalChange",
+            "expectedActiveMinutes",
+            "diskImpact",
+            "safeSkip",
+            "choice",
+        ],
+    )
+}
+
+fn setup_step_choice() -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("kind", constant("goals")),
+                ("starter_plan", setup_starter_plan()),
+                ("goals", bounded_array(setup_goal(), 8)),
+            ],
+            &["kind", "starter_plan", "goals"],
+        ),
+        closed(
+            vec![
+                ("kind", constant("storage")),
+                ("retention_days", unsigned()),
+                ("workspace_soft_limit_bytes", unsigned()),
+                (
+                    "time_policy",
+                    constant("point_in_time_with_first_observed_locally_provenance"),
+                ),
+            ],
+            &[
+                "kind",
+                "retention_days",
+                "workspace_soft_limit_bytes",
+                "time_policy",
+            ],
+        ),
+        closed(
+            vec![
+                ("kind", constant("providers")),
+                ("outcomes", bounded_array(setup_provider_outcome(), 6)),
+            ],
+            &["kind", "outcomes"],
+        ),
+        closed(
+            vec![
+                ("kind", constant("imports")),
+                ("formats", bounded_array(setup_import_format(), 5)),
+                ("preserve_source_identity", boolean()),
+                ("require_reconciliation_receipt", boolean()),
+            ],
+            &[
+                "kind",
+                "formats",
+                "preserve_source_identity",
+                "require_reconciliation_receipt",
+            ],
+        ),
+        closed(
+            vec![
+                ("kind", constant("model_runtime")),
+                ("managed_python", boolean()),
+                ("native_inference", boolean()),
+                ("onnx_inference", boolean()),
+            ],
+            &[
+                "kind",
+                "managed_python",
+                "native_inference",
+                "onnx_inference",
+            ],
+        ),
+        closed(
+            vec![
+                ("kind", constant("paper_risk")),
+                ("starts_stopped", boolean()),
+                ("paper_only", boolean()),
+                ("central_risk_required", boolean()),
+            ],
+            &[
+                "kind",
+                "starts_stopped",
+                "paper_only",
+                "central_risk_required",
+            ],
+        ),
+        setup_client_choice("claude_code"),
+        setup_client_choice("codex"),
+        closed(
+            vec![
+                ("kind", constant("backup")),
+                ("retention_count", unsigned()),
+                ("verify_after_create", boolean()),
+            ],
+            &["kind", "retention_count", "verify_after_create"],
+        ),
+        closed(
+            vec![
+                ("kind", constant("review")),
+                ("show_gaps_and_reversible_changes", boolean()),
+            ],
+            &["kind", "show_gaps_and_reversible_changes"],
+        ),
+        closed(
+            vec![
+                ("kind", constant("first_useful_result")),
+                ("result", setup_first_result()),
+                ("target_minutes", unsigned()),
+            ],
+            &["kind", "result", "target_minutes"],
+        ),
+    ])
+}
+
+fn setup_client_choice(kind: &'static str) -> Value {
+    closed(
+        vec![
+            ("kind", constant(kind)),
+            ("separate_client_credential", boolean()),
+            ("require_real_safe_read", boolean()),
+        ],
+        &[
+            "kind",
+            "separate_client_credential",
+            "require_real_safe_read",
+        ],
+    )
+}
+
+fn setup_time_estimate() -> Value {
+    closed(
+        vec![
+            ("expectedActiveMinutes", unsigned()),
+            ("firstUseTargetMinutes", unsigned()),
+            ("includesExternalWait", boolean()),
+        ],
+        &[
+            "expectedActiveMinutes",
+            "firstUseTargetMinutes",
+            "includesExternalWait",
+        ],
+    )
+}
+
+fn setup_disk_estimate() -> Value {
+    closed(
+        vec![
+            ("workspaceSoftLimitBytes", unsigned()),
+            ("includedImpacts", bounded_array(setup_disk_impact(), 3)),
+        ],
+        &["workspaceSoftLimitBytes", "includedImpacts"],
+    )
+}
+
+fn setup_goal() -> Value {
+    enumeration(&[
+        "everything_recommended",
+        "explore_public_markets",
+        "research_investments",
+        "manage_portfolio",
+        "build_and_evaluate_models",
+        "practice_paper_execution",
+        "use_claude_code",
+        "use_codex",
+    ])
+}
+
+fn setup_starter_plan() -> Value {
+    enumeration(&[
+        "everything_recommended",
+        "public_markets",
+        "research",
+        "portfolio",
+        "models",
+        "paper_practice",
+        "ai_clients",
+    ])
+}
+
+fn setup_step_id() -> Value {
+    enumeration(&[
+        "goals_and_starter_plan",
+        "storage_retention_time_and_disk",
+        "public_and_zero_fee_providers",
+        "file_and_portfolio_import",
+        "model_runtime",
+        "paper_and_risk",
+        "claude_code",
+        "codex",
+        "backup",
+        "review",
+        "first_useful_result",
+    ])
+}
+
+fn setup_outcome() -> Value {
+    enumeration(&[
+        "durable_resumable_plan",
+        "governed_workspace_budget",
+        "quality_labeled_provider_evidence",
+        "receipt_bound_local_data",
+        "verified_local_model_runtime",
+        "stopped_paper_under_central_risk",
+        "verified_claude_code_mcp",
+        "verified_codex_mcp",
+        "verified_recovery_point",
+        "capability_gap_review",
+        "first_useful_result",
+    ])
+}
+
+fn setup_required_input() -> Value {
+    enumeration(&[
+        "none",
+        "local_confirmation",
+        "local_disk",
+        "zero_fee_account_or_provider_key",
+        "owned_file",
+        "detected_local_client",
+    ])
+}
+
+fn setup_external_contact() -> Value {
+    enumeration(&[
+        "coinbase_public_api",
+        "kraken_public_api",
+        "securities_and_exchange_commission",
+        "bureau_of_labor_statistics",
+        "united_states_treasury",
+        "federal_reserve_bank_of_st_louis",
+        "claude_code_official_cli",
+        "codex_official_cli",
+    ])
+}
+
+fn setup_reversible_change() -> Value {
+    enumeration(&[
+        "accept_workspace_plan",
+        "configure_workspace_retention_and_budget",
+        "activate_or_remove_provider_sessions",
+        "import_or_remove_derived_local_data",
+        "configure_or_reset_model_runtime",
+        "configure_stopped_paper_account_and_risk_defaults",
+        "register_or_disconnect_claude_code",
+        "register_or_disconnect_codex",
+        "create_or_remove_backup_policy",
+    ])
+}
+
+fn setup_disk_impact() -> Value {
+    enumeration(&[
+        "no_additional_product_bytes",
+        "variable_within_workspace_soft_limit",
+        "variable_backup_destination",
+    ])
+}
+
+fn setup_provider_outcome() -> Value {
+    enumeration(&[
+        "coinbase_public_market_snapshot",
+        "kraken_public_market_snapshot",
+        "sec_filing_research",
+        "bls_macro_research",
+        "treasury_rates_research",
+        "fred_alfred_authorized_research",
+    ])
+}
+
+fn setup_import_format() -> Value {
+    enumeration(&["csv", "json", "ndjson", "parquet", "portfolio_file"])
+}
+
+fn setup_first_result() -> Value {
+    enumeration(&[
+        "verified_public_market_snapshot",
+        "point_in_time_research_result",
+        "reconciled_portfolio_summary",
+        "admitted_model_forecast",
+        "stopped_paper_and_risk_review",
+        "verified_mcp_safe_read",
+    ])
+}
+
+fn setup_capability() -> Value {
+    enumeration(&[
+        "managed_workspace",
+        "retention_and_disk_budget",
+        "public_market_data",
+        "filing_research",
+        "macro_research",
+        "controlled_file_import",
+        "portfolio_import",
+        "managed_python_runtime",
+        "native_model_inference",
+        "onnx_model_inference",
+        "paper_only_execution",
+        "central_risk",
+        "claude_code_mcp",
+        "codex_mcp",
+        "verified_backup",
+        "capability_review",
+        "first_useful_result",
+    ])
 }
 
 fn source_lifecycle_receipt() -> Value {
