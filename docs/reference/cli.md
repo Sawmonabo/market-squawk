@@ -1,42 +1,16 @@
 # Command-line interface reference
 
-This page is the factual reference for the shipping `market-squawk` command hierarchy and the
-`market-squawk-desktop` launcher, including their arguments, local authority boundaries, result
-envelopes, and exit behavior.
+This is the installed `market-squawk` command contract. The CLI is a separately authenticated
+client of the one per-user service for product commands; it does not start a second catalog, MCP
+server, job authority, or paper runtime. Use [MCP](mcp.md) when an automation needs the complete
+typed operation registry rather than this operator-oriented command projection.
 
 | Field | Value |
 | --- | --- |
 | Document type | Reference |
-| Audience | Operators, integrators, automation authors, and maintainers |
-| Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
-
-## Contents
-
-- [Scope](#scope)
-- [Invocation and global options](#invocation-and-global-options)
-- [Desktop launcher](#desktop-launcher)
-- [Command hierarchy](#command-hierarchy)
-- [Release evidence](#release-evidence)
-- [Confirmation and input admission](#confirmation-and-input-admission)
-- [Request and result limits](#request-and-result-limits)
-- [Output and exit behavior](#output-and-exit-behavior)
-- [Compatibility commands](#compatibility-commands)
-- [Authority mapping](#authority-mapping)
-- [Related documentation and code](#related-documentation-and-code)
-- [External sources](#external-sources)
-
-## Scope
-
-The public CLI is a local transport over the same application services used by MCP, except where a
-row below explicitly identifies a CLI-owned boundary such as initialization, bounded read-only
-DataFusion SQL, provider activation, or an immutable input-file admission path.
-
-This page does not define the JSON schema inside every request file, provide an operating tutorial,
-or claim that the complete release gate has passed. Request schemas are code-owned contracts;
-operator procedures belong in the [operations guide](../operations/README.md), and current release
-blockers remain in the [delivery ledger](../plans/delivery-ledger.md).
+| Status | Current implementation contract |
+| Last substantive review | 2026-08-03 |
+| Authority | `apps/market-squawk/src/cli.rs` and `src/main.rs` |
 
 ## Invocation and global options
 
@@ -44,457 +18,149 @@ blockers remain in the [delivery ledger](../plans/delivery-ledger.md).
 market-squawk [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
 ```
 
-Clap marks the options below as global, so they may appear with any public subcommand.
-
-| Option | Value | Default | Effect |
-| --- | --- | --- | --- |
-| `--data-dir <PATH>` | Local path | `.market-squawk` through configuration | Highest-precedence local data-root override |
-| `--config <PATH>` | Local TOML file | None | Reads one explicit configuration file; there is no implicit file discovery |
-| `--log <FILTER>` | Tracing filter | `info`; may use `MARKET_SQUAWK_LOG` | Configures local stderr tracing; it is not part of `AppConfig` |
-| `--json-logs` | Flag | Off | Emits structured tracing to stderr |
-| `--output <human|json>` | Enum | `human` | Selects human plus pretty JSON or compact JSON for supported commands |
-| `--source-shutdown-ms <U64>` | Milliseconds | Configuration value, initially `15000` | Overrides the source-supervisor shutdown deadline; it must be at least `2 × capture_shutdown_ms + 1000` and no greater than `121000` |
-| `--training-release-root <PATH>` | Absolute path | None | Selects the installed signed training release; the running application and sibling ONNX worker must be the exact files from that release |
-| `--capture-queue-capacity <USIZE>` | Count | Configuration value, initially `16384` | Overrides the fixed raw-capture queue capacity; valid range is `1..=1048576` |
-| `--capture-memory-ceiling-bytes <USIZE>` | Bytes | Configuration value, initially `67108864` | Overrides the per-channel capture memory ceiling; valid range is `1..=4294967295` |
-| `--capture-destination-registry-memory-ceiling-bytes <USIZE>` | Bytes | Configuration value, initially `1048576` | Overrides the process-wide destination-registry ceiling; valid range is `1..=67108864` |
-| `-h`, `--help` | Flag | — | Prints help and exits successfully |
-| `-V`, `--version` | Flag | — | Prints the package version and exits successfully |
-
-Configuration precedence, every environment mapping, and the provider-profile contracts are in
-[Configuration reference](configuration.md).
-
-## Desktop launcher
-
-```text
-market-squawk-desktop [OPTIONS]
-```
-
-The desktop launcher opens the Obsidian Signal Tauri application and composes the same
-`LocalProduct` and closed `Application` operation registry used by the CLI and local MCP server.
-It is an interactive presentation mode, not a second implementation of provider, research, model,
-portfolio, risk, execution, or persistence authority.
-
-| Option | Value | Default | Effect |
-| --- | --- | --- | --- |
-| `--config <PATH>` | Local TOML file | None | Loads one explicit configuration file |
-| `--data-dir <PATH>` | Local path | `.market-squawk` through configuration | Highest-precedence local data-root override |
-| `--training-release-root <PATH>` | Absolute path | None | Selects the verified local Python training release and sibling model worker |
-| `-h`, `--help` | Flag | — | Prints desktop launcher help and exits successfully |
-| `-V`, `--version` | Flag | — | Prints the desktop package version and exits successfully |
-
-The Linux AppImage has one hidden stdio-MCP package transport so a generated client command can
-re-enter the portable image after the desktop closes. It is not a user-facing option, is absent
-from help, rejects non-AppImage contexts and arbitrary commands, and dispatches before Tauri or
-local product state opens.
-
-The desktop uses safe defaults, the explicit file, normal `MARKET_SQUAWK_*` configuration
-variables, and these launcher overrides. It deliberately removes
-`MARKET_SQUAWK_LOG`, `MARKET_SQUAWK_EXTERNAL_NETWORK`, and
-`MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED` from the configuration environment because those values
-belong to CLI logging or foreground release-evidence workflows, not ambient desktop authority.
-The desktop does not accept the CLI's output, log-rendering, capture-memory, or release-evidence
-options. The production Paper service is independent of the diagnostic-capture
-`paper_bot_enabled` setting; it starts stopped and remains behind typed Bot, Execution, and central
-risk operations.
-
-The WebView receives five closed commands: bootstrap facts, read-only bounded application
-invocation, confirmed provider onboarding, exact official-provider page opening, and protected
-provider-setup opening. Every business and operating capability remains with its owning Rust
-service. Provider pages and the validated loopback setup URL open only in the system browser.
-
-When launching from the source checkout, pass application arguments after Tauri's runner
-separator:
-
-```bash
-CARGO_INCREMENTAL=0 pnpm --dir apps/market-squawk-desktop \
-  tauri dev -- -- --data-dir "$PWD/.market-squawk"
-```
-
-The CLI remains the complete interface for automation, servers, release evidence, supported
-headless use, and local stdio MCP. It does not require Node.js, pnpm, Tauri, or a system WebView.
-
-## Command hierarchy
-
-### Bootstrap and control
-
-| Command | Arguments | Authority and result |
+| Option | Default | Meaning |
 | --- | --- | --- |
-| `init` | None | Explicitly prepares/opens the full local product, initializes or migrates durable authorities, creates the current Coinbase diagnostic journal, completes bounded shutdown, and prints the initialized root |
-| `config show` | None | Loads validated configuration and emits the shared redacted `{value, origin}` view |
-| `config validate` | None | Performs the same load/validation and emits `valid: true` plus the shared provenance-bearing redacted view |
-| `doctor` | None | Performs a bounded query-only inspection of an existing layout/catalog plus compiled application/MCP contracts and provider facts; it does not initialize storage, acquire application/MCP writer authority, start adapters, or call remote endpoints |
-| `mcp` | Optional `serve` | Runs the sole production MCP server over stdio; bare `mcp` is the v0.1 compatibility form for `mcp serve` |
+| `--data-dir <PATH>` | Configuration default | Local workspace root passed to configuration. It is not a service endpoint selector. |
+| `--config <PATH>` | None | The sole explicit TOML configuration file. |
+| `--log <FILTER>` | `info` or `MARKET_SQUAWK_LOG` | Stderr tracing filter. |
+| `--json-logs` | Off | Render local tracing as JSON on stderr. |
+| `--output <human|json>` | `human` | Command-result rendering mode; MCP reserves stdout for protocol frames. |
+| `--source-shutdown-ms <U64>` | Configuration value | Source-supervisor shutdown override; whole-configuration validation still applies. |
+| `--training-release-root <PATH>` | Installed release root when resolvable | Absolute release root used to verify admitted model artifacts. |
+| `--capture-queue-capacity <USIZE>` | Configuration value | Diagnostic capture override. |
+| `--capture-memory-ceiling-bytes <USIZE>` | Configuration value | Diagnostic per-channel capture-memory override. |
+| `--capture-destination-registry-memory-ceiling-bytes <USIZE>` | Configuration value | Diagnostic capture registry-memory override. |
 
-`mcp` reserves stdout for protocol frames. It does not render a normal CLI result envelope.
+The exact startup configuration semantics and ranges are in the [configuration reference](configuration.md).
 
-### Sources and capture
+## Service lifecycle and routing
 
-| Command | Arguments and defaults | Application boundary |
-| --- | --- | --- |
-| `source register <PROVIDER> --confirm` | Provider is a code-owned profile identifier | `Source.Register` |
-| `source status [PROVIDER]` | Provider filter is optional | `Source.GetStatus` |
-| `source coverage [PROVIDER]` | Provider filter is optional | `Source.GetCoverage` |
-| `source health [PROVIDER]` | Provider filter is optional | `Source.GetHealth` |
-| `source setup <PROVIDER> --confirm` | Starts or resumes local onboarding; keeps the bounded loopback portal alive until Ctrl-C or expiry | `Source.Setup` plus the local portal owner |
-| `source discover <PROVIDER> --dataset <DATASET>` | Provider and exact dataset namespace are required | `Source.ListObjects`; bounded listing only, with no ingestion receipt |
-| `source inspect <PROVIDER> --onboarding-session-id <UUID> --dataset-identifier <DATASET>` | Optional `--page-index` defaults to `0` in `0..=63`; optional `--max-records` defaults to `256` in `1..=1024` | `Source.Inspect`; bounded FRED/ALFRED canonical page and exact evidence, with no research-dataset persistence |
-| `source activate <REQUEST> --confirm` | Versioned activation request file, at most 1 MiB | Evidence-bound provider activation and durable restart authority |
-| `capture` | `--products <CSV>` defaults to `BTC-USD`; optional `--seconds <U64>` and `--paper-bot` | Diagnostic Coinbase capture composition, not the production application-service path |
+`service status` authenticates the owner-only rendezvous, probes readiness, and returns a
+non-secret bootstrap snapshot. `service start` first probes; if no ready service is found it starts
+the verified packaged `market-squawk-service` sibling and waits up to 15 seconds for authenticated
+readiness. It never accepts a caller-provided port, URL, bearer token, or service executable.
 
-`source setup` accepts only the loopback URL returned by the product: scheme `http`, host
-`127.0.0.1`, an explicit port, no credentials, query, or fragment, and a lifetime from 30 seconds
-through one hour. A browser-launch failure does not terminate the portal; the URL remains in the
-command result and local log. The portal commits source-only sessions for public Coinbase,
-Coinbase Direct, and Kraken. Treasury daily XML uses a provider-specific research form that selects
-an inclusive year range and activates all five official families; Treasury Fiscal has its own
-date/page form. The Coinbase Direct form creates the exact version-1 credential envelope from
-separate write-only API-key, passphrase, and signing-secret fields. Buttons remain disabled when
-the code-owned profile is `refresh_required` or `rights_blocked`.
+The commands in the following table connect as the CLI client and require that installed service:
+`source`, `ingest`, `dataset`, `query`, `feature`, `model`, `portfolio`, `backtest`, `bot`,
+`execution`, `fair-value`, `job`, `operations`, and `setup`. `init`, `config`, `capture`,
+`doctor`, `release`, and the named-client MCP relay have their documented dedicated compositions.
 
-### Research, datasets, and features
-
-| Command | Arguments and defaults | Application boundary |
-| --- | --- | --- |
-| `ingest file <MANIFEST> --object <ID> --dataset <ID> --confirm` | Confined file-adapter manifest and exact object/dataset identities | File adapter, research-ingestion authority, then immutable publication |
-| `ingest source <PROVIDER> <OBJECT> --dataset <DATASET> --confirm` | Provider and object are positional; dataset is a required named option | `Research.IngestSource` |
-| `dataset list` | Optional `--after-dataset <DATASET>` cursor from the preceding bounded page | `Research.ListDatasets` |
-| `dataset manifest <DATASET>` | Dataset identity is positional | `Research.GetManifest` |
-| `dataset build <REQUEST> --confirm` | Closed point-in-time build request, at most 8 MiB | Research dataset builder and immutable publication |
-| `query dataset <DATASET>` | `--maximum-rows <USIZE>` defaults to `1000` | `Research.GetHistory` with the requested result-count ceiling |
-| `query artifact --artifact-id <ID> --sha256 <HEX> --byte-count <N>` | Optional `--media-type application/json`, `--offset 0`, and `--maximum-bytes 32768`; pass the returned `application/vnd.apache.parquet` media type for query overflow | `Analysis.ReadArtifact` over the shared path-free controlled-artifact authority |
-| `query sql --dataset <DATASET> <STATEMENT>` | `--maximum-rows <USIZE>` defaults to `1000` | CLI-only bounded read-only DataFusion over the latest pinned immutable generation |
-| `feature list` | Optional `--after-dataset <DATASET>` stable cursor | `Analysis.GetFeatureDatasets` |
-| `feature build <REQUEST> --confirm` | Same closed point-in-time build contract as `dataset build` | Research dataset builder and immutable publication |
-
-The SQL command is deliberately absent from MCP. Its fixed query ceilings are 64 KiB SQL text,
-256 KiB inline Arrow IPC, 64 MiB for the complete result, 256 MiB of admitted query memory, four
-partitions, 2,048 AST nodes, 4,096 plan nodes, and 60 seconds. A result above the inline ceiling and
-within the complete-result ceiling becomes one opaque durable content-addressed Parquet reference.
-Its exact fields are `artifactId`, `sha256`, `byteCount`, `mediaType`, and `rowCount`, with
-`mediaType: "application/vnd.apache.parquet"`. Retrieve it through `query artifact`; the reference
-has no public owner, expiry, or path.
-
-Fixed-template application queries use a different limit source: their inline and complete-result
-ceilings are the caller's admitted `ServiceLimits`, their query-memory ceiling is four times the
-complete-result ceiling within the code-owned clamp, and the same partition/node/at-most-60-second
-bounds apply. The CLI `query dataset` request admits 16 MiB for both inline and complete result, so
-that command returns inline or fails at its complete ceiling; production MCP can use the wider
-caller-admitted band described in the [MCP reference](mcp.md).
-
-### Models and backtests
-
-| Command | Arguments | Application boundary |
-| --- | --- | --- |
-| `model list` | None | `Model.ListBundles` |
-| `model admit <REQUEST> --confirm` | Closed schema-v1 request, at most 8 MiB; requires a configured verified training release | Model runtime admission and immutable registry publication |
-| `model metadata <MODEL>` | Model identity is positional | `Model.GetMetadata` |
-| `model evaluate <REQUEST> --confirm` | Confined JSON object | `Model.Evaluate` |
-| `model predict <REQUEST>` | Confined JSON object | `Model.Predict` |
-| `backtest run <REQUEST> --confirm` | Closed governed-input registration request | Registration followed by `Analysis.RunBacktest` |
-| `backtest show <RUN>` | Experiment or run identity | `Analysis.GetBacktests` |
-
-Inference errors and model-admission failures return no order authority. Backtest results remain
-research evidence and cannot create execution authority.
-
-### Portfolio, paper operation, and execution
-
-| Command | Arguments and defaults | Application boundary |
-| --- | --- | --- |
-| `portfolio import <PATH> --account <ID> --confirm` | Versioned holdings/transaction manifest, at most 8 MiB | Portfolio adapter, research ingest, immutable artifact, then `Portfolio.Import` |
-| `portfolio holdings --account <ID>` | Exact account identity | `Portfolio.GetHoldings` |
-| `portfolio transactions --account <ID>` | Exact account identity | `Portfolio.GetTransactions` |
-| `portfolio performance <REQUEST>` | Confined JSON object | `Portfolio.GetPerformance` |
-| `portfolio exposure <REQUEST>` | Confined JSON object | `Portfolio.GetExposure` |
-| `portfolio risk <REQUEST>` | Confined JSON object | `Portfolio.GetRisk` |
-| `bot status` | None | `Bot.GetStatus` |
-| `bot start --confirm` | `--provider <coinbase|coinbase-direct|kraken>` defaults to `coinbase`; Direct requires `--provider-session-id <UUID>`; optional `--seconds`; `--initial-cash` defaults to `100000`; `--fee-basis-points` defaults to `100` | `Bot.Start`, wait for duration/Ctrl-C, then confirmed `Bot.Stop` |
-| `bot stop --reason <TEXT> --confirm` | Audit reason is required | `Bot.Stop` |
-| `execution orders` | None | `Execution.GetOrders` |
-| `execution fills` | None | `Execution.GetFills` |
-| `execution cancel <ORDER> --confirm` | Existing paper order identity | `Execution.Cancel` |
-| `execution reconcile --confirm` | None beyond confirmation | `Execution.Reconcile` |
-
-Public Coinbase and Kraken remain `DirectUnverified`. Authenticated `coinbase-direct` binds the
-exact active onboarding session and can derive `DirectVerified` authority only while every
-sequence, snapshot, status, timestamp, freshness, precision, coverage, and generation check
-remains current. Any failure cancels the paper run and denies further operations until stop
-completes.
-
-### Fair value
-
-| Command | Arguments | Application boundary |
-| --- | --- | --- |
-| `fair-value list` | None | `FairValue.ListMeasurements` |
-| `fair-value measure <REQUEST> --confirm` | Confined genuine-producer selection and measurement JSON | `FairValue.Measure` |
-| `fair-value classify <MEASUREMENT> --confirm` | Measurement identity | `FairValue.Classify` |
-| `fair-value explain <MEASUREMENT>` | Measurement identity | `FairValue.Explain` |
-| `fair-value evidence <MEASUREMENT>` | Measurement identity | `FairValue.GetEvidence` |
-| `fair-value approval-status <MEASUREMENT> --at <RFC3339>` | Exact status instant | `FairValue.GetApprovalStatus` |
-| `fair-value approve <MEASUREMENT> --decision <ID> --reviewer <ID> --approved-at <RFC3339> --expires-at <RFC3339> --confirm` | Exact decision, distinct reviewer, approval time, and expiry | `FairValue.Approve` |
-
-Fair-value classification never changes market-data quality or creates live execution authority.
-
-## Release evidence
-
-| Command | Purpose and primary output |
+| Command | Exact subcommands / admission |
 | --- | --- |
-| `release evidence fuzz` | Runs the six closed parser/protocol/model fuzz targets and atomically publishes `fuzz.json` |
-| `release evidence benchmark` | Supervises the production live/storage measurement worker and atomically publishes `performance.json` |
-| `release evidence providers` | Exercises the selected authorized production provider surfaces and creates `providers/provider-evidence.json` |
-| `release demonstrate --offline` | Composes the complete local product against the exact provider/Python evidence and atomically publishes `demo.json` |
-| `release evidence gate` | Supervises the exact checked-in full gate and binds its repository, executable, script, log, process limits, and target usage in `full-gate.json` |
-| `release evidence close` | Validates the complete exact-HEAD directory and atomically publishes its terminal `manifest.json` |
+| `init` | Initializes controlled local state and the Coinbase diagnostic journal, then performs bounded shutdown. |
+| `config show`, `config validate` | Redacted effective startup configuration; validate returns `valid: true` only after whole-object validation. |
+| `service status`, `service start` | Authenticated readiness or verified sibling start as above. |
+| `doctor` | Query-only existing-layout/configuration/readiness inspection; does not start adapters or make provider calls. |
+| `capture` | Diagnostic Coinbase capture; `--products` is CSV and defaults to `BTC-USD`; optional `--seconds` and `--paper-bot`. It is not the production paper-service path. |
+| `release evidence <fuzz|benchmark|providers|gate|close>`; `release demonstrate` | Exact-head release-evidence producer/closure commands. Their required arguments are Clap-defined evidence paths and identities; they make no release approval claim by themselves. |
 
-Exact-head producers accept `--head` and `--tree`, reject a dirty or changing repository, and use
-no-clobber outputs. The fuzz and benchmark commands permit omitted identities only for provisional
-diagnosis; their reports cannot close a release. The demonstration and closer require exact
-identities. Benchmark and demonstration execution require a binary built with the
-`release-evidence` feature.
+## Product command hierarchy
 
-### Provider acceptance
+All mutations require `--confirm` unless a row explicitly says it is a read. Confirmation records
+local mutation intent; it is not an identity, risk approval, source qualification, or an execution
+bypass. Request files are admitted as bounded, confined JSON objects only at the command boundaries
+that name one; MCP never receives a filesystem path.
 
-`release evidence providers` is the production provider-acceptance producer. It is intentionally
-separate from ordinary source setup and requires:
+### Sources, ingestion, datasets, and analysis
 
-- exact `--head` and `--tree` identities for a clean, unchanged repository;
-- `MARKET_SQUAWK_EXTERNAL_NETWORK=1` and
-  `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED=1`;
-- a nonempty, duplicate-free list of exact built-in surface identifiers;
-- `--sec-cik <CIK>` containing the exact nonzero ten-digit registrant selected during SEC setup;
-- `--fred-dataset <PROVIDER_DATASET>` containing one bounded
-  `fred:series-observations:<SERIES>:<START>:<END>` or `alfred:` selector;
-- `--fred-training-request <REQUEST_FILE>` containing the existing bounded typed PIT dataset-build
-  contract;
-- `--bls-dataset <PROVIDER_DATASET>` containing the exact
-  `bls:timeseries:public-v1:<PLAN_SHA256>` identity returned by BLS setup/status;
-- `--bls-training-request <REQUEST_FILE>` containing the bounded typed PIT dataset-build contract
-  for the exact published BLS manifest;
-- an existing parent for `--output-directory`, while the output directory itself must not exist;
-  and
-- portal-prepared active sessions and callable research runtimes for surfaces that require
-  contacts, credentials, series/query configuration, or admitted durable-use rights.
-
-The exact terminal-closing surface set is:
-
-```text
-coinbase.public-market-data
-coinbase.exchange-direct-market-data
-kraken.spot-public-market-data
-sec.edgar-public
-fred-alfred.api-v1-v2
-bls.v1-unregistered
-treasury.daily-rates-xml
-treasury.fiscal-data
-```
-
-The producer also recognizes `bls.v2-registered` for bounded provisional diagnostics. It does not
-replace the mandatory public-v1 path and cannot appear as an extra surface in a terminal provider
-report.
-
-The producer can establish no-credential onboarding for public Coinbase and public Kraken. It
-requires a portal-prepared Treasury daily research runtime with all five official families and an
-inclusive configured range; it then retrieves, ingests, queries, and recovers one configured
-common year across those families. It does not invent SEC contact data, BLS series semantics,
-Treasury query bounds, provider credentials, or FRED/ALFRED rights. Every selected surface must
-recover an exact active lease; durable research surfaces must also recover the same callable
-runtime generation after a clean application shutdown and restart.
-
-FRED/ALFRED acceptance is a working-data gate. The producer discovers every page for the exact
-provider selector, persists it under the separate dotted analytical `DatasetId`, queries
-observations and vintages, and repeats those exact queries after restart. It then runs the supplied
-PIT build request through the same production builder used by `dataset build`. That request must
-name the exact published FRED manifest and genuine historical-universe evidence; it must produce
-nonempty train, validation, and test splits plus a durable nonzero Python-export digest. Missing,
-synthetic, zero-row, mismatched-parent, or non-recoverable evidence fails the command. This path
-cannot begin durable publication unless exact current terms, written St. Louis Fed service
-permission with a hash-bound local review, and independent exact-series authority are all present.
-
-Live surfaces are exercised one at a time through the production application. Public Coinbase and
-Kraken must remain `DirectUnverified` and must produce no automated paper order. Coinbase Direct
-must reach `DirectVerified`; `--require-direct-verified-action` additionally requires at least one
-strategy-originated, centrally risk-approved paper order. `--require-fred-alfred-rights` requires
-both persistence and model-training admission for the exact FRED/ALFRED surface. Profile revision
-4 is rights-limited: those operations pass only when the active lease binds both the exact Bank
-service-permission gate and the exact-series gate for the same scope and validity interval. An API
-key, contact receipt, or public-domain series alone cannot satisfy this predicate.
-
-Only after collection, shutdown, restart recovery, executable hashing, and a second repository
-identity barrier does the command create
-`<OUTPUT-DIRECTORY>/provider-evidence.json` through atomic no-clobber publication. The final
-`release evidence close` command rejects a provider report unless it contains every mandatory
-Coinbase, Kraken, SEC, FRED/ALFRED, BLS v1, Treasury XML, and Treasury Fiscal surface plus the
-required Direct action, FRED/ALFRED rights, restart, and exact-binary evidence.
-For FRED/ALFRED, closure also requires nonempty real publications, observation/vintage queries,
-the exact derived-parent relationship, all three dataset splits, a nonzero Python-export digest,
-and restart recovery of that same derived generation and complete parent set.
-
-### Demonstration and closure
-
-`release demonstrate --offline` requires:
-
-- exact `--head` and `--tree`;
-- `--provider-evidence <HEAD-ROOT>/providers`;
-- `--python-evidence <HEAD-ROOT>/python/market-squawk-release.json`; and
-- `--output-file <HEAD-ROOT>/demo.json`, which must not exist.
-
-It revalidates the provider report, current executable, the verified CPython 3.14.6 environment,
-repository identity, and directory topology at admission and publication. It runs production
-live/model/risk/paper, storage/PIT/Python/backtest, portfolio/fair-value, CLI/doctor, and stdio MCP
-paths. Public-source fixtures remain `DirectUnverified`; the local product starts with the paper bot
-stopped and proves execution operations fail closed until a running source owns authority.
-
-`release evidence gate` requires exact `--head`, `--tree`, `--binary`, absent
-`--gate-log <HEAD-ROOT>/full-gate.log`, and absent
-`--output-file <HEAD-ROOT>/full-gate.json`. The running selected release executable
-parent-supervises the exact checked-in `scripts/verify.sh` with an eight-hour deadline, a 16 GiB
-process-tree RSS ceiling, a log-only 64 MiB file-size ceiling, and no-clobber log creation. It binds
-the script and completed log by SHA-256 and byte count, records observed process evidence,
-revalidates its immutable inputs, and rejects target usage above 20 GiB.
-
-`release evidence close` accepts only the exact HEAD-keyed root containing `fuzz.json`,
-`performance.json`, `providers/`, `python/`, `demo.json`, `full-gate.log`, and `full-gate.json`. Its
-`--output-file` must be the absent `<HEAD-ROOT>/manifest.json`. The closer rejects missing or extra
-root entries, credentials, symlinks, parent traversal, cross-HEAD artifacts, binary mismatches,
-failed semantic fuzz/performance/gate predicates, incomplete product predicates, or incomplete
-provider rights/action evidence. Python release evidence must bind the same selected application
-binary. The final artifact inventory and every external immutable input are revalidated on both
-sides of pending-manifest preparation.
-
-The reproducible sequence and current blockers are in the
-[exact-head release gate](../verification/usable-release-gate.md).
-
-## Confirmation and input admission
-
-Commands marked `--confirm` require the flag at the CLI boundary or the typed application
-descriptor. Omitting it fails before the requested durable mutation. Confirmation does not bypass
-provider rights, source qualification, point-in-time, model, portfolio, fair-value, risk, or
-execution authority.
-
-Ordinary JSON request-file commands enforce all of the following:
-
-- the path is made absolute without accepting a parent-directory component;
-- the parent becomes a user-authorized capability root;
-- the input is an unchanged, no-follow, bounded regular file;
-- the default file ceiling is 8 MiB;
-- the top-level JSON value is an object; and
-- the operation's closed descriptor or dedicated versioned decoder performs the final validation.
-
-Provider activation uses a 1 MiB request ceiling and additional provider-evidence bounds. Governed
-backtest, dataset, model-admission, portfolio, and file-ingestion paths use their dedicated closed
-decoders rather than treating arbitrary JSON as authority.
-
-## Request and result limits
-
-Shared product commands receive a five-minute monotonic request deadline and these fixed transport
-limits:
-
-| Limit | Value |
-| --- | ---: |
-| Default result items | 10,000 |
-| Default result bytes | 16 MiB |
-| Hard result bytes | 64 MiB |
-| Maximum JSON depth | 32 |
-| Maximum bytes in one JSON string or key | 1 MiB |
-| Maximum items in one JSON array | 100,000 |
-| Maximum entries in one JSON object | 10,000 |
-
-`query dataset` replaces the default item ceiling with `--maximum-rows` and retains the 16 MiB
-default byte ceiling for both inline and complete fixed-template query output. `query sql` instead
-uses its dedicated 256 KiB inline and 64 MiB complete-result ceilings and returns only its small
-terminal reference when it republishes Parquet. `portfolio import` uses an 8 MiB result ceiling.
-Individual application descriptors may impose narrower instrument, time, source-coverage, schema,
-work, or retained-memory limits.
-
-The standard local-product result envelope is:
-
-```json
-{
-  "data": {},
-  "metadata": {
-    "completeness": "complete",
-    "returnedItems": 0,
-    "availableItems": 0,
-    "sourceCoverage": null,
-    "dataQuality": null,
-    "sourceEvidence": null
-  },
-  "encodedBytes": 0
-}
-```
-
-The values above illustrate the shape, not the result of a particular operation.
-
-## Output and exit behavior
-
-| Condition | Exit status | Output behavior |
-| --- | ---: | --- |
-| Help, version, or successful command | `0` | Command result on stdout; local tracing on stderr |
-| Clap syntax, enum, or required-argument error | `2` | Clap diagnostic and usage on stderr |
-| Configuration, admission, service, I/O, lifecycle, or shutdown failure | `1` | Error chain on stderr; no success envelope |
-
-For `--output human`, supported control/product commands print one summary line followed by
-pretty-printed JSON. For `--output json`, they print one compact JSON value. `init`, diagnostic
-`capture`, and the hidden compatibility commands retain their fixed v0.1 rendering and currently do
-not change shape with `--output`. MCP stdout is protocol-only.
-
-JSON errors are not currently emitted as a separate stable machine-readable envelope. Automation
-must use the exit status and treat stderr text as diagnostic rather than a versioned API.
-
-## Compatibility commands
-
-The following commands are hidden from normal help and are not the primary product interface:
-
-| Command | Purpose and boundary |
+| Command | Exact arguments and effect |
 | --- | --- |
-| `mock --product <ID> --events <N> [--paper-bot]` | Deterministic diagnostic source; defaults are `TEST-USD` and `100` events |
-| `paper-bot [--provider <coinbase|coinbase-direct|kraken>] [--seconds <U64>] [--initial-cash <DECIMAL>] [--fee-basis-points <U32>]` | v0.1 public-source compatibility command; `coinbase-direct` is rejected with an instruction to use `bot start`, which retains the exact onboarding session and application authority |
-| `replay [--source coinbase-exchange] [--journal-format <current|legacy>]` | Validates and reconstructs the diagnostic Coinbase journal; other decoded sources are rejected |
+| `source register <provider> --confirm`; `source setup <provider> --confirm` | Register a code-supported profile or start/resume its bounded onboarding flow. |
+| `source status [provider]`; `source coverage [provider]`; `source health [provider]` | Bounded provider status, explicit coverage, or connection/integrity/freshness facts. |
+| `source discover <provider> --dataset <dataset>` | Bounded object list without ingestion authority. |
+| `source inspect <provider> --onboarding-session-id <UUID> --dataset-identifier <dataset> [--page-index 0..63] [--max-records 1..1024]` | One non-persisting provider page; defaults are `0` and `256`. |
+| `source activate <request> --confirm` | CLI-owned, confined, versioned provider activation request. |
+| `ingest source <provider> <object> --dataset <dataset> --confirm` | Mints the exact discovery receipt then uses it for source ingestion. |
+| `ingest file <manifest> --object <id> --dataset <id> --confirm` | CLI-owned confined local-file manifest admission. |
+| `dataset list [--after-dataset <id>]`; `dataset manifest <dataset>` | Bounded immutable dataset inventory or one manifest. |
+| `dataset build <request> --confirm`; `feature build <request> --confirm` | CLI-owned confined typed point-in-time dataset request and immutable publication. |
+| `feature list [--after-dataset <id>]` | Registered feature contracts and immutable feature datasets. |
+| `query dataset <dataset> [--maximum-rows <n>]` | Bounded dataset-history read; default row request is `1000`. |
+| `query sql --dataset <dataset> <statement> [--maximum-rows <n>]` | CLI-only bounded, read-only DataFusion SQL. It does not exist as an MCP tool. |
+| `query artifact --artifact-id <id> --sha256 <digest> --byte-count <n> [--media-type <type>] [--offset <n>] [--maximum-bytes <n>]` | Digest-verified artifact chunk; defaults are `application/json`, `0`, and `32768` bytes. |
 
-Replay is diagnostic tooling. It is not a source of current execution authority and is not a core
-historical-data requirement.
+CLI SQL has fixed limits: 64 KiB statement text, 1,000 default requested rows, 256 KiB inline
+Arrow IPC, 64 MiB complete result, 256 MiB query memory, four partitions, 2,048 syntax-tree nodes,
+4,096 plan nodes, and 60 seconds. A result above inline and within the complete ceiling is a
+path-free Parquet artifact reference with `artifactId`, `sha256`, `byteCount`, `mediaType`, and
+`rowCount`; retrieve it through `query artifact`.
 
-## Authority mapping
+### Models, portfolio, backtests, paper, and fair value
 
-The CLI parser creates no business authority. It either calls a local lifecycle boundary or maps a
-command to a code-owned operation descriptor. The descriptor validates its closed schema and
-authorization class; the domain service then owns financial, source, model, portfolio, valuation,
-or execution invariants. Risk-mediated actions still cross central risk and one-use dispatch.
+| Command | Exact arguments and effect |
+| --- | --- |
+| `model list`; `model metadata <model>` | Admitted immutable model bundles or one bundle's validation metadata. |
+| `model admit <request> --confirm` | CLI-owned verified model-admission request. |
+| `model evaluate <request> --confirm`; `model predict <request>` | Confined model-input object. Prediction failure produces no automatic action. |
+| `portfolio import <path> --account <id> --confirm` | CLI-owned confined portfolio import. |
+| `portfolio holdings --account <id>`; `portfolio transactions --account <id>` | Bounded current holdings or normalized transactions. |
+| `portfolio performance <request>`; `portfolio exposure <request>`; `portfolio risk <request>` | Confined typed point-in-time request object. |
+| `backtest run <request> --confirm`; `backtest show <run>` | CLI-owned governed-input registration followed by a bounded backtest request, or one result. |
+| `bot status`; `bot start --confirm [--provider <coinbase|coinbase-direct|kraken>] [--provider-session-id <UUID>] [--seconds <n>] [--initial-cash <decimal>] [--fee-basis-points <n>]`; `bot stop --reason <text> --confirm` | Paper lifecycle. The provider defaults to `coinbase`, cash to `100000`, and fee basis points to `100`; `coinbase-direct` requires its exact active session. A timed/interactive start stops through the typed `Bot.Stop` path. |
+| `execution orders`; `execution fills`; `execution cancel <order> --confirm`; `execution reconcile --confirm` | Paper order/fill reads and risk-mediated cancel/reconciliation. |
+| `fair-value list`; `fair-value measure <request> --confirm`; `fair-value classify <measurement> --confirm`; `fair-value explain <measurement>`; `fair-value evidence <measurement>` | Bounded evidence-bound fair-value workflow. |
+| `fair-value approval-status <measurement> --at <RFC3339>` | Approval/revocation state at one exact time. |
+| `fair-value approve <measurement> --decision <id> --reviewer <id> --approved-at <RFC3339> --expires-at <RFC3339> --confirm` | Controlled review approval. |
+
+### Durable jobs, operational lifecycle, and guided setup
+
+| Command | Exact arguments and effect |
+| --- | --- |
+| `job list [--after-job-id <UUID>] [--limit 1..1000]` | Latest job-generation page; default `100`. |
+| `job get <UUID>` | Latest sanitized generation. |
+| `job watch <UUID> --generation <positive> [--after-sequence <n>] [--limit 1..1000]` | Ordered event page; defaults `0`, `100`. |
+| `job cancel <UUID> --generation <positive> --expected-sequence <n> --confirm`; `job retry ... --confirm` | Exact-observation fenced mutation. |
+| `job confirm <UUID> --generation <positive> --expected-sequence <n> --confirmation-identity <id> --evidence-sha256 <lowercase digest> --confirm` | Exact generation/sequence confirmation. |
+| `operations backup list [--after-backup-id <digest>] [--limit 1..64]`; `get <digest>`; `create --confirm`; `verify <digest> --confirm` | Backup inventory/get and durable create/verify. |
+| `operations backup retention preview --keep-latest 1..128`; `apply --preview-id <UUID> --preview-digest <digest> --confirm` | Preview-bound retention only. |
+| `operations backup restore preview <digest>`; `start --preview-id <UUID> --preview-digest <digest> --confirm` | Fenced fresh-workspace restore only. |
+| `operations workspace list [--after-workspace-id <UUID>] [--limit 1..64]`; `switch preview <UUID>`; `switch start <preview args>` | List and preview-bound service-owned switch. |
+| `operations update status`; `check --confirm`; `preview`; `start <preview args>` | Trusted update state, staged check, and preview-bound activation. |
+| `operations update program-rollback preview`; `start <preview args>` | Program-file rollback only; it is not data restore. |
+| `operations logs query` / `export --confirm` | Closed filters `--from`, `--through`, `--minimum-severity`, `--domain`, `--source-id`, `--job-id`, `--correlation-id`, `--search`, `--after-sequence`, and `--limit 1..1000` (default `250`). Export publishes a controlled redacted artifact. |
+| `operations settings get`; `change preview --expected-revision <positive> <typed fields>`; `change apply <preview args>`; `rollback preview --expected-revision <positive> --target-revision <positive>`; `rollback apply <preview args>` | Typed settings only. Fields are log retention `1..365`, severity, update channel, automatic checks, storage `1073741824..17592186044416`, default query rows `100..1000000`, concurrent jobs `1..64`, freshness `250..600000`, and backup retention `1..64`. |
+| `setup status`; `preview [--expected-revision <n>] [--goal <csv/repeated>] [--starter-plan <value>]`; `apply --preview-id <UUID> --preview-sha256 <digest> --confirm` | Closed, workspace-bound guided plan. Goals and starters are Clap enums; defaults are `everything-recommended`. Preview/acceptance do not claim all steps are complete. |
+
+Every preview-bound operation requires the exact non-nil preview UUID, lowercase SHA-256 digest,
+and `--confirm`; stale previews fail rather than being reapplied. Jobs, workspace switches, updates,
+backups, restores, and logs return typed receipts or controlled artifacts rather than shell paths.
+
+## MCP relay and client registration
+
+The installed registration target is the package relay, not `market-squawk mcp` directly:
 
 ```text
-Clap command
-  -> confined CLI input and fixed request limits
-  -> code-owned application descriptor or dedicated local authority
-  -> product-domain service
-  -> bounded result envelope
+market-squawk-mcp-relay --client <claude|codex> [--data-dir <PATH>] [--config <PATH>]
 ```
 
-CLI-only DataFusion SQL receives only a pinned dataset generation, a read-only query engine, and
-bounded transient query-publication authority. Verified overflow is transferred into the shared
-terminal repository before a path-free reference is returned. The CLI confines file inputs to
-declared capability roots; credential resolution, approval authority, unrelated database
-publication, and order dispatch remain with their dedicated application services.
+It resolves the authenticated service rendezvous and that named client's credential through native
+secret authority, then relays bounded stdio JSON-RPC to the service's local `/mcp`. It does no
+catalog, model, source, job, or application work and never puts a bearer credential in client
+configuration or argv. The public compatibility command is:
 
-## Related documentation and code
+```text
+market-squawk mcp serve --client <claude-code|codex>
+```
 
-- [Control-plane architecture](../architecture/control-plane.md)
+Bare `market-squawk mcp` now fails with the same requirement; it is not a standalone server. Setup
+and repair own official Claude Code/Codex registration, use the logical name `market-squawk`, and
+refuse to overwrite an unrelated same-name registration. See [MCP reference](mcp.md).
+
+## Output, authority, and hidden compatibility commands
+
+Normal command results use human output or JSON according to `--output`; errors are non-successful
+process exits and do not disclose secrets or uncontrolled paths. MCP stdio reserves stdout for
+frames. `mock`, `paper-bot`, and `replay` remain hidden diagnostic/v0.1 compatibility commands and
+are intentionally not an installed-product automation interface.
+
+The CLI has no raw SQL outside `query sql`, raw configuration editor, arbitrary shell/filesystem
+authority, raw service port/token option, unrestricted database query, direct order submit, or
+risk bypass.
+
+## Related references
+
 - [Configuration reference](configuration.md)
 - [MCP reference](mcp.md)
 - [Installation and bootstrap](../operations/installation-and-bootstrap.md)
-- [Desktop launcher contract](../../apps/market-squawk-desktop/src-tauri/src/lib.rs)
-- [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
-- [CLI contract](../../apps/market-squawk/src/cli.rs)
-- [Process dispatch and output](../../apps/market-squawk/src/main.rs)
-- [Shared CLI transport](../../apps/market-squawk/src/local_product/cli_transport.rs)
-- [Application capability registry](../../apps/market-squawk/src/application/contracts.rs)
-- [Accepted-head delivery evidence](../plans/delivery-ledger.md)
-
-## External sources
-
-| Source | Applied fact | Reviewed |
-| --- | --- | --- |
-| [Clap derive tutorial 4.6.2](https://docs.rs/clap/4.6.2/clap/_derive/_tutorial/index.html) | Derive-based parser, subcommand, argument, help, and version behavior used by the shipping CLI | 2026-07-23 |
-| [DataFusion SQL reference](https://datafusion.apache.org/user-guide/sql/index.html) | SQL dialect reference for the separately bounded CLI-only analytical query | 2026-07-23 |
-
-External documentation explains upstream parser and query syntax. The reviewed Market Squawk code
-head remains the authority for which commands, options, and limits actually ship.
+- [CLI definition](../../apps/market-squawk/src/cli.rs)
+- [CLI transport](../../apps/market-squawk/src/local_product/cli_transport.rs)

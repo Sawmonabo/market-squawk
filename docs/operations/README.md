@@ -10,7 +10,6 @@ recovery behavior.
 | Audience | Local operators, analysts, integrators, and incident responders |
 | Status | Current |
 | Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
 
 ## Runbooks
 

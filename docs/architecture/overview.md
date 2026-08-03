@@ -9,8 +9,7 @@ runtime containers before the reader descends into crate or protocol detail.
 | Document type | Architecture overview |
 | Audience | Operators, maintainers, integrators, security reviewers, and research users |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -42,16 +41,18 @@ for release blockers and acceptance state.
 
 ### Self-hosted cost and deployment boundary
 
-The complete release requires no paid software, paid API, cloud service, external database
-service, container runtime, or telemetry infrastructure. Hardware, local storage, electricity, and
-internet access are outside that software-cost boundary. A provider may require a free account,
-credential, contact identity, or provider-controlled consent step; that requirement is recorded
-separately from software and API cost.
+The installed product is self-hosted: its application and analytical state remain local by default,
+and its provider connections are direct and explicitly configured. It does not require a cloud
+service, external database service, container runtime, or telemetry infrastructure to run the local
+product. Hardware, local storage, electricity, internet access, and a provider's own account,
+credential, or consent requirements are separate from that product boundary.
 
 All durable product state is local by default. Network access is limited to explicitly configured
 provider interfaces and provider-controlled onboarding handoffs. The baseline analytical database
-is embedded SQLite plus local Parquet, not a remote service. MCP uses local stdio. Structured logs
-remain local process output, and the application emits no analytics beacon.
+is embedded SQLite plus local Parquet, not a remote service. The service exposes authenticated
+loopback application and MCP routes; named Claude Code and Codex stdio relays are compatibility
+clients for that service. Structured logs remain local, and the application emits no analytics
+beacon.
 
 The adapter boundary is replaceable. Provider availability, coverage, rights, and protocol
 differences are represented as metadata and evidence rather than hidden behind a universal source
@@ -96,7 +97,7 @@ The context view answers: who and what exchanges information with the local Mark
 ```mermaid
 flowchart LR
     Operator["Operator, researcher, or model developer"]
-    McpClient["Local MCP client"]
+    McpClients["Claude Code and Codex\nMCP clients"]
     Browser["Local browser"]
     Files["User-authorized files and portfolio exports"]
     Providers["Venue and official provider interfaces"]
@@ -107,10 +108,10 @@ flowchart LR
         LocalState["Controlled local state and artifacts"]
     end
 
-    Operator -->|"Tauri desktop or CLI and local configuration"| MarketSquawk
-    McpClient -->|"stdio MCP requests"| MarketSquawk
+    Operator -->|"Tauri desktop, CLI, and local configuration"| MarketSquawk
+    McpClients -->|"named stdio relay to authenticated loopback MCP"| MarketSquawk
     MarketSquawk -->|"bounded results and artifact references"| Operator
-    MarketSquawk -->|"typed MCP results"| McpClient
+    MarketSquawk -->|"typed MCP results"| McpClients
     Browser <-->|"official handoff or ephemeral loopback onboarding"| MarketSquawk
     Files -->|"capability-confined reads"| MarketSquawk
     Providers <-->|"allowlisted HTTPS or WebSocket protocols"| MarketSquawk
@@ -118,11 +119,13 @@ flowchart LR
     MarketSquawk <-->|"catalog, journals, evidence, datasets, and checkpoints"| LocalState
 ```
 
-The system has no required inbound network service. The only current HTTP listener is an
-ephemeral IPv4 loopback provider-onboarding portal with a bounded lifetime, request count,
-connection count, request body, session cookie, and CSRF check. MCP is not a network listener; it
-uses the process's standard input and output. Provider feeds and official research interfaces are
-outbound, allowlisted connections.
+The system has no remote or public inbound service. One per-user service binds an authenticated
+loopback listener only on `127.0.0.1`: its private `/app/v1` route serves Desktop and CLI clients,
+and its `/mcp` route serves the shared Streamable HTTP MCP endpoint. The endpoint and generation
+are published through an owner-only rendezvous record; named stdio relays keep their credentials
+out of client configuration. The separate IPv4 loopback provider-onboarding portal is ephemeral and
+bounded by lifetime, request count, connection count, request body, session, Host/Origin, and CSRF
+checks. Provider feeds and official research interfaces remain outbound, allowlisted connections.
 
 User files enter through an explicitly authorized root and stable file identity. Python operates
 outside the live path and consumes only catalog-authorized point-in-time exports. Finalized model
@@ -139,10 +142,9 @@ The runtime-container view answers: which local runtimes and stores own the majo
 
 ```mermaid
 flowchart TB
-    subgraph ApplicationProcess["One Market Squawk application process"]
-        Desktop["Tauri desktop and closed presentation bridge"]
-        Cli["CLI transport"]
-        Mcp["Local stdio MCP transport"]
+    subgraph ServiceProcess["One Market Squawk per-user service"]
+        Runtime["Authenticated loopback /app/v1 and /mcp"]
+        Jobs["Durable job authority"]
         Portal["Bounded loopback onboarding portal"]
         App["Transport-neutral application services"]
 
@@ -161,6 +163,10 @@ flowchart TB
         Paper["Local paper execution runtime"]
     end
 
+    Desktop["Tauri desktop and closed Rust bridge"]
+    Cli["market-squawk CLI client"]
+    Relays["Claude Code / Codex named stdio relays"]
+
     CaptureHelper["Validated capture helper process"]
     OnnxHelper["Admitted ONNX worker process"]
     ProviderInterfaces["Configured provider interfaces"]
@@ -174,10 +180,12 @@ flowchart TB
         Secrets["OS keyring"]
     end
 
-    Desktop --> App
-    Cli --> App
-    Mcp --> App
+    Desktop --> Runtime
+    Cli --> Runtime
+    Relays --> Runtime
+    Runtime --> App
     Portal --> App
+    App --> Jobs
     ProviderInterfaces --> Sources
     ProviderInterfaces --> Extract
     UserInputs --> Extract
@@ -198,11 +206,14 @@ flowchart TB
     ResearchConsumers -->|"bounded admitted inference"| OnnxHelper
 ```
 
-Desktop, CLI, and MCP are presentations over the same immutable set of 11 application-domain
-services. They do not call adapters or storage engines directly. A desktop process and a CLI/MCP
-process each compose the same `LocalProduct`; they are alternative owners of a single-writer data
-root, not concurrent frontends over one root. Composition fails before a presentation is published
-if a required domain implementation is missing or duplicated.
+The per-user service is the sole owner of the selected workspace, `LocalProduct`, durable jobs,
+catalog writers, source connections, model/runtime lifecycle, paper state, risk, and audit. Desktop,
+CLI, Claude Code, and Codex are concurrent presentations over its bounded typed application
+services; they do not call adapters or storage engines directly and do not construct competing
+product roots. The Desktop Rust layer keeps its application credential outside the WebView. A named
+MCP relay holds only its own client credential and adapts stdio to the service; it owns no catalog,
+model, source, job, or workspace authority. Service composition fails before its rendezvous is
+published if a required authority is missing or duplicated.
 
 The live runtime starts its shards and initial immutable snapshots before feed ingress escapes.
 Each source generation obtains current registry and capture authority, binds its routes before the
@@ -234,7 +245,9 @@ validated model generation requires it.
 | Mutable live state has deterministic single-writer ownership | Book, feature, and strategy transitions are ordered per instrument route. |
 | Queues and result surfaces are bounded | Saturation returns a typed failure and invalidates or suppresses the affected action where integrity requires it. |
 | Publication is lease-controlled and manifest-driven | Durable objects are verified before reader authority is committed; readers pin a known generation and directory contents alone never establish completeness. |
-| CLI and MCP share application descriptors | Transport differences cannot create a second business-authority path. |
+| Desktop, CLI, and MCP share application descriptors | Presentation or transport differences cannot create a second business-authority path. |
+| One service owns one active workspace | Switching is explicit, audited, and fenced against incompatible jobs or paper operations. |
+| Durable job authority outlives a client request | A disconnected window or MCP session cannot silently abandon, duplicate, or publish partial long-running work. |
 
 ## Failure and recovery posture
 
@@ -250,8 +263,12 @@ Market Squawk fails closed at authority boundaries and isolates recoverable fail
   partially staged file is not inferred to be a committed dataset;
 - model, portfolio, backtest, fair-value, and paper-execution state is reopened through
   digest-bound local authority and explicit recovery contracts; and
-- shutdown first stops admission and invalidates authority, then drains or reaps owned tasks under
-  deadlines. Uncertain helper termination remains unavailable rather than being detached.
+- durable jobs preserve their typed generation, event sequence, authority snapshot, result
+  references, cancellation/recovery state, and terminal evidence; a client loss does not cancel
+  them by implication; and
+- shutdown first stops admission and invalidates authority, then drains or reaps requests, jobs,
+  audit, and owned tasks under deadlines. Uncertain helper termination remains unavailable rather
+  than being detached.
 
 These are architectural behaviors, not a release-approval claim. Prior exact-head and current
 focused evidence are summarized in the [delivery ledger](../plans/delivery-ledger.md); final
@@ -263,10 +280,11 @@ The operator controls the host, configuration, local data root, and provider cre
 responses, WebSocket frames, local input files, model artifacts, MCP requests, and browser requests
 are untrusted until admitted by their bounded parser and evidence contract.
 
-Secrets are represented by opaque references and resolved through the OS keyring in the reviewed
-application composition. Secret values are redacted and zeroized and do not enter MCP results,
-artifacts, or logs. Provider onboarding keeps credential state, rights evidence, technical
-connectivity, and activation authority independent.
+Secrets are represented by opaque references and resolved through the OS keyring first, with the
+reviewed encrypted local fallback available only after an explicit foreground unlock. Secret values
+are redacted and zeroized and do not enter WebView payloads, MCP results, artifacts, or logs.
+Provider onboarding keeps credential state, rights evidence, technical connectivity, and activation
+authority independent.
 
 The local state directory is trusted only through retained directory/file capabilities, exact
 identity checks, no-follow opens, immutable digests, and transactional or crash-consistent
@@ -298,6 +316,9 @@ Primary implementation anchors:
 - [Live runtime ownership](../../apps/market-squawk/src/live_runtime.rs)
 - [Research service composition](../../apps/market-squawk/src/research_service.rs)
 - [Execution-owned live action hook](../../crates/market-squawk-execution/src/live_hook.rs)
+- [Installed per-user service](../../apps/market-squawk/src/service/mod.rs)
+- [Installed runtime contracts](../../crates/market-squawk-runtime/src/contracts.rs)
+- [Durable job contracts](../../crates/market-squawk-jobs/src/contracts.rs)
 - [Controlled local paths](../../crates/market-squawk-platform/src/paths.rs)
 - [Provider activation evidence validation](../research/2026-07-23-provider-activation-evidence-validation.md)
 

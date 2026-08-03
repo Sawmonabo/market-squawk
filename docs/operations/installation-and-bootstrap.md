@@ -1,408 +1,387 @@
-# Installation, first launch, and maintenance
+# Installation and bootstrap
 
-Use this runbook to install the complete Market Squawk v1.0.0 product, open guided setup, verify
-the installed state, update or repair it, roll back one version, and uninstall without deleting
-user data.
+This runbook defines the verified V1 installation flow. No public package is available yet, so the
+current source tree does not advertise a live curl endpoint. Follow an installation route only when
+its distribution includes the exact target receipt and every identity required below.
 
 | Field | Value |
 | --- | --- |
 | Document type | Operations runbook |
-| Audience | Desktop users, headless operators, support engineers, and release verifiers |
-| Status | Current v1.0.0 contract |
-| Last substantive review | 2026-07-30 |
-| Implementation review base | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
+| Audience | Operators and release engineers |
+| Status | Current installation contract; public packages are not yet available |
+| Product version | `1.0.0` |
+| Last substantive review | 2026-08-03 |
+| Authorities | Rust installer, complete-release manifest, installed service, and package receipts |
 
 ## Contents
 
-- [Scope](#scope)
-- [What the complete installation contains](#what-the-complete-installation-contains)
-- [Supported platforms](#supported-platforms)
-- [Install](#install)
-- [First launch](#first-launch)
-- [Verify the installation](#verify-the-installation)
+- [Scope and safety boundary](#scope-and-safety-boundary)
+- [Complete installed inventory](#complete-installed-inventory)
+- [Supported package targets](#supported-package-targets)
+- [Obtain and verify controlled artifacts](#obtain-and-verify-controlled-artifacts)
+- [Native installation](#native-installation)
+- [Local terminal installation](#local-terminal-installation)
+- [First launch and guided setup](#first-launch-and-guided-setup)
+- [Verify the installed service and clients](#verify-the-installed-service-and-clients)
 - [Program and data locations](#program-and-data-locations)
-- [Update, repair, and rollback](#update-repair-and-rollback)
-- [Uninstall](#uninstall)
-- [Offline installation](#offline-installation)
-- [Release integrity and platform trust](#release-integrity-and-platform-trust)
+- [Updates, repair, and program rollback](#updates-repair-and-program-rollback)
+- [Backup and workspace recovery](#backup-and-workspace-recovery)
+- [Data-preserving removal](#data-preserving-removal)
 - [Failure and recovery](#failure-and-recovery)
-- [Development installation](#development-installation)
-- [Related documentation and code](#related-documentation-and-code)
-- [Official sources](#official-sources)
+- [Trust and publication boundary](#trust-and-publication-boundary)
+- [Contributor source mode](#contributor-source-mode)
+- [Related documentation and sources](#related-documentation-and-sources)
 
-## Scope
+## Scope and safety boundary
 
-This page covers supported per-user installation from the public v1.0.0 release. The normal
-desktop path requires no knowledge of Rust, Python, Node.js, databases, containers, or finance.
-The headless path installs the same component set and exposes durable terminal entrypoints.
+This procedure covers one immutable distribution delivered either as a controlled pre-release
+artifact or an immutable public release. A public download, stable curl command, or publisher-
+signing claim is valid only after those exact hosted artifacts are independently verified.
 
-Installation proves that the complete software release is present and internally consistent. It
-does not:
+Do not proceed when any of these facts is absent or inconsistent:
 
-- create a provider account or accept provider terms for the user;
-- qualify any observation as `DirectVerified`;
-- import private portfolios or datasets without an explicit user action;
-- admit a model, approve an order, or start paper execution; or
-- claim Apple Developer ID or Windows Authenticode identity when a package declares
-  `provenance-only`.
+- exact candidate commit and tree SHA;
+- target triple and supported operating-system floor;
+- component-manifest and Python source-closure identities;
+- package or complete-bundle filename, byte length, and SHA-256;
+- package receipt and installed-smoke receipt;
+- explicit target trust state;
+- controlled artifact location bound to the same candidate.
 
-## What the complete installation contains
+The installation lifecycle is fail-closed:
 
-Every supported target is one closed release. It contains:
-
-- the Obsidian Signal Tauri desktop;
-- the `market-squawk` CLI and local stdio MCP server;
-- the bounded raw-capture helper;
-- the isolated ONNX worker;
-- the model-bundle validator and supported training driver;
-- the versioned installer and maintenance command;
-- uv 0.12.0;
-- managed CPython 3.14.6;
-- the locked offline Python analytics and modeling environment; and
-- schemas, notices, licenses, checksums, and release metadata.
-
-The installer rejects a missing, additional, oversized, unsafe, or digest-mismatched component
-before activation. A version is immutable after publication. Activation changes a small local
-selector only after the complete candidate has been admitted.
-
-## Supported platforms
-
-| Platform | Minimum | Native packages | Terminal installer |
-| --- | --- | --- | --- |
-| macOS Apple Silicon | macOS 12 | DMG | Yes |
-| macOS Intel | macOS 12 | DMG | Yes |
-| Windows x64 | Windows 10 version 1809 | Guided NSIS installer and MSI | Use the native package |
-| Linux x64 | Ubuntu 24.04-compatible | AppImage and DEB | Yes |
-
-The Linux compatibility statement covers the release's glibc and native-library baseline. Other
-distributions may work but are not represented as supported until they pass the same installed
-product checks.
-
-## Install
-
-### Recommended desktop installation
-
-Open the [latest GitHub Release](https://github.com/Sawmonabo/market-squawk/releases/latest) and
-choose the package for the computer:
-
-- **macOS:** use the DMG matching Apple Silicon or Intel, copy **Market Squawk** into
-  Applications, and open it.
-- **Windows:** use the guided `-setup.exe` package for the normal per-user flow. The MSI is
-  available for operators who specifically manage MSI deployment.
-- **Linux:** use the AppImage for a portable desktop or the DEB on a compatible Debian/Ubuntu
-  system.
-
-The first desktop start admits the complete release embedded in the native package, installs it in
-the per-user program store, supplies the active Python/modeling release to the application, and
-then opens guided setup.
-
-### One-command macOS or Linux installation
-
-Run:
-
-```bash
-curl -fsSL \
-  https://github.com/Sawmonabo/market-squawk/releases/latest/download/install.sh | sh
+```mermaid
+flowchart LR
+    Handoff["Controlled candidate handoff"] --> Verify["Verify target, size, SHA-256, manifest, and receipt"]
+    Verify -->|"mismatch"| Stop["Stop without activation"]
+    Verify -->|"exact"| Install["Native package or local complete bundle"]
+    Install --> Register["Register one per-user service and stable entrypoints"]
+    Register --> Health["Authenticate service rendezvous and selected workspace"]
+    Health -->|"unhealthy"| Rollback["Retain or restore previous known-good program"]
+    Health -->|"healthy"| Setup["Open permanent Desktop shell and guided setup"]
 ```
 
-The script performs only bounded bootstrap work:
+## Complete installed inventory
 
-1. detects a supported operating system and architecture;
-2. downloads the exact release bootstrap over HTTPS;
-3. verifies its release-published SHA-256 digest;
-4. hands the target-specific manifest to the Rust installer; and
-5. removes its temporary files.
+The native and terminal routes must carry the same product capability set. Platform packaging may
+differ, but the release manifest must close the same roles:
 
-The Rust installer downloads, verifies, and activates the complete release. It prints durable
-Desktop, CLI, and maintenance paths when it succeeds. It does not edit the shell profile or
-modify system Python.
+- Obsidian Signal Desktop;
+- `market-squawk` CLI/application;
+- one per-user `market-squawk-service`;
+- `market-squawk-mcp-relay` for named Claude Code and Codex clients;
+- capture helper and ONNX worker;
+- model validator and training driver;
+- Rust installer and maintenance authority;
+- uv and managed CPython with the locked Python analytics/modeling product;
+- schemas, notices, licenses, trust/update metadata, and lifecycle assets.
 
-The command requires `curl`, `sh`, and either `sha256sum` or `shasum`. It does not require an
-existing Market Squawk build toolchain.
+[`distribution/release-components.json`](../../distribution/release-components.json) is the
+current external-component authority. It currently records managed CPython `3.14.6`, uv `0.12.1`,
+and target-specific PyArrow `25.0.0` artifacts. The final receipt must bind the exact manifest used;
+this runbook does not override it.
 
-## First launch
+Installation does not configure providers, import private data, or mint user credentials. Guided
+setup performs those actions later with explicit operator choices. Rust, Node.js, pnpm, system
+Python, a database service, a container runtime, and a paid service are not installed-product
+prerequisites.
 
-Open **Market Squawk** from the operating system after a native installation. After a terminal
-installation, run the exact Desktop path printed at completion.
+## Supported package targets
 
-The dark guided setup:
+| Target | Operating-system floor | Package families |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | Ubuntu 24.04-compatible x64 | AppImage, DEB, complete ZIP/bootstrap |
+| `x86_64-pc-windows-msvc` | Windows 10 1809+ x64 | Guided installer, MSI, complete ZIP/bootstrap |
+| `x86_64-apple-darwin` | macOS 12+ Intel | Application, DMG, complete ZIP/bootstrap |
+| `aarch64-apple-darwin` | macOS 12+ Apple Silicon | Application, DMG, complete ZIP/bootstrap |
 
-1. opens the local workspace and catalog;
-2. explains each product area in plain language;
-3. helps select and validate zero-fee sources;
-4. handles provider credentials only when a chosen provider requires them;
-5. checks research, portfolio, Python/modeling, MCP, paper-execution, and storage readiness; and
-6. ends with either **Ready** or named recovery actions.
+A distribution is supported only when the package receipt proves native install, service, Desktop,
+CLI, both MCP clients, useful data/model/portfolio flows, recovery, repair, and data-preserving
+removal from the same immutable source identity.
 
-The portal is local. Protected provider setup may open a temporary loopback page. Closing that
-page or the desktop does not publish data or send telemetry.
+## Obtain and verify controlled artifacts
 
-## Verify the installation
+Pre-release distributions use SHA-bound GitHub Actions artifacts. Public distributions use an
+immutable GitHub Release. In either case, obtain the exact run/release and artifact set named by the
+package receipt. Do not substitute a local rebuild, moving branch tip, prior version, or similarly
+named file.
 
-### Desktop
-
-The Overview and Operations views show the installation version, integrity state, setup status,
-and recovery actions. An installed component or active-selector mismatch reports repair required;
-it is never converted into readiness.
-
-### Terminal
-
-Set `INSTALLER` and `MSQ` to the exact maintenance and CLI paths printed by the terminal installer:
-
-```bash
-INSTALLER="/exact/printed/path/market-squawk-installer"
-MSQ="/exact/printed/path/market-squawk"
-DATA_ROOT="/absolute/operator-owned/path/market-squawk-data"
-```
-
-Then verify the program and initialize a new data root:
+Create a private working directory, download only the named target artifact, and compare all facts
+to the handoff receipt. On POSIX systems:
 
 ```bash
-"$INSTALLER" status --json
-"$MSQ" --version
-"$MSQ" --data-dir "$DATA_ROOT" config validate
-"$MSQ" --data-dir "$DATA_ROOT" init
-"$MSQ" --data-dir "$DATA_ROOT" doctor
+umask 077
+mkdir -p ./market-squawk-install
+cd ./market-squawk-install
+
+shasum -a 256 <artifact-file>
+# Linux may use: sha256sum <artifact-file>
 ```
 
-Success requires:
+On Windows PowerShell:
 
-- installer status reports `installed: true`, version `1.0.0`, and `healthy: true`;
-- `market-squawk --version` reports `1.0.0`;
-- configuration validation succeeds without unknown or invalid settings;
-- `init` opens the controlled layout and shuts down cleanly; and
-- `doctor` reports the existing local authorities without creating or repairing them.
+```powershell
+New-Item -ItemType Directory -Force .\market-squawk-install | Out-Null
+Set-Location .\market-squawk-install
+Get-FileHash .\<artifact-file> -Algorithm SHA256
+```
 
-`doctor` does not contact providers and does not turn an unconfigured source into a healthy one.
+Then verify:
+
+1. The observed digest is the receipt digest.
+2. The observed byte length is the receipt length.
+3. The release index selects the current target exactly once.
+4. The target manifest, complete ZIP, native package set, SBOM/provenance inputs, and checksums all
+   name the same candidate commit, tree, version, component manifest, and source closure.
+5. The target trust state matches the receipt; do not infer signing from an operating-system icon
+   or prompt.
+
+Any mismatch stops the procedure. Preserve the files for diagnosis; do not run, rename, recompress,
+or repair them manually.
+
+## Native installation
+
+The native package is the normal Desktop route. Perform this section only for a target whose table
+row and handoff receipt are verified.
+
+### macOS
+
+1. Verify the DMG digest and trust state from the handoff.
+2. Open the DMG and move Obsidian Signal to Applications, or use the package's documented local
+   test mount procedure.
+3. Launch Obsidian Signal from the normal application entrypoint.
+4. Accept only the operating-system prompt documented by the receipt's actual trust state.
+5. Confirm the managed-install handoff completes and the installed service becomes healthy.
+
+### Windows
+
+1. Verify the guided-installer or MSI digest and trust state.
+2. Run the selected installer as the current user.
+3. Launch Obsidian Signal from the installed application entrypoint.
+4. Confirm the installer-owned per-user service is registered once and reaches authenticated
+   readiness.
+
+### Linux
+
+1. Verify the AppImage or DEB digest and trust state.
+2. For DEB, install the local package with the operating system's package UI or local-package
+   command. For AppImage, apply executable permission only after digest verification.
+3. Launch the installed application entrypoint.
+4. Confirm the installer-owned user service and stable entrypoints are present and healthy.
+
+Native package success is not inferred from extraction alone. The candidate receipt must prove the
+package entrypoint, immutable release activation, service registration, and managed Desktop handoff.
+
+## Local terminal installation
+
+The eventual public `curl ... | sh` asset is not available before publication. Use the downloaded
+target bootstrap, manifest, and complete ZIP from the same controlled artifact set:
+
+```bash
+chmod 700 ./market-squawk-bootstrap-<target>
+
+./market-squawk-bootstrap-<target> install \
+  --manifest ./market-squawk-release-<target>.json \
+  --bundle ./market-squawk-complete-1.0.0-<target>.zip
+```
+
+The installer prints stable Desktop, CLI, and Updates/repair paths on POSIX systems. Windows owner
+testing uses the native package route. The installer must not alter shell profiles, replace system
+Python, or expose a raw program directory as mutable product state.
+
+The generated `distribution/install.sh` is tested as a release asset, but its repository copy
+contains release-builder tokens and intentionally exits. It becomes a documented one-command
+installer only after separately authorized publication and verification of its exact hosted bytes.
+
+## First launch and guided setup
+
+First launch opens the permanent Obsidian Signal shell. Guided setup previews all selected changes
+before acceptance and evaluates completion from durable owner evidence. The recommended complete
+plan covers these outcomes in order:
+
+1. goals and starter plan;
+2. workspace and storage;
+3. data sources;
+4. owned files and portfolio imports;
+5. model and forecast readiness;
+6. paper execution and risk;
+7. Claude Code and Codex MCP registration;
+8. verified backup inventory;
+9. capability and gap review;
+10. first useful result;
+11. system/governance readiness shown by the shipped plan.
+
+The Desktop may report installed, available, configured, data ready, running, needs attention, or
+recovery required. Skipped steps stay visible and resumable. Plan acceptance alone is not source,
+model, client, backup, or system readiness.
+
+Provider accounts or free API keys are requested only for selected providers that require them.
+Secrets go directly to the protected credential boundary and are not copied into logs, request
+history, configuration prose, or the WebView.
+
+## Verify the installed service and clients
+
+Use the exact stable paths printed by the installer or recorded in its JSON receipt. Do not call a
+build-tree binary.
+
+```bash
+INSTALLER="/exact/installed/path/market-squawk-installer"
+MSQ="/exact/installed/path/market-squawk"
+
+"$INSTALLER" status
+"$INSTALLER" service status
+"$MSQ" service status
+"$MSQ" service start
+"$MSQ" doctor
+"$MSQ" setup status
+```
+
+Successful evidence identifies one installation, one selected workspace, one current service
+generation, one healthy owner-only rendezvous, and no duplicate service process.
+
+Guided setup owns normal MCP registration. It must independently connect and verify one
+`market-squawk` entry for Claude Code and one for Codex, each using its own credential and stateless
+relay. A manual diagnostic may run:
+
+```bash
+"$MSQ" mcp serve --client claude-code
+"$MSQ" mcp serve --client codex
+```
+
+Those commands relay stdio to the one service; they do not create another catalog, model runtime,
+paper account, or MCP backend. Verification requires a real initialize handshake and safe read from
+each named client, followed by clean relay exit without stopping the service.
 
 ## Program and data locations
 
-The default program store is separate from portfolios, datasets, models, configuration, and logs.
-Ordinary uninstall can therefore remove the software without deleting user work.
+Program state and workspace data are separate authorities:
 
-| Platform | Default program root |
-| --- | --- |
-| macOS | `~/Library/Application Support/com.MarketSquawk.Market-Squawk/program` |
-| Linux | `${XDG_DATA_HOME:-~/.local/share}/marketsquawk/program` |
-| Windows | `%LOCALAPPDATA%\MarketSquawk\Market Squawk\data\program` |
+- the installer owns immutable program versions, the active selector, one previous known-good
+  version, stable entrypoints, service registration, and installation receipts;
+- the selected workspace owns configuration, credentials, catalogs, portfolios, datasets, models,
+  logs, artifacts, backups, and audit state;
+- the service rendezvous contains identities and endpoint metadata but no credential;
+- secrets live in native protected storage where available, with the configured encrypted local
+  fallback.
 
-On Linux, a relative `XDG_DATA_HOME` is ignored and the home-directory fallback is used.
+Do not document or guess a platform path from memory. Use the installer status receipt, Desktop
+Settings, or the installed CLI to resolve the current code-owned location. A workspace switch is a
+preview-bound service operation; changing `--data-dir` on an arbitrary client is not a workspace
+switch.
 
-The managed store has this shape:
+## Updates, repair, and program rollback
 
-```text
-program/
-├── installation.json
-├── bin/                              stable Unix desktop, CLI, and installer entrypoints
-├── versions/
-│   ├── 1.0.0-<manifest-sha256>/      active immutable complete release
-│   └── <previous-version>/           one retained rollback version, when available
-├── releases/
-│   └── <manifest-sha256>/            exact retained manifest and complete bundle
-└── staging/                          cleared bounded recovery workspace
-```
+The production update channel truthfully reports unavailable when no signed release metadata is
+configured. Release verification proves update preflight and rollback with a repository-controlled
+signed fixture that cannot become a production trust root.
 
-Windows native packages own the normal Start menu and application entrypoints. macOS and Linux
-terminal installations use the stable `bin/` entrypoints shown above. Update and rollback refresh
-those derived files from the selected immutable release, and status verifies them against the
-component receipts.
-
-The installed desktop uses Tauri's platform application-local data directory as its safe default.
-The CLI uses `.market-squawk` only when no explicit data directory is supplied. For durable
-headless operation, always choose an absolute `--data-dir`. Exact configuration and local storage
-semantics are in [Configuration and secrets](configuration-and-secrets.md) and the
-[configuration reference](../reference/configuration.md).
-
-## Update, repair, and rollback
-
-The desktop exposes Status, Update, Repair, and Rollback in its Operations area. Update and
-rollback require a restart because they change the active complete release.
-
-The terminal maintenance command uses the retained HTTPS release channel:
+Use the Desktop **Updates** workspace or installed maintenance authority for program lifecycle:
 
 ```bash
 "$INSTALLER" status
-"$INSTALLER" update
 "$INSTALLER" repair
 "$INSTALLER" rollback
 ```
 
-- **Update** accepts only a strictly newer semantic version, stages it completely, and changes the
-  selector only after validation.
-- **Repair** revalidates the active tree and durable entrypoints. If needed, it reconstructs the
-  same version from its exact retained manifest and bundle. Native-package startup can also restore
-  the same active version from the package's admitted embedded bundle when both the installed tree
-  and retained cache are damaged.
-- **Rollback** revalidates the one retained previous version before selecting it. It never rewinds
-  catalog or dataset schemas.
+Application-level update operations use status/check, preview, explicit digest-bound start, safe
+drain, service restart, health verification, and program rollback. A failed new generation must not
+replace the previous healthy version. Repair reconstructs derived program files from the retained
+exact bundle; it does not alter workspace data.
 
-If an update or rollback reports `restartRequired`, close every Market Squawk desktop, CLI, MCP,
-and helper process, then start the selected release again.
+Do not route program repair or removal through Backup & Recovery. That workspace owns data backup
+and restore, not installed-program lifecycle.
 
-## Uninstall
+## Backup and workspace recovery
 
-### Preserve user data
+Use **Backup & Recovery** or the `operations backup` CLI hierarchy to:
 
-On Windows, **Backup & Recovery → Uninstall programs** opens **Installed apps** and exits the
-desktop so no running release is deleted in place. Removing the NSIS or MSI package there runs the
-same data-preserving lifecycle before Windows removes the native package.
+1. list backups;
+2. create a durable backup job;
+3. watch it to terminal completion;
+4. verify the exact backup;
+5. preview retention or restore;
+6. review conflicts, disk requirements, and target workspace identity;
+7. explicitly confirm the preview digest;
+8. watch restore progress and reconnect to the new service generation;
+9. verify the selected workspace and post-restore health.
 
-On macOS and Linux, first open **Backup & Recovery → Uninstall programs** in the desktop, then
-remove the application, AppImage, or DEB package through the platform's normal flow. A dragged
-macOS application or portable AppImage has no operating-system uninstall hook, and a system-wide
-Linux package manager cannot safely infer which user's program store it should delete.
+Restore creates a fresh inactive workspace, validates the complete product state, and activates it
+through the service-owned workspace authority. It never overwrites an active workspace in place.
+Program rollback changes executable generations; data restore changes selected workspace state.
+They are separate operations and evidence.
 
-For a terminal installation—or before removing a macOS/Linux native package—run:
+See [Backup and recovery](backup-and-recovery.md) for exact commands and failure handling.
+
+## Data-preserving removal
+
+Default removal deletes program versions, stable entrypoints, and installer-owned service/client
+registration while preserving user data. Use the Desktop **Updates** workspace, the native package
+uninstaller, or:
 
 ```bash
 "$INSTALLER" uninstall
 ```
 
-The default removes the program store and managed entrypoints. It preserves configuration,
-credentials, catalogs, portfolios, datasets, models, logs, and artifacts.
-
-### Delete selected data classes
-
-Data deletion is separate and must identify each exact absolute directory:
-
-```bash
-"$INSTALLER" uninstall \
-  --confirm-delete-configuration "/absolute/path/to/configuration" \
-  --confirm-delete-logs "/absolute/path/to/logs"
-```
-
-Available confirmations are:
-
-```text
---confirm-delete-configuration
---confirm-delete-credentials
---confirm-delete-catalogs
---confirm-delete-portfolios
---confirm-delete-datasets
---confirm-delete-models
---confirm-delete-logs
---confirm-delete-artifacts
-```
-
-Overlapping, relative, shallow, program-contained, symlinked, or non-directory deletion targets
-are rejected. Back up portfolios, datasets, models, and credentials before requesting deletion.
-
-## Offline installation
-
-From an online machine, download the target-specific complete ZIP, target manifest, bootstrap,
-`SHA256SUMS`, and attestations from the same immutable release. Preserve their filenames and verify
-them before transfer.
-
-On the offline target:
-
-```bash
-"/path/to/market-squawk-bootstrap-TARGET" \
-  install \
-  --manifest "/path/to/market-squawk-release-TARGET.json" \
-  --bundle "/path/to/market-squawk-1.0.0-TARGET.zip"
-```
-
-Replace `TARGET` with one of:
-
-```text
-aarch64-apple-darwin
-x86_64-apple-darwin
-x86_64-pc-windows-msvc
-x86_64-unknown-linux-gnu
-```
-
-Offline installation performs the same manifest, archive, inventory, digest, mode, and activation
-checks. It does not resolve Python packages or download another component.
-
-## Release integrity and platform trust
-
-The public release is all-or-nothing: Linux, Windows, both macOS architectures, complete Python
-3.14.6 products, native package installation, desktop startup, CLI doctor, MCP, lifecycle
-operations, checksums, and GitHub attestations must pass before publication.
-
-With GitHub CLI installed, verify release assets with:
-
-```bash
-mkdir market-squawk-release-verify
-gh release download v1.0.0 \
-  --repo Sawmonabo/market-squawk \
-  --pattern SHA256SUMS \
-  --pattern install.sh \
-  --dir market-squawk-release-verify
-gh release verify v1.0.0 --repo Sawmonabo/market-squawk
-gh release verify-asset v1.0.0 \
-  market-squawk-release-verify/install.sh \
-  --repo Sawmonabo/market-squawk
-gh attestation verify \
-  market-squawk-release-verify/install.sh \
-  --repo Sawmonabo/market-squawk
-```
-
-The cross-platform release index records terminal-archive trust independently from every native
-package. A package may carry stronger native trust than the target's terminal ZIP:
-
-- `developer-id-signed-and-notarized` only on the exact Apple package for which verification,
-  timestamping, notarization, and stapling succeed;
-- `authenticode-signed` only after Windows publisher and timestamp verification succeeds; or
-- `provenance-only` when the zero-cost release relies on GitHub provenance, attestation, exact
-  checksums, and transparent package identity.
-
-The macOS terminal ZIP remains `provenance-only` when only the DMG has been notarized and stapled.
-
-An operating system may show an unfamiliar-publisher warning for a provenance-only package. Verify
-the release first, then use the operating system's documented manual-open path if the user chooses
-to trust those exact bytes. Do not disable platform security globally.
+Success evidence must prove the program store and owned registrations are gone while the exact
+configuration, credentials, catalogs, portfolios, datasets, models, logs, artifacts, backups, and
+test sentinel remain. Data deletion is a separate operation requiring the exact code-owned
+directory confirmation options. Never use recursive manual deletion as an uninstall shortcut.
 
 ## Failure and recovery
 
-| Symptom | Meaning | Recovery |
+| Failure | Meaning | Safe response |
 | --- | --- | --- |
-| Terminal installer says its template is unpublished | A source-tree template was run instead of the release asset | Download `install.sh` from `releases/latest/download` |
-| Bootstrap digest mismatch | Downloaded bootstrap differs from the release-bound identity | Stop; remove the temporary download and retry from the official release |
-| `already installed` | An active selector exists | Use `status`, `update`, or `repair` |
-| `healthy: false` | Active release or derived Unix entrypoints differ from receipts | Close running processes and run `repair` |
-| Update is not newer | Candidate version is equal to or older than active | Keep the active version or use the explicit one-version `rollback` |
-| No previous version is available | No second admitted version is retained | Repair the current version or install a newer release |
-| Desktop reports packaged release unavailable | A production package lacks its complete embedded release | Re-download the native package; do not copy only the desktop binary |
-| Provider is not ready after install | Software installation and provider activation are separate | Continue guided setup and resolve the named provider requirement |
-| Python/model readiness fails | The active complete release or admitted model does not match | Repair the release, then revalidate the exact model bundle |
+| Artifact size or SHA-256 mismatch | Handoff bytes are not the admitted candidate | Stop; preserve evidence and obtain the exact artifact again |
+| Target or OS floor rejected | Package is not admitted for this host | Use a supported target; do not force installation |
+| Trust prompt differs from receipt | Signing/provenance state is not what was reviewed | Stop and reconcile the package receipt |
+| Manifest or bundle rejected | Closed component set, identity, or path contract failed | Do not edit the archive; obtain the exact manifest/bundle pair |
+| Service registration conflict | Another owner or stale generation occupies the identity | Use installed repair/status; do not replace an unrelated service |
+| Service readiness fails | Installed generation did not prove authenticated health | Keep/restore the known-good version and inspect redacted logs |
+| Stale workspace generation | Client observed a retired service/workspace identity | Reconnect through the current rendezvous and re-read state |
+| MCP registration conflict | Same logical name is not owned by this installation | Preserve the unrelated entry; choose repair only for owned state |
+| Update unavailable | No admitted production trust root/channel exists | Keep the current version; use only the isolated signed fixture during release verification |
+| No previous program version | Program rollback has no retained target | Repair current version or reinstall the same verified candidate |
+| Restore lacks disk or conflicts | Preview cannot prove a safe fresh workspace | Resolve the exact preview finding and generate a new preview |
+| Default removal deletes data | Data-preservation invariant failed | Stop acceptance; restore from verified backup and retain evidence |
 
-Never edit `installation.json`, an immutable version, a retained manifest, or a bundle by hand.
-Repair from the retained exact release or reinstall from the immutable public release.
+Use bounded redacted logs from the Desktop **Logs** workspace or `operations logs`. Do not attach
+credentials, provider payloads, private portfolios, or uncontrolled workspace archives to issues.
 
-## Development installation
+## Trust and publication boundary
 
-Building from source is a contributor workflow, not the normal installation path. It requires the
-pinned Rust toolchain, Node.js, pnpm, Tauri prerequisites, and platform build tools. Follow the
-[README Development section](../../README.md#development) and
-[CONTRIBUTING.md](../../CONTRIBUTING.md). A source build does not carry public-release
-attestations merely because its tests pass.
+Every package receipt states one proven trust mode. Without separately configured and verified
+publisher credentials, the package remains unsigned/provenance-only and may show an operating-
+system warning. Do not claim Developer ID, notarization, Authenticode, Store identity, a GitHub
+attestation, or public availability unless the exact package has that independently verified
+evidence.
 
-## Related documentation and code
+The public curl command, moving `latest` links, public checksums, and GitHub Release attestations are
+not part of the current unpublished distribution. They may be documented only after the user authorizes publication
+and the hosted script, manifests, packages, and endpoint redirects are downloaded and reverified.
 
-- [README quick start](../../README.md#quick-start)
-- [Configuration and secrets operations](configuration-and-secrets.md)
-- [Source operations](source-operations.md)
-- [Model training and inference](model-inference.md)
-- [Backup and recovery](backup-and-recovery.md)
+## Contributor source mode
+
+Source development is separate from installed-product evidence. Contributors need the pinned Rust
+toolchain, Node.js/pnpm, and host Tauri prerequisites, then follow the repository
+[Development instructions](../../README.md#development). A source build may demonstrate a code path;
+it does not inherit package receipt, trust, clean-machine, service-registration, uninstall, or
+cross-platform evidence.
+
+## Related documentation and sources
+
+- [Architecture overview](../architecture/overview.md)
 - [Deployment architecture](../architecture/deployment.md)
-- [Configuration reference](../reference/configuration.md)
+- [Configuration and secrets](configuration-and-secrets.md)
+- [Source operations](source-operations.md)
+- [MCP reference](../reference/mcp.md)
 - [CLI reference](../reference/cli.md)
-- [Release trust decision](../architecture/decisions/0006-complete-versioned-release-bundles.md)
-- [Installer lifecycle implementation](../../apps/market-squawk-installer/src/lifecycle.rs)
-- [Release workflow](../../.github/workflows/release.yml)
+- [Backup and recovery](backup-and-recovery.md)
+- [Delivery ledger](../plans/delivery-ledger.md)
+- [Rust installer command authority](../../apps/market-squawk-installer/src/command.rs)
+- [Complete-release builder](../../scripts/build_complete_release.py)
+- [Tauri updater and distribution guidance](https://v2.tauri.app/distribute/)
+- [GitHub Actions workflow-artifact documentation](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts)
+- [GitHub CLI artifact attestation verification](https://cli.github.com/manual/gh_attestation_verify)
 
-## Official sources
-
-| Source | Applied fact | Reviewed |
-| --- | --- | --- |
-| [Tauri distribution](https://v2.tauri.app/distribute/) | Native package families and platform distribution boundary | 2026-07-30 |
-| [Tauri Windows installers](https://v2.tauri.app/distribute/windows-installer/) | NSIS/MSI and Windows runtime behavior | 2026-07-30 |
-| [Tauri AppImage](https://v2.tauri.app/distribute/appimage/) | Linux AppImage runtime and compatibility considerations | 2026-07-30 |
-| [Apple notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow) | Notarization evidence is bound to the submitted deliverable; ZIP archives and stapled DMGs have different evidence boundaries | 2026-07-31 |
-| [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) | Public build-provenance verification | 2026-07-30 |
-| [GitHub CLI attestation verification](https://cli.github.com/manual/gh_attestation_verify) | Local artifact-attestation command | 2026-07-30 |
-| [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) | Tag and asset immutability boundary | 2026-07-30 |
-| [Apple: Open a Mac app from an unidentified developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unidentified-developer-mh40616/mac) | Narrow user-controlled manual-open recovery | 2026-07-30 |
-| [Microsoft SmartScreen overview](https://learn.microsoft.com/en-us/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/) | Windows reputation and warning boundary | 2026-07-30 |
-| [`directories` 6.0.0](https://docs.rs/directories/6.0.0/directories/struct.ProjectDirs.html) | Per-user program-root derivation | 2026-07-30 |
+External sources were reviewed on 2026-08-03. They describe distribution mechanics; the repository's
+closed manifests, installer authority, and exact package receipts remain the product truth.

@@ -10,8 +10,7 @@ durable state or an order adapter.
 | Document type | Security architecture explanation |
 | Audience | Maintainers, security reviewers, operators, adapter authors, and integrators |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -37,7 +36,8 @@ central risk, local desktop/CLI/MCP presentations, controlled artifacts, audit, 
 
 It does not claim:
 
-- that inherited stdio authenticates an MCP peer;
+- that inherited stdio authenticates an MCP peer, or that a loopback listener authenticates a
+  request by locality alone;
 - that an ordinary local process can defend against a fully compromised operating-system account,
   kernel, compiler, or hardware;
 - that a digest alone establishes who authored content;
@@ -88,7 +88,7 @@ flowchart LR
     subgraph Entry["Bounded entry surfaces"]
         Desktop["Bundled WebView and closed Tauri bridge"]
         CLI["CLI transport"]
-        MCP["MCP stdio transport<br/>peer identity recorded as unverified"]
+        MCP["Named MCP stdio relay and<br/>authenticated loopback MCP route"]
         Portal["Ephemeral IPv4 loopback onboarding portal"]
         Parser["Source decoders and extraction parsers"]
         ModelAdmission["Controlled model and runtime admission"]
@@ -120,7 +120,7 @@ flowchart LR
 
     Operator -->|typed arguments| CLI
     DesktopUser -->|local interaction| Desktop
-    Client -->|bounded JSON-RPC frames| MCP
+    Client -->|bounded stdio frame and named credential| MCP
     Operator -->|host, origin, session, CSRF, bounded body| Portal
     Providers -->|untrusted bounded bytes| Parser
     Files -->|untrusted bounded bytes| Parser
@@ -129,7 +129,7 @@ flowchart LR
     Desktop -->|read-only bounded operation| App
     Desktop -->|confirmed provider workflow| Onboarding
     Desktop -->|confirmed provider workflow| Activation
-    MCP -->|admitted operation| App
+    MCP -->|authenticated bounded operation| App
     Portal -->|session and credential request| Onboarding
     Portal -->|verified activation request| Activation
     Onboarding -->|generation-bound credential operation| Secrets
@@ -294,19 +294,25 @@ alternate constructor or direct submission path.
 
 ## Desktop, CLI, MCP, artifacts, and audit
 
-Desktop, CLI, and MCP share the same lifecycle-owned `Application` and its complete set of eleven
-domain services. Each generic operation is defined by a closed descriptor and admitted before
-dispatch to a domain service. Services own their financial, persistence, and authority invariants;
-presentations own rendering, framing, and their stricter local limits.
+The per-user service owns `LocalProduct`, durable jobs, lifecycle, and `Application`; Desktop, CLI,
+and MCP clients use that one service rather than composing competing domain owners. Each generic
+operation is defined by a closed descriptor and admitted before dispatch to a domain service.
+Services own their financial, persistence, and authority invariants; presentations own rendering,
+framing, and their stricter local limits.
 
 The desktop loads bundled assets under a strict CSP. Its window capability grants five closed
 commands: bootstrap, read-only application invocation, confirmed provider onboarding, exact
 official-provider page opening, and validated protected-setup opening. Credential fields remain
 write-only presentation state and are cleared after submission.
 
-The production MCP server:
+The production MCP route:
 
-- uses inherited local stdio and honestly records the peer identity as unverified;
+- binds only to the service's loopback endpoint and requires a named-client credential, expected
+  Host, and an allowlisted or absent Origin before dispatch;
+- uses a named stdio relay as client compatibility transport; the relay has no product authority
+  beyond reading its own credential and forwarding one bounded exchange;
+- validates the selected Streamable HTTP protocol, request metadata, method, media type, body,
+  deadline, and client scope before handler dispatch;
 - incrementally bounds frames and JSON structure before service execution;
 - bounds active request count, aggregate body/result memory, writer queues, inline results,
   progress, deadlines, and shutdown;
@@ -382,7 +388,8 @@ publication contexts are process-local and must be newly admitted.
 - [Execution adapter boundary](../../crates/market-squawk-execution/src/adapter.rs)
 - [Desktop presentation bridge](../../apps/market-squawk-desktop/src-tauri/src/bridge.rs)
 - [Desktop window capability](../../apps/market-squawk-desktop/src-tauri/capabilities/main.json)
-- [MCP server and limits](../../crates/market-squawk-mcp/src/server.rs)
+- [Installed service and route admission](../../apps/market-squawk/src/service/mod.rs)
+- [MCP relay](../../crates/market-squawk-mcp/src/relay.rs)
 - [Production MCP audit sink](../../apps/market-squawk/src/mcp/audit.rs)
 - [Provider activation evidence validation](../research/2026-07-23-provider-activation-evidence-validation.md)
 - [Delivery ledger](../plans/delivery-ledger.md)
@@ -395,8 +402,8 @@ defines Market Squawk's current controls.
 | Source | Relevance | Reviewed |
 | --- | --- | --- |
 | [OWASP threat-modeling guidance](https://owasp.org/www-project-security-culture/stable/6-Threat_Modelling/) | Uses data-flow diagrams and trust boundaries to identify where data changes trust level | 2026-07-23 |
-| [Model Context Protocol transports specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) | Defines stdio transport responsibilities and process-bound message exchange | 2026-07-23 |
-| [Model Context Protocol security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices) | Documents MCP-specific request, credential, and trust threats | 2026-07-23 |
+| [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) | Defines the stateless loopback request transport and Host/Origin protections used by the shared service | 2026-08-03 |
+| [MCP security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices) | Documents MCP-specific request, credential, and trust threats | 2026-08-03 |
 | [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Defines window-scoped command permissions for the desktop presentation boundary | 2026-07-28 |
 | [Tauri content-security policy](https://v2.tauri.app/security/csp/) | Defines the bundled WebView content policy used to restrict desktop content loading | 2026-07-28 |
 | [FASB ASU 2011-04, Fair Value Measurement (Topic 820)](https://fasb.org/page/document?pdf=ASU2011-04.pdf&title=UPDATE+NO.+2011-04%E2%80%94FAIR+VALUE+MEASUREMENT+%28TOPIC+820%29%3A+AMENDMENTS+TO+ACHIEVE+COMMON+FAIR+VALUE+MEASUREMENT+AND+DISCLOSURE+REQUIREMENTS+IN+U.S.+GAAP+AND+IFRSS) | Establishes the accounting fair-value framework that remains separate from market-data execution authority | 2026-07-23 |

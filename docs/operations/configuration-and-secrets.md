@@ -9,8 +9,8 @@ by the reviewed `LocalProduct`.
 | Document type | Operations runbook |
 | Audience | Local operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed-service configuration, setup, and typed-settings contracts; not release approval evidence |
 
 ## Contents
 
@@ -23,6 +23,7 @@ by the reviewed `LocalProduct`.
 - [Inspect effective values and precedence](#inspect-effective-values-and-precedence)
 - [Secret operations boundary](#secret-operations-boundary)
 - [Apply a correction or planned change](#apply-a-correction-or-planned-change)
+- [Use guided setup and typed settings](#use-guided-setup-and-typed-settings)
 - [Expected success evidence](#expected-success-evidence)
 - [Rollback and recovery](#rollback-and-recovery)
 - [Known failure modes](#known-failure-modes)
@@ -50,6 +51,13 @@ opaque secret locators. It cannot:
 Use [Source operations](source-operations.md) for evidence-bound provider onboarding. Mutable
 release blockers and provider-qualification status remain in the
 [delivery ledger](../plans/delivery-ledger.md).
+
+The installed product also has **typed operational settings** and a durable **guided setup plan**.
+They are service-owned workspace state, distinct from startup TOML/environment configuration. The
+Desktop's Settings and Setup routes and the installed-only `operations settings` and `setup`
+commands use the same bounded application authority. Do not edit the corresponding control files
+or infer setup completion from a displayed capability; only a typed settings receipt or setup
+status evidence proves the action.
 
 ## Preconditions
 
@@ -337,6 +345,107 @@ onboarding lifecycle.
 
 No signal or file rewrite changes the configuration of a process that is already running.
 
+## Use guided setup and typed settings
+
+### Inspect or accept an evidence-driven setup plan
+
+Use guided setup after the installed service is reachable. It records the selected goals and starter
+plan but deliberately does **not** mark a source, model, portfolio, paper account, MCP client,
+backup, or first useful result complete. Those steps remain evidence-driven in `setup status` and
+the Desktop checklist.
+
+```bash
+MSQ="/path/to/installed/market-squawk"
+"$MSQ" --output json setup status
+"$MSQ" --output json setup preview \
+  --expected-revision 0 \
+  --goal everything-recommended \
+  --starter-plan everything-recommended
+```
+
+Review the returned workspace, current revision, selected goals/starter plan, each step's current
+evidence, blocking reason, recovery guidance, expected contact/change, time/disk impact, and the
+one-use `previewId`/`previewSha256`. Replace `0` with the exact returned revision whenever a plan
+already exists. Accept only that preview:
+
+```bash
+"$MSQ" --output json setup apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-sha256 <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json setup status
+```
+
+Success is an accepted-plan receipt followed by status that identifies the same plan/revision; it
+does not claim that individual steps are done. If a preview is stale, replayed, scoped to another
+workspace, or rejected, refresh `setup status`, resolve the reported condition, and create a new
+preview. Closing the desktop, disconnecting a CLI, or skipping a step preserves honest incomplete
+state. Use the owning source, portfolio, model, MCP, or backup procedure to create the evidence
+that advances a step.
+
+### Change typed product settings
+
+Typed settings are the supported way to change log retention/minimum severity, update channel and
+automatic checks, storage soft limit, default query row limit, maximum concurrent jobs, market
+freshness, and backup retention. They are revisioned workspace policy, not a raw TOML editor and
+not a secret mechanism. Read the current snapshot first:
+
+```bash
+"$MSQ" --output json operations settings get
+```
+
+Record its `revision`, values, origins, and restart impact. Preview a complete desired change at
+that exact revision; every supplied field is checked and omitted fields remain unchanged. For
+example:
+
+```bash
+"$MSQ" --output json operations settings change preview \
+  --expected-revision <CURRENT_REVISION> \
+  --log-retention-days 30 \
+  --log-minimum-severity info \
+  --storage-soft-limit-bytes 21474836480 \
+  --maximum-concurrent-jobs 2 \
+  --backup-retention-count 3
+```
+
+The admitted ranges are: log retention `1..=365` days; storage soft limit
+`1,073,741,824..=17,592,186,044,416` bytes; query rows `100..=1,000,000`; concurrent jobs
+`1..=64`; market freshness `250..=600,000` milliseconds; and retained backups `1..=64`.
+`update-channel` is `stable` or `preview`; log severity is one of `trace`, `debug`, `info`, `warn`,
+or `error`. Read the preview rather than assuming its restart requirement.
+
+Apply only its exact one-use reference:
+
+```bash
+"$MSQ" --output json operations settings change apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json operations settings get
+```
+
+Success is a new monotonic settings receipt/revision and a reread that reports the intended
+values. Where the receipt says restart/reconnect is required, let the service finish its bounded
+transition, reconnect Desktop/CLI/MCP clients, and repeat their safe bootstrap/health check. Do not
+make a second change using the old revision.
+
+To undo a settings revision, restore it as a new revision—never rewrite the history:
+
+```bash
+"$MSQ" --output json operations settings rollback preview \
+  --expected-revision <CURRENT_REVISION> \
+  --target-revision <RETAINED_REVISION>
+"$MSQ" --output json operations settings rollback apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+```
+
+The preview verifies the target and applies the same authority/restart checks. A stale revision,
+unknown retained revision, malformed setting, duplicate/immutable setting, or expired preview is
+a fail-closed result: preserve the returned evidence, reread settings, and correct through a new
+preview. It is never safe to repair typed settings by editing an internal database or control file.
+
 ## Expected success evidence
 
 With the baseline above, `config validate` returns this shape:
@@ -441,10 +550,13 @@ commands for those separate checks.
 | `<data-root>/catalog.sqlite3` | Durable onboarding references and product catalog; may have SQLite sidecars while active |
 | `<data-root>/control/` | Durable non-secret authority and recovery state |
 | stdout | Redacted command results |
-| stderr | Configuration/startup tracing; `--json-logs` selects structured tracing; no log file exists by default |
+| stderr | Configuration/startup tracing; `--json-logs` selects structured tracing |
+| Service-owned structured-log store | Bounded redacted operational records, queried/exported only through `operations logs`; neither a raw tail nor an editable log path is exposed |
 
 Market Squawk does not persist an effective configuration cache or a plaintext resolved-secret
-file.
+file. Query logs with `operations logs query --limit <1..=1000>` and use
+`operations logs export ... --confirm` only for the exact bounded redacted selection; controlled
+exports are artifacts, not arbitrary output paths.
 
 ## Related documentation and code
 

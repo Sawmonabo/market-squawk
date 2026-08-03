@@ -1,101 +1,63 @@
 # Configuration and secrets reference
 
-This page defines the configuration sources, precedence, validated settings, production live-source
-profiles, provenance, and local secret-storage boundary implemented by Market Squawk.
+This is the exact startup-configuration contract for the installed Market Squawk binaries. It is
+not the editable product-settings contract: service-owned settings are read, previewed, and changed
+only through `market-squawk operations settings` (or the equivalent typed application operation).
 
 | Field | Value |
 | --- | --- |
 | Document type | Reference |
-| Audience | Operators, integrators, security reviewers, and maintainers |
-| Status | Current |
-| Last substantive review | 2026-07-30 |
-| Reviewed base | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
+| Status | Current implementation contract |
+| Last substantive review | 2026-08-03 |
+| Authority | `crates/market-squawk-platform/src/config.rs` |
 
-## Contents
+## Scope and precedence
 
-- [Scope](#scope)
-- [Composition and precedence](#composition-and-precedence)
-- [Settings](#settings)
-- [TOML file contract](#toml-file-contract)
-- [Environment contract](#environment-contract)
-- [Production live-source profiles](#production-live-source-profiles)
-- [Secrets](#secrets)
-- [Provenance and reporting](#provenance-and-reporting)
-- [Loading, failure, and recovery behavior](#loading-failure-and-recovery-behavior)
-- [Related documentation and code](#related-documentation-and-code)
-- [External sources](#external-sources)
+`AppConfig` is composed once before a CLI, relay, service, or diagnostic command acquires product
+authority. Its low-to-high precedence order is built-in default, the one explicit `--config` TOML
+file, `MARKET_SQUAWK_*` environment, and the command's supported CLI override. There is no implicit
+configuration-file discovery or in-process reload. An invalid value at any layer rejects the whole
+merged configuration without echoing secret material.
 
-## Scope
+`market-squawk-service` and `market-squawk-mcp-relay` remove `MARKET_SQUAWK_LOG`,
+`MARKET_SQUAWK_EXTERNAL_NETWORK`, and `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED` before loading
+`AppConfig`; `MARKET_SQUAWK_LOG` is instead a tracing option. The installed service owns the active
+workspace after startup. Client commands discover it through the authenticated owner-only rendezvous;
+the rendezvous endpoint, credentials, service generation, and workspace identity are not user
+configuration fields.
 
-The application composes one immutable, validated `AppConfig` at process startup. Configuration
-determines local paths, bounded runtime resources, source shutdown behavior, optional training
-release admission, secret locators, and closed Coinbase and Kraken production profiles.
+## Accepted startup settings
 
-Configuration does not contain resolved credential material, grant source or execution authority,
-qualify observations as `DirectVerified`, or hot-reload a running process. Provider registration,
-evidence-backed activation, source qualification, model admission, and risk remain separate
-authorities.
+All integer ceilings are bytes, counts, or milliseconds as named. The accepted TOML keys and
+environment variables are closed; an unknown `MARKET_SQUAWK_*` key, non-UTF-8 in-scope key/value,
+or invalid scalar fails closed.
 
-## Composition and precedence
-
-Effective values are composed in this fixed low-to-high precedence order:
-
-```mermaid
-flowchart LR
-    Defaults["Safe built-in defaults"] --> File["Explicit local TOML file"]
-    File --> Environment["MARKET_SQUAWK_* environment"]
-    Environment --> CLI["CLI overrides"]
-    CLI --> Validate["Whole-config validation"]
-    Validate --> AppConfig["Immutable AppConfig"]
-```
-
-The configuration file is optional and is read only when `--config <PATH>` is supplied. There is
-no home-directory, current-directory, XDG, or platform-default configuration-file discovery.
-Process environment is captured once at the application boundary. A higher layer replaces only the
-settings it supplies; the final merged object is then validated as one unit.
-
-An installed desktop replaces only the built-in `data_dir` value with Tauri's
-operating-system application-local data directory. That value remains a `safe_default`; it does
-not impersonate a file, environment, or CLI origin. Every higher-precedence layer below works
-unchanged. It also supplies the active verified complete-release root as the default
-`training_release_root`, so the bundled CPython 3.14.6/modeling product is admitted without a
-manual path. The CLI and headless MCP retain `.market-squawk` and an unset training release as
-their safe defaults.
-
-The `--log` option and `MARKET_SQUAWK_LOG` configure tracing through Clap. They are consumed before
-the environment is passed to `AppConfig`, so `MARKET_SQUAWK_LOG` is not an `AppConfig` setting and
-does not trigger the unknown-key failure described below.
-
-## Settings
-
-All byte ceilings are exact integer byte counts. All timing values are milliseconds.
-
-| TOML key | Environment key | CLI override | Safe default | Validation and semantics |
+| TOML key | Environment | CLI override | Default | Exact admission |
 | --- | --- | --- | --- | --- |
-| `data_dir` | `MARKET_SQUAWK_DATA_DIR` | `--data-dir` | `.market-squawk` for CLI/MCP; OS application-local data directory for the installed desktop | Nonempty local path; it need not already exist when configuration is loaded; the surface-specific value retains `safe_default` provenance |
-| `products` | `MARKET_SQUAWK_PRODUCTS` | Command-specific product override | `["BTC-USD"]` | Nonempty, unique list; at most 128 entries; each is 1–128 bytes and contains only ASCII alphanumeric characters or `-`, `.`, `_`, `/` |
-| `stale_after_ms` | `MARKET_SQUAWK_STALE_AFTER_MS` | Internal override only | `5000` | `250..=600000`; market-price freshness, not connection-heartbeat health |
-| `capture_queue_capacity` | `MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY` | `--capture-queue-capacity` | `16384` | `1..=1048576`; fixed raw-capture queue capacity |
-| `capture_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES` | `--capture-memory-ceiling-bytes` | `67108864` | `1..=4294967295`; per-channel fixed, resident-generation, and queued-record ceiling |
-| `capture_destination_registry_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES` | `--capture-destination-registry-memory-ceiling-bytes` | `1048576` | `1..=67108864`; process-wide capture-destination registry ceiling |
-| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | Command-specific diagnostic override | `false` | Boolean; applies to diagnostic capture/replay and grants no live-execution or production Paper authority |
-| `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | Internal override only | `1000` | Positive and no greater than `capture_shutdown_ms` |
-| `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | Internal override only | `5000` | Positive, no greater than `60000`, and no less than the flush interval |
-| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000`, and no greater than `121000`; bounds the source supervisor and its owned capture cleanup |
-| `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | Unset for CLI/MCP; active verified complete-release root for the installed desktop | When present, must be a nonempty absolute path; model composition verifies that the installed `market-squawk` application identity and sibling ONNX worker are the exact release-bound files |
-| `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | Internal override only | Unset | Redacted locator, 1–512 bytes, no control characters, prefixed by `keyring:` or `encrypted-file:` |
-| `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | Internal typed override only | Unset | Complete closed Coinbase profile; the environment value is JSON at most 128 KiB |
-| `kraken` | `MARKET_SQUAWK_KRAKEN_JSON` | Internal typed override only | Unset | Complete closed Kraken profile; the environment value is JSON at most 128 KiB |
+| `data_dir` | `MARKET_SQUAWK_DATA_DIR` | `--data-dir` | `.market-squawk` for CLI/service/relay | Nonempty local path; it may be created after configuration validation. |
+| `products` | `MARKET_SQUAWK_PRODUCTS` | command-specific diagnostic override | `["BTC-USD"]` | Unique `1..=128` entries, each `1..=128` ASCII bytes from alphanumerics plus `-`, `.`, `_`, `/`. The environment form is comma-separated and does not trim whitespace. |
+| `stale_after_ms` | `MARKET_SQUAWK_STALE_AFTER_MS` | internal only | `5000` | `250..=600000`; market-data freshness, not a process heartbeat. |
+| `capture_queue_capacity` | `MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY` | `--capture-queue-capacity` | `16384` | `1..=1048576`. |
+| `capture_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES` | `--capture-memory-ceiling-bytes` | `67108864` | `1..=4294967295`. |
+| `capture_destination_registry_memory_ceiling_bytes` | `MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES` | `--capture-destination-registry-memory-ceiling-bytes` | `1048576` | `1..=67108864`. |
+| `paper_bot_enabled` | `MARKET_SQUAWK_PAPER_BOT_ENABLED` | diagnostic only | `false` | Boolean diagnostic capture/replay setting; it grants no production Paper or execution authority. |
+| `capture_flush_interval_ms` | `MARKET_SQUAWK_CAPTURE_FLUSH_INTERVAL_MS` | internal only | `1000` | Positive and no larger than `capture_shutdown_ms`. |
+| `capture_shutdown_ms` | `MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS` | internal only | `5000` | Positive, no more than `60000`, and no less than the flush interval. |
+| `source_shutdown_ms` | `MARKET_SQUAWK_SOURCE_SHUTDOWN_MS` | `--source-shutdown-ms` | `15000` | At least `2 × capture_shutdown_ms + 1000` and at most `121000`. |
+| `training_release_root` | `MARKET_SQUAWK_TRAINING_RELEASE_ROOT` | `--training-release-root` | unset | Nonempty absolute path when set; admitted models also require the release-bound application and sibling ONNX worker identities to verify. |
+| `source_secret` | `MARKET_SQUAWK_SOURCE_SECRET` | internal only | unset | Redacted `keyring:` or `encrypted-file:` locator, `1..=512` bytes, no control characters. |
+| `coinbase` | `MARKET_SQUAWK_COINBASE_JSON` | internal typed override | unset | Complete closed Coinbase profile; environment JSON is at most 128 KiB. |
+| `kraken` | `MARKET_SQUAWK_KRAKEN_JSON` | internal typed override | unset | Complete closed Kraken profile; environment JSON is at most 128 KiB. |
 
-`MARKET_SQUAWK_PRODUCTS` is a literal comma-separated list. Whitespace is not trimmed; an empty,
-duplicate, oversized, or syntactically invalid element rejects the whole configuration.
+`--log` (or `MARKET_SQUAWK_LOG`) defaults to `info` and controls local stderr tracing. `--json-logs`
+selects JSON tracing. Neither is an `AppConfig` setting. The public CLI's other global options are
+listed in the [CLI reference](cli.md).
 
-## TOML file contract
+## Explicit TOML file
 
-The explicit file must be UTF-8 TOML and no larger than 1 MiB. Its root is a closed object: an
-unknown key, malformed value, invalid UTF-8, or oversized file rejects the entire configuration.
-Every setting is optional in the file because omitted values continue from the lower-precedence
-defaults.
+Pass a file only with `--config <PATH>`. It must be UTF-8 TOML no larger than 1 MiB; its root and
+provider tables are closed objects. Omitted values retain lower-precedence values. This is a valid
+shape, not a required complete file:
 
 ```toml
 data_dir = "/absolute/or/relative/local/path"
@@ -112,158 +74,73 @@ training_release_root = "/absolute/path/to/installed-training-release"
 source_secret = "keyring:opaque-local-reference"
 ```
 
-Provider tables, when present, use the exact closed schemas in the next section. Secret material
-must not be placed in this file; `source_secret` is only a locator.
+Do not place a credential, bearer token, MCP token, or raw provider secret in TOML or environment.
+The `source_secret` value is only a redacted legacy locator.
 
-## Environment contract
+## Provider profile contract
 
-Only the fourteen `MARKET_SQUAWK_*` keys in the settings table are accepted by `AppConfig`.
-An unknown key with that prefix, a non-UTF-8 in-scope key or value, an unparseable scalar, an
-oversized provider JSON profile, or an invalid merged value fails startup without echoing the
-rejected value. Unrelated environment variables are ignored.
+The optional `coinbase` and `kraken` profiles are complete, code-owned live-source profiles. A
+profile permits construction only; it does not register a provider, prove rights, qualify a market
+observation, or create execution authority. Those actions use the typed Source, Bot, Execution,
+and Risk operations.
 
-Boolean environment values use Rust's `bool` parser (`true` or `false`). Integer values use
-unsigned decimal parsing. Coinbase and Kraken profiles are complete JSON objects, not partial
-patches over a TOML table.
-
-## Production live-source profiles
-
-Both live profiles are closed schemas with `deny_unknown_fields` semantics. They bind provider
-symbols to canonical instrument definitions and carry explicit, finite, content-hashed
-authorization evidence. A configured profile enables construction; it does not itself establish
-verified execution-quality observations.
-
-### Shared authorization object
-
-Each profile contains an `authorization` object with these exact fields:
+Both profiles carry a closed `authorization` object:
 
 | Field | Contract |
 | --- | --- |
 | `mode` | `public_interface` |
-| `provider` | Exactly `coinbase-exchange` for Coinbase or `kraken` for Kraken |
-| `basis` | Valid bounded source identifier naming the locally reviewed basis |
+| `provider` | `coinbase-exchange` for Coinbase; `kraken` for Kraken |
+| `basis`, `evidence_reference`, `evidence_version` | Valid bounded identifiers/locators |
 | `evidence_sha256` | Exactly 64 hexadecimal characters |
-| `evidence_reference` | Valid bounded, version-pinned source locator component |
-| `evidence_version` | Valid bounded version identifier |
-| `effective_from_unix_nanos` | Signed Unix nanoseconds |
-| `effective_until_unix_nanos` | Signed Unix nanoseconds, strictly after the start |
+| `effective_from_unix_nanos`, `effective_until_unix_nanos` | Signed nanoseconds; the half-open interval must be increasing and cover the use instant |
 
-The finite half-open interval must cover the instant at which the authorization is relied upon.
-The digest and version-pinned locator retain exact evidence identity without placing evidence
-payloads in configuration.
+Coinbase is fixed to `wss://ws-feed.exchange.coinbase.com`, exactly one each of
+`book_snapshot`, `book_delta`, and `trade`, and `price_level` depth. Its freshness is
+`250..=600000` ms; frame and control-byte ceilings are `1..=4194304`; the acknowledgement timeout
+is `1..=60000` ms; control message capacity is `1..=4096`; and it admits `1..=100` unique crypto
+instrument mappings. Its serialized subscription is capped at 16 KiB.
 
-### Coinbase profile
+Kraken is fixed to `wss://ws.kraken.com/v2`, `book`, and depth `10`. It has the same freshness,
+frame, acknowledgement, and control-capacity ranges, but admits one canonical crypto instrument
+mapping. Canonical mapping fields are validated against the code-owned instrument-definition
+contract; they are not a generic venue or symbol escape hatch.
 
-| Field | Required value or bound |
-| --- | --- |
-| `endpoint` | Exactly `wss://ws-feed.exchange.coinbase.com` |
-| `authorization` | Shared object above, provider `coinbase-exchange` |
-| `event_classes` | Exactly one each of `book_snapshot`, `book_delta`, and `trade` |
-| `depth` | `price_level` |
-| `freshness_ms` | `250..=600000` |
-| `max_frame_bytes` | `1..=4194304` |
-| `subscription_ack_timeout_ms` | `1..=60000` |
-| `control_message_capacity` | `1..=4096` |
-| `control_byte_capacity` | `1..=4194304` |
-| `instruments` | `1..=100` unique products and unique internal instrument identities |
+## Secret boundary
 
-Every Coinbase instrument entry contains `product`, `instrument_id`, `definition_revision`,
-`asset_class`, exactly one of `primary_currency` or `primary_asset`, `quote_currency`, `tick_size`,
-`lot_size`, `contract_multiplier`, `venue`, and `trading_status`. The asset class must be `crypto`,
-the venue must be `coinbase-exchange`, and the product is 1–64 bytes using only ASCII alphanumeric
-characters, `-`, or `_`. The encoded subscription request is also capped at 16 KiB.
+`AppConfig` retains a redacted reference, not resolved material. The product prefers the current
+user's OS credential facility (Apple Keychain, Windows Credential Manager, or Secret Service).
+The locked encrypted-file fallback under the product control root is eligible only when the primary
+backend is unavailable, the fallback was explicitly configured and unlocked, and the exact
+operation permits it. Existing references are never silently migrated between backends.
 
-### Kraken profile
+Secret values are bounded to `1..=65536` bytes, redacted in debug output, and zeroized on drop.
+The installed service separately holds its service/rendezvous and named-client MCP credentials in
+protected per-user state. CLI arguments, configuration files, environment variables, MCP stdio,
+and the WebView do not expose those credentials.
 
-| Field | Required value or bound |
-| --- | --- |
-| `endpoint` | Exactly `wss://ws.kraken.com/v2` |
-| `authorization` | Shared object above, provider `kraken` |
-| `channel` | `book` |
-| `depth` | Exactly `10`, the admitted checksum scope |
-| `freshness_ms` | `250..=600000` |
-| `max_frame_bytes` | `1..=4194304` |
-| `subscription_ack_timeout_ms` | `1..=60000` |
-| `control_message_capacity` | `1..=4096` |
-| `control_byte_capacity` | `1..=4194304` |
-| `instrument` | Exactly one canonical instrument mapping |
+## Effective configuration versus product settings
 
-The Kraken instrument contains `symbol` plus the same canonical definition fields listed for
-Coinbase. The asset class must be `crypto`, the venue must be `kraken`, and the symbol is 1–64
-bytes using only ASCII alphanumeric characters, `/`, `-`, `_`, or `.`.
+`market-squawk config show` and `market-squawk config validate` emit the redacted
+`market-squawk-effective-config-v1` view. Each startup setting reports `value` and one origin:
+`safe_default`, `local_file`, `environment`, or `cli`. Secrets and live profiles are represented
+only as configured/not-configured facts.
 
-## Secrets
+Runtime product settings are a distinct typed, revision-fenced authority. `operations settings get`
+returns settings, origin, and restart impact; changes and rollbacks require a preview and then an
+exact `--preview-id`, `--preview-digest`, and `--confirm` application. It intentionally has no raw
+TOML editor, arbitrary key, arbitrary path, secret, or environment mutation surface.
 
-Configuration retains a redacted `SecretReference`, never the resolved value. The legacy
-configuration reference syntax accepts only `keyring:` and `encrypted-file:` locators. The fuller
-secret-store subsystem uses an opaque `SecretRef` carrying an exact backend and generation; reads,
-replacements, and deletion are routed only to that recorded backend.
+## Failure and recovery
 
-Production secret creation probes the operating-system keyring first. The supported primary
-backends are Apple Keychain, Windows Credential Manager, and a Secret Service implementation. An
-encrypted-file fallback is eligible only when it was explicitly configured and unlocked and the
-pre-mutation primary probe reports the backend unavailable, the session unavailable, or the exact
-lifecycle unsupported. An existing reference is never moved between backends by fallback routing.
+Configuration validation is necessary but not evidence that a provider, dataset, model, service,
+or paper operation is ready. Correct the explicit source and rerun `market-squawk config validate`.
+For service discovery, a missing, stale, retired, or unauthenticated rendezvous is a service
+lifecycle/repair condition, not a reason to edit the rendezvous or inject a port/token manually.
 
-The production `LocalProduct` configures that fallback at the code-owned
-`<data-root>/control/secrets/provider-credentials/` root in a locked state. Its only public unlock
-surface is the bounded foreground onboarding portal; configuration files, environment variables,
-CLI arguments, and restart recovery cannot supply the unlock.
-
-Secret material is admitted into `SecretValue` only when it is 1–65536 bytes. Its debug
-representation is redacted and its allocation is zeroized on drop. Secret keys and opaque
-references also redact their debug representations. Backend operations carry explicit interaction,
-cancellation, deadline, and generation authority; indeterminate mutations fail into reconciliation
-rather than being guessed successful.
-
-## Provenance and reporting
-
-`AppConfig` records one origin for every setting: `safe_default`, `local_file`, `environment`, or
-`cli`. `market-squawk config show`, `config validate`, and `doctor` serialize the same
-`market-squawk-effective-config-v1` redacted view. Every setting is represented as
-`{"value": ..., "origin": ...}`. Secret references and live-source profiles are represented only by
-configured/not-configured booleans; their locators, credentials, authorization evidence, and
-profile bodies are not exposed.
-
-## Loading, failure, and recovery behavior
-
-Configuration is read before the requested command acquires authority. Any file, environment,
-provider-profile, cross-setting, path, secret-reference, or bound violation fails closed and
-prevents initialization, inspection, or runtime startup. Error variants intentionally omit file
-contents, rejected environment values, secret locators, and resolved material. `doctor` then uses
-the validated configuration only for query-only existing-layout inspection; it does not compose a
-runtime.
-
-There is no in-process reload or rollback operation. Correct the explicit source, restart the
-command, and re-run `market-squawk config validate`. Configuration success confirms parsing and
-whole-object validation only; source activation, source health, datasets, models, and execution
-must still pass their own admission and recovery boundaries.
-
-## Related documentation and code
+## Related references
 
 - [CLI reference](cli.md)
-- [Source coverage reference](source-coverage.md)
+- [MCP reference](mcp.md)
 - [Configuration and secrets operations](../operations/configuration-and-secrets.md)
-- [Control-plane architecture](../architecture/control-plane.md)
-- [Security and trust boundaries](../architecture/security-and-trust-boundaries.md)
 - [Configuration implementation](../../crates/market-squawk-platform/src/config.rs)
-- [Production source-profile validation](../../crates/market-squawk-platform/src/config/instruments.rs)
-- [Redacted provenance view](../../crates/market-squawk-platform/src/config/report.rs)
-- [Local secret-store boundary](../../crates/market-squawk-platform/src/secrets.rs)
-- [OS-first routing](../../crates/market-squawk-platform/src/secrets/preferred.rs)
-- [Accepted-head delivery evidence](../plans/delivery-ledger.md)
-
-## External sources
-
-| Source | Applied fact | Reviewed |
-| --- | --- | --- |
-| [TOML v1.1.0 specification](https://toml.io/en/v1.1.0) | Syntax and data-model reference for the explicit configuration file | 2026-07-23 |
-| [Serde container attributes](https://serde.rs/container-attrs.html) | Closed-structure `deny_unknown_fields` behavior used by configuration and provider profiles | 2026-07-23 |
-| [Apple Keychain Services](https://developer.apple.com/documentation/security/keychain-services) | Platform credential-store boundary used by the macOS backend | 2026-07-23 |
-| [Windows Credentials Management](https://learn.microsoft.com/en-us/windows/win32/secauthn/credentials-management) | Platform credential-store boundary used by the Windows backend | 2026-07-23 |
-| [Secret Service API specification](https://specifications.freedesktop.org/secret-service-spec/latest/) | Desktop secret-service contract used by the Linux/Unix backend | 2026-07-23 |
-| [Tauri application-local data resolver](https://docs.rs/tauri/2.11.5/tauri/path/struct.PathResolver.html#method.app_local_data_dir) | Native per-application data directory used only as the installed desktop safe default | 2026-07-28 |
-
-External sources define upstream formats and platform facilities. The reviewed Market Squawk code
-head remains the authority for precedence, accepted keys, exact bounds, routing, and failure
-behavior.
+- [Installed service](../../apps/market-squawk/src/service/mod.rs)

@@ -8,14 +8,15 @@ admission, native and ONNX inference, evaluation evidence, and restart recovery.
 | Document type | Operations runbook |
 | Audience | Local research operators, model reviewers, release engineers, and incident responders |
 | Status | Current |
-| Last substantive review | 2026-07-30 |
-| Reviewed commit | `da35ef2ca1f9e1d936d5c88014f11eb9304bcca3` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed service, durable-job, model, and ONNX contracts; not release approval evidence |
 
 ## Contents
 
 - [Scope](#scope)
 - [Safety and authority boundaries](#safety-and-authority-boundaries)
 - [Preconditions and current product limits](#preconditions-and-current-product-limits)
+- [Use durable model work in the installed product](#use-durable-model-work-in-the-installed-product)
 - [Prepare the verified Python training release](#prepare-the-verified-python-training-release)
 - [Train and export a native candidate](#train-and-export-a-native-candidate)
 - [Prepare an admission request](#prepare-an-admission-request)
@@ -109,11 +110,55 @@ only the exact release-bound application and ONNX worker for admission. Model fa
 format are separate authorities: `modelKind` is `linear` or `logistic`, while `artifactFormat` is
 `onnx`.
 
+## Use durable model work in the installed product
+
+The installed Desktop Models workflow starts `Model.StartTraining` and `Model.StartForecast` as
+durable service jobs. The service, not the WebView or a connected MCP/CLI client, owns the exact
+workspace, captured request, worker lifecycle, cancellation, output admission, and terminal
+receipt. A client disconnect therefore does not discard accepted training or forecast work.
+
+### Prerequisites and authority checks
+
+Before starting work, use the Models page or exact typed service status to confirm the active
+workspace, selected signed training release, exact dataset/feature/label identities, model input
+contract, applicable model/admission authority, and available job/storage budget. The request is a
+code-owned closed schema; no raw filesystem path, interpreter path, arbitrary Python command, or
+arbitrary ONNX runtime is supplied by the UI or MCP client. A training proposal still requires
+independent authority review before immutable admission.
+
+### Procedure, evidence, and recovery
+
+1. In **Models**, select the workflow whose displayed identities and source-time evidence match
+   the intended research question. Review validation, expected input/output, cancellation boundary,
+   and the explicit confirmation prompt.
+2. Confirm the start. `Model.StartTraining` or `Model.StartForecast` returns a durable job receipt;
+   record its `jobId`, workspace/service generation, input identity, and initial event sequence.
+3. Watch it from **Operations** or the Models page. `Job.Get`, bounded `Job.Watch`, `Job.Cancel`,
+   `Job.Confirm`, and `Job.Retry` retain the service state. Progress is a named monotonic phase;
+   percentage appears only when objective units exist. An accepted start is not completion.
+4. On `Completed`, open the returned result/controlled artifact and exact model or forecast
+   identity. Forecast review uses `Model.GetForecast`, `Model.ListForecasts`, and
+   `Model.GetForecastOutcomes`. Training still needs the reviewed immutable admission flow below
+   before a new bundle is usable.
+
+Success is a terminal completed job with bounded result identity and a subsequent typed read that
+returns the same evidence after client reconnection. An interrupted, failed, cancelled, or
+`AwaitingConfirmation` job has not produced a usable model merely because temporary worker output
+exists. Cancellation is cooperative: request it through `Job.Cancel`, then wait for terminal
+evidence; do not kill a worker or delete staged output.
+
+After a restore, workspace switch, update, or stale-generation response, reconnect before reading
+or mutating and never reuse earlier requests, previews, job handles, or confirmations. If the
+service reports `Interrupted` or recovery required, preserve its phases, diagnostics, inputs, and
+artifact references. Use `Job.Retry` only when the returned contract declares it recoverable;
+otherwise repair the first failed training-release, dataset, policy, disk, or worker-identity
+authority and start a new governed request. No incomplete output is admitted or shown as a forecast.
+
 ## Prepare the verified Python training release
 
-The v1.0.0 complete installation already contains standard-GIL CPython 3.14.6, uv 0.12.0, and the
-locked Python environment for its target. The desktop automatically selects the active immutable
-complete-release root. A headless process must pass that same active root through
+An installed product release carries its selected managed Python and uv runtime plus the locked
+Python environment for its target. The Desktop automatically selects the active immutable release
+root. A headless process must pass that same active root through
 `--training-release-root`; do not select the retained previous version or an arbitrary virtual
 environment.
 
@@ -223,7 +268,8 @@ hide durable models behind an empty inventory.
 ## Supported ONNX first-use flow
 
 Create a private configuration file containing the exact retained dataset, feature, label, and
-model identities. The schema is closed; placeholders must be replaced with accepted evidence:
+model identities. The schema is closed; every illustrative value below must be replaced with its
+accepted evidence before it is used:
 
 ```json
 {

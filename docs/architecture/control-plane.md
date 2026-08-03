@@ -1,18 +1,17 @@
 # Local control plane
 
-Market Squawk's local control plane composes product authorities once and exposes them through the
-Obsidian Signal desktop, CLI, and local stdio MCP. `LocalProduct` owns the local capabilities;
-`Application` is the transport-neutral operation boundary shared by all three presentations.
-Source admission, dataset authority, model admission, central risk, and execution lifecycle remain
-product-owned regardless of presentation.
+Market Squawk's local control plane composes product authorities once in the per-user installed
+service and exposes them through the Obsidian Signal Desktop, CLI, and named-client MCP relays.
+`LocalProduct` owns the selected-workspace capabilities; `Application` is the transport-neutral
+operation boundary shared by every presentation. Source admission, dataset authority, durable jobs,
+model admission, central risk, and execution lifecycle remain product-owned regardless of client.
 
 | Metadata | Value |
 | --- | --- |
 | Document type | Architecture |
 | Audience | Maintainers, desktop/CLI/MCP authors, operators, security reviewers |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Contents
 
@@ -32,13 +31,14 @@ product-owned regardless of presentation.
 
 The control plane owns:
 
-- construction and lifecycle of local product services and their capabilities;
+- construction and lifecycle of one per-user service, its selected workspace, and product capabilities;
 - the closed, typed application operation registry;
-- the desktop bootstrap, read-only application view, and provider-setup presentation boundary;
-- CLI request admission and local operator workflows;
-- MCP initialization, tool discovery/calls, framing, cancellation, result rendering, and shutdown;
+- desktop bootstrap, a typed application client, and provider-setup presentation boundary;
+- CLI request admission and local operator workflows through the private application client;
+- authenticated Streamable HTTP MCP initialization, tool discovery/calls, framing, cancellation,
+  result rendering, named-client relay, and shutdown;
 - SQLite catalog/control state, source activation state, secrets, and controlled artifacts;
-- durable MCP audit and bounded mutation admission;
+- durable service/MCP audit and bounded mutation admission;
 - cancellation, deadlines, result limits, and reverse-order shutdown;
 - central risk and the sole dispatch route into paper execution.
 
@@ -49,24 +49,28 @@ gates.
 
 ## Composition
 
-`LocalProduct::try_new` opens the hardened local paths and builds the source, research, portfolio,
-analysis/backtest, model, fair-value, and paper authorities. It then composes exactly one
-`Application` from all required domain services. The desktop and CLI borrow this product
-composition. The MCP composition receives an `Arc<Application>` plus the same controlled path
-capabilities for its audit and large-result repository.
+`InstalledService::start` selects and fences one active workspace, opens hardened local paths, and
+builds source, research, portfolio, analysis/backtest, model, fair-value, paper, jobs, operations,
+and audit authorities. It composes exactly one `Application` from the required domain services,
+binds private `/app/v1` and authenticated `/mcp` routes, probes readiness, then publishes the
+owner-only rendezvous. Desktop and CLI use separate native credentials to call `/app/v1`; Claude
+Code and Codex each use a distinct credential through their own stateless stdio relay to `/mcp`.
 
 ```mermaid
 flowchart TD
     Operator["Local operator"]
     DesktopUser["Desktop user"]
-    Client["Local MCP client"]
+    Claude["Claude Code"]
+    Codex["Codex"]
     Config["Validated AppConfig and LocalPaths"]
-    Product["LocalProduct lifecycle owner"]
-    CLI["market-squawk CLI transport"]
+    Service["Installed service lifecycle owner"]
+    Product["Selected-workspace LocalProduct"]
+    CLI["market-squawk CLI client"]
     Desktop["Tauri WebView and closed bridge"]
-    MCP["Hardened stdio MCP transport"]
+    Relay["Named credential-owning stdio relay"]
+    Runtime["Authenticated loopback /app/v1 and /mcp"]
     App["Application descriptor and dispatch authority"]
-    Domains["11 required domain services"]
+    Domains["Application domain services"]
     Source["Source and onboarding authorities"]
     Research["Research, catalog, and dataset authorities"]
     Portfolio["Portfolio authority"]
@@ -81,7 +85,8 @@ flowchart TD
     Adapter["Paper execution adapter"]
     SQL["CLI-only bounded read-only DataFusion"]
 
-    Config --> Product
+    Config --> Service
+    Service --> Product
     Product --> App
     Product --> Source
     Product --> Research
@@ -91,13 +96,14 @@ flowchart TD
     Product --> Paper
     Operator --> CLI
     DesktopUser --> Desktop
-    Client --> MCP
-    Desktop --> App
-    Desktop --> Source
-    CLI --> App
-    MCP --> App
+    Claude --> Relay
+    Codex --> Relay
+    Desktop --> Runtime
+    CLI --> Runtime
+    Relay --> Runtime
+    Runtime --> App
+    Runtime --> Source
     CLI --> SQL
-    CLI --> Product
     App --> Domains
     Domains --> Source
     Domains --> Research
@@ -113,23 +119,24 @@ flowchart TD
     Model --> SQLite
     Model --> Artifacts
     FairValue --> SQLite
+    App --> Paper
     Paper --> Risk
     Risk --> Dispatch
     Dispatch --> Adapter
 ```
 
-The CLI-to-`LocalProduct` edge represents bounded producer/admission workflows that need explicit
-local capabilities: provider activation, controlled file ingestion, point-in-time dataset
-publication, model admission, portfolio import, and governed backtest registration. These
-workflows still call the same owned domain authorities; they are not duplicate service
-implementations. General read-only DataFusion SQL is likewise an explicit CLI-only operator path.
-The desktop bridge invokes only read-only application descriptors through its generic path and
-delegates confirmed provider setup to the existing source/onboarding authorities.
+The service owns bounded producer/admission workflows requiring stronger local capabilities:
+provider activation, controlled file ingestion, point-in-time dataset publication, model admission,
+portfolio import, and governed backtest registration. CLI requests those workflows through the
+service; they are not duplicate implementations. General read-only DataFusion SQL remains an
+explicit CLI-only operator path. The Desktop bridge uses the private application client for generic
+requests and delegates confirmed provider setup to the service's source/onboarding authorities.
 
 ## Application contract
 
-At the reviewed implementation, the immutable application capability registry contains **62 typed
-operation descriptors** across exactly 11 required domains:
+The installed service exposes an immutable typed application capability registry across the core
+financial domains and installed-product domains, including durable job, setup, workspace, backup,
+update, logs, and settings operations:
 
 | Domain | Responsibility |
 | --- | --- |
@@ -144,6 +151,7 @@ operation descriptors** across exactly 11 required domains:
 | `FairValue` | Measurements, classification, evidence, access assessments, and approval |
 | `Bot` | Status, kill switch, and controlled paper-operation lifecycle |
 | `Execution` | Orders, fills, cancellation, and reconciliation |
+| `Job` and installed operations | Durable work plus setup, workspace, backup, update, logs, and typed settings |
 
 Every descriptor defines a version, closed input schema, operation-specific structured-output
 schema, domain, effects, authorization/confirmation policy, source-evidence policy, scope, result
@@ -151,51 +159,55 @@ bounds, and artifact policy. `Application` admits an operation only through its 
 dispatches it to the one service owning that domain, and validates the typed result against the
 request limits, source-evidence policy, and output schema before returning it.
 
-All 62 application descriptors are mapped into MCP tools with their complete `inputSchema`,
-`outputSchema`, effect annotations, task prohibition, and bounded contract metadata; the server does
-not maintain a separate handwritten tool catalog. The pure MCP capability check performs that exact
-conversion and proves the complete `tools/list` response fits the configured frame before a server
-can be published. CLI commands and desktop read views representing application operations call
-`Application::invoke` with the same descriptor admission. This prevents schema and authorization
-drift between presentations while allowing the explicit local producer and provider-setup
-workflows described above to retain their stronger capabilities.
+Eligible application descriptors are mapped into MCP tools with their complete `inputSchema`,
+`outputSchema`, effect annotations, and bounded contract metadata; the service does not maintain a
+separate handwritten tool catalog. The capability check proves the complete `tools/list` response
+fits the configured frame before the MCP route is published. Desktop and CLI request paths use the
+same application admission through `/app/v1`, while explicit local producer and provider-setup
+workflows retain their stronger, narrower capabilities. This prevents schema and authorization drift
+between presentations.
 
 ## Presentation request paths
 
 ### Shared application request
 
-Each application request constructs a `RequestContext` with a request identity, cancellation token,
-absolute deadline, and result limits. The application validates the operation and arguments before
-a domain service sees them. Domain services return transport-neutral typed results rather than
-writing directly to a presentation.
+Each native application request resolves the current authenticated rendezvous and constructs a
+request context with installation, service-generation, workspace, client, request/correlation
+identity, cancellation, absolute deadline, and result limits. The runtime rejects stale
+generations, replayed mutations, invalid payloads, and unauthorized clients before the application
+validates the operation and arguments. Domain services return transport-neutral typed results rather
+than writing directly to a presentation.
 
 ### Desktop request
 
 The desktop WebView validates bootstrap and result payloads at its Zod boundary. Its Rust bridge
-then admits only read-only operations through the generic application path, applies fixed request
-and result ceilings plus a 15-second deadline, and returns redacted typed failures. Provider setup
-uses a separate tagged command with explicit confirmation, a 30-second operation deadline, and the
-existing durable onboarding and activation authorities. The system browser receives only an exact
-code-owned official provider URL or the validated loopback portal URL returned by `Source.Setup`.
+holds the Desktop credential, calls the private application route, applies fixed request and result
+ceilings plus a deadline, and returns redacted typed failures. The WebView never receives the
+service token or direct network authority. Provider setup uses a separate tagged command with
+explicit confirmation and the durable onboarding/activation authorities. The system browser
+receives only an exact code-owned official-provider URL or a validated loopback portal URL.
 
 ### MCP request
 
-The shipping MCP process uses inherited stdin/stdout and the MCP initialization lifecycle. Inherited
-stdio establishes a local process transport but does not authenticate the peer; the session records
-that identity class rather than claiming more trust.
+The service exposes MCP through its authenticated loopback Streamable HTTP route. The named
+`market-squawk mcp serve --client` process uses inherited stdin/stdout only as a stateless
+compatibility relay. It reads the named client's credential through native secret authority, adapts
+one bounded request to the endpoint, and exits without affecting the shared service. Stdio locality
+does not authenticate the client; service credential, Origin/Host, protocol, request metadata,
+limits, and audit policy do.
 
 ```mermaid
 sequenceDiagram
-    participant Peer as MCP client
-    participant Framing as Bounded stdio framing
-    participant Server as MCP server
+    participant Peer as Claude Code or Codex
+    participant Relay as Named stdio relay
+    participant Server as Authenticated MCP route
     participant Audit as Durable audit
     participant App as Application
     participant Domain as Domain service
     participant Artifacts as Controlled artifacts
 
-    Peer->>Framing: initialize and negotiated protocol messages
-    Framing->>Server: bounded parsed request
+    Peer->>Relay: initialize and bounded stdio request
+    Relay->>Server: credentialed Streamable HTTP request
     Server->>Server: active-request and descriptor admission
     opt mutating operation
         Server->>Audit: durable mutation-admission record
@@ -296,17 +308,18 @@ admission atomically and begins domain shutdown in reverse dependency order. Com
 absolute deadline; each domain receives its terminal barrier even when another domain reports a
 failure, and the resulting report retains per-domain evidence.
 
-For MCP:
+For the installed service and its MCP route:
 
 1. platform termination listeners are installed before product composition so Unix
    `SIGINT`/`SIGTERM` and Windows console termination events cannot bypass the async drain after
    startup admission;
 2. session cancellation closes bounded ingress and propagates child cancellation tokens;
-3. protocol/runtime tasks stop under configured deadlines;
-4. the application begins reverse-order shutdown and reconciliation;
-5. durable audit records are flushed;
-6. the process returns a controlled exit only after server, audit, and application outcomes have
-   been combined.
+3. route/runtime tasks stop under configured deadlines;
+4. durable jobs stop at their declared fence and the application begins reverse-order shutdown and
+   reconciliation;
+5. durable audit records are flushed and the rendezvous is retired; and
+6. the service returns a controlled exit only after route, job, audit, and application outcomes
+   have been combined.
 
 Dropped application ownership invokes fail-safe admission closure. This is not a substitute for
 normal asynchronous drain, but it prevents a partially torn-down composition from accepting new
@@ -337,15 +350,15 @@ work.
   results, CLI output, MCP tools, or audit records.
 - MCP tool annotations do not replace server-side descriptor admission, confirmation policy, or
   domain authorization.
-- Inherited stdio is recorded as an unverified local-process identity; transport locality is not
-  treated as user authentication.
+- Named stdio relay locality is not treated as user authentication; the service authenticates its
+  separately scoped client credential and request metadata before dispatch.
 - Mutating MCP operations require durable admission evidence before domain execution and a bounded
   terminal disposition.
 - CLI file-based producer workflows validate an explicitly authorized input root, regular-file
   identity, size, content, confirmation, and, where applicable, signatures/evidence before
   publication.
 - Read-only DataFusion SQL is confined to the CLI and one immutable dataset relation.
-- The desktop, CLI, and MCP remain outside the live event-to-action path; execution-related
+- The desktop, CLI, and MCP relays remain outside the live event-to-action path; execution-related
   operations retain central risk and dispatcher-owned adapter authority.
 
 ## Related documentation and code
@@ -375,7 +388,7 @@ Current implementation anchors:
 - [Shipping MCP composition](../../apps/market-squawk/src/mcp.rs)
 - [Hardened MCP server](../../crates/market-squawk-mcp/src/server.rs)
 - [Durable MCP audit](../../apps/market-squawk/src/mcp/audit.rs)
-- [Controlled MCP artifact repository](../../apps/market-squawk/src/mcp/artifact.rs)
+- [Controlled artifact repository](../../apps/market-squawk/src/artifact_repository.rs)
 - [Catalog path authority](../../crates/market-squawk-platform/src/paths/catalog.rs)
 - [Central risk service](../../crates/market-squawk-execution/src/risk.rs)
 - [Bounded execution dispatcher](../../crates/market-squawk-execution/src/dispatcher.rs)
@@ -399,9 +412,8 @@ Market Squawk behavior.
 
 | Source | Architectural use | Reviewed |
 | --- | --- | --- |
-| [MCP 2025-11-25 lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) | Initialization, capability negotiation, operation, timeout, and stdio shutdown semantics | 2026-07-23 |
-| [MCP 2025-11-25 tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) | Tool discovery, input/output schema, structured results, tool errors, and security requirements | 2026-07-26 |
-| [MCP 2025-11-25 schema](https://modelcontextprotocol.io/specification/2025-11-25/schema) | Exact `Tool.outputSchema`, `CallToolResult.structuredContent`, and `CallToolResult.isError` wire contracts | 2026-07-26 |
-| [MCP 2025-11-25 cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation) | Request-identity cancellation and late-cancellation race semantics | 2026-07-23 |
+| [MCP 2026-07-28 base protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic) | Initialization, capability negotiation, operation, timeout, and request metadata semantics selected by the service facade | 2026-08-03 |
+| [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) | Stateless endpoint, Host/Origin validation, POST handling, and bounded response transport | 2026-08-03 |
+| [MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) | Tool discovery, input/output schema, structured results, tool errors, and security requirements | 2026-08-03 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction boundaries and single-writer behavior for local catalog state | 2026-07-23 |
 | [Tauri capabilities](https://v2.tauri.app/security/capabilities/) | Window-scoped permission composition for the desktop presentation bridge | 2026-07-28 |

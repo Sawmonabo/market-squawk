@@ -9,15 +9,14 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Document type | Documentation portal index |
 | Audience | Operators, users, integrators, maintainers, reviewers, and contributors |
 | Status | Current |
-| Last substantive review | 2026-07-28 |
-| Implementation review base | `85cdf0715954e850339a0b281b41c9beaf254ffb` |
+| Last substantive review | 2026-08-03 |
 
 ## Start by intent
 
 | I want to… | Start here |
 | --- | --- |
 | Understand the system and its boundaries | [Architecture](architecture/README.md) |
-| Launch the desktop, install, configure, ingest, query, model, or operate it | [Operations](operations/README.md) |
+| Install, configure, ingest, query, model, or operate Market Squawk | [Operations](operations/README.md) |
 | Look up an exact desktop/CLI command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
 | Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
@@ -54,16 +53,18 @@ flowchart TD
 
 ### Architecture
 
-The [architecture portal](architecture/README.md) moves from system context and building blocks
-through the live, research, and control planes, then into time/provenance, trust boundaries,
-deployment, quality attributes, and decision records. Architecture pages explain durable design and
-current implementation boundaries; they do not track day-to-day completion percentages.
+The [architecture portal](architecture/README.md) explains the one-per-user installed service,
+its Desktop/CLI/MCP clients, durable jobs, workspace and lifecycle authorities, live and research
+planes, time/provenance, trust boundaries, deployment, quality attributes, and decision records.
+Architecture pages explain durable design and implementation boundaries; they do not track
+day-to-day completion percentages or claim package/release approval.
 
 ### Operations
 
 The [operations portal](operations/README.md) contains current procedures with prerequisites,
-authority checks, exact commands, success evidence, and recovery behavior. A page describes a
-workflow only when the reviewed product commit supports it. Mandatory capabilities that are not
+authority checks, exact commands, success evidence, and recovery behavior. It distinguishes
+installed-product operations from candidate-package evidence: a package, signing, or publication
+claim appears only when the corresponding evidence exists. Mandatory capabilities that are not
 runnable remain in the delivery ledger rather than receiving fictional instructions.
 
 ### Reference
@@ -113,14 +114,16 @@ frozen candidate completes every evidence predicate.
 
 ## Reading paths
 
-### New operator
+### Installed-product operator
 
-1. [Installation and bootstrap](operations/installation-and-bootstrap.md)
+1. [Installation and bootstrap](operations/installation-and-bootstrap.md) — use only an artifact
+   and command whose availability is evidenced for the candidate you hold.
 2. [Configuration and secrets](operations/configuration-and-secrets.md)
 3. [Source operations](operations/source-operations.md)
 4. [Research ingestion](operations/research-ingestion.md)
 5. [Datasets and query](operations/datasets-and-query.md)
-6. [Troubleshooting](operations/troubleshooting.md)
+6. [Backup and recovery](operations/backup-and-recovery.md)
+7. [Troubleshooting](operations/troubleshooting.md)
 
 ### Architecture or security review
 
@@ -146,9 +149,10 @@ frozen candidate completes every evidence predicate.
 ## Documentation contract
 
 Substantive maintained pages identify their document type, audience, status, last review date, and
-reviewed product commit. Long pages provide a contents list. Architecture and operations pages link
-to relevant code and direct primary sources. Mermaid diagrams use stable flowchart, sequence, state,
-and entity-relationship syntax that renders on GitHub.
+implementation-review basis. Long pages provide a contents list. Architecture and operations pages
+link to relevant code and direct primary sources. Mermaid diagrams use stable flowchart, sequence,
+state, and entity-relationship syntax that renders on GitHub. An implementation review basis is not
+release approval: only the delivery ledger and exact-head evidence may make approval claims.
 
 When behavior changes, update the owning code and its factual reference or runbook in the same
 accepted lane. Update mutable completion state in the delivery ledger. Preserve dated audits and

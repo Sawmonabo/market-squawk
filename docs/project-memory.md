@@ -1450,3 +1450,25 @@ completed Tauri's maintained `app,dmg` bundler, verified and mounted the DMG, pa
 product and 63-tool MCP smoke, collected the closed artifacts, and uploaded them. That candidate is
 not a release candidate because its separate Windows package job failed at the staging command
 corrected after the run.
+
+## 2026-08-01 installed-product candidate authority
+
+The approved
+[`2026-08-01-market-squawk-v1-installed-product-experience.md`](superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md)
+supersedes the earlier `release/*`-only platform-dispatch and public-release sequence for its
+defined scope. Task 25 may explicitly dispatch platform verification for the exact pushed and
+frozen `feature/v1-installed-product-experience` candidate. The dispatch must remain fail-closed,
+must identify that exact feature ref and commit, and must produce controlled workflow artifacts
+without creating a GitHub Release. Ordinary feature pushes still do not build native packages.
+
+Task 26 freezes and verifies that unchanged feature candidate, runs the existing final Quarter 4
+grouped review, and hands controlled artifact references to the owner through the draft PR and
+project. It does not authorize public release creation, stable curl hosting, release-branch or
+`main` integration, signing/notarization claims, or a release declaration. Those actions require a
+separate user-authorized workflow after owner testing.
+
+Historical version, component, package, and checkpoint facts above remain valid only for their
+dated audit anchors. Current candidate version, component identities, head/tree, package receipts,
+review state, blockers, issue state, and cleanup disposition live only in
+[`docs/plans/delivery-ledger.md`](plans/delivery-ledger.md); this memory is not a second mutable
+ledger.
