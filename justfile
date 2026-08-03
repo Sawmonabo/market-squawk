@@ -19,9 +19,30 @@ _tools:
     @just --version
     @rustc --version
     @cargo --version
-    @node --version
-    @pnpm --version
     @uv --version
+
+[private]
+[unix]
+_frontend-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nvm_script="${NVM_DIR:-${HOME}/.nvm}/nvm.sh"
+    if [[ -s "${nvm_script}" ]]; then
+        # nvm is a shell function, so non-interactive just recipes must load it explicitly.
+        source "${nvm_script}"
+        nvm install
+        nvm use
+    fi
+    node --version
+    corepack enable
+    corepack prepare pnpm@10.31.0 --activate
+    pnpm --version
+    pnpm --dir "{{ desktop }}" install --frozen-lockfile
+
+[private]
+[windows]
+_frontend-setup:
+    $version = (Get-Content "{{ root }}/.nvmrc" -Raw).Trim(); if (Get-Command nvm -ErrorAction SilentlyContinue) { nvm install $version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; nvm use $version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; node --version; corepack enable; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; corepack prepare pnpm@10.31.0 --activate; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm --version; pnpm --dir "{{ desktop }}" install --frozen-lockfile
 
 [private]
 _build-dev-siblings:
@@ -39,8 +60,7 @@ _python-tests:
     & "{{ python_executable }}" -m pytest "{{ python_project }}/tests"
 
 # Prepare frozen frontend, Python, and Rust development inputs.
-setup: _tools
-    pnpm --dir "{{ desktop }}" install --frozen-lockfile
+setup: _tools _frontend-setup
     uv --directory "{{ python_project }}" python install 3.14.6
     uv --directory "{{ python_project }}" venv --python 3.14.6 .venv
     uv --directory "{{ python_project }}" pip sync --python "{{ python_executable }}" --require-hashes --strict "{{ python_requirements }}"

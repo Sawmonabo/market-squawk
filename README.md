@@ -310,6 +310,10 @@ just setup
 just dev
 ```
 
+The repository includes `.nvmrc`. When `nvm` is installed, `just setup` loads it in the
+non-interactive setup shell, installs Node.js `24.18.0` if needed, and runs the frontend setup with
+that exact version. Developers can also run `nvm use` directly in an interactive shell.
+
 `just dev` incrementally builds the required CLI, service, MCP relay, capture helper, and ONNX
 worker before starting the Tauri desktop with Vite hot reload. Its ignored
 `.market-squawk/development` data root is separate from installed-product data. The one shared

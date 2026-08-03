@@ -375,6 +375,12 @@ just setup
 just dev
 ```
 
+The repository `.nvmrc` pins Node.js `24.18.0`. On macOS or Linux, when `nvm` is available,
+`just setup` loads it inside the setup process, installs the pinned version if necessary, and uses
+it for the frozen pnpm install. On Windows, the setup recipe uses `nvm-windows` when its `nvm`
+command is available. An interactive terminal may run `nvm use` explicitly before other direct
+Node or pnpm commands.
+
 The complete development desktop uses the ignored repository-local
 `.market-squawk/development` data root. It builds and discovers its required debug sibling programs
 without admitting that fallback into non-debug packages. The shared development service may outlive
