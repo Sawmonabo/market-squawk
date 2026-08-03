@@ -1,6 +1,10 @@
 //! Bridge from installed recovery operations to the sole workspace selector authority.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+};
 
 use async_trait::async_trait;
 use market_squawk_runtime::WorkspaceId;
@@ -24,7 +28,8 @@ use super::workspace_selector::{
 
 /// Sole bridge for selector handoffs, recovery receipts, and fresh inactive workspace roots.
 pub(super) struct WorkspaceRecoveryBridge {
-    selector: Arc<WorkspaceSelector>,
+    selector: Weak<WorkspaceSelector>,
+    workspace_repository_root: PathBuf,
     recovery: Arc<DurableRecoveryState>,
 }
 
@@ -35,12 +40,17 @@ impl WorkspaceRecoveryBridge {
         selector: Arc<WorkspaceSelector>,
         recovery: Arc<DurableRecoveryState>,
     ) -> Self {
-        Self { selector, recovery }
+        let workspace_repository_root = selector.workspace_repository_root().to_path_buf();
+        Self {
+            selector: Arc::downgrade(&selector),
+            workspace_repository_root,
+            recovery,
+        }
     }
 
     /// Returns the selector-validated managed workspace container.
-    pub(super) fn workspace_repository_root(&self) -> &std::path::Path {
-        self.selector.workspace_repository_root()
+    pub(super) fn workspace_repository_root(&self) -> &Path {
+        &self.workspace_repository_root
     }
 
     /// Finalizes a healthy selector startup and its exact recovery receipt before publication.
@@ -52,9 +62,13 @@ impl WorkspaceRecoveryBridge {
         &self,
         selection: &WorkspaceStartupSelection,
     ) -> Result<(), LifecycleError> {
+        let selector = self
+            .selector
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?;
         if let Some(handoff) = selection.handoff() {
             self.record_handoff(handoff)?;
-            self.selector
+            selector
                 .finalize_startup(selection)
                 .map_err(map_selector_lifecycle)?;
             return self
@@ -63,7 +77,7 @@ impl WorkspaceRecoveryBridge {
                 .map_err(|_error| LifecycleError::AuthorityUnavailable);
         }
 
-        self.selector
+        selector
             .finalize_startup(selection)
             .map_err(map_selector_lifecycle)?;
         let Some(pending) = self
@@ -109,8 +123,11 @@ impl RecoveryWorkspaceSelectionAuthority for WorkspaceRecoveryBridge {
         expected_active: WorkspaceRuntimeIdentity,
         target: WorkspaceId,
     ) -> Result<WorkspaceRuntimeIdentity, LifecycleError> {
-        let handoff = self
+        let selector = self
             .selector
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?;
+        let handoff = selector
             .stage_activation(expected_active, target)
             .map_err(map_selector_lifecycle)?;
         self.record_handoff(handoff)?;
@@ -119,6 +136,8 @@ impl RecoveryWorkspaceSelectionAuthority for WorkspaceRecoveryBridge {
 
     fn has_pending_handoff(&self) -> Result<bool, LifecycleError> {
         self.selector
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?
             .has_pending_handoff()
             .map_err(map_selector_lifecycle)
     }
@@ -139,15 +158,15 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
                 Err(ProductBackupError::InvalidRestoreTarget)
             };
         }
-        let selected = self
+        let selector = self
             .selector
-            .active_identity()
-            .map_err(map_selector_restore)?;
+            .upgrade()
+            .ok_or(ProductBackupError::RestoreComponents)?;
+        let selected = selector.active_identity().map_err(map_selector_restore)?;
         if selected.workspace_id() != active_workspace {
             return Err(ProductBackupError::InvalidRestoreTarget);
         }
-        let (workspace_id, paths) = self
-            .selector
+        let (workspace_id, paths) = selector
             .prepare_fresh_managed_workspace()
             .map_err(map_selector_restore)?;
         if cancellation.is_cancelled()
@@ -155,7 +174,7 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
             || workspace_id == active_workspace
         {
             drop(paths);
-            self.selector
+            selector
                 .abandon_managed_workspace(workspace_id)
                 .map_err(map_selector_restore)?;
             return if cancellation.is_cancelled() {
@@ -178,7 +197,7 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
             Ok(descriptor) => descriptor,
             Err(_error) => {
                 drop(paths);
-                self.selector
+                selector
                     .abandon_managed_workspace(workspace_id)
                     .map_err(map_selector_restore)?;
                 return Err(ProductBackupError::InvalidRestoreTarget);
@@ -189,6 +208,8 @@ impl ManagedWorkspaceRestoreAuthority for WorkspaceRecoveryBridge {
 
     async fn abandon(&self, workspace_id: WorkspaceId) -> Result<(), ProductBackupError> {
         self.selector
+            .upgrade()
+            .ok_or(ProductBackupError::RestoreComponents)?
             .abandon_managed_workspace(workspace_id)
             .map_err(map_selector_restore)
     }

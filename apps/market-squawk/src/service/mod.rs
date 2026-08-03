@@ -2,6 +2,7 @@
 
 mod analysis;
 mod backtest_preparation;
+mod bootstrap;
 mod decision;
 mod dispatch;
 mod forecast_preparation;
@@ -39,13 +40,15 @@ use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
 use market_squawk_platform::{
-    LocalAuthorityStateStoreError, LocalPaths, PathError, PreferredSecretStore, SecretStore,
+    EncryptedFileFallbackStatus, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
+    LocalPaths, PathError, PreferredSecretStore, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClientError, ApplicationProtocolRange, ApplicationProtocolVersion,
     ApplicationRequestScope, CorrelationId, CredentialError, EventHub, EventHubLimits, InputStager,
-    InputStagingLimits, LoopbackApplicationClient, MutationReplayGuard, NamedClient, OriginPolicy,
-    RendezvousError, ReplayLimits, RuntimeContractError, RuntimeRouter, RuntimeRouterLimits,
+    InputStagingLimits, InstallationId, LoopbackApplicationClient, MutationReplayGuard,
+    NamedClient, OriginPolicy, RendezvousError, ReplayLimits, RuntimeContractError, RuntimeRouter,
+    RuntimeRouterLimits,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceLimits, ToolServices,
@@ -57,6 +60,10 @@ use tool_services::{
     InstalledToolServiceAuthorities, InstalledToolServiceRuntime, InstalledToolServices,
 };
 use uuid::Uuid;
+
+pub use bootstrap::{
+    BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceBootstrapStatus,
+};
 
 use mcp_client::InstalledMcpRelayTransport;
 
@@ -176,6 +183,28 @@ impl InstalledServiceConnector {
         )
     }
 
+    /// Reads the current short-lived, secret-free credential-bootstrap state.
+    pub async fn bootstrap_status(
+        &self,
+    ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
+        bootstrap::status(&self.paths).await
+    }
+
+    /// Consumes one explicit encrypted-fallback unlock over the owner-authenticated channel.
+    pub async fn bootstrap_unlock(
+        &self,
+        unlock: SecretValue,
+    ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
+        bootstrap::unlock(&self.paths, unlock).await
+    }
+
+    /// Retries unchanged preparation after a foreground platform-keyring interaction.
+    pub async fn bootstrap_retry_after_foreground_keyring(
+        &self,
+    ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
+        bootstrap::retry_after_foreground_keyring(&self.paths).await
+    }
+
     /// Resolves one current Claude Code or Codex registration into a credential-owning MCP relay
     /// transport. The endpoint and credential remain private to the native connector.
     pub fn connect_mcp_relay(
@@ -209,6 +238,7 @@ pub struct InstalledService {
     runtime: PreparedRuntime,
     lifecycle: Arc<InstalledServiceLifecycle>,
     _workspace_selector: Arc<WorkspaceSelector>,
+    _instance_guard: LocalAuthorityStateStore,
 }
 
 impl std::fmt::Debug for InstalledService {
@@ -222,6 +252,7 @@ impl std::fmt::Debug for InstalledService {
             .field("server", &self.server)
             .field("lifecycle", &self.lifecycle)
             .field("workspace_selector", &"[INSTALLATION-GLOBAL AUTHORITY]")
+            .field("instance_guard", &"[INSTALLATION-GLOBAL AUTHORITY]")
             .finish_non_exhaustive()
     }
 }
@@ -281,6 +312,9 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
     ) -> Result<Self, InstalledServiceError> {
+        let instance_guard = runtime::acquire_instance(&installation_paths)?;
+        let installation_id = runtime::installation_id(&installation_paths)?
+            .map_or_else(|| InstallationId::try_from_uuid(Uuid::new_v4()), Ok)?;
         let workspace_selector = Arc::new(
             WorkspaceSelector::try_open_or_bootstrap(&installation_paths, &legacy_workspace_paths)
                 .map_err(map_workspace_selector_startup)?,
@@ -291,9 +325,32 @@ impl InstalledService {
         let failed_startup_selector = Arc::clone(&workspace_selector);
         let failed_startup_selection = selection.clone();
         let result = async move {
-            let mut runtime =
-                PreparedRuntime::prepare(&installation_paths, secret_store, selection.identity())
-                    .await?;
+            let mut runtime = loop {
+                match PreparedRuntime::prepare(
+                    &installation_paths,
+                    Arc::clone(&secret_store),
+                    selection.identity(),
+                    installation_id,
+                )
+                .await
+                {
+                    Ok(runtime) => break runtime,
+                    Err(error) => {
+                        let Some(requirement) =
+                            recoverable_bootstrap_requirement(secret_store.as_ref(), &error)?
+                        else {
+                            return Err(error);
+                        };
+                        let _action = bootstrap::wait_for_action(
+                            &installation_paths,
+                            Arc::clone(&secret_store),
+                            installation_id,
+                            requirement,
+                        )
+                        .await?;
+                    }
+                }
+            };
             let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
             let workspace_paths = selection.paths().clone();
             let product = LocalProduct::try_new_at_paths(config.clone(), workspace_paths.clone())?;
@@ -394,6 +451,7 @@ impl InstalledService {
                 runtime,
                 lifecycle,
                 _workspace_selector: workspace_selector,
+                _instance_guard: instance_guard,
             })
         }
         .await;
@@ -422,6 +480,7 @@ impl InstalledService {
             runtime,
             lifecycle,
             _workspace_selector,
+            _instance_guard,
         } = self;
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
@@ -445,8 +504,9 @@ impl InstalledService {
         };
         let transport = match completed_transport {
             Some(transport) => transport,
-            None => serving.await.is_ok(),
+            None => (&mut serving).await.is_ok(),
         };
+        drop(serving);
         let jobs_stopped = if let Ok(at) = current_timestamp() {
             jobs.shutdown_authority(at, JOB_RUNNER_DRAIN).await.is_ok()
         } else {
@@ -464,6 +524,13 @@ impl InstalledService {
             jobs_closed,
             rendezvous_retired,
         };
+        drop(runtime);
+        drop(audit);
+        drop(jobs);
+        drop(product);
+        drop(lifecycle);
+        drop(_workspace_selector);
+        drop(_instance_guard);
         if report.is_complete() && transport_stopped_unexpectedly {
             Err(InstalledServiceError::TransportStopped)
         } else if report.is_complete() {
@@ -844,6 +911,29 @@ fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, Inst
     ))
 }
 
+fn recoverable_bootstrap_requirement(
+    secret_store: &dyn SecretStore,
+    error: &InstalledServiceError,
+) -> Result<Option<BootstrapRequirement>, InstalledServiceError> {
+    let credential_condition = matches!(
+        error,
+        InstalledServiceError::SecretStore
+            | InstalledServiceError::Credential(CredentialError::SecretStore)
+    );
+    if !credential_condition {
+        return Ok(None);
+    }
+    match secret_store
+        .encrypted_file_fallback_status()
+        .map_err(|_error| InstalledServiceError::SecretStore)?
+    {
+        EncryptedFileFallbackStatus::Locked => {
+            Ok(Some(BootstrapRequirement::EncryptedFallbackLocked))
+        }
+        EncryptedFileFallbackStatus::Disabled | EncryptedFileFallbackStatus::Ready => Ok(None),
+    }
+}
+
 fn deterministic_installation_root(
     workspace_paths: &LocalPaths,
 ) -> Result<PathBuf, InstalledServiceError> {
@@ -971,6 +1061,18 @@ pub enum InstalledServiceError {
     /// No authenticated current installed-service generation is available.
     #[error("the installed Market Squawk service is unavailable")]
     ServiceUnavailable,
+    /// The short-lived bootstrap endpoint or its owner boundary is unavailable.
+    #[error("installed-service bootstrap channel is unavailable")]
+    BootstrapUnavailable,
+    /// A bootstrap request violated the fixed binary protocol or exact binding.
+    #[error("installed-service bootstrap request is invalid")]
+    BootstrapProtocol,
+    /// A bootstrap request or the total bootstrap lifetime elapsed.
+    #[error("installed-service bootstrap deadline elapsed")]
+    BootstrapDeadline,
+    /// Owner-authenticated bootstrap input was rejected without exposing secret detail.
+    #[error("installed-service bootstrap request was rejected")]
+    BootstrapRejected,
     /// A private application client could not be constructed or used.
     #[error(transparent)]
     Client(#[from] ApplicationClientError),

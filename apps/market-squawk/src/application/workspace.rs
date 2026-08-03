@@ -183,6 +183,39 @@ impl DurableWorkspaceRegistry {
             .map_err(|_| WorkspaceRegistryError::Unavailable)
     }
 
+    /// Advances the active fence for an ordinary same-workspace process startup.
+    ///
+    /// Workspace changes and generation jumps remain owned by the explicit transition journal.
+    pub(crate) fn reconcile_ordinary_startup(
+        &self,
+        selected: WorkspaceRuntimeIdentity,
+    ) -> Result<(), WorkspaceRegistryError> {
+        let mut document = self
+            .document
+            .lock()
+            .map_err(|_| WorkspaceRegistryError::Unavailable)?;
+        if document.active == selected {
+            return Ok(());
+        }
+        let next_generation = document
+            .active
+            .generation()
+            .get()
+            .checked_add(1)
+            .ok_or(WorkspaceRegistryError::CapacityOrConflict)?;
+        if document.active.workspace_id() != selected.workspace_id()
+            || selected.generation().get() != next_generation
+            || !document.workspaces.contains_key(&selected.workspace_id())
+        {
+            return Err(WorkspaceRegistryError::CapacityOrConflict);
+        }
+        let mut candidate = document.clone();
+        candidate.active = selected;
+        self.store.store(&encode(&candidate)?)?;
+        *document = candidate;
+        Ok(())
+    }
+
     /// Returns the exact durable descriptor for one registered workspace.
     pub fn descriptor(
         &self,
@@ -350,6 +383,28 @@ mod tests {
         }
         let reopened = DurableWorkspaceRegistry::try_open(root.path(), active, descriptor)?;
         assert_eq!(reopened.active()?, active);
+        Ok(())
+    }
+
+    #[test]
+    fn registry_reconciles_only_the_next_ordinary_startup_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let active_id = workspace(1)?;
+        let active = WorkspaceRuntimeIdentity::try_new(active_id, 3)?;
+        let selected = WorkspaceRuntimeIdentity::try_new(active_id, 4)?;
+        let skipped = WorkspaceRuntimeIdentity::try_new(active_id, 6)?;
+        let descriptor =
+            WorkspaceDescriptor::try_new(active_id, "Primary", 1, WorkspaceHealth::Healthy, 1024)?;
+        {
+            let registry =
+                DurableWorkspaceRegistry::try_open(root.path(), active, descriptor.clone())?;
+            registry.reconcile_ordinary_startup(selected)?;
+            assert_eq!(registry.active()?, selected);
+            assert!(registry.reconcile_ordinary_startup(skipped).is_err());
+        }
+        let reopened = DurableWorkspaceRegistry::try_open(root.path(), selected, descriptor)?;
+        assert_eq!(reopened.active()?, selected);
         Ok(())
     }
 }

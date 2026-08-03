@@ -17,6 +17,7 @@ path = "tests/harnesses/configuration_security.rs"
 [[test]]
 name = "capture_journal"
 path = "tests/harnesses/capture_journal.rs"
+required-features = ["capture-test"]
 
 [features]
 default = []

@@ -71,6 +71,7 @@ http-body-util = "=0.1.4"
 hyper = { version = "=1.11.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
 hmac = "=0.12.1"
+interprocess = { version = "=2.4.3", features = ["tokio"] }
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
 market-squawk = { path = "apps/market-squawk", version = "=1.0.0" }
@@ -120,6 +121,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
     "rustls-no-provider",
     "stream",
 ] }
+rpassword = "=7.5.4"
 loom = "=0.7.2"
 proptest = "1.7"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
@@ -167,7 +169,7 @@ tokio = { version = "=1.53.1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "=0.7.19", features = ["rt"] }
+tokio-util = { version = "=0.7.19", features = ["codec", "rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1"
 tracing = "0.1"
@@ -181,7 +183,8 @@ tower = { version = "=0.5.3", default-features = false, features = [
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
 url = "2.5"
 webbrowser = { version = "=1.2.1", features = ["hardened"] }
-win-security-identifier = "=0.1.1"
+widestring = "=1.2.1"
+win-security-identifier = "=0.2.0"
 windows-permissions = "=0.2.4"
 zeroize = "1.8"
 zip = { version = "=8.6.0", default-features = false, features = [

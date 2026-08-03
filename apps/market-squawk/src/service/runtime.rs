@@ -136,7 +136,6 @@ pub(super) struct PreparedRuntime {
     listener: Option<TcpListener>,
     rendezvous: RendezvousAuthority,
     record: RendezvousRecord,
-    _instance_guard: LocalAuthorityStateStore,
 }
 
 impl std::fmt::Debug for PreparedRuntime {
@@ -157,11 +156,9 @@ impl PreparedRuntime {
         paths: &LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         selected: WorkspaceRuntimeIdentity,
+        installation_id: InstallationId,
     ) -> Result<Self, InstalledServiceError> {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
-        let instance_guard =
-            LocalAuthorityStateStore::try_open(service_root.join(INSTANCE_DIRECTORY))
-                .map_err(InstalledServiceError::instance)?;
         let identity_store =
             LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
         let loaded = identity_store.load()?;
@@ -212,7 +209,13 @@ impl PreparedRuntime {
                     .await?
             }
             None => {
-                initialize_runtime(&identity_store, Arc::clone(&secret_store), selected).await?
+                initialize_runtime(
+                    &identity_store,
+                    Arc::clone(&secret_store),
+                    selected,
+                    installation_id,
+                )
+                .await?
             }
         };
         let mcp_roots = [
@@ -268,7 +271,6 @@ impl PreparedRuntime {
             listener: Some(listener),
             rendezvous,
             record,
-            _instance_guard: instance_guard,
         })
     }
 
@@ -348,6 +350,7 @@ async fn initialize_runtime(
     identity_store: &LocalAuthorityStateStore,
     secret_store: Arc<dyn SecretStore>,
     selected: WorkspaceRuntimeIdentity,
+    installation_id: InstallationId,
 ) -> Result<
     (
         InstalledRuntimeState,
@@ -382,7 +385,7 @@ async fn initialize_runtime(
     let initialization = InstalledRuntimeInitialization {
         format_version: STATE_FORMAT_VERSION,
         runtime: selected
-            .to_runtime(InstallationId::try_from_uuid(Uuid::new_v4())?)
+            .to_runtime(installation_id)
             .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?,
         credentials,
         rendezvous_signing_plan: signing_plan,
@@ -399,6 +402,31 @@ async fn initialize_runtime(
         return Err(InstalledServiceError::InvalidRuntimeState);
     };
     resume_initialization(identity_store, secret_store, initialization).await
+}
+
+pub(super) fn acquire_instance(
+    paths: &LocalPaths,
+) -> Result<LocalAuthorityStateStore, InstalledServiceError> {
+    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
+    LocalAuthorityStateStore::try_open(service_root.join(INSTANCE_DIRECTORY))
+        .map_err(InstalledServiceError::instance)
+}
+
+pub(super) fn installation_id(
+    paths: &LocalPaths,
+) -> Result<Option<InstallationId>, InstalledServiceError> {
+    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
+    let identity_store = LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
+    let Some(encoded) = identity_store.load()? else {
+        return Ok(None);
+    };
+    let runtime = match decode_document(&encoded)? {
+        InstalledRuntimeDocument::Initializing { initialization } => {
+            initialization.validate()?.runtime
+        }
+        InstalledRuntimeDocument::Active { state } => state.validate()?.runtime,
+    };
+    Ok(Some(runtime.installation_id()))
 }
 
 async fn resume_initialization(

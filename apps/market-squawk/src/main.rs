@@ -5,6 +5,7 @@
 
 use std::{
     ffi::OsString,
+    io::{IsTerminal as _, Read as _},
     process::{Command as ProcessCommand, Stdio},
     sync::Arc,
     time::Duration,
@@ -39,7 +40,7 @@ use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
-    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
+    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter, SecretValue,
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use market_squawk_runtime::NamedClient;
@@ -50,6 +51,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+const MAXIMUM_BOOTSTRAP_UNLOCK_BYTES: u64 = 4 * 1024;
 
 fn main() -> Result<()> {
     let application = std::thread::Builder::new()
@@ -435,16 +437,69 @@ async fn run_service_command(
     output: OutputFormat,
 ) -> Result<()> {
     let (summary, value) = match command {
-        ServiceCommand::Status => (
-            "installed service is ready",
-            installed_service_snapshot(config).await?,
-        ),
+        ServiceCommand::Status => service_status(config).await?,
         ServiceCommand::Start => {
             start_installed_service(config, config_file, log, json_logs, Duration::from_secs(15))
                 .await?
         }
+        ServiceCommand::Bootstrap {
+            stdin,
+            retry_after_foreground_keyring,
+        } => {
+            let connector = InstalledServiceConnector::try_new(config)?;
+            let status = if retry_after_foreground_keyring {
+                connector.bootstrap_retry_after_foreground_keyring().await?
+            } else {
+                connector
+                    .bootstrap_unlock(read_bootstrap_unlock(stdin)?)
+                    .await?
+            };
+            (
+                "installed service bootstrap was accepted",
+                serde_json::to_value(status)?,
+            )
+        }
     };
     emit_result(output, summary, &value)
+}
+
+async fn service_status(config: &AppConfig) -> Result<(&'static str, serde_json::Value)> {
+    if let Ok(snapshot) = installed_service_snapshot(config).await {
+        return Ok(("installed service is ready", snapshot));
+    }
+    let connector = InstalledServiceConnector::try_new(config)?;
+    let status = connector.bootstrap_status().await?;
+    Ok((
+        "installed service requires credential bootstrap",
+        serde_json::json!({"status": "bootstrap_required", "bootstrap": status}),
+    ))
+}
+
+fn read_bootstrap_unlock(explicit_stdin: bool) -> Result<SecretValue> {
+    if explicit_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(MAXIMUM_BOOTSTRAP_UNLOCK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read the bounded bootstrap unlock from standard input")?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAXIMUM_BOOTSTRAP_UNLOCK_BYTES {
+            anyhow::bail!("bootstrap unlock exceeds its input bound");
+        }
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        return SecretValue::from_utf8_bytes(bytes)
+            .context("bootstrap unlock is empty, invalid UTF-8, or outside its secret bound");
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("bootstrap unlock requires a terminal or explicit --stdin");
+    }
+    let unlock = rpassword::prompt_password("Encrypted fallback unlock: ")
+        .context("failed to read the no-echo bootstrap unlock")?;
+    SecretValue::new(unlock).context("bootstrap unlock is empty or outside its secret bound")
 }
 
 async fn installed_service_snapshot(config: &AppConfig) -> Result<serde_json::Value> {
@@ -499,6 +554,13 @@ async fn start_installed_service(
     loop {
         if let Ok(snapshot) = installed_service_snapshot(config).await {
             return Ok(("installed service started", snapshot));
+        }
+        let connector = InstalledServiceConnector::try_new(config)?;
+        if let Ok(status) = connector.bootstrap_status().await {
+            return Ok((
+                "installed service started and requires credential bootstrap",
+                serde_json::json!({"status": "bootstrap_required", "bootstrap": status}),
+            ));
         }
         if let Some(status) = child
             .try_wait()

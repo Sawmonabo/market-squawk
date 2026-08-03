@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -199,12 +199,18 @@ impl PreparedInstalledOperations {
             DurableWorkspaceRegistry::try_open(control_path, selection.identity(), descriptor)
                 .map_err(|_error| InstalledServiceError::CompositionStage("workspace registry"))?,
         );
-        if workspaces
+        let active_workspace = workspaces
             .active()
-            .map_err(|_error| InstalledServiceError::CompositionStage("workspace registry"))?
-            != selection.identity()
-        {
-            return Err(InstalledServiceError::InvalidComposition);
+            .map_err(|_error| InstalledServiceError::CompositionStage("workspace registry"))?;
+        if active_workspace != selection.identity() {
+            if selection.handoff().is_some() {
+                return Err(InstalledServiceError::InvalidComposition);
+            }
+            workspaces
+                .reconcile_ordinary_startup(selection.identity())
+                .map_err(|_error| {
+                    InstalledServiceError::CompositionStage("workspace registry startup fence")
+                })?;
         }
         let workspace_journal = workspaces.clone();
         let workspace_lifecycle = Arc::new(
@@ -493,9 +499,9 @@ fn request_settings_restart(
 }
 
 struct InstalledRecoveryRuntimeHooks {
-    application: Arc<Application>,
-    jobs: Arc<market_squawk_jobs::JobAuthority<market_squawk_jobs::SqliteJobRepository>>,
-    lifecycle: Arc<InstalledServiceLifecycle>,
+    application: Weak<Application>,
+    jobs: Weak<market_squawk_jobs::JobAuthority<market_squawk_jobs::SqliteJobRepository>>,
+    lifecycle: Weak<InstalledServiceLifecycle>,
     active_job_kind: market_squawk_domain::SourceIdentifier,
 }
 
@@ -507,9 +513,9 @@ impl InstalledRecoveryRuntimeHooks {
         active_job_kind: market_squawk_domain::SourceIdentifier,
     ) -> Self {
         Self {
-            application,
-            jobs,
-            lifecycle,
+            application: Arc::downgrade(&application),
+            jobs: Arc::downgrade(&jobs),
+            lifecycle: Arc::downgrade(&lifecycle),
             active_job_kind,
         }
     }
@@ -518,13 +524,20 @@ impl InstalledRecoveryRuntimeHooks {
 #[async_trait]
 impl InstalledServiceRecoveryHooks for InstalledRecoveryRuntimeHooks {
     async fn drain_and_reconcile(&self, deadline: Instant) -> Result<(), LifecycleError> {
-        self.application.begin_shutdown();
-        let _lifecycle_fence = self
+        let application = self
+            .application
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?;
+        let jobs = self
             .jobs
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?;
+        application.begin_shutdown();
+        let _lifecycle_fence = jobs
             .retain_lifecycle_fence(&self.active_job_kind)
             .await
             .map_err(|_| LifecycleError::PreflightBlocked)?;
-        if self.application.shutdown(deadline).await.is_complete() {
+        if application.shutdown(deadline).await.is_complete() {
             Ok(())
         } else {
             Err(LifecycleError::AuthorityUnavailable)
@@ -533,6 +546,8 @@ impl InstalledServiceRecoveryHooks for InstalledRecoveryRuntimeHooks {
 
     fn request_restart(&self, expected: RuntimeIdentity) -> Result<(), LifecycleError> {
         self.lifecycle
+            .upgrade()
+            .ok_or(LifecycleError::AuthorityUnavailable)?
             .request_restart(expected)
             .map_err(|_| LifecycleError::AuthorityUnavailable)
     }
