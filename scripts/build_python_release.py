@@ -445,6 +445,8 @@ class InstalledDistribution:
     version: str
     roots: tuple[str, ...]
     external_paths: tuple[str, ...]
+    owned_paths: tuple[Path, ...]
+    owned_file_identities: tuple[tuple[int, int], ...]
     record: Path
     record_sha256: str
     record_size: int
@@ -1649,7 +1651,9 @@ def refresh_source_closure(lock_path: Path, root: Path) -> None:
         if candidate.is_symlink() or not candidate.is_file():
             raise ReleaseBuildError("Python release source is unavailable")
         before = candidate.stat(follow_symlinks=False)
-        size, digest, _header = _inspect_installed_distribution_file(candidate)
+        size, digest, _header, _file_identity = _inspect_installed_distribution_file(
+            candidate
+        )
         identity = (
             before.st_dev,
             before.st_ino,
@@ -3528,11 +3532,14 @@ def rewrite_signed_record_entries(
         return
     profile = host_profile()
     site_packages = _site_packages_path(release_root, runtime, profile).resolve(strict=True)
-    pending = {
-        path.resolve(strict=True)
-        for path in signed_paths
-        if path.resolve(strict=True).is_relative_to(site_packages)
+    signed = {path.resolve(strict=True) for path in signed_paths}
+    required_owners = {
+        path
+        for path in signed
+        if path.is_relative_to(site_packages)
     }
+    observed_owners: set[Path] = set()
+    rewrites: list[tuple[Path, list[list[str]]]] = []
     for record in sorted(site_packages.glob("*.dist-info/RECORD")):
         if record.is_symlink() or not record.is_file() or record.stat().st_size > MAX_RECORD_BYTES:
             raise ReleaseBuildError("installed distribution RECORD is invalid")
@@ -3543,13 +3550,15 @@ def rewrite_signed_record_entries(
                 for row in csv.reader(stream):
                     if len(row) != 3:
                         raise ReleaseBuildError("installed distribution RECORD is malformed")
-                    candidate = (
-                        site_packages.joinpath(*PurePosixPath(row[0]).parts)
-                        .resolve(strict=True)
+                    candidate, _is_internal = _installed_record_path(
+                        row[0], site_packages, release_root, profile
                     )
-                    if not candidate.is_relative_to(release_root):
-                        raise ReleaseBuildError("installed distribution RECORD escapes its release")
-                    if candidate in pending:
+                    candidate = candidate.resolve(strict=True)
+                    if candidate in signed:
+                        if candidate in observed_owners:
+                            raise ReleaseBuildError(
+                                "signed installed distribution ownership overlaps"
+                            )
                         size, digest = _file_digest(candidate)
                         encoded = (
                             base64.urlsafe_b64encode(bytes.fromhex(digest))
@@ -3557,13 +3566,16 @@ def rewrite_signed_record_entries(
                             .decode("ascii")
                         )
                         row = [row[0], f"sha256={encoded}", str(size)]
-                        pending.remove(candidate)
+                        observed_owners.add(candidate)
                         changed = True
                     rows.append(row)
         except (OSError, UnicodeError, csv.Error) as error:
             raise ReleaseBuildError("installed distribution RECORD is unreadable") from error
-        if not changed:
-            continue
+        if changed:
+            rewrites.append((record, rows))
+    if not required_owners <= observed_owners:
+        raise ReleaseBuildError("signed installed distribution file is absent from RECORD")
+    for record, rows in rewrites:
         temporary = record.with_name(f".{record.name}.signed")
         if temporary.exists() or temporary.is_symlink():
             raise ReleaseBuildError("signed RECORD replacement path already exists")
@@ -3577,8 +3589,6 @@ def rewrite_signed_record_entries(
             os.replace(temporary, record)
         finally:
             temporary.unlink(missing_ok=True)
-    if pending:
-        raise ReleaseBuildError("signed installed distribution file is absent from RECORD")
 
 
 def _is_native_code(path: Path, system: str) -> bool:
@@ -4450,6 +4460,8 @@ def inspect_installed_distribution(
     hashed_entries: set[str] = set()
     checked_hash_bytecode: list[tuple[str, str]] = []
     external_entries: set[str] = set()
+    owned_paths: set[Path] = set()
+    owned_file_identities: set[tuple[int, int]] = set()
     saw_record = False
     saw_training_driver = False
     total_size = 0
@@ -4499,9 +4511,19 @@ def inspect_installed_distribution(
                     )
                 if path.is_symlink() or not path.is_file():
                     raise ReleaseBuildError("installed distribution file is unavailable")
-                observed_size, observed_sha256, header = (
+                observed_size, observed_sha256, header, file_identity = (
                     _inspect_installed_distribution_file(path)
                 )
+                resolved_path = path.resolve(strict=True)
+                if (
+                    resolved_path in owned_paths
+                    or file_identity in owned_file_identities
+                ):
+                    raise ReleaseBuildError(
+                        "installed distribution physical ownership overlaps"
+                    )
+                owned_paths.add(resolved_path)
+                owned_file_identities.add(file_identity)
                 if not encoded_digest and not encoded_size:
                     source_name = _checked_hash_bytecode_source(name, runtime)
                     if (
@@ -4595,12 +4617,21 @@ def inspect_installed_distribution(
         native_name = native_entries[0]
         native = site_packages / _safe_record_path(native_name)
         native_sha256, native_size = entries[native_name]
-    record_size, record_sha256 = _file_digest(record)
+    record_size, record_sha256, _header, record_identity = (
+        _inspect_installed_distribution_file(record)
+    )
+    resolved_record = record.resolve(strict=True)
+    if resolved_record in owned_paths or record_identity in owned_file_identities:
+        raise ReleaseBuildError("installed distribution physical ownership overlaps")
+    owned_paths.add(resolved_record)
+    owned_file_identities.add(record_identity)
     return InstalledDistribution(
         name=requirement.name,
         version=requirement.version,
         roots=roots,
         external_paths=tuple(sorted(external_entries)),
+        owned_paths=tuple(sorted(owned_paths)),
+        owned_file_identities=tuple(sorted(owned_file_identities)),
         record=record.relative_to(release_root),
         record_sha256=record_sha256,
         record_size=record_size,
@@ -4655,6 +4686,8 @@ def _require_disjoint_distribution_roots(
 ) -> None:
     roots = set()
     external_paths = set()
+    owned_paths = set()
+    owned_file_identities = set()
     for distribution in distributions:
         for root in distribution.roots:
             if root in roots:
@@ -4664,6 +4697,14 @@ def _require_disjoint_distribution_roots(
             if path in external_paths:
                 raise ReleaseBuildError("installed distribution ownership overlaps")
             external_paths.add(path)
+        for path in distribution.owned_paths:
+            if path in owned_paths:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            owned_paths.add(path)
+        for identity in distribution.owned_file_identities:
+            if identity in owned_file_identities:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            owned_file_identities.add(identity)
 
 
 def install_training_environment(
@@ -4806,7 +4847,9 @@ def _checked_hash_bytecode_source(
     return (path.parent.parent / f"{stem}.py").as_posix()
 
 
-def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
+def _inspect_installed_distribution_file(
+    path: Path,
+) -> tuple[int, str, bytes, tuple[int, int]]:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -4867,7 +4910,7 @@ def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
         raise ReleaseBuildError(
             "installed distribution file changed during inspection"
         )
-    return observed, digest.hexdigest(), bytes(header)
+    return observed, digest.hexdigest(), bytes(header), (before.st_dev, before.st_ino)
 
 
 def _safe_record_path(value: str) -> Path:

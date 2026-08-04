@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -413,6 +414,19 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                             runtime,
                             builder.RuntimeRequirement("numpy", "2.5.1"),
                         )
+                    signed_script_bytes = b"MZsigned locked uv launcher"
+                    script.write_bytes(signed_script_bytes)
+                    with mock.patch.object(builder, "host_profile", return_value=profile):
+                        builder.rewrite_signed_record_entries(
+                            release,
+                            runtime,
+                            (script,),
+                        )
+                        distribution = builder.inspect_installed_distribution(
+                            release,
+                            runtime,
+                            builder.RuntimeRequirement("numpy", "2.5.1"),
+                        )
                     self.assertEqual(distribution.file_count, 2)
                     self.assertEqual(
                         distribution.roots, ("numpy-2.5.1.dist-info",)
@@ -502,6 +516,46 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 "installed distribution ownership overlaps",
             ):
                 builder._require_disjoint_distribution_roots(tuple(distributions))
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                with self.assertRaisesRegex(
+                    builder.ReleaseBuildError,
+                    "signed installed distribution ownership overlaps",
+                ):
+                    builder.rewrite_signed_record_entries(
+                        release,
+                        runtime,
+                        (script,),
+                    )
+
+            alias = release / "bin/beta-tool"
+            os.link(script, alias)
+            beta_metadata = b"Metadata-Version: 2.4\nName: beta\nVersion: 1.0\n\n"
+            beta_record = site_packages / "beta-1.0.dist-info/RECORD"
+            beta_record.write_text(
+                "\n".join(
+                    (
+                        hashed_row("beta-1.0.dist-info/METADATA", beta_metadata),
+                        hashed_row("../../../bin/beta-tool", script_bytes),
+                        "beta-1.0.dist-info/RECORD,,",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(builder, "host_profile", return_value=profile):
+                aliased = builder.inspect_installed_distribution(
+                    release,
+                    runtime,
+                    builder.RuntimeRequirement("beta", "1.0"),
+                )
+            self.assertNotEqual(distributions[0].external_paths, aliased.external_paths)
+            with self.assertRaisesRegex(
+                builder.ReleaseBuildError,
+                "installed distribution ownership overlaps",
+            ):
+                builder._require_disjoint_distribution_roots(
+                    (distributions[0], aliased)
+                )
 
     def test_training_receipts_bind_build_foundation_and_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

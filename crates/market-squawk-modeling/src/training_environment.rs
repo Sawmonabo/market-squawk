@@ -1,7 +1,8 @@
 //! Independent verification of the installed Python training release authority.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, Metadata};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -664,6 +665,7 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
 struct VerifiedDistribution {
     entries: BTreeMap<String, ([u8; 32], u64)>,
     external_paths: BTreeSet<String>,
+    owned_paths: Vec<PathBuf>,
     roots: BTreeSet<String>,
     site_packages: PathBuf,
 }
@@ -686,6 +688,7 @@ fn verify_distributions(
     }
     let mut owned_roots = project.roots.clone();
     let mut owned_external_paths = project.external_paths.clone();
+    let mut owned_paths = project.owned_paths.clone();
     for (wire, requirement) in environment
         .runtime_distributions
         .iter()
@@ -707,7 +710,9 @@ fn verify_distributions(
         {
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
+        owned_paths.extend(verified.owned_paths);
     }
+    verify_unique_owned_files(&owned_paths)?;
 
     let native_relative = relative_path(&environment.native_extension.relative_path)?;
     let native_path = root.join(native_relative);
@@ -762,6 +767,7 @@ fn verify_distribution(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let mut owned_paths = vec![canonical(&record_path)?];
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -797,6 +803,7 @@ fn verify_distribution(
         }
         let is_external = external_paths.contains(name);
         let is_training_driver = require_training_driver && name == training_driver_record_path;
+        let owned_path;
         let file = if is_external {
             if digest.is_empty() || size.is_empty() || (is_training_driver && saw_training_driver) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
@@ -804,12 +811,9 @@ fn verify_distribution(
             if is_training_driver {
                 saw_training_driver = true;
             }
-            read_controlled(
-                root,
-                &external_distribution_relative_path(name)?,
-                MAX_DISTRIBUTION_FILE_BYTES,
-                false,
-            )?
+            let relative = external_distribution_relative_path(name)?;
+            owned_path = root.join(&relative);
+            read_controlled(root, &relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
         } else {
             let relative = relative_path(name)?;
             let first = relative
@@ -823,8 +827,10 @@ fn verify_distribution(
             if !roots.contains(first) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
+            owned_path = site_packages.join(relative);
             read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
         };
+        owned_paths.push(canonical(&owned_path)?);
         let size = if digest.is_empty() && size.is_empty() {
             file.size_bytes
         } else {
@@ -878,6 +884,7 @@ fn verify_distribution(
     Ok(VerifiedDistribution {
         entries,
         external_paths,
+        owned_paths,
         roots,
         site_packages: site_packages.to_path_buf(),
     })
@@ -930,6 +937,30 @@ fn external_distribution_relative_path(value: &str) -> Result<PathBuf, TrainingE
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     Ok(Path::new(directory).join(path))
+}
+
+fn verify_unique_owned_files(paths: &[PathBuf]) -> Result<(), TrainingEnvironmentError> {
+    let mut canonical_paths = BTreeSet::new();
+    let mut identities: HashMap<u64, Vec<&Path>> = HashMap::new();
+    for path in paths {
+        if !canonical_paths.insert(path.clone()) {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        let handle = same_file::Handle::from_path(path)
+            .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+        let mut hasher = DefaultHasher::new();
+        handle.hash(&mut hasher);
+        let candidates = identities.entry(hasher.finish()).or_default();
+        for candidate in candidates.iter().copied() {
+            if same_file::is_same_file(candidate, path)
+                .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
+            {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+        }
+        candidates.push(path);
+    }
+    Ok(())
 }
 
 fn scan_distribution_paths(
@@ -1403,7 +1434,25 @@ fn base64_url(bytes: &[u8; 32]) -> String {
 mod tests {
     use std::fs;
 
-    use super::{TrainingEnvironmentError, hash, verify_runtime_program_identity};
+    use super::{
+        TrainingEnvironmentError, hash, verify_runtime_program_identity, verify_unique_owned_files,
+    };
+
+    #[test]
+    fn distribution_ownership_rejects_distinct_hard_link_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"one physical distribution file")?;
+        fs::hard_link(&first, &second)?;
+
+        assert_eq!(
+            verify_unique_owned_files(&[first, second]),
+            Err(TrainingEnvironmentError::InstalledDistribution)
+        );
+        Ok(())
+    }
 
     #[test]
     fn runtime_program_identity_accepts_a_copy_and_rejects_a_substitution()

@@ -1373,13 +1373,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "21342e57a52170bd0dee161bca119f87bd7c96036c3ab1a67b4e59540ce0fdce",
-      "size_bytes": 243636
+      "sha256": "4a2f41312d2c29c5bf007c7f88b38de3fbf1c5e38f0eaf3aca7e76285ce445c4",
+      "size_bytes": 243650
     },
     {
       "path": "Cargo.toml",
-      "sha256": "9e9c40521bccd4092c861b3f22a2de09c1e85e07d07e0b810a28f0d717ed0ff3",
-      "size_bytes": 9045
+      "sha256": "ca378b4ecef6d3f699b54495fa8543bbf62e6ae73ee56489c11e18dacfdae91a",
+      "size_bytes": 9066
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
@@ -5248,8 +5248,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/Cargo.toml",
-      "sha256": "86f173229ec9963501fe9942fa6e5cd8c4b939660df1cd967e9828f81e88a1fc",
-      "size_bytes": 1741
+      "sha256": "bcb4427a19eae7aa1895a6bf08a6381c1776e43a52c5c7898d05ca2502cd98ad",
+      "size_bytes": 1768
     },
     {
       "path": "crates/market-squawk-modeling/fixtures/onnx/manifest.json",
@@ -5398,8 +5398,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/training_environment.rs",
-      "sha256": "da58ee741444e2f342a9334546a3889e81109d06f7c6592fc4ff926da3ba3535",
-      "size_bytes": 50498
+      "sha256": "887d2fc9944f53b8b91b08861db59d72947a97853566695b0657a77c183089b2",
+      "size_bytes": 52561
     },
     {
       "path": "crates/market-squawk-modeling/src/training_protocol.rs",
@@ -6633,13 +6633,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "98f16c9fae4f32ec71afc096b70185a86e22db80c6a05da66770acd1a6430fa5",
-      "size_bytes": 207459
+      "sha256": "bdfaa96cb891e97e3e6b28472a535f0ac2e0efeef5d7ec3833e5b750cf1354fe",
+      "size_bytes": 209499
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "81797fc9382035dea720956016d537de8dba45a33941a3a2b66cdfaa0ab7fc76",
-      "size_bytes": 29117
+      "sha256": "390486a936c5bf10876ef662978be40d6bdbb8adf265778f8e6b44ffc0fb2ed9",
+      "size_bytes": 31569
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",
