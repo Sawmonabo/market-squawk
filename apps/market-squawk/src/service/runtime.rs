@@ -27,7 +27,8 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use super::{
-    InstalledServiceError, mcp_control::PreparedMcpClientAuthority,
+    InstalledServiceError,
+    mcp_control::{McpClientActivationAuthority, PreparedMcpClientAuthority},
     ready_admission::AdmittedRuntimeClient,
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
@@ -320,6 +321,23 @@ impl PreparedRuntime {
 
     pub(super) fn identity_root(&self) -> std::path::PathBuf {
         self.identity_root.clone()
+    }
+
+    pub(super) fn mcp_client_activation_authority(
+        &self,
+    ) -> Result<McpClientActivationAuthority, InstalledServiceError> {
+        let desktop_client_id = self
+            .state
+            .registration(NamedClient::Desktop)
+            .ok_or(InstalledServiceError::InvalidRuntimeState)?
+            .client_id();
+        Ok(McpClientActivationAuthority::new(
+            self.state.runtime,
+            desktop_client_id,
+            self.identity_root.clone(),
+            Arc::clone(&self.secret_store),
+            Arc::clone(&self.credentials),
+        ))
     }
 
     pub(super) fn take_mcp_clients(

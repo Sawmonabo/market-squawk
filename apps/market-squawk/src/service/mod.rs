@@ -804,13 +804,9 @@ fn compose_transport(
             .map_err(|_error| InstalledServiceError::InvalidComposition)?,
     ));
     let mcp_limit_spec = McpLimitSpec::default();
-    let desktop_registration = runtime.registration(NamedClient::Desktop)?;
+    let mcp_activation_authority = runtime.mcp_client_activation_authority()?;
     let mcp_control = runtime.take_mcp_clients()?.activate(
-        runtime.runtime(),
-        desktop_registration.client_id(),
-        runtime.identity_root(),
-        runtime.secret_store(),
-        runtime.credentials(),
+        mcp_activation_authority,
         MCP_CLIENT_REQUESTS,
         mcp_limit_spec,
     )?;

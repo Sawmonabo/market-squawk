@@ -48,6 +48,33 @@ pub(super) struct PreparedMcpClientAuthority {
     document: AuthorityDocument,
 }
 
+/// Product-owned capabilities required to activate the prepared MCP client authority.
+pub(super) struct McpClientActivationAuthority {
+    runtime: RuntimeIdentity,
+    desktop_client_id: ClientId,
+    runtime_identity_root: PathBuf,
+    secret_store: Arc<dyn SecretStore>,
+    credentials: Arc<CredentialRegistry>,
+}
+
+impl McpClientActivationAuthority {
+    pub(super) fn new(
+        runtime: RuntimeIdentity,
+        desktop_client_id: ClientId,
+        runtime_identity_root: PathBuf,
+        secret_store: Arc<dyn SecretStore>,
+        credentials: Arc<CredentialRegistry>,
+    ) -> Self {
+        Self {
+            runtime,
+            desktop_client_id,
+            runtime_identity_root,
+            secret_store,
+            credentials,
+        }
+    }
+}
+
 impl std::fmt::Debug for PreparedMcpClientAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -111,14 +138,17 @@ impl PreparedMcpClientAuthority {
     /// Activates dynamic authentication and reconciles any interrupted prior-generation cleanup.
     pub(super) fn activate(
         mut self,
-        runtime: RuntimeIdentity,
-        desktop_client_id: ClientId,
-        runtime_identity_root: PathBuf,
-        secret_store: Arc<dyn SecretStore>,
-        credentials: Arc<CredentialRegistry>,
+        authority: McpClientActivationAuthority,
         maximum_client_requests: usize,
         limits: McpLimitSpec,
     ) -> Result<Arc<InstalledMcpControl>, McpControlError> {
+        let McpClientActivationAuthority {
+            runtime,
+            desktop_client_id,
+            runtime_identity_root,
+            secret_store,
+            credentials,
+        } = authority;
         if runtime.installation_id() != self.document.installation_id
             || runtime.workspace_id() != self.document.workspace_id
             || maximum_client_requests == 0
