@@ -345,7 +345,7 @@ describe("Market Squawk desktop boundary", () => {
     if (!(navigation instanceof HTMLElement)) {
       throw new Error("Market Squawk navigation is absent")
     }
-    expect(navigation.querySelectorAll("a,button")).toHaveLength(16)
+    expect(navigation.querySelectorAll("a,button")).toHaveLength(18)
     const paperExecution = Array.from(
       navigation.querySelectorAll("button"),
     ).find((button) => button.textContent?.includes("Paper Execution"))
