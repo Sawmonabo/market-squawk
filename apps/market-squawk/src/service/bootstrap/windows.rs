@@ -1,6 +1,6 @@
 //! Local-only named-pipe boundary with exact logon-SID admission and client impersonation.
 
-use std::{io::Read as _, os::windows::io::OwnedHandle, path::Path, sync::Arc};
+use std::{fs, io::Read as _, os::windows::io::OwnedHandle, path::Path, sync::Arc};
 
 use interprocess::{
     local_socket::{
@@ -27,6 +27,7 @@ pub(super) struct Listener {
 
 impl Listener {
     pub(super) fn bind(root: &Path) -> Result<Self, InstalledServiceError> {
+        fs::create_dir_all(root)?;
         let logon_sid = SecurityIdentifier::get_current_logon_sid()
             .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?
             .ok_or(InstalledServiceError::BootstrapUnavailable)?;

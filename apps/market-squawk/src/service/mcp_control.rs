@@ -39,27 +39,6 @@ const FORMAT_VERSION: u16 = 1;
 const AUTHORITY_DIRECTORY: &str = "installed-service/mcp-client-authority";
 const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Resolves the current generation for a newly launched MCP relay without reading secret bytes.
-pub(super) fn resolve_registration(
-    paths: &LocalPaths,
-    runtime: RuntimeIdentity,
-    root: &ClientCredentialRegistration,
-) -> Result<ClientCredentialRegistration, McpControlError> {
-    ensure_mcp_client(root.client())?;
-    let store =
-        LocalAuthorityStateStore::try_open(paths.control_root()?.root().join(AUTHORITY_DIRECTORY))?;
-    let encoded = store.load()?.ok_or(McpControlError::InvalidState)?;
-    let document = serde_json::from_slice::<AuthorityDocument>(&encoded)
-        .map_err(|_error| McpControlError::InvalidState)?
-        .validate(runtime.installation_id(), runtime.workspace_id())?;
-    document.validate_runtime_root(root)?;
-    document
-        .effective_registrations()?
-        .into_iter()
-        .find(|registration| registration.client() == root.client())
-        .ok_or(McpControlError::InvalidState)
-}
-
 /// Durable preparation boundary resolved before the runtime credential registry is loaded.
 pub(super) struct PreparedMcpClientAuthority {
     authority_root: PathBuf,
@@ -163,6 +142,7 @@ impl PreparedMcpClientAuthority {
             desktop_client_id,
             authority_root: self.authority_root,
             credentials,
+            secret_store,
             limits,
             started_at: Instant::now(),
             rejected_credentials: std::sync::atomic::AtomicU64::new(0),
@@ -191,6 +171,7 @@ pub(super) struct InstalledMcpControl {
     desktop_client_id: ClientId,
     authority_root: PathBuf,
     credentials: Arc<CredentialRegistry>,
+    secret_store: Arc<dyn SecretStore>,
     limits: McpLimitSpec,
     started_at: Instant,
     rejected_credentials: std::sync::atomic::AtomicU64,
@@ -212,6 +193,40 @@ impl std::fmt::Debug for InstalledMcpControl {
 }
 
 impl InstalledMcpControl {
+    /// Atomically admits the current non-revoked MCP generation and its exact secret.
+    pub(super) fn admit_client(
+        &self,
+        client: NamedClient,
+    ) -> Result<
+        (
+            ClientCredentialRegistration,
+            market_squawk_platform::SecretValue,
+        ),
+        McpControlError,
+    > {
+        ensure_mcp_client(client)?;
+        let _mutation = self.mutation_gate.lock();
+        let registration = {
+            let state = self.state.read();
+            if state.document.pending.is_some() || state.document.is_revoked(client) {
+                return Err(McpControlError::Unauthorized);
+            }
+            state
+                .entries
+                .get(&client)
+                .map(|entry| entry.registration.clone())
+                .ok_or(McpControlError::InvalidState)?
+        };
+        let credential = self
+            .secret_store
+            .read(
+                registration.reference(),
+                &secret_control("installed-mcp-ready-admission")?,
+            )
+            .map_err(|_error| McpControlError::SecretStore)?;
+        Ok((registration, credential))
+    }
+
     /// Returns the exact number of MCP client identities with active requests.
     pub(super) fn active_client_count(&self) -> Result<usize, McpControlError> {
         let state = self.state.read();

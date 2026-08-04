@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    io::Read as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -18,8 +19,7 @@ use market_squawk::{
 };
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service_capabilities};
 use market_squawk_platform::{
-    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, PreferredSecretStore,
-    SecretStore, SecretValue,
+    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{ApplicationClient, EventPageLimit, NamedClient};
 use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext, RequestId};
@@ -29,13 +29,17 @@ use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const BOOTSTRAP_SEED_ROOT_ENV: &str = "MARKET_SQUAWK_TEST_BOOTSTRAP_SEED_ROOT";
+const INSTALLED_SERVICE_PROCESS_ROLE_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROLE";
+const INSTALLED_SERVICE_PROCESS_ROOT_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROOT";
 const INSTALLED_SERVICE_TEST_UNLOCK: &str = "installed-service-test-unlock";
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
-    if let Some(root) = std::env::var_os(BOOTSTRAP_SEED_ROOT_ENV) {
-        return seed_encrypted_runtime(PathBuf::from(root)).await;
+    if let Some(role) = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROLE_ENV) {
+        let root = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROOT_ENV)
+            .map(PathBuf::from)
+            .ok_or("installed-service subprocess root is missing")?;
+        return run_installed_service_process_role(&role, root).await;
     }
     let temporary = tempfile::tempdir()?;
     let environment = BTreeMap::<OsString, OsString>::new();
@@ -60,8 +64,10 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         Err(InstalledServiceError::AlreadyRunning)
     ));
 
-    let connector =
-        InstalledServiceConnector::try_new_with_secret_store(&config, Arc::clone(&secrets))?;
+    let connector = InstalledServiceConnector::try_new_at_installation_root(
+        &config,
+        temporary.path().join(".market-squawk-installed-service"),
+    )?;
     let desktop = connector.connect(NamedClient::Desktop, Some("tauri://localhost".to_owned()))?;
     let cli = connector.connect(NamedClient::Cli, None)?;
     let bootstrap = desktop.bootstrap(CancellationToken::new()).await?;
@@ -132,43 +138,14 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
     drop(secrets);
 
     let bootstrap_seed_root = temporary.path().join("bootstrap-seed");
-    seed_encrypted_runtime_subprocess(&bootstrap_seed_root).await?;
-    let bootstrap_config = AppConfig::load(ConfigSources::new(
-        None,
-        &environment,
-        ConfigOverrides {
-            data_dir: Some(bootstrap_seed_root.join("product")),
-            source_shutdown_ms: Some(60_000),
-            ..ConfigOverrides::default()
-        },
-    ))?;
-    let bootstrap_secret_root = bootstrap_seed_root.join("runtime-secrets");
-    let locked_secrets: Arc<dyn SecretStore> = Arc::new(
-        PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-            "market-squawk-runtime-bootstrap-test",
-            &bootstrap_secret_root,
-        )?,
-    );
-    let locked_connector = InstalledServiceConnector::try_new_with_secret_store(
+    run_installed_subprocess(&bootstrap_seed_root, "seed").await?;
+    let bootstrap_config = installed_service_process_config(&bootstrap_seed_root)?;
+    let locked_connector = InstalledServiceConnector::try_new_at_installation_root(
         &bootstrap_config,
-        Arc::clone(&locked_secrets),
+        installed_service_authority_root(&bootstrap_seed_root),
     )?;
-    let restarting = tokio::spawn(InstalledService::start_with_secret_store(
-        bootstrap_config,
-        Arc::clone(&locked_secrets),
-    ));
-    let bootstrap = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match locked_connector.bootstrap_status().await {
-                Ok(status) => break Ok::<_, InstalledServiceError>(status),
-                Err(InstalledServiceError::ServiceUnavailable) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => break Err(error),
-            }
-        }
-    })
-    .await??;
+    let mut service = start_installed_service_subprocess(&bootstrap_seed_root)?;
+    let bootstrap = wait_for_bootstrap(&locked_connector).await?;
     assert_eq!(bootstrap.state(), InstalledServiceBootstrapState::Required);
     assert_eq!(
         bootstrap.requirement(),
@@ -176,6 +153,7 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
     );
     assert!(locked_connector.connect(NamedClient::Cli, None).is_err());
     let installation = bootstrap.installation_id();
+    let first_bootstrap_generation = bootstrap.generation();
 
     let accepted = locked_connector
         .bootstrap_unlock(SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())?)
@@ -187,20 +165,220 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
             .await
             .is_err()
     );
+    wait_until_ready(&locked_connector).await?;
+    assert!(matches!(
+        locked_connector.bootstrap_status().await,
+        Err(InstalledServiceError::ServiceUnavailable)
+    ));
 
-    let restarted = tokio::time::timeout(Duration::from_secs(30), restarting).await???;
-    let restarted_cli = locked_connector.connect(NamedClient::Cli, None)?;
-    let restarted_snapshot = restarted_cli.bootstrap(CancellationToken::new()).await?;
+    run_installed_subprocess(&bootstrap_seed_root, "clients").await?;
+    service.stop()?;
+
+    let mut restarted_service = start_installed_service_subprocess(&bootstrap_seed_root)?;
+    let restarted_bootstrap = wait_for_bootstrap(&locked_connector).await?;
     assert_eq!(
-        restarted_snapshot["runtime"]["installationId"],
-        installation.as_uuid().to_string()
+        restarted_bootstrap.state(),
+        InstalledServiceBootstrapState::Required
     );
-    let restarted_shutdown = CancellationToken::new();
-    let restarted_task = tokio::spawn(restarted.run(restarted_shutdown.clone()));
-    restarted_cli.probe_ready(CancellationToken::new()).await?;
-    restarted_shutdown.cancel();
-    assert_eq!(restarted_task.await??, InstalledServiceRunOutcome::Stopped);
+    assert_eq!(
+        restarted_bootstrap.requirement(),
+        Some(BootstrapRequirement::EncryptedFallbackLocked)
+    );
+    assert_eq!(restarted_bootstrap.installation_id(), installation);
+    assert_ne!(restarted_bootstrap.generation(), first_bootstrap_generation);
+    let restarted_accepted = locked_connector
+        .bootstrap_unlock(SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())?)
+        .await?;
+    assert_eq!(
+        restarted_accepted.state(),
+        InstalledServiceBootstrapState::Retrying
+    );
+    assert_eq!(
+        restarted_accepted.generation(),
+        restarted_bootstrap.generation()
+    );
+    wait_until_ready(&locked_connector).await?;
+    run_installed_subprocess(&bootstrap_seed_root, "cli").await?;
+    restarted_service.stop()?;
     Ok(())
+}
+
+async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> TestResult {
+    match role.to_str() {
+        Some("seed") => seed_encrypted_runtime(root).await,
+        Some("service") => {
+            let config = installed_service_process_config(&root)?;
+            let service = InstalledService::start_at_installation_root(
+                config,
+                installed_service_authority_root(&root),
+            )
+            .await?;
+            let cancellation = CancellationToken::new();
+            let task = tokio::spawn(service.run(cancellation.clone()));
+            let mut stop = [0_u8; 1];
+            let _read = tokio::io::AsyncReadExt::read(&mut tokio::io::stdin(), &mut stop).await?;
+            cancellation.cancel();
+            assert_eq!(task.await??, InstalledServiceRunOutcome::Stopped);
+            Ok(())
+        }
+        Some("clients" | "cli") => {
+            let role = role.to_str().ok_or("installed client role is not UTF-8")?;
+            let config = installed_service_process_config(&root)?;
+            let connector = InstalledServiceConnector::try_new_at_installation_root(
+                &config,
+                installed_service_authority_root(&root),
+            )?;
+            let cli = connector.connect(NamedClient::Cli, None)?;
+            cli.probe_ready(CancellationToken::new()).await?;
+            if role == "clients" {
+                let desktop = connector
+                    .connect(NamedClient::Desktop, Some("tauri://localhost".to_owned()))?;
+                let snapshot = desktop.bootstrap(CancellationToken::new()).await?;
+                assert_eq!(snapshot["readiness"]["service"], true);
+                for client in [NamedClient::ClaudeCode, NamedClient::Codex] {
+                    exercise_installed_relay(client, connector.connect_mcp_relay(client)?).await?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err("unsupported installed-service subprocess role".into()),
+    }
+}
+
+fn installed_service_process_config(root: &Path) -> TestResult<AppConfig> {
+    Ok(AppConfig::load(ConfigSources::new(
+        None,
+        &BTreeMap::<OsString, OsString>::new(),
+        ConfigOverrides {
+            data_dir: Some(root.join("product")),
+            source_shutdown_ms: Some(60_000),
+            ..ConfigOverrides::default()
+        },
+    ))?)
+}
+
+fn installed_service_authority_root(root: &Path) -> PathBuf {
+    root.join(".market-squawk-installed-service")
+}
+
+async fn wait_for_bootstrap(
+    connector: &InstalledServiceConnector,
+) -> TestResult<market_squawk::service::InstalledServiceBootstrapStatus> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match connector.bootstrap_status().await {
+                Ok(status) => break Ok::<_, InstalledServiceError>(status),
+                Err(InstalledServiceError::ServiceUnavailable) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await?
+    .map_err(Into::into)
+}
+
+async fn wait_until_ready(connector: &InstalledServiceConnector) -> TestResult {
+    let client = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match connector.connect(NamedClient::Cli, None) {
+                Ok(client) => break Ok::<_, InstalledServiceError>(client),
+                Err(InstalledServiceError::ServiceUnavailable) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await??;
+    client.probe_ready(CancellationToken::new()).await?;
+    Ok(())
+}
+
+async fn run_installed_subprocess(root: &Path, role: &str) -> TestResult {
+    let executable = std::env::current_exe()?;
+    let root = root.to_path_buf();
+    let role = role.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(executable)
+            .args([
+                "--exact",
+                "production_mcp_composition::service_runtime_is_the_single_authority_for_native_and_mcp_clients",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INSTALLED_SERVICE_PROCESS_ROLE_ENV, role)
+            .env(INSTALLED_SERVICE_PROCESS_ROOT_ENV, root)
+            .output()
+    })
+    .await??;
+    if !output.status.success() {
+        return Err(format!(
+            "installed subprocess role failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+struct InstalledServiceProcess {
+    child: Child,
+}
+
+impl InstalledServiceProcess {
+    fn stop(&mut self) -> TestResult {
+        drop(self.child.stdin.take());
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(15))
+            .ok_or("installed service stop deadline overflow")?;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let mut stderr = String::new();
+                if let Some(source) = self.child.stderr.take() {
+                    source.take(8 * 1024).read_to_string(&mut stderr)?;
+                }
+                return Err(format!("installed service subprocess failed: {stderr}").into());
+            }
+            if Instant::now() >= deadline {
+                self.child.kill()?;
+                let _status = self.child.wait()?;
+                return Err("installed service subprocess missed its stop deadline".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for InstalledServiceProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn start_installed_service_subprocess(root: &Path) -> TestResult<InstalledServiceProcess> {
+    let executable = std::env::current_exe()?;
+    let child = Command::new(executable)
+        .args([
+            "--exact",
+            "production_mcp_composition::service_runtime_is_the_single_authority_for_native_and_mcp_clients",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(INSTALLED_SERVICE_PROCESS_ROLE_ENV, "service")
+        .env(INSTALLED_SERVICE_PROCESS_ROOT_ENV, root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(InstalledServiceProcess { child })
 }
 
 async fn seed_encrypted_runtime(root: PathBuf) -> TestResult {
@@ -215,7 +393,9 @@ async fn seed_encrypted_runtime(root: PathBuf) -> TestResult {
         },
     ))?;
     let secrets: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
-        root.join("runtime-secrets"),
+        installed_service_authority_root(&root)
+            .join("control")
+            .join("secrets/installed-runtime"),
         SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())?,
     )?);
     let service = InstalledService::start_with_secret_store(config, secrets).await?;
@@ -223,31 +403,6 @@ async fn seed_encrypted_runtime(root: PathBuf) -> TestResult {
     let task = tokio::spawn(service.run(cancellation.clone()));
     cancellation.cancel();
     assert_eq!(task.await??, InstalledServiceRunOutcome::Stopped);
-    Ok(())
-}
-
-async fn seed_encrypted_runtime_subprocess(root: &Path) -> TestResult {
-    let executable = std::env::current_exe()?;
-    let root = root.to_path_buf();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(executable)
-            .args([
-                "--exact",
-                "production_mcp_composition::service_runtime_is_the_single_authority_for_native_and_mcp_clients",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(BOOTSTRAP_SEED_ROOT_ENV, root)
-            .output()
-    })
-    .await??;
-    if !output.status.success() {
-        return Err(format!(
-            "encrypted-runtime seed subprocess failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
     Ok(())
 }
 

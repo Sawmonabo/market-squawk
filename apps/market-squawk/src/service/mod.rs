@@ -19,6 +19,7 @@ mod operations_activity_bindings;
 mod operations_bootstrap;
 mod operations_composition;
 mod portfolio_import;
+mod ready_admission;
 mod research_dataset;
 mod resources;
 mod runtime;
@@ -28,7 +29,7 @@ mod workspace_recovery;
 mod workspace_selector;
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -111,7 +112,6 @@ pub use runtime::SystemProcessIdentityVerifier;
 /// Native-only connector for one named client of the already running installed service.
 pub struct InstalledServiceConnector {
     paths: LocalPaths,
-    secret_store: Arc<dyn SecretStore>,
 }
 
 impl std::fmt::Debug for InstalledServiceConnector {
@@ -119,36 +119,24 @@ impl std::fmt::Debug for InstalledServiceConnector {
         formatter
             .debug_struct("InstalledServiceConnector")
             .field("paths", &"[LOCAL CAPABILITIES]")
-            .field("secret_store", &"[SECRET AUTHORITY]")
             .finish()
     }
 }
 
 impl InstalledServiceConnector {
-    /// Opens only discovery and native secret capabilities; it never constructs product domains.
+    /// Opens only native discovery capabilities; it never constructs product or secret domains.
     pub fn try_new(_config: &AppConfig) -> Result<Self, InstalledServiceError> {
         let paths = LocalPaths::prepare(default_installation_data_root()?)?;
-        let secret_store = runtime_secret_store(&paths)?;
-        Ok(Self {
-            paths,
-            secret_store,
-        })
+        Ok(Self { paths })
     }
 
-    /// Opens discovery with an already-owned native secret capability.
-    ///
-    /// This is intended for a foreground unlock/bootstrap host and deterministic integration
-    /// verification. The capability remains native and is never serialized to presentation code.
-    pub fn try_new_with_secret_store(
-        config: &AppConfig,
-        secret_store: Arc<dyn SecretStore>,
+    /// Opens native discovery at an explicitly selected absolute installation authority root.
+    pub fn try_new_at_installation_root(
+        _config: &AppConfig,
+        installation_root: impl AsRef<Path>,
     ) -> Result<Self, InstalledServiceError> {
-        let legacy_paths = LocalPaths::prepare(config.data_dir())?;
-        let paths = LocalPaths::prepare(deterministic_installation_root(&legacy_paths)?)?;
-        Ok(Self {
-            paths,
-            secret_store,
-        })
+        let paths = prepare_installation_paths(installation_root.as_ref())?;
+        Ok(Self { paths })
     }
 
     /// Resolves one exact live generation and returns its authenticated native client.
@@ -172,15 +160,8 @@ impl InstalledServiceConnector {
         }
         let structure = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
             .map_err(|_error| InstalledServiceError::InvalidComposition)?;
-        runtime::connect_client(
-            &self.paths,
-            Arc::clone(&self.secret_store),
-            client,
-            origin,
-            structure,
-            RESPONSE_BODY_BYTES,
-            timeout,
-        )
+        let admitted = ready_admission::request(&self.paths, client, timeout)?;
+        runtime::connect_admitted_client(admitted, origin, structure, RESPONSE_BODY_BYTES, timeout)
     }
 
     /// Reads the current short-lived, secret-free credential-bootstrap state.
@@ -214,17 +195,13 @@ impl InstalledServiceConnector {
         if !matches!(client, NamedClient::ClaudeCode | NamedClient::Codex) {
             return Err(InstalledServiceError::InvalidComposition);
         }
-        let resolved =
-            runtime::resolve_client_root(&self.paths, Arc::clone(&self.secret_store), client)?;
-        let registration = mcp_control::resolve_registration(
-            &self.paths,
-            resolved.record.runtime(),
-            &resolved.registration,
-        )?;
-        let credential = runtime::load_client_credential(&self.secret_store, &registration)?;
-        let transport =
-            InstalledMcpRelayTransport::try_new(&resolved.record, credential, CLIENT_TIMEOUT)
-                .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+        let admitted = ready_admission::request(&self.paths, client, CLIENT_TIMEOUT)?;
+        let transport = InstalledMcpRelayTransport::try_new(
+            &admitted.record,
+            admitted.credential,
+            CLIENT_TIMEOUT,
+        )
+        .map_err(|_error| InstalledServiceError::InvalidComposition)?;
         Ok(Arc::new(transport))
     }
 }
@@ -236,6 +213,7 @@ pub struct InstalledService {
     jobs: InstalledJobAuthority,
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     runtime: PreparedRuntime,
+    admission: ready_admission::ReadyAdmission,
     lifecycle: Arc<InstalledServiceLifecycle>,
     _workspace_selector: Arc<WorkspaceSelector>,
     _instance_guard: LocalAuthorityStateStore,
@@ -246,6 +224,7 @@ impl std::fmt::Debug for InstalledService {
         formatter
             .debug_struct("InstalledService")
             .field("runtime", &self.runtime)
+            .field("admission", &self.admission)
             .field("product", &"[LOCAL PRODUCT AUTHORITY]")
             .field("jobs", &self.jobs)
             .field("audit", &"[DURABLE AUDIT AUTHORITY]")
@@ -265,13 +244,41 @@ impl InstalledService {
         Self::start_with_logging_store(config, logs).await
     }
 
+    /// Composes the service at an explicitly selected absolute installation authority root.
+    pub async fn start_at_installation_root(
+        config: AppConfig,
+        installation_root: impl AsRef<Path>,
+    ) -> Result<Self, InstalledServiceError> {
+        let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
+        let logs = logging::open_log_store(&installation_paths)?;
+        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+    }
+
     /// Composes the installed service over the process-owned structured-log store.
     pub async fn start_with_logging_store(
         config: AppConfig,
         logs: Arc<crate::application::logs::StructuredLogStore>,
     ) -> Result<Self, InstalledServiceError> {
-        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
         let installation_paths = LocalPaths::prepare(default_installation_data_root()?)?;
+        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+    }
+
+    /// Composes the service with process-owned logging at an explicit installation root.
+    pub async fn start_with_logging_store_at_installation_root(
+        config: AppConfig,
+        installation_root: impl AsRef<Path>,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+    ) -> Result<Self, InstalledServiceError> {
+        let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
+        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+    }
+
+    async fn start_with_logging_store_at_prepared_root(
+        config: AppConfig,
+        installation_paths: LocalPaths,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+    ) -> Result<Self, InstalledServiceError> {
+        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
         let secret_store = runtime_secret_store(&installation_paths)?;
         Self::start_prepared(
             config,
@@ -403,6 +410,7 @@ impl InstalledService {
                 audit,
                 server,
                 readiness,
+                mcp_control,
             } = match compose_transport(TransportComposition {
                 paths: &workspace_paths,
                 runtime: &mut runtime,
@@ -438,7 +446,36 @@ impl InstalledService {
                 cleanup_startup(&product, &jobs).await;
                 return Err(InstalledServiceError::WorkspaceSelection);
             }
+            let mut admission = match ready_admission::ReadyAdmission::start(
+                &installation_paths,
+                runtime.record().clone(),
+                runtime.registration(NamedClient::Desktop)?,
+                runtime.registration(NamedClient::Cli)?,
+                runtime.secret_store(),
+                mcp_control,
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    drain_failed_server(server).await;
+                    cleanup_startup(&product, &jobs).await;
+                    return Err(error);
+                }
+            };
+            if admission.probe().await.is_err() {
+                let _retired = admission.shutdown().await;
+                drain_failed_server(server).await;
+                cleanup_startup(&product, &jobs).await;
+                return Err(InstalledServiceError::ReadinessFailed);
+            }
             if let Err(error) = runtime.publish() {
+                let _retired = admission.shutdown().await;
+                drain_failed_server(server).await;
+                cleanup_startup(&product, &jobs).await;
+                return Err(error);
+            }
+            if let Err(error) = admission.publish() {
+                let _rendezvous = runtime.retire();
+                let _retired = admission.shutdown().await;
                 drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
                 return Err(error);
@@ -449,6 +486,7 @@ impl InstalledService {
                 jobs,
                 audit,
                 runtime,
+                admission,
                 lifecycle,
                 _workspace_selector: workspace_selector,
                 _instance_guard: instance_guard,
@@ -478,6 +516,7 @@ impl InstalledService {
             jobs,
             audit,
             runtime,
+            mut admission,
             lifecycle,
             _workspace_selector,
             _instance_guard,
@@ -488,20 +527,28 @@ impl InstalledService {
             GRACEFUL_REQUEST_DRAIN,
             FORCED_REQUEST_DRAIN,
         ));
-        let (expected_next, transport_stopped_unexpectedly, completed_transport) = tokio::select! {
+        let (
+            expected_next,
+            transport_stopped_unexpectedly,
+            admission_stopped_unexpectedly,
+            completed_transport,
+        ) = tokio::select! {
             biased;
             expected_next = lifecycle.wait_for_restart() => {
-                transport_cancellation.cancel();
-                (Some(expected_next), false, None)
+                (Some(expected_next), false, false, None)
             }
             () = cancellation.cancelled() => {
-                transport_cancellation.cancel();
-                (None, false, None)
+                (None, false, false, None)
             }
             result = &mut serving => {
-                (None, true, Some(result.is_ok()))
+                (None, true, false, Some(result.is_ok()))
+            }
+            () = admission.failed() => {
+                (None, false, true, None)
             }
         };
+        let admission_retired = admission.shutdown().await;
+        transport_cancellation.cancel();
         let transport = match completed_transport {
             Some(transport) => transport,
             None => (&mut serving).await.is_ok(),
@@ -518,6 +565,7 @@ impl InstalledService {
         let rendezvous_retired = runtime.retire().unwrap_or(false);
         let report = InstalledServiceShutdownReport {
             transport,
+            admission_retired,
             jobs_stopped,
             application,
             audit_flushed,
@@ -525,13 +573,16 @@ impl InstalledService {
             rendezvous_retired,
         };
         drop(runtime);
+        drop(admission);
         drop(audit);
         drop(jobs);
         drop(product);
         drop(lifecycle);
         drop(_workspace_selector);
         drop(_instance_guard);
-        if report.is_complete() && transport_stopped_unexpectedly {
+        if report.is_complete() && admission_stopped_unexpectedly {
+            Err(InstalledServiceError::AdmissionStopped)
+        } else if report.is_complete() && transport_stopped_unexpectedly {
             Err(InstalledServiceError::TransportStopped)
         } else if report.is_complete() {
             Ok(
@@ -586,6 +637,7 @@ struct ComposedTransport {
     audit: Arc<crate::mcp::audit::DurableAuditSink>,
     server: market_squawk_runtime::RuntimeServer,
     readiness: LoopbackApplicationClient,
+    mcp_control: Arc<mcp_control::InstalledMcpControl>,
 }
 
 struct TransportComposition<'a> {
@@ -825,7 +877,7 @@ fn compose_transport(
         runtime.runtime().workspace_id(),
     )
     .map_err(|_error| InstalledServiceError::CompositionStage("MCP handler factory"))?;
-    let authenticator: Arc<dyn market_squawk_mcp::McpHttpAuthenticator> = mcp_control;
+    let authenticator: Arc<dyn market_squawk_mcp::McpHttpAuthenticator> = mcp_control.clone();
     let endpoint = runtime.endpoint().to_string();
     let request_cancellation = native.request_cancellation();
     let mcp = Arc::new(McpHttpService::new(
@@ -866,6 +918,7 @@ fn compose_transport(
         audit,
         server,
         readiness,
+        mcp_control,
     })
 }
 
@@ -902,13 +955,41 @@ async fn shutdown_application(application: Arc<crate::application::Application>)
 }
 
 fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
+    let namespace = runtime_secret_namespace(paths)?;
     Ok(Arc::new(
         PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-            "market-squawk-runtime",
+            &namespace,
             paths.control_root()?.root().join(RUNTIME_SECRET_DIRECTORY),
         )
         .map_err(|_error| InstalledServiceError::SecretStore)?,
     ))
+}
+
+fn runtime_secret_namespace(paths: &LocalPaths) -> Result<String, InstalledServiceError> {
+    use sha2::{Digest as _, Sha256};
+
+    let selected = std::fs::canonicalize(paths.root())?;
+    let default = default_installation_data_root()
+        .ok()
+        .and_then(|root| std::fs::canonicalize(root).ok());
+    if default.as_ref() == Some(&selected) {
+        return Ok("market-squawk-runtime".to_owned());
+    }
+    let digest = Sha256::digest(selected.as_os_str().as_encoded_bytes());
+    let mut namespace = String::from("market-squawk-runtime-v1-");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in &digest[..16] {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(namespace)
+}
+
+fn prepare_installation_paths(root: &Path) -> Result<LocalPaths, InstalledServiceError> {
+    if !root.is_absolute() {
+        return Err(InstalledServiceError::InvalidInstallationRoot);
+    }
+    LocalPaths::prepare(root).map_err(Into::into)
 }
 
 fn recoverable_bootstrap_requirement(
@@ -948,6 +1029,7 @@ fn deterministic_installation_root(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstalledServiceShutdownReport {
     transport: bool,
+    admission_retired: bool,
     jobs_stopped: bool,
     application: bool,
     audit_flushed: bool,
@@ -960,6 +1042,7 @@ impl InstalledServiceShutdownReport {
     #[must_use]
     pub const fn is_complete(self) -> bool {
         self.transport
+            && self.admission_retired
             && self.jobs_stopped
             && self.application
             && self.audit_flushed
@@ -971,6 +1054,9 @@ impl InstalledServiceShutdownReport {
 /// Closed installed-service composition and lifecycle failure.
 #[derive(Debug, Error)]
 pub enum InstalledServiceError {
+    /// An explicitly selected installation authority root was not absolute.
+    #[error("the installed-service authority root must be absolute")]
+    InvalidInstallationRoot,
     /// Another process owns the installed-service instance authority.
     #[error("the installed Market Squawk service is already running")]
     AlreadyRunning,
@@ -1058,6 +1144,9 @@ pub enum InstalledServiceError {
     /// The private runtime server stopped without an admitted lifecycle signal.
     #[error("installed-service transport stopped unexpectedly")]
     TransportStopped,
+    /// The service-lifetime ready admission broker stopped without an admitted lifecycle signal.
+    #[error("installed-service ready admission stopped unexpectedly")]
+    AdmissionStopped,
     /// No authenticated current installed-service generation is available.
     #[error("the installed Market Squawk service is unavailable")]
     ServiceUnavailable,
@@ -1073,6 +1162,18 @@ pub enum InstalledServiceError {
     /// Owner-authenticated bootstrap input was rejected without exposing secret detail.
     #[error("installed-service bootstrap request was rejected")]
     BootstrapRejected,
+    /// The ready-state native admission endpoint or its owner boundary is unavailable.
+    #[error("installed-service ready admission is unavailable")]
+    AdmissionUnavailable,
+    /// A ready-state admission request violated the fixed exact-generation protocol.
+    #[error("installed-service ready admission request is invalid")]
+    AdmissionProtocol,
+    /// A ready-state admission request elapsed its bounded monotonic deadline.
+    #[error("installed-service ready admission deadline elapsed")]
+    AdmissionDeadline,
+    /// Owner-authenticated ready-state admission was rejected without secret detail.
+    #[error("installed-service ready admission was rejected")]
+    AdmissionRejected,
     /// A private application client could not be constructed or used.
     #[error(transparent)]
     Client(#[from] ApplicationClientError),

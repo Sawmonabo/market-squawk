@@ -1,6 +1,7 @@
 //! Process-owned structured-log and terminal-tracing bootstrap.
 
 use std::{
+    path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,9 +46,31 @@ impl InstalledServiceLogging {
         filter: &str,
         terminal_format: TerminalLogFormat,
     ) -> Result<Self, InstalledServiceLoggingError> {
+        let store = open_installation_log_store()?;
+        Self::install_with_store(filter, terminal_format, store)
+    }
+
+    /// Installs process-owned logging at an explicitly selected absolute installation root.
+    pub fn install_at_installation_root(
+        filter: &str,
+        terminal_format: TerminalLogFormat,
+        installation_root: impl AsRef<Path>,
+    ) -> Result<Self, InstalledServiceLoggingError> {
+        if !installation_root.as_ref().is_absolute() {
+            return Err(InstalledServiceLoggingError::InvalidInstallationRoot);
+        }
+        let paths = LocalPaths::prepare(installation_root)?;
+        let store = open_log_store(&paths)?;
+        Self::install_with_store(filter, terminal_format, store)
+    }
+
+    fn install_with_store(
+        filter: &str,
+        terminal_format: TerminalLogFormat,
+        store: Arc<StructuredLogStore>,
+    ) -> Result<Self, InstalledServiceLoggingError> {
         let filter =
             EnvFilter::try_new(filter).map_err(|_| InstalledServiceLoggingError::InvalidFilter)?;
-        let store = open_installation_log_store()?;
         let (structured, drain, mut worker) =
             StructuredLogLayer::try_spawn(Arc::clone(&store), STRUCTURED_LOG_QUEUE_CAPACITY)?;
         let formatter = match terminal_format {
@@ -129,6 +152,9 @@ fn current_timestamp() -> Result<Timestamp, InstalledServiceLoggingError> {
 /// Typed bootstrap or terminal-drain failure without secret-bearing values.
 #[derive(Debug, Error)]
 pub enum InstalledServiceLoggingError {
+    /// An explicitly selected installation authority root was not absolute.
+    #[error("the installed-service logging root must be absolute")]
+    InvalidInstallationRoot,
     /// The configured tracing filter is invalid.
     #[error("the installed-service tracing filter is invalid")]
     InvalidFilter,

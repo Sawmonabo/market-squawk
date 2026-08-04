@@ -26,7 +26,10 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use super::{InstalledServiceError, mcp_control::PreparedMcpClientAuthority};
+use super::{
+    InstalledServiceError, mcp_control::PreparedMcpClientAuthority,
+    ready_admission::AdmittedRuntimeClient,
+};
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
 const STATE_FORMAT_VERSION: u16 = 1;
@@ -609,80 +612,6 @@ pub(super) fn current_timestamp() -> Result<Timestamp, InstalledServiceError> {
     wall_now()
 }
 
-pub(super) struct ResolvedRuntimeClient {
-    pub(super) record: RendezvousRecord,
-    pub(super) registration: ClientCredentialRegistration,
-    pub(super) credential: SecretValue,
-}
-
-pub(super) struct ResolvedRuntimeClientRoot {
-    pub(super) record: RendezvousRecord,
-    pub(super) registration: ClientCredentialRegistration,
-}
-
-impl std::fmt::Debug for ResolvedRuntimeClient {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ResolvedRuntimeClient")
-            .field("record", &self.record)
-            .field("registration", &self.registration)
-            .field("credential", &"[REDACTED]")
-            .finish()
-    }
-}
-
-pub(super) fn resolve_client(
-    paths: &LocalPaths,
-    secret_store: Arc<dyn SecretStore>,
-    client: NamedClient,
-) -> Result<ResolvedRuntimeClient, InstalledServiceError> {
-    let resolved = resolve_client_root(paths, Arc::clone(&secret_store), client)?;
-    let credential = load_client_credential(&secret_store, &resolved.registration)?;
-    Ok(ResolvedRuntimeClient {
-        record: resolved.record,
-        registration: resolved.registration,
-        credential,
-    })
-}
-
-pub(super) fn resolve_client_root(
-    paths: &LocalPaths,
-    secret_store: Arc<dyn SecretStore>,
-    client: NamedClient,
-) -> Result<ResolvedRuntimeClientRoot, InstalledServiceError> {
-    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
-    let identity_store = LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
-    let encoded = identity_store
-        .load()?
-        .ok_or(InstalledServiceError::ServiceUnavailable)?;
-    let InstalledRuntimeDocument::Active { state } = decode_document(&encoded)? else {
-        return Err(InstalledServiceError::ServiceUnavailable);
-    };
-    let state = state.validate()?;
-    let signing_key = secret_store
-        .read(
-            &state.rendezvous_signing_secret,
-            &secret_control("installed-runtime-client-signing-load")?,
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)?;
-    let rendezvous =
-        RendezvousAuthority::try_open(service_root.join(RENDEZVOUS_DIRECTORY), signing_key)?;
-    let record = rendezvous
-        .load(&SystemProcessIdentityVerifier)?
-        .ok_or(InstalledServiceError::ServiceUnavailable)?;
-    if record.runtime() != state.runtime || record.endpoint() != state.endpoint {
-        return Err(InstalledServiceError::ServiceUnavailable);
-    }
-    let registration = state
-        .registration(client)
-        .cloned()
-        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    Ok(ResolvedRuntimeClientRoot {
-        record,
-        registration,
-    })
-}
-
 pub(super) fn load_client_credential(
     secret_store: &Arc<dyn SecretStore>,
     registration: &ClientCredentialRegistration,
@@ -695,29 +624,25 @@ pub(super) fn load_client_credential(
         .map_err(|_error| InstalledServiceError::SecretStore)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn connect_client(
-    paths: &LocalPaths,
-    secret_store: Arc<dyn SecretStore>,
-    client: NamedClient,
+pub(super) fn connect_admitted_client(
+    admitted: AdmittedRuntimeClient,
     origin: Option<String>,
     structure: JsonStructureLimits,
     maximum_response_bytes: usize,
     transport_timeout: Duration,
 ) -> Result<LoopbackApplicationClient, InstalledServiceError> {
-    let resolved = resolve_client(paths, secret_store, client)?;
     let scope = ApplicationRequestScope::try_new(
-        resolved.record.runtime(),
-        resolved.registration.client_id(),
-        resolved.registration.generation(),
+        admitted.record.runtime(),
+        admitted.client_id,
+        admitted.generation,
         CorrelationId::try_from_uuid(Uuid::new_v4())?,
         structure,
         maximum_response_bytes,
     )?;
     LoopbackApplicationClient::try_new(
-        &resolved.record,
+        &admitted.record,
         scope,
-        resolved.credential,
+        admitted.credential,
         origin,
         maximum_response_bytes,
         structure,
