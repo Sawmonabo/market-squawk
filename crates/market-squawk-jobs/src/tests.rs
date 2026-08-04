@@ -258,7 +258,17 @@ async fn activity_snapshot_counts_the_registered_mutation_subset() -> Result<(),
         mutation_spec.generation(),
     )
     .await?;
-    assert_eq!(authority.activity(), JobActivitySnapshot::new(0, 0));
+    let activity = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let activity = authority.activity();
+            if activity == JobActivitySnapshot::new(0, 0) {
+                return activity;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(activity, JobActivitySnapshot::new(0, 0));
     Ok(())
 }
 
