@@ -570,7 +570,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 include!("registry/catalog.rs");
 #[path = "registry/catalog/construction.rs"]
 mod catalog_construction;
-pub use catalog_construction::ExclusiveInstalledServiceSourceRecoveryAuthority;
+pub use catalog_construction::RESEARCH_SOURCE_AUTHORITY_DIRECTORY;
 #[path = "registry/catalog/persistence.rs"]
 mod catalog_persistence;
 include!("registry/health_authority.rs");

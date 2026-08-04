@@ -214,7 +214,9 @@ impl ProviderMetadataBackupAuthority {
             .map_err(|_error| ProviderMetadataBackupError::RestoreTargetNotFresh)?;
         let activation = DurableProviderActivationState::new(control_root.root().to_path_buf());
         let registry_store = LocalAuthorityStateStore::try_open(
-            control_root.root().join(super::SOURCE_AUTHORITY_DIRECTORY),
+            control_root
+                .root()
+                .join(market_squawk_sources::RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
         )?;
         Self::restore_fresh(&activation, registry_store, bytes)
     }

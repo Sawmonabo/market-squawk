@@ -9,6 +9,7 @@ use std::{
 
 use cap_std::{ambient_authority, fs::Dir};
 use market_squawk_platform::{
+    InstalledServiceInstanceGuard, InstalledServiceSelectedWorkspaceGuard,
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
 };
 use market_squawk_runtime::WorkspaceId;
@@ -233,12 +234,6 @@ impl WorkspaceStartupSelection {
         self.identity
     }
 
-    /// Prepared capability for the selected workspace root.
-    #[must_use]
-    pub(super) const fn paths(&self) -> &LocalPaths {
-        &self.paths
-    }
-
     /// Placement state shown by setup until a legacy workspace is explicitly migrated.
     #[must_use]
     pub(super) const fn placement(&self) -> WorkspacePlacement {
@@ -249,6 +244,16 @@ impl WorkspaceStartupSelection {
     #[must_use]
     pub(super) const fn handoff(&self) -> Option<WorkspaceSupervisorHandoff> {
         self.handoff
+    }
+
+    /// Consumes the sole installation-instance lock into this already validated selection.
+    pub(super) fn bind_instance_guard(
+        &self,
+        guard: InstalledServiceInstanceGuard,
+    ) -> Result<InstalledServiceSelectedWorkspaceGuard, WorkspaceSelectorError> {
+        guard
+            .bind_selected_workspace(self.paths.clone())
+            .map_err(WorkspaceSelectorError::from)
     }
 }
 

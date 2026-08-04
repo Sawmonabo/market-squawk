@@ -41,9 +41,10 @@ use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, InstalledServiceInstanceGuard, LocalAuthorityStateStoreError,
-    LocalPaths, LocalSecretStoreError, PathError, PreferredSecretStore, SecretCancellation,
-    SecretInteractionPolicy, SecretOperationControl, SecretStore, SecretValue,
+    EncryptedFileFallbackStatus, InstalledServiceSelectedWorkspaceGuard,
+    LocalAuthorityStateStoreError, LocalPaths, LocalSecretStoreError, PathError,
+    PreferredSecretStore, SecretCancellation, SecretInteractionPolicy, SecretOperationControl,
+    SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClientError, ApplicationProtocolRange, ApplicationProtocolVersion,
@@ -262,7 +263,7 @@ pub struct InstalledService {
     installation_paths: LocalPaths,
     ephemeral_verification_credentials: bool,
     _workspace_selector: Arc<WorkspaceSelector>,
-    _instance_guard: InstalledServiceInstanceGuard,
+    _selected_workspace_guard: InstalledServiceSelectedWorkspaceGuard,
 }
 
 impl std::fmt::Debug for InstalledService {
@@ -436,18 +437,13 @@ impl InstalledService {
                 }
             };
             let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
-            let workspace_paths = selection.paths().clone();
-            // `instance_guard` is the exact still-live guard returned by
-            // `runtime::acquire_instance(&installation_paths)` and remains owned by
-            // `InstalledService` through final drop.
-            let source_recovery_authority =
-                market_squawk_sources::ExclusiveInstalledServiceSourceRecoveryAuthority::from_acquired_installation_instance_guard(
-                    &instance_guard,
-                );
-            let product = LocalProduct::try_new_at_paths(
+            let selected_workspace_guard = selection
+                .bind_instance_guard(instance_guard)
+                .map_err(map_workspace_selector_startup)?;
+            let workspace_paths = selected_workspace_guard.workspace_paths().clone();
+            let product = LocalProduct::try_new_at_selected_workspace(
                 config.clone(),
-                workspace_paths.clone(),
-                source_recovery_authority,
+                &selected_workspace_guard,
             )?;
             let prepared_operations = PreparedInstalledOperations::prepare(
                 &config,
@@ -578,7 +574,7 @@ impl InstalledService {
                 installation_paths,
                 ephemeral_verification_credentials,
                 _workspace_selector: workspace_selector,
-                _instance_guard: instance_guard,
+                _selected_workspace_guard: selected_workspace_guard,
             })
         }
         .await;
@@ -626,7 +622,7 @@ impl InstalledService {
             installation_paths,
             ephemeral_verification_credentials,
             _workspace_selector,
-            _instance_guard,
+            _selected_workspace_guard,
         } = self;
         let transport_cancellation = CancellationToken::new();
         let mut serving = Box::pin(server.run_until(
@@ -693,7 +689,7 @@ impl InstalledService {
         drop(lifecycle);
         drop(installation_paths);
         drop(_workspace_selector);
-        drop(_instance_guard);
+        drop(_selected_workspace_guard);
         if credential_cleanup.is_err() {
             Err(InstalledServiceError::EphemeralCredentialCleanup)
         } else if report.is_complete() && admission_stopped_unexpectedly {

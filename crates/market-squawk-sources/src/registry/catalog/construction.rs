@@ -1,52 +1,7 @@
 use super::*;
 
-/// Borrowed proof that the installed replacement owns the installation-global instance lock.
-///
-/// Only installed-service composition should create this witness, immediately after acquiring its
-/// exact per-installation [`market_squawk_platform::LocalAuthorityStateStore`] guard. The witness is
-/// move-only, borrows that guard, and is consumed by source-registry recovery, so recovery cannot
-/// run after the exclusive guard is released or without a live guard capability.
-pub struct ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
-    _instance_guard: &'guard market_squawk_platform::InstalledServiceInstanceGuard,
-}
-
-impl<'guard> ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
-    /// Binds installed source recovery to an already acquired installation-global instance guard.
-    ///
-    /// The typed guard can only be acquired from the code-owned `installed-service/instance`
-    /// authority beneath the selected installation control root. The witness carries that exact,
-    /// exclusive lifetime ownership into source composition without exposing a boolean recovery
-    /// bypass.
-    ///
-    /// A general authority-state store cannot mint installed-service recovery authority:
-    ///
-    /// ```compile_fail
-    /// use market_squawk_platform::LocalAuthorityStateStore;
-    /// use market_squawk_sources::ExclusiveInstalledServiceSourceRecoveryAuthority;
-    ///
-    /// fn rejected(store: &LocalAuthorityStateStore) {
-    ///     let _authority = ExclusiveInstalledServiceSourceRecoveryAuthority::
-    ///         from_acquired_installation_instance_guard(store);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn from_acquired_installation_instance_guard(
-        instance_guard: &'guard market_squawk_platform::InstalledServiceInstanceGuard,
-    ) -> Self {
-        Self {
-            _instance_guard: instance_guard,
-        }
-    }
-}
-
-impl std::fmt::Debug for ExclusiveInstalledServiceSourceRecoveryAuthority<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExclusiveInstalledServiceSourceRecoveryAuthority")
-            .field("instance_guard", &"[INSTALLATION-GLOBAL AUTHORITY]")
-            .finish_non_exhaustive()
-    }
-}
+/// Code-owned location of the restart-durable research source authority within a workspace.
+pub const RESEARCH_SOURCE_AUTHORITY_DIRECTORY: &str = "sources/research-runtime";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UncleanPredecessorPolicy {
@@ -175,20 +130,55 @@ impl AuthoritativeSourceRegistry {
     /// the replacement. Invalid state, wall rollback, or any generation exhaustion remains
     /// fail-closed.
     ///
-    /// The recovery witness borrows the installation-global exclusive instance guard and is held
-    /// until opening completes. Default durable constructors do not accept this witness and continue
-    /// to reject every unclean predecessor.
+    /// The selected-workspace guard owns the installation-global instance lock and exact prepared
+    /// workspace together. This constructor derives the fixed source store from that capability;
+    /// it does not accept a separately substitutable store. Default durable constructors do not
+    /// accept the guard and continue to reject every unclean predecessor.
+    ///
+    /// A raw authority-state store cannot be paired with an unrelated installation guard:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use market_squawk_platform::{
+    ///     InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
+    /// };
+    /// use market_squawk_sources::{
+    ///     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, ProviderRateAuthority,
+    /// };
+    ///
+    /// fn rejected(
+    ///     store: LocalAuthorityStateStore,
+    ///     selected: &InstalledServiceSelectedWorkspaceGuard,
+    ///     resolver: Arc<dyn AuthorizationSubjectResolver>,
+    ///     provider_rate: ProviderRateAuthority,
+    /// ) {
+    ///     let _registry = AuthoritativeSourceRegistry::
+    ///         try_new_durable_for_exclusive_installed_service_replacement(
+    ///             store,
+    ///             resolver,
+    ///             provider_rate,
+    ///             selected,
+    ///         );
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
     /// Fails closed on invalid persistence, restore, subject resolution, aggregate registration,
     /// trusted-time rollback, or generation exhaustion.
     pub fn try_new_durable_for_exclusive_installed_service_replacement(
-        store: market_squawk_platform::LocalAuthorityStateStore,
+        selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         provider_rate: crate::ProviderRateAuthority,
-        _recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
     ) -> Result<Self, RegistryError> {
+        let control = selected_workspace
+            .workspace_paths()
+            .control_root()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?;
+        let store = market_squawk_platform::LocalAuthorityStateStore::try_open(
+            control.root().join(RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
+        )
+        .map_err(|_error| RegistryError::AuthorityPersistence)?;
         let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
         Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
             store,

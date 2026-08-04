@@ -11,7 +11,8 @@ mod secrets;
 
 pub use authority_state::{
     AuthorityCommitContext, AuthorityStateSnapshot, InstalledServiceInstanceGuard,
-    LocalAuthorityStateStore, LocalAuthorityStateStoreError,
+    InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
+    LocalAuthorityStateStoreError,
 };
 #[cfg(feature = "capture-benchmark")]
 pub use capture::benchmark_support as capture_benchmark_support;

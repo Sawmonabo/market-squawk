@@ -29,11 +29,13 @@ use market_squawk_decisions::DecisionRepositoryLimits;
 use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
-use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
+use market_squawk_platform::{
+    InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore, LocalPaths,
+    PreferredSecretStore,
+};
 use market_squawk_services::{ArtifactAuthority, ArtifactError, ArtifactRepository};
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationSubjectResolver,
-    ExclusiveInstalledServiceSourceRecoveryAuthority,
+    AuthoritativeSourceRegistry, AuthorizationSubjectResolver, RESEARCH_SOURCE_AUTHORITY_DIRECTORY,
 };
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
@@ -101,7 +103,6 @@ use crate::{
     ProviderOnboardingService, ResearchService, ResearchServiceError,
 };
 
-const SOURCE_AUTHORITY_DIRECTORY: &str = "sources/research-runtime";
 const PROVIDER_SECRET_DIRECTORY: &str = "secrets/provider-credentials";
 const CATALOG_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const CATALOG_MAXIMUM_ROWS: usize = 10_000;
@@ -177,7 +178,7 @@ pub struct LocalProduct {
 #[derive(Debug)]
 enum SourceAuthorityStartupPolicy<'guard> {
     RejectUncleanPredecessor,
-    ExclusiveInstalledReplacement(ExclusiveInstalledServiceSourceRecoveryAuthority<'guard>),
+    ExclusiveInstalledReplacement(&'guard InstalledServiceSelectedWorkspaceGuard),
 }
 
 impl LocalProduct {
@@ -194,16 +195,15 @@ impl LocalProduct {
     }
 
     /// Opens the product through an already selected workspace path capability.
-    pub(crate) fn try_new_at_paths(
+    pub(crate) fn try_new_at_selected_workspace(
         config: AppConfig,
-        paths: LocalPaths,
-        source_recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
+        selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
             config,
-            paths,
+            selected_workspace.workspace_paths().clone(),
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
-            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(source_recovery_authority),
+            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace),
         )
     }
 
@@ -249,28 +249,27 @@ impl LocalProduct {
         let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
-        let source_store = LocalAuthorityStateStore::try_open(
-            paths
-                .control_root()?
-                .root()
-                .join(SOURCE_AUTHORITY_DIRECTORY),
-        )?;
         let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
             Arc::new(provider_rate.clone());
         let source_registry = match source_authority_startup_policy {
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
+                let source_store = LocalAuthorityStateStore::try_open(
+                    paths
+                        .control_root()?
+                        .root()
+                        .join(RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
+                )?;
                 AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
                     source_store,
                     authorization_subject_resolver,
                     provider_rate.clone(),
                 )
             }
-            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(recovery_authority) => {
+            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) => {
                 AuthoritativeSourceRegistry::try_new_durable_for_exclusive_installed_service_replacement(
-                    source_store,
+                    selected_workspace,
                     authorization_subject_resolver,
                     provider_rate.clone(),
-                    recovery_authority,
                 )
             }
         }?;

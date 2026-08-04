@@ -134,7 +134,6 @@ pub use policy::{
     QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
     apply_http_retry_after,
 };
-pub use registry::ExclusiveInstalledServiceSourceRecoveryAuthority;
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
@@ -142,11 +141,11 @@ pub use registry::{
     CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
     CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey, ExtractionAuthority,
     FrameSessionLease, InstrumentUniverseAttestation, LiveSourceGeneration,
-    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, RawFrameFactory,
-    RegisteredSource, RegistryAuthorityState, RegistryError, SessionControlDisposition,
-    SessionIgnoredDisposition, SessionQuarantineDisposition, SessionRecoveryDisposition,
-    ValidatedCurrentSourceAuthority, ValidatedLiveScope, ValidatedSessionDecodeOutcome,
-    ValidatedSourceSession,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError,
+    RESEARCH_SOURCE_AUTHORITY_DIRECTORY, RawFrameFactory, RegisteredSource, RegistryAuthorityState,
+    RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
+    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
+    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
 };
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 
