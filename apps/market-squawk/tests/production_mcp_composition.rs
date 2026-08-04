@@ -35,7 +35,7 @@ type TestResult<T = ()> = anyhow::Result<T>;
 const INSTALLED_SERVICE_PROCESS_ROLE_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROLE";
 const INSTALLED_SERVICE_PROCESS_ROOT_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROOT";
 const INSTALLED_SERVICE_TEST_UNLOCK: &str = "installed-service-test-unlock";
-const CRASH_RECOVERY_SOURCE_PROFILE: &str = "coinbase.public-market-data";
+const CRASH_RECOVERY_SOURCE_PROFILE: &str = "kraken.spot-public-market-data";
 const INSTALLED_MCP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,10 +443,18 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
                         CancellationToken::new(),
                     )
                     .await
-                    .context("register durable source before installed-service crash")?;
+                    .context(
+                        "resolve durable source registration before installed-service crash",
+                    )?;
                 assert_eq!(
                     registration.result()["value"]["data"]["outcome"],
-                    "inserted",
+                    "replay",
+                    "{}",
+                    registration.result()
+                );
+                assert_eq!(
+                    registration.result()["value"]["data"]["profile"]["id"],
+                    CRASH_RECOVERY_SOURCE_PROFILE,
                     "{}",
                     registration.result()
                 );

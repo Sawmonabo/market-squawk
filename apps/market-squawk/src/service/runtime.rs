@@ -319,10 +319,6 @@ impl PreparedRuntime {
         Arc::clone(&self.secret_store)
     }
 
-    pub(super) fn identity_root(&self) -> std::path::PathBuf {
-        self.identity_root.clone()
-    }
-
     pub(super) fn mcp_client_activation_authority(
         &self,
     ) -> Result<McpClientActivationAuthority, InstalledServiceError> {
