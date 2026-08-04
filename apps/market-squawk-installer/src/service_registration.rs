@@ -31,7 +31,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::platform::{ProgramName, SupportedTarget};
+use crate::platform::{ProgramName, SupportedTarget, default_workspace_data_root};
 use crate::store::InstallStore;
 
 const RECEIPT_FILE: &str = "service-registration.json";
@@ -187,6 +187,8 @@ struct RegistrationMaterial {
     receipt: ServiceRegistrationReceipt,
     service_path: PathBuf,
     release_root: PathBuf,
+    installation_data_root: PathBuf,
+    workspace_data_root: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -497,8 +499,18 @@ fn registration_material(
     let canonical_root = fs::canonicalize(spec.version_root)
         .map_err(|source| ServiceRegistrationError::io("resolve candidate release", source))?;
     if canonical_root == canonical_install_root
-        || !canonical_root.starts_with(canonical_install_root)
+        || !canonical_root.starts_with(&canonical_install_root)
     {
+        return Err(ServiceRegistrationError::UnsafePath);
+    }
+    let installation_data_root = canonical_install_root
+        .parent()
+        .filter(|root| root.is_absolute())
+        .ok_or(ServiceRegistrationError::UnsafePath)?
+        .to_path_buf();
+    let workspace_data_root =
+        default_workspace_data_root().map_err(|_| ServiceRegistrationError::UnsafePath)?;
+    if !workspace_data_root.is_absolute() {
         return Err(ServiceRegistrationError::UnsafePath);
     }
     let service = program_identity(&canonical_root, ProgramName::Service, spec.target)?;
@@ -521,6 +533,8 @@ fn registration_material(
         receipt,
         service_path: service.path,
         release_root: canonical_root,
+        installation_data_root,
+        workspace_data_root,
     })
 }
 
@@ -807,6 +821,10 @@ fn probe_health_once(
         [
             OsString::from("--output"),
             OsString::from("json"),
+            OsString::from("--data-dir"),
+            material.workspace_data_root.as_os_str().to_owned(),
+            OsString::from("--installation-data-root"),
+            material.installation_data_root.as_os_str().to_owned(),
             OsString::from("--training-release-root"),
             material.release_root.as_os_str().to_owned(),
             OsString::from("service"),
@@ -1116,11 +1134,26 @@ fn prepare_native(
     material: &RegistrationMaterial,
 ) -> Result<PreparedRegistration, ServiceRegistrationError> {
     #[cfg(target_os = "macos")]
-    return macos::prepare(&material.service_path, &material.release_root);
+    return macos::prepare(
+        &material.service_path,
+        &material.workspace_data_root,
+        &material.installation_data_root,
+        &material.release_root,
+    );
     #[cfg(target_os = "linux")]
-    return linux::prepare(&material.service_path, &material.release_root);
+    return linux::prepare(
+        &material.service_path,
+        &material.workspace_data_root,
+        &material.installation_data_root,
+        &material.release_root,
+    );
     #[cfg(target_os = "windows")]
-    return windows::prepare(&material.service_path, &material.release_root);
+    return windows::prepare(
+        &material.service_path,
+        &material.workspace_data_root,
+        &material.installation_data_root,
+        &material.release_root,
+    );
     #[allow(unreachable_code)]
     Err(ServiceRegistrationError::Target)
 }
@@ -1308,12 +1341,17 @@ mod tests {
     fn macos_registration_binds_exact_argv_and_restart_policy() -> TestResult {
         let service = Path::new("/Users/Test & Co/Market Squawk/bin/market-squawk-service");
         let release = Path::new("/Users/Test & Co/Market Squawk/releases/0.2.0");
+        let workspace = Path::new("/Users/Test & Co/Library/Application Support/Market Squawk");
+        let installation = Path::new("/Users/Test & Co/Market Squawk");
 
-        let launch_agent = macos::render_launch_agent(service, release)?;
+        let launch_agent = macos::render_launch_agent(service, workspace, installation, release)?;
         assert!(launch_agent.contains("<key>ProgramArguments</key>"));
         assert!(launch_agent.contains(
             "<string>/Users/Test &amp; Co/Market Squawk/bin/market-squawk-service</string>"
         ));
+        assert!(launch_agent.contains("<string>--data-dir</string>"));
+        assert!(launch_agent.contains("<string>--installation-data-root</string>"));
+        assert!(launch_agent.contains("<key>WorkingDirectory</key>"));
         assert!(launch_agent.contains("<key>KeepAlive</key>"));
         assert!(!launch_agent.contains("/bin/sh"));
 
@@ -1325,8 +1363,13 @@ mod tests {
     fn linux_registration_binds_exact_argv_and_runtime_hardening() -> TestResult {
         let service = Path::new("/home/test/Market Squawk/bin/market-squawk-service");
         let release = Path::new("/home/test/Market Squawk/releases/0.2.0");
-        let unit = linux::render_user_unit(service, release)?;
+        let workspace = Path::new("/home/test/.local/share/com.marketsquawk.desktop");
+        let installation = Path::new("/home/test/.local/share/Market Squawk");
+        let unit = linux::render_user_unit(service, workspace, installation, release)?;
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WorkingDirectory="));
+        assert!(unit.contains("--data-dir"));
+        assert!(unit.contains("--installation-data-root"));
         assert!(unit.contains("NoNewPrivileges=yes"));
         assert!(unit.contains("ProtectSystem=full"));
         assert!(!unit.contains("loginctl enable-linger"));
@@ -1340,12 +1383,16 @@ mod tests {
     fn windows_registration_binds_exact_argv_and_least_privilege() -> TestResult {
         let task = windows::render_task_xml(
             Path::new(r"C:\Users\Test & Co\Market Squawk\market-squawk-service.exe"),
+            Path::new(r"C:\Users\Test & Co\AppData\Local\com.marketsquawk.desktop"),
+            Path::new(r"C:\Users\Test & Co\AppData\Local\Market Squawk"),
             Path::new(r"C:\Users\Test & Co\Market Squawk\releases\0.2.0"),
             "S-1-5-21-1000",
         )?;
         assert!(task.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(task.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(task.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(task.contains("<WorkingDirectory>"));
+        assert!(task.contains("--installation-data-root"));
         assert!(task.contains("Test &amp; Co"));
         assert!(!task.contains("powershell"));
         assert!(!task.contains("cmd.exe"));

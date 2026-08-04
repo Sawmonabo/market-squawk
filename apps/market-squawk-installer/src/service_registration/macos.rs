@@ -26,9 +26,17 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 
 pub(super) fn render_launch_agent(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
 ) -> Result<String, ServiceRegistrationError> {
     let service = service.to_str().ok_or(ServiceRegistrationError::Identity)?;
+    let workspace_data_root = workspace_data_root
+        .to_str()
+        .ok_or(ServiceRegistrationError::Identity)?;
+    let installation_data_root = installation_data_root
+        .to_str()
+        .ok_or(ServiceRegistrationError::Identity)?;
     let release_root = release_root
         .to_str()
         .ok_or(ServiceRegistrationError::Identity)?;
@@ -44,9 +52,15 @@ pub(super) fn render_launch_agent(
            <key>ProgramArguments</key>\n\
            <array>\n\
              <string>{service}</string>\n\
+             <string>--data-dir</string>\n\
+             <string>{workspace_data_root}</string>\n\
+             <string>--installation-data-root</string>\n\
+             <string>{installation_data_root}</string>\n\
              <string>--training-release-root</string>\n\
              <string>{release_root}</string>\n\
            </array>\n\
+           <key>WorkingDirectory</key>\n\
+           <string>{installation_data_root}</string>\n\
            <key>RunAtLoad</key>\n\
            <true/>\n\
            <key>KeepAlive</key>\n\
@@ -65,15 +79,27 @@ pub(super) fn render_launch_agent(
         owner = REGISTRATION_OWNER,
         label = xml_escape(REGISTRATION_IDENTITY)?,
         service = xml_escape(service)?,
+        workspace_data_root = xml_escape(workspace_data_root)?,
+        installation_data_root = xml_escape(installation_data_root)?,
         release_root = xml_escape(release_root)?,
     ))
 }
 
 pub(super) fn prepare(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
 ) -> Result<PreparedRegistration, ServiceRegistrationError> {
-    let document = native_document(render_launch_agent(service, release_root)?.into_bytes())?;
+    let document = native_document(
+        render_launch_agent(
+            service,
+            workspace_data_root,
+            installation_data_root,
+            release_root,
+        )?
+        .into_bytes(),
+    )?;
     Ok(PreparedRegistration {
         identity: REGISTRATION_IDENTITY,
         configuration_sha256: sha256_bytes(&document),

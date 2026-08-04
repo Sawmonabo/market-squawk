@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::ValueEnum;
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -196,6 +196,19 @@ pub fn default_installation_data_root() -> Result<PathBuf, PlatformError> {
 /// expose a per-user application-data location.
 pub fn default_install_root() -> Result<PathBuf, PlatformError> {
     Ok(default_installation_data_root()?.join("program"))
+}
+
+/// Returns the native desktop's default workspace-data root.
+///
+/// This intentionally mirrors Tauri's `app_local_data_dir`: the operating system's local data
+/// directory joined with the configured desktop bundle identifier. Keeping the calculation in
+/// the installer lets a background service receive an absolute path without depending on an
+/// unspecified service-manager working directory.
+pub(crate) fn default_workspace_data_root() -> Result<PathBuf, PlatformError> {
+    const DESKTOP_IDENTIFIER: &str = "com.marketsquawk.desktop";
+
+    let directories = BaseDirs::new().ok_or(PlatformError::StandardDirectoriesUnavailable)?;
+    Ok(directories.data_local_dir().join(DESKTOP_IDENTIFIER))
 }
 
 /// Platform selection or per-user path failure.

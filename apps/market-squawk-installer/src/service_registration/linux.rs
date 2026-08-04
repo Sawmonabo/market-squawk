@@ -19,10 +19,19 @@ const OWNER_LINE: &str = "# owner:market-squawk-installer-v1";
 
 pub(super) fn render_user_unit(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
 ) -> Result<String, ServiceRegistrationError> {
     let service = systemd_quote(service)?;
+    let workspace_data_root = systemd_quote(workspace_data_root)?;
+    let installation_data_root = systemd_quote(installation_data_root)?;
     let release_root = systemd_quote(release_root)?;
+    let invocation = format!(
+        "{service} --data-dir {workspace_data_root} \
+         --installation-data-root {installation_data_root} \
+         --training-release-root {release_root}"
+    );
     Ok(format!(
         "{OWNER_LINE}\n\
          [Unit]\n\
@@ -33,7 +42,8 @@ pub(super) fn render_user_unit(
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={service} --training-release-root {release_root}\n\
+         WorkingDirectory={installation_data_root}\n\
+         ExecStart={invocation}\n\
          Restart=on-failure\n\
          RestartSec=5s\n\
          TimeoutStopSec=15s\n\
@@ -58,9 +68,19 @@ pub(super) fn render_user_unit(
 
 pub(super) fn prepare(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
 ) -> Result<PreparedRegistration, ServiceRegistrationError> {
-    let document = native_document(render_user_unit(service, release_root)?.into_bytes())?;
+    let document = native_document(
+        render_user_unit(
+            service,
+            workspace_data_root,
+            installation_data_root,
+            release_root,
+        )?
+        .into_bytes(),
+    )?;
     Ok(PreparedRegistration {
         identity: REGISTRATION_IDENTITY,
         configuration_sha256: sha256_bytes(&document),

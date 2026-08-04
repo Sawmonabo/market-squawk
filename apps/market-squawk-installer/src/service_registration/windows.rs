@@ -23,22 +23,33 @@ struct TaskSemantics {
     user_sid: Box<str>,
     command: Box<str>,
     arguments: Box<str>,
+    working_directory: Box<str>,
     restart_interval: Box<str>,
     restart_count: u8,
 }
 
 pub(super) fn render_task_xml(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
     user_sid: &str,
 ) -> Result<String, ServiceRegistrationError> {
     validate_sid(user_sid)?;
     let service = service.to_str().ok_or(ServiceRegistrationError::Identity)?;
+    let workspace_data_root = workspace_data_root
+        .to_str()
+        .ok_or(ServiceRegistrationError::Identity)?;
+    let installation_data_root = installation_data_root
+        .to_str()
+        .ok_or(ServiceRegistrationError::Identity)?;
     let release_root = release_root
         .to_str()
         .ok_or(ServiceRegistrationError::Identity)?;
     let arguments = format!(
-        "--training-release-root {}",
+        "--data-dir {} --installation-data-root {} --training-release-root {}",
+        quote_windows_argument(workspace_data_root)?,
+        quote_windows_argument(installation_data_root)?,
         quote_windows_argument(release_root)?
     );
     Ok(format!(
@@ -84,6 +95,7 @@ pub(super) fn render_task_xml(
              <Exec>\n\
                <Command>{service}</Command>\n\
                <Arguments>{arguments}</Arguments>\n\
+               <WorkingDirectory>{working_directory}</WorkingDirectory>\n\
              </Exec>\n\
            </Actions>\n\
          </Task>\n",
@@ -92,6 +104,7 @@ pub(super) fn render_task_xml(
         sid = xml_escape(user_sid)?,
         service = xml_escape(service)?,
         arguments = xml_escape(&arguments)?,
+        working_directory = xml_escape(installation_data_root)?,
     ))
 }
 
@@ -107,10 +120,21 @@ pub(super) fn task_configuration_digest(
 
 pub(super) fn prepare(
     service: &Path,
+    workspace_data_root: &Path,
+    installation_data_root: &Path,
     release_root: &Path,
 ) -> Result<PreparedRegistration, ServiceRegistrationError> {
     let sid = current_user_sid()?;
-    let document = native_document(render_task_xml(service, release_root, &sid)?.into_bytes())?;
+    let document = native_document(
+        render_task_xml(
+            service,
+            workspace_data_root,
+            installation_data_root,
+            release_root,
+            &sid,
+        )?
+        .into_bytes(),
+    )?;
     Ok(PreparedRegistration {
         identity: REGISTRATION_IDENTITY,
         configuration_sha256: task_configuration_digest(&document)?,
@@ -402,7 +426,7 @@ impl TaskStructures {
             (Some("Task"), "Actions") => increment(&mut self.actions)?,
             (Some("Actions"), "Exec") => increment(&mut self.exec)?,
             (Some("Actions"), _) => return Err(ServiceRegistrationError::NativeDocument),
-            (Some("Exec"), "Command" | "Arguments") => {}
+            (Some("Exec"), "Command" | "Arguments" | "WorkingDirectory") => {}
             (Some("Exec"), _) => return Err(ServiceRegistrationError::NativeDocument),
             (None, _) => return Err(ServiceRegistrationError::NativeDocument),
             _ => {}
@@ -448,6 +472,7 @@ struct TaskValues {
     restart_count: Vec<String>,
     command: Vec<String>,
     arguments: Vec<String>,
+    working_directory: Vec<String>,
 }
 
 impl TaskValues {
@@ -469,6 +494,7 @@ impl TaskValues {
             (Some("RestartOnFailure"), "Count") => Some(&mut self.restart_count),
             (Some("Exec"), "Command") => Some(&mut self.command),
             (Some("Exec"), "Arguments") => Some(&mut self.arguments),
+            (Some("Exec"), "WorkingDirectory") => Some(&mut self.working_directory),
             (
                 _,
                 "Description"
@@ -483,7 +509,8 @@ impl TaskValues {
                 | "Interval"
                 | "Count"
                 | "Command"
-                | "Arguments",
+                | "Arguments"
+                | "WorkingDirectory",
             ) => {
                 return Err(ServiceRegistrationError::NativeDocument);
             }
@@ -523,6 +550,7 @@ impl TaskValues {
             (Some("RestartOnFailure"), Some("Count")) => Some(&mut self.restart_count),
             (Some("Exec"), Some("Command")) => Some(&mut self.command),
             (Some("Exec"), Some("Arguments")) => Some(&mut self.arguments),
+            (Some("Exec"), Some("WorkingDirectory")) => Some(&mut self.working_directory),
             _ => None,
         };
         if let Some(target) = target {
@@ -553,8 +581,12 @@ impl TaskValues {
         validate_sid(&self.user_ids[0])?;
         let command = one(self.command)?;
         let arguments = one(self.arguments)?;
+        let working_directory = one(self.working_directory)?;
         if !is_windows_absolute(&command)
-            || !arguments.starts_with("--training-release-root \"")
+            || !is_windows_absolute(&working_directory)
+            || !arguments.starts_with("--data-dir \"")
+            || !arguments.contains("\" --installation-data-root \"")
+            || !arguments.contains("\" --training-release-root \"")
             || !arguments.ends_with('"')
         {
             return Err(ServiceRegistrationError::NativeDocument);
@@ -570,6 +602,7 @@ impl TaskValues {
             user_sid: self.user_ids[0].clone().into(),
             command: command.into(),
             arguments: arguments.into(),
+            working_directory: working_directory.into(),
             restart_interval: "PT5S".into(),
             restart_count,
         })

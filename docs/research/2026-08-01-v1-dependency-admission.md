@@ -313,6 +313,17 @@ entrypoints serve the CLI, installer, and MCP relay. Install, update, repair, ro
 form one recoverable transaction over the release selector, stable entrypoints, native service
 definition, authenticated health, and owned client-registration receipts.
 
+Every registered service receives absolute `--data-dir`, `--installation-data-root`, and
+`--training-release-root` arguments, plus a native working directory equal to its installation-data
+root. Activation probes the same workspace and installation roots. This is a correctness boundary,
+not a convenience: native service managers do not preserve the installer's shell working directory.
+Apple directs launchd jobs to declare `WorkingDirectory`; Windows Task Scheduler otherwise starts an
+action in `%windir%\system32`; systemd requires an explicit absolute `WorkingDirectory`; and Tauri's
+desktop workspace default is the operating system's local-data directory joined with the configured
+bundle identifier. A 2026-08-04 packaged-install failure and isolated LaunchAgent reproduction
+confirmed that leaving Market Squawk's relative CLI default under service-manager control can make
+startup target an unwritable root and never publish authenticated readiness.
+
 ## Lock and acceptance gates
 
 Before a serialized dependency boundary is committed:
@@ -344,7 +355,7 @@ smokes on all four targets.
 ## Primary sources
 
 Sources were checked on 2026-08-01; Python artifact and Packaging API evidence was refreshed on
-2026-08-02.
+2026-08-02, and native service working-directory guidance was refreshed on 2026-08-04.
 
 - Rust and runtime: [Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/),
   [Tokio releases](https://github.com/tokio-rs/tokio/releases), [Axum
@@ -391,6 +402,9 @@ Sources were checked on 2026-08-01; Python artifact and Packaging API evidence w
   capabilities](https://v2.tauri.app/security/capabilities/).
 - Platform lifecycle: [Apple LaunchAgents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatinglaunchdJobs.html),
   [Microsoft logon task](https://learn.microsoft.com/en-us/windows/win32/taskschd/starting-an-executable-when-a-user-logs-on),
+  [Microsoft scheduled-task working directory](https://learn.microsoft.com/en-us/windows/win32/taskschd/execaction-workingdirectory),
   [Microsoft run level](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-runlevel),
+  [systemd execution environment](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html),
+  [Tauri application-local data](https://v2.tauri.app/reference/javascript/api/namespacepath/#applocaldatadir),
   [Ubuntu 24.04 release notes](https://documentation.ubuntu.com/release-notes/24.04/), and
   [`pam_systemd`](https://www.freedesktop.org/software/systemd/man/252/pam_systemd.html).

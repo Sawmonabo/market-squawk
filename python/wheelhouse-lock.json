@@ -2133,28 +2133,28 @@
     },
     {
       "path": "apps/market-squawk-installer/src/platform.rs",
-      "sha256": "9a5459aecf44aa396d9213295f8cd8ed2c87c142c788904add6549bb2d171a7b",
-      "size_bytes": 8362
+      "sha256": "08f333f305dacd9671f1120db2501430e6e091d9047169d5aad137eab991a2e1",
+      "size_bytes": 9078
     },
     {
       "path": "apps/market-squawk-installer/src/service_registration.rs",
-      "sha256": "85c5bdd3770a89069d8ecf44cfb125aa468b0cba1fe33840893d933f6c1f6200",
-      "size_bytes": 51875
+      "sha256": "56952612ef526f07df9afd52265aa1d0b33057a401f23a33a6b16e69dd9489a0",
+      "size_bytes": 54047
     },
     {
       "path": "apps/market-squawk-installer/src/service_registration/linux.rs",
-      "sha256": "3879d6931e9e9e3e82950964985c9dfbfe307558f4190de5656921bda318dfb8",
-      "size_bytes": 9535
+      "sha256": "2ff3740bb4bf4e8e2d9323c4a2cd68e8c2b46263a18bb2b92fdc62db0e8a39b5",
+      "size_bytes": 10156
     },
     {
       "path": "apps/market-squawk-installer/src/service_registration/macos.rs",
-      "sha256": "62cc37eaad784e46586bcd8464497b2e3b0d5c2220cc1b63ae52a74cd63fe974",
-      "size_bytes": 10280
+      "sha256": "f9392252f91f1354377f09fec5232ed53fd081084550ede35d45a2b284d2ccbc",
+      "size_bytes": 11237
     },
     {
       "path": "apps/market-squawk-installer/src/service_registration/windows.rs",
-      "sha256": "b59865ffb471df4b1f8fc03f1cecd2102a28348a55474decb267dc22cd28293e",
-      "size_bytes": 25420
+      "sha256": "0940ea635cdab13c5529ee83d888d0b7c4d4993b032ae8af24f27c8609ce1793",
+      "size_bytes": 26837
     },
     {
       "path": "apps/market-squawk-installer/src/store.rs",
