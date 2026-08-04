@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -189,6 +190,7 @@ def bounded_redacted_diagnostics(
 def bootstrap_service(
     binary: pathlib.Path,
     data_dir: str,
+    installation_data_root: str,
     requirement: str,
     environment: dict[str, str],
 ) -> None:
@@ -199,6 +201,8 @@ def bootstrap_service(
         "json",
         "--data-dir",
         data_dir,
+        "--installation-data-root",
+        installation_data_root,
         "service",
         "bootstrap",
     ]
@@ -233,6 +237,7 @@ def bootstrap_service(
 def wait_for_service(
     binary: pathlib.Path,
     data_dir: str,
+    installation_data_root: str,
     service: subprocess.Popen[str],
     environment: dict[str, str],
 ) -> None:
@@ -254,6 +259,8 @@ def wait_for_service(
                     "json",
                     "--data-dir",
                     data_dir,
+                    "--installation-data-root",
+                    installation_data_root,
                     "service",
                     "status",
                 ],
@@ -282,7 +289,11 @@ def wait_for_service(
                 ):
                     bootstrap_attempted = True
                     bootstrap_service(
-                        binary, data_dir, bootstrap["requirement"], environment
+                        binary,
+                        data_dir,
+                        installation_data_root,
+                        bootstrap["requirement"],
+                        environment,
                     )
         time.sleep(0.1)
     raise TimeoutError(
@@ -294,19 +305,38 @@ def main() -> int:
     arguments = parse_arguments()
     binary = pathlib.Path(arguments.binary).resolve()
     require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
+    temporary_user_context = (
+        contextlib.nullcontext(None)
+        if arguments.running_service
+        else tempfile.TemporaryDirectory(prefix="market-squawk-smoke-user-")
+    )
+    temporary_installation_context = (
+        contextlib.nullcontext(None)
+        if arguments.running_service
+        else tempfile.TemporaryDirectory(prefix="market-squawk-smoke-installation-")
+    )
     with (
         tempfile.TemporaryDirectory() as temporary_data_dir,
-        tempfile.TemporaryDirectory(
-            prefix="market-squawk-smoke-user-"
-        ) as temporary_user_root,
+        temporary_user_context as temporary_user_root,
+        temporary_installation_context as temporary_installation_root,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
     ):
         data_dir = str(arguments.data_dir or temporary_data_dir)
         environment = (
             None
-            if arguments.running_service
+            if temporary_user_root is None
             else isolated_child_environment(pathlib.Path(temporary_user_root))
+        )
+        installation_data_root = (
+            None
+            if temporary_installation_root is None
+            else str(pathlib.Path(temporary_installation_root).resolve(strict=True))
+        )
+        installation_arguments = (
+            []
+            if installation_data_root is None
+            else ["--installation-data-root", installation_data_root]
         )
         service: subprocess.Popen[str] | None = None
         process: subprocess.Popen[str] | None = None
@@ -314,13 +344,20 @@ def main() -> int:
             str(binary),
             "--data-dir",
             data_dir,
+            *installation_arguments,
             "mcp",
             "serve",
             "--client",
             arguments.client,
         ]
         if arguments.desktop_appimage:
-            command = [str(binary), "--stdio-mcp", "--data-dir", data_dir]
+            command = [
+                str(binary),
+                "--stdio-mcp",
+                "--data-dir",
+                data_dir,
+                *installation_arguments,
+            ]
         elif arguments.installed_relay:
             relay_client = "claude" if arguments.client == "claude-code" else "codex"
             command = [
@@ -333,13 +370,23 @@ def main() -> int:
         failure: BaseException | None = None
         try:
             if not arguments.desktop_appimage and not arguments.running_service:
+                require(
+                    installation_data_root is not None,
+                    "isolated installation root is unavailable",
+                )
                 service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
                 require(
                     service_binary.is_file(),
                     f"Market Squawk service binary does not exist: {service_binary}",
                 )
                 service = subprocess.Popen(
-                    [str(service_binary), "--data-dir", data_dir],
+                    [
+                        str(service_binary),
+                        "--data-dir",
+                        data_dir,
+                        "--installation-data-root",
+                        installation_data_root,
+                    ],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=service_stderr,
@@ -347,7 +394,13 @@ def main() -> int:
                     env=environment,
                 )
                 require(environment is not None, "isolated service environment is unavailable")
-                wait_for_service(binary, data_dir, service, environment)
+                wait_for_service(
+                    binary,
+                    data_dir,
+                    installation_data_root,
+                    service,
+                    environment,
+                )
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
