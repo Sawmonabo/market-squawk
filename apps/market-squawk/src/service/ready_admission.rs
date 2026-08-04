@@ -394,6 +394,8 @@ fn request_with_metadata(
     if trailing_bytes != 0 {
         return Err(InstalledServiceError::AdmissionProtocol);
     }
+    #[cfg(windows)]
+    platform::finish_response(&mut stream)?;
     remaining(deadline)?;
     match response {
         DecodedAdmissionResponse::Success(admitted) => Ok(admitted),
