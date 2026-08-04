@@ -5,7 +5,7 @@ use std::{fs, io::Read as _, os::windows::io::OwnedHandle, path::Path, sync::Arc
 use interprocess::{
     local_socket::{
         GenericNamespaced, Listener as SyncListener, ListenerOptions, Stream as SyncStream,
-        prelude::*, tokio::Stream as TokioStream,
+        prelude::*, tokio::Stream as TokioStream, traits::tokio::Stream as _,
     },
     os::windows::{
         local_socket::ListenerOptionsExt as _, named_pipe::local_socket::tokio as tokio_pipe,
