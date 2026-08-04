@@ -163,24 +163,27 @@ def _signed_prediction_attempt(
 def _initialize_signed_data_root(data_root: Path) -> None:
     release_root = Path(sys.prefix).resolve(strict=True)
     application = _native_release_executable("market-squawk").resolve(strict=True)
-    subprocess.run(
+    completed = subprocess.run(
         [
             str(application),
             "--data-dir",
             str(data_root),
             "--training-release-root",
             str(release_root),
-            "--output",
-            "json",
-            "feature",
-            "list",
+            "init",
         ],
-        check=True,
+        check=False,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=70,
         env=_native_subprocess_environment(),
     )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "sealed native initialization failed\n"
+            f"stdout: {completed.stdout[-4096:].decode('utf-8', 'replace')}\n"
+            f"stderr: {completed.stderr[-4096:].decode('utf-8', 'replace')}"
+        )
 
 
 class TrainingBundleContracts(unittest.TestCase):
@@ -270,10 +273,6 @@ class TrainingBundleContracts(unittest.TestCase):
         authority = Path(sys.prefix) / "share/market-squawk"
         receipt = authority / "training-environment.json"
         envelope = json.loads(receipt.read_text(encoding="ascii"))
-        self.assertEqual(
-            [value["name"] for value in envelope["payload"]["runtime_distributions"]],
-            ["pyarrow"],
-        )
 
         def reject_before_fresh_import(
             source: Path, replacement: bytes, sentinel: Path

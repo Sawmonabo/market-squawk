@@ -6598,8 +6598,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "8b8898347db16d02c31a8930dffbd75d5d8624f76c98923939bbeb71118112bc",
-      "size_bytes": 26427
+      "sha256": "5a12136e3eba862d79d57d72a82ed4fdd68cb75fcec32dbff12f8328fc458650",
+      "size_bytes": 26507
     },
     {
       "path": "python/tests/test_visualization_examples.py",
