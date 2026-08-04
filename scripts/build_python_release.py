@@ -35,6 +35,7 @@ MAX_ARTIFACTS = 64
 MAX_SOURCES = 2_048
 MAX_RUNTIME_DISTRIBUTIONS = 32
 MAX_DISTRIBUTION_FILES = 16_384
+MAX_DISTRIBUTION_EXTERNAL_PATHS = 256
 MAX_DISTRIBUTION_ROOTS = 64
 MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
 MAX_APPLICATION_EXECUTABLE_BYTES = 768 * 1024 * 1024
@@ -47,7 +48,7 @@ RUST_TOOLCHAIN = "1.97.1"
 MACOS_DEPLOYMENT_TARGET = "12.0"
 SOURCE_DATE_EPOCH = "946684800"
 RELEASE_MANIFEST_DOMAIN = b"market-squawk-release-manifest-v1\0"
-ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v1\0"
+ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v2\0"
 SUPPORTED_PYTHONS = ((3, 14),)
 REQUIRED_PYTHON = (3, 14, 6)
 CANONICAL_RELEASE = "release-cp314"
@@ -4492,6 +4493,10 @@ def inspect_installed_distribution(
                     )
                     if not is_internal:
                         external_entries.add(name)
+                if len(external_entries) > MAX_DISTRIBUTION_EXTERNAL_PATHS:
+                    raise ReleaseBuildError(
+                        "installed distribution external path count is unbounded"
+                    )
                 if path.is_symlink() or not path.is_file():
                     raise ReleaseBuildError("installed distribution file is unavailable")
                 observed_size, observed_sha256, header = (
@@ -4746,7 +4751,7 @@ def install_training_environment(
     ).encode("ascii")
     receipt = {
         "payload": payload,
-        "schema_version": 1,
+        "schema_version": 2,
         "signature": signer.sign(ENVIRONMENT_RECEIPT_DOMAIN, payload_bytes),
     }
     encoded = json.dumps(
@@ -4767,6 +4772,7 @@ def install_training_environment(
 
 def _distribution_payload(distribution: InstalledDistribution) -> dict[str, object]:
     return {
+        "external_paths": list(distribution.external_paths),
         "file_count": distribution.file_count,
         "file_set_sha256": distribution.file_set_sha256,
         "name": distribution.name,

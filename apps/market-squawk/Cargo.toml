@@ -127,6 +127,7 @@ zeroize = { workspace = true }
 rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+recvmsg = { workspace = true }
 widestring = { workspace = true }
 win-security-identifier = { workspace = true }
 windows-permissions = { workspace = true }

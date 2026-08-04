@@ -1,27 +1,25 @@
 //! Local-only named-pipe boundary with exact logon-SID DACL admission.
 
+use interprocess::{
+    ConnectWaitMode,
+    os::windows::{
+        named_pipe::{
+            DuplexPipeStream, PipeListener, PipeListenerOptions, PipeMode, pipe_mode::Messages,
+        },
+        security_descriptor::SecurityDescriptor,
+    },
+};
+use recvmsg::{MsgBuf, RecvResult, sync::RecvMsg as _};
+use sha2::{Digest as _, Sha256};
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
-    os::windows::io::OwnedHandle,
     path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-
-use interprocess::{
-    ConnectWaitMode,
-    os::windows::{
-        named_pipe::{
-            DuplexPipeStream, PipeListener, PipeListenerOptions, PipeMode,
-            pipe_mode::{Bytes, Messages},
-        },
-        security_descriptor::SecurityDescriptor,
-    },
-};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use widestring::U16CString;
@@ -30,7 +28,6 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::service::InstalledServiceError;
 
-type SyncBytePipe = DuplexPipeStream<Bytes>;
 type SyncMessagePipe = DuplexPipeStream<Messages>;
 type AdmissionPipeListener = PipeListener<Messages, Messages>;
 
@@ -41,7 +38,7 @@ const RESPONSE_ACK: &[u8; 8] = b"MSQARACK";
 
 pub(super) struct Stream {
     pending: Option<SyncMessagePipe>,
-    inner: Option<SyncBytePipe>,
+    inner: Option<SyncMessagePipe>,
     request: Zeroizing<Vec<u8>>,
     request_offset: usize,
     deadline: Instant,
@@ -78,10 +75,10 @@ impl Drop for Stream {
 }
 
 pub(super) struct BlockingStream {
-    pending: Option<SyncMessagePipe>,
-    response: Option<SyncBytePipe>,
+    pipe: Option<SyncMessagePipe>,
     request: Zeroizing<Vec<u8>>,
-    response_remaining: Option<usize>,
+    response: Zeroizing<Vec<u8>>,
+    response_offset: usize,
     deadline: Instant,
 }
 
@@ -90,43 +87,21 @@ impl Read for BlockingStream {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let remaining = self.response_remaining.ok_or_else(|| {
-            std::io::Error::new(
+        if self.response.is_empty() {
+            return Err(std::io::Error::new(
                 ErrorKind::NotConnected,
                 "ready admission request has not been committed",
-            )
-        })?;
+            ));
+        }
+        let remaining = self.response.len().saturating_sub(self.response_offset);
         if remaining == 0 {
-            // The complete response message, rather than pipe closure, is the response boundary.
             return Ok(0);
         }
-        let pipe = self.response.as_mut().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::NotConnected,
-                "ready admission response pipe is unavailable",
-            )
-        })?;
-        let limit = remaining.min(buffer.len());
-        loop {
-            match pipe.read(&mut buffer[..limit]) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "ready admission response ended inside its message",
-                    ));
-                }
-                Ok(count) => {
-                    self.response_remaining = Some(remaining - count);
-                    return Ok(count);
-                }
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
-                {
-                    wait_before_retry(self.deadline)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let count = remaining.min(buffer.len());
+        let end = self.response_offset + count;
+        buffer[..count].copy_from_slice(&self.response[self.response_offset..end]);
+        self.response_offset = end;
+        Ok(count)
     }
 }
 
@@ -135,7 +110,7 @@ impl Write for BlockingStream {
         if buffer.is_empty() {
             return Ok(0);
         }
-        if self.pending.is_none() {
+        if self.pipe.is_none() || !self.response.is_empty() {
             return Err(std::io::Error::new(
                 ErrorKind::BrokenPipe,
                 "ready admission request was already committed",
@@ -167,10 +142,7 @@ impl Write for BlockingStream {
 
 impl Drop for BlockingStream {
     fn drop(&mut self) {
-        if let Some(pipe) = self.pending.as_ref() {
-            pipe.assume_flushed();
-        }
-        if let Some(pipe) = self.response.as_ref() {
+        if let Some(pipe) = self.pipe.as_ref() {
             pipe.assume_flushed();
         }
     }
@@ -234,10 +206,10 @@ pub(super) fn connect_blocking(
     // write fits the explicitly bounded, otherwise empty pipe direction.
     stream.set_nonblocking(false)?;
     Ok(BlockingStream {
-        pending: Some(stream),
-        response: None,
+        pipe: Some(stream),
         request: Zeroizing::new(Vec::with_capacity(128)),
-        response_remaining: None,
+        response: Zeroizing::new(Vec::new()),
+        response_offset: 0,
         deadline,
     })
 }
@@ -250,7 +222,7 @@ pub(super) async fn authenticate_preface(stream: &mut Stream) -> Result<(), Inst
     let deadline = stream.deadline;
     let io_cancellation = stream.io_cancellation.clone();
     let (pipe, request) = tokio::task::spawn_blocking(move || {
-        receive_message(
+        receive_pipe_message(
             pipe,
             MAXIMUM_REQUEST_MESSAGE_BYTES,
             deadline,
@@ -272,32 +244,19 @@ pub(super) async fn authenticate_preface(stream: &mut Stream) -> Result<(), Inst
 
 pub(super) fn finish_request(stream: &mut BlockingStream) -> Result<(), InstalledServiceError> {
     let pipe = stream
-        .pending
-        .take()
+        .pipe
+        .as_ref()
         .ok_or(InstalledServiceError::AdmissionUnavailable)?;
     let mut request = std::mem::take(&mut stream.request);
-    let sent = send_message_before(&pipe, &request, stream.deadline, None);
+    let sent = send_message_before(pipe, &request, stream.deadline, None);
     request.zeroize();
     if let Err(error) = sent {
-        pipe.assume_flushed();
         return Err(error);
     }
-    let response_length = match wait_for_message(&pipe, stream.deadline, None) {
-        Ok(length) if length <= MAXIMUM_RESPONSE_MESSAGE_BYTES => length,
-        Ok(_) => {
-            pipe.assume_flushed();
-            return Err(InstalledServiceError::AdmissionProtocol);
-        }
-        Err(error) => {
-            pipe.assume_flushed();
-            return Err(error);
-        }
-    };
-    // A response can exist only after the server consumed the request message, so clearing the
-    // dependency's conservative conversion-dirty state cannot discard an outstanding client send.
-    let pipe = into_byte_pipe(pipe, false)?;
-    stream.response = Some(pipe);
-    stream.response_remaining = Some(response_length);
+    stream.response = receive_message(pipe, MAXIMUM_RESPONSE_MESSAGE_BYTES, stream.deadline, None)?;
+    // Receiving the response proves that the server consumed the complete request.
+    pipe.assume_flushed();
+    stream.response_offset = 0;
     Ok(())
 }
 
@@ -312,15 +271,13 @@ pub(super) async fn require_request_end(stream: &mut Stream) -> Result<(), Insta
 }
 
 pub(super) fn finish_response(stream: &mut BlockingStream) -> Result<(), InstalledServiceError> {
-    if stream.response_remaining != Some(0) {
+    if stream.response.is_empty() || stream.response_offset != stream.response.len() {
         return Err(InstalledServiceError::AdmissionProtocol);
     }
     let pipe = stream
-        .response
+        .pipe
         .take()
         .ok_or(InstalledServiceError::AdmissionUnavailable)?;
-    // The response is fully consumed before the acknowledgement send begins.
-    let pipe = into_message_pipe(pipe)?;
     if let Err(error) = send_message_before(&pipe, RESPONSE_ACK, stream.deadline, None) {
         pipe.assume_flushed();
         return Err(error);
@@ -357,70 +314,66 @@ pub(super) async fn write_response(
 }
 
 fn exchange_response(
-    pipe: SyncBytePipe,
+    pipe: SyncMessagePipe,
     wire: &[u8],
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), InstalledServiceError> {
-    // No server send is outstanding when the request is complete.
-    let pipe = into_message_pipe(pipe)?;
     if let Err(error) = send_message_before(&pipe, wire, deadline, Some(cancellation)) {
         pipe.assume_flushed();
         return Err(error);
     }
-    let acknowledgement_length = match wait_for_message(&pipe, deadline, Some(cancellation)) {
-        Ok(length) if length == RESPONSE_ACK.len() => length,
-        Ok(_) => {
-            pipe.assume_flushed();
-            return Err(InstalledServiceError::AdmissionProtocol);
-        }
-        Err(error) => {
-            pipe.assume_flushed();
-            return Err(error);
-        }
-    };
-    // The client emits the acknowledgement only after consuming the complete response message.
-    let mut pipe = into_byte_pipe(pipe, false)?;
-    let mut acknowledgement = [0_u8; RESPONSE_ACK.len()];
-    let result = read_exact_before(
-        &mut pipe,
-        &mut acknowledgement[..acknowledgement_length],
-        deadline,
-        Some(cancellation),
-    );
+    let acknowledgement = receive_message(&pipe, RESPONSE_ACK.len(), deadline, Some(cancellation));
+    // The client emits the acknowledgement only after consuming the complete response message,
+    // so the response no longer requires dependency-managed flushing.
     pipe.assume_flushed();
-    result?;
-    if acknowledgement == *RESPONSE_ACK {
+    if acknowledgement?.as_slice() == RESPONSE_ACK {
         Ok(())
     } else {
         Err(InstalledServiceError::AdmissionProtocol)
     }
 }
 
-fn receive_message(
+fn receive_pipe_message(
     pipe: SyncMessagePipe,
     maximum: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<(SyncBytePipe, Zeroizing<Vec<u8>>), InstalledServiceError> {
-    let length = match wait_for_message(&pipe, deadline, Some(cancellation)) {
+) -> Result<(SyncMessagePipe, Zeroizing<Vec<u8>>), InstalledServiceError> {
+    let message = receive_message(&pipe, maximum, deadline, Some(cancellation))?;
+    Ok((pipe, message))
+}
+
+fn receive_message(
+    pipe: &SyncMessagePipe,
+    maximum: usize,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
+    let length = match wait_for_message(pipe, deadline, cancellation) {
         Ok(length) if length <= maximum => length,
         Ok(_) => {
-            pipe.assume_flushed();
             return Err(InstalledServiceError::AdmissionProtocol);
         }
-        Err(error) => {
-            pipe.assume_flushed();
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    let mut pipe = into_byte_pipe(pipe, false)?;
     let mut message = Zeroizing::new(vec![0_u8; length]);
-    if let Err(error) = read_exact_before(&mut pipe, &mut message, deadline, Some(cancellation)) {
-        pipe.assume_flushed();
-        return Err(error);
+    let received_length = {
+        let mut buffer = MsgBuf::from(message.as_mut_slice());
+        let mut receiver = pipe;
+        match receiver.recv_msg(&mut buffer, None) {
+            Ok(RecvResult::Fit) => Ok(buffer.len_filled()),
+            Ok(RecvResult::Spilled | RecvResult::EndOfStream | RecvResult::QuotaExceeded(_)) => {
+                Err(InstalledServiceError::AdmissionProtocol)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }?;
+    if received_length == length {
+        Ok(message)
+    } else {
+        Err(InstalledServiceError::AdmissionProtocol)
     }
-    Ok((pipe, message))
 }
 
 fn send_message_before(
@@ -484,28 +437,6 @@ fn wait_for_close(pipe: &SyncMessagePipe, deadline: Instant) -> Result<(), Insta
     }
 }
 
-fn read_exact_before(
-    pipe: &mut SyncBytePipe,
-    mut buffer: &mut [u8],
-    deadline: Instant,
-    cancellation: Option<&CancellationToken>,
-) -> Result<(), InstalledServiceError> {
-    while !buffer.is_empty() {
-        require_io_open(deadline, cancellation)?;
-        match pipe.read(buffer) {
-            Ok(0) => return Err(InstalledServiceError::AdmissionProtocol),
-            Ok(count) => buffer = &mut buffer[count..],
-            Err(error)
-                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
-            {
-                wait_before_retry(deadline).map_err(super::map_admission_io)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
 fn require_io_open(
     deadline: Instant,
     cancellation: Option<&CancellationToken>,
@@ -517,41 +448,6 @@ fn require_io_open(
         return Err(InstalledServiceError::AdmissionDeadline);
     }
     Ok(())
-}
-
-fn into_byte_pipe(
-    pipe: SyncMessagePipe,
-    outstanding_send: bool,
-) -> Result<SyncBytePipe, InstalledServiceError> {
-    let handle: OwnedHandle = pipe.try_into().map_err(|pipe: SyncMessagePipe| {
-        pipe.assume_flushed();
-        InstalledServiceError::AdmissionUnavailable
-    })?;
-    let pipe = SyncBytePipe::try_from(handle)
-        .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-    if let Err(error) = pipe.set_nonblocking(false) {
-        pipe.assume_flushed();
-        return Err(error.into());
-    }
-    if !outstanding_send {
-        pipe.assume_flushed();
-    }
-    Ok(pipe)
-}
-
-fn into_message_pipe(pipe: SyncBytePipe) -> Result<SyncMessagePipe, InstalledServiceError> {
-    let handle: OwnedHandle = pipe.try_into().map_err(|pipe: SyncBytePipe| {
-        pipe.assume_flushed();
-        InstalledServiceError::AdmissionUnavailable
-    })?;
-    let pipe = SyncMessagePipe::try_from(handle)
-        .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-    if let Err(error) = pipe.set_nonblocking(false) {
-        pipe.assume_flushed();
-        return Err(error.into());
-    }
-    pipe.assume_flushed();
-    Ok(pipe)
 }
 
 fn wait_before_retry(deadline: Instant) -> std::io::Result<()> {

@@ -417,6 +417,11 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                     self.assertEqual(
                         distribution.roots, ("numpy-2.5.1.dist-info",)
                     )
+                    self.assertEqual(distribution.external_paths, (record_path,))
+                    self.assertEqual(
+                        builder._distribution_payload(distribution)["external_paths"],
+                        [record_path],
+                    )
 
                     escaped = site_packages.joinpath(*escape.split("/")).resolve()
                     escaped.parent.mkdir(parents=True, exist_ok=True)

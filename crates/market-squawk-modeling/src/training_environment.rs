@@ -23,11 +23,12 @@ const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRAINING_LAUNCHER_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILES: usize = 16_384;
+const MAX_DISTRIBUTION_EXTERNAL_PATHS: usize = 256;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
 const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
-const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
+const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v2\0";
 
 /// Installed training-release verification failed closed.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -251,6 +252,7 @@ struct RelativeFileWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DistributionWire {
+    external_paths: Vec<String>,
     file_count: usize,
     file_set_sha256: String,
     name: String,
@@ -420,7 +422,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         &manifest_file.bytes,
         TrainingEnvironmentError::ReleaseManifest,
     )?;
-    if signed_environment.schema_version != 1
+    if signed_environment.schema_version != 2
         || signed_manifest.schema_version != 3
         || !verify_signature(
             &foundation.release_public_key,
@@ -661,6 +663,7 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
 
 struct VerifiedDistribution {
     entries: BTreeMap<String, ([u8; 32], u64)>,
+    external_paths: BTreeSet<String>,
     roots: BTreeSet<String>,
     site_packages: PathBuf,
 }
@@ -682,6 +685,7 @@ fn verify_distributions(
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     let mut owned_roots = project.roots.clone();
+    let mut owned_external_paths = project.external_paths.clone();
     for (wire, requirement) in environment
         .runtime_distributions
         .iter()
@@ -696,6 +700,10 @@ fn verify_distributions(
                 .roots
                 .iter()
                 .any(|value| !owned_roots.insert(value.clone()))
+            || verified
+                .external_paths
+                .iter()
+                .any(|value| !owned_external_paths.insert(value.clone()))
         {
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
@@ -749,6 +757,11 @@ fn verify_distribution(
         .ok_or(TrainingEnvironmentError::InstalledDistribution)?
         .replace('\\', "/");
     let roots = distribution.roots.iter().cloned().collect::<BTreeSet<_>>();
+    let external_paths = distribution
+        .external_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -782,15 +795,18 @@ fn verify_distribution(
             saw_record = true;
             continue;
         }
+        let is_external = external_paths.contains(name);
         let is_training_driver = require_training_driver && name == training_driver_record_path;
-        let file = if is_training_driver {
-            if saw_training_driver || digest.is_empty() || size.is_empty() {
+        let file = if is_external {
+            if digest.is_empty() || size.is_empty() || (is_training_driver && saw_training_driver) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
-            saw_training_driver = true;
+            if is_training_driver {
+                saw_training_driver = true;
+            }
             read_controlled(
                 root,
-                Path::new(training_driver_relative_path()),
+                &external_distribution_relative_path(name)?,
                 MAX_DISTRIBUTION_FILE_BYTES,
                 false,
             )?
@@ -836,8 +852,15 @@ fn verify_distribution(
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
     }
+    let observed_external_paths = entries
+        .keys()
+        .filter(|name| external_paths.contains(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if !saw_record
         || require_training_driver != saw_training_driver
+        || require_training_driver != external_paths.contains(training_driver_record_path)
+        || observed_external_paths != external_paths
         || entries.len() != distribution.file_count
         || record_set_digest(&entries) != parse_hex(&distribution.file_set_sha256)?
     {
@@ -845,7 +868,7 @@ fn verify_distribution(
     }
     let mut expected_paths = entries
         .keys()
-        .filter(|name| name.as_str() != training_driver_record_path)
+        .filter(|name| !external_paths.contains(name.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     expected_paths.insert(record_entry);
@@ -854,6 +877,7 @@ fn verify_distribution(
     }
     Ok(VerifiedDistribution {
         entries,
+        external_paths,
         roots,
         site_packages: site_packages.to_path_buf(),
     })
@@ -885,6 +909,27 @@ const fn training_driver_record_path() -> &'static str {
     } else {
         "../../../bin/market-squawk-train"
     }
+}
+
+fn external_distribution_relative_path(value: &str) -> Result<PathBuf, TrainingEnvironmentError> {
+    let (prefix, directory) = if cfg!(windows) {
+        ("../../Scripts/", "Scripts")
+    } else {
+        ("../../../bin/", "bin")
+    };
+    let filename = value
+        .strip_prefix(prefix)
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+    let path = Path::new(filename);
+    if filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\'])
+        || path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    Ok(Path::new(directory).join(path))
 }
 
 fn scan_distribution_paths(
@@ -1206,6 +1251,15 @@ fn valid_runtime_requirements(values: &[RuntimeRequirementWire]) -> bool {
 fn valid_distribution(value: &DistributionWire) -> bool {
     value.file_count > 0
         && value.file_count <= MAX_DISTRIBUTION_FILES
+        && value.external_paths.len() <= MAX_DISTRIBUTION_EXTERNAL_PATHS
+        && value
+            .external_paths
+            .iter()
+            .all(|path| external_distribution_relative_path(path).is_ok())
+        && value
+            .external_paths
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str())
         && valid_hex(&value.file_set_sha256)
         && valid_distribution_name(&value.name)
         && valid_hex(&value.record_sha256)

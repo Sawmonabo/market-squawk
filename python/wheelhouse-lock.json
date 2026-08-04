@@ -1373,13 +1373,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "966b0c1150880cba79a39e863ee01c47a950a5e8e6b909a00591d1dc12896025",
-      "size_bytes": 243624
+      "sha256": "21342e57a52170bd0dee161bca119f87bd7c96036c3ab1a67b4e59540ce0fdce",
+      "size_bytes": 243636
     },
     {
       "path": "Cargo.toml",
-      "sha256": "d9e19847c30d1d2f3966dd1f53d5c10a2e118b4fac88d286cd12da649fec738b",
-      "size_bytes": 9026
+      "sha256": "9e9c40521bccd4092c861b3f22a2de09c1e85e07d07e0b810a28f0d717ed0ff3",
+      "size_bytes": 9045
     },
     {
       "path": "adapters/market-squawk-adapter-bls/Cargo.toml",
@@ -2168,8 +2168,8 @@
     },
     {
       "path": "apps/market-squawk/Cargo.toml",
-      "sha256": "032874146889bd0982aaa680dd203a7f63a465923088e965c10d651c643aa247",
-      "size_bytes": 4397
+      "sha256": "d88b9ffdcc3da67f7e94ea292424835e89fc8f8f5508517dc59c52910b0f78c2",
+      "size_bytes": 4428
     },
     {
       "path": "apps/market-squawk/assets/provider-onboarding/index.html",
@@ -3458,8 +3458,8 @@
     },
     {
       "path": "apps/market-squawk/src/service/ready_admission/windows.rs",
-      "sha256": "87b4854124255355e62de9c5e3981a474d923eadee8d57ec1f6b75dcda69c997",
-      "size_bytes": 21080
+      "sha256": "61b13602471a85be2f80b30ea0fe21c0b186fbc0685aaa3b7b07cb77f45c0373",
+      "size_bytes": 17605
     },
     {
       "path": "apps/market-squawk/src/service/research_dataset.rs",
@@ -5398,8 +5398,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/training_environment.rs",
-      "sha256": "73cfc2e581f5c55dc383d221dde70a21c2566c83ddf8b39a493a9b44f5cdb60f",
-      "size_bytes": 48476
+      "sha256": "da58ee741444e2f342a9334546a3889e81109d06f7c6592fc4ff926da3ba3535",
+      "size_bytes": 50498
     },
     {
       "path": "crates/market-squawk-modeling/src/training_protocol.rs",
@@ -6633,13 +6633,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "06cb595e3d2422dd1473bb3eb1ecbe039006d9c7a078b34f3dac1ce96439ace0",
-      "size_bytes": 207135
+      "sha256": "98f16c9fae4f32ec71afc096b70185a86e22db80c6a05da66770acd1a6430fa5",
+      "size_bytes": 207459
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "f087d3e80b74c2866ad3b656b5095614905733de68e2288b5a790cc954172694",
-      "size_bytes": 28849
+      "sha256": "81797fc9382035dea720956016d537de8dba45a33941a3a2b66cdfaa0ab7fc76",
+      "size_bytes": 29117
     },
     {
       "path": "vendor/glib-0.18.5/Cargo.toml",
