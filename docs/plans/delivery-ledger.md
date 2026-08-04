@@ -12,31 +12,34 @@ evidence; it does not replace the README capability truth or the canonical relea
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
 - The latest integrated product code is
-  `19e6fc5a40929c0676d1352128e7e8a5c9be640f`, tree
-  `b353355d8cc37f7eaf6e366a255ab0c15704d5c9`. This ledger synchronization follows that product
+  `b0b4f6ead80577a129cf7f1e4581dbb0d411fbc5`, tree
+  `851b5dd41ab08e9287e69de309fec38424035175`. This ledger synchronization follows that product
   commit and does not change application behavior. The branch contains the complete native
   desktop, CLI, per-user service, shared Claude Code/Codex MCP relays, guided setup, backup and
   recovery, settings, logs, updates, research/modeling Python product, and four-platform package
   construction required by the approved V1 installed-product plan.
-- Hosted candidate `1930f8fb06195b5d5eeeb3be5867fd0aa078fc1f` was rejected rather than
-  approved. Windows exposed a cancel-unsafe detached named-pipe accept owner after the startup
-  self-probe, and the Linux sealed Python package exposed two obsolete test assumptions: a
-  service-routed product command was being used as a build-time initializer, and a tamper test
-  still expected a pyarrow-only runtime after the locked environment expanded.
-- Commits `cee97b8caad4e18587a0be6138c927d7663d3f01` and `19e6fc5a40929c0676d1352128e7e8a5c9be640f`
-  close those findings. The ready-admission server retains and drains exactly one accept operation;
-  sealed fixtures use the explicit local `init` operation; bounded subprocess diagnostics are
-  preserved; and the unrelated one-package snapshot is removed without weakening receipt or
-  dependency-tamper coverage.
+- Hosted candidate `f93634e0eaba38d933fb0176178ed06b9cf5f372` was rejected rather than
+  approved by explicit run
+  [30922568757](https://github.com/Sawmonabo/market-squawk/actions/runs/30922568757). The Linux
+  terminal ZIP installed its complete release, but the registered service did not publish exact
+  authenticated readiness. The matrix was cancelled after the failure was reproduced and its
+  shared root cause was confirmed; results from this rejected candidate cannot approve a package.
+- Commit `b0b4f6ead80577a129cf7f1e4581dbb0d411fbc5` binds absolute workspace,
+  installation, and training roots into the Linux systemd user unit, macOS LaunchAgent, and Windows
+  current-user task; declares the installation-data root as the native working directory; includes
+  that Windows field in the admitted task semantics; and makes installer health probe the same
+  exact roots. The desktop workspace root uses the operating system's local-data directory and
+  `com.marketsquawk.desktop`, matching Tauri's installed default.
 - Focused integration evidence on the product code head is clean: the exact control-plane service
-  scenario passed, strict application Clippy passed, all 16 Python release-builder contracts and
-  complete source closure passed, formatting and diff checks passed, and independent remediation
-  reviews reported zero unresolved Critical, Important, or Minor findings. This is local
-  integration evidence, not hosted package or release approval.
+  scenario passed, installer unit tests report 15 passed with only the package-only fixture ignored,
+  strict installer Clippy passed, the complete Python source closure passed, and formatting and diff
+  checks passed. An isolated LaunchAgent reproduced the rejected read-only working-directory
+  failure; the corrected registration reached authenticated `ready` state and shut down cleanly.
+  This is local integration evidence, not hosted package or release approval.
 - Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), draft PR
   [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project item remain open and
   `In Progress`. The main checkout owns the feature branch; `.worktrees` is empty; no temporary
-  lane branch is active; and generated Cargo output is 7.9 GiB, below the 20 GiB ceiling.
+  lane branch is active; and generated Cargo output is 8.3 GiB, below the 20 GiB ceiling.
 - Exactly three barriers remain before the requested V1 handoff:
 
   1. One unchanged-head ordinary CI run plus the explicit installed-product campaign must pass the
