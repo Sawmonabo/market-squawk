@@ -377,8 +377,7 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
     match role.to_str() {
         Some("seed") => seed_encrypted_runtime(root)
             .await
-            .context("run encrypted-runtime seed subprocess role")
-            .map_err(Into::into),
+            .context("run encrypted-runtime seed subprocess role"),
         Some("service") => {
             let config = installed_service_process_config(&root)
                 .context("load installed-service subprocess configuration")?;
@@ -517,7 +516,7 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
 }
 
 fn installed_service_process_config(root: &Path) -> TestResult<AppConfig> {
-    Ok(AppConfig::load(ConfigSources::new(
+    AppConfig::load(ConfigSources::new(
         None,
         &BTreeMap::<OsString, OsString>::new(),
         ConfigOverrides {
@@ -526,7 +525,7 @@ fn installed_service_process_config(root: &Path) -> TestResult<AppConfig> {
             ..ConfigOverrides::default()
         },
     ))
-    .context("load installed-service process configuration")?)
+    .context("load installed-service process configuration")
 }
 
 fn installed_service_authority_root(root: &Path) -> PathBuf {
@@ -550,7 +549,6 @@ async fn wait_for_bootstrap(
     .await
     .context("time out waiting for installed-service bootstrap status")?
     .context("poll installed-service bootstrap status")
-    .map_err(Into::into)
 }
 
 async fn wait_until_ready(connector: &InstalledServiceConnector) -> TestResult {

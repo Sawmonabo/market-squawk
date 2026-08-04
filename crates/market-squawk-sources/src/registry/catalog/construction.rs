@@ -175,18 +175,16 @@ impl AuthoritativeSourceRegistry {
         store: market_squawk_platform::LocalAuthorityStateStore,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         provider_rate: crate::ProviderRateAuthority,
-        recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
+        _recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
     ) -> Result<Self, RegistryError> {
         let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
-        let result = Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
             store,
             resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
             Some(provider_rate),
             UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
-        );
-        drop(recovery_authority);
-        result
+        )
     }
 
     #[cfg(test)]
