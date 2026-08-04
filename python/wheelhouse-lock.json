@@ -3448,8 +3448,8 @@
     },
     {
       "path": "apps/market-squawk/src/service/ready_admission.rs",
-      "sha256": "971d2f0c3c8dbebd342adb2757fe82925bbdb1c97063bf1cb2da1740b09ad4d2",
-      "size_bytes": 32436
+      "sha256": "5f50abb781db967ebf3c6fa2640b857fdf293b75fd8e16a3b0c0f612a91a1483",
+      "size_bytes": 32678
     },
     {
       "path": "apps/market-squawk/src/service/ready_admission/unix.rs",

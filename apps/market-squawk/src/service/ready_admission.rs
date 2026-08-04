@@ -278,27 +278,33 @@ async fn run_server(
 ) {
     let mut workers = JoinSet::new();
     loop {
-        tokio::select! {
+        while workers.try_join_next().is_some() {}
+        let accepted = listener.accept(cancellation.clone());
+        tokio::pin!(accepted);
+        let accepted = tokio::select! {
             biased;
-            () = cancellation.cancelled() => break,
-            joined = workers.join_next(), if !workers.is_empty() => {
-                let _worker_completed = joined;
+            () = cancellation.cancelled() => {
+                // Windows acceptance owns a started blocking task. Drain that exact future after
+                // cancellation so a detached accept cannot consume a later pipe connection.
+                let _drained = (&mut accepted).await;
+                break;
             }
-            accepted = listener.accept(cancellation.clone()) => {
-                let Ok(stream) = accepted else { break; };
-                if workers.len() >= MAXIMUM_CONNECTIONS {
-                    drop(stream);
-                    continue;
-                }
-                let authority = Arc::clone(&authority);
-                workers.spawn(async move {
-                    let _served = tokio::time::timeout(
-                        CONNECTION_TIMEOUT,
-                        serve_connection(stream, metadata, authority),
-                    ).await;
-                });
-            }
+            accepted = &mut accepted => accepted,
+        };
+        let Ok(stream) = accepted else { break };
+        while workers.try_join_next().is_some() {}
+        if workers.len() >= MAXIMUM_CONNECTIONS {
+            drop(stream);
+            continue;
         }
+        let authority = Arc::clone(&authority);
+        workers.spawn(async move {
+            let _served = tokio::time::timeout(
+                CONNECTION_TIMEOUT,
+                serve_connection(stream, metadata, authority),
+            )
+            .await;
+        });
     }
     workers.abort_all();
     while workers.join_next().await.is_some() {}
