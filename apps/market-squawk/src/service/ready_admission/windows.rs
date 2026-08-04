@@ -229,7 +229,10 @@ pub(super) fn connect_blocking(
         ConnectWaitMode::Timeout(super::remaining(deadline)?),
     )
     .map_err(super::map_admission_io)?;
-    stream.set_nonblocking(true)?;
+    // PIPE_NOWAIT is a legacy compatibility mode, not cancellable asynchronous I/O. Connected
+    // streams use PIPE_WAIT; every read below is preceded by a complete-message peek and every
+    // write fits the explicitly bounded, otherwise empty pipe direction.
+    stream.set_nonblocking(false)?;
     Ok(BlockingStream {
         pending: Some(stream),
         response: None,
@@ -323,9 +326,8 @@ pub(super) fn finish_response(stream: &mut BlockingStream) -> Result<(), Install
         return Err(error);
     }
     // Preserve the acknowledgement's dirty state until server closure proves that the peer has
-    // consumed it. Drop clears it on every deadline/error path, so no linger work can escape.
-    let mut pipe = into_byte_pipe(pipe, true)?;
-    let closed = wait_for_close(&mut pipe, stream.deadline);
+    // consumed it. `peek_msg_len` never blocks, so this remains deadline-bounded under PIPE_WAIT.
+    let closed = wait_for_close(&pipe, stream.deadline);
     pipe.assume_flushed();
     closed
 }
@@ -465,6 +467,23 @@ fn wait_for_message(
     }
 }
 
+fn wait_for_close(pipe: &SyncMessagePipe, deadline: Instant) -> Result<(), InstalledServiceError> {
+    loop {
+        require_io_open(deadline, None)?;
+        match pipe.peek_msg_len() {
+            Ok(0) => wait_before_retry(deadline).map_err(super::map_admission_io)?,
+            Ok(_) => return Err(InstalledServiceError::AdmissionProtocol),
+            Err(error) if error.kind() == ErrorKind::BrokenPipe => return Ok(()),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
+            {
+                wait_before_retry(deadline).map_err(super::map_admission_io)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn read_exact_before(
     pipe: &mut SyncBytePipe,
     mut buffer: &mut [u8],
@@ -485,23 +504,6 @@ fn read_exact_before(
         }
     }
     Ok(())
-}
-
-fn wait_for_close(pipe: &mut SyncBytePipe, deadline: Instant) -> Result<(), InstalledServiceError> {
-    let mut trailing = [0_u8; 1];
-    loop {
-        require_io_open(deadline, None)?;
-        match pipe.read(&mut trailing) {
-            Ok(0) => return Ok(()),
-            Ok(_) => return Err(InstalledServiceError::AdmissionProtocol),
-            Err(error)
-                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
-            {
-                wait_before_retry(deadline).map_err(super::map_admission_io)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
 }
 
 fn require_io_open(
@@ -527,7 +529,7 @@ fn into_byte_pipe(
     })?;
     let pipe = SyncBytePipe::try_from(handle)
         .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-    if let Err(error) = pipe.set_nonblocking(true) {
+    if let Err(error) = pipe.set_nonblocking(false) {
         pipe.assume_flushed();
         return Err(error.into());
     }
@@ -544,7 +546,7 @@ fn into_message_pipe(pipe: SyncBytePipe) -> Result<SyncMessagePipe, InstalledSer
     })?;
     let pipe = SyncMessagePipe::try_from(handle)
         .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-    if let Err(error) = pipe.set_nonblocking(true) {
+    if let Err(error) = pipe.set_nonblocking(false) {
         pipe.assume_flushed();
         return Err(error.into());
     }
@@ -579,7 +581,7 @@ fn accept_authenticated(
             Err(error) => return Err(error.into()),
         }
     };
-    stream.set_nonblocking(true)?;
+    stream.set_nonblocking(false)?;
     let deadline = Instant::now()
         .checked_add(super::CONNECTION_TIMEOUT)
         .ok_or(InstalledServiceError::AdmissionDeadline)?;

@@ -511,11 +511,15 @@ impl InstalledService {
                     return Err(error);
                 }
             };
-            let native_readiness = readiness.probe_ready(CancellationToken::new()).await;
-            if native_readiness.is_err() || server.is_finished() {
+            if let Err(error) = readiness.probe_ready(CancellationToken::new()).await {
                 drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
-                return Err(InstalledServiceError::ReadinessFailed);
+                return Err(InstalledServiceError::NativeReadiness(error));
+            }
+            if server.is_finished() {
+                drain_failed_server(server).await;
+                cleanup_startup(&product, &jobs).await;
+                return Err(InstalledServiceError::TransportStopped);
             }
             if operations
                 .recovery_bridge()
@@ -543,12 +547,11 @@ impl InstalledService {
                     return Err(error);
                 }
             };
-            let admission_readiness = admission.probe().await;
-            if admission_readiness.is_err() {
+            if let Err(error) = admission.probe().await {
                 let _retired = admission.shutdown().await;
                 drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
-                return Err(InstalledServiceError::ReadinessFailed);
+                return Err(InstalledServiceError::AdmissionReadiness(Box::new(error)));
             }
             if let Err(error) = runtime.publish() {
                 let _retired = admission.shutdown().await;
@@ -1328,6 +1331,12 @@ pub enum InstalledServiceError {
     /// The authenticated exact-generation self-probe did not prove readiness.
     #[error("installed-service readiness verification failed")]
     ReadinessFailed,
+    /// The exact native loopback generation did not pass its authenticated readiness probe.
+    #[error("installed-service native readiness verification failed")]
+    NativeReadiness(#[source] market_squawk_runtime::ApplicationClientError),
+    /// The exact fresh-client admission generation did not pass its owner-authenticated probe.
+    #[error("installed-service ready-admission verification failed")]
+    AdmissionReadiness(#[source] Box<InstalledServiceError>),
     /// The private runtime server stopped without an admitted lifecycle signal.
     #[error("installed-service transport stopped unexpectedly")]
     TransportStopped,
