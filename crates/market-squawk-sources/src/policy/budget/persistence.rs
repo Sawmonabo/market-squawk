@@ -118,7 +118,7 @@ enum DurableRunState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UncleanPredecessorPolicy {
     Reject,
-    RecoverExactlyEmpty,
+    RecoverStructurallyValidExclusiveInstalledReplacement,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -395,6 +395,18 @@ impl BudgetCheckpointState {
         self.availability_generation = self.availability_generation.saturating_add(1);
     }
 
+    fn recover_exclusive_installed_replacement(&mut self) -> Result<(), AuthorityPersistenceError> {
+        if self.in_flight == 0 {
+            return Ok(());
+        }
+        self.in_flight = 0;
+        self.availability_generation = self
+            .availability_generation
+            .checked_add(1)
+            .ok_or(AuthorityPersistenceError::GenerationExhausted)?;
+        Ok(())
+    }
+
     pub(crate) const fn in_flight(&self) -> u16 {
         self.in_flight
     }
@@ -665,14 +677,14 @@ impl AuthorityDurabilitySession {
         Self::open_unpublished_with_policy(store, now, UncleanPredecessorPolicy::Reject)
     }
 
-    pub(crate) fn open_unpublished_recovering_exactly_empty(
+    pub(crate) fn open_unpublished_for_exclusive_installed_replacement(
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
         Self::open_unpublished_with_policy(
             store,
             now,
-            UncleanPredecessorPolicy::RecoverExactlyEmpty,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
         )
     }
 
@@ -709,15 +721,21 @@ impl AuthorityDurabilitySession {
             None => DurableAuthorityEnvelope::empty(now),
         };
         let predecessor_was_unclean = envelope.run_state == DurableRunState::InUse;
-        let recover_exactly_empty = predecessor_was_unclean
-            && policy == UncleanPredecessorPolicy::RecoverExactlyEmpty
-            && envelope.registry.is_exactly_empty()
-            && envelope.budgets.is_empty();
-        let recovered_unclean = predecessor_was_unclean && !recover_exactly_empty;
+        let recover_exclusive_installed_replacement = predecessor_was_unclean
+            && policy
+                == UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement;
+        let recovered_unclean = predecessor_was_unclean && !recover_exclusive_installed_replacement;
         if recovered_unclean {
             let mut groups = envelope.budgets.as_slice().to_vec();
             for group in &mut groups {
                 group.checkpoint.terminalize_unclean();
+            }
+            envelope.budgets = BoundedVec::try_new(groups)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        } else if recover_exclusive_installed_replacement {
+            let mut groups = envelope.budgets.as_slice().to_vec();
+            for group in &mut groups {
+                group.checkpoint.recover_exclusive_installed_replacement()?;
             }
             envelope.budgets = BoundedVec::try_new(groups)
                 .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;

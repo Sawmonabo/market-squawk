@@ -106,6 +106,15 @@ mod tests {
         )
     }
 
+    fn durable_registry_with_test_store_for_exclusive_installed_replacement(
+        store: Arc<dyn AuthorityStateStore>,
+    ) -> Result<AuthoritativeSourceRegistry, RegistryError> {
+        AuthoritativeSourceRegistry::try_new_durable_with_store_for_exclusive_installed_replacement_for_test(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+        )
+    }
+
     impl ManualRegistryClock {
         fn new(reading: TrustedRegistryTime) -> Self {
             Self {
@@ -828,6 +837,128 @@ mod tests {
             durable_registry_with_test_store(store),
             Err(RegistryError::UncleanAuthorityPredecessor)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_installed_replacement_restores_nonempty_state_rejected_by_default() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let crashed_store = Arc::new(FailingAuthorityStore::default());
+        let metadata = direct_metadata_with_provider_and_limit(
+            "installed-crash-recovery",
+            "revision-1",
+            "installed-crash-recovery-provider",
+            2,
+        )?;
+        let mut crashed = durable_registry_with_test_store(crashed_store.clone())?;
+        let registered = crashed.register_or_resume_exact(metadata.clone(), at)?;
+        let expected = crashed.export_authority_state()?;
+        assert!(!expected.sources.is_empty());
+        assert!(!expected.budget_policies.is_empty());
+        let crashed_permit = match registered
+            .budget()
+            .ok_or("crashed provider budget was absent")?
+            .try_acquire()
+        {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("crashed provider budget was unusable: {other:?}").into()),
+        };
+        let payload = crashed_store
+            .payload
+            .lock()
+            .map_err(|_| "crashed authority payload lock was poisoned")?
+            .clone()
+            .ok_or("crashed authority payload was absent")?;
+        crashed_permit.release();
+        drop(registered);
+        crashed.shutdown()?;
+        let predecessor_envelope: serde_json::Value = serde_json::from_slice(&payload)?;
+        let default_store = Arc::new(FailingAuthorityStore {
+            payload: Mutex::new(Some(payload.clone())),
+            ..FailingAuthorityStore::default()
+        });
+        assert!(matches!(
+            durable_registry_with_test_store(default_store),
+            Err(RegistryError::UncleanAuthorityPredecessor)
+        ));
+
+        let replacement_store = Arc::new(FailingAuthorityStore {
+            payload: Mutex::new(Some(payload)),
+            ..FailingAuthorityStore::default()
+        });
+        let mut replacement = durable_registry_with_test_store_for_exclusive_installed_replacement(
+            replacement_store.clone(),
+        )?;
+        let recovered_payload = replacement_store
+            .payload
+            .lock()
+            .map_err(|_| "replacement authority payload lock was poisoned")?
+            .clone()
+            .ok_or("replacement authority payload was absent")?;
+        let recovered_envelope: serde_json::Value = serde_json::from_slice(&recovered_payload)?;
+        let predecessor_generation = predecessor_envelope["run_generation"]
+            .as_u64()
+            .ok_or("predecessor run generation was invalid")?;
+        assert_eq!(
+            recovered_envelope["run_generation"],
+            predecessor_generation
+                .checked_add(1)
+                .ok_or("test run generation overflowed")?
+        );
+        assert_eq!(recovered_envelope["run_state"], "in_use");
+        assert_eq!(
+            recovered_envelope["saved_at_wall"],
+            recovered_envelope["wall_high_water"]
+        );
+        let mut expected_recovered_envelope = predecessor_envelope;
+        expected_recovered_envelope["run_generation"] =
+            recovered_envelope["run_generation"].clone();
+        expected_recovered_envelope["saved_at_wall"] = recovered_envelope["saved_at_wall"].clone();
+        expected_recovered_envelope["wall_high_water"] =
+            recovered_envelope["wall_high_water"].clone();
+        for group in expected_recovered_envelope["budgets"]
+            .as_array_mut()
+            .ok_or("predecessor budgets were invalid")?
+        {
+            let checkpoint = group
+                .get_mut("checkpoint")
+                .ok_or("predecessor budget checkpoint was absent")?;
+            let in_flight = checkpoint["in_flight"]
+                .as_u64()
+                .ok_or("predecessor in-flight count was invalid")?;
+            if in_flight != 0 {
+                checkpoint["in_flight"] = serde_json::Value::from(0);
+                let generation = checkpoint["availability_generation"]
+                    .as_u64()
+                    .ok_or("predecessor availability generation was invalid")?;
+                checkpoint["availability_generation"] = serde_json::Value::from(
+                    generation
+                        .checked_add(1)
+                        .ok_or("test availability generation overflowed")?,
+                );
+            }
+        }
+        assert_eq!(recovered_envelope, expected_recovered_envelope);
+        assert_eq!(replacement.export_authority_state()?, expected);
+        let resumed = replacement.register_or_resume_exact(metadata, at)?;
+        let permit = match resumed
+            .budget()
+            .ok_or("restored provider budget was absent")?
+            .try_acquire()
+        {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("restored provider budget was unusable: {other:?}").into()),
+        };
+        permit.release();
+        assert!(matches!(
+            resumed
+                .budget()
+                .ok_or("restored provider budget disappeared")?
+                .try_acquire(),
+            BudgetDecision::WaitUntil(_)
+        ));
+        drop(resumed);
+        replacement.shutdown()?;
         Ok(())
     }
 

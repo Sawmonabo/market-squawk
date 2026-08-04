@@ -134,6 +134,7 @@ pub use policy::{
     QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
     apply_http_retry_after,
 };
+pub use registry::ExclusiveInstalledServiceSourceRecoveryAuthority;
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,

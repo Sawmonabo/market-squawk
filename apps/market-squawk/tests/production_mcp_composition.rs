@@ -35,6 +35,7 @@ type TestResult<T = ()> = anyhow::Result<T>;
 const INSTALLED_SERVICE_PROCESS_ROLE_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROLE";
 const INSTALLED_SERVICE_PROCESS_ROOT_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROOT";
 const INSTALLED_SERVICE_TEST_UNLOCK: &str = "installed-service-test-unlock";
+const CRASH_RECOVERY_SOURCE_PROFILE: &str = "coinbase.public-market-data";
 const INSTALLED_MCP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -428,6 +429,27 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
                     .await
                     .context("fetch installed subprocess desktop bootstrap")?;
                 assert_eq!(snapshot["readiness"]["service"], true);
+                let registration = desktop
+                    .invoke_operation(
+                        RequestId::try_string("installed-crash-source-registration")
+                            .context("construct crash source-registration request ID")?,
+                        "Source.Register",
+                        json!({
+                            "provider": CRASH_RECOVERY_SOURCE_PROFILE,
+                            "confirm": true,
+                            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+                        }),
+                        Duration::from_secs(5),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .context("register durable source before installed-service crash")?;
+                assert_eq!(
+                    registration.result()["value"]["data"]["outcome"],
+                    "inserted",
+                    "{}",
+                    registration.result()
+                );
                 for client in [NamedClient::ClaudeCode, NamedClient::Codex] {
                     exercise_installed_relay(
                         client,
@@ -438,6 +460,47 @@ async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> T
                     .await
                     .context("exercise installed subprocess MCP relay")?;
                 }
+            } else {
+                let replay = cli
+                    .invoke_operation(
+                        RequestId::try_string("installed-crash-source-replay")
+                            .context("construct recovered source-registration request ID")?,
+                        "Source.Register",
+                        json!({
+                            "provider": CRASH_RECOVERY_SOURCE_PROFILE,
+                            "confirm": true,
+                            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+                        }),
+                        Duration::from_secs(5),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .context("prove crashed source registration survived restart")?;
+                assert_eq!(replay.result()["value"]["data"]["outcome"], "replay");
+                let status = cli
+                    .invoke_operation(
+                        RequestId::try_string("installed-crash-source-status")
+                            .context("construct recovered source-status request ID")?,
+                        "Source.GetStatus",
+                        json!({
+                            "sourceCoverage": [CRASH_RECOVERY_SOURCE_PROFILE],
+                            "resultLimits": {"maximumItems": 16, "maximumBytes": 1_048_576},
+                        }),
+                        Duration::from_secs(5),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .context("query recovered source registration after restart")?;
+                let rows = status.result()["value"]["data"]
+                    .as_array()
+                    .context("recovered source status was not an array")?;
+                assert_eq!(rows.len(), 1, "{}", status.result());
+                assert_eq!(
+                    rows[0]["profile"]["id"],
+                    CRASH_RECOVERY_SOURCE_PROFILE,
+                    "{}",
+                    status.result()
+                );
             }
             Ok(())
         }

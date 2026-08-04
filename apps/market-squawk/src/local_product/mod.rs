@@ -31,7 +31,10 @@ use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths, PreferredSecretStore};
 use market_squawk_services::{ArtifactAuthority, ArtifactError, ArtifactRepository};
-use market_squawk_sources::{AuthoritativeSourceRegistry, AuthorizationSubjectResolver};
+use market_squawk_sources::{
+    AuthoritativeSourceRegistry, AuthorizationSubjectResolver,
+    ExclusiveInstalledServiceSourceRecoveryAuthority,
+};
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
 
@@ -171,10 +174,10 @@ pub struct LocalProduct {
     fair_value_inputs: ProductionFairValueInputAuthority,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceAuthorityStartupPolicy {
+#[derive(Debug)]
+enum SourceAuthorityStartupPolicy<'guard> {
     RejectUncleanPredecessor,
-    RecoverExactlyEmptyUncleanPredecessor,
+    ExclusiveInstalledReplacement(ExclusiveInstalledServiceSourceRecoveryAuthority<'guard>),
 }
 
 impl LocalProduct {
@@ -194,12 +197,13 @@ impl LocalProduct {
     pub(crate) fn try_new_at_paths(
         config: AppConfig,
         paths: LocalPaths,
+        source_recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
             config,
             paths,
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
-            SourceAuthorityStartupPolicy::RecoverExactlyEmptyUncleanPredecessor,
+            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(source_recovery_authority),
         )
     }
 
@@ -232,7 +236,7 @@ impl LocalProduct {
         config: AppConfig,
         paths: LocalPaths,
         registrations: I,
-        source_authority_startup_policy: SourceAuthorityStartupPolicy,
+        source_authority_startup_policy: SourceAuthorityStartupPolicy<'_>,
     ) -> Result<Self, LocalProductError>
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
@@ -261,11 +265,12 @@ impl LocalProduct {
                     provider_rate.clone(),
                 )
             }
-            SourceAuthorityStartupPolicy::RecoverExactlyEmptyUncleanPredecessor => {
-                AuthoritativeSourceRegistry::try_new_durable_for_installed_product_recovering_exactly_empty_predecessor(
+            SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(recovery_authority) => {
+                AuthoritativeSourceRegistry::try_new_durable_for_exclusive_installed_service_replacement(
                     source_store,
                     authorization_subject_resolver,
                     provider_rate.clone(),
+                    recovery_authority,
                 )
             }
         }?;

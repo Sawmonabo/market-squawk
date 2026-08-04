@@ -437,7 +437,18 @@ impl InstalledService {
             };
             let lifecycle = Arc::new(InstalledServiceLifecycle::new(runtime.runtime()));
             let workspace_paths = selection.paths().clone();
-            let product = LocalProduct::try_new_at_paths(config.clone(), workspace_paths.clone())?;
+            // `instance_guard` is the exact still-live guard returned by
+            // `runtime::acquire_instance(&installation_paths)` and remains owned by
+            // `InstalledService` through final drop.
+            let source_recovery_authority =
+                market_squawk_sources::ExclusiveInstalledServiceSourceRecoveryAuthority::from_acquired_installation_instance_guard(
+                    &instance_guard,
+                );
+            let product = LocalProduct::try_new_at_paths(
+                config.clone(),
+                workspace_paths.clone(),
+                source_recovery_authority,
+            )?;
             let prepared_operations = PreparedInstalledOperations::prepare(
                 &config,
                 &installation_paths,
@@ -1092,14 +1103,14 @@ fn retire_and_verify_ephemeral_credentials(
     secret_store: &dyn SecretStore,
 ) -> Result<(), InstalledServiceError> {
     let mut failed = false;
-    let mut references = match runtime::credential_references(&paths) {
+    let mut references = match runtime::credential_references(paths) {
         Ok(references) => references,
         Err(_error) => {
             failed = true;
             Vec::new()
         }
     };
-    match mcp_control::credential_references(&paths) {
+    match mcp_control::credential_references(paths) {
         Ok(mut mcp_references) => references.append(&mut mcp_references),
         Err(_error) => failed = true,
     }

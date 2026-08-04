@@ -437,10 +437,6 @@ impl RegistryAuthorityState {
         }
     }
 
-    pub(crate) fn is_exactly_empty(&self) -> bool {
-        self.sources.is_empty() && self.budget_policies.is_empty()
-    }
-
     fn try_new(
         sources: Vec<PersistedSourceAuthority>,
         budget_policies: Vec<PersistedProviderBudgetPolicy>,
@@ -574,6 +570,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 include!("registry/catalog.rs");
 #[path = "registry/catalog/construction.rs"]
 mod catalog_construction;
+pub use catalog_construction::ExclusiveInstalledServiceSourceRecoveryAuthority;
 #[path = "registry/catalog/persistence.rs"]
 mod catalog_persistence;
 include!("registry/health_authority.rs");

@@ -1,9 +1,45 @@
 use super::*;
 
+/// Borrowed proof that the installed replacement owns the installation-global instance lock.
+///
+/// Only installed-service composition should create this witness, immediately after acquiring its
+/// exact per-installation [`market_squawk_platform::LocalAuthorityStateStore`] guard. The witness is
+/// move-only, borrows that guard, and is consumed by source-registry recovery, so recovery cannot
+/// run after the exclusive guard is released or without a live guard capability.
+pub struct ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
+    _instance_guard: &'guard market_squawk_platform::LocalAuthorityStateStore,
+}
+
+impl<'guard> ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
+    /// Binds installed source recovery to an already acquired installation-global instance guard.
+    ///
+    /// The caller must pass the exact guard acquired from the installed service's code-owned
+    /// `installed-service/instance` authority path, not an unrelated authority-state store. The
+    /// concrete store enforces exclusive lifetime ownership; this witness carries that ownership
+    /// proof into source composition without exposing a boolean recovery bypass.
+    #[must_use]
+    pub fn from_acquired_installation_instance_guard(
+        instance_guard: &'guard market_squawk_platform::LocalAuthorityStateStore,
+    ) -> Self {
+        Self {
+            _instance_guard: instance_guard,
+        }
+    }
+}
+
+impl std::fmt::Debug for ExclusiveInstalledServiceSourceRecoveryAuthority<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExclusiveInstalledServiceSourceRecoveryAuthority")
+            .field("instance_guard", &"[INSTALLATION-GLOBAL AUTHORITY]")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UncleanPredecessorPolicy {
     Reject,
-    RecoverExactlyEmptyForInstalledProduct,
+    RecoverStructurallyValidExclusiveInstalledReplacement,
 }
 
 impl AuthoritativeSourceRegistry {
@@ -118,30 +154,52 @@ impl AuthoritativeSourceRegistry {
         )
     }
 
-    /// Opens installed-product authority while recovering only an exactly empty unclean
-    /// predecessor.
+    /// Opens source authority for an exclusively admitted installed-service replacement.
     ///
-    /// This exception exists for replacement of a crashed installed service that had opened the
-    /// source authority store but had not registered any source, budget policy, or durable budget
-    /// group. Every nonempty unclean predecessor is still rejected. The concrete local store is
-    /// consumed by value so recovery cannot race a live process-local owner.
+    /// Structurally valid source registrations, provenance, policies, window consumption, cooldowns,
+    /// and generation history are retained. Orphaned in-flight request counts are reconciled to zero
+    /// under a checked availability-generation advance because no request owner can survive the
+    /// crashed process. The run generation advances and the canonical envelope remains in-use for
+    /// the replacement. Invalid state, wall rollback, or any generation exhaustion remains
+    /// fail-closed.
+    ///
+    /// The recovery witness borrows the installation-global exclusive instance guard and is held
+    /// until opening completes. Default durable constructors do not accept this witness and continue
+    /// to reject every unclean predecessor.
     ///
     /// # Errors
     ///
-    /// Fails closed on persistence, restore, subject resolution, aggregate registration, or any
-    /// nonempty unclean predecessor.
-    pub fn try_new_durable_for_installed_product_recovering_exactly_empty_predecessor(
+    /// Fails closed on invalid persistence, restore, subject resolution, aggregate registration,
+    /// trusted-time rollback, or generation exhaustion.
+    pub fn try_new_durable_for_exclusive_installed_service_replacement(
         store: market_squawk_platform::LocalAuthorityStateStore,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         provider_rate: crate::ProviderRateAuthority,
+        recovery_authority: ExclusiveInstalledServiceSourceRecoveryAuthority<'_>,
     ) -> Result<Self, RegistryError> {
         let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
-        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+        let result = Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
             store,
             resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
             Some(provider_rate),
-            UncleanPredecessorPolicy::RecoverExactlyEmptyForInstalledProduct,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        );
+        drop(recovery_authority);
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_new_durable_with_store_for_exclusive_installed_replacement_for_test(
+        store: Arc<dyn crate::policy::AuthorityStateStore>,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            resolver,
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            None,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
         )
     }
 
@@ -181,8 +239,10 @@ impl AuthoritativeSourceRegistry {
             UncleanPredecessorPolicy::Reject => {
                 AuthorityDurabilitySession::open_unpublished(store, now)
             }
-            UncleanPredecessorPolicy::RecoverExactlyEmptyForInstalledProduct => {
-                AuthorityDurabilitySession::open_unpublished_recovering_exactly_empty(store, now)
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement => {
+                AuthorityDurabilitySession::open_unpublished_for_exclusive_installed_replacement(
+                    store, now,
+                )
             }
         }
         .map_err(map_authority_persistence_error)?;
