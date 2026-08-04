@@ -9,9 +9,9 @@ use std::{
 use getrandom::fill as fill_random;
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{
-    LocalAuthorityStateStore, LocalPaths, SecretCancellation, SecretGeneration,
-    SecretInteractionPolicy, SecretKey, SecretMutationPlan, SecretOperationControl,
-    SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
+    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalPaths, SecretCancellation,
+    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretMutationPlan,
+    SecretOperationControl, SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationProtocolRange, ApplicationProtocolVersion, ApplicationRequestScope,
@@ -35,7 +35,6 @@ use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
 const STATE_FORMAT_VERSION: u16 = 1;
 const SERVICE_DIRECTORY: &str = "installed-service";
-const INSTANCE_DIRECTORY: &str = "instance";
 const IDENTITY_DIRECTORY: &str = "identity";
 const RENDEZVOUS_DIRECTORY: &str = "rendezvous";
 const SIGNING_SECRET_SCOPE: &str = "runtime-service";
@@ -458,9 +457,8 @@ async fn initialize_runtime(
 
 pub(super) fn acquire_instance(
     paths: &LocalPaths,
-) -> Result<LocalAuthorityStateStore, InstalledServiceError> {
-    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
-    LocalAuthorityStateStore::try_open(service_root.join(INSTANCE_DIRECTORY))
+) -> Result<InstalledServiceInstanceGuard, InstalledServiceError> {
+    InstalledServiceInstanceGuard::try_acquire(paths.control_root()?)
         .map_err(InstalledServiceError::instance)
 }
 

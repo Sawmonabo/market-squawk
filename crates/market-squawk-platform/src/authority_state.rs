@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 use thiserror::Error;
 
+use crate::paths::ControlRoot;
+
 pub use self::envelope::{AuthorityCommitContext, AuthorityStateSnapshot};
 use self::envelope::{Envelope, next_context, validate_payload_size};
 use self::filesystem::{LifetimeLock, Slot, StateFiles};
@@ -26,6 +28,47 @@ pub struct LocalAuthorityStateStore {
     files: StateFiles,
     _lock: LifetimeLock,
     gate: Mutex<StoreGate>,
+}
+
+/// Exclusive lifetime guard for one selected installation's service process.
+///
+/// Unlike a general [`LocalAuthorityStateStore`], this capability can only be acquired at the
+/// code-owned `installed-service/instance` authority beneath a prepared control root. Holding it
+/// proves that no other service process owns that installation authority for the guard's lifetime.
+pub struct InstalledServiceInstanceGuard {
+    _store: LocalAuthorityStateStore,
+}
+
+impl fmt::Debug for InstalledServiceInstanceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledServiceInstanceGuard")
+            .field("authority", &"[INSTALLATION SERVICE INSTANCE]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledServiceInstanceGuard {
+    /// Acquires the exact installed-service instance authority under `installation_control`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalAuthorityStateStoreError`] when the authority root is unsafe, unavailable,
+    /// corrupt, or already owned by another service process.
+    pub fn try_acquire(
+        installation_control: &ControlRoot,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
+        const SERVICE_DIRECTORY: &str = "installed-service";
+        const INSTANCE_DIRECTORY: &str = "instance";
+
+        let store = LocalAuthorityStateStore::try_open(
+            installation_control
+                .root()
+                .join(SERVICE_DIRECTORY)
+                .join(INSTANCE_DIRECTORY),
+        )?;
+        Ok(Self { _store: store })
+    }
 }
 
 struct StoreGate {

@@ -316,6 +316,11 @@ jobs:
           echo "RustSec advisory database commit: $advisory_commit"
 
           cargo deny --offline check
+          resolved_tree="$(cargo tree --workspace --all-features --target all --locked)"
+          if rg -q 'rkyv v0\.[0-7]\.' <<<"$resolved_tree"; then
+            echo "RUSTSEC-2026-0235 exception is invalid: vulnerable rkyv is active" >&2
+            exit 1
+          fi
           cargo audit --db "$advisory_db" --no-fetch --deny warnings \
             --ignore RUSTSEC-2024-0370 \
             --ignore RUSTSEC-2024-0411 \
@@ -331,7 +336,8 @@ jobs:
             --ignore RUSTSEC-2025-0080 \
             --ignore RUSTSEC-2025-0081 \
             --ignore RUSTSEC-2025-0098 \
-            --ignore RUSTSEC-2025-0100
+            --ignore RUSTSEC-2025-0100 \
+            --ignore RUSTSEC-2026-0235
 
   documentation-links:
     name: Documentation links

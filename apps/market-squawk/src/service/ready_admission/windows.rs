@@ -152,8 +152,9 @@ impl Write for BlockingStream {
                     "ready admission request message exceeds its bound",
                 )
             })?;
+        let additional = new_len - self.request.len();
         self.request
-            .try_reserve(new_len - self.request.len())
+            .try_reserve(additional)
             .map_err(|_error| std::io::Error::other("ready admission request allocation failed"))?;
         self.request.extend_from_slice(buffer);
         Ok(buffer.len())

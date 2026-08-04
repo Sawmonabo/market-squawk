@@ -10,8 +10,8 @@ mod raw_record;
 mod secrets;
 
 pub use authority_state::{
-    AuthorityCommitContext, AuthorityStateSnapshot, LocalAuthorityStateStore,
-    LocalAuthorityStateStoreError,
+    AuthorityCommitContext, AuthorityStateSnapshot, InstalledServiceInstanceGuard,
+    LocalAuthorityStateStore, LocalAuthorityStateStoreError,
 };
 #[cfg(feature = "capture-benchmark")]
 pub use capture::benchmark_support as capture_benchmark_support;

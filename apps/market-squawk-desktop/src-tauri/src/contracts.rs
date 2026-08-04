@@ -128,7 +128,7 @@ impl DesktopServiceBootstrapStatus {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum DesktopStartup {
-    Ready(DesktopBootstrap),
+    Ready(Box<DesktopBootstrap>),
     BootstrapRequired(DesktopServiceBootstrapStatus),
 }
 

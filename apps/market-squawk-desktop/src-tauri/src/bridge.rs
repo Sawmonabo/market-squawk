@@ -87,7 +87,7 @@ impl DesktopBootstrapState {
     ) -> Result<Self, DesktopCommandError> {
         let pending = match startup {
             DesktopServiceStartup::Ready(connection) => {
-                manage_ready_desktop(app, connection, &context)?;
+                manage_ready_desktop(app, *connection, &context)?;
                 None
             }
             DesktopServiceStartup::BootstrapRequired(service) => {
@@ -651,7 +651,11 @@ pub(crate) async fn desktop_bootstrap(
     bootstrap_state: State<'_, DesktopBootstrapState>,
 ) -> Result<DesktopStartup, DesktopCommandError> {
     if let Some(state) = app.try_state::<DesktopState>() {
-        return state.bootstrap().await.map(DesktopStartup::Ready);
+        return state
+            .bootstrap()
+            .await
+            .map(Box::new)
+            .map(DesktopStartup::Ready);
     }
     bootstrap_state
         .status()

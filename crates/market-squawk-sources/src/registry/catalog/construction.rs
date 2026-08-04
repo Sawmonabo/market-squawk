@@ -7,19 +7,31 @@ use super::*;
 /// move-only, borrows that guard, and is consumed by source-registry recovery, so recovery cannot
 /// run after the exclusive guard is released or without a live guard capability.
 pub struct ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
-    _instance_guard: &'guard market_squawk_platform::LocalAuthorityStateStore,
+    _instance_guard: &'guard market_squawk_platform::InstalledServiceInstanceGuard,
 }
 
 impl<'guard> ExclusiveInstalledServiceSourceRecoveryAuthority<'guard> {
     /// Binds installed source recovery to an already acquired installation-global instance guard.
     ///
-    /// The caller must pass the exact guard acquired from the installed service's code-owned
-    /// `installed-service/instance` authority path, not an unrelated authority-state store. The
-    /// concrete store enforces exclusive lifetime ownership; this witness carries that ownership
-    /// proof into source composition without exposing a boolean recovery bypass.
+    /// The typed guard can only be acquired from the code-owned `installed-service/instance`
+    /// authority beneath the selected installation control root. The witness carries that exact,
+    /// exclusive lifetime ownership into source composition without exposing a boolean recovery
+    /// bypass.
+    ///
+    /// A general authority-state store cannot mint installed-service recovery authority:
+    ///
+    /// ```compile_fail
+    /// use market_squawk_platform::LocalAuthorityStateStore;
+    /// use market_squawk_sources::ExclusiveInstalledServiceSourceRecoveryAuthority;
+    ///
+    /// fn rejected(store: &LocalAuthorityStateStore) {
+    ///     let _authority = ExclusiveInstalledServiceSourceRecoveryAuthority::
+    ///         from_acquired_installation_instance_guard(store);
+    /// }
+    /// ```
     #[must_use]
     pub fn from_acquired_installation_instance_guard(
-        instance_guard: &'guard market_squawk_platform::LocalAuthorityStateStore,
+        instance_guard: &'guard market_squawk_platform::InstalledServiceInstanceGuard,
     ) -> Self {
         Self {
             _instance_guard: instance_guard,

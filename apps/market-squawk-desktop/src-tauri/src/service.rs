@@ -31,7 +31,7 @@ pub(crate) struct DesktopServiceConnection {
 }
 
 pub(crate) enum DesktopServiceStartup {
-    Ready(DesktopServiceConnection),
+    Ready(Box<DesktopServiceConnection>),
     BootstrapRequired(DesktopServiceBootstrap),
 }
 
@@ -77,7 +77,7 @@ pub(crate) async fn connect_or_start(
             .map_err(|_error| DesktopServiceError::Discovery)?,
     );
     match connect(&connector).await {
-        Ok(connection) => return Ok(DesktopServiceStartup::Ready(connection)),
+        Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
         Err(ConnectionAttempt::NotRunning) => {}
         Err(ConnectionAttempt::InvalidBootstrap) => {
             return Err(DesktopServiceError::InvalidBootstrap);
@@ -111,7 +111,7 @@ pub(crate) async fn connect_or_start(
         .ok_or(DesktopServiceError::StartupDeadline)?;
     loop {
         match connect(&connector).await {
-            Ok(connection) => return Ok(DesktopServiceStartup::Ready(connection)),
+            Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
             Err(ConnectionAttempt::InvalidBootstrap) => {
                 stop_failed_start(&mut child);
                 return Err(DesktopServiceError::InvalidBootstrap);
@@ -290,14 +290,13 @@ mod tests {
     use super::{DesktopBootstrapAction, admit_bootstrap_action};
 
     #[test]
-    fn bootstrap_action_must_match_the_native_typed_requirement() {
+    fn bootstrap_action_must_match_the_native_typed_requirement()
+    -> Result<(), market_squawk_platform::SecretError> {
+        let unlock = SecretValue::new("process-local-test-unlock".to_owned())?;
         assert!(matches!(
             admit_bootstrap_action(
                 BootstrapRequirement::EncryptedFallbackLocked,
-                DesktopBootstrapAction::Unlock(
-                    SecretValue::new("process-local-test-unlock".to_owned())
-                        .expect("test unlock is valid"),
-                ),
+                DesktopBootstrapAction::Unlock(unlock),
             ),
             Ok(DesktopBootstrapAction::Unlock(_))
         ));
@@ -308,15 +307,14 @@ mod tests {
             )
             .is_err()
         );
+        let unlock = SecretValue::new("process-local-test-unlock".to_owned())?;
         assert!(
             admit_bootstrap_action(
                 BootstrapRequirement::ForegroundKeyringRetry,
-                DesktopBootstrapAction::Unlock(
-                    SecretValue::new("process-local-test-unlock".to_owned())
-                        .expect("test unlock is valid"),
-                ),
+                DesktopBootstrapAction::Unlock(unlock),
             )
             .is_err()
         );
+        Ok(())
     }
 }

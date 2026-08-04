@@ -41,7 +41,7 @@ use market_squawk_mcp::{
     AuditSink, HttpMcpConfig, McpHandlerFactory, McpHttpService, McpLimitSpec, McpLimits,
 };
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
+    EncryptedFileFallbackStatus, InstalledServiceInstanceGuard, LocalAuthorityStateStoreError,
     LocalPaths, LocalSecretStoreError, PathError, PreferredSecretStore, SecretCancellation,
     SecretInteractionPolicy, SecretOperationControl, SecretStore, SecretValue,
 };
@@ -262,7 +262,7 @@ pub struct InstalledService {
     installation_paths: LocalPaths,
     ephemeral_verification_credentials: bool,
     _workspace_selector: Arc<WorkspaceSelector>,
-    _instance_guard: LocalAuthorityStateStore,
+    _instance_guard: InstalledServiceInstanceGuard,
 }
 
 impl std::fmt::Debug for InstalledService {
