@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncleanPredecessorPolicy {
+    Reject,
+    RecoverExactlyEmptyForInstalledProduct,
+}
+
 impl AuthoritativeSourceRegistry {
     /// Opens the restart-durable authority registry and marks its new run generation in-use before
     /// any provider-budget authority can be minted.
@@ -108,6 +114,34 @@ impl AuthoritativeSourceRegistry {
             resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
             Some(provider_rate),
+            UncleanPredecessorPolicy::Reject,
+        )
+    }
+
+    /// Opens installed-product authority while recovering only an exactly empty unclean
+    /// predecessor.
+    ///
+    /// This exception exists for replacement of a crashed installed service that had opened the
+    /// source authority store but had not registered any source, budget policy, or durable budget
+    /// group. Every nonempty unclean predecessor is still rejected. The concrete local store is
+    /// consumed by value so recovery cannot race a live process-local owner.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on persistence, restore, subject resolution, aggregate registration, or any
+    /// nonempty unclean predecessor.
+    pub fn try_new_durable_for_installed_product_recovering_exactly_empty_predecessor(
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: crate::ProviderRateAuthority,
+    ) -> Result<Self, RegistryError> {
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            resolver,
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            Some(provider_rate),
+            UncleanPredecessorPolicy::RecoverExactlyEmptyForInstalledProduct,
         )
     }
 
@@ -126,7 +160,11 @@ impl AuthoritativeSourceRegistry {
         raw_clock: Arc<dyn RawRegistryClockSource>,
     ) -> Result<Self, RegistryError> {
         Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
-            store, resolver, raw_clock, None,
+            store,
+            resolver,
+            raw_clock,
+            None,
+            UncleanPredecessorPolicy::Reject,
         )
     }
 
@@ -135,11 +173,19 @@ impl AuthoritativeSourceRegistry {
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         raw_clock: Arc<dyn RawRegistryClockSource>,
         provider_rate: Option<crate::ProviderRateAuthority>,
+        unclean_predecessor_policy: UncleanPredecessorPolicy,
     ) -> Result<Self, RegistryError> {
         let clock = Arc::new(SealedRegistryClock::new(raw_clock));
         let now = clock.observe()?.wall();
-        let unpublished = AuthorityDurabilitySession::open_unpublished(store, now)
-            .map_err(map_authority_persistence_error)?;
+        let unpublished = match unclean_predecessor_policy {
+            UncleanPredecessorPolicy::Reject => {
+                AuthorityDurabilitySession::open_unpublished(store, now)
+            }
+            UncleanPredecessorPolicy::RecoverExactlyEmptyForInstalledProduct => {
+                AuthorityDurabilitySession::open_unpublished_recovering_exactly_empty(store, now)
+            }
+        }
+        .map_err(map_authority_persistence_error)?;
         let durability = Arc::clone(unpublished.session());
         if durability.recovered_unclean() {
             durability.invalidate();

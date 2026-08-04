@@ -1,35 +1,56 @@
-//! Local-only named-pipe boundary with exact logon-SID admission and impersonation.
+//! Local-only named-pipe boundary with exact logon-SID DACL admission.
 
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
     os::windows::io::OwnedHandle,
     path::Path,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use interprocess::{
-    local_socket::{
-        GenericNamespaced, Listener as SyncListener, ListenerNonblockingMode, ListenerOptions,
-        Stream as SyncStream, prelude::*, tokio::Stream as TokioStream,
-    },
+    ConnectWaitMode, TryClone as _,
     os::windows::{
-        local_socket::ListenerOptionsExt as _, named_pipe::local_socket::tokio as tokio_pipe,
+        named_pipe::{
+            DuplexPipeStream as SyncPipeStream, PipeListener, PipeListenerOptions,
+            pipe_mode::Bytes, tokio::DuplexPipeStream as TokioPipeStream,
+        },
         security_descriptor::SecurityDescriptor,
     },
 };
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use widestring::U16CString;
 use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::service::InstalledServiceError;
 
-pub(super) type Stream = TokioStream;
+type SyncPipe = SyncPipeStream<Bytes>;
+type TokioPipe = TokioPipeStream<Bytes>;
+type AdmissionPipeListener = PipeListener<Bytes, Bytes>;
+
+pub(super) struct Stream {
+    inner: TokioPipe,
+    response: Option<SyncPipe>,
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
 
 pub(super) struct BlockingStream {
-    inner: SyncStream,
+    inner: SyncPipe,
     deadline: Instant,
 }
 
@@ -37,15 +58,7 @@ impl Read for BlockingStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         loop {
             match self.inner.read(buffer) {
-                Ok(0) => {
-                    if Instant::now() >= self.deadline {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            "ready admission read deadline elapsed",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                Ok(0) => return Ok(0),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     if Instant::now() >= self.deadline {
                         return Err(std::io::Error::new(
@@ -94,8 +107,7 @@ impl Write for BlockingStream {
 }
 
 pub(super) struct Listener {
-    inner: Arc<SyncListener>,
-    logon_sid: Arc<SecurityIdentifier>,
+    inner: Arc<AdmissionPipeListener>,
 }
 
 impl Listener {
@@ -111,18 +123,17 @@ impl Listener {
             .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
         let descriptor = SecurityDescriptor::deserialize(&sddl)
             .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-        let name_text = pipe_name(root, endpoint_key);
-        let name = name_text.to_ns_name::<GenericNamespaced>()?;
-        let inner = ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .try_overwrite(false)
-            .nonblocking(ListenerNonblockingMode::Accept)
-            .security_descriptor(descriptor)
-            .create_sync()?;
+        let buffer_bytes = u32::try_from(super::MAXIMUM_FRAME_BYTES + 4)
+            .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
+        let inner = PipeListenerOptions::new()
+            .path(pipe_path(root, endpoint_key))
+            .nonblocking(true)
+            .input_buffer_size_hint(buffer_bytes)
+            .output_buffer_size_hint(buffer_bytes)
+            .security_descriptor(Some(descriptor))
+            .create_duplex::<Bytes>()?;
         Ok(Self {
             inner: Arc::new(inner),
-            logon_sid: Arc::new(logon_sid),
         })
     }
 
@@ -131,44 +142,111 @@ impl Listener {
         cancellation: CancellationToken,
     ) -> Result<Stream, InstalledServiceError> {
         let listener = Arc::clone(&self.inner);
-        let logon_sid = Arc::clone(&self.logon_sid);
-        tokio::task::spawn_blocking(move || {
-            accept_authenticated(&listener, &logon_sid, &cancellation)
-        })
-        .await
-        .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?
+        tokio::task::spawn_blocking(move || accept_authenticated(&listener, &cancellation))
+            .await
+            .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?
     }
 }
 
 pub(super) fn connect_blocking(
     root: &Path,
     endpoint_key: &[u8; 32],
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<BlockingStream, InstalledServiceError> {
-    let name_text = pipe_name(root, endpoint_key);
-    let name = name_text.to_ns_name::<GenericNamespaced>()?;
-    let stream = SyncStream::connect(name)?;
+    let stream = SyncPipe::connect_by_path_with_wait_mode(
+        pipe_path(root, endpoint_key),
+        ConnectWaitMode::Timeout(super::remaining(deadline)?),
+    )
+    .map_err(super::map_admission_io)?;
     stream.set_nonblocking(true)?;
     Ok(BlockingStream {
         inner: stream,
-        deadline: Instant::now()
-            .checked_add(timeout)
-            .ok_or(InstalledServiceError::AdmissionDeadline)?,
+        deadline,
     })
 }
 
-pub(super) async fn authenticate_preface(
-    _stream: &mut Stream,
+pub(super) async fn authenticate_preface(stream: &mut Stream) -> Result<(), InstalledServiceError> {
+    let mut preface = [0_u8; super::PREFACE.len()];
+    stream.read_exact(&mut preface).await?;
+    if preface == *super::PREFACE {
+        Ok(())
+    } else {
+        Err(InstalledServiceError::AdmissionProtocol)
+    }
+}
+
+pub(super) fn finish_request(_stream: &mut BlockingStream) -> Result<(), InstalledServiceError> {
+    // Windows byte-mode named pipes do not expose a safe half-close. REQUEST_COMMIT is the fixed
+    // transaction terminator; the server never admits a second request on the connection.
+    Ok(())
+}
+
+pub(super) async fn require_request_end(_stream: &mut Stream) -> Result<(), InstalledServiceError> {
+    Ok(())
+}
+
+pub(super) async fn write_response(
+    stream: &mut Stream,
+    mut response: Zeroizing<Vec<u8>>,
+    deadline: Instant,
 ) -> Result<(), InstalledServiceError> {
+    let length = u32::try_from(response.len())
+        .map_err(|_error| InstalledServiceError::AdmissionProtocol)?
+        .to_be_bytes();
+    let mut wire = Zeroizing::new(Vec::with_capacity(length.len() + response.len()));
+    wire.extend_from_slice(&length);
+    wire.extend_from_slice(&response);
+    response.zeroize();
+    let mut pipe = stream
+        .response
+        .take()
+        .ok_or(InstalledServiceError::AdmissionUnavailable)?;
+    // DuplicateHandle aliases the same pipe instance state, so do not assume the response clone
+    // has an independent wait mode. PIPE_NOWAIT is selected only after the complete request has
+    // been consumed; no Tokio read is attempted after this transition.
+    pipe.set_nonblocking(true)?;
+    tokio::task::spawn_blocking(move || write_all_before(&mut pipe, &wire, deadline))
+        .await
+        .map_err(|_join| InstalledServiceError::AdmissionUnavailable)??;
+    Ok(())
+}
+
+fn write_all_before(
+    pipe: &mut SyncPipe,
+    wire: &[u8],
+    deadline: Instant,
+) -> Result<(), InstalledServiceError> {
+    let mut written = 0_usize;
+    while written < wire.len() {
+        match pipe.write(&wire[written..]) {
+            Ok(0) => {
+                if Instant::now() >= deadline {
+                    return Err(InstalledServiceError::AdmissionDeadline);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(count) => {
+                written = written
+                    .checked_add(count)
+                    .ok_or(InstalledServiceError::AdmissionProtocol)?;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(InstalledServiceError::AdmissionDeadline);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
 fn accept_authenticated(
-    listener: &SyncListener,
-    logon_sid: &SecurityIdentifier,
+    listener: &AdmissionPipeListener,
     cancellation: &CancellationToken,
 ) -> Result<Stream, InstalledServiceError> {
-    let mut stream = loop {
+    let stream = loop {
         if cancellation.is_cancelled() {
             return Err(InstalledServiceError::AdmissionUnavailable);
         }
@@ -180,40 +258,20 @@ fn accept_authenticated(
             Err(error) => return Err(error.into()),
         }
     };
-    stream.set_nonblocking(true)?;
-    let SyncStream::NamedPipe(ref mut pipe) = stream;
-    let mut preface = [0_u8; super::PREFACE.len()];
-    let mut offset = 0;
-    let deadline = Instant::now()
-        .checked_add(super::CONNECTION_TIMEOUT)
-        .ok_or(InstalledServiceError::AdmissionDeadline)?;
-    while offset < preface.len() {
-        if cancellation.is_cancelled() || Instant::now() >= deadline {
-            return Err(InstalledServiceError::AdmissionDeadline);
-        }
-        match pipe.read(&mut preface[offset..]) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(1)),
-            Ok(bytes) => offset += bytes,
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if preface != *super::PREFACE {
-        return Err(InstalledServiceError::AdmissionProtocol);
-    }
-    {
-        let _impersonation = pipe.inner().impersonate_client()?;
-        if !SecurityIdentifier::is_current_user_member_of(logon_sid.as_sid())
-            .map_err(|_error| InstalledServiceError::AdmissionRejected)?
-        {
-            return Err(InstalledServiceError::AdmissionRejected);
-        }
-    }
-    let SyncStream::NamedPipe(pipe) = stream;
-    let handle = OwnedHandle::from(pipe);
-    let pipe = tokio_pipe::Stream::try_from(handle)
+    // The listener itself remains nonblocking so cancellation can be observed, but the accepted
+    // pipe handed to Tokio must use PIPE_WAIT. Tokio supplies overlapped readiness; PIPE_NOWAIT
+    // would turn a transient empty read into a false EOF.
+    stream.set_nonblocking(false)?;
+    let response = stream.try_clone()?;
+    let handle: OwnedHandle = stream
+        .try_into()
+        .map_err(|_stream| InstalledServiceError::AdmissionUnavailable)?;
+    let inner = TokioPipe::try_from(handle)
         .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?;
-    Ok(TokioStream::NamedPipe(pipe))
+    Ok(Stream {
+        inner,
+        response: Some(response),
+    })
 }
 
 fn pipe_name(root: &Path, endpoint_key: &[u8; 32]) -> String {
@@ -229,4 +287,8 @@ fn pipe_name(root: &Path, endpoint_key: &[u8; 32]) -> String {
         name.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     name
+}
+
+fn pipe_path(root: &Path, endpoint_key: &[u8; 32]) -> String {
+    format!(r"\\.\pipe\{}", pipe_name(root, endpoint_key))
 }

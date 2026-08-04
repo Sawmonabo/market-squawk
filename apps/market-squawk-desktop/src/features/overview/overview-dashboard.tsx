@@ -249,7 +249,7 @@ function PortfolioTruth({
           </div>
         </div>
         <Button asChild variant="outline" size="sm">
-          <Link to="/portfolio">Open Portfolios</Link>
+          <Link to="/portfolios">Open Portfolios</Link>
         </Button>
       </div>
 
@@ -381,7 +381,7 @@ function PortfolioEmpty({ title, detail }: { title: string; detail: string }) {
           <h2 className="text-sm font-semibold">{title}</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{detail}</p>
           <Button asChild className="mt-3" size="sm">
-            <Link to="/portfolio">Open Portfolios</Link>
+            <Link to="/portfolios">Open Portfolios</Link>
           </Button>
         </div>
       </div>

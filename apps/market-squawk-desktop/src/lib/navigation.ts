@@ -13,8 +13,10 @@ import {
   Landmark,
   Logs,
   Network,
+  Search,
   Settings,
   ShieldCheck,
+  ServerCog,
   type LucideIcon,
 } from "lucide-react"
 
@@ -35,6 +37,7 @@ const overviewNavigation: NavigationItem = {
 
 export const workspaceNavigation: NavigationItem[] = [
   overviewNavigation,
+  { label: "Lookup", path: "/lookup", icon: Search, domain: "analysis" },
   { label: "Markets", path: "/markets", icon: BarChart3, domain: "market" },
   { label: "Sources", path: "/sources", icon: Database, domain: "source" },
   {
@@ -79,6 +82,7 @@ export const workspaceNavigation: NavigationItem[] = [
 ]
 
 export const operationsNavigation: NavigationItem[] = [
+  { label: "Operations", path: "/operations", icon: ServerCog },
   { label: "Updates", path: "/updates", icon: Activity },
   {
     label: "Backup & Recovery",

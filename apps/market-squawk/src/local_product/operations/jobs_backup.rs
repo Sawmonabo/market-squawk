@@ -1,6 +1,10 @@
 //! Workspace-backup adapter for the genuine durable jobs-and-receipts owner.
 
-use std::{fmt, io::Write, sync::Arc};
+use std::{
+    fmt,
+    io::Write,
+    sync::{Arc, Weak},
+};
 
 use async_trait::async_trait;
 use market_squawk_domain::{SchemaVersion, SourceIdentifier};
@@ -28,7 +32,7 @@ const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Fixed adapter binding the component to the installed job authority and code-owned backup kind.
 pub(crate) struct JobsAndReceiptsWorkspaceBackupAuthority {
-    authority: Arc<JobAuthority<SqliteJobRepository>>,
+    authority: Weak<JobAuthority<SqliteJobRepository>>,
     backup_kind: SourceIdentifier,
     descriptors: [WorkspaceComponentDescriptor; 1],
 }
@@ -45,8 +49,9 @@ impl JobsAndReceiptsWorkspaceBackupAuthority {
             .map_err(|_| ProductBackupError::InvalidComponentSchema)?;
         let schema =
             ProductBackupComponentSchema::try_new(schema_identity, SchemaVersion::CURRENT)?;
+        let authority = jobs.authority();
         Ok(Self {
-            authority: jobs.authority(),
+            authority: Arc::downgrade(&authority),
             backup_kind: backup_runner.kind().clone(),
             descriptors: [WorkspaceComponentDescriptor::try_new(
                 ProductBackupComponentKind::JobsAndReceipts,
@@ -78,8 +83,11 @@ impl WorkspaceComponentSnapshotAuthority for JobsAndReceiptsWorkspaceBackupAutho
         if cancellation.is_cancelled() {
             return Err(ProductBackupError::Cancelled);
         }
-        let retained = self
+        let authority = self
             .authority
+            .upgrade()
+            .ok_or(ProductBackupError::SnapshotMismatch)?;
+        let retained = authority
             .retain_jobs_and_receipts_backup(&self.backup_kind)
             .await
             .map_err(|_| ProductBackupError::SnapshotMismatch)?;

@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::Parser;
+use market_squawk::cli::McpClientArgument;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
 use market_squawk_installer::{
@@ -69,8 +70,11 @@ struct DesktopArgs {
     #[arg(long)]
     training_release_root: Option<PathBuf>,
     /// Dispatch the packaged stdio MCP process from a portable Linux image.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, requires = "mcp_client")]
     stdio_mcp: bool,
+    /// Installed MCP client identity for the portable Linux relay.
+    #[arg(long, hide = true, value_enum, requires = "stdio_mcp")]
+    mcp_client: Option<McpClientArgument>,
     /// Remove the current user's managed program store before native package removal.
     #[arg(
         long,
@@ -80,7 +84,8 @@ struct DesktopArgs {
             "data_dir",
             "installation_data_root",
             "training_release_root",
-            "stdio_mcp"
+            "stdio_mcp",
+            "mcp_client"
         ]
     )]
     native_uninstall: bool,
@@ -156,6 +161,13 @@ fn run_native_uninstall() -> Result<i32, DesktopStartupError> {
 fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     use std::os::unix::process::CommandExt as _;
 
+    let mcp_client = match args
+        .mcp_client
+        .ok_or(DesktopStartupError::McpTransportUnavailable)?
+    {
+        McpClientArgument::ClaudeCode => "claude-code",
+        McpClientArgument::Codex => "codex",
+    };
     let cli = verified_installed_cli_program()
         .map_err(|_error| DesktopStartupError::McpTransportUnavailable)?;
     let launcher = appimage_mcp_launcher(&cli)
@@ -207,7 +219,11 @@ fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     if let Some(root) = installation_data_root {
         command.arg("--installation-data-root").arg(root);
     }
-    command.arg("mcp").arg("serve");
+    command
+        .arg("mcp")
+        .arg("serve")
+        .arg("--client")
+        .arg(mcp_client);
     let source = command.exec();
     Err(DesktopStartupError::McpTransportStart { source })
 }

@@ -18,17 +18,20 @@ use market_squawk_mcp::{
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, LocalSecretStoreError,
     PathError, SecretCancellation, SecretInteractionPolicy, SecretOperationControl, SecretStore,
+    SecretValue,
 };
 use market_squawk_runtime::{
     AppRequestEnvelope, ClientCredentialRegistration, ClientCredentialRotationPlan, ClientId,
     CredentialError, CredentialRegistry, InstallationId, NamedClient, OperationEffect,
     RuntimeIdentity, WorkspaceId,
 };
-use parking_lot::{Mutex, RwLock};
+use market_squawk_services::RequestContext;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub(super) const STATUS_OPERATION: &str = "Mcp.GetRuntimeStatus";
 pub(super) const ACTIVATE_OPERATION: &str = "Mcp.ActivateCredential";
@@ -65,17 +68,21 @@ impl PreparedMcpClientAuthority {
     ) -> Result<Self, McpControlError> {
         let authority_root = paths.control_root()?.root().join(AUTHORITY_DIRECTORY);
         let store = LocalAuthorityStateStore::try_open(&authority_root)?;
-        let document = match store.load()? {
+        let mut document = match store.load()? {
             Some(encoded) => serde_json::from_slice::<AuthorityDocument>(&encoded)
                 .map_err(|_error| McpControlError::InvalidState)?
-                .validate(runtime.installation_id(), runtime.workspace_id())?,
+                .validate(runtime.installation_id())?,
             None => {
                 let document = AuthorityDocument::new(runtime, registrations.clone())?
-                    .validate(runtime.installation_id(), runtime.workspace_id())?;
+                    .validate(runtime.installation_id())?;
                 store_document(&store, &document)?;
                 document
             }
         };
+        if document.workspace_id != runtime.workspace_id() {
+            document.workspace_id = runtime.workspace_id();
+            store_document(&store, &document)?;
+        }
         document.validate_runtime_roots(&registrations)?;
         if let Some(pending) = &document.pending {
             let reconciled = CredentialRegistry::reconcile_planned_rotation(
@@ -106,6 +113,7 @@ impl PreparedMcpClientAuthority {
         mut self,
         runtime: RuntimeIdentity,
         desktop_client_id: ClientId,
+        runtime_identity_root: PathBuf,
         secret_store: Arc<dyn SecretStore>,
         credentials: Arc<CredentialRegistry>,
         maximum_client_requests: usize,
@@ -131,6 +139,12 @@ impl PreparedMcpClientAuthority {
                 Ok((
                     registration.client(),
                     ClientEntry {
+                        credential: secret_store
+                            .read(
+                                registration.reference(),
+                                &secret_control("installed-mcp-admission-cache-load")?,
+                            )
+                            .map_err(|_error| McpControlError::SecretStore)?,
                         registration,
                         identity,
                     },
@@ -141,12 +155,13 @@ impl PreparedMcpClientAuthority {
             runtime,
             desktop_client_id,
             authority_root: self.authority_root,
+            runtime_identity_root,
             credentials,
             secret_store,
             limits,
             started_at: Instant::now(),
             rejected_credentials: std::sync::atomic::AtomicU64::new(0),
-            mutation_gate: Mutex::new(()),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
             state: RwLock::new(ControlState {
                 document: self.document,
                 entries,
@@ -157,6 +172,7 @@ impl PreparedMcpClientAuthority {
 
 struct ClientEntry {
     registration: ClientCredentialRegistration,
+    credential: SecretValue,
     identity: AuthenticatedMcpClient,
 }
 
@@ -170,12 +186,13 @@ pub(super) struct InstalledMcpControl {
     runtime: RuntimeIdentity,
     desktop_client_id: ClientId,
     authority_root: PathBuf,
+    runtime_identity_root: PathBuf,
     credentials: Arc<CredentialRegistry>,
     secret_store: Arc<dyn SecretStore>,
     limits: McpLimitSpec,
     started_at: Instant,
     rejected_credentials: std::sync::atomic::AtomicU64,
-    mutation_gate: Mutex<()>,
+    mutation_gate: Arc<AsyncMutex<()>>,
     state: RwLock<ControlState>,
 }
 
@@ -186,6 +203,10 @@ impl std::fmt::Debug for InstalledMcpControl {
             .field("runtime", &self.runtime)
             .field("desktop_client_id", &self.desktop_client_id)
             .field("authority_root", &"[CONTROLLED MCP AUTHORITY ROOT]")
+            .field(
+                "runtime_identity_root",
+                &"[CONTROLLED RUNTIME AUTHORITY ROOT]",
+            )
             .field("credentials", &"[CREDENTIAL AUTHORITY]")
             .field("state", &"[DYNAMIC MCP CLIENT IDENTITIES]")
             .finish_non_exhaustive()
@@ -205,26 +226,24 @@ impl InstalledMcpControl {
         McpControlError,
     > {
         ensure_mcp_client(client)?;
-        let _mutation = self.mutation_gate.lock();
-        let registration = {
-            let state = self.state.read();
-            if state.document.pending.is_some() || state.document.is_revoked(client) {
-                return Err(McpControlError::Unauthorized);
-            }
-            state
-                .entries
-                .get(&client)
-                .map(|entry| entry.registration.clone())
-                .ok_or(McpControlError::InvalidState)?
-        };
-        let credential = self
-            .secret_store
-            .read(
-                registration.reference(),
-                &secret_control("installed-mcp-ready-admission")?,
-            )
-            .map_err(|_error| McpControlError::SecretStore)?;
-        Ok((registration, credential))
+        let state = self.state.read();
+        if state
+            .document
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.client == client)
+            || state.document.is_revoked(client)
+        {
+            return Err(McpControlError::Unauthorized);
+        }
+        let entry = state
+            .entries
+            .get(&client)
+            .ok_or(McpControlError::InvalidState)?;
+        Ok((
+            entry.registration.clone(),
+            duplicate_secret(&entry.credential)?,
+        ))
     }
 
     /// Returns the exact number of MCP client identities with active requests.
@@ -321,7 +340,11 @@ impl InstalledMcpControl {
     }
 
     /// Handles only the private desktop MCP control surface.
-    pub(super) fn dispatch(&self, request: &AppRequestEnvelope) -> Result<Value, McpControlError> {
+    pub(super) async fn dispatch(
+        self: &Arc<Self>,
+        request: &AppRequestEnvelope,
+        context: &RequestContext,
+    ) -> Result<Value, McpControlError> {
         if request.client_id() != self.desktop_client_id {
             return Err(McpControlError::Unauthorized);
         }
@@ -334,12 +357,37 @@ impl InstalledMcpControl {
                     serde_json::from_value::<MutationArguments>(request.arguments().clone())
                         .map_err(|_error| McpControlError::InvalidRequest)?;
                 let client = arguments.client.named();
-                let mutation = match request.operation().as_str() {
-                    ACTIVATE_OPERATION => self.activate_access(client)?,
-                    ROTATE_OPERATION => self.rotate_prior_access(client, false)?,
-                    REVOKE_OPERATION => self.rotate_prior_access(client, true)?,
+                ensure_mcp_client(client)?;
+                let revoke_access = match request.operation().as_str() {
+                    ACTIVATE_OPERATION => None,
+                    ROTATE_OPERATION => Some(false),
+                    REVOKE_OPERATION => Some(true),
                     _ => return Err(McpControlError::InvalidRequest),
                 };
+                let mutation_gate = Arc::clone(&self.mutation_gate);
+                let mutation_permit = tokio::select! {
+                    biased;
+                    () = context.cancellation().cancelled() => {
+                        return Err(McpControlError::Interrupted);
+                    }
+                    permit = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(context.deadline()),
+                        mutation_gate.lock_owned(),
+                    ) => permit.map_err(|_elapsed| McpControlError::Interrupted)?,
+                };
+                if context.cancellation().is_cancelled() || Instant::now() >= context.deadline() {
+                    return Err(McpControlError::Interrupted);
+                }
+                let authority = Arc::clone(self);
+                let mutation = tokio::task::spawn_blocking(move || {
+                    let _mutation_permit = mutation_permit;
+                    revoke_access.map_or_else(
+                        || authority.activate_access(client),
+                        |revoke_access| authority.rotate_prior_access(client, revoke_access),
+                    )
+                })
+                .await
+                .map_err(|_error| McpControlError::Interrupted)??;
                 serde_json::to_value(mutation).map_err(|_error| McpControlError::InvalidState)
             }
             _ => Err(McpControlError::InvalidRequest),
@@ -364,7 +412,6 @@ impl InstalledMcpControl {
         revoke_access: bool,
     ) -> Result<CredentialMutationReceipt, McpControlError> {
         ensure_mcp_client(client)?;
-        let _mutation = self.mutation_gate.lock();
         let (prior, prior_identity, prior_document) = {
             let state = self.state.read();
             if state.document.pending.is_some() {
@@ -399,12 +446,26 @@ impl InstalledMcpControl {
             return Err(error);
         }
         let candidate = self.credentials.begin_planned_rotation(&plan)?;
+        let candidate_credential = self
+            .secret_store
+            .read(
+                candidate.reference(),
+                &secret_control("installed-mcp-rotation-cache-load")?,
+            )
+            .map_err(|_error| McpControlError::SecretStore)?;
+        super::runtime::persist_mcp_registration(
+            &self.runtime_identity_root,
+            self.runtime,
+            candidate.clone(),
+        )
+        .map_err(|_error| McpControlError::InvalidState)?;
         let candidate_identity = prior_identity
             .with_credential_generation(candidate.client_id(), candidate.generation())?;
         self.state.write().entries.insert(
             client,
             ClientEntry {
                 registration: candidate.clone(),
+                credential: candidate_credential,
                 identity: candidate_identity,
             },
         );
@@ -436,7 +497,6 @@ impl InstalledMcpControl {
         client: NamedClient,
     ) -> Result<CredentialMutationReceipt, McpControlError> {
         ensure_mcp_client(client)?;
-        let _mutation = self.mutation_gate.lock();
         let (registration, mut document) = {
             let state = self.state.read();
             if state.document.pending.is_some() {
@@ -525,11 +585,7 @@ impl AuthorityDocument {
         })
     }
 
-    fn validate(
-        self,
-        installation_id: InstallationId,
-        workspace_id: WorkspaceId,
-    ) -> Result<Self, McpControlError> {
+    fn validate(self, installation_id: InstallationId) -> Result<Self, McpControlError> {
         let names = self
             .clients
             .iter()
@@ -543,7 +599,6 @@ impl AuthorityDocument {
         let revoked = self.revoked_clients.iter().copied().collect::<HashSet<_>>();
         if self.format_version != FORMAT_VERSION
             || self.installation_id != installation_id
-            || self.workspace_id != workspace_id
             || self.clients.len() != 2
             || names != HashSet::from([NamedClient::ClaudeCode, NamedClient::Codex])
             || ids.len() != 2
@@ -600,8 +655,17 @@ impl AuthorityDocument {
             .iter()
             .find(|registration| registration.client() == root.client())
             .ok_or(McpControlError::InvalidState)?;
-        if recorded.client_id() != root.client_id()
-            || recorded.generation().get() < root.generation().get()
+        let pending_candidate = self
+            .pending
+            .as_ref()
+            .and_then(|pending| (pending.client == root.client()).then_some(&pending.candidate));
+        if recorded.client_id() != root.client_id() {
+            return Err(McpControlError::InvalidState);
+        }
+        if pending_candidate == Some(root) {
+            return Ok(());
+        }
+        if recorded.generation().get() < root.generation().get()
             || (recorded.generation() == root.generation() && recorded != root)
         {
             return Err(McpControlError::InvalidState);
@@ -815,6 +879,28 @@ fn store_document(
     Ok(())
 }
 
+pub(super) fn credential_references(
+    paths: &LocalPaths,
+) -> Result<Vec<market_squawk_platform::SecretRef>, McpControlError> {
+    let authority_root = paths.control_root()?.root().join(AUTHORITY_DIRECTORY);
+    let store = LocalAuthorityStateStore::try_open(authority_root)?;
+    let Some(encoded) = store.load()? else {
+        return Ok(Vec::new());
+    };
+    let document = serde_json::from_slice::<AuthorityDocument>(&encoded)
+        .map_err(|_error| McpControlError::InvalidState)?;
+    let mut references = document
+        .clients
+        .iter()
+        .map(|registration| registration.reference().clone())
+        .collect::<Vec<_>>();
+    if let Some(pending) = document.pending {
+        references.push(pending.prior.reference().clone());
+        references.push(pending.candidate.reference().clone());
+    }
+    Ok(references)
+}
+
 fn ensure_mcp_client(client: NamedClient) -> Result<(), McpControlError> {
     if matches!(client, NamedClient::ClaudeCode | NamedClient::Codex) {
         Ok(())
@@ -829,6 +915,11 @@ fn credential_identity(registration: &ClientCredentialRegistration) -> String {
         registration.client_id().as_uuid(),
         registration.generation().get()
     )
+}
+
+fn duplicate_secret(secret: &SecretValue) -> Result<SecretValue, McpControlError> {
+    SecretValue::new(secret.expose_secret().to_owned())
+        .map_err(|_error| McpControlError::SecretStore)
 }
 
 fn secret_control(owner: &'static str) -> Result<SecretOperationControl, McpControlError> {
@@ -902,6 +993,8 @@ pub(super) enum McpControlError {
     InvalidRequest,
     #[error("the installed MCP client request is not authorized")]
     Unauthorized,
+    #[error("the installed MCP client request was interrupted")]
+    Interrupted,
     #[error("a prior MCP credential rotation still requires recovery")]
     RecoveryPending,
     #[error("the installed secret authority is unavailable")]

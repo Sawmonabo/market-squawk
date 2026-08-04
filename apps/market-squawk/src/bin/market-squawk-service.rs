@@ -15,7 +15,8 @@ use clap::Parser;
 use market_squawk::{
     AppConfig,
     service::{
-        InstalledService, InstalledServiceLogging, InstalledServiceRunOutcome, TerminalLogFormat,
+        EphemeralVerificationRoot, InstalledService, InstalledServiceLogging,
+        InstalledServiceRunOutcome, TerminalLogFormat,
     },
     termination::TerminationSignals,
 };
@@ -35,6 +36,9 @@ struct ServiceArguments {
     /// Explicit installed-service authority root for isolated verification.
     #[arg(long, hide = true)]
     installation_data_root: Option<PathBuf>,
+    /// Retire all credentials created under a fresh verification-only installation root on exit.
+    #[arg(long, hide = true, requires = "installation_data_root")]
+    ephemeral_verification_credentials: bool,
     /// Explicit local configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -87,6 +91,16 @@ fn run_service() -> Result<InstalledServiceRunOutcome> {
 
 async fn run() -> Result<InstalledServiceRunOutcome> {
     let arguments = ServiceArguments::parse();
+    let ephemeral_verification_root = if arguments.ephemeral_verification_credentials {
+        Some(EphemeralVerificationRoot::try_new(
+            arguments
+                .installation_data_root
+                .as_deref()
+                .context("ephemeral verification requires an installation data root")?,
+        )?)
+    } else {
+        None
+    };
     let config = load_config(
         arguments.config.as_deref(),
         arguments.data_dir,
@@ -109,6 +123,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
         config,
         logging.store(),
         arguments.installation_data_root.as_deref(),
+        ephemeral_verification_root,
     )
     .await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
@@ -136,14 +151,26 @@ async fn run_installed_service(
     config: AppConfig,
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
     installation_data_root: Option<&Path>,
+    ephemeral_verification_root: Option<EphemeralVerificationRoot>,
 ) -> Result<InstalledServiceRunOutcome> {
     let mut termination = TerminationSignals::install()?;
-    let service = match installation_data_root {
-        Some(root) => {
+    let service = match (installation_data_root, ephemeral_verification_root) {
+        (Some(_root), Some(ephemeral_root)) => {
+            InstalledService::start_ephemeral_verification_with_logging_store_at_installation_root(
+                config,
+                ephemeral_root,
+                logs,
+            )
+            .await?
+        }
+        (Some(root), None) => {
             InstalledService::start_with_logging_store_at_installation_root(config, root, logs)
                 .await?
         }
-        None => InstalledService::start_with_logging_store(config, logs).await?,
+        (None, None) => InstalledService::start_with_logging_store(config, logs).await?,
+        (None, Some(_)) => {
+            anyhow::bail!("ephemeral verification requires an explicit installation data root")
+        }
     };
     let cancellation = CancellationToken::new();
     let mut serving = Box::pin(service.run(cancellation.clone()));

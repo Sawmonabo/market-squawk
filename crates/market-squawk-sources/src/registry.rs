@@ -437,6 +437,10 @@ impl RegistryAuthorityState {
         }
     }
 
+    pub(crate) fn is_exactly_empty(&self) -> bool {
+        self.sources.is_empty() && self.budget_policies.is_empty()
+    }
+
     fn try_new(
         sources: Vec<PersistedSourceAuthority>,
         budget_policies: Vec<PersistedProviderBudgetPolicy>,

@@ -233,7 +233,11 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         context: market_squawk_services::RequestContext,
     ) -> Result<Value, DispatchError> {
         if InstalledMcpControl::effect(request.operation().as_str()).is_some() {
-            return self.mcp.dispatch(request).map_err(map_mcp_error);
+            return self
+                .mcp
+                .dispatch(request, &context)
+                .await
+                .map_err(map_mcp_error);
         }
         let Value::Object(arguments) = request.arguments() else {
             return Err(DispatchError::Rejected);
@@ -272,6 +276,7 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
 fn map_mcp_error(error: McpControlError) -> DispatchError {
     match error {
         McpControlError::InvalidRequest | McpControlError::Unauthorized => DispatchError::Rejected,
+        McpControlError::Interrupted => DispatchError::Interrupted,
         McpControlError::AuthorityStore(_)
         | McpControlError::Clock
         | McpControlError::Credential(_)

@@ -6,7 +6,7 @@
 | Audience | Runtime, platform, Desktop, CLI, installer, packaging, and security maintainers |
 | Status | Evidence verified; implementation and exact-head platform proof required |
 | Research date | 2026-08-03 |
-| Evidence review | `PASS_WITH_NOTES` on 2026-08-03 |
+| Evidence review | `PASS_WITH_NOTES` on 2026-08-03; runtime supplement verified 2026-08-04 |
 
 This report preserves the durable conclusions from the decision-grade investigation into two V1
 failures: an installed service that could not pass credential initialization without a foreground
@@ -115,12 +115,25 @@ named pipes, first-instance protection, and safe named-pipe impersonation. Bound
 The protocol is deliberately small:
 
 - one fixed versioned preface;
-- one length-prefixed request and one fixed typed response;
+- one length-prefixed request, an explicit request terminator, and one exact typed response;
 - a 64 KiB frame ceiling, with a much smaller domain limit for the unlock itself;
 - exact installation, bootstrap-generation, command, and deadline binding;
 - finite connections, authentication workers, queued work, aggregate bytes, and total lifetime;
 - no trailing frames or generic secret-bearing JSON; and
 - zeroization on every secret success and failure path.
+
+The ready-service admission protocol uses separate bound success and rejection responses. Both
+commit to the runtime identity, service process identity, endpoint key, requested client, and
+fresh request nonce. A rejection contains no registration or credential. Generic end-of-file,
+connection reset, timeout, crash, or malformed response is never reclassified as an authorization
+decision.
+
+On Unix, the blocking client uses nonblocking file descriptors plus `poll` against one absolute
+transaction deadline. This follows Apple's readiness-oriented socket guidance and avoids relying
+on repeated `SO_RCVTIMEO` operations after a local socket has been half-closed. The request still
+uses `SHUT_WR`, and the server still requires exact end-of-request before admitting a client. On
+Windows, connection wait, request transfer, and response transfer share one bounded transaction
+deadline.
 
 Endpoint permissions and peer identity are admission controls, not product authorization. The
 bootstrap generation and command contract provide the additional authority boundary. Malware
@@ -216,6 +229,10 @@ place, and the previous verified generation remains available for rollback.
 - Installer activation and repair distinguish `ready`, `bootstrap_required`, and terminal failure.
 - Installed smoke tests use the installed CLI path, keep the unlock process-local, and emit only
   bounded redacted early-exit diagnostics.
+- Memory-hard password derivation and other finite credential mutations run outside Tokio's core
+  asynchronous worker threads. One bounded asynchronous mutation gate preserves ordering; after a
+  mutation begins on the blocking pool, it is allowed to reach its durable terminal state rather
+  than being reported as cancelled while still changing authority state.
 - Acceptance requires the same clean, pushed, unchanged commit to pass Ubuntu x64, Windows x64,
   macOS Intel, and macOS Apple Silicon installed-product jobs before the grouped review.
 
@@ -250,6 +267,12 @@ Reviewed 2026-08-03:
   [crate documentation](https://docs.rs/win-security-identifier/0.2.0/win_security_identifier/).
 - `tokio-util` 0.7.19,
   [`LengthDelimitedCodec`](https://docs.rs/tokio-util/0.7.19/tokio_util/codec/length_delimited/struct.LengthDelimitedCodec.html).
+- Apple, [`setsockopt(2)`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setsockopt.2.html),
+  [`shutdown(2)`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/shutdown.2.html),
+  and [Using Sockets and Socket Streams](https://developer.apple.com/library/archive/documentation/NetworkingInternet/Conceptual/NetworkingTopics/Articles/UsingSocketsandSocketStreams.html).
+- Tokio, [CPU-bound tasks and blocking code](https://docs.rs/tokio/latest/tokio/index.html#cpu-bound-tasks-and-blocking-code)
+  and [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html).
+- IETF, [RFC 9106: Argon2 Memory-Hard Function](https://datatracker.ietf.org/doc/html/rfc9106).
 - PyPA, [Recording installed projects](https://packaging.python.org/en/latest/specifications/recording-installed-packages/)
   and [Binary distribution format](https://packaging.python.org/en/latest/specifications/binary-distribution-format/).
 - Astral, [uv installer reference](https://docs.astral.sh/uv/reference/installer/) and

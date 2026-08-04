@@ -133,8 +133,11 @@ impl InstalledRuntimeState {
 /// Prepared single-instance runtime. The rendezvous remains unpublished until composition ends.
 pub(super) struct PreparedRuntime {
     state: InstalledRuntimeState,
+    identity_root: std::path::PathBuf,
     secret_store: Arc<dyn SecretStore>,
     credentials: Arc<CredentialRegistry>,
+    desktop_credential: SecretValue,
+    cli_credential: SecretValue,
     mcp_clients: Option<PreparedMcpClientAuthority>,
     listener: Option<TcpListener>,
     rendezvous: RendezvousAuthority,
@@ -164,8 +167,9 @@ impl PreparedRuntime {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let identity_store =
             LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
+        let identity_root = service_root.join(IDENTITY_DIRECTORY);
         let loaded = identity_store.load()?;
-        let (state, _root_credentials, signing_key, listener) = match loaded
+        let (mut state, signing_key, listener) = match loaded
             .map(|encoded| decode_document(&encoded))
             .transpose()?
         {
@@ -176,10 +180,6 @@ impl PreparedRuntime {
                 state.runtime = selected
                     .to_runtime(state.runtime.installation_id())
                     .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
-                let credentials = Arc::new(CredentialRegistry::try_load(
-                    Arc::clone(&secret_store),
-                    state.credentials.clone(),
-                )?);
                 let signing_key = secret_store
                     .read(
                         &state.rendezvous_signing_secret,
@@ -189,7 +189,7 @@ impl PreparedRuntime {
                 identity_store.store(&encode_document(&InstalledRuntimeDocument::Active {
                     state: state.clone(),
                 })?)?;
-                (state, credentials, signing_key, listener)
+                (state, signing_key, listener)
             }
             Some(InstalledRuntimeDocument::Initializing { mut initialization }) => {
                 initialization.runtime = selected
@@ -208,17 +208,23 @@ impl PreparedRuntime {
                 else {
                     return Err(InstalledServiceError::InvalidRuntimeState);
                 };
-                resume_initialization(&identity_store, Arc::clone(&secret_store), initialization)
-                    .await?
+                let (state, _credentials, signing_key, listener) = resume_initialization(
+                    &identity_store,
+                    Arc::clone(&secret_store),
+                    initialization,
+                )
+                .await?;
+                (state, signing_key, listener)
             }
             None => {
-                initialize_runtime(
+                let (state, _credentials, signing_key, listener) = initialize_runtime(
                     &identity_store,
                     Arc::clone(&secret_store),
                     selected,
                     installation_id,
                 )
-                .await?
+                .await?;
+                (state, signing_key, listener)
             }
         };
         let mcp_roots = [
@@ -246,10 +252,26 @@ impl PreparedRuntime {
                 .ok_or(InstalledServiceError::InvalidRuntimeState)?;
             *root = effective;
         }
+        state.credentials = effective_registrations.clone();
+        identity_store.store(&encode_document(&InstalledRuntimeDocument::Active {
+            state: state.clone(),
+        })?)?;
         let credentials = Arc::new(CredentialRegistry::try_load(
             Arc::clone(&secret_store),
             effective_registrations,
         )?);
+        let desktop_credential = load_client_credential(
+            &secret_store,
+            state
+                .registration(NamedClient::Desktop)
+                .ok_or(InstalledServiceError::InvalidRuntimeState)?,
+        )?;
+        let cli_credential = load_client_credential(
+            &secret_store,
+            state
+                .registration(NamedClient::Cli)
+                .ok_or(InstalledServiceError::InvalidRuntimeState)?,
+        )?;
         drop(identity_store);
         let verifier = SystemProcessIdentityVerifier;
         let process = verifier.current()?;
@@ -268,8 +290,11 @@ impl PreparedRuntime {
         )?;
         Ok(Self {
             state,
+            identity_root,
             secret_store,
             credentials,
+            desktop_credential,
+            cli_credential,
             mcp_clients: Some(mcp_clients),
             listener: Some(listener),
             rendezvous,
@@ -291,6 +316,10 @@ impl PreparedRuntime {
 
     pub(super) fn secret_store(&self) -> Arc<dyn SecretStore> {
         Arc::clone(&self.secret_store)
+    }
+
+    pub(super) fn identity_root(&self) -> std::path::PathBuf {
+        self.identity_root.clone()
     }
 
     pub(super) fn take_mcp_clients(
@@ -315,16 +344,22 @@ impl PreparedRuntime {
         &self,
         client: NamedClient,
     ) -> Result<SecretValue, InstalledServiceError> {
-        let registration = self
-            .state
-            .registration(client)
-            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-        self.secret_store
-            .read(
-                registration.reference(),
-                &secret_control("installed-runtime-client-load")?,
-            )
-            .map_err(|_error| InstalledServiceError::SecretStore)
+        match client {
+            NamedClient::Desktop => duplicate_secret(&self.desktop_credential),
+            NamedClient::Cli => duplicate_secret(&self.cli_credential),
+            NamedClient::ClaudeCode | NamedClient::Codex => {
+                Err(InstalledServiceError::InvalidRuntimeState)
+            }
+        }
+    }
+
+    pub(super) fn admission_credentials(
+        &self,
+    ) -> Result<(SecretValue, SecretValue), InstalledServiceError> {
+        Ok((
+            duplicate_secret(&self.desktop_credential)?,
+            duplicate_secret(&self.cli_credential)?,
+        ))
     }
 
     pub(super) fn take_listener(&mut self) -> Result<TcpListener, InstalledServiceError> {
@@ -430,6 +465,77 @@ pub(super) fn installation_id(
         InstalledRuntimeDocument::Active { state } => state.validate()?.runtime,
     };
     Ok(Some(runtime.installation_id()))
+}
+
+pub(super) fn persist_mcp_registration(
+    identity_root: &std::path::Path,
+    runtime: RuntimeIdentity,
+    registration: ClientCredentialRegistration,
+) -> Result<(), InstalledServiceError> {
+    if !matches!(
+        registration.client(),
+        NamedClient::ClaudeCode | NamedClient::Codex
+    ) {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    let store = LocalAuthorityStateStore::try_open(identity_root)?;
+    let encoded = store
+        .load()?
+        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+    let InstalledRuntimeDocument::Active { mut state } = decode_document(&encoded)? else {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    };
+    state = state.validate()?;
+    if state.runtime != runtime {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    let current = state
+        .credentials
+        .iter_mut()
+        .find(|current| current.client() == registration.client())
+        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
+    if current.client_id() != registration.client_id()
+        || current.generation().get() > registration.generation().get()
+    {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    *current = registration;
+    store.store(&encode_document(&InstalledRuntimeDocument::Active {
+        state,
+    })?)?;
+    Ok(())
+}
+
+pub(super) fn credential_references(
+    paths: &LocalPaths,
+) -> Result<Vec<SecretRef>, InstalledServiceError> {
+    let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
+    let identity_store = LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
+    let Some(encoded) = identity_store.load()? else {
+        return Ok(Vec::new());
+    };
+    match decode_document(&encoded)? {
+        InstalledRuntimeDocument::Initializing { initialization } => {
+            let initialization = initialization.validate()?;
+            let mut references = initialization
+                .credentials
+                .iter()
+                .map(|plan| plan.mutation().target().clone())
+                .collect::<Vec<_>>();
+            references.push(initialization.rendezvous_signing_plan.target().clone());
+            Ok(references)
+        }
+        InstalledRuntimeDocument::Active { state } => {
+            let state = state.validate()?;
+            let mut references = state
+                .credentials
+                .iter()
+                .map(|registration| registration.reference().clone())
+                .collect::<Vec<_>>();
+            references.push(state.rendezvous_signing_secret);
+            Ok(references)
+        }
+    }
 }
 
 async fn resume_initialization(

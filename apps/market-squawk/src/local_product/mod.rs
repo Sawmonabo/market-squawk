@@ -171,6 +171,12 @@ pub struct LocalProduct {
     fair_value_inputs: ProductionFairValueInputAuthority,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceAuthorityStartupPolicy {
+    RejectUncleanPredecessor,
+    RecoverExactlyEmptyUncleanPredecessor,
+}
+
 impl LocalProduct {
     /// Opens or initializes every required local product domain under one application authority.
     ///
@@ -193,6 +199,7 @@ impl LocalProduct {
             config,
             paths,
             std::iter::empty::<PrepublishedResearchSourceRegistration>(),
+            SourceAuthorityStartupPolicy::RecoverExactlyEmptyUncleanPredecessor,
         )
     }
 
@@ -213,13 +220,19 @@ impl LocalProduct {
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
         let paths = LocalPaths::prepare(config.data_dir())?;
-        Self::try_new_with_paths_and_prepublished_research_sources(config, paths, registrations)
+        Self::try_new_with_paths_and_prepublished_research_sources(
+            config,
+            paths,
+            registrations,
+            SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
+        )
     }
 
     fn try_new_with_paths_and_prepublished_research_sources<I>(
         config: AppConfig,
         paths: LocalPaths,
         registrations: I,
+        source_authority_startup_policy: SourceAuthorityStartupPolicy,
     ) -> Result<Self, LocalProductError>
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
@@ -240,12 +253,22 @@ impl LocalProduct {
         )?;
         let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
             Arc::new(provider_rate.clone());
-        let source_registry =
-            AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
-                source_store,
-                authorization_subject_resolver,
-                provider_rate.clone(),
-            )?;
+        let source_registry = match source_authority_startup_policy {
+            SourceAuthorityStartupPolicy::RejectUncleanPredecessor => {
+                AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+                    source_store,
+                    authorization_subject_resolver,
+                    provider_rate.clone(),
+                )
+            }
+            SourceAuthorityStartupPolicy::RecoverExactlyEmptyUncleanPredecessor => {
+                AuthoritativeSourceRegistry::try_new_durable_for_installed_product_recovering_exactly_empty_predecessor(
+                    source_store,
+                    authorization_subject_resolver,
+                    provider_rate.clone(),
+                )
+            }
+        }?;
         let (research_ingest, provider_runtime_mutation) =
             ProductionResearchIngestCoordinator::try_new_with_provider_runtime_authority(
                 source_registry,

@@ -115,6 +115,12 @@ enum DurableRunState {
     InUse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncleanPredecessorPolicy {
+    Reject,
+    RecoverExactlyEmpty,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderBudgetPolicyV1 {
@@ -656,10 +662,18 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
-        Self::open_session(store, now).map(|session| UnpublishedAuthoritySession {
-            session,
-            finalized: false,
-        })
+        Self::open_unpublished_with_policy(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    pub(crate) fn open_unpublished_recovering_exactly_empty(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_unpublished_with_policy(
+            store,
+            now,
+            UncleanPredecessorPolicy::RecoverExactlyEmpty,
+        )
     }
 
     #[cfg(test)]
@@ -667,12 +681,24 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
-        Self::open_session(store, now)
+        Self::open_session(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    fn open_unpublished_with_policy(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+        policy: UncleanPredecessorPolicy,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_session(store, now, policy).map(|session| UnpublishedAuthoritySession {
+            session,
+            finalized: false,
+        })
     }
 
     fn open_session(
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
+        policy: UncleanPredecessorPolicy,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
         let mut envelope = match store.load().map_err(|_| AuthorityPersistenceError::Store)? {
             Some(bytes) => {
@@ -682,7 +708,12 @@ impl AuthorityDurabilitySession {
             }
             None => DurableAuthorityEnvelope::empty(now),
         };
-        let recovered_unclean = envelope.run_state == DurableRunState::InUse;
+        let predecessor_was_unclean = envelope.run_state == DurableRunState::InUse;
+        let recover_exactly_empty = predecessor_was_unclean
+            && policy == UncleanPredecessorPolicy::RecoverExactlyEmpty
+            && envelope.registry.is_exactly_empty()
+            && envelope.budgets.is_empty();
+        let recovered_unclean = predecessor_was_unclean && !recover_exactly_empty;
         if recovered_unclean {
             let mut groups = envelope.budgets.as_slice().to_vec();
             for group in &mut groups {

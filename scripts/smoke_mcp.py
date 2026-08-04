@@ -9,6 +9,7 @@ import pathlib
 import queue
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ SHUTDOWN_TIMEOUT_SECONDS = 25.0
 SERVICE_STATUS_TIMEOUT_SECONDS = 35.0
 SERVICE_BOOTSTRAP_TIMEOUT_SECONDS = 45.0
 SERVICE_START_TIMEOUT_SECONDS = 60.0
+APPIMAGE_EXTRACTION_TIMEOUT_SECONDS = 90.0
 MCP_PROTOCOL_VERSION = "2026-07-28"
 MAXIMUM_DIAGNOSTIC_BYTES = 8 * 1024
 
@@ -151,6 +153,26 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
 
+def stop_service(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        if os.name == "nt":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            raise TimeoutError(
+                "installed service did not complete bounded credential retirement"
+            ) from error
+    require(
+        process.returncode == 0,
+        f"installed service exited with status {process.returncode}",
+    )
+
+
 def finish_process(process: subprocess.Popen[str]) -> None:
     require(process.stdin is not None, "MCP process stdin is unavailable")
     process.stdin.close()
@@ -185,6 +207,60 @@ def bounded_redacted_diagnostics(
     if truncated:
         text = f"{text}\n[diagnostics truncated]" if text else "[diagnostics truncated]"
     return text
+
+
+def controlled_extracted_program(
+    extraction_root: pathlib.Path, name: str
+) -> pathlib.Path:
+    candidate = extraction_root / "usr" / "bin" / name
+    metadata = candidate.lstat()
+    require(not candidate.is_symlink(), f"AppImage program is a symbolic link: {name}")
+    require(metadata.st_size > 0, f"AppImage program is empty: {name}")
+    require(candidate.is_file(), f"AppImage program is not a regular file: {name}")
+    resolved_root = extraction_root.resolve(strict=True)
+    resolved = candidate.resolve(strict=True)
+    require(
+        resolved.is_relative_to(resolved_root),
+        f"AppImage program escapes the extracted package: {name}",
+    )
+    require(os.access(resolved, os.X_OK), f"AppImage program is not executable: {name}")
+    return resolved
+
+
+def extract_appimage_programs(
+    appimage: pathlib.Path,
+    extraction_directory: pathlib.Path,
+    environment: dict[str, str],
+) -> tuple[pathlib.Path, pathlib.Path]:
+    extraction_environment = environment.copy()
+    extraction_environment.pop("APPIMAGE_EXTRACT_AND_RUN", None)
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+        result = subprocess.run(
+            [str(appimage), "--appimage-extract"],
+            cwd=extraction_directory,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            text=True,
+            check=False,
+            env=extraction_environment,
+            timeout=APPIMAGE_EXTRACTION_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            diagnostics = bounded_redacted_diagnostics(stderr)
+            detail = f": {diagnostics}" if diagnostics else ""
+            raise RuntimeError(
+                f"AppImage extraction exited with status {result.returncode}{detail}"
+            )
+    extracted = extraction_directory / "squashfs-root"
+    extracted_metadata = extracted.lstat()
+    require(not extracted.is_symlink(), "AppImage extraction root is a symbolic link")
+    require(extracted_metadata.st_size > 0, "AppImage extraction root is empty")
+    require(extracted.is_dir(), "AppImage extraction root is not a directory")
+    return (
+        controlled_extracted_program(extracted, "market-squawk"),
+        controlled_extracted_program(extracted, "market-squawk-service"),
+    )
 
 
 def bootstrap_service(
@@ -315,10 +391,16 @@ def main() -> int:
         if arguments.running_service
         else tempfile.TemporaryDirectory(prefix="market-squawk-smoke-installation-")
     )
+    temporary_appimage_context = (
+        tempfile.TemporaryDirectory(prefix="market-squawk-smoke-appimage-")
+        if arguments.desktop_appimage
+        else contextlib.nullcontext(None)
+    )
     with (
         tempfile.TemporaryDirectory() as temporary_data_dir,
         temporary_user_context as temporary_user_root,
         temporary_installation_context as temporary_installation_root,
+        temporary_appimage_context as temporary_appimage_root,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
     ):
@@ -340,6 +422,20 @@ def main() -> int:
         )
         service: subprocess.Popen[str] | None = None
         process: subprocess.Popen[str] | None = None
+        service_cli = binary
+        service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
+        if arguments.desktop_appimage:
+            require(environment is not None, "isolated AppImage environment is unavailable")
+            require(
+                temporary_appimage_root is not None,
+                "isolated AppImage extraction root is unavailable",
+            )
+            service_cli, service_binary = extract_appimage_programs(
+                binary,
+                pathlib.Path(temporary_appimage_root),
+                environment,
+            )
+            environment["APPIMAGE_EXTRACT_AND_RUN"] = "1"
         command = [
             str(binary),
             "--data-dir",
@@ -354,6 +450,8 @@ def main() -> int:
             command = [
                 str(binary),
                 "--stdio-mcp",
+                "--mcp-client",
+                arguments.client,
                 "--data-dir",
                 data_dir,
                 *installation_arguments,
@@ -369,12 +467,11 @@ def main() -> int:
             ]
         failure: BaseException | None = None
         try:
-            if not arguments.desktop_appimage and not arguments.running_service:
+            if not arguments.running_service:
                 require(
                     installation_data_root is not None,
                     "isolated installation root is unavailable",
                 )
-                service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
                 require(
                     service_binary.is_file(),
                     f"Market Squawk service binary does not exist: {service_binary}",
@@ -386,16 +483,20 @@ def main() -> int:
                         data_dir,
                         "--installation-data-root",
                         installation_data_root,
+                        "--ephemeral-verification-credentials",
                     ],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=service_stderr,
                     text=True,
                     env=environment,
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    ),
                 )
                 require(environment is not None, "isolated service environment is unavailable")
                 wait_for_service(
-                    binary,
+                    service_cli,
                     data_dir,
                     installation_data_root,
                     service,
@@ -580,7 +681,13 @@ def main() -> int:
             elif process is not None:
                 stop_process(process)
             if service is not None:
-                stop_process(service)
+                try:
+                    stop_service(service)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.add_note(f"service cleanup also failed: {error}")
         if failure is not None:
             diagnostics = bounded_redacted_diagnostics(stderr_log)
             if diagnostics:

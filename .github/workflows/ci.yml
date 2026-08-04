@@ -924,10 +924,13 @@ jobs:
           relay="$(find "$root/versions" -type f \
             -path '*/bin/market-squawk-mcp-relay' -print)"
           runtime="$(find "$root/versions" -type f -path '*/bin/python' -print)"
+          training="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-train' -print)"
           [[ -n "$installer" && "$installer" != *$'\n'* ]]
           [[ -n "$application_cli" && "$application_cli" != *$'\n'* ]]
           [[ -n "$relay" && "$relay" != *$'\n'* ]]
           [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          [[ -n "$training" && "$training" != *$'\n'* ]]
 
           sentinel="$data_root/portfolios/native-package-smoke.txt"
           sentinel_content='native-package-user-data-v1'
@@ -942,6 +945,9 @@ jobs:
             --output json setup status
           HOME="$home" "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          HOME="$home" "$training" --help >/dev/null
+          HOME="$home" "$runtime" -I -B -c \
+            'from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts'
           HOME="$home" python3 scripts/smoke_mcp.py "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
             --client claude-code
@@ -1152,11 +1158,19 @@ jobs:
               -File `
               -Recurse
           )
+          $training = @(
+            Get-ChildItem `
+              -Path (Join-Path $root "versions") `
+              -Filter market-squawk-train.exe `
+              -File `
+              -Recurse
+          )
           if (
             $installer.Count -ne 1 -or
             $application.Count -ne 1 -or
             $relay.Count -ne 1 -or
-            $runtime.Count -ne 1
+            $runtime.Count -ne 1 -or
+            $training.Count -ne 1
           ) {
             throw "The installed Windows product component set is incomplete."
           }
@@ -1178,6 +1192,11 @@ jobs:
           & $runtime[0].FullName -I -B -c `
             "import market_squawk, pyarrow; print(pyarrow.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Managed Python admission failed." }
+          & $training[0].FullName --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Installed training launcher failed." }
+          & $runtime[0].FullName -I -B -c `
+            "from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts"
+          if ($LASTEXITCODE -ne 0) { throw "Installed Python analytics admission failed." }
           python scripts/smoke_mcp.py $relay[0].FullName `
             --installed-relay --running-service --data-dir $dataRoot `
             --client claude-code
@@ -1332,10 +1351,13 @@ jobs:
           relay="$(find "$root/versions" -type f \
             -path '*/bin/market-squawk-mcp-relay' -print)"
           runtime="$(find "$root/versions" -type f -path '*/bin/python' -print)"
+          training="$(find "$root/versions" -type f \
+            -path '*/bin/market-squawk-train' -print)"
           [[ -n "$installer" && "$installer" != *$'\n'* ]]
           [[ -n "$application" && "$application" != *$'\n'* ]]
           [[ -n "$relay" && "$relay" != *$'\n'* ]]
           [[ -n "$runtime" && "$runtime" != *$'\n'* ]]
+          [[ -n "$training" && "$training" != *$'\n'* ]]
 
           sentinel="$data_root/portfolios/native-package-smoke.txt"
           sentinel_content='native-package-user-data-v1'
@@ -1354,6 +1376,10 @@ jobs:
           HOME="$home" XDG_DATA_HOME="$xdg" \
             "$runtime" -I -B -c \
             'import market_squawk, pyarrow; print(pyarrow.__version__)'
+          HOME="$home" XDG_DATA_HOME="$xdg" "$training" --help >/dev/null
+          HOME="$home" XDG_DATA_HOME="$xdg" \
+            "$runtime" -I -B -c \
+            'from market_squawk import training_environment_receipt; from market_squawk.finance import OperationContext, feature_contracts; receipt = training_environment_receipt(); contracts = feature_contracts(context=OperationContext(60000, 1000000)); assert len(receipt.sha256) == 64 and contracts'
           HOME="$home" XDG_DATA_HOME="$xdg" \
             python3 scripts/smoke_mcp.py "$relay" \
             --installed-relay --running-service --data-dir "$data_root" \
@@ -1397,6 +1423,7 @@ jobs:
           stderr="$RUNNER_TEMP/appimage-mcp-outside.stderr"
           if "target/$TARGET/release/market-squawk-desktop" \
             --stdio-mcp \
+            --mcp-client codex \
             --data-dir "$RUNNER_TEMP/appimage-mcp-outside-data" \
             >"$stdout" 2>"$stderr"; then
             echo "hidden MCP transport ran outside a verified AppImage" >&2
@@ -1407,8 +1434,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 \
             HOME="$home" \
             XDG_DATA_HOME="$xdg" \
-            python3 scripts/smoke_mcp.py "$desktop" --desktop-appimage \
-            --data-dir "$data_root"
+            python3 scripts/smoke_mcp.py "$desktop" --desktop-appimage
 
           APPIMAGE_EXTRACT_AND_RUN=1 \
             HOME="$home" \

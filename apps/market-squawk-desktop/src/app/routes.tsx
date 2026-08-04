@@ -8,6 +8,9 @@ const OverviewPage = lazy(() =>
     default: module.OverviewPage,
   })),
 )
+const LookupPage = lazy(() =>
+  import("@/features/lookup").then((module) => ({ default: module.LookupPage })),
+)
 
 const MarketsPage = lazy(() =>
   import("@/features/markets").then((module) => ({ default: module.MarketsPage })),
@@ -60,6 +63,7 @@ export function AppRoutes() {
     <Suspense fallback={<RouteLoading />}>
       <Routes>
         <Route path="/overview" element={<OverviewPage />} />
+        <Route path="/lookup" element={<LookupPage />} />
         <Route path="/markets" element={<MarketsPage />} />
         <Route path="/sources" element={<SourcesPage />} />
         <Route path="/research" element={<ResearchPage />} />

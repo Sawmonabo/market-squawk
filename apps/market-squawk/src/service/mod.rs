@@ -42,7 +42,8 @@ use market_squawk_mcp::{
 };
 use market_squawk_platform::{
     EncryptedFileFallbackStatus, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
-    LocalPaths, PathError, PreferredSecretStore, SecretStore, SecretValue,
+    LocalPaths, LocalSecretStoreError, PathError, PreferredSecretStore, SecretCancellation,
+    SecretInteractionPolicy, SecretOperationControl, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClientError, ApplicationProtocolRange, ApplicationProtocolVersion,
@@ -104,10 +105,53 @@ const MAXIMUM_CLIENT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const GRACEFUL_REQUEST_DRAIN: Duration = Duration::from_secs(5);
 const FORCED_REQUEST_DRAIN: Duration = Duration::from_secs(2);
 const JOB_RUNNER_DRAIN: Duration = Duration::from_secs(15);
+const EPHEMERAL_CREDENTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CLIENT_REQUESTS: usize = 4;
 const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
 pub use runtime::SystemProcessIdentityVerifier;
+
+/// One fresh, absolute, non-default installation root authorized for destructive verification
+/// credential cleanup.
+pub struct EphemeralVerificationRoot {
+    root: PathBuf,
+}
+
+impl std::fmt::Debug for EphemeralVerificationRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EphemeralVerificationRoot([CONTROLLED PATH])")
+    }
+}
+
+impl EphemeralVerificationRoot {
+    /// Validates the destructive verification boundary before logging or service setup mutates it.
+    pub fn try_new(root: impl AsRef<Path>) -> Result<Self, InstalledServiceError> {
+        let root = root.as_ref();
+        if !root.is_absolute() {
+            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+        }
+        let selected = canonical_candidate(root)?;
+        let default = canonical_candidate(&default_installation_data_root()?)?;
+        if selected == default {
+            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+        }
+        match std::fs::symlink_metadata(root) {
+            Ok(metadata)
+                if metadata.file_type().is_dir() && std::fs::read_dir(root)?.next().is_none() => {}
+            Ok(_) => return Err(InstalledServiceError::InvalidEphemeralVerificationRoot),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// Returns the already validated root for colocated verification-only logging.
+    pub fn as_path(&self) -> &Path {
+        &self.root
+    }
+}
 
 /// Native-only connector for one named client of the already running installed service.
 pub struct InstalledServiceConnector {
@@ -215,6 +259,8 @@ pub struct InstalledService {
     runtime: PreparedRuntime,
     admission: ready_admission::ReadyAdmission,
     lifecycle: Arc<InstalledServiceLifecycle>,
+    installation_paths: LocalPaths,
+    ephemeral_verification_credentials: bool,
     _workspace_selector: Arc<WorkspaceSelector>,
     _instance_guard: LocalAuthorityStateStore,
 }
@@ -230,6 +276,10 @@ impl std::fmt::Debug for InstalledService {
             .field("audit", &"[DURABLE AUDIT AUTHORITY]")
             .field("server", &self.server)
             .field("lifecycle", &self.lifecycle)
+            .field(
+                "ephemeral_verification_credentials",
+                &self.ephemeral_verification_credentials,
+            )
             .field("workspace_selector", &"[INSTALLATION-GLOBAL AUTHORITY]")
             .field("instance_guard", &"[INSTALLATION-GLOBAL AUTHORITY]")
             .finish_non_exhaustive()
@@ -286,6 +336,7 @@ impl InstalledService {
             workspace_paths,
             secret_store,
             logs,
+            false,
         )
         .await
     }
@@ -308,6 +359,29 @@ impl InstalledService {
             workspace_paths,
             secret_store,
             logs,
+            false,
+        )
+        .await
+    }
+
+    /// Composes a verification-only service whose exact credential generations are retired and
+    /// proven absent on every graceful shutdown or startup unwind.
+    ///
+    pub async fn start_ephemeral_verification_with_logging_store_at_installation_root(
+        config: AppConfig,
+        installation_root: EphemeralVerificationRoot,
+        logs: Arc<crate::application::logs::StructuredLogStore>,
+    ) -> Result<Self, InstalledServiceError> {
+        let installation_paths = prepare_installation_paths(installation_root.as_path())?;
+        let workspace_paths = LocalPaths::prepare(config.data_dir())?;
+        let secret_store = runtime_secret_store(&installation_paths)?;
+        Self::start_prepared(
+            config,
+            installation_paths,
+            workspace_paths,
+            secret_store,
+            logs,
+            true,
         )
         .await
     }
@@ -318,6 +392,7 @@ impl InstalledService {
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
+        ephemeral_verification_credentials: bool,
     ) -> Result<Self, InstalledServiceError> {
         let instance_guard = runtime::acquire_instance(&installation_paths)?;
         let installation_id = runtime::installation_id(&installation_paths)?
@@ -331,6 +406,8 @@ impl InstalledService {
             .map_err(|_error| InstalledServiceError::WorkspaceSelection)?;
         let failed_startup_selector = Arc::clone(&workspace_selector);
         let failed_startup_selection = selection.clone();
+        let cleanup_paths = installation_paths.clone();
+        let cleanup_store = Arc::clone(&secret_store);
         let result = async move {
             let mut runtime = loop {
                 match PreparedRuntime::prepare(
@@ -427,12 +504,8 @@ impl InstalledService {
                     return Err(error);
                 }
             };
-            if readiness
-                .probe_ready(CancellationToken::new())
-                .await
-                .is_err()
-                || server.is_finished()
-            {
+            let native_readiness = readiness.probe_ready(CancellationToken::new()).await;
+            if native_readiness.is_err() || server.is_finished() {
                 drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
                 return Err(InstalledServiceError::ReadinessFailed);
@@ -446,12 +519,14 @@ impl InstalledService {
                 cleanup_startup(&product, &jobs).await;
                 return Err(InstalledServiceError::WorkspaceSelection);
             }
+            let (desktop_credential, cli_credential) = runtime.admission_credentials()?;
             let mut admission = match ready_admission::ReadyAdmission::start(
                 &installation_paths,
                 runtime.record().clone(),
                 runtime.registration(NamedClient::Desktop)?,
                 runtime.registration(NamedClient::Cli)?,
-                runtime.secret_store(),
+                desktop_credential,
+                cli_credential,
                 mcp_control,
             ) {
                 Ok(admission) => admission,
@@ -461,7 +536,8 @@ impl InstalledService {
                     return Err(error);
                 }
             };
-            if admission.probe().await.is_err() {
+            let admission_readiness = admission.probe().await;
+            if admission_readiness.is_err() {
                 let _retired = admission.shutdown().await;
                 drain_failed_server(server).await;
                 cleanup_startup(&product, &jobs).await;
@@ -488,11 +564,18 @@ impl InstalledService {
                 runtime,
                 admission,
                 lifecycle,
+                installation_paths,
+                ephemeral_verification_credentials,
                 _workspace_selector: workspace_selector,
                 _instance_guard: instance_guard,
             })
         }
         .await;
+        let credential_cleanup = if ephemeral_verification_credentials && result.is_err() {
+            retire_and_verify_ephemeral_credentials(&cleanup_paths, cleanup_store.as_ref())
+        } else {
+            Ok(())
+        };
         if result.is_err()
             && recover_failed_workspace_startup(
                 failed_startup_selector.as_ref(),
@@ -502,7 +585,18 @@ impl InstalledService {
         {
             return Err(InstalledServiceError::WorkspaceSelection);
         }
-        result
+        match (result, credential_cleanup) {
+            (Ok(service), Ok(())) => Ok(service),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_service), Err(_cleanup_error)) => {
+                Err(InstalledServiceError::EphemeralCredentialCleanup)
+            }
+            (Err(startup), Err(_cleanup_error)) => {
+                Err(InstalledServiceError::EphemeralStartupCleanup {
+                    startup: Box::new(startup),
+                })
+            }
+        }
     }
 
     /// Serves until cancellation, then executes every shutdown phase in authority order.
@@ -518,6 +612,8 @@ impl InstalledService {
             runtime,
             mut admission,
             lifecycle,
+            installation_paths,
+            ephemeral_verification_credentials,
             _workspace_selector,
             _instance_guard,
         } = self;
@@ -563,6 +659,12 @@ impl InstalledService {
         let audit_flushed = audit.flush().is_ok();
         let jobs_closed = jobs.shutdown_repository().await.is_ok();
         let rendezvous_retired = runtime.retire().unwrap_or(false);
+        let credential_cleanup = if ephemeral_verification_credentials {
+            let secret_store = runtime.secret_store();
+            retire_and_verify_ephemeral_credentials(&installation_paths, secret_store.as_ref())
+        } else {
+            Ok(())
+        };
         let report = InstalledServiceShutdownReport {
             transport,
             admission_retired,
@@ -578,9 +680,12 @@ impl InstalledService {
         drop(jobs);
         drop(product);
         drop(lifecycle);
+        drop(installation_paths);
         drop(_workspace_selector);
         drop(_instance_guard);
-        if report.is_complete() && admission_stopped_unexpectedly {
+        if credential_cleanup.is_err() {
+            Err(InstalledServiceError::EphemeralCredentialCleanup)
+        } else if report.is_complete() && admission_stopped_unexpectedly {
             Err(InstalledServiceError::AdmissionStopped)
         } else if report.is_complete() && transport_stopped_unexpectedly {
             Err(InstalledServiceError::TransportStopped)
@@ -692,6 +797,7 @@ fn compose_transport(
     let mcp_control = runtime.take_mcp_clients()?.activate(
         runtime.runtime(),
         desktop_registration.client_id(),
+        runtime.identity_root(),
         runtime.secret_store(),
         runtime.credentials(),
         MCP_CLIENT_REQUESTS,
@@ -965,6 +1071,80 @@ fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, Inst
     ))
 }
 
+fn canonical_candidate(path: &Path) -> Result<PathBuf, InstalledServiceError> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
+            let name = path
+                .file_name()
+                .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn retire_and_verify_ephemeral_credentials(
+    paths: &LocalPaths,
+    secret_store: &dyn SecretStore,
+) -> Result<(), InstalledServiceError> {
+    let mut failed = false;
+    let mut references = match runtime::credential_references(&paths) {
+        Ok(references) => references,
+        Err(_error) => {
+            failed = true;
+            Vec::new()
+        }
+    };
+    match mcp_control::credential_references(&paths) {
+        Ok(mut mcp_references) => references.append(&mut mcp_references),
+        Err(_error) => failed = true,
+    }
+    references.sort();
+    references.dedup();
+
+    for reference in &references {
+        let control = ephemeral_credential_control()?;
+        match secret_store.delete(reference, &control) {
+            Ok(()) | Err(LocalSecretStoreError::NotFound) => {}
+            Err(_error) => failed = true,
+        }
+    }
+    for reference in &references {
+        let control = ephemeral_credential_control()?;
+        match secret_store.read(reference, &control) {
+            Err(LocalSecretStoreError::NotFound) => {}
+            Ok(secret) => {
+                drop(secret);
+                failed = true;
+            }
+            Err(_error) => failed = true,
+        }
+    }
+    if failed {
+        Err(InstalledServiceError::SecretStore)
+    } else {
+        Ok(())
+    }
+}
+
+fn ephemeral_credential_control() -> Result<SecretOperationControl, InstalledServiceError> {
+    let deadline = Instant::now()
+        .checked_add(EPHEMERAL_CREDENTIAL_CLEANUP_TIMEOUT)
+        .ok_or(InstalledServiceError::SecretStore)?;
+    SecretOperationControl::try_new(
+        "installed-verification-credential-cleanup",
+        deadline,
+        1,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )
+    .map_err(|_error| InstalledServiceError::SecretStore)
+}
+
 fn runtime_secret_namespace(paths: &LocalPaths) -> Result<String, InstalledServiceError> {
     use sha2::{Digest as _, Sha256};
 
@@ -1057,6 +1237,9 @@ pub enum InstalledServiceError {
     /// An explicitly selected installation authority root was not absolute.
     #[error("the installed-service authority root must be absolute")]
     InvalidInstallationRoot,
+    /// A destructive verification root was not fresh, absolute, and distinct from the live root.
+    #[error("ephemeral verification requires a fresh, absolute, non-default installation root")]
+    InvalidEphemeralVerificationRoot,
     /// Another process owns the installed-service instance authority.
     #[error("the installed Market Squawk service is already running")]
     AlreadyRunning,
@@ -1180,6 +1363,16 @@ pub enum InstalledServiceError {
     /// One or more bounded shutdown barriers did not complete.
     #[error("installed-service shutdown was incomplete: {0:?}")]
     ShutdownIncomplete(InstalledServiceShutdownReport),
+    /// A verification-only service could not retire and prove absence of every credential.
+    #[error("ephemeral verification credential cleanup was incomplete")]
+    EphemeralCredentialCleanup,
+    /// Startup failed and cleanup of credentials created before that failure was also incomplete.
+    #[error("ephemeral verification credential cleanup failed after service startup failed")]
+    EphemeralStartupCleanup {
+        /// The primary startup failure retained for diagnosis and audit.
+        #[source]
+        startup: Box<InstalledServiceError>,
+    },
     /// Structured-log storage could not be opened for service composition.
     #[error(transparent)]
     Logging(#[from] InstalledServiceLoggingError),
@@ -1212,6 +1405,7 @@ impl From<mcp_control::McpControlError> for InstalledServiceError {
             McpControlError::InvalidState => "authority-state-invalid",
             McpControlError::InvalidRequest => "request-invalid",
             McpControlError::Unauthorized => "request-unauthorized",
+            McpControlError::Interrupted => "request-interrupted",
             McpControlError::RecoveryPending => "credential-recovery-pending",
             McpControlError::SecretStore => "secret-store-unavailable",
             McpControlError::Clock => "system-clock-invalid",

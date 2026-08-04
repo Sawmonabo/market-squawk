@@ -15,13 +15,13 @@ use std::{
 };
 
 use getrandom::fill as fill_random;
-use market_squawk_platform::{LocalPaths, SecretStore, SecretValue};
+use market_squawk_platform::{LocalPaths, SecretValue};
 use market_squawk_runtime::{
     ApplicationProtocolVersion, ClientCredentialRegistration, ClientId, CredentialGeneration,
     NamedClient, ProcessIdentity, ProcessIdentityVerifier as _, RendezvousRecord, RuntimeIdentity,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::AsyncReadExt as _,
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -29,7 +29,8 @@ use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::{
-    InstalledServiceError, SystemProcessIdentityVerifier, mcp_control::InstalledMcpControl,
+    InstalledServiceError, SystemProcessIdentityVerifier,
+    mcp_control::{InstalledMcpControl, McpControlError},
 };
 
 #[cfg(unix)]
@@ -41,17 +42,20 @@ const ADMISSION_DIRECTORY: &str = "installed-service/admission";
 const METADATA_FILE: &str = "state";
 const METADATA_TEMP_FILE: &str = ".state.tmp";
 const METADATA_MAGIC: &[u8; 4] = b"MSQA";
-const PREFACE: &[u8; 8] = b"MSQA\0\x01\0\0";
-const PROTOCOL_VERSION: u16 = 1;
+const PREFACE: &[u8; 8] = b"MSQA\0\x02\0\0";
+const REQUEST_COMMIT: &[u8; 8] = b"MSQACMIT";
+const PROTOCOL_VERSION: u16 = 2;
 const METADATA_BYTES: usize = 90;
 const REQUEST_BYTES: usize = 107;
-const RESPONSE_FIXED_BYTES: usize = 133;
+const RESPONSE_COMMON_BYTES: usize = 104;
+const RESPONSE_SUCCESS_FIXED_BYTES: usize = 134;
+const RESPONSE_STATUS_SUCCESS: u8 = 0;
+const RESPONSE_STATUS_REJECTED: u8 = 1;
 const MAXIMUM_FRAME_BYTES: usize = 64 * 1024;
 const MAXIMUM_CREDENTIAL_BYTES: usize = 4 * 1024;
 const MAXIMUM_CONNECTIONS: usize = 16;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const TRAILING_DATA_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionMetadata {
@@ -74,6 +78,11 @@ pub(super) struct AdmittedRuntimeClient {
     pub(super) credential: SecretValue,
 }
 
+enum DecodedAdmissionResponse {
+    Success(AdmittedRuntimeClient),
+    Rejected,
+}
+
 impl std::fmt::Debug for AdmittedRuntimeClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -89,8 +98,9 @@ impl std::fmt::Debug for AdmittedRuntimeClient {
 struct AdmissionAuthority {
     record: RendezvousRecord,
     desktop: ClientCredentialRegistration,
+    desktop_credential: SecretValue,
     cli: ClientCredentialRegistration,
-    secret_store: Arc<dyn SecretStore>,
+    cli_credential: SecretValue,
     mcp: Arc<InstalledMcpControl>,
 }
 
@@ -106,12 +116,20 @@ impl AdmissionAuthority {
                 } else {
                     self.cli.clone()
                 };
-                let credential =
-                    super::runtime::load_client_credential(&self.secret_store, &registration)?;
+                let cached = if client == NamedClient::Desktop {
+                    &self.desktop_credential
+                } else {
+                    &self.cli_credential
+                };
+                let credential = SecretValue::new(cached.expose_secret().to_owned())
+                    .map_err(|_error| InstalledServiceError::SecretStore)?;
                 Ok((registration, credential))
             }
             NamedClient::ClaudeCode | NamedClient::Codex => {
-                self.mcp.admit_client(client).map_err(Into::into)
+                self.mcp.admit_client(client).map_err(|error| match error {
+                    McpControlError::Unauthorized => InstalledServiceError::AdmissionRejected,
+                    error => error.into(),
+                })
             }
         }
     }
@@ -142,7 +160,8 @@ impl ReadyAdmission {
         record: RendezvousRecord,
         desktop: ClientCredentialRegistration,
         cli: ClientCredentialRegistration,
-        secret_store: Arc<dyn SecretStore>,
+        desktop_credential: SecretValue,
+        cli_credential: SecretValue,
         mcp: Arc<InstalledMcpControl>,
     ) -> Result<Self, InstalledServiceError> {
         let root = paths.control_root()?.root().join(ADMISSION_DIRECTORY);
@@ -161,8 +180,9 @@ impl ReadyAdmission {
         let authority = Arc::new(AdmissionAuthority {
             record,
             desktop,
+            desktop_credential,
             cli,
-            secret_store,
+            cli_credential,
             mcp,
         });
         let cancellation = CancellationToken::new();
@@ -186,8 +206,8 @@ impl ReadyAdmission {
         let root = self.root.clone();
         let metadata = self.metadata;
         tokio::task::spawn_blocking(move || {
-            request_with_metadata(&root, metadata, NamedClient::Desktop, CONNECTION_TIMEOUT)
-                .map(drop)
+            let deadline = transaction_deadline(CONNECTION_TIMEOUT)?;
+            request_with_metadata(&root, metadata, NamedClient::Desktop, deadline).map(drop)
         })
         .await
         .map_err(|_error| InstalledServiceError::AdmissionUnavailable)?
@@ -244,9 +264,10 @@ pub(super) fn request(
     if timeout.is_zero() {
         return Err(InstalledServiceError::AdmissionDeadline);
     }
+    let deadline = transaction_deadline(timeout.min(CONNECTION_TIMEOUT))?;
     let root = paths.control_root()?.root().join(ADMISSION_DIRECTORY);
     let metadata = load_metadata(&root)?;
-    request_with_metadata(&root, metadata, client, timeout.min(CONNECTION_TIMEOUT))
+    request_with_metadata(&root, metadata, client, deadline)
 }
 
 async fn run_server(
@@ -261,9 +282,7 @@ async fn run_server(
             biased;
             () = cancellation.cancelled() => break,
             joined = workers.join_next(), if !workers.is_empty() => {
-                if joined.is_some_and(|result| result.is_err()) {
-                    break;
-                }
+                let _worker_completed = joined;
             }
             accepted = listener.accept(cancellation.clone()) => {
                 let Ok(stream) = accepted else { break; };
@@ -294,31 +313,33 @@ async fn serve_connection(
     let mut frame = read_async_frame(&mut stream).await?;
     let request = decode_request(&frame, metadata)?;
     frame.zeroize();
-    let mut trailing = [0_u8; 1];
-    match tokio::time::timeout(TRAILING_DATA_TIMEOUT, stream.read(&mut trailing)).await {
-        Ok(Ok(0)) | Err(_) => {}
-        _ => return Err(InstalledServiceError::AdmissionProtocol),
+    let mut commit = [0_u8; REQUEST_COMMIT.len()];
+    stream.read_exact(&mut commit).await?;
+    if commit != *REQUEST_COMMIT {
+        return Err(InstalledServiceError::AdmissionProtocol);
     }
+    platform::require_request_end(&mut stream).await?;
     if Instant::now() >= request.deadline {
         return Err(InstalledServiceError::AdmissionDeadline);
     }
-    let (registration, credential) = authority.admit(request.client)?;
-    let mut response = encode_response(
-        metadata,
-        request,
-        &authority.record,
-        &registration,
-        &credential,
-    )?;
-    drop(credential);
-    let length = u32::try_from(response.len())
-        .map_err(|_error| InstalledServiceError::AdmissionProtocol)?
-        .to_be_bytes();
-    stream.write_all(&length).await?;
-    let result = stream.write_all(&response).await;
-    response.zeroize();
-    result?;
-    stream.shutdown().await?;
+    let response = match authority.admit(request.client) {
+        Ok((registration, credential)) => {
+            let response = encode_success_response(
+                metadata,
+                request,
+                &authority.record,
+                &registration,
+                &credential,
+            );
+            drop(credential);
+            response?
+        }
+        Err(InstalledServiceError::AdmissionRejected) => {
+            encode_rejected_response(metadata, request)
+        }
+        Err(error) => return Err(error),
+    };
+    platform::write_response(&mut stream, response, request.deadline).await?;
     Ok(())
 }
 
@@ -341,50 +362,118 @@ fn request_with_metadata(
     root: &Path,
     metadata: AdmissionMetadata,
     client: NamedClient,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<AdmittedRuntimeClient, InstalledServiceError> {
-    let mut stream = platform::connect_blocking(root, &metadata.endpoint_key, timeout)?;
+    let mut stream = platform::connect_blocking(root, &metadata.endpoint_key, deadline)
+        .map_err(|error| reclassify_stale_connect(root, metadata, error))?;
     let mut request_nonce = [0_u8; 16];
     fill_random(&mut request_nonce).map_err(|_error| InstalledServiceError::EntropyUnavailable)?;
     if request_nonce.iter().all(|byte| *byte == 0) {
         return Err(InstalledServiceError::EntropyUnavailable);
     }
-    let deadline_millis = u32::try_from(timeout.as_millis())
+    let deadline_millis = u32::try_from(remaining(deadline)?.as_millis().max(1))
         .map_err(|_error| InstalledServiceError::AdmissionProtocol)?;
     let request = encode_request(metadata, client, request_nonce, deadline_millis)?;
-    stream.write_all(PREFACE)?;
-    stream.write_all(
-        &u32::try_from(request.len())
-            .map_err(|_error| InstalledServiceError::AdmissionProtocol)?
-            .to_be_bytes(),
-    )?;
-    stream.write_all(&request)?;
-    stream.flush()?;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(InstalledServiceError::AdmissionDeadline)?;
+    stream.write_all(PREFACE).map_err(map_admission_io)?;
+    stream
+        .write_all(
+            &u32::try_from(request.len())
+                .map_err(|_error| InstalledServiceError::AdmissionProtocol)?
+                .to_be_bytes(),
+        )
+        .map_err(map_admission_io)?;
+    stream.write_all(&request).map_err(map_admission_io)?;
+    stream.write_all(REQUEST_COMMIT).map_err(map_admission_io)?;
+    platform::finish_request(&mut stream)?;
     let mut frame = read_blocking_frame(&mut stream)?;
-    if Instant::now() >= deadline {
-        return Err(InstalledServiceError::AdmissionDeadline);
-    }
-    let admitted = decode_response(&frame, metadata, client, request_nonce)?;
+    remaining(deadline)?;
+    let response = decode_response(&frame, metadata, client, request_nonce)?;
     frame.zeroize();
-    Ok(admitted)
+    let mut trailing = [0_u8; 1];
+    let trailing_bytes = stream.read(&mut trailing).map_err(map_admission_io)?;
+    if trailing_bytes != 0 {
+        return Err(InstalledServiceError::AdmissionProtocol);
+    }
+    remaining(deadline)?;
+    match response {
+        DecodedAdmissionResponse::Success(admitted) => Ok(admitted),
+        DecodedAdmissionResponse::Rejected => Err(InstalledServiceError::AdmissionRejected),
+    }
+}
+
+fn reclassify_stale_connect(
+    root: &Path,
+    metadata: AdmissionMetadata,
+    error: InstalledServiceError,
+) -> InstalledServiceError {
+    let endpoint_is_gone = matches!(
+        &error,
+        InstalledServiceError::Io(cause)
+            if matches!(
+                cause.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            )
+    );
+    if !endpoint_is_gone {
+        return error;
+    }
+    let metadata_is_exact = match load_metadata_unchecked(root) {
+        Ok(current) => current == metadata,
+        Err(InstalledServiceError::ServiceUnavailable) => false,
+        Err(_) => return error,
+    };
+    match SystemProcessIdentityVerifier.is_current(metadata.process) {
+        Ok(false) => {
+            if metadata_is_exact {
+                let _removed = remove_metadata_if_raw_current(root, metadata);
+            }
+            InstalledServiceError::ServiceUnavailable
+        }
+        Ok(true) | Err(_) => error,
+    }
+}
+
+fn transaction_deadline(timeout: Duration) -> Result<Instant, InstalledServiceError> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(InstalledServiceError::AdmissionDeadline)
+}
+
+pub(super) fn remaining(deadline: Instant) -> Result<Duration, InstalledServiceError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(InstalledServiceError::AdmissionDeadline)
 }
 
 fn read_blocking_frame(
     stream: &mut platform::BlockingStream,
 ) -> Result<Zeroizing<Vec<u8>>, InstalledServiceError> {
     let mut length = [0_u8; 4];
-    stream.read_exact(&mut length)?;
+    stream.read_exact(&mut length).map_err(map_admission_io)?;
     let length = usize::try_from(u32::from_be_bytes(length))
         .map_err(|_error| InstalledServiceError::AdmissionProtocol)?;
     if length == 0 || length > MAXIMUM_FRAME_BYTES {
         return Err(InstalledServiceError::AdmissionProtocol);
     }
     let mut frame = Zeroizing::new(vec![0_u8; length]);
-    stream.read_exact(&mut frame)?;
+    stream.read_exact(&mut frame).map_err(map_admission_io)?;
     Ok(frame)
+}
+
+fn map_admission_io(error: std::io::Error) -> InstalledServiceError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        InstalledServiceError::AdmissionDeadline
+    } else {
+        InstalledServiceError::Io(error)
+    }
 }
 
 fn encode_request(
@@ -446,7 +535,7 @@ fn decode_request(
     })
 }
 
-fn encode_response(
+fn encode_success_response(
     metadata: AdmissionMetadata,
     request: AdmissionRequest,
     record: &RendezvousRecord,
@@ -462,17 +551,14 @@ fn encode_response(
     if credential.is_empty() || credential.len() > MAXIMUM_CREDENTIAL_BYTES {
         return Err(InstalledServiceError::AdmissionRejected);
     }
-    let mut encoded = Zeroizing::new(Vec::with_capacity(
-        RESPONSE_FIXED_BYTES + record.len() + credential.len(),
-    ));
-    encoded.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    encode_runtime_extend(metadata.runtime, &mut encoded);
-    encode_process_extend(metadata.process, &mut encoded);
-    encoded.extend_from_slice(&metadata.endpoint_key);
-    encoded.push(encode_client(request.client));
+    let mut encoded = encode_response_common(
+        metadata,
+        request,
+        RESPONSE_STATUS_SUCCESS,
+        RESPONSE_SUCCESS_FIXED_BYTES + record.len() + credential.len(),
+    );
     encoded.extend_from_slice(registration.client_id().as_uuid().as_bytes());
     encoded.extend_from_slice(&registration.generation().get().to_be_bytes());
-    encoded.extend_from_slice(&request.request_nonce);
     encoded.extend_from_slice(
         &u32::try_from(record.len())
             .map_err(|_error| InstalledServiceError::AdmissionProtocol)?
@@ -488,46 +574,85 @@ fn encode_response(
     Ok(encoded)
 }
 
+fn encode_rejected_response(
+    metadata: AdmissionMetadata,
+    request: AdmissionRequest,
+) -> Zeroizing<Vec<u8>> {
+    encode_response_common(
+        metadata,
+        request,
+        RESPONSE_STATUS_REJECTED,
+        RESPONSE_COMMON_BYTES,
+    )
+}
+
+fn encode_response_common(
+    metadata: AdmissionMetadata,
+    request: AdmissionRequest,
+    status: u8,
+    capacity: usize,
+) -> Zeroizing<Vec<u8>> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(capacity));
+    encoded.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    encode_runtime_extend(metadata.runtime, &mut encoded);
+    encode_process_extend(metadata.process, &mut encoded);
+    encoded.extend_from_slice(&metadata.endpoint_key);
+    encoded.push(encode_client(request.client));
+    encoded.extend_from_slice(&request.request_nonce);
+    encoded.push(status);
+    debug_assert_eq!(encoded.len(), RESPONSE_COMMON_BYTES);
+    encoded
+}
+
 fn decode_response(
     encoded: &[u8],
     metadata: AdmissionMetadata,
     client: NamedClient,
     request_nonce: [u8; 16],
-) -> Result<AdmittedRuntimeClient, InstalledServiceError> {
-    if encoded.len() < RESPONSE_FIXED_BYTES
+) -> Result<DecodedAdmissionResponse, InstalledServiceError> {
+    if encoded.len() < RESPONSE_COMMON_BYTES
         || u16::from_be_bytes([encoded[0], encoded[1]]) != PROTOCOL_VERSION
         || decode_runtime(&encoded[2..42])? != metadata.runtime
         || decode_process(&encoded[42..54])? != metadata.process
         || encoded[54..86] != metadata.endpoint_key
         || decode_client(encoded[86])? != client
-        || encoded[111..127] != request_nonce
+        || encoded[87..103] != request_nonce
     {
         return Err(InstalledServiceError::AdmissionProtocol);
     }
+    match encoded[103] {
+        RESPONSE_STATUS_REJECTED if encoded.len() == RESPONSE_COMMON_BYTES => {
+            return Ok(DecodedAdmissionResponse::Rejected);
+        }
+        RESPONSE_STATUS_REJECTED => return Err(InstalledServiceError::AdmissionProtocol),
+        RESPONSE_STATUS_SUCCESS if encoded.len() >= RESPONSE_SUCCESS_FIXED_BYTES => {}
+        RESPONSE_STATUS_SUCCESS => return Err(InstalledServiceError::AdmissionProtocol),
+        _ => return Err(InstalledServiceError::AdmissionProtocol),
+    }
     let client_id = ClientId::try_from_uuid(
-        Uuid::from_slice(&encoded[87..103])
+        Uuid::from_slice(&encoded[104..120])
             .map_err(|_error| InstalledServiceError::AdmissionProtocol)?,
     )?;
     let generation = CredentialGeneration::try_new(u64::from_be_bytes(
-        encoded[103..111]
+        encoded[120..128]
             .try_into()
             .map_err(|_error| InstalledServiceError::AdmissionProtocol)?,
     ))?;
     let record_len = usize::try_from(u32::from_be_bytes(
-        encoded[127..131]
+        encoded[128..132]
             .try_into()
             .map_err(|_error| InstalledServiceError::AdmissionProtocol)?,
     ))
     .map_err(|_error| InstalledServiceError::AdmissionProtocol)?;
-    let credential_len = usize::from(u16::from_be_bytes([encoded[131], encoded[132]]));
+    let credential_len = usize::from(u16::from_be_bytes([encoded[132], encoded[133]]));
     if credential_len == 0
         || credential_len > MAXIMUM_CREDENTIAL_BYTES
-        || encoded.len() != RESPONSE_FIXED_BYTES + record_len + credential_len
+        || encoded.len() != RESPONSE_SUCCESS_FIXED_BYTES + record_len + credential_len
     {
         return Err(InstalledServiceError::AdmissionProtocol);
     }
     let record = serde_json::from_slice::<RendezvousRecord>(
-        &encoded[RESPONSE_FIXED_BYTES..RESPONSE_FIXED_BYTES + record_len],
+        &encoded[RESPONSE_SUCCESS_FIXED_BYTES..RESPONSE_SUCCESS_FIXED_BYTES + record_len],
     )
     .map_err(|_error| InstalledServiceError::AdmissionProtocol)?;
     if record.runtime() != metadata.runtime
@@ -541,7 +666,7 @@ fn decode_response(
     {
         return Err(InstalledServiceError::AdmissionRejected);
     }
-    let credential_bytes = &encoded[RESPONSE_FIXED_BYTES + record_len..];
+    let credential_bytes = &encoded[RESPONSE_SUCCESS_FIXED_BYTES + record_len..];
     if credential_bytes.len() != 64
         || credential_bytes
             .iter()
@@ -551,12 +676,12 @@ fn decode_response(
     }
     let credential = SecretValue::from_utf8_bytes(credential_bytes.to_vec())
         .map_err(|_error| InstalledServiceError::AdmissionRejected)?;
-    Ok(AdmittedRuntimeClient {
+    Ok(DecodedAdmissionResponse::Success(AdmittedRuntimeClient {
         record,
         client_id,
         generation,
         credential,
-    })
+    }))
 }
 
 fn publish_metadata(root: &Path, metadata: AdmissionMetadata) -> Result<(), InstalledServiceError> {
@@ -571,6 +696,18 @@ fn publish_metadata(root: &Path, metadata: AdmissionMetadata) -> Result<(), Inst
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(InstalledServiceError::AdmissionUnavailable);
+        }
+    }
     file.write_all(&encode_metadata(metadata))?;
     file.sync_all()?;
     #[cfg(windows)]
@@ -580,10 +717,23 @@ fn publish_metadata(root: &Path, metadata: AdmissionMetadata) -> Result<(), Inst
         Err(error) => return Err(error.into()),
     }
     fs::rename(temporary, final_path)?;
+    validate_metadata_file(&root.join(METADATA_FILE))?;
     Ok(())
 }
 
 fn load_metadata(root: &Path) -> Result<AdmissionMetadata, InstalledServiceError> {
+    let metadata = load_metadata_unchecked(root)?;
+    if SystemProcessIdentityVerifier
+        .is_current(metadata.process)
+        .map_err(InstalledServiceError::Rendezvous)?
+    {
+        return Ok(metadata);
+    }
+    let _removed = remove_metadata_if_raw_current(root, metadata);
+    Err(InstalledServiceError::ServiceUnavailable)
+}
+
+fn load_metadata_unchecked(root: &Path) -> Result<AdmissionMetadata, InstalledServiceError> {
     let mut file = OpenOptions::new()
         .read(true)
         .open(root.join(METADATA_FILE))
@@ -594,20 +744,44 @@ fn load_metadata(root: &Path) -> Result<AdmissionMetadata, InstalledServiceError
                 InstalledServiceError::Io(error)
             }
         })?;
-    let file_metadata = file.metadata()?;
-    if !file_metadata.file_type().is_file() || file_metadata.len() != METADATA_BYTES as u64 {
-        return Err(InstalledServiceError::AdmissionProtocol);
-    }
+    validate_metadata(&file.metadata()?)?;
     let mut encoded = [0_u8; METADATA_BYTES];
     file.read_exact(&mut encoded)?;
     decode_metadata(&encoded)
+}
+
+fn validate_metadata_file(path: &Path) -> Result<(), InstalledServiceError> {
+    validate_metadata(&fs::symlink_metadata(path)?)
+}
+
+fn validate_metadata(metadata: &fs::Metadata) -> Result<(), InstalledServiceError> {
+    if !metadata.file_type().is_file() || metadata.len() != METADATA_BYTES as u64 {
+        return Err(InstalledServiceError::AdmissionProtocol);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(InstalledServiceError::AdmissionProtocol);
+        }
+    }
+    Ok(())
 }
 
 fn remove_metadata_if_current(
     root: &Path,
     metadata: AdmissionMetadata,
 ) -> Result<bool, InstalledServiceError> {
-    match load_metadata(root) {
+    remove_metadata_if_raw_current(root, metadata)
+}
+
+fn remove_metadata_if_raw_current(
+    root: &Path,
+    metadata: AdmissionMetadata,
+) -> Result<bool, InstalledServiceError> {
+    match load_metadata_unchecked(root) {
         Ok(current) if current == metadata => {
             fs::remove_file(root.join(METADATA_FILE))?;
             Ok(true)

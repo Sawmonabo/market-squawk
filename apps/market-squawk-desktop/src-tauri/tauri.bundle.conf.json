@@ -8,6 +8,7 @@
     "useLocalToolsDir": true,
     "externalBin": [
       "binaries/market-squawk",
+      "binaries/market-squawk-service",
       "binaries/market-squawk-capture-helper",
       "binaries/market-squawk-onnx-worker"
     ],
