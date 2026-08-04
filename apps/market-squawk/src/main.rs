@@ -6,6 +6,7 @@
 use std::{
     ffi::OsString,
     io::{IsTerminal as _, Read as _},
+    path::Path,
     process::{Command as ProcessCommand, Stdio},
     sync::Arc,
     time::Duration,
@@ -76,6 +77,7 @@ async fn run() -> Result<()> {
     initialize_logging(&cli.log, cli.json_logs)?;
     let output = cli.output;
     let config_file = cli.config.clone();
+    let installation_data_root = cli.installation_data_root.clone();
     let training_release_root = match cli.training_release_root {
         Some(root) => Some(root),
         None => {
@@ -152,7 +154,7 @@ async fn run() -> Result<()> {
         | Command::Operations { .. }
         | Command::Setup { .. }) => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            run_product_command(config, command, output).await?;
+            run_product_command(config, command, output, installation_data_root.as_deref()).await?;
         }
         Command::Service { command } => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
@@ -163,6 +165,7 @@ async fn run() -> Result<()> {
                 &cli.log,
                 cli.json_logs,
                 output,
+                installation_data_root.as_deref(),
             )
             .await?;
         }
@@ -259,7 +262,8 @@ async fn run() -> Result<()> {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             let client = NamedClient::from(client);
             let transport =
-                InstalledServiceConnector::try_new(&config)?.connect_mcp_relay(client)?;
+                installed_service_connector(&config, installation_data_root.as_deref())?
+                    .connect_mcp_relay(client)?;
             let relay = McpStdioRelay::try_new(
                 client,
                 transport,
@@ -397,6 +401,7 @@ async fn run_product_command(
     config: AppConfig,
     command: Command,
     output: OutputFormat,
+    installation_data_root: Option<&Path>,
 ) -> Result<()> {
     let opens_onboarding_portal = matches!(
         &command,
@@ -404,7 +409,7 @@ async fn run_product_command(
             command: SourceCommand::Setup { .. }
         }
     );
-    let connector = InstalledServiceConnector::try_new(&config)?;
+    let connector = installed_service_connector(&config, installation_data_root)?;
     let client = connector.connect(NamedClient::Cli, None)?;
     let result = execute_installed_cli_command(&client, command).await;
     let portal_outcome = match &result {
@@ -435,18 +440,26 @@ async fn run_service_command(
     log: &str,
     json_logs: bool,
     output: OutputFormat,
+    installation_data_root: Option<&Path>,
 ) -> Result<()> {
     let (summary, value) = match command {
-        ServiceCommand::Status => service_status(config).await?,
+        ServiceCommand::Status => service_status(config, installation_data_root).await?,
         ServiceCommand::Start => {
-            start_installed_service(config, config_file, log, json_logs, Duration::from_secs(15))
-                .await?
+            start_installed_service(
+                config,
+                config_file,
+                log,
+                json_logs,
+                Duration::from_secs(15),
+                installation_data_root,
+            )
+            .await?
         }
         ServiceCommand::Bootstrap {
             stdin,
             retry_after_foreground_keyring,
         } => {
-            let connector = InstalledServiceConnector::try_new(config)?;
+            let connector = installed_service_connector(config, installation_data_root)?;
             let status = if retry_after_foreground_keyring {
                 connector.bootstrap_retry_after_foreground_keyring().await?
             } else {
@@ -463,11 +476,26 @@ async fn run_service_command(
     emit_result(output, summary, &value)
 }
 
-async fn service_status(config: &AppConfig) -> Result<(&'static str, serde_json::Value)> {
-    if let Ok(snapshot) = installed_service_snapshot(config).await {
+fn installed_service_connector(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<InstalledServiceConnector> {
+    installation_data_root
+        .map_or_else(
+            || InstalledServiceConnector::try_new(config),
+            |root| InstalledServiceConnector::try_new_at_installation_root(config, root),
+        )
+        .map_err(Into::into)
+}
+
+async fn service_status(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<(&'static str, serde_json::Value)> {
+    if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
         return Ok(("installed service is ready", snapshot));
     }
-    let connector = InstalledServiceConnector::try_new(config)?;
+    let connector = installed_service_connector(config, installation_data_root)?;
     let status = connector.bootstrap_status().await?;
     Ok((
         "installed service requires credential bootstrap",
@@ -502,8 +530,11 @@ fn read_bootstrap_unlock(explicit_stdin: bool) -> Result<SecretValue> {
     SecretValue::new(unlock).context("bootstrap unlock is empty or outside its secret bound")
 }
 
-async fn installed_service_snapshot(config: &AppConfig) -> Result<serde_json::Value> {
-    let connector = InstalledServiceConnector::try_new(config)?;
+async fn installed_service_snapshot(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let connector = installed_service_connector(config, installation_data_root)?;
     let client = connector.connect(NamedClient::Cli, None)?;
     client.probe_ready(CancellationToken::new()).await?;
     let bootstrap = client.bootstrap(CancellationToken::new()).await?;
@@ -519,8 +550,9 @@ async fn start_installed_service(
     log: &str,
     json_logs: bool,
     readiness_timeout: Duration,
+    installation_data_root: Option<&Path>,
 ) -> Result<(&'static str, serde_json::Value)> {
-    if let Ok(snapshot) = installed_service_snapshot(config).await {
+    if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
         return Ok(("installed service was already ready", snapshot));
     }
 
@@ -542,6 +574,9 @@ async fn start_installed_service(
             .arg("--training-release-root")
             .arg(training_release_root);
     }
+    if let Some(root) = installation_data_root {
+        command.arg("--installation-data-root").arg(root);
+    }
     if json_logs {
         command.arg("--json-logs");
     }
@@ -552,10 +587,10 @@ async fn start_installed_service(
         .checked_add(readiness_timeout)
         .ok_or_else(|| anyhow!("installed-service readiness deadline overflow"))?;
     loop {
-        if let Ok(snapshot) = installed_service_snapshot(config).await {
+        if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
             return Ok(("installed service started", snapshot));
         }
-        let connector = InstalledServiceConnector::try_new(config)?;
+        let connector = installed_service_connector(config, installation_data_root)?;
         if let Ok(status) = connector.bootstrap_status().await {
             return Ok((
                 "installed service started and requires credential bootstrap",

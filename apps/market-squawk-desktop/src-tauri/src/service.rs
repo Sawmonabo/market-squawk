@@ -66,9 +66,14 @@ pub(crate) enum DesktopServiceError {
 pub(crate) async fn connect_or_start(
     config: &AppConfig,
     config_path: Option<&Path>,
+    installation_data_root: Option<&Path>,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
     let connector = Arc::new(
-        InstalledServiceConnector::try_new(config)
+        installation_data_root
+            .map_or_else(
+                || InstalledServiceConnector::try_new(config),
+                |root| InstalledServiceConnector::try_new_at_installation_root(config, root),
+            )
             .map_err(|_error| DesktopServiceError::Discovery)?,
     );
     match connect(&connector).await {
@@ -96,6 +101,9 @@ pub(crate) async fn connect_or_start(
     }
     if let Some(path) = config.training_release_root() {
         command.arg("--training-release-root").arg(path);
+    }
+    if let Some(root) = installation_data_root {
+        command.arg("--installation-data-root").arg(root);
     }
     let mut child = command.spawn().map_err(DesktopServiceError::Launch)?;
     let deadline = Instant::now()

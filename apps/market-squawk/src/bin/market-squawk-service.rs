@@ -3,7 +3,12 @@
 // enabled because this allowance is restricted to debug-assertion builds.
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -27,6 +32,9 @@ struct ServiceArguments {
     /// Local Market Squawk data root.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Explicit installed-service authority root for isolated verification.
+    #[arg(long, hide = true)]
+    installation_data_root: Option<PathBuf>,
     /// Explicit local configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -89,8 +97,20 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     } else {
         TerminalLogFormat::Human
     };
-    let mut logging = InstalledServiceLogging::install(&arguments.log, terminal_format)?;
-    let result = run_installed_service(config, logging.store()).await;
+    let mut logging = match arguments.installation_data_root.as_deref() {
+        Some(root) => InstalledServiceLogging::install_at_installation_root(
+            &arguments.log,
+            terminal_format,
+            root,
+        )?,
+        None => InstalledServiceLogging::install(&arguments.log, terminal_format)?,
+    };
+    let result = run_installed_service(
+        config,
+        logging.store(),
+        arguments.installation_data_root.as_deref(),
+    )
+    .await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
         if evidence.accepted == evidence.persisted
             && evidence.dropped_overflow == 0
@@ -115,9 +135,16 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
 async fn run_installed_service(
     config: AppConfig,
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
+    installation_data_root: Option<&Path>,
 ) -> Result<InstalledServiceRunOutcome> {
     let mut termination = TerminationSignals::install()?;
-    let service = InstalledService::start_with_logging_store(config, logs).await?;
+    let service = match installation_data_root {
+        Some(root) => {
+            InstalledService::start_with_logging_store_at_installation_root(config, root, logs)
+                .await?
+        }
+        None => InstalledService::start_with_logging_store(config, logs).await?,
+    };
     let cancellation = CancellationToken::new();
     let mut serving = Box::pin(service.run(cancellation.clone()));
     tokio::select! {

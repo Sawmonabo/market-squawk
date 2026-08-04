@@ -62,6 +62,9 @@ struct DesktopArgs {
     /// Local Market Squawk data root.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Explicit installed-service authority root for isolated verification.
+    #[arg(long, hide = true)]
+    installation_data_root: Option<PathBuf>,
     /// Absolute verified Python training-release root.
     #[arg(long)]
     training_release_root: Option<PathBuf>,
@@ -72,7 +75,13 @@ struct DesktopArgs {
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["config", "data_dir", "training_release_root", "stdio_mcp"]
+        conflicts_with_all = [
+            "config",
+            "data_dir",
+            "installation_data_root",
+            "training_release_root",
+            "stdio_mcp"
+        ]
     )]
     native_uninstall: bool,
 }
@@ -176,6 +185,16 @@ fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             }
         })
         .transpose()?;
+    let installation_data_root = args
+        .installation_data_root
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(DesktopStartupError::McpTransportUnavailable)
+            }
+        })
+        .transpose()?;
 
     let mut command = std::process::Command::new(launcher.cli_program);
     if let Some(path) = config_path {
@@ -184,6 +203,9 @@ fn run_stdio_mcp(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     command.arg("--data-dir").arg(data_directory);
     if let Some(path) = training_release_root {
         command.arg("--training-release-root").arg(path);
+    }
+    if let Some(root) = installation_data_root {
+        command.arg("--installation-data-root").arg(root);
     }
     command.arg("mcp").arg("serve");
     let source = command.exec();
@@ -196,6 +218,7 @@ fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 }
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
+    let installation_data_root = args.installation_data_root.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -256,8 +279,11 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         )
         .with_data_directory_default(desktop_data_directory),
     )?;
-    let service =
-        tauri::async_runtime::block_on(service::connect_or_start(&config, config_path.as_deref()))?;
+    let service = tauri::async_runtime::block_on(service::connect_or_start(
+        &config,
+        config_path.as_deref(),
+        installation_data_root.as_deref(),
+    ))?;
     let relay_program = mcp_relay_program(&installation.root)?;
     let bootstrap_state = DesktopBootstrapState::compose(
         app.handle(),

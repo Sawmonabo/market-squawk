@@ -17,6 +17,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<PathBuf>,
 
+    /// Explicit installed-service authority root for isolated verification.
+    #[arg(long, global = true, hide = true)]
+    pub installation_data_root: Option<PathBuf>,
+
     /// Explicit local configuration file.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
