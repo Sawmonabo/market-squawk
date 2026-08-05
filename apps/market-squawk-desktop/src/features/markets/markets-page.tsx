@@ -8,6 +8,7 @@ import {
   RefreshCw,
   ShieldCheck,
 } from "lucide-react"
+import { useSearchParams } from "react-router-dom"
 
 import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
@@ -16,6 +17,11 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
+
+import {
+  instrumentLookupDetailSchema,
+  lookupResultSchema,
+} from "../lookup/schemas"
 
 import {
   type BookLevel,
@@ -57,6 +63,8 @@ function ReadyMarketsPage({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedInstrumentId = validInstrumentId(searchParams.get("instrumentId"))
   const snapshot = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
@@ -77,14 +85,44 @@ function ReadyMarketsPage({
   })
   const evidenceRead = parseRead(() => marketEvidence(snapshot.data, quality.data))
   const evidence = evidenceRead.value ?? []
-  const instrumentIds = [...new Set(evidence.map((row) => row.instrumentId))]
-  const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  const instrumentIds = [
+    ...new Set([
+      ...(requestedInstrumentId ? [requestedInstrumentId] : []),
+      ...evidence.map((row) => row.instrumentId),
+    ]),
+  ]
+  const [selectedId, setSelectedId] =
+    React.useState<string | null>(requestedInstrumentId)
+  React.useEffect(() => {
+    if (requestedInstrumentId) setSelectedId(requestedInstrumentId)
+  }, [requestedInstrumentId])
   const selectedInstrument =
     instrumentIds.find((instrumentId) => instrumentId === selectedId) ??
     instrumentIds[0] ??
     null
   const operationNames = new Set(
     bootstrap.operations.map((operation) => operation.name),
+  )
+  const identity = useQuery({
+    queryKey: productKeys.operation(
+      bootstrap.runtime,
+      "Analysis",
+      "Analysis.Lookup",
+      { instrumentId: selectedInstrument },
+    ),
+    enabled:
+      selectedInstrument !== null && operationNames.has("Analysis.Lookup"),
+    queryFn: () =>
+      transport.query({
+        query: "lookup",
+        text: requiredInstrument(selectedInstrument),
+        categories: ["instrument"],
+      }),
+    staleTime: 30_000,
+  })
+  const selectedInstrumentLabel = lookupInstrumentLabel(
+    identity.data,
+    selectedInstrument,
   )
   const tradesAvailable = operationNames.has("Market.GetTrades")
   const quotesAvailable = operationNames.has("Market.GetQuotes")
@@ -175,6 +213,11 @@ function ReadyMarketsPage({
     ])
   }
 
+  const selectInstrument = (instrumentId: string) => {
+    setSelectedId(instrumentId)
+    setSearchParams({ instrumentId }, { replace: true })
+  }
+
   return (
     <PageFrame
       action={
@@ -195,7 +238,7 @@ function ReadyMarketsPage({
         />
       ) : evidence.length === 0 && (snapshot.isLoading || quality.isLoading) ? (
         <MarketGridLoading />
-      ) : evidence.length === 0 ? (
+      ) : evidence.length === 0 && selectedInstrument === null ? (
         <EmptyState
           title="No active market observations"
           detail="Connect and start a supported market source. Market Squawk will only show a market as current when the installed service returns timestamped runtime evidence."
@@ -218,11 +261,13 @@ function ReadyMarketsPage({
               id="market-instrument"
               className="mt-2 h-9 w-full max-w-xl rounded-md border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={selectedInstrument ?? ""}
-              onChange={(event) => setSelectedId(event.target.value)}
+              onChange={(event) => selectInstrument(event.target.value)}
             >
               {instrumentIds.map((instrumentId) => (
                 <option key={instrumentId} value={instrumentId}>
-                  {instrumentId}
+                  {instrumentId === selectedInstrument && selectedInstrumentLabel
+                    ? selectedInstrumentLabel
+                    : instrumentId}
                 </option>
               ))}
             </select>
@@ -231,11 +276,19 @@ function ReadyMarketsPage({
               in authoritative ticks and lots because no display scale is present in this contract.
             </p>
           </section>
+          {selectedInstrument &&
+          !evidence.some((row) => row.instrumentId === selectedInstrument) ? (
+            <Notice text="This instrument is selected from the reference catalog, but no active live market observation is available for it. The instrument-scoped reads below remain bound to this exact identity." />
+          ) : null}
           <div className="mt-4 grid gap-4 xl:grid-cols-2">
             {evidence
               .filter((row) => row.instrumentId === selectedInstrument)
               .map((row) => (
-              <MarketCard key={row.key} evidence={row} />
+                <MarketCard
+                  key={row.key}
+                  evidence={row}
+                  instrumentLabel={selectedInstrumentLabel}
+                />
               ))}
           </div>
           {selectedInstrument ? (
@@ -260,7 +313,22 @@ function ReadyMarketsPage({
   )
 }
 
-function MarketCard({ evidence }: { evidence: ReturnType<typeof marketEvidence>[number] }) {
+function validInstrumentId(value: string | null): string | null {
+  return value &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+    ? value
+    : null
+}
+
+function MarketCard({
+  evidence,
+  instrumentLabel,
+}: {
+  evidence: ReturnType<typeof marketEvidence>[number]
+  instrumentLabel: string | null
+}) {
   const integrityIssues = [
     evidence.snapshotInitialized === false ? "Snapshot not initialized" : null,
     evidence.generationCurrent === false ? "Connection generation is not current" : null,
@@ -274,7 +342,14 @@ function MarketCard({ evidence }: { evidence: ReturnType<typeof marketEvidence>[
           <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
             {evidence.venueId} · {evidence.sourceId}
           </p>
-          <h2 className="mt-2 truncate text-lg font-semibold">{evidence.instrumentId}</h2>
+          <h2 className="mt-2 truncate text-lg font-semibold">
+            {instrumentLabel ?? evidence.instrumentId}
+          </h2>
+          {instrumentLabel ? (
+            <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
+              {evidence.instrumentId}
+            </p>
+          ) : null}
         </div>
         <EvidenceBadge
           label={qualityName(evidence.currentQuality)}
@@ -721,6 +796,24 @@ function boundary(value: ReturnType<typeof resultState>) {
 function requiredInstrument(value: string | null) {
   if (!value) throw new Error("Select a market instrument first.")
   return value
+}
+
+function lookupInstrumentLabel(
+  result: ApplicationResult | undefined,
+  instrumentId: string | null,
+): string | null {
+  if (!result || !instrumentId) return null
+  const lookup = lookupResultSchema.safeParse(result.data)
+  if (!lookup.success) return null
+  const match = lookup.data.matches.find(
+    (candidate) =>
+      candidate.category === "instrument" && candidate.id === instrumentId,
+  )
+  if (!match) return null
+  const detail = instrumentLookupDetailSchema.safeParse(match.detail)
+  return detail.success
+    ? detail.data.companyName ?? detail.data.displayName
+    : match.label
 }
 
 function levelSummary(value: BookLevel | null) {

@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::{
     CatalogAuthority, CatalogError, CatalogLimit, FairValueCatalogCommit,
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogSnapshot,
-    FairValueCatalogSnapshotLimits, OnboardingAppendOutcome, OnboardingReservation,
-    OnboardingReservationRequest, PinnedInstrumentDefinitions, ResumedProviderOnboarding,
+    FairValueCatalogSnapshotLimits, InstrumentSearchPage, OnboardingAppendOutcome,
+    OnboardingReservation, OnboardingReservationRequest, PinnedInstrumentDefinitions,
+    ResumedProviderOnboarding,
 };
 
 /// Cloneable point-in-time instrument-definition reader without general catalog authority.
@@ -97,6 +98,23 @@ impl InstrumentDefinitionReadCapability {
         }
         check_read(deadline, cancellation)?;
         Ok(definitions)
+    }
+
+    /// Searches the canonical reference master without exposing general catalog authority.
+    ///
+    /// Results include only digest-verified current definitions and matching symbol history. The
+    /// catalog excludes quarantined or rights-restricted identity assertions before returning the
+    /// page.
+    pub fn search(
+        &self,
+        query: &str,
+        maximum_instruments: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentSearchPage, CatalogError> {
+        let limit = CatalogLimit::new(maximum_instruments)?;
+        self.lock()?
+            .search_instruments(query, limit, deadline, cancellation)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {

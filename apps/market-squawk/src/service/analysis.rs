@@ -2,7 +2,14 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use market_squawk_data::{AnalyticalReadCapability, AnalyticalReadLimit};
+use market_squawk_data::{
+    AnalyticalReadCapability, AnalyticalReadLimit, CatalogError,
+    InstrumentDefinitionReadCapability, InstrumentSearchMatch,
+};
+use market_squawk_domain::{
+    AssignmentVerification, ExternalIdentifier, IdentifierEntitlement, InstrumentDefinition,
+    SymbolIdentityRecord,
+};
 use market_squawk_jobs::{JobListPageLimit, SqliteJobRepository};
 use market_squawk_services::{
     RequestContext, ServiceCapabilities, ServiceError, ToolResultMetadata, TypedToolRequest,
@@ -25,6 +32,7 @@ const LOOKUP: &str = "Analysis.Lookup";
 const OVERVIEW: &str = "Analysis.GetDecisionOverview";
 const MAXIMUM_LOOKUP_ITEMS: usize = 64;
 const MAXIMUM_QUERY_BYTES: usize = 256;
+const MAXIMUM_INSTRUMENT_MATCH_REASONS: usize = 8;
 const ALL_CATEGORIES: [&str; 9] = [
     "command",
     "dataset",
@@ -42,6 +50,7 @@ pub(super) struct InstalledAnalysisOperations {
     capabilities: ServiceCapabilities,
     providers: Arc<ProviderOnboardingService>,
     analytical: AnalyticalReadCapability,
+    instrument_definitions: InstrumentDefinitionReadCapability,
     decisions: Arc<DecisionApplication>,
     jobs: JobApplication<SqliteJobRepository>,
 }
@@ -52,6 +61,7 @@ impl InstalledAnalysisOperations {
             capabilities: product.application().capabilities(),
             providers: product.provider_onboarding(),
             analytical: product.research().analytical_reader(),
+            instrument_definitions: product.research().instrument_definitions(),
             decisions: product.decisions(),
             jobs: JobApplication::new(jobs.repository(), jobs.authority()),
         }
@@ -102,6 +112,7 @@ impl InstalledAnalysisOperations {
         }
         let mut matches = Vec::new();
         let mut status = Vec::new();
+        let mut truncated = false;
 
         for category in categories {
             ensure_live(context)?;
@@ -172,6 +183,27 @@ impl InstalledAnalysisOperations {
                     }
                     status.push(available("dataset"));
                 }
+                "instrument" => {
+                    let remaining = maximum.saturating_sub(matches.len());
+                    if remaining == 0 {
+                        truncated = true;
+                    } else {
+                        let page = self
+                            .instrument_definitions
+                            .search(
+                                &query,
+                                remaining,
+                                context.deadline(),
+                                context.cancellation(),
+                            )
+                            .map_err(map_instrument_search)?;
+                        truncated |= page.has_more();
+                        for instrument in page.matches() {
+                            matches.push(instrument_lookup_match(instrument, &query)?);
+                        }
+                    }
+                    status.push(available("instrument"));
+                }
                 "screen" => {
                     for screen in self
                         .decisions
@@ -225,7 +257,7 @@ impl InstalledAnalysisOperations {
                 })),
             }
         }
-        let truncated = matches.len() == maximum;
+        truncated |= matches.len() == maximum;
         let count = matches.len();
         Ok((
             json!({
@@ -277,7 +309,6 @@ impl InstalledAnalysisOperations {
                     "count": self.capabilities.tools().len()
                 },
                 "unavailable": [
-                    {"category": "instrument", "reason": "no bounded all-instrument index is available"},
                     {"category": "model", "reason": "model bundles remain available through Model.ListBundles"},
                     {"category": "portfolio", "reason": "accounts remain available through Portfolio.ListAccounts"},
                     {"category": "target", "reason": "targets require a known target-series identity"}
@@ -312,6 +343,7 @@ impl std::fmt::Debug for InstalledAnalysisOperations {
             .field("capabilities", &self.capabilities)
             .field("providers", &"[PROVIDER AUTHORITY]")
             .field("analytical", &self.analytical)
+            .field("instrument_definitions", &self.instrument_definitions)
             .field("decisions", &"[DECISION AUTHORITY]")
             .field("jobs", &"[JOB AUTHORITY]")
             .finish()
@@ -379,4 +411,216 @@ fn map_job(error: JobApplicationError) -> ServiceError {
 
 fn map_decision(_error: DecisionApplicationError) -> ServiceError {
     ServiceError::Unavailable
+}
+
+fn map_instrument_search(error: CatalogError) -> ServiceError {
+    match error {
+        CatalogError::InstrumentDefinitionReadCancelled => ServiceError::Cancelled,
+        CatalogError::InstrumentDefinitionReadDeadlineExceeded => ServiceError::DeadlineExceeded,
+        CatalogError::InvalidLimit | CatalogError::InvalidRecord => ServiceError::InvalidRequest,
+        _ => ServiceError::Unavailable,
+    }
+}
+
+fn instrument_lookup_match(
+    search_match: &InstrumentSearchMatch,
+    query: &str,
+) -> Result<Value, ServiceError> {
+    let definition = search_match.definition();
+    let label = instrument_label(definition);
+    let (reasons, reasons_truncated) = instrument_match_reasons(search_match, query)?;
+    if reasons.is_empty() {
+        return Err(ServiceError::Internal);
+    }
+    Ok(json!({
+        "category": "instrument",
+        "id": definition.instrument_id().to_string(),
+        "label": label,
+        "destination": {
+            "kind": "market_instrument",
+            "instrumentId": definition.instrument_id().to_string()
+        },
+        "detail": {
+            "displayName": label,
+            "companyName": null,
+            "assetClass": encode(definition.asset_class())?,
+            "tradingStatus": encode(definition.trading_status())?,
+            "quoteCurrency": definition.quote_currency().to_string(),
+            "definitionRevision": definition.definition_revision().get(),
+            "definitionObservedAt": encode(search_match.definition_observed_at())?,
+            "venueMappings": encode(definition.venue_mappings())?,
+            "matchReasons": reasons,
+            "matchReasonsTruncated": reasons_truncated || search_match.matching_symbols_truncated()
+        }
+    }))
+}
+
+fn instrument_label(definition: &InstrumentDefinition) -> String {
+    definition
+        .venue_mappings()
+        .iter()
+        .min_by_key(|mapping| (mapping.venue_symbol().as_str(), mapping.venue_id().as_str()))
+        .map(|mapping| {
+            format!(
+                "{} · {}",
+                mapping.venue_symbol().as_str(),
+                mapping.venue_id().as_str()
+            )
+        })
+        .unwrap_or_else(|| definition.instrument_id().to_string())
+}
+
+fn instrument_match_reasons(
+    search_match: &InstrumentSearchMatch,
+    query: &str,
+) -> Result<(Vec<Value>, bool), ServiceError> {
+    let definition = search_match.definition();
+    let mut reasons = Vec::new();
+    let mut truncated = false;
+    let instrument_id = definition.instrument_id().to_string();
+    if matches_query(&instrument_id, query) {
+        reasons.push(json!({
+            "kind": "stable_instrument_id",
+            "label": "Stable instrument ID",
+            "value": instrument_id,
+            "current": true,
+            "evidence": {
+                "definitionRevision": definition.definition_revision().get(),
+                "observedAt": encode(search_match.definition_observed_at())?
+            }
+        }));
+    }
+    for mapping in definition.venue_mappings() {
+        if matches_query(mapping.venue_symbol().as_str(), query)
+            || matches_query(mapping.venue_id().as_str(), query)
+        {
+            if reasons.len() == MAXIMUM_INSTRUMENT_MATCH_REASONS {
+                truncated = true;
+                break;
+            }
+            reasons.push(json!({
+                "kind": "current_venue_symbol",
+                "label": "Current market symbol",
+                "value": mapping.venue_symbol().as_str(),
+                "venueId": mapping.venue_id().as_str(),
+                "current": true,
+                "evidence": {
+                    "definitionRevision": definition.definition_revision().get(),
+                    "observedAt": encode(search_match.definition_observed_at())?
+                }
+            }));
+        }
+    }
+    for symbol in search_match.matching_symbols() {
+        if !is_current_symbol(definition, symbol) {
+            if reasons.len() == MAXIMUM_INSTRUMENT_MATCH_REASONS {
+                truncated = true;
+                break;
+            }
+            reasons.push(json!({
+                "kind": "historical_venue_symbol",
+                "label": "Historical market symbol",
+                "value": symbol.venue_symbol().as_str(),
+                "venueId": symbol.venue_id().as_str(),
+                "current": false,
+                "evidence": {
+                    "validFrom": encode(symbol.validity().starts_at())?,
+                    "validUntil": encode(symbol.validity().ends_at())?
+                }
+            }));
+        }
+    }
+    for record in definition.identifiers() {
+        if record.assignment_verification() == AssignmentVerification::VerifiedUnassigned
+            || record.rights_policy().entitlement() == IdentifierEntitlement::UnknownOrRestricted
+        {
+            continue;
+        }
+        let identifier = identifier_search_value(record.identifier())?;
+        let kind = identifier_kind(record.identifier())?;
+        if matches_query(&identifier, query) || matches_query(&kind, query) {
+            if reasons.len() == MAXIMUM_INSTRUMENT_MATCH_REASONS {
+                truncated = true;
+                break;
+            }
+            reasons.push(json!({
+                "kind": "external_identifier",
+                "label": identifier_label(record.identifier()),
+                "value": record.identifier().to_string(),
+                "current": record.validity().ends_at().is_none(),
+                "evidence": {
+                    "identifierKind": kind,
+                    "assignmentVerification": encode(record.assignment_verification())?,
+                    "syntaxVerification": encode(record.syntax_verification())?,
+                    "sourceId": record.source_id().as_str(),
+                    "sourceEvidence": encode(record.source_evidence())?,
+                    "sourceTimestamp": encode(record.source_timestamp())?,
+                    "observedAt": encode(record.observed_at())?,
+                    "validFrom": encode(record.validity().starts_at())?,
+                    "validUntil": encode(record.validity().ends_at())?,
+                    "rightsPolicy": encode(record.rights_policy())?
+                }
+            }));
+        }
+    }
+    for record in definition.provider_identities() {
+        if matches_query(record.provider_instrument_id().as_str(), query)
+            || matches_query(record.source_id().as_str(), query)
+        {
+            if reasons.len() == MAXIMUM_INSTRUMENT_MATCH_REASONS {
+                truncated = true;
+                break;
+            }
+            reasons.push(json!({
+                "kind": "accepted_provider_identity",
+                "label": "Provider instrument ID",
+                "value": record.provider_instrument_id().as_str(),
+                "sourceId": record.source_id().as_str(),
+                "current": record.validity().ends_at().is_none(),
+                "evidence": encode(record)?
+            }));
+        }
+    }
+    Ok((reasons, truncated))
+}
+
+fn is_current_symbol(definition: &InstrumentDefinition, symbol: &SymbolIdentityRecord) -> bool {
+    definition.venue_mappings().iter().any(|mapping| {
+        mapping.venue_id() == symbol.venue_id() && mapping.venue_symbol() == symbol.venue_symbol()
+    })
+}
+
+fn matches_query(value: &str, query: &str) -> bool {
+    value.to_ascii_lowercase().contains(query)
+}
+
+fn identifier_search_value(identifier: &ExternalIdentifier) -> Result<String, ServiceError> {
+    let value = encode(identifier)?;
+    Ok(value
+        .get("value")
+        .map(Value::to_string)
+        .unwrap_or_default()
+        .to_ascii_lowercase())
+}
+
+fn identifier_kind(identifier: &ExternalIdentifier) -> Result<String, ServiceError> {
+    encode(identifier)?
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(ServiceError::Internal)
+}
+
+const fn identifier_label(identifier: &ExternalIdentifier) -> &'static str {
+    match identifier {
+        ExternalIdentifier::Ticker(_) => "Ticker",
+        ExternalIdentifier::Cusip(_) => "CUSIP",
+        ExternalIdentifier::Isin(_) => "ISIN",
+        ExternalIdentifier::Sedol(_) => "SEDOL",
+        ExternalIdentifier::Figi(_) => "FIGI",
+        ExternalIdentifier::OccOption(_) => "OCC option identity",
+        ExternalIdentifier::Futures(_) => "Futures identity",
+        ExternalIdentifier::CryptoPair(_) => "Crypto pair",
+        ExternalIdentifier::ChainAddress(_) => "Chain address",
+    }
 }

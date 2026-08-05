@@ -2,6 +2,7 @@ import * as React from "react"
 import {
   ArrowRight,
   BriefcaseBusiness,
+  ChartNoAxesCombined,
   Database,
   Gauge,
   Search,
@@ -17,6 +18,7 @@ import type { ProductTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
+  instrumentLookupDetailSchema,
   lookupCategories,
   type LookupCategory,
   type LookupMatch,
@@ -69,7 +71,7 @@ export function LookupSurface({
           value={text}
           maxLength={256}
           onChange={(event) => setText(event.target.value)}
-          placeholder="Search sources, datasets, screens, jobs, or actions…"
+          placeholder="Search a ticker, market, identifier, source, or research item…"
           aria-label="Search your Market Squawk workspace"
           className="h-11 pl-10"
         />
@@ -100,7 +102,7 @@ export function LookupSurface({
       <LookupResults
         state={state}
         query={text.trim()}
-        onOpen={(match) => navigate(routeFor(match))}
+        onOpen={(match) => navigate(lookupRoute(match))}
       />
     </div>
   )
@@ -121,8 +123,8 @@ function LookupResults({
         <Gauge className="mx-auto size-5 text-primary" aria-hidden="true" />
         <p className="mt-3 text-sm font-medium">Find something in your workspace</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Enter at least two characters. Lookup only searches bounded local indexes and never runs
-          arbitrary SQL or an AI prompt.
+          Enter at least two characters, such as a ticker, market, FIGI, dataset, or saved screen.
+          Every instrument result explains why it matched.
         </p>
       </div>
     )
@@ -155,8 +157,8 @@ function LookupResults({
       <div className="rounded-xl border border-border bg-card/25 p-5">
         <p className="text-sm font-medium">No matches for “{query}”</p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          Try an exact source, dataset, screen, job, or operation name. Categories without a
-          bounded local index are listed below rather than guessed.
+          Try a ticker, venue, external identifier, source, dataset, screen, job, or action name.
+          Categories without a safe local index are listed below.
         </p>
         <UnavailableCategories categories={unavailable} />
       </div>
@@ -239,9 +241,11 @@ function LookupIcon({ category }: { category: LookupCategory }) {
       ? ServerCog
       : category === "dataset"
         ? Database
-        : category === "portfolio" || category === "target"
-          ? BriefcaseBusiness
-          : Settings2
+        : category === "instrument"
+          ? ChartNoAxesCombined
+          : category === "portfolio" || category === "target"
+            ? BriefcaseBusiness
+            : Settings2
   return (
     <span className="rounded-md border border-border bg-background/70 p-2">
       <Icon className="size-4 text-primary" aria-hidden="true" />
@@ -250,6 +254,10 @@ function LookupIcon({ category }: { category: LookupCategory }) {
 }
 
 function friendlyLabel(match: LookupMatch) {
+  if (match.category === "instrument") {
+    const parsed = instrumentLookupDetailSchema.safeParse(match.detail)
+    if (parsed.success) return parsed.data.companyName ?? parsed.data.displayName
+  }
   if (match.category === "provider" && typeof match.detail.display_name === "string") {
     return match.detail.display_name
   }
@@ -258,6 +266,16 @@ function friendlyLabel(match: LookupMatch) {
 
 function detailFor(match: LookupMatch) {
   const detail = match.detail
+  if (match.category === "instrument") {
+    const parsed = instrumentLookupDetailSchema.safeParse(detail)
+    if (parsed.success) {
+      const reason = parsed.data.matchReasons[0]
+      const matched = reason
+        ? `${reason.label}: ${reason.value}${reason.venueId ? ` · ${reason.venueId}` : ""}`
+        : match.id
+      return `${matched} · ${parsed.data.assetClass.replaceAll("_", " ")} · ${parsed.data.quoteCurrency}`
+    }
+  }
   if (match.category === "provider") {
     return [detail.coverage, detail.quality_ceiling].filter(isText).join(" · ") || match.id
   }
@@ -277,7 +295,10 @@ function detailFor(match: LookupMatch) {
   return match.id
 }
 
-function routeFor(match: LookupMatch) {
+export function lookupRoute(match: LookupMatch) {
+  if (match.destination?.kind === "market_instrument") {
+    return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
+  }
   if (match.category === "provider") return "/sources"
   if (match.category === "dataset") return "/research"
   if (match.category === "screen") return "/decisions"

@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
@@ -25,6 +25,7 @@ use market_squawk_sources::{
     RatePolicyDescriptor, RightsAdmissionState, SetupMode, SourceCapabilities, SourceClass,
     SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
+use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -114,6 +115,19 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
             Some(Timestamp::from_unix_nanos(80)),
         )?,
     ))?;
+    let search = catalog.search_instruments(
+        "msq",
+        CatalogLimit::new(8)?,
+        Instant::now() + Duration::from_secs(1),
+        &CancellationToken::new(),
+    )?;
+    assert!(!search.has_more());
+    assert_eq!(search.matches().len(), 1);
+    assert_eq!(
+        search.matches()[0].definition().instrument_id(),
+        instrument.instrument_id()
+    );
+    assert_eq!(search.matches()[0].matching_symbols().len(), 1);
     catalog.put_lifecycle(&LifecycleTransition::new(
         instrument.instrument_id(),
         Timestamp::from_unix_nanos(80),

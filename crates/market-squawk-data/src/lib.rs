@@ -59,11 +59,12 @@ pub use catalog::{
     FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
     FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
     FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
-    IngestReservation, IngestRunRecord, IngestRunState, OnboardingAppendOutcome,
-    OnboardingReservation, OnboardingReservationRequest, PinnedInstrumentDefinitions,
-    ProviderOnboardingDiagnostic, PublishedIngest, QueryArtifactReservation,
-    QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle, ResumedIngest,
-    ResumedProviderOnboarding, SourceCursor, StoredObservedRevision,
+    IngestReservation, IngestRunRecord, IngestRunState, InstrumentSearchMatch,
+    InstrumentSearchPage, OnboardingAppendOutcome, OnboardingReservation,
+    OnboardingReservationRequest, PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic,
+    PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
+    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
+    StoredObservedRevision,
 };
 pub use catalog_capabilities::{
     FairValueCatalogCapability, InstrumentDefinitionReadCapability, OnboardingCatalogCapability,

@@ -829,7 +829,7 @@ fn pinned_definition_identity(
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
-fn deserialize_verified<T: DeserializeOwned>(
+pub(super) fn deserialize_verified<T: DeserializeOwned>(
     value: &str,
     stored_digest: &[u8],
     budget: &mut ResultBudget,

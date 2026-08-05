@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest"
 import { App } from "@/app/app"
 import marketSquawkMarkSvg from "@/assets/market-squawk-mark.svg?raw"
 import { CredentialField } from "@/components/setup/credential-field"
+import { lookupRoute } from "@/features/lookup/lookup-surface"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -235,6 +236,19 @@ function datasetRead(
 }
 
 describe("Market Squawk desktop boundary", () => {
+  it("keeps an instrument lookup bound to its exact Markets context", () => {
+    const instrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
+    expect(
+      lookupRoute({
+        category: "instrument",
+        id: instrumentId,
+        label: "MSQ · nasdaq",
+        detail: {},
+        destination: { kind: "market_instrument", instrumentId },
+      }),
+    ).toBe(`/markets?instrumentId=${instrumentId}`)
+  })
+
   it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {
     const user = userEvent.setup()
     let ready = false

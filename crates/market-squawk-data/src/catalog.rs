@@ -13,6 +13,7 @@ mod query_artifacts;
 mod records;
 mod restore_logical;
 mod runs;
+mod search;
 mod storage;
 mod types;
 
@@ -57,6 +58,7 @@ pub use query_artifacts::{
 };
 pub(crate) use restore_logical::RestoreCatalogBaseline;
 pub use runs::{CatalogAuthority, ResumedIngest};
+pub use search::{InstrumentSearchMatch, InstrumentSearchPage};
 
 impl Catalog {
     /// Opens, hardens, migrates, and verifies a local SQLite catalog.
