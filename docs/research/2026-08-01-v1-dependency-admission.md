@@ -6,11 +6,12 @@
 | --- | --- |
 | Document type | Implementation dependency and platform admission record |
 | Audience | Runtime, MCP, desktop, modeling, installer, security, and release owners |
-| Status | Task 0 decision baseline with Task 7 Python artifacts and Task 14 desktop dependencies admitted; release approval remains pending |
+| Status | Dependency baseline; the 2026-08-04 service-lifecycle remediation is a candidate pending frozen exact-head and four-platform proof |
 | Research date | 2026-08-01 |
-| Last substantive review | 2026-08-02 |
+| Last substantive review | 2026-08-04 |
 | Audited commit | `f43da3aa5cbd887a35c9ef25c748b722c9d5c028` |
 | Audited tree | `7387a1db499cf3fc6afb58792a28adfb7e5e4d84` |
+| Service candidate base | `9800ca4f46d126fc9bfec3a91e295a1a36c391ce`; refresh this row to the frozen implementation commit and tree before approval |
 | Governing design | [V1 installed-product design](../superpowers/specs/2026-08-01-market-squawk-v1-installed-product-experience-design.md) |
 | Implementation plan | [V1 implementation plan](../superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md) |
 
@@ -27,6 +28,7 @@ and protocol facts immediately before each serialized lock mutation.
 - [Python, forecasting, and wheel admission](#python-forecasting-and-wheel-admission)
 - [Frontend and native desktop](#frontend-and-native-desktop)
 - [Per-user service lifecycle](#per-user-service-lifecycle)
+- [Service-management library assessment](#service-management-library-assessment)
 - [Lock and acceptance gates](#lock-and-acceptance-gates)
 - [Primary sources](#primary-sources)
 
@@ -324,6 +326,73 @@ bundle identifier. A 2026-08-04 packaged-install failure and isolated LaunchAgen
 confirmed that leaving Market Squawk's relative CLI default under service-manager control can make
 startup target an unwritable root and never publish authenticated readiness.
 
+The 2026-08-04 lifecycle remediation candidate proposes the following native boundaries. These are
+implementation requirements, not audited capability claims, until the candidate is committed and
+the exact frozen head passes the supported macOS, Windows, and Ubuntu installed-product lanes:
+
+- The installed service and desktop both use the sibling verified CLI as their signed application
+  identity. A service executable is not substituted for the CLI identity bound by the release
+  manifest.
+- Activation persists a pending receipt before changing native state. If native rollback cannot
+  prove restoration, that receipt and the outer pending-activation barrier remain intact so a later
+  recovery attempt still authorizes exactly the previous or attempted registration digest.
+- Health polling admits retries only for a failed or timed-out readiness command while the native
+  manager still reports a startup-capable state. Missing evidence has a five-second grace;
+  unchanged startup phases have a 60-second ceiling; an unchanged ready record has a two-second
+  endpoint grace; and a stopped record has a five-second grace only during an explicit startup or
+  restart transition. Failed evidence, inactive native state, invalid evidence, and typed protocol
+  or identity failures terminate immediately. The 120-second activation deadline remains an outer
+  ceiling, not blanket retry authority.
+- `launchctl bootout` failures are never treated generically as absence. The exact service target
+  must be absent while its GUI domain remains queryable before registration files are replaced or
+  removed. The implementation uses only command success and exact target/domain identity; it does
+  not parse `launchctl print` output, which the manual explicitly says is not an API.
+- Windows uses the root task `\MarketSquawkService`, the Task Scheduler schema minimum restart
+  interval `PT1M`, and the built-in Task Scheduler COM `RegisteredTask.State` values to distinguish
+  disabled/ready from queued/running. A failed `schtasks /End` is accepted only if a subsequent
+  exact COM state proves no instance remains, and task deletion is followed by exact absence proof.
+- Native teardown removes ownership receipts only after both the platform definition and the exact
+  manager entry are proved absent. On macOS this combines plist absence with an exact launchd-target
+  lookup in a queryable GUI domain; on Linux it combines unit-file absence with
+  `LoadState=not-found` and an empty `FragmentPath` after `daemon-reload`.
+- The ordinary Ubuntu 24.04 user unit uses a compatibility-safe hardening tier that does not create
+  an unprivileged user namespace: no-new-privileges, empty capability and ambient-capability sets,
+  restricted address families and namespace creation, SUID/SGID and realtime restrictions, a
+  locked personality, native syscall architecture, and owner-only umask. `PrivateUsers=` and the
+  mount-namespace-dependent `Private*`/`Protect*` directives are rejected for this zero-root tier
+  because Ubuntu 24.04 can require a root-installed AppArmor policy for namespace construction.
+- Linux terminal health evidence retains a bounded parse of `ActiveState`, `SubState`, `Result`,
+  `ExecMainCode`, `ExecMainStatus`, and `NRestarts`, while CI retains only the closed startup record
+  and the application's bounded, redacted structured logs on failure.
+- After authenticated readiness, startup evidence is diagnostic rather than lifecycle authority.
+  A write failure cannot prevent cancellation, controlled service shutdown, or a successful
+  user-requested stop; it is retained as a bounded warning and as context when an authoritative
+  shutdown failure also occurs.
+
+## Service-management library assessment
+
+The following maintained alternatives were refreshed on 2026-08-04. None is admitted as the V1
+lifecycle authority because none provides the complete Market Squawk transaction: owned immutable
+registration material, a dual-digest pending receipt, exact rollback and absence proof, bounded
+commands, authenticated application readiness, and deterministic service-generation validation.
+This is a fit decision, not a claim that the libraries are poor implementations of their stated
+scope.
+
+| Candidate | Refreshed release | Useful capability | V1 fit decision |
+| --- | ---: | --- | --- |
+| [`service-manager`](https://docs.rs/crate/service-manager/latest) | 0.11.0 | Common install, uninstall, start, stop, and status surface | Not admitted: user-level support is limited to systemd and launchd, while Windows selects the elevated Service Control Manager rather than Market Squawk's current-user Task Scheduler boundary; documented restart mappings are also platform approximations. |
+| [`auto-launch`](https://docs.rs/crate/auto-launch/latest) | 0.6.0 | Login registration through XDG/systemd-user, LaunchAgent/`SMAppService`, or Windows Run keys | Not admitted: its public contract is enable, disable, and enabled-state registration, not supervised process state, authenticated readiness, transactional rollback, or exact absence proof. |
+| [`zbus_systemd`](https://docs.rs/crate/zbus_systemd/latest) | 0.26100.0 | Generated access to the systemd 261 D-Bus manager | Not admitted: Linux-only binding generated against a newer manager than Ubuntu 24.04; it leaves unit publication, version fallback, ownership, compensation, and cross-platform lifecycle policy to the caller. |
+| [`systemd-zbus`](https://docs.rs/crate/systemd-zbus/latest) | 5.3.2 | Async and blocking typed systemd D-Bus proxies | Not admitted: Linux-only transport whose own documentation identifies incomplete testing/documentation; it does not replace the product transaction or supported-version proof. |
+| [`smappservice-rs`](https://docs.rs/crate/smappservice-rs/latest) | 0.1.3 | Rust wrapper for app-bundled `SMAppService` registration and approval state | Not admitted as the sole macOS path: it requires macOS 13+, while V1 supports macOS 12 and the terminal ZIP route in addition to app-bundle installation. |
+| [`winsafe`](https://docs.rs/crate/winsafe/latest) | 0.0.28 | Safe Task Scheduler COM wrappers | Not admitted: useful Windows binding, but it supplies neither cross-platform transaction semantics nor product readiness/generation authority. The current bounded native adapter avoids local unsafe code and retains the exact task XML as ownership evidence. |
+| Microsoft [`windows`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/System/TaskScheduler/index.html) | 0.62.2 | Official complete Task Scheduler COM projection | Not admitted: authoritative low-level bindings, but not a safe high-level lifecycle abstraction under this workspace's `unsafe_code = "forbid"` boundary and not a replacement for product receipts, compensation, or readiness. |
+
+The bounded academic search found no paper that directly evaluates any Rust service-management
+crate or a failure-atomic per-user lifecycle spanning launchd, systemd, and Windows Task Scheduler.
+The decision therefore rests on the current package APIs, native platform contracts, and
+Market Squawk's installed-product fault and platform proofs rather than inferred academic support.
+
 ## Lock and acceptance gates
 
 Before a serialized dependency boundary is committed:
@@ -355,7 +424,7 @@ smokes on all four targets.
 ## Primary sources
 
 Sources were checked on 2026-08-01; Python artifact and Packaging API evidence was refreshed on
-2026-08-02, and native service working-directory guidance was refreshed on 2026-08-04.
+2026-08-02, and native service lifecycle guidance was refreshed on 2026-08-04.
 
 - Rust and runtime: [Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/),
   [Tokio releases](https://github.com/tokio-rs/tokio/releases), [Axum
@@ -401,10 +470,15 @@ Sources were checked on 2026-08-01; Python artifact and Packaging API evidence w
   [Tauri dialog](https://v2.tauri.app/plugin/dialog/), and [Tauri
   capabilities](https://v2.tauri.app/security/capabilities/).
 - Platform lifecycle: [Apple LaunchAgents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatinglaunchdJobs.html),
+  [`launchctl` domain, service, `bootout`, and unstable-print contracts](https://keith.github.io/xcode-man-pages/launchctl.1.html),
   [Microsoft logon task](https://learn.microsoft.com/en-us/windows/win32/taskschd/starting-an-executable-when-a-user-logs-on),
   [Microsoft scheduled-task working directory](https://learn.microsoft.com/en-us/windows/win32/taskschd/execaction-workingdirectory),
   [Microsoft run level](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-runlevel),
+  [Microsoft `RegisteredTask.State`](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-state),
+  [Microsoft `schtasks /End`](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-end),
+  [Task Scheduler restart-interval schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-interval-restarttype-element),
   [systemd execution environment](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html),
+  [systemd per-user namespace requirement source](https://raw.githubusercontent.com/systemd/systemd/v255/man/system-or-user-ns.xml),
   [Tauri application-local data](https://v2.tauri.app/reference/javascript/api/namespacepath/#applocaldatadir),
   [Ubuntu 24.04 release notes](https://documentation.ubuntu.com/release-notes/24.04/), and
   [`pam_systemd`](https://www.freedesktop.org/software/systemd/man/252/pam_systemd.html).

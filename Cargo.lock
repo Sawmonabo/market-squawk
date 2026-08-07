@@ -4919,6 +4919,7 @@ name = "market-squawk-runtime"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "atomicwrites",
  "axum",
  "futures-util",
  "getrandom 0.3.4",

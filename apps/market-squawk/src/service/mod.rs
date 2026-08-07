@@ -1079,18 +1079,42 @@ fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, Inst
 }
 
 fn canonical_candidate(path: &Path) -> Result<PathBuf, InstalledServiceError> {
-    match std::fs::canonicalize(path) {
-        Ok(path) => Ok(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
-            let name = path
-                .file_name()
-                .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
-            Ok(std::fs::canonicalize(parent)?.join(name))
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+    }
+
+    let mut unresolved = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for component in unresolved.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                unresolved.push(
+                    existing
+                        .file_name()
+                        .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?
+                        .to_owned(),
+                );
+                existing = existing
+                    .parent()
+                    .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => Err(error.into()),
     }
 }
 

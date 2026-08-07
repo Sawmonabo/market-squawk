@@ -21,6 +21,9 @@ use market_squawk::{
     termination::TerminationSignals,
 };
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
+use market_squawk_runtime::{
+    ServiceStartupEvidenceWriter, ServiceStartupPhase, ServiceStartupState,
+};
 use tokio_util::sync::CancellationToken;
 
 const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -101,29 +104,72 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     } else {
         None
     };
-    let config = load_config(
+    let startup = arguments
+        .installation_data_root
+        .as_deref()
+        .map(ServiceStartupEvidenceWriter::try_open)
+        .transpose()?;
+    publish_startup(
+        startup.as_ref(),
+        ServiceStartupState::Starting {
+            phase: ServiceStartupPhase::ProcessStarted,
+        },
+    )?;
+    let config = match load_config(
         arguments.config.as_deref(),
         arguments.data_dir,
         arguments.training_release_root,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return fail_startup(
+                startup.as_ref(),
+                ServiceStartupPhase::ConfigurationLoaded,
+                error,
+            );
+        }
+    };
+    publish_startup(
+        startup.as_ref(),
+        ServiceStartupState::Starting {
+            phase: ServiceStartupPhase::ConfigurationLoaded,
+        },
     )?;
     let terminal_format = if arguments.json_logs {
         TerminalLogFormat::Json
     } else {
         TerminalLogFormat::Human
     };
-    let mut logging = match arguments.installation_data_root.as_deref() {
+    let logging_result = match arguments.installation_data_root.as_deref() {
         Some(root) => InstalledServiceLogging::install_at_installation_root(
             &arguments.log,
             terminal_format,
             root,
-        )?,
-        None => InstalledServiceLogging::install(&arguments.log, terminal_format)?,
+        ),
+        None => InstalledServiceLogging::install(&arguments.log, terminal_format),
     };
+    let mut logging = match logging_result {
+        Ok(logging) => logging,
+        Err(error) => {
+            return fail_startup(
+                startup.as_ref(),
+                ServiceStartupPhase::LoggingReady,
+                error.into(),
+            );
+        }
+    };
+    publish_startup(
+        startup.as_ref(),
+        ServiceStartupState::Starting {
+            phase: ServiceStartupPhase::LoggingReady,
+        },
+    )?;
     let result = run_installed_service(
         config,
         logging.store(),
         arguments.installation_data_root.as_deref(),
         ephemeral_verification_root,
+        startup.as_ref(),
     )
     .await;
     let log_shutdown = logging.shutdown(LOG_SHUTDOWN_TIMEOUT).and_then(|evidence| {
@@ -152,35 +198,145 @@ async fn run_installed_service(
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
     installation_data_root: Option<&Path>,
     ephemeral_verification_root: Option<EphemeralVerificationRoot>,
+    startup: Option<&ServiceStartupEvidenceWriter>,
 ) -> Result<InstalledServiceRunOutcome> {
-    let mut termination = TerminationSignals::install()?;
-    let service = match (installation_data_root, ephemeral_verification_root) {
+    publish_startup(
+        startup,
+        ServiceStartupState::Starting {
+            phase: ServiceStartupPhase::RuntimeComposition,
+        },
+    )?;
+    let mut termination = match TerminationSignals::install() {
+        Ok(termination) => termination,
+        Err(error) => {
+            return fail_startup(
+                startup,
+                ServiceStartupPhase::RuntimeComposition,
+                error.into(),
+            );
+        }
+    };
+    let service_result = match (installation_data_root, ephemeral_verification_root) {
         (Some(_root), Some(ephemeral_root)) => {
             InstalledService::start_ephemeral_verification_with_logging_store_at_installation_root(
                 config,
                 ephemeral_root,
                 logs,
             )
-            .await?
+            .await
         }
         (Some(root), None) => {
             InstalledService::start_with_logging_store_at_installation_root(config, root, logs)
-                .await?
+                .await
         }
-        (None, None) => InstalledService::start_with_logging_store(config, logs).await?,
+        (None, None) => InstalledService::start_with_logging_store(config, logs).await,
         (None, Some(_)) => {
             anyhow::bail!("ephemeral verification requires an explicit installation data root")
         }
     };
+    let service = match service_result {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::error!(
+                target: "market_squawk::installed_service",
+                stage = "runtime-composition",
+                reason = %error,
+                "installed service startup failed"
+            );
+            return fail_startup(
+                startup,
+                ServiceStartupPhase::RuntimeComposition,
+                error.into(),
+            );
+        }
+    };
+    publish_startup(startup, ServiceStartupState::Ready)?;
     let cancellation = CancellationToken::new();
     let mut serving = Box::pin(service.run(cancellation.clone()));
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut serving => result.map_err(Into::into),
         signal = termination.wait() => {
-            signal?;
             cancellation.cancel();
-            serving.await.map_err(Into::into)
+            let evidence = publish_startup(
+                startup,
+                ServiceStartupState::Starting {
+                    phase: ServiceStartupPhase::Shutdown,
+                },
+            ).err();
+            if let Some(error) = evidence.as_ref() {
+                tracing::warn!(
+                    target: "market_squawk::installed_service",
+                    stage = "shutdown",
+                    reason = %error,
+                    "installed service shutdown evidence could not be updated"
+                );
+            }
+            combine_shutdown_results(
+                signal.map_err(Into::into),
+                serving.await.map_err(Into::into),
+                evidence,
+            )
         }
+    };
+    match result {
+        Ok(outcome) => {
+            if let Err(error) = publish_startup(startup, ServiceStartupState::Stopped) {
+                tracing::warn!(
+                    target: "market_squawk::installed_service",
+                    stage = "stopped",
+                    reason = %error,
+                    "installed service stop evidence could not be updated"
+                );
+            }
+            Ok(outcome)
+        }
+        Err(error) => fail_startup(startup, ServiceStartupPhase::Serving, error),
+    }
+}
+
+fn combine_shutdown_results<T>(
+    signal: Result<()>,
+    service: Result<T>,
+    evidence: Option<anyhow::Error>,
+) -> Result<T> {
+    let result = match (signal, service) {
+        (Ok(()), Ok(outcome)) => Ok(outcome),
+        (Err(signal), Ok(_)) => Err(signal),
+        (Ok(()), Err(service)) => Err(service),
+        (Err(signal), Err(service)) => Err(service.context(format!(
+            "termination-signal handling also failed: {signal:#}"
+        ))),
+    };
+    match (result, evidence) {
+        (Ok(outcome), _) => Ok(outcome),
+        (Err(primary), Some(evidence)) => Err(primary.context(format!(
+            "shutdown-evidence publication also failed: {evidence:#}"
+        ))),
+        (Err(primary), None) => Err(primary),
+    }
+}
+
+fn publish_startup(
+    startup: Option<&ServiceStartupEvidenceWriter>,
+    state: ServiceStartupState,
+) -> Result<()> {
+    startup
+        .map(|startup| startup.publish(state))
+        .transpose()
+        .context("failed to publish installed-service startup evidence")?;
+    Ok(())
+}
+
+fn fail_startup<T>(
+    startup: Option<&ServiceStartupEvidenceWriter>,
+    phase: ServiceStartupPhase,
+    primary: anyhow::Error,
+) -> Result<T> {
+    match publish_startup(startup, ServiceStartupState::Failed { phase }) {
+        Ok(()) => Err(primary),
+        Err(evidence) => Err(primary.context(format!(
+            "startup-evidence failure while recording {phase:?}: {evidence:#}"
+        ))),
     }
 }
 

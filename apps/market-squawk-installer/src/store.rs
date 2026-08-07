@@ -207,6 +207,14 @@ pub(crate) struct InstallStore {
 }
 
 impl InstallStore {
+    pub(crate) fn program_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn installation_data_root(&self) -> Result<&Path, StoreError> {
+        self.root.parent().ok_or(StoreError::UnsafeRoot)
+    }
+
     pub(crate) fn open_or_create(root: &Path) -> Result<Self, StoreError> {
         let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
         fs::create_dir_all(parent)

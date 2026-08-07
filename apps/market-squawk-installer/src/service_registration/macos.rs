@@ -17,8 +17,9 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use directories::BaseDirs;
 
 use super::{
-    NativeRegistrationSnapshot, PreparedRegistration, REGISTRATION_OWNER, ServiceRegistrationError,
-    native_document, run_bounded, sha256_bytes, xml_escape,
+    NativeManagerState, NativeRegistrationSnapshot, PlatformCommandFailure,
+    PlatformServiceOperation, PreparedRegistration, REGISTRATION_OWNER, ServiceRegistrationError,
+    native_document, run_bounded, run_bounded_raw_silent, sha256_bytes, xml_escape,
 };
 
 pub(super) const REGISTRATION_IDENTITY: &str = "com.marketsquawk.service";
@@ -68,8 +69,10 @@ pub(super) fn render_launch_agent(
              <key>SuccessfulExit</key>\n\
              <false/>\n\
            </dict>\n\
-           <key>ProcessType</key>\n\
-           <string>Background</string>\n\
+           <key>AssociatedBundleIdentifiers</key>\n\
+           <array>\n\
+             <string>com.marketsquawk.desktop</string>\n\
+           </array>\n\
            <key>ThrottleInterval</key>\n\
            <integer>5</integer>\n\
            <key>Umask</key>\n\
@@ -132,14 +135,16 @@ pub(super) fn apply(prepared: &PreparedRegistration) -> Result<(), ServiceRegist
     bootstrap()
 }
 
-pub(super) fn start() -> Result<(), ServiceRegistrationError> {
+pub(super) fn start(_replacing_existing: bool) -> Result<(), ServiceRegistrationError> {
     let target = service_target()?;
     run_bounded(
+        PlatformServiceOperation::EnableRegistration,
         Path::new(LAUNCHCTL),
         [OsString::from("enable"), target.clone()],
         false,
     )?;
     run_bounded(
+        PlatformServiceOperation::StartRegistration,
         Path::new(LAUNCHCTL),
         [OsString::from("kickstart"), target],
         false,
@@ -149,6 +154,7 @@ pub(super) fn start() -> Result<(), ServiceRegistrationError> {
 
 pub(super) fn restart() -> Result<(), ServiceRegistrationError> {
     run_bounded(
+        PlatformServiceOperation::RestartRegistration,
         Path::new(LAUNCHCTL),
         [
             OsString::from("kickstart"),
@@ -162,11 +168,27 @@ pub(super) fn restart() -> Result<(), ServiceRegistrationError> {
 
 pub(super) fn ensure_active() -> Result<(), ServiceRegistrationError> {
     run_bounded(
+        PlatformServiceOperation::InspectRegistration,
         Path::new(LAUNCHCTL),
         [OsString::from("print"), service_target()?],
         false,
     )?;
     Ok(())
+}
+
+pub(super) fn manager_state() -> Result<NativeManagerState, ServiceRegistrationError> {
+    Ok(match launchd_target_state()? {
+        LaunchdTargetState::Loaded => NativeManagerState::LoadedStateUnavailable,
+        LaunchdTargetState::Absent => NativeManagerState::Absent,
+    })
+}
+
+pub(super) fn prove_absent() -> Result<(), ServiceRegistrationError> {
+    if inspect()?.is_none() && launchd_target_state()? == LaunchdTargetState::Absent {
+        Ok(())
+    } else {
+        Err(ServiceRegistrationError::Conflict)
+    }
 }
 
 pub(super) fn remove(
@@ -181,7 +203,8 @@ pub(super) fn remove(
     unload_if_loaded()?;
     fs::remove_file(launch_agent_path()?)
         .map_err(|source| ServiceRegistrationError::io("remove LaunchAgent", source))?;
-    sync_parent(&launch_agent_path()?)
+    sync_parent(&launch_agent_path()?)?;
+    prove_absent()
 }
 
 pub(super) fn restore(
@@ -200,25 +223,27 @@ pub(super) fn restore(
         Some(prior) if prior.owned => {
             write_registration_file(&launch_agent_path()?, &prior.document)?;
             bootstrap()?;
-            start()
+            start(true)
         }
         Some(_) => Err(ServiceRegistrationError::Conflict),
         None => {
             let path = launch_agent_path()?;
             match fs::remove_file(&path) {
-                Ok(()) => sync_parent(&path),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(()) => sync_parent(&path)?,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => Err(ServiceRegistrationError::io(
                     "remove failed LaunchAgent",
                     source,
-                )),
+                ))?,
             }
+            prove_absent()
         }
     }
 }
 
 fn bootstrap() -> Result<(), ServiceRegistrationError> {
     run_bounded(
+        PlatformServiceOperation::ApplyRegistration,
         Path::new(LAUNCHCTL),
         [
             OsString::from("bootstrap"),
@@ -231,13 +256,51 @@ fn bootstrap() -> Result<(), ServiceRegistrationError> {
 }
 
 fn unload_if_loaded() -> Result<(), ServiceRegistrationError> {
-    match run_bounded(
+    if launchd_target_state()? == LaunchdTargetState::Absent {
+        return Ok(());
+    }
+    run_bounded(
+        PlatformServiceOperation::RemoveRegistration,
         Path::new(LAUNCHCTL),
         [OsString::from("bootout"), service_target()?],
         false,
-    ) {
-        Ok(_) | Err(ServiceRegistrationError::CommandFailed(_)) => Ok(()),
-        Err(error) => Err(error),
+    )?;
+    if launchd_target_state()? != LaunchdTargetState::Absent {
+        return Err(ServiceRegistrationError::Conflict);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchdTargetState {
+    Loaded,
+    Absent,
+}
+
+fn launchd_target_state() -> Result<LaunchdTargetState, ServiceRegistrationError> {
+    let target = run_bounded_raw_silent(
+        PlatformServiceOperation::InspectRegistration,
+        Path::new(LAUNCHCTL),
+        [OsString::from("print"), service_target()?],
+    )?;
+    if target.status.success() {
+        return Ok(LaunchdTargetState::Loaded);
+    }
+
+    // `launchctl print` has no stable machine-readable output. A failed exact-target lookup is
+    // accepted as absence only when the containing GUI domain can be queried successfully; this
+    // keeps permission and unavailable-domain failures distinct from idempotent teardown.
+    let domain = run_bounded_raw_silent(
+        PlatformServiceOperation::ListRegistrations,
+        Path::new(LAUNCHCTL),
+        [OsString::from("print"), user_domain()?],
+    )?;
+    if domain.status.success() {
+        Ok(LaunchdTargetState::Absent)
+    } else {
+        Err(ServiceRegistrationError::CommandFailed(
+            PlatformCommandFailure::new(PlatformServiceOperation::ListRegistrations, &domain),
+        ))
     }
 }
 

@@ -25,9 +25,9 @@ pub(super) fn current_executable_sha256() -> Result<[u8; 32], ExecutableIdentity
 
 /// Returns the signed application identity and its fixed sibling ONNX worker path.
 ///
-/// The CLI is its own signed application identity. The desktop bundle carries the same exact CLI
-/// and worker as sibling executables, so model admission remains bound to the release manifest
-/// produced by the existing training pipeline.
+/// The CLI is the signed application identity. The desktop and installed service carry that exact
+/// CLI plus the worker as sibling executables, so every presentation and the shared service remain
+/// bound to the one release manifest produced by the training pipeline.
 pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), ExecutableIdentityError> {
     let executable = std::env::current_exe()
         .map_err(|source| ExecutableIdentityError::CurrentExecutable { source })?;
@@ -35,9 +35,11 @@ pub(super) fn installed_release_programs() -> Result<(PathBuf, PathBuf), Executa
         .parent()
         .ok_or(ExecutableIdentityError::InvalidExecutablePath)?
         .to_path_buf();
-    let application = if executable.file_stem().and_then(|name| name.to_str())
-        == Some(DESKTOP_APPLICATION_BASENAME)
-    {
+    let executable_name = executable.file_stem().and_then(|name| name.to_str());
+    let application = if matches!(
+        executable_name,
+        Some(DESKTOP_APPLICATION_BASENAME | SERVICE_APPLICATION_BASENAME)
+    ) {
         directory.join(format!(
             "{APPLICATION_BASENAME}{}",
             std::env::consts::EXE_SUFFIX

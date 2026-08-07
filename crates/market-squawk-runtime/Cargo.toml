@@ -9,6 +9,7 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+atomicwrites.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 futures-util.workspace = true

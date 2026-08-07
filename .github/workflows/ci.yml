@@ -831,7 +831,7 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             install_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/ci-verification/program"
           else
-            install_root="$RUNNER_TEMP/installed-product"
+            install_root="$RUNNER_TEMP/installed-product/program"
           fi
           unset \
             MARKET_SQUAWK_COMPONENT_ROOT \
@@ -845,6 +845,35 @@ jobs:
           "$bootstrap" --root "$install_root" status --json
           "$bootstrap" --root "$install_root" uninstall
           [[ ! -e "$install_root" ]]
+      - name: Collect bounded installed-service failure evidence
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            installation_data_root="$(cygpath -u "$LOCALAPPDATA")/MarketSquawk/ci-verification"
+          else
+            installation_data_root="$RUNNER_TEMP/installed-product"
+          fi
+          diagnostics="$RUNNER_TEMP/installed-service-diagnostics"
+          install -d -m 700 "$diagnostics"
+          startup="$installation_data_root/control/installed-service-startup/state.json"
+          logs="$installation_data_root/control/structured-logs"
+          if [[ -f "$startup" && ! -L "$startup" ]]; then
+            install -m 600 "$startup" "$diagnostics/startup-state.json"
+          fi
+          if [[ -d "$logs" && ! -L "$logs" ]]; then
+            cp -R -- "$logs" "$diagnostics/structured-logs"
+          fi
+      # actions/upload-artifact v7.0.1, verified release commit (2026-04-10).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: failure()
+        with:
+          name: installed-service-failure-${{ matrix.target }}-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/installed-service-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
       - name: Install and verify the local DMG
         if: runner.os == 'macOS'
         shell: bash

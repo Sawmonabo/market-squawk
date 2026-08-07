@@ -16,6 +16,7 @@ mod macos;
 mod windows;
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -24,7 +25,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
-use market_squawk_runtime::{InstallationId, RuntimeIdentity, ServiceGeneration};
+#[cfg(not(test))]
+use market_squawk_runtime::ServiceStartupEvidenceWriter;
+use market_squawk_runtime::{
+    InstallationId, RuntimeIdentity, ServiceGeneration, ServiceStartupEvidenceError,
+    ServiceStartupState, read_service_startup_evidence,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,11 +47,17 @@ const MAXIMUM_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
 const MAXIMUM_RECEIPT_BYTES: usize = 64 * 1024;
 const MAXIMUM_NATIVE_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAXIMUM_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_COMMAND_DIAGNOSTIC_CHARS: usize = 8 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+const HEALTH_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_MISSING_EVIDENCE_GRACE: Duration = Duration::from_secs(5);
+const HEALTH_STOPPED_GRACE: Duration = Duration::from_secs(5);
+const HEALTH_READY_ENDPOINT_GRACE: Duration = Duration::from_secs(2);
+const HEALTH_STARTING_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const TEST_HEALTH_FAILURE_MARKER: &[u8] = b"market-squawk-test-service-health-failure";
 #[cfg(test)]
@@ -57,9 +69,41 @@ enum HealthProbe {
     BootstrapRequired,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealthRetryMode {
+    Ordinary,
+    StartupTransition,
+}
+
+#[derive(Debug)]
+struct HealthRetryTracker {
+    started_at: Instant,
+    last_state: Option<Option<ServiceStartupState>>,
+    state_changed_at: Instant,
+}
+
+impl HealthRetryTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            last_state: None,
+            state_changed_at: now,
+        }
+    }
+
+    fn observe(&mut self, state: Option<ServiceStartupState>, now: Instant) -> Duration {
+        if self.last_state != Some(state) {
+            self.last_state = Some(state);
+            self.state_changed_at = now;
+        }
+        now.saturating_duration_since(self.state_changed_at)
+    }
+}
+
 /// Exact immutable release binding used for registration, repair, and verification.
 #[derive(Debug)]
 pub(crate) struct RegistrationSpec<'a> {
+    installation_data_root: &'a Path,
     install_root: &'a Path,
     version_root: &'a Path,
     target: SupportedTarget,
@@ -70,6 +114,7 @@ pub(crate) struct RegistrationSpec<'a> {
 impl<'a> RegistrationSpec<'a> {
     /// Admits one candidate registration specification.
     pub(crate) fn new(
+        installation_data_root: &'a Path,
         install_root: &'a Path,
         version_root: &'a Path,
         target: SupportedTarget,
@@ -80,6 +125,7 @@ impl<'a> RegistrationSpec<'a> {
         let parsed = Version::parse(version).map_err(|_| ServiceRegistrationError::Identity)?;
         if current != target
             || parsed.to_string() != version
+            || !installation_data_root.is_absolute()
             || !install_root.is_absolute()
             || !version_root.is_absolute()
             || !is_lower_sha256(manifest_sha256)
@@ -87,6 +133,7 @@ impl<'a> RegistrationSpec<'a> {
             return Err(ServiceRegistrationError::Identity);
         }
         Ok(Self {
+            installation_data_root,
             install_root,
             version_root,
             target,
@@ -339,8 +386,19 @@ pub fn restart_installed_service(
     with_current_registration(&root, |spec, material| {
         let receipt = verify_owned_material(spec, material)?;
         probe_health(material, Some(expected_current), HEALTH_STATUS_TIMEOUT)?;
+        #[cfg(not(test))]
+        ServiceStartupEvidenceWriter::try_open(&material.installation_data_root)?.clear()?;
         restart_native()?;
-        let runtime = probe_health(material, Some(expected_next), HEALTH_RESTART_TIMEOUT)?;
+        let runtime = probe_health_outcome(
+            material,
+            Some(expected_next),
+            HEALTH_RESTART_TIMEOUT,
+            HealthRetryMode::StartupTransition,
+        )
+        .and_then(|outcome| match outcome {
+            HealthProbe::Ready(runtime) => Ok(runtime),
+            HealthProbe::BootstrapRequired => Err(ServiceRegistrationError::Health),
+        })?;
         Ok(service_status(&receipt, runtime))
     })
 }
@@ -372,6 +430,7 @@ fn with_current_registration<T>(
     crate::archive::verify_installed_tree(&version_root, &state.active.components)
         .map_err(|_| ServiceRegistrationError::Receipt)?;
     let spec = RegistrationSpec::new(
+        store.installation_data_root()?,
         root,
         &version_root,
         state.active.target,
@@ -405,6 +464,8 @@ pub(crate) fn remove_owned(
         return Err(ServiceRegistrationError::Target);
     }
     let Some(receipt) = read_receipt(install_root)? else {
+        #[cfg(not(test))]
+        prove_native_absent()?;
         return Ok(false);
     };
     validate_receipt_identity(&receipt, target)?;
@@ -419,10 +480,24 @@ pub(crate) fn remove_owned(
                 return Err(ServiceRegistrationError::Conflict);
             }
             remove_native(&native)?;
+        } else {
+            prove_native_absent()?;
         }
+        prove_native_absent()?;
     }
     remove_receipt(install_root)?;
     Ok(true)
+}
+
+/// Removes the exact owned registration or proves that both its receipt and native entry are
+/// absent. This is the first-install recovery boundary after an inner rollback may already have
+/// restored the known-good empty state.
+pub(crate) fn remove_owned_or_prove_absent(
+    install_root: &Path,
+    target: SupportedTarget,
+) -> Result<(), ServiceRegistrationError> {
+    remove_owned(install_root, target)?;
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -442,23 +517,60 @@ fn activate_native(
         |native| native.configuration_sha256.clone(),
     );
     pending_receipt.pending_configuration_sha256 = Some(desired.configuration_sha256.clone());
+    ServiceStartupEvidenceWriter::try_open(&material.installation_data_root)?.clear()?;
     write_receipt(spec.install_root, &pending_receipt)?;
 
+    let replacing_existing = prior_native.is_some();
     let attempt = apply_native(&desired)
-        .and_then(|()| start_native())
-        .and_then(|()| probe_activation_health(&material, HEALTH_RESTART_TIMEOUT).map(|_| ()));
+        .and_then(|()| start_native(replacing_existing))
+        .and_then(|()| probe_activation_health(&material, HEALTH_ACTIVATION_TIMEOUT).map(|_| ()));
     if let Err(error) = attempt {
-        restore_native(prior_native.as_ref(), &desired)?;
-        restore_receipt(spec.install_root, prior_receipt.as_ref())?;
-        return Err(error);
+        return Err(activation_failure(
+            error,
+            prior_native.as_ref(),
+            &desired,
+            spec.install_root,
+            prior_receipt.as_ref(),
+        ));
     }
     material.receipt.pending_configuration_sha256 = None;
     if let Err(error) = write_receipt(spec.install_root, &material.receipt) {
-        restore_native(prior_native.as_ref(), &desired)?;
-        restore_receipt(spec.install_root, prior_receipt.as_ref())?;
-        return Err(error);
+        return Err(activation_failure(
+            error,
+            prior_native.as_ref(),
+            &desired,
+            spec.install_root,
+            prior_receipt.as_ref(),
+        ));
     }
     Ok(material.receipt)
+}
+
+#[cfg(not(test))]
+fn activation_failure(
+    primary: ServiceRegistrationError,
+    prior_native: Option<&NativeRegistrationSnapshot>,
+    attempted: &PreparedRegistration,
+    install_root: &Path,
+    prior_receipt: Option<&ServiceRegistrationReceipt>,
+) -> ServiceRegistrationError {
+    let native = restore_native(prior_native, attempted).err().map(Box::new);
+    let receipt = if native.is_none() {
+        match restore_receipt(install_root, prior_receipt) {
+            Ok(()) => ReceiptRollback::Restored,
+            Err(error) => ReceiptRollback::Failed(Box::new(error)),
+        }
+    } else {
+        // The pending receipt admits both the previous and attempted native digests. Retaining it
+        // is the only safe recovery authority when native rollback could not prove which
+        // registration remains installed.
+        ReceiptRollback::PreservedForRecovery
+    };
+    ServiceActivationFailure {
+        primary: Box::new(primary),
+        rollback: ActivationRollback { native, receipt },
+    }
+    .into()
 }
 
 #[cfg(not(test))]
@@ -496,6 +608,8 @@ fn registration_material(
     }
     let canonical_install_root = fs::canonicalize(spec.install_root)
         .map_err(|source| ServiceRegistrationError::io("resolve program store", source))?;
+    let canonical_installation_data_root = fs::canonicalize(spec.installation_data_root)
+        .map_err(|source| ServiceRegistrationError::io("resolve installation data root", source))?;
     let canonical_root = fs::canonicalize(spec.version_root)
         .map_err(|source| ServiceRegistrationError::io("resolve candidate release", source))?;
     if canonical_root == canonical_install_root
@@ -503,11 +617,9 @@ fn registration_material(
     {
         return Err(ServiceRegistrationError::UnsafePath);
     }
-    let installation_data_root = canonical_install_root
-        .parent()
-        .filter(|root| root.is_absolute())
-        .ok_or(ServiceRegistrationError::UnsafePath)?
-        .to_path_buf();
+    if canonical_install_root.parent() != Some(canonical_installation_data_root.as_path()) {
+        return Err(ServiceRegistrationError::UnsafePath);
+    }
     let workspace_data_root =
         default_workspace_data_root().map_err(|_| ServiceRegistrationError::UnsafePath)?;
     if !workspace_data_root.is_absolute() {
@@ -533,7 +645,7 @@ fn registration_material(
         receipt,
         service_path: service.path,
         release_root: canonical_root,
-        installation_data_root,
+        installation_data_root: canonical_installation_data_root,
         workspace_data_root,
     })
 }
@@ -773,7 +885,7 @@ fn probe_health(
     expected: Option<RuntimeIdentity>,
     timeout: Duration,
 ) -> Result<RuntimeIdentity, ServiceRegistrationError> {
-    match probe_health_outcome(material, expected, timeout)? {
+    match probe_health_outcome(material, expected, timeout, HealthRetryMode::Ordinary)? {
         HealthProbe::Ready(runtime) => Ok(runtime),
         HealthProbe::BootstrapRequired => Err(ServiceRegistrationError::Health),
     }
@@ -784,31 +896,111 @@ fn probe_activation_health(
     material: &RegistrationMaterial,
     timeout: Duration,
 ) -> Result<HealthProbe, ServiceRegistrationError> {
-    probe_health_outcome(material, None, timeout)
+    probe_health_outcome(material, None, timeout, HealthRetryMode::StartupTransition)
 }
 
 fn probe_health_outcome(
     material: &RegistrationMaterial,
     expected: Option<RuntimeIdentity>,
     timeout: Duration,
+    retry_mode: HealthRetryMode,
 ) -> Result<HealthProbe, ServiceRegistrationError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(ServiceRegistrationError::CommandTimeout)?;
+    let deadline =
+        Instant::now()
+            .checked_add(timeout)
+            .ok_or(ServiceRegistrationError::CommandTimeout(
+                PlatformServiceOperation::ProbeHealth,
+            ))?;
+    let now = Instant::now();
+    let mut last_transient = None;
+    let mut retry_tracker = HealthRetryTracker::new(now);
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(ServiceRegistrationError::Health);
+            return Err(service_health_failure(
+                last_transient.unwrap_or(ServiceRegistrationError::CommandTimeout(
+                    PlatformServiceOperation::ProbeHealth,
+                )),
+                material,
+            ));
         }
         let command_timeout = deadline
             .saturating_duration_since(now)
             .min(HEALTH_COMMAND_TIMEOUT);
         match probe_health_once(material, expected, command_timeout) {
             Ok(outcome) => return Ok(outcome),
-            Err(_) if Instant::now() < deadline => thread::sleep(HEALTH_RETRY_INTERVAL),
-            Err(_) => return Err(ServiceRegistrationError::Health),
+            Err(error)
+                if transient_health_error(&error, material, retry_mode, &mut retry_tracker)
+                    && Instant::now() < deadline =>
+            {
+                last_transient = Some(error);
+                thread::sleep(
+                    HEALTH_RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(service_health_failure(error, material)),
         }
     }
+}
+
+fn transient_health_error(
+    error: &ServiceRegistrationError,
+    material: &RegistrationMaterial,
+    retry_mode: HealthRetryMode,
+    tracker: &mut HealthRetryTracker,
+) -> bool {
+    let command_can_be_transient = match error {
+        ServiceRegistrationError::CommandTimeout(PlatformServiceOperation::ProbeHealth) => true,
+        ServiceRegistrationError::CommandFailed(failure) => {
+            failure.operation == PlatformServiceOperation::ProbeHealth
+        }
+        _ => false,
+    };
+    if !command_can_be_transient {
+        return false;
+    }
+    let native = match native_manager_state() {
+        Ok(native) if native.may_be_starting() => native,
+        Ok(_) | Err(_) => return false,
+    };
+    let now = Instant::now();
+    let evidence = match read_service_startup_evidence(&material.installation_data_root) {
+        Ok(evidence) => evidence.map(|evidence| evidence.state()),
+        Err(_) => return false,
+    };
+    let unchanged_for = tracker.observe(evidence, now);
+    match evidence {
+        Some(ServiceStartupState::Failed { .. }) => false,
+        Some(ServiceStartupState::Starting { .. }) => unchanged_for < HEALTH_STARTING_PHASE_TIMEOUT,
+        Some(ServiceStartupState::Ready) => unchanged_for < HEALTH_READY_ENDPOINT_GRACE,
+        Some(ServiceStartupState::Stopped) => {
+            retry_mode == HealthRetryMode::StartupTransition && unchanged_for < HEALTH_STOPPED_GRACE
+        }
+        None => {
+            now.saturating_duration_since(tracker.started_at) < HEALTH_MISSING_EVIDENCE_GRACE
+                && native.may_be_starting()
+        }
+    }
+}
+
+fn service_health_failure(
+    last: ServiceRegistrationError,
+    material: &RegistrationMaterial,
+) -> ServiceRegistrationError {
+    let native = match native_manager_state() {
+        Ok(state) => NativeManagerObservation::Observed(state),
+        Err(error) => NativeManagerObservation::InspectionFailed(Box::new(error)),
+    };
+    let startup = match read_service_startup_evidence(&material.installation_data_root) {
+        Ok(evidence) => StartupObservation::Observed(evidence.map(|evidence| evidence.state())),
+        Err(error) => StartupObservation::InspectionFailed(Box::new(error)),
+    };
+    ServiceHealthFailure {
+        last: Box::new(last),
+        native,
+        startup,
+    }
+    .into()
 }
 
 fn probe_health_once(
@@ -817,6 +1009,7 @@ fn probe_health_once(
     timeout: Duration,
 ) -> Result<HealthProbe, ServiceRegistrationError> {
     let output = run_bounded_with_timeout(
+        PlatformServiceOperation::ProbeHealth,
         &material.receipt.cli.path,
         [
             OsString::from("--output"),
@@ -956,9 +1149,11 @@ fn file_contains_marker(path: &Path, marker: &[u8]) -> Result<bool, ServiceRegis
 pub(super) struct CommandOutput {
     pub(super) status: ExitStatus,
     pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 pub(super) fn run_bounded<I, S>(
+    operation: PlatformServiceOperation,
     program: &Path,
     arguments: I,
     capture_stdout: bool,
@@ -967,10 +1162,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_bounded_with_timeout(program, arguments, capture_stdout, COMMAND_TIMEOUT)
+    run_bounded_with_timeout(
+        operation,
+        program,
+        arguments,
+        capture_stdout,
+        COMMAND_TIMEOUT,
+    )
 }
 
 fn run_bounded_with_timeout<I, S>(
+    operation: PlatformServiceOperation,
     program: &Path,
     arguments: I,
     capture_stdout: bool,
@@ -980,17 +1182,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = run_bounded_raw_with_timeout(program, arguments, capture_stdout, timeout)?;
+    let output = run_bounded_raw_with_timeout(
+        operation,
+        program,
+        arguments,
+        capture_stdout,
+        false,
+        timeout,
+    )?;
     if !output.status.success() {
         return Err(ServiceRegistrationError::CommandFailed(
-            output.status.code(),
+            PlatformCommandFailure::new(operation, &output),
         ));
     }
     Ok(output)
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(super) fn run_bounded_raw<I, S>(
+    operation: PlatformServiceOperation,
     program: &Path,
     arguments: I,
     capture_stdout: bool,
@@ -999,13 +1209,35 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_bounded_raw_with_timeout(program, arguments, capture_stdout, COMMAND_TIMEOUT)
+    run_bounded_raw_with_timeout(
+        operation,
+        program,
+        arguments,
+        capture_stdout,
+        false,
+        COMMAND_TIMEOUT,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn run_bounded_raw_silent<I, S>(
+    operation: PlatformServiceOperation,
+    program: &Path,
+    arguments: I,
+) -> Result<CommandOutput, ServiceRegistrationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_bounded_raw_with_timeout(operation, program, arguments, false, true, COMMAND_TIMEOUT)
 }
 
 fn run_bounded_raw_with_timeout<I, S>(
+    operation: PlatformServiceOperation,
     program: &Path,
     arguments: I,
     capture_stdout: bool,
+    suppress_stdout: bool,
     timeout: Duration,
 ) -> Result<CommandOutput, ServiceRegistrationError>
 where
@@ -1013,32 +1245,30 @@ where
     S: AsRef<OsStr>,
 {
     if timeout.is_zero() || timeout > COMMAND_TIMEOUT {
-        return Err(ServiceRegistrationError::CommandTimeout);
+        return Err(ServiceRegistrationError::CommandTimeout(operation));
     }
     let mut command = Command::new(program);
     command
         .args(arguments)
         .stdin(Stdio::null())
-        .stdout(if capture_stdout {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
         .stderr(Stdio::piped());
+    if suppress_stdout {
+        command.stdout(Stdio::null());
+    } else {
+        command.stdout(Stdio::piped());
+    }
     let mut child = command.spawn().map_err(|source| {
         ServiceRegistrationError::io("start platform registration command", source)
     })?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|stdout| thread::spawn(move || read_bounded(stdout, MAXIMUM_COMMAND_OUTPUT_BYTES)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| thread::spawn(move || read_bounded(stderr, MAXIMUM_COMMAND_OUTPUT_BYTES)));
+    let stdout = child.stdout.take().map(|stdout| {
+        thread::spawn(move || read_bounded(stdout, MAXIMUM_COMMAND_OUTPUT_BYTES, operation))
+    });
+    let stderr = child.stderr.take().map(|stderr| {
+        thread::spawn(move || read_bounded(stderr, MAXIMUM_COMMAND_OUTPUT_BYTES, operation))
+    });
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or(ServiceRegistrationError::CommandTimeout)?;
+        .ok_or(ServiceRegistrationError::CommandTimeout(operation))?;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|source| {
             ServiceRegistrationError::io("inspect platform registration command", source)
@@ -1048,16 +1278,29 @@ where
         if Instant::now() >= deadline {
             let _ignored = child.kill();
             let _ignored = child.wait();
-            return Err(ServiceRegistrationError::CommandTimeout);
+            let _stdout = join_reader(stdout, operation)?;
+            let _stderr = join_reader(stderr, operation)?;
+            return Err(ServiceRegistrationError::CommandTimeout(operation));
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let stdout = join_reader(stdout)?;
-    let _stderr = join_reader(stderr)?;
-    Ok(CommandOutput { status, stdout })
+    let mut stdout = join_reader(stdout, operation)?;
+    let stderr = join_reader(stderr, operation)?;
+    if status.success() && !capture_stdout {
+        stdout.clear();
+    }
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
-fn read_bounded(mut reader: impl Read, maximum: u64) -> Result<Vec<u8>, ServiceRegistrationError> {
+fn read_bounded(
+    mut reader: impl Read,
+    maximum: u64,
+    operation: PlatformServiceOperation,
+) -> Result<Vec<u8>, ServiceRegistrationError> {
     let mut bytes = Vec::new();
     reader
         .by_ref()
@@ -1067,20 +1310,122 @@ fn read_bounded(mut reader: impl Read, maximum: u64) -> Result<Vec<u8>, ServiceR
             ServiceRegistrationError::io("read platform registration command", source)
         })?;
     if bytes.len() as u64 > maximum {
-        return Err(ServiceRegistrationError::CommandOutput);
+        return Err(ServiceRegistrationError::CommandOutput(operation));
     }
     Ok(bytes)
 }
 
 fn join_reader(
     reader: Option<thread::JoinHandle<Result<Vec<u8>, ServiceRegistrationError>>>,
+    operation: PlatformServiceOperation,
 ) -> Result<Vec<u8>, ServiceRegistrationError> {
     match reader {
         Some(reader) => reader
             .join()
-            .map_err(|_| ServiceRegistrationError::CommandOutput)?,
+            .map_err(|_| ServiceRegistrationError::CommandOutput(operation))?,
         None => Ok(Vec::new()),
     }
+}
+
+/// One closed native service-manager operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformServiceOperation {
+    /// Reload native registration configuration.
+    ReloadManager,
+    /// Inspect one exact registration.
+    InspectRegistration,
+    /// List native registrations only to distinguish absence from an inspect failure.
+    ListRegistrations,
+    /// Inspect the native manager's closed process or task state.
+    InspectProcessState,
+    /// Apply one exact native registration.
+    ApplyRegistration,
+    /// Enable one exact native registration.
+    EnableRegistration,
+    /// Start one exact native registration.
+    StartRegistration,
+    /// Restart one exact native registration.
+    RestartRegistration,
+    /// Stop one exact native registration.
+    StopRegistration,
+    /// Disable one exact native registration.
+    DisableRegistration,
+    /// Remove one exact native registration.
+    RemoveRegistration,
+    /// Resolve the current user identity required by the native service manager.
+    ResolveCurrentUser,
+    /// Query the authenticated Market Squawk service endpoint.
+    ProbeHealth,
+}
+
+impl fmt::Display for PlatformServiceOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::ReloadManager => "reload-manager",
+            Self::InspectRegistration => "inspect-registration",
+            Self::ListRegistrations => "list-registrations",
+            Self::InspectProcessState => "inspect-process-state",
+            Self::ApplyRegistration => "apply-registration",
+            Self::EnableRegistration => "enable-registration",
+            Self::StartRegistration => "start-registration",
+            Self::RestartRegistration => "restart-registration",
+            Self::StopRegistration => "stop-registration",
+            Self::DisableRegistration => "disable-registration",
+            Self::RemoveRegistration => "remove-registration",
+            Self::ResolveCurrentUser => "resolve-current-user",
+            Self::ProbeHealth => "probe-health",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// Bounded failure evidence returned by a native service-manager command.
+#[derive(Debug)]
+pub struct PlatformCommandFailure {
+    operation: PlatformServiceOperation,
+    status: Option<i32>,
+    diagnostic: Box<str>,
+}
+
+impl PlatformCommandFailure {
+    fn new(operation: PlatformServiceOperation, output: &CommandOutput) -> Self {
+        let diagnostic = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        Self {
+            operation,
+            status: output.status.code(),
+            diagnostic: bounded_command_diagnostic(diagnostic),
+        }
+    }
+}
+
+impl fmt::Display for PlatformCommandFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} failed with status {:?}",
+            self.operation, self.status
+        )?;
+        if !self.diagnostic.is_empty() {
+            write!(formatter, ": {}", self.diagnostic)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PlatformCommandFailure {}
+
+fn bounded_command_diagnostic(bytes: &[u8]) -> Box<str> {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .take(MAXIMUM_COMMAND_DIAGNOSTIC_CHARS)
+        .collect::<String>()
+        .trim()
+        .into()
 }
 
 pub(super) fn sha256_bytes(bytes: &[u8]) -> Box<str> {
@@ -1107,6 +1452,168 @@ pub(super) fn native_document(bytes: Vec<u8>) -> Result<Vec<u8>, ServiceRegistra
     Ok(bytes)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeManagerState {
+    #[cfg(target_os = "windows")]
+    Active,
+    #[cfg(target_os = "windows")]
+    Registered,
+    Absent,
+    #[cfg(target_os = "macos")]
+    LoadedStateUnavailable,
+    #[cfg(target_os = "linux")]
+    Linux(LinuxManagerState),
+}
+
+impl NativeManagerState {
+    fn may_be_starting(&self) -> bool {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Active => true,
+            #[cfg(target_os = "windows")]
+            Self::Registered => false,
+            Self::Absent => false,
+            #[cfg(target_os = "macos")]
+            Self::LoadedStateUnavailable => true,
+            #[cfg(target_os = "linux")]
+            Self::Linux(state) => state.may_be_starting(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxManagerState {
+    active_state: Box<str>,
+    sub_state: Box<str>,
+    result: Box<str>,
+    exec_main_code: i32,
+    exec_main_status: i32,
+    restarts: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxManagerState {
+    fn may_be_starting(&self) -> bool {
+        matches!(
+            self.active_state.as_ref(),
+            "active" | "activating" | "reloading"
+        )
+    }
+}
+
+impl fmt::Display for NativeManagerState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            #[cfg(target_os = "windows")]
+            Self::Active => "active",
+            #[cfg(target_os = "windows")]
+            Self::Registered => "registered-but-not-active",
+            Self::Absent => "absent",
+            #[cfg(target_os = "macos")]
+            Self::LoadedStateUnavailable => "loaded-running-state-unavailable",
+            #[cfg(target_os = "linux")]
+            Self::Linux(state) => {
+                return write!(
+                    formatter,
+                    "systemd active={} sub={} result={} exec-code={} exec-status={} restarts={}",
+                    state.active_state,
+                    state.sub_state,
+                    state.result,
+                    state.exec_main_code,
+                    state.exec_main_status,
+                    state.restarts
+                );
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+enum NativeManagerObservation {
+    Observed(NativeManagerState),
+    InspectionFailed(Box<ServiceRegistrationError>),
+}
+
+impl fmt::Display for NativeManagerObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observed(state) => state.fmt(formatter),
+            Self::InspectionFailed(error) => write!(formatter, "inspection-failed ({error})"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StartupObservation {
+    Observed(Option<ServiceStartupState>),
+    InspectionFailed(Box<ServiceStartupEvidenceError>),
+}
+
+impl fmt::Display for StartupObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observed(Some(state)) => write!(formatter, "{state:?}"),
+            Self::Observed(None) => formatter.write_str("unavailable"),
+            Self::InspectionFailed(error) => write!(formatter, "inspection-failed ({error})"),
+        }
+    }
+}
+
+/// Final authenticated-health failure with bounded native and application startup evidence.
+#[derive(Debug, Error)]
+#[error(
+    "installed service health failed: {last}; native manager: {native}; application startup: \
+     {startup}"
+)]
+pub struct ServiceHealthFailure {
+    #[source]
+    last: Box<ServiceRegistrationError>,
+    native: NativeManagerObservation,
+    startup: StartupObservation,
+}
+
+#[derive(Debug)]
+struct ActivationRollback {
+    native: Option<Box<ServiceRegistrationError>>,
+    receipt: ReceiptRollback,
+}
+
+#[derive(Debug)]
+enum ReceiptRollback {
+    Restored,
+    PreservedForRecovery,
+    Failed(Box<ServiceRegistrationError>),
+}
+
+impl fmt::Display for ActivationRollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.native, &self.receipt) {
+            (None, ReceiptRollback::Restored) => formatter.write_str("succeeded"),
+            (None, ReceiptRollback::Failed(receipt)) => {
+                write!(formatter, "failed restoring receipt: {receipt}")
+            }
+            (Some(native), ReceiptRollback::PreservedForRecovery) => write!(
+                formatter,
+                "failed restoring native state ({native}); pending recovery receipt preserved"
+            ),
+            (Some(_), ReceiptRollback::Restored | ReceiptRollback::Failed(_))
+            | (None, ReceiptRollback::PreservedForRecovery) => {
+                formatter.write_str("entered an invalid rollback state")
+            }
+        }
+    }
+}
+
+/// Primary installed-service activation failure plus any independent rollback failure.
+#[derive(Debug, Error)]
+#[error("installed-service activation failed: {primary}; rollback {rollback}")]
+pub struct ServiceActivationFailure {
+    #[source]
+    primary: Box<ServiceRegistrationError>,
+    rollback: ActivationRollback,
+}
+
 fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1125,7 +1632,7 @@ fn platform_registration_identity(target: SupportedTarget) -> &'static str {
             "com.marketsquawk.service"
         }
         SupportedTarget::X86_64UnknownLinuxGnu => "market-squawk.service",
-        SupportedTarget::X86_64PcWindowsMsvc => r"\MarketSquawk\Service",
+        SupportedTarget::X86_64PcWindowsMsvc => r"\MarketSquawkService",
     }
 }
 
@@ -1171,6 +1678,35 @@ fn inspect_native() -> Result<Option<NativeRegistrationSnapshot>, ServiceRegistr
 }
 
 #[cfg(not(test))]
+fn prove_native_absent() -> Result<(), ServiceRegistrationError> {
+    #[cfg(target_os = "macos")]
+    return macos::prove_absent();
+    #[cfg(target_os = "linux")]
+    return linux::prove_absent();
+    #[cfg(target_os = "windows")]
+    return windows::prove_absent();
+    #[allow(unreachable_code)]
+    Err(ServiceRegistrationError::Target)
+}
+
+#[cfg(not(test))]
+fn native_manager_state() -> Result<NativeManagerState, ServiceRegistrationError> {
+    #[cfg(target_os = "macos")]
+    return macos::manager_state();
+    #[cfg(target_os = "linux")]
+    return linux::manager_state();
+    #[cfg(target_os = "windows")]
+    return windows::manager_state();
+    #[allow(unreachable_code)]
+    Err(ServiceRegistrationError::Target)
+}
+
+#[cfg(test)]
+fn native_manager_state() -> Result<NativeManagerState, ServiceRegistrationError> {
+    Err(ServiceRegistrationError::NativeControlUnavailable)
+}
+
+#[cfg(not(test))]
 fn apply_native(prepared: &PreparedRegistration) -> Result<(), ServiceRegistrationError> {
     #[cfg(target_os = "macos")]
     return macos::apply(prepared);
@@ -1183,13 +1719,13 @@ fn apply_native(prepared: &PreparedRegistration) -> Result<(), ServiceRegistrati
 }
 
 #[cfg(not(test))]
-fn start_native() -> Result<(), ServiceRegistrationError> {
+fn start_native(replacing_existing: bool) -> Result<(), ServiceRegistrationError> {
     #[cfg(target_os = "macos")]
-    return macos::start();
+    return macos::start(replacing_existing);
     #[cfg(target_os = "linux")]
-    return linux::start();
+    return linux::start(replacing_existing);
     #[cfg(target_os = "windows")]
-    return windows::start();
+    return windows::start(replacing_existing);
     #[allow(unreachable_code)]
     Err(ServiceRegistrationError::Target)
 }
@@ -1253,6 +1789,12 @@ fn restore_native(
 /// Per-user registration, ownership, command, or health failure.
 #[derive(Debug, Error)]
 pub enum ServiceRegistrationError {
+    /// Activation failed and preserves both the primary and any rollback failure.
+    #[error(transparent)]
+    ActivationFailed(#[from] ServiceActivationFailure),
+    /// Health failed and preserves the last typed probe plus bounded native/application evidence.
+    #[error(transparent)]
+    HealthFailed(#[from] ServiceHealthFailure),
     /// The target is not the running supported platform.
     #[error("service registration target does not match this platform")]
     Target,
@@ -1287,17 +1829,20 @@ pub enum ServiceRegistrationError {
     #[error("native service registration document is invalid")]
     NativeDocument,
     /// A bounded platform command exceeded its deadline.
-    #[error("platform service-registration command exceeded its deadline")]
-    CommandTimeout,
+    #[error("platform service operation {0} exceeded its deadline")]
+    CommandTimeout(PlatformServiceOperation),
     /// A bounded platform command exceeded its output ceiling.
-    #[error("platform service-registration command exceeded its output ceiling")]
-    CommandOutput,
+    #[error("platform service operation {0} exceeded its output ceiling")]
+    CommandOutput(PlatformServiceOperation),
     /// A platform command returned failure.
-    #[error("platform service-registration command failed with status {0:?}")]
-    CommandFailed(Option<i32>),
+    #[error(transparent)]
+    CommandFailed(PlatformCommandFailure),
     /// Authenticated service readiness did not bind the expected generation.
     #[error("installed service did not prove exact authenticated readiness")]
     Health,
+    /// Application-owned startup evidence could not be prepared or inspected.
+    #[error(transparent)]
+    StartupEvidence(#[from] ServiceStartupEvidenceError),
     /// Filesystem or process I/O failed.
     #[error("service registration I/O failed while {operation}")]
     Io {
@@ -1353,6 +1898,8 @@ mod tests {
         assert!(launch_agent.contains("<string>--installation-data-root</string>"));
         assert!(launch_agent.contains("<key>WorkingDirectory</key>"));
         assert!(launch_agent.contains("<key>KeepAlive</key>"));
+        assert!(launch_agent.contains("<key>AssociatedBundleIdentifiers</key>"));
+        assert!(!launch_agent.contains("<key>ProcessType</key>"));
         assert!(!launch_agent.contains("/bin/sh"));
 
         Ok(())
@@ -1371,7 +1918,10 @@ mod tests {
         assert!(unit.contains("--data-dir"));
         assert!(unit.contains("--installation-data-root"));
         assert!(unit.contains("NoNewPrivileges=yes"));
-        assert!(unit.contains("ProtectSystem=full"));
+        assert!(unit.contains("CapabilityBoundingSet="));
+        assert!(unit.contains("RestrictNamespaces=yes"));
+        assert!(!unit.contains("PrivateUsers="));
+        assert!(!unit.contains("ProtectSystem="));
         assert!(!unit.contains("loginctl enable-linger"));
         assert!(!unit.contains("/bin/sh"));
 
@@ -1391,6 +1941,7 @@ mod tests {
         assert!(task.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(task.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(task.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(task.contains("<Interval>PT1M</Interval>"));
         assert!(task.contains("<WorkingDirectory>"));
         assert!(task.contains("--installation-data-root"));
         assert!(task.contains("Test &amp; Co"));
@@ -1400,6 +1951,8 @@ mod tests {
         assert_eq!(digest.len(), 64);
         let elevated = task.replace("LeastPrivilege", "HighestAvailable");
         assert!(windows::task_configuration_digest(elevated.as_bytes()).is_err());
+        let invalid_restart = task.replace("PT1M", "PT30S");
+        assert!(windows::task_configuration_digest(invalid_restart.as_bytes()).is_err());
         Ok(())
     }
 

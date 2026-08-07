@@ -3,19 +3,29 @@
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::Serialize;
 
 use super::{
-    NativeRegistrationSnapshot, PreparedRegistration, ServiceRegistrationError, native_document,
+    NativeManagerState, NativeRegistrationSnapshot, PlatformCommandFailure,
+    PlatformServiceOperation, PreparedRegistration, ServiceRegistrationError, native_document,
     run_bounded, run_bounded_raw, sha256_bytes, xml_escape,
 };
 
-pub(super) const REGISTRATION_IDENTITY: &str = r"\MarketSquawk\Service";
+pub(super) const REGISTRATION_IDENTITY: &str = r"\MarketSquawkService";
 const OWNER_DESCRIPTION: &str =
     "Managed by Market Squawk installer; owner=market-squawk-installer-v1";
+const RESTART_INTERVAL: &str = "PT1M";
+const MAXIMUM_SCHEDULER_PATH_UNITS: usize = 259;
+const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const TASK_STATE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const TASK_STATE_SCRIPT: &str = "$s=New-Object -ComObject 'Schedule.Service';$s.Connect();\
+$t=$s.GetFolder('\\').GetTask('MarketSquawkService');\
+[Console]::Out.Write([int]$t.State)";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,21 +46,15 @@ pub(super) fn render_task_xml(
     user_sid: &str,
 ) -> Result<String, ServiceRegistrationError> {
     validate_sid(user_sid)?;
-    let service = service.to_str().ok_or(ServiceRegistrationError::Identity)?;
-    let workspace_data_root = workspace_data_root
-        .to_str()
-        .ok_or(ServiceRegistrationError::Identity)?;
-    let installation_data_root = installation_data_root
-        .to_str()
-        .ok_or(ServiceRegistrationError::Identity)?;
-    let release_root = release_root
-        .to_str()
-        .ok_or(ServiceRegistrationError::Identity)?;
+    let service = scheduler_path(service)?;
+    let workspace_data_root = scheduler_path(workspace_data_root)?;
+    let installation_data_root = scheduler_path(installation_data_root)?;
+    let release_root = scheduler_path(release_root)?;
     let arguments = format!(
         "--data-dir {} --installation-data-root {} --training-release-root {}",
-        quote_windows_argument(workspace_data_root)?,
-        quote_windows_argument(installation_data_root)?,
-        quote_windows_argument(release_root)?
+        quote_windows_argument(&workspace_data_root)?,
+        quote_windows_argument(&installation_data_root)?,
+        quote_windows_argument(&release_root)?
     );
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -87,7 +91,7 @@ pub(super) fn render_task_xml(
              <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
              <Priority>7</Priority>\n\
              <RestartOnFailure>\n\
-               <Interval>PT5S</Interval>\n\
+               <Interval>{restart_interval}</Interval>\n\
                <Count>3</Count>\n\
              </RestartOnFailure>\n\
            </Settings>\n\
@@ -102,9 +106,10 @@ pub(super) fn render_task_xml(
         description = xml_escape(OWNER_DESCRIPTION)?,
         uri = xml_escape(REGISTRATION_IDENTITY)?,
         sid = xml_escape(user_sid)?,
-        service = xml_escape(service)?,
+        service = xml_escape(&service)?,
         arguments = xml_escape(&arguments)?,
-        working_directory = xml_escape(installation_data_root)?,
+        working_directory = xml_escape(&installation_data_root)?,
+        restart_interval = RESTART_INTERVAL,
     ))
 }
 
@@ -145,19 +150,28 @@ pub(super) fn prepare(
 pub(super) fn inspect() -> Result<Option<NativeRegistrationSnapshot>, ServiceRegistrationError> {
     let scheduler = system_program("schtasks.exe")?;
     let query = run_bounded_raw(
+        PlatformServiceOperation::InspectRegistration,
         &scheduler,
         ["/Query", "/TN", REGISTRATION_IDENTITY, "/XML"],
         true,
     )?;
     if !query.status.success() {
-        let listing = run_bounded(&scheduler, ["/Query", "/FO", "CSV", "/NH"], true)?;
-        let listing = String::from_utf8(listing.stdout)
-            .map_err(|_| ServiceRegistrationError::CommandOutput)?;
+        let listing = run_bounded(
+            PlatformServiceOperation::ListRegistrations,
+            &scheduler,
+            ["/Query", "/FO", "CSV", "/NH"],
+            true,
+        )?;
+        let listing = String::from_utf8(listing.stdout).map_err(|_| {
+            ServiceRegistrationError::CommandOutput(PlatformServiceOperation::ListRegistrations)
+        })?;
         if listing.lines().any(|line| {
             line.trim_start()
                 .starts_with(&format!("\"{REGISTRATION_IDENTITY}\","))
         }) {
-            return Err(ServiceRegistrationError::CommandFailed(query.status.code()));
+            return Err(ServiceRegistrationError::CommandFailed(
+                PlatformCommandFailure::new(PlatformServiceOperation::InspectRegistration, &query),
+            ));
         }
         return Ok(None);
     }
@@ -178,12 +192,15 @@ pub(super) fn apply(prepared: &PreparedRegistration) -> Result<(), ServiceRegist
     if prepared.identity != REGISTRATION_IDENTITY {
         return Err(ServiceRegistrationError::Identity);
     }
-    end_if_running()?;
+    if inspect()?.is_some() {
+        end_if_running()?;
+    }
     register_document(&prepared.document)
 }
 
-pub(super) fn start() -> Result<(), ServiceRegistrationError> {
+pub(super) fn start(_replacing_existing: bool) -> Result<(), ServiceRegistrationError> {
     run_bounded(
+        PlatformServiceOperation::StartRegistration,
         &system_program("schtasks.exe")?,
         ["/Run", "/TN", REGISTRATION_IDENTITY],
         false,
@@ -193,7 +210,7 @@ pub(super) fn start() -> Result<(), ServiceRegistrationError> {
 
 pub(super) fn restart() -> Result<(), ServiceRegistrationError> {
     end_if_running()?;
-    start()
+    start(true)
 }
 
 pub(super) fn ensure_active() -> Result<(), ServiceRegistrationError> {
@@ -201,6 +218,24 @@ pub(super) fn ensure_active() -> Result<(), ServiceRegistrationError> {
         return Err(ServiceRegistrationError::RegistrationMissing);
     }
     Ok(())
+}
+
+pub(super) fn manager_state() -> Result<NativeManagerState, ServiceRegistrationError> {
+    if inspect()?.is_none() {
+        return Ok(NativeManagerState::Absent);
+    }
+    match task_state()? {
+        TaskState::Queued | TaskState::Running => Ok(NativeManagerState::Active),
+        TaskState::Disabled | TaskState::Ready => Ok(NativeManagerState::Registered),
+    }
+}
+
+pub(super) fn prove_absent() -> Result<(), ServiceRegistrationError> {
+    if inspect()?.is_none() {
+        Ok(())
+    } else {
+        Err(ServiceRegistrationError::Conflict)
+    }
 }
 
 pub(super) fn remove(
@@ -213,7 +248,8 @@ pub(super) fn remove(
         return Err(ServiceRegistrationError::Conflict);
     }
     end_if_running()?;
-    delete_task()
+    delete_task()?;
+    prove_absent()
 }
 
 pub(super) fn restore(
@@ -232,10 +268,10 @@ pub(super) fn restore(
     match prior {
         Some(prior) if prior.owned => {
             register_document(&prior.document)?;
-            start()
+            start(true)
         }
         Some(_) => Err(ServiceRegistrationError::Conflict),
-        None => Ok(()),
+        None => prove_absent(),
     }
 }
 
@@ -252,6 +288,7 @@ fn register_document(document: &[u8]) -> Result<(), ServiceRegistrationError> {
         .map_err(|source| ServiceRegistrationError::io("write scheduled-task document", source))?;
     let path = temporary.path().as_os_str().to_owned();
     run_bounded(
+        PlatformServiceOperation::ApplyRegistration,
         &system_program("schtasks.exe")?,
         [
             OsString::from("/Create"),
@@ -267,33 +304,96 @@ fn register_document(document: &[u8]) -> Result<(), ServiceRegistrationError> {
 }
 
 fn end_if_running() -> Result<(), ServiceRegistrationError> {
-    match run_bounded(
-        &system_program("schtasks.exe")?,
+    if task_state()?.is_stopped() {
+        return Ok(());
+    }
+    let scheduler = system_program("schtasks.exe")?;
+    let stopped = run_bounded_raw(
+        PlatformServiceOperation::StopRegistration,
+        &scheduler,
         ["/End", "/TN", REGISTRATION_IDENTITY],
         false,
-    ) {
-        Ok(_) | Err(ServiceRegistrationError::CommandFailed(_)) => Ok(()),
-        Err(error) => Err(error),
+    )?;
+    if !stopped.status.success() && !task_state()?.is_stopped() {
+        return Err(ServiceRegistrationError::CommandFailed(
+            PlatformCommandFailure::new(PlatformServiceOperation::StopRegistration, &stopped),
+        ));
+    }
+    let deadline = Instant::now().checked_add(TASK_STOP_TIMEOUT).ok_or(
+        ServiceRegistrationError::CommandTimeout(PlatformServiceOperation::StopRegistration),
+    )?;
+    loop {
+        if task_state()?.is_stopped() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceRegistrationError::CommandTimeout(
+                PlatformServiceOperation::StopRegistration,
+            ));
+        }
+        thread::sleep(TASK_STATE_RETRY_INTERVAL);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskState {
+    Disabled,
+    Queued,
+    Ready,
+    Running,
+}
+
+impl TaskState {
+    const fn is_stopped(self) -> bool {
+        matches!(self, Self::Disabled | Self::Ready)
+    }
+}
+
+fn task_state() -> Result<TaskState, ServiceRegistrationError> {
+    let output = run_bounded(
+        PlatformServiceOperation::InspectProcessState,
+        &powershell_program()?,
+        [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            TASK_STATE_SCRIPT,
+        ],
+        true,
+    )?;
+    match output.stdout.as_slice() {
+        b"1" => Ok(TaskState::Disabled),
+        b"2" => Ok(TaskState::Queued),
+        b"3" => Ok(TaskState::Ready),
+        b"4" => Ok(TaskState::Running),
+        _ => Err(ServiceRegistrationError::NativeDocument),
     }
 }
 
 fn delete_task() -> Result<(), ServiceRegistrationError> {
     run_bounded(
+        PlatformServiceOperation::RemoveRegistration,
         &system_program("schtasks.exe")?,
         ["/Delete", "/TN", REGISTRATION_IDENTITY, "/F"],
         false,
     )?;
+    if inspect()?.is_some() {
+        return Err(ServiceRegistrationError::Conflict);
+    }
     Ok(())
 }
 
 fn current_user_sid() -> Result<String, ServiceRegistrationError> {
     let output = run_bounded(
+        PlatformServiceOperation::ResolveCurrentUser,
         &system_program("whoami.exe")?,
         ["/user", "/fo", "csv", "/nh"],
         true,
     )?;
-    let text =
-        String::from_utf8(output.stdout).map_err(|_| ServiceRegistrationError::CommandOutput)?;
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        ServiceRegistrationError::CommandOutput(PlatformServiceOperation::ResolveCurrentUser)
+    })?;
     let start = text
         .find("S-1-")
         .ok_or(ServiceRegistrationError::Identity)?;
@@ -319,6 +419,19 @@ fn system_program(name: &str) -> Result<PathBuf, ServiceRegistrationError> {
         return Err(ServiceRegistrationError::UnsafePath);
     }
     Ok(root.join("System32").join(name))
+}
+
+fn powershell_program() -> Result<PathBuf, ServiceRegistrationError> {
+    let root = std::env::var_os("SystemRoot").ok_or(ServiceRegistrationError::UnsafePath)?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(ServiceRegistrationError::UnsafePath);
+    }
+    Ok(root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe"))
 }
 
 fn parse_task_semantics(text: &str) -> Result<TaskSemantics, ServiceRegistrationError> {
@@ -591,7 +704,7 @@ impl TaskValues {
         {
             return Err(ServiceRegistrationError::NativeDocument);
         }
-        exact(&self.restart_interval, "PT5S")?;
+        exact(&self.restart_interval, RESTART_INTERVAL)?;
         let restart_count = one(self.restart_count)?
             .parse::<u8>()
             .map_err(|_| ServiceRegistrationError::NativeDocument)?;
@@ -603,7 +716,7 @@ impl TaskValues {
             command: command.into(),
             arguments: arguments.into(),
             working_directory: working_directory.into(),
-            restart_interval: "PT5S".into(),
+            restart_interval: RESTART_INTERVAL.into(),
             restart_count,
         })
     }
@@ -645,6 +758,27 @@ fn is_windows_absolute(value: &str) -> bool {
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/'))
         || value.starts_with(r"\\")
+}
+
+fn scheduler_path(path: &Path) -> Result<String, ServiceRegistrationError> {
+    let value = path.to_str().ok_or(ServiceRegistrationError::Identity)?;
+    let normalized = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(drive_path) = value.strip_prefix(r"\\?\") {
+        drive_path.to_owned()
+    } else {
+        value.to_owned()
+    };
+    if normalized.starts_with(r"\\.\")
+        || normalized.starts_with(r"\??\")
+        || normalized.starts_with(r"\\?\")
+        || !is_windows_absolute(&normalized)
+        || normalized.chars().any(char::is_control)
+        || normalized.encode_utf16().count() > MAXIMUM_SCHEDULER_PATH_UNITS
+    {
+        return Err(ServiceRegistrationError::Identity);
+    }
+    Ok(normalized)
 }
 
 fn decode_task_xml(document: &[u8]) -> Result<String, ServiceRegistrationError> {

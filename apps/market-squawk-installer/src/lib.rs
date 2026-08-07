@@ -17,7 +17,7 @@ pub use self::contracts::{
     RepairRequest, RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
-    InstallError, active_program_path, active_release_root,
+    InstallActivationRecoveryFailure, InstallError, active_program_path, active_release_root,
     active_release_root_for_installed_program, install, installation_root_for_installed_program,
     program_install_snapshot, repair, rollback, stable_program_path, status, uninstall, update,
 };
@@ -29,8 +29,10 @@ pub use self::platform::{
     default_installation_data_root,
 };
 pub use self::service_registration::{
-    InstalledServiceStatus, RestartInstalledServiceRequest, ServiceRegistrationError,
-    installed_service_status, restart_installed_service, verify_installed_service,
+    InstalledServiceStatus, PlatformCommandFailure, PlatformServiceOperation,
+    RestartInstalledServiceRequest, ServiceActivationFailure, ServiceHealthFailure,
+    ServiceRegistrationError, installed_service_status, restart_installed_service,
+    verify_installed_service,
 };
 pub use self::store::StoreError;
 pub use self::update_metadata::{

@@ -25,7 +25,9 @@ use crate::manifest::{
 use crate::platform::ProgramName;
 use crate::service_registration::{
     RegistrationSpec, ServiceRegistrationError, activate_and_verify as activate_registration,
-    remove_owned as remove_owned_registration, verify as verify_registration,
+    remove_owned as remove_owned_registration,
+    remove_owned_or_prove_absent as remove_owned_registration_or_prove_absent,
+    verify as verify_registration,
 };
 use crate::store::{
     InstallStore, InstallationState, StoreError, StoredVersion, remove_tree, validate_store_parent,
@@ -591,16 +593,24 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
         Ok::<(), InstallError>(())
     })();
     if let Err(error) = precommit {
-        restore_known_good_activation(store, previous.as_ref(), state.active.target)?;
-        return Err(error);
+        return Err(recover_activation_failure(
+            store,
+            previous.as_ref(),
+            state.active.target,
+            error,
+        ));
     }
     if let Err(error) = store.write_state(&state) {
         let committed = store.load_state()?.is_some_and(|observed| {
             observed.active.manifest_sha256 == state.active.manifest_sha256
         });
         if !committed {
-            restore_known_good_activation(store, previous.as_ref(), state.active.target)?;
-            return Err(error.into());
+            return Err(recover_activation_failure(
+                store,
+                previous.as_ref(),
+                state.active.target,
+                error.into(),
+            ));
         }
     }
     store.prune(&state)?;
@@ -614,9 +624,9 @@ fn activate_service_registration(
     version: &StoredVersion,
 ) -> Result<(), InstallError> {
     let version_root = store.version_path(version);
-    let install_root = install_root_from_version(&version_root)?;
     let specification = RegistrationSpec::new(
-        install_root,
+        store.installation_data_root()?,
+        store.program_root(),
         &version_root,
         version.target,
         &version.version,
@@ -631,9 +641,9 @@ fn verify_service_registration(
     version: &StoredVersion,
 ) -> Result<(), InstallError> {
     let version_root = store.version_path(version);
-    let install_root = install_root_from_version(&version_root)?;
     let specification = RegistrationSpec::new(
-        install_root,
+        store.installation_data_root()?,
+        store.program_root(),
         &version_root,
         version.target,
         &version.version,
@@ -647,21 +657,68 @@ fn restore_known_good_activation(
     store: &InstallStore,
     previous: Option<&InstallationState>,
     failed_target: crate::platform::SupportedTarget,
-) -> Result<(), InstallError> {
-    let failed_version_root = store
-        .load_pending_activation()?
-        .map(|pending| store.version_path(&pending.active))
-        .ok_or(InstallError::CorruptInstallation)?;
-    let install_root = install_root_from_version(&failed_version_root)?;
-    remove_owned_registration(install_root, failed_target)?;
-    if let Some(previous) = previous {
-        activate_service_registration(store, &previous.active)?;
-        publish_stable_programs(store, previous)?;
-    } else {
-        clear_stable_programs(store, failed_target)?;
+) -> Result<(), KnownGoodRestorationFailure> {
+    match store.load_pending_activation() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(KnownGoodRestorationFailure::barrier(
+                RecoveryBarrier::Missing,
+            ));
+        }
+        Err(error) => {
+            return Err(KnownGoodRestorationFailure::barrier(
+                RecoveryBarrier::InspectionFailed(Box::new(error.into())),
+            ));
+        }
     }
-    store.clear_pending_activation()?;
-    Ok(())
+
+    let native = (|| {
+        remove_owned_registration_or_prove_absent(store.program_root(), failed_target)?;
+        if let Some(previous) = previous {
+            activate_service_registration(store, &previous.active)?;
+        }
+        Ok::<(), InstallError>(())
+    })()
+    .err()
+    .map(Box::new);
+    let entrypoints = match previous {
+        Some(previous) => publish_stable_programs(store, previous),
+        None => clear_stable_programs(store, failed_target),
+    }
+    .err()
+    .map(Box::new);
+
+    if native.is_none() && entrypoints.is_none() {
+        store
+            .clear_pending_activation()
+            .map_err(|error| KnownGoodRestorationFailure {
+                native: None,
+                entrypoints: None,
+                barrier: RecoveryBarrier::ClearFailed(Box::new(error.into())),
+            })
+    } else {
+        Err(KnownGoodRestorationFailure {
+            native,
+            entrypoints,
+            barrier: RecoveryBarrier::Preserved,
+        })
+    }
+}
+
+fn recover_activation_failure(
+    store: &InstallStore,
+    previous: Option<&InstallationState>,
+    failed_target: crate::platform::SupportedTarget,
+    primary: InstallError,
+) -> InstallError {
+    match restore_known_good_activation(store, previous, failed_target) {
+        Ok(()) => primary,
+        Err(recovery) => InstallActivationRecoveryFailure {
+            primary: Box::new(primary),
+            recovery,
+        }
+        .into(),
+    }
 }
 
 #[cfg(unix)]
@@ -691,13 +748,6 @@ fn clear_stable_programs(
     _target: crate::platform::SupportedTarget,
 ) -> Result<(), InstallError> {
     Ok(())
-}
-
-fn install_root_from_version(version_root: &Path) -> Result<&Path, InstallError> {
-    version_root
-        .parent()
-        .and_then(Path::parent)
-        .ok_or(InstallError::CorruptInstallation)
 }
 
 #[cfg(not(unix))]
@@ -1485,9 +1535,81 @@ fn is_path_redirect(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+#[derive(Debug)]
+enum RecoveryBarrier {
+    Preserved,
+    Missing,
+    InspectionFailed(Box<InstallError>),
+    ClearFailed(Box<InstallError>),
+}
+
+impl std::fmt::Display for RecoveryBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preserved => formatter.write_str("preserved for a deterministic retry"),
+            Self::Missing => formatter.write_str("was unexpectedly absent"),
+            Self::InspectionFailed(error) => write!(formatter, "inspection failed: {error}"),
+            Self::ClearFailed(error) => write!(formatter, "could not be cleared: {error}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct KnownGoodRestorationFailure {
+    native: Option<Box<InstallError>>,
+    entrypoints: Option<Box<InstallError>>,
+    barrier: RecoveryBarrier,
+}
+
+impl KnownGoodRestorationFailure {
+    fn barrier(barrier: RecoveryBarrier) -> Self {
+        Self {
+            native: None,
+            entrypoints: None,
+            barrier,
+        }
+    }
+}
+
+impl std::fmt::Display for KnownGoodRestorationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.native, &self.entrypoints) {
+            (None, None) => write!(formatter, "pending activation barrier {}", self.barrier),
+            (Some(native), None) => write!(
+                formatter,
+                "native service recovery failed ({native}); pending activation barrier {}",
+                self.barrier
+            ),
+            (None, Some(entrypoints)) => write!(
+                formatter,
+                "stable entrypoint recovery failed ({entrypoints}); pending activation barrier {}",
+                self.barrier
+            ),
+            (Some(native), Some(entrypoints)) => write!(
+                formatter,
+                "native service recovery failed ({native}) and stable entrypoint recovery failed \
+                 ({entrypoints}); pending activation barrier {}",
+                self.barrier
+            ),
+        }
+    }
+}
+
+/// Primary installation activation failure plus any incomplete known-good restoration.
+#[derive(Debug, Error)]
+#[error("installation activation failed: {primary}; recovery failed: {recovery}")]
+pub struct InstallActivationRecoveryFailure {
+    #[source]
+    primary: Box<InstallError>,
+    recovery: KnownGoodRestorationFailure,
+}
+
 /// Complete installation lifecycle failure.
 #[derive(Debug, Error)]
 pub enum InstallError {
+    /// Activation failed and the known-good state could not be restored completely.
+    #[error(transparent)]
+    ActivationRecoveryFailed(#[from] InstallActivationRecoveryFailure),
     /// A release manifest failed closed admission.
     #[error(transparent)]
     Manifest(#[from] ManifestError),

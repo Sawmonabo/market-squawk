@@ -12,6 +12,7 @@ mod input;
 mod rendezvous;
 mod replay;
 mod router;
+mod service_startup;
 mod streaming;
 
 pub use auth::*;
@@ -22,6 +23,7 @@ pub use input::*;
 pub use rendezvous::*;
 pub use replay::*;
 pub use router::*;
+pub use service_startup::*;
 pub use streaming::*;
 
 #[cfg(test)]
