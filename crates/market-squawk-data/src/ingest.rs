@@ -739,6 +739,11 @@ impl AnalyticalDataService {
         crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns bounded canonical-instrument publication authority over the sole catalog writer.
+    pub fn instrument_catalog(&self) -> crate::InstrumentCatalogCapability {
+        crate::InstrumentCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
     pub fn dataset_builder(&self) -> crate::DatasetBuilderService<'_> {
         crate::DatasetBuilderService::new(

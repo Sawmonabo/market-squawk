@@ -17,6 +17,47 @@ use crate::{
     ResumedProviderOnboarding,
 };
 
+/// Cloneable, bounded canonical-instrument publication authority.
+///
+/// The capability exposes only restart-safe reference-master reconciliation. It cannot access
+/// general catalog records, rights state, analytical generations, or SQLite.
+#[derive(Clone)]
+pub struct InstrumentCatalogCapability {
+    authority: Arc<Mutex<CatalogAuthority>>,
+}
+
+impl fmt::Debug for InstrumentCatalogCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstrumentCatalogCapability")
+            .field("authority", &"[SEALED INSTRUMENT CATALOG AUTHORITY]")
+            .finish()
+    }
+}
+
+impl InstrumentCatalogCapability {
+    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
+        Self { authority }
+    }
+
+    /// Atomically reconciles one bounded configured instrument universe.
+    pub fn synchronize(
+        &self,
+        instruments: &[InstrumentDefinition],
+        observed_at: Timestamp,
+        limit: CatalogLimit,
+    ) -> Result<usize, CatalogError> {
+        self.lock()?
+            .synchronize_instruments(instruments, observed_at, limit)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
+        self.authority
+            .lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)
+    }
+}
+
 /// Cloneable point-in-time instrument-definition reader without general catalog authority.
 #[derive(Clone)]
 pub struct InstrumentDefinitionReadCapability {

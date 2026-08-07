@@ -4,14 +4,16 @@ use std::sync::Arc;
 
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
-    CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildPrecommitAuthority,
-    DatasetBuildRequest, DatasetBuilder, DatasetId, FairValueCatalogCapability,
-    FeatureLabelDataset, IngestError, IngestIdentity, IngestPrecommitAuthority,
-    InstrumentDefinitionReadCapability, ManifestCatalogError, ObjectStoreConfig,
-    OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput, RightsError,
-    SourceOperation, extraction_provider_payload_digest,
+    CatalogConfig, CatalogLimit, CommittedDataset, DatasetBuildError,
+    DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder, DatasetId,
+    FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
+    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
+    ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
+    RightsError, SourceOperation, extraction_provider_payload_digest,
 };
-use market_squawk_domain::{DigestAlgorithm, ExactPayloadEvidence};
+use market_squawk_domain::{
+    DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition, Timestamp,
+};
 use market_squawk_platform::{LocalPaths, PathError};
 use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
 use sha2::{Digest as _, Sha256};
@@ -348,6 +350,19 @@ impl ResearchService {
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
     pub fn instrument_definitions(&self) -> InstrumentDefinitionReadCapability {
         self.analytical.instrument_definitions()
+    }
+
+    /// Atomically reconciles validated code/config-owned definitions before product publication.
+    pub(crate) fn synchronize_configured_instruments(
+        &self,
+        instruments: &[InstrumentDefinition],
+        observed_at: Timestamp,
+        limit: CatalogLimit,
+    ) -> Result<usize, ResearchServiceError> {
+        self.analytical
+            .instrument_catalog()
+            .synchronize(instruments, observed_at, limit)
+            .map_err(Into::into)
     }
 }
 

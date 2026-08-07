@@ -1198,7 +1198,7 @@ where
     Ok(output)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub(super) fn run_bounded_raw<I, S>(
     operation: PlatformServiceOperation,
     program: &Path,

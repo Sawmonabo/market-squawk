@@ -46,7 +46,12 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     let source_v1 = local_source("revision-1", 1)?;
     let source = local_source("revision-2", 4)?;
     let instrument_v1 = test_instrument("e93cb0b3-749f-4efe-a58c-22a788764bc0", "active")?;
-    let instrument = test_instrument("e93cb0b3-749f-4efe-a58c-22a788764bc0", "inactive")?;
+    let instrument = test_instrument_revision(
+        "e93cb0b3-749f-4efe-a58c-22a788764bc0",
+        "inactive",
+        2,
+        "0.01",
+    )?;
     let successor = test_instrument("e7c627d2-147c-45ef-b882-10aab0639db0", "active")?;
     let payload = digest(11);
     let rights_input = test_rights_input(source.source_id().clone(), payload, i64::MAX)?;
@@ -99,8 +104,30 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         catalog.register_source(&source_v1, Timestamp::from_unix_nanos(8)),
         Err(CatalogError::StaleSourceRevision)
     ));
-    catalog.put_instrument(&instrument_v1, Timestamp::from_unix_nanos(11))?;
-    catalog.put_instrument(&instrument, Timestamp::from_unix_nanos(12))?;
+    assert_eq!(
+        catalog.synchronize_instruments(
+            std::slice::from_ref(&instrument_v1),
+            Timestamp::from_unix_nanos(11),
+            CatalogLimit::new(2)?,
+        )?,
+        1
+    );
+    assert_eq!(
+        catalog.synchronize_instruments(
+            std::slice::from_ref(&instrument_v1),
+            Timestamp::from_unix_nanos(12),
+            CatalogLimit::new(2)?,
+        )?,
+        0
+    );
+    assert_eq!(
+        catalog.synchronize_instruments(
+            std::slice::from_ref(&instrument),
+            Timestamp::from_unix_nanos(12),
+            CatalogLimit::new(2)?,
+        )?,
+        1
+    );
     assert!(matches!(
         catalog.put_instrument(&instrument_v1, Timestamp::from_unix_nanos(10)),
         Err(CatalogError::StaleInstrumentRevision)

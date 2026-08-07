@@ -16,7 +16,7 @@ mod source_lifecycle;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_treasury::TreasuryFiscalQuery;
 use market_squawk_analytics::{
@@ -26,7 +26,7 @@ use market_squawk_analytics::{
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
 use market_squawk_decisions::DecisionRepositoryLimits;
-use market_squawk_domain::{RoundingPolicy, SourceIdentifier};
+use market_squawk_domain::{InstrumentDefinition, RoundingPolicy, SourceIdentifier, Timestamp};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
 use market_squawk_modeling::{TrainingEnvironmentError, verify_application_training_environment};
 use market_squawk_platform::{
@@ -119,6 +119,7 @@ const FORECAST_INDEX_BYTES: usize = LocalAuthorityStateStore::maximum_payload_by
 const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+const MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS: usize = 101;
 
 /// Returns the installed CLI path after stable-file and permission verification.
 ///
@@ -242,6 +243,14 @@ impl LocalProduct {
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
         let research = Arc::new(open_research(&paths)?);
+        let configured_instruments = configured_live_instruments(&config)?;
+        if !configured_instruments.is_empty() {
+            research.synchronize_configured_instruments(
+                &configured_instruments,
+                local_product_timestamp()?,
+                CatalogLimit::new(MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS)?,
+            )?;
+        }
         let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MAXIMUM_ARTIFACT_BYTES)
             .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
         let artifacts =
@@ -742,6 +751,63 @@ fn open_research(paths: &LocalPaths) -> Result<ResearchService, LocalProductErro
     .map_err(Into::into)
 }
 
+fn configured_live_instruments(
+    config: &AppConfig,
+) -> Result<Vec<InstrumentDefinition>, LocalProductError> {
+    let coinbase_count = config
+        .coinbase()
+        .map_or(0, |source| source.instruments().len());
+    let total = coinbase_count
+        .checked_add(usize::from(config.kraken().is_some()))
+        .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+    if total > MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS {
+        return Err(LocalProductError::InvalidCodeOwnedLimit);
+    }
+    let mut definitions = Vec::new();
+    definitions
+        .try_reserve_exact(total)
+        .map_err(|_error| LocalProductError::ConfiguredInstrumentAllocation)?;
+    if let Some(source) = config.coinbase() {
+        definitions.extend(
+            source
+                .instruments()
+                .iter()
+                .map(|mapping| mapping.definition().clone()),
+        );
+    }
+    if let Some(source) = config.kraken() {
+        definitions.push(source.definition().clone());
+    }
+    definitions.sort_by_key(InstrumentDefinition::instrument_id);
+
+    let mut canonical = Vec::<InstrumentDefinition>::new();
+    canonical
+        .try_reserve_exact(definitions.len())
+        .map_err(|_error| LocalProductError::ConfiguredInstrumentAllocation)?;
+    for definition in definitions {
+        match canonical.last() {
+            Some(previous)
+                if previous.instrument_id() == definition.instrument_id()
+                    && previous != &definition =>
+            {
+                return Err(LocalProductError::ConfiguredInstrumentConflict);
+            }
+            Some(previous) if previous.instrument_id() == definition.instrument_id() => continue,
+            _ => canonical.push(definition),
+        }
+    }
+    Ok(canonical)
+}
+
+fn local_product_timestamp() -> Result<Timestamp, LocalProductError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_error| LocalProductError::ClockRange)?;
+    let nanos =
+        i64::try_from(elapsed.as_nanos()).map_err(|_error| LocalProductError::ClockRange)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
+}
+
 pub(crate) fn local_catalog_config(paths: &LocalPaths) -> Result<CatalogConfig, LocalProductError> {
     CatalogConfig::try_new(
         paths.catalog()?.clone(),
@@ -874,6 +940,15 @@ pub enum LocalProductError {
     /// A code-owned nonzero or duration conversion was invalid.
     #[error("local product code-owned limit is invalid")]
     InvalidCodeOwnedLimit,
+    /// Configured live definitions exceeded bounded allocation capacity.
+    #[error("configured live instrument publication allocation failed")]
+    ConfiguredInstrumentAllocation,
+    /// Two configured live providers supplied incompatible definitions for one stable identity.
+    #[error("configured live providers disagree on one canonical instrument definition")]
+    ConfiguredInstrumentConflict,
+    /// System wall-clock time cannot be represented by the domain timestamp.
+    #[error("local product wall clock is outside the supported timestamp range")]
+    ClockRange,
     /// Existing durable model generations require their signed training release.
     #[error("durable model admissions require the configured signed training release")]
     TrainingReleaseRequired,

@@ -67,7 +67,8 @@ pub use catalog::{
     StoredObservedRevision,
 };
 pub use catalog_capabilities::{
-    FairValueCatalogCapability, InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
+    FairValueCatalogCapability, InstrumentCatalogCapability, InstrumentDefinitionReadCapability,
+    OnboardingCatalogCapability,
 };
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
