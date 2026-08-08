@@ -129,17 +129,29 @@ impl EphemeralVerificationRoot {
     pub fn try_new(root: impl AsRef<Path>) -> Result<Self, InstalledServiceError> {
         let root = root.as_ref();
         if !root.is_absolute() {
-            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot(
+                "the root is not absolute",
+            ));
         }
         let selected = canonical_candidate(root)?;
         let default = canonical_candidate(&default_installation_data_root()?)?;
         if selected == default {
-            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+            return Err(InstalledServiceError::InvalidEphemeralVerificationRoot(
+                "the root resolves to the default installation root",
+            ));
         }
         match std::fs::symlink_metadata(root) {
-            Ok(metadata)
-                if metadata.file_type().is_dir() && std::fs::read_dir(root)?.next().is_none() => {}
-            Ok(_) => return Err(InstalledServiceError::InvalidEphemeralVerificationRoot),
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(InstalledServiceError::InvalidEphemeralVerificationRoot(
+                    "the root exists but is not a real directory",
+                ));
+            }
+            Ok(_) if std::fs::read_dir(root)?.next().is_some() => {
+                return Err(InstalledServiceError::InvalidEphemeralVerificationRoot(
+                    "the root directory is not empty",
+                ));
+            }
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1089,7 +1101,9 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf, InstalledServiceError> {
             )
         })
     {
-        return Err(InstalledServiceError::InvalidEphemeralVerificationRoot);
+        return Err(InstalledServiceError::InvalidEphemeralVerificationRoot(
+            "the root contains unsupported path components",
+        ));
     }
 
     let mut unresolved = Vec::new();
@@ -1106,12 +1120,16 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf, InstalledServiceError> {
                 unresolved.push(
                     existing
                         .file_name()
-                        .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?
+                        .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot(
+                            "the root cannot be canonicalized safely",
+                        ))?
                         .to_owned(),
                 );
-                existing = existing
-                    .parent()
-                    .ok_or(InstalledServiceError::InvalidEphemeralVerificationRoot)?;
+                existing = existing.parent().ok_or(
+                    InstalledServiceError::InvalidEphemeralVerificationRoot(
+                        "the root cannot be canonicalized safely",
+                    ),
+                )?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -1269,8 +1287,8 @@ pub enum InstalledServiceError {
     #[error("the installed-service authority root must be absolute")]
     InvalidInstallationRoot,
     /// A destructive verification root was not fresh, absolute, and distinct from the live root.
-    #[error("ephemeral verification requires a fresh, absolute, non-default installation root")]
-    InvalidEphemeralVerificationRoot,
+    #[error("ephemeral verification root is invalid: {0}")]
+    InvalidEphemeralVerificationRoot(&'static str),
     /// Another process owns the installed-service instance authority.
     #[error("the installed Market Squawk service is already running")]
     AlreadyRunning,

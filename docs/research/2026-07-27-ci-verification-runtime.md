@@ -408,6 +408,37 @@ A correct implementation must emit only absolute, existing Git metadata paths an
 normal checkout, linked worktrees, symbolic refs, detached `HEAD`, and packed refs. Simply joining
 the repository root with `.git/HEAD` would not cover all of those Git layouts.
 
+#### 2026-08-08 follow-up: authoritative Git identity must not invalidate ordinary builds
+
+The absolute-path correction removed the perpetual missing-file rebuild, but retaining a valid Git
+metadata watch in every non-authoritative all-feature build still made any commit rebuild
+`market-squawk-platform` and its large downstream graph. This was especially costly when only a
+verification script or documentation changed: the shipping Rust inputs were unchanged, but the
+release binaries relinked for approximately 12 minutes on the maintained Apple Silicon development
+system.
+
+Cargo recommends narrowing build-script change detection to the inputs that actually require the
+script to rerun, and its fingerprints use the emitted `rerun-if-changed` paths
+([Cargo build scripts](https://doc.rust-lang.org/cargo/reference/build-scripts.html), reviewed
+2026-08-08). Reproducible Builds likewise distinguishes deterministic source/version identity from
+incidental build-time state
+([version information](https://reproducible-builds.org/docs/version-information/), reviewed
+2026-08-08).
+
+The maintained boundary is therefore:
+
+- a clean, explicitly authoritative capture benchmark reads the full Git object ID, verifies the
+  clean tree, and watches the checkout's resolved `HEAD`, symbolic reference, and packed references;
+- an ordinary non-authoritative build emits the existing 40-zero unverified identity convention and
+  does not read or watch Git metadata;
+- Cargo's normal source, manifest, lockfile, feature, and build-script fingerprints continue to
+  invalidate binaries when shipping inputs change; and
+- release/package evidence binds the exact commit, tree, complete source closure, and component
+  manifest outside the Rust compilation graph.
+
+This preserves exact benchmark and release provenance while preventing unrelated repository commits
+from masquerading as shipping-code changes.
+
 ### 3. Loom repeats the invalidated build
 
 `scripts/run_exact_loom_gate.sh` correctly compares the discovered reserved models with an explicit

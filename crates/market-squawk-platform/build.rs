@@ -15,6 +15,7 @@ const MAX_SOURCE_ENTRIES: usize = 20_000;
 const MAX_SOURCE_DEPTH: usize = 32;
 const MAX_SOURCE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SOURCE_INVENTORY_BYTES: u64 = 64 * 1024 * 1024;
+const UNVERIFIED_GIT_HEAD: &str = "0000000000000000000000000000000000000000";
 
 const IMMUTABLE_MODULES: [(&str, &str); 8] = [
     ("benchmark_identity", "benchmark_identity.rs"),
@@ -203,10 +204,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     for path in &build_support_paths {
         rerun(path);
     }
-    let git_head = command(&git_executable, repository, &["rev-parse", "HEAD"])?;
-    if !is_lower_git_head(&git_head) {
-        return Err("Git HEAD is not a full hexadecimal object ID".into());
-    }
     let clean_build_enforced = match std::env::var("CAPTURE_BENCH_REQUIRE_CLEAN_BUILD") {
         Ok(value) if value == "1" => {
             if !command(
@@ -224,6 +221,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(std::env::VarError::NotPresent) => false,
         Err(error) => return Err(error.into()),
     };
+    let git_head = if clean_build_enforced {
+        let head = command(&git_executable, repository, &["rev-parse", "HEAD"])?;
+        if !is_lower_git_head(&head) {
+            return Err("Git HEAD is not a full hexadecimal object ID".into());
+        }
+        head
+    } else {
+        UNVERIFIED_GIT_HEAD.to_owned()
+    };
     let build_environment = if clean_build_enforced {
         validate_authoritative_build_environment()?
     } else {
@@ -240,19 +246,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     if build_environment.evidence_backend != selected_backend.as_str() {
         return Err("compiled backend differs from its build-environment identity".into());
     }
-    let head_path = git_metadata_path(&git_executable, repository, "HEAD")?
-        .ok_or("Git HEAD metadata path is unavailable")?;
-    rerun(&head_path);
-    if let Ok(reference) = command(
-        &git_executable,
-        repository,
-        &["symbolic-ref", "--quiet", "HEAD"],
-    ) && let Some(path) = git_metadata_path(&git_executable, repository, &reference)?
-    {
-        rerun(&path);
-    }
-    if let Some(path) = git_metadata_path(&git_executable, repository, "packed-refs")? {
-        rerun(&path);
+    if clean_build_enforced {
+        let head_path = git_metadata_path(&git_executable, repository, "HEAD")?
+            .ok_or("Git HEAD metadata path is unavailable")?;
+        rerun(&head_path);
+        if let Ok(reference) = command(
+            &git_executable,
+            repository,
+            &["symbolic-ref", "--quiet", "HEAD"],
+        ) && let Some(path) = git_metadata_path(&git_executable, repository, &reference)?
+        {
+            rerun(&path);
+        }
+        if let Some(path) = git_metadata_path(&git_executable, repository, "packed-refs")? {
+            rerun(&path);
+        }
     }
     let source_inventory =
         inventory_hash(repository, platform_sources.iter().chain(&domain_sources))?;

@@ -3433,8 +3433,8 @@
     },
     {
       "path": "apps/market-squawk/src/service/mod.rs",
-      "sha256": "e2b9791433ab871e99cc6821da7d512b2299eac12d8d1ed204b66749402f647e",
-      "size_bytes": 58426
+      "sha256": "6c2457095ec487619d3b6e81a5f7302b80aa57150bf9c66a1f713fec7956536a",
+      "size_bytes": 59103
     },
     {
       "path": "apps/market-squawk/src/service/operations.rs",
@@ -5453,8 +5453,8 @@
     },
     {
       "path": "crates/market-squawk-platform/build.rs",
-      "sha256": "d01fe3ac27abe813a413b3f0e91c1ca6c6fe64b5fad634f820ffea214df30f56",
-      "size_bytes": 29075
+      "sha256": "ccbb03c4d01d33c0e5db882533f7e90e762c598c5f641179778d2e4767714c40",
+      "size_bytes": 29370
     },
     {
       "path": "crates/market-squawk-platform/build_support.rs",
