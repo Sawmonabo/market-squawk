@@ -2,6 +2,7 @@
 
 mod capture;
 mod classification;
+mod company_identity;
 mod denomination;
 mod digest;
 mod evidence;
@@ -41,6 +42,11 @@ pub use classification::{
     SnapshotApplicability, SnapshotConsistency, SnapshotEvidence, SnapshotState,
     SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment, StreamIntegrityState,
     TimestampIntegrity,
+};
+pub use company_identity::{
+    CompanyIdentityError, CompanyIdentityObservation, CompanyIdentityObservationInput,
+    CompanyIdentitySurface, FormerCompanyName, MAX_COMPANY_FORMER_NAMES,
+    MAX_COMPANY_SECURITY_ASSOCIATIONS, ProviderReportedSecurityAssociation,
 };
 pub use denomination::Denomination;
 pub use digest::DigestAlgorithm;

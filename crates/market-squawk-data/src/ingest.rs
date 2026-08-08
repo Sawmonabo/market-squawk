@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+};
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
     ObservedRevisionAuthority, ObservedRevisionError, SourceClass, SourceMetadata,
@@ -739,6 +741,11 @@ impl AnalyticalDataService {
         crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns bounded company-identity reads over this service's sole catalog session.
+    pub fn company_identities(&self) -> crate::CompanyIdentityReadCapability {
+        crate::CompanyIdentityReadCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns bounded canonical-instrument publication authority over the sole catalog writer.
     pub fn instrument_catalog(&self) -> crate::InstrumentCatalogCapability {
         crate::InstrumentCatalogCapability::new(Arc::clone(&self.authority))
@@ -933,6 +940,7 @@ impl AnalyticalDataService {
             request.source().dataset_id(),
             &schema,
             &object,
+            None,
         )? {
             return Ok(committed);
         }
@@ -948,6 +956,7 @@ impl AnalyticalDataService {
             plan,
             published,
             GenerationKind::Compaction,
+            None,
             None,
         )
     }
@@ -1003,17 +1012,28 @@ impl AnalyticalDataService {
         recovery.finish().map_err(map_recovery_store_error)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ingestion retains revision, identity, cancellation, and precommit authority explicitly"
+    )]
     async fn ingest_batch(
         &self,
         reservation: IngestReservation,
         analytical_dataset: DatasetId,
         batch: ExtractionBatch,
         revision_plan: Option<ExtractionRevisionPlan>,
+        company_identity: Option<CompanyIdentityObservation>,
         cancellation: CancellationToken,
         precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_provider_payload_digest(&batch);
         let source_id = batch.request().object().source_id().clone();
+        if company_identity.as_ref().is_some_and(|identity| {
+            identity.source_id() != &source_id
+                || identity.parent_ingest_payload_evidence().content_digest() != payload_digest
+        }) {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
         let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
             .map_err(|_| IngestError::InvalidDataset)?;
         {
@@ -1028,6 +1048,7 @@ impl AnalyticalDataService {
                 &reservation,
                 run.state(),
                 &analytical_dataset,
+                company_identity.as_ref(),
             )? {
                 return Ok(committed);
             }
@@ -1110,6 +1131,7 @@ impl AnalyticalDataService {
             &analytical_dataset,
             &schema,
             &object,
+            company_identity.as_ref(),
         )? {
             return Ok(committed);
         }
@@ -1126,6 +1148,7 @@ impl AnalyticalDataService {
             published,
             GenerationKind::Ingest,
             precommit_authority.as_deref(),
+            company_identity.as_ref(),
         )
     }
 
@@ -1142,6 +1165,7 @@ impl AnalyticalDataService {
             reservation,
             analytical_dataset,
             batch,
+            None,
             None,
             cancellation,
             Some(precommit_authority),
@@ -1164,6 +1188,56 @@ impl AnalyticalDataService {
             analytical_dataset,
             batch,
             Some(revisions),
+            None,
+            cancellation,
+            Some(precommit_authority),
+        )
+        .await
+    }
+
+    /// Ingests provider revisions and atomically publishes source-authored company identity.
+    pub async fn ingest_with_revision_plan_and_company_identity(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        company_identity: CompanyIdentityObservation,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(company_identity),
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Ingests provider revisions and atomically publishes source-authored company identity.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "provider revision, identity, cancellation, and publication authority stay explicit"
+    )]
+    pub async fn ingest_with_revision_plan_company_identity_and_precommit_authority(
+        &self,
+        reservation: IngestReservation,
+        analytical_dataset: DatasetId,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        company_identity: CompanyIdentityObservation,
+        cancellation: CancellationToken,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(
+            reservation,
+            analytical_dataset,
+            batch,
+            Some(revisions),
+            Some(company_identity),
             cancellation,
             Some(precommit_authority),
         )
@@ -1198,6 +1272,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_id: &DatasetId,
+        company_identity: Option<&CompanyIdentityObservation>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -1211,14 +1286,26 @@ impl AnalyticalDataService {
         }
         match state {
             IngestRunState::Reserved => {
-                authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
+                authority.complete_ingest_with_company_identity(
+                    reservation,
+                    ContractCompletion::Succeeded,
+                    company_identity,
+                )?;
             }
-            IngestRunState::Succeeded => {}
+            IngestRunState::Succeeded => {
+                if let Some(company_identity) = company_identity {
+                    authority.reconcile_company_identity(reservation, company_identity)?;
+                }
+            }
             IngestRunState::Failed => return Err(IngestError::TerminalRun),
         }
         Ok(Some(CommittedDataset::new(existing)))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "recovery compares the exact run, generation, schema, object, and identity evidence"
+    )]
     fn reconcile_existing(
         &self,
         authority: &CatalogAuthority,
@@ -1227,6 +1314,7 @@ impl AnalyticalDataService {
         dataset_id: &DatasetId,
         schema: &DatasetSchemaRef,
         object: &ManifestObject,
+        company_identity: Option<&CompanyIdentityObservation>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -1243,9 +1331,17 @@ impl AnalyticalDataService {
         }
         match state {
             IngestRunState::Reserved => {
-                authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
+                authority.complete_ingest_with_company_identity(
+                    reservation,
+                    ContractCompletion::Succeeded,
+                    company_identity,
+                )?;
             }
-            IngestRunState::Succeeded => {}
+            IngestRunState::Succeeded => {
+                if let Some(company_identity) = company_identity {
+                    authority.reconcile_company_identity(reservation, company_identity)?;
+                }
+            }
             IngestRunState::Failed => return Err(IngestError::TerminalRun),
         }
         Ok(Some(CommittedDataset::new(existing)))
@@ -1266,6 +1362,7 @@ impl AnalyticalDataService {
         published: PublishedObject,
         kind: GenerationKind,
         precommit_authority: Option<&dyn IngestPrecommitAuthority>,
+        company_identity: Option<&CompanyIdentityObservation>,
     ) -> Result<CommittedDataset, IngestError> {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
@@ -1299,7 +1396,11 @@ impl AnalyticalDataService {
                 GenerationKind::Compaction | GenerationKind::Derived => None,
             },
         )?;
-        authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
+        authority.complete_ingest_with_company_identity(
+            reservation,
+            ContractCompletion::Succeeded,
+            company_identity,
+        )?;
         Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?))
     }
 
@@ -1358,6 +1459,7 @@ impl ResearchIngestService for AnalyticalDataService {
             analytical_dataset,
             batch,
             None,
+            None,
             cancellation,
             None,
         )
@@ -1377,6 +1479,7 @@ impl ResearchIngestService for AnalyticalDataService {
             analytical_dataset,
             batch,
             Some(revisions),
+            None,
             cancellation,
             None,
         )

@@ -7,8 +7,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
-    AvailabilityEvidence, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    ProviderIdentityRegistry, ResearchContext, ResearchObservation, SourceId, SourceIdentifier,
+    AvailabilityEvidence, CompanyIdentityObservation, CompanyIdentityObservationInput,
+    CompanyIdentitySurface, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
+    FormerCompanyName, ProviderIdentityRegistry, ProviderReportedSecurityAssociation,
+    ResearchContext, ResearchObservation, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    VersionPinnedSourceLocator,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
@@ -21,12 +24,44 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    RawEvidenceStore, RetrievedCompanyFacts, SecClientError, SecCompositeBounds, SecEdgarSource,
-    SecNormalizationError, SecParserError, SecParserLimits,
-    normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
+    RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions,
+    SecClientError, SecCompositeBounds, SecEdgarSource, SecNormalizationError, SecParserError,
+    SecParserLimits, normalize_company_facts_with_cancellation,
+    normalize_filings_with_cancellation,
 };
 
 const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
+
+/// SEC analytical extraction paired with optional evidence-bound company identity.
+///
+/// Company identity remains research metadata and cannot establish a tradable instrument, venue
+/// mapping, or execution-quality observation.
+#[derive(Debug)]
+pub struct SecExtractionResult {
+    batch: ExtractionBatch,
+    company_identity: Option<CompanyIdentityObservation>,
+}
+
+impl SecExtractionResult {
+    /// Returns the ordinary source-agnostic analytical batch.
+    pub const fn batch(&self) -> &ExtractionBatch {
+        &self.batch
+    }
+
+    /// Returns identity evidence parsed from the same exact retrieved representation.
+    pub const fn company_identity(&self) -> Option<&CompanyIdentityObservation> {
+        self.company_identity.as_ref()
+    }
+
+    /// Consumes this result into its analytical and identity components.
+    pub fn into_parts(self) -> (ExtractionBatch, Option<CompanyIdentityObservation>) {
+        (self.batch, self.company_identity)
+    }
+
+    fn into_batch(self) -> ExtractionBatch {
+        self.batch
+    }
+}
 
 impl SecEdgarSource {
     /// Builds provider-owned revision evidence aligned to one extracted SEC batch.
@@ -66,6 +101,55 @@ impl SecEdgarSource {
             )?);
         }
         ExtractionRevisionPlan::try_new(evidence).map_err(Into::into)
+    }
+
+    /// Extracts SEC analytical records with company identity from the same exact source bytes.
+    ///
+    /// The ordinary [`ExtractionSource`] implementation delegates here and discards only the
+    /// adapter-specific sidecar. Callers that own company-identity publication use this method so
+    /// no second raw-store read or parser pass is required.
+    pub fn extract_with_company_identity(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<SecExtractionResult, ExtractionSourceError>> {
+        let raw_store = self.raw_store();
+        let identities = self.identity_registry();
+        let source_id = self.metadata().source_id().clone();
+        Box::pin(async move {
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            let remaining = deadline_remaining(request.deadline())?;
+            let worker_cancellation = cancellation.child_token();
+            let worker_authority = authority.clone();
+            let worker = self.run_validation_blocking(&worker_cancellation, move |worker_token| {
+                extract_blocking(
+                    request,
+                    raw_store,
+                    identities,
+                    source_id,
+                    worker_authority,
+                    worker_token,
+                )
+            });
+            tokio::pin!(worker);
+            tokio::select! {
+                result = &mut worker => {
+                    let extracted = result.map_err(map_client_error)?;
+                    self.validate_authority(&authority).map_err(map_client_error)?;
+                    Ok(extracted)
+                },
+                () = tokio::time::sleep(remaining) => {
+                    worker_cancellation.cancel();
+                    Err(ExtractionSourceError::DeadlineExceeded)
+                }
+                () = cancellation.cancelled() => {
+                    worker_cancellation.cancel();
+                    Err(ExtractionSourceError::Cancelled)
+                }
+            }
+        })
     }
 }
 
@@ -166,42 +250,8 @@ impl ExtractionSource for SecEdgarSource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        let raw_store = self.raw_store();
-        let identities = self.identity_registry();
-        let source_id = self.metadata().source_id().clone();
-        Box::pin(async move {
-            self.validate_authority(&authority)
-                .map_err(map_client_error)?;
-            let remaining = deadline_remaining(request.deadline())?;
-            let worker_cancellation = cancellation.child_token();
-            let worker_authority = authority.clone();
-            let worker = self.run_validation_blocking(&worker_cancellation, move |worker_token| {
-                extract_blocking(
-                    request,
-                    raw_store,
-                    identities,
-                    source_id,
-                    worker_authority,
-                    worker_token,
-                )
-            });
-            tokio::pin!(worker);
-            tokio::select! {
-                result = &mut worker => {
-                    let batch = result.map_err(map_client_error)?;
-                    self.validate_authority(&authority).map_err(map_client_error)?;
-                    Ok(batch)
-                },
-                () = tokio::time::sleep(remaining) => {
-                    worker_cancellation.cancel();
-                    Err(ExtractionSourceError::DeadlineExceeded)
-                }
-                () = cancellation.cancelled() => {
-                    worker_cancellation.cancel();
-                    Err(ExtractionSourceError::Cancelled)
-                }
-            }
-        })
+        let extracted = self.extract_with_company_identity(authority, request, cancellation);
+        Box::pin(async move { extracted.await.map(SecExtractionResult::into_batch) })
     }
 }
 
@@ -212,7 +262,7 @@ fn extract_blocking(
     source_id: SourceId,
     authority: ExtractionAuthority,
     cancellation: &CancellationToken,
-) -> Result<ExtractionBatch, SecClientError> {
+) -> Result<SecExtractionResult, SecClientError> {
     authority.validate_current()?;
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
@@ -229,44 +279,61 @@ fn extract_blocking(
     };
     let parser_limits = request_parser_limits(&request, bytes.len())?;
     let ingested_at = crate::client::system_timestamp()?;
-    let observations = match DatasetLocator::parse(request.object().dataset().as_str())
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
-    {
-        DatasetLocator::Submissions(_) => {
-            let retrieved = crate::composite::restore_online_submissions(
-                &raw_store,
-                &bytes,
-                request.object().evidence().content_digest(),
-                SecCompositeBounds::production_defaults(),
-                parser_limits,
-                cancellation,
-            )?;
-            normalize_filings_with_cancellation(
-                &source_id,
-                &identities,
-                &retrieved,
-                ingested_at,
-                cancellation,
-            )?
-        }
-        DatasetLocator::CompanyFacts(_) => {
-            let retrieved = RetrievedCompanyFacts::restored(
-                bytes,
-                request.object().evidence().content_digest(),
-                received_at,
-                availability,
-                parser_limits,
-                cancellation,
-            )?;
-            normalize_company_facts_with_cancellation(
-                &source_id,
-                &identities,
-                &retrieved,
-                ingested_at,
-                cancellation,
-            )?
-        }
-    };
+    let (observations, company_identity) =
+        match DatasetLocator::parse(request.object().dataset().as_str())
+            .map_err(|_| SecClientError::InvalidCompositeRepresentation)?
+        {
+            DatasetLocator::Submissions(_) => {
+                let retrieved = crate::composite::restore_online_submissions(
+                    &raw_store,
+                    &bytes,
+                    request.object().evidence().content_digest(),
+                    SecCompositeBounds::production_defaults(),
+                    parser_limits,
+                    cancellation,
+                )?;
+                let observations = normalize_filings_with_cancellation(
+                    &source_id,
+                    &identities,
+                    &retrieved,
+                    ingested_at,
+                    cancellation,
+                )?;
+                let company_identity = company_identity_from_submissions(
+                    &request,
+                    &source_id,
+                    &retrieved,
+                    ingested_at,
+                    cancellation,
+                )?;
+                (observations, Some(company_identity))
+            }
+            DatasetLocator::CompanyFacts(_) => {
+                let retrieved = RetrievedCompanyFacts::restored(
+                    bytes,
+                    request.object().evidence().content_digest(),
+                    received_at,
+                    availability,
+                    parser_limits,
+                    cancellation,
+                )?;
+                let observations = normalize_company_facts_with_cancellation(
+                    &source_id,
+                    &identities,
+                    &retrieved,
+                    ingested_at,
+                    cancellation,
+                )?;
+                let company_identity = company_identity_from_company_facts(
+                    &request,
+                    &source_id,
+                    &retrieved,
+                    ingested_at,
+                    cancellation,
+                )?;
+                (observations, Some(company_identity))
+            }
+        };
     authority.validate_current()?;
     let mut records = Vec::new();
     records
@@ -288,7 +355,124 @@ fn extract_blocking(
     let batch = ExtractionBatch::try_new(&request, records)
         .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
     authority.validate_current()?;
-    Ok(batch)
+    Ok(SecExtractionResult {
+        batch,
+        company_identity,
+    })
+}
+
+fn company_identity_from_submissions(
+    request: &ExtractionRequest,
+    source_id: &SourceId,
+    retrieved: &RetrievedSubmissions,
+    ingested_at: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<CompanyIdentityObservation, SecClientError> {
+    if cancellation.is_cancelled() {
+        return Err(SecClientError::Cancelled);
+    }
+    let metadata = retrieved.document().company_metadata();
+    let mut former_names = Vec::new();
+    former_names
+        .try_reserve_exact(metadata.former_names().len())
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    for former_name in metadata.former_names() {
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        former_names.push(FormerCompanyName::try_new(
+            former_name.name(),
+            former_name.effective_from(),
+            former_name.effective_to(),
+        )?);
+    }
+    let mut associations = Vec::new();
+    associations
+        .try_reserve_exact(metadata.ticker_exchange_pairs().len())
+        .map_err(|_| SecClientError::AllocationFailed)?;
+    for association in metadata.ticker_exchange_pairs() {
+        if cancellation.is_cancelled() {
+            return Err(SecClientError::Cancelled);
+        }
+        associations.push(ProviderReportedSecurityAssociation::try_new(
+            association.ticker(),
+            association.exchange(),
+        )?);
+    }
+    let identity_raw = retrieved.current_component();
+    CompanyIdentityObservation::try_new(CompanyIdentityObservationInput {
+        schema_version: SchemaVersion::CURRENT,
+        source_id: source_id.clone(),
+        provider_company_id: retrieved.document().cik().clone(),
+        surface: CompanyIdentitySurface::SecSubmissions,
+        conformed_name: metadata.conformed_name().to_owned(),
+        former_names,
+        entity_type: metadata.entity_type().map(str::to_owned),
+        sic: metadata.sic().map(str::to_owned),
+        sic_description: metadata.sic_description().map(str::to_owned),
+        associations,
+        parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
+            request.object().evidence().content_digest(),
+        ),
+        identity_payload_evidence: retrieved_payload_evidence(identity_raw)?,
+        received_at: identity_raw.received_at(),
+        availability: identity_raw.availability().clone(),
+        ingested_at,
+        quality: DataQuality::OfficialDelayed,
+    })
+    .map_err(Into::into)
+}
+
+fn company_identity_from_company_facts(
+    request: &ExtractionRequest,
+    source_id: &SourceId,
+    retrieved: &RetrievedCompanyFacts,
+    ingested_at: Timestamp,
+    cancellation: &CancellationToken,
+) -> Result<CompanyIdentityObservation, SecClientError> {
+    if cancellation.is_cancelled() {
+        return Err(SecClientError::Cancelled);
+    }
+    let identity_raw = retrieved.raw();
+    CompanyIdentityObservation::try_new(CompanyIdentityObservationInput {
+        schema_version: SchemaVersion::CURRENT,
+        source_id: source_id.clone(),
+        provider_company_id: retrieved.document().cik().clone(),
+        surface: CompanyIdentitySurface::SecCompanyFacts,
+        conformed_name: retrieved.document().entity_name().to_owned(),
+        former_names: Vec::new(),
+        entity_type: None,
+        sic: None,
+        sic_description: None,
+        associations: Vec::new(),
+        parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
+            request.object().evidence().content_digest(),
+        ),
+        identity_payload_evidence: retrieved_payload_evidence(identity_raw)?,
+        received_at: identity_raw.received_at(),
+        availability: identity_raw.availability().clone(),
+        ingested_at,
+        quality: DataQuality::OfficialDelayed,
+    })
+    .map_err(Into::into)
+}
+
+fn retrieved_payload_evidence(
+    retrieved: &RetrievedSecBytes,
+) -> Result<ExactPayloadEvidence, SecClientError> {
+    match (retrieved.locator(), retrieved.retrieval_revision()) {
+        (Some(locator), Some(revision)) => Ok(ExactPayloadEvidence::with_version_pinned_locator(
+            retrieved.evidence(),
+            VersionPinnedSourceLocator::new(
+                SourceIdentifier::try_from(locator)?,
+                SourceIdentifier::try_from(revision.to_string())?,
+            ),
+        )),
+        (None, None) => Ok(ExactPayloadEvidence::from_content_digest(
+            retrieved.evidence(),
+        )),
+        _ => Err(SecClientError::InvalidCompositeRepresentation),
+    }
 }
 
 fn canonical_record(
@@ -462,6 +646,7 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
             return ExtractionSourceError::Cancelled;
         }
         SecClientError::Parser(_)
+        | SecClientError::CompanyIdentity(_)
         | SecClientError::Normalization(_)
         | SecClientError::Xbrl(_)
         | SecClientError::RevisionAuthority(_)

@@ -1,8 +1,9 @@
 use std::error::Error;
 
+use cap_std::{ambient_authority, fs::Dir};
 use market_squawk_adapter_sec::{
-    CompanyFactsDocument, SecCompositeBounds, SecParserError, SecParserLimits, SubmissionsDocument,
-    reconcile_submissions,
+    CompanyFactsDocument, RawEvidenceStore, RetrievedSubmissions, SecCompositeBounds,
+    SecParserError, SecParserLimits, SubmissionsDocument, reconcile_submissions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -20,8 +21,42 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
         limits,
     )?;
     let reconciled = reconcile_submissions(&recent, &[archive], limits)?;
+    let temporary = tempfile::tempdir()?;
+    let raw_store = RawEvidenceStore::new(Dir::open_ambient_dir(
+        temporary.path(),
+        ambient_authority(),
+    )?);
+    let retrieved = RetrievedSubmissions::import_exact_bytes(
+        include_bytes!("../fixtures/submissions-recent.json"),
+        &[include_bytes!("../fixtures/submissions-archive.json")],
+        &raw_store,
+        limits,
+    )?;
+    assert_eq!(
+        retrieved.current_component().bytes().as_ref(),
+        include_bytes!("../fixtures/submissions-recent.json")
+    );
 
     assert_eq!(reconciled.cik().as_str(), "0000320193");
+    let metadata = reconciled.company_metadata();
+    assert_eq!(metadata.conformed_name(), "APPLE INC");
+    assert_eq!(metadata.entity_type(), Some("operating"));
+    assert_eq!(metadata.sic(), Some("3571"));
+    assert_eq!(metadata.sic_description(), Some("Electronic Computers"));
+    assert_eq!(metadata.ticker_exchange_pairs().len(), 1);
+    assert_eq!(metadata.ticker_exchange_pairs()[0].ticker(), "AAPL");
+    assert_eq!(metadata.ticker_exchange_pairs()[0].exchange(), "Nasdaq");
+    let former_name_document = br#"{
+        "cik":"0000320193","name":"Apple Inc.",
+        "formerNames":[{"name":"APPLE COMPUTER INC","from":"1994-01-26T05:00:00.000Z","to":"2007-01-04T05:00:00.000Z"}],
+        "tickers":["AAPL"],"exchanges":["Nasdaq"],
+        "filings":{"recent":{"accessionNumber":[],"filingDate":[],"reportDate":[],"acceptanceDateTime":[],"form":[]},"files":[]}
+    }"#;
+    let former_name = SubmissionsDocument::parse(former_name_document, limits)?;
+    assert_eq!(
+        former_name.company_metadata().former_names()[0].name(),
+        "APPLE COMPUTER INC"
+    );
     assert_eq!(reconciled.filings().len(), 3);
     assert_eq!(
         reconciled
@@ -49,6 +84,7 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
     let facts =
         CompanyFactsDocument::parse(include_bytes!("../fixtures/company-facts.json"), limits)?;
     assert_eq!(facts.cik().as_str(), "0000320193");
+    assert_eq!(facts.entity_name(), "APPLE INC");
     assert_eq!(facts.occurrences().len(), 3);
     let loss = facts
         .occurrences()
@@ -69,6 +105,7 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
 
     let high_precision = br#"{
         "cik":"0000320193",
+        "entityName":"APPLE INC",
         "facts":{"us-gaap":{"ExactRatio":{"units":{"pure":[{
             "val":0.1234567890123456789012345678,
             "accn":"0000320193-25-000079","form":"10-Q",
@@ -88,6 +125,7 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
     assert!(SecCompositeBounds::try_new(0, 1).is_err());
     let mismatched = br#"{
         "cik":"0000320193",
+        "name":"APPLE INC","tickers":[],"exchanges":[],
         "filings":{"recent":{"accessionNumber":["0000320193-25-000079"],"form":[]},"files":[]}
     }"#;
     assert!(
@@ -103,6 +141,28 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
             .is_err(),
         "ambiguous duplicate JSON keys must fail closed"
     );
+    let mismatched_associations = br#"{
+        "cik":"0000320193","name":"APPLE INC",
+        "tickers":["AAPL"],"exchanges":[]
+    }"#;
+    assert!(matches!(
+        SubmissionsDocument::parse(
+            mismatched_associations,
+            SecParserLimits::production_defaults()
+        ),
+        Err(SecParserError::MetadataAssociationLengthMismatch)
+    ));
+    let duplicate_association = br#"{
+        "cik":"0000320193","name":"APPLE INC",
+        "tickers":["AAPL","AAPL"],"exchanges":["Nasdaq","Nasdaq"]
+    }"#;
+    assert!(matches!(
+        SubmissionsDocument::parse(
+            duplicate_association,
+            SecParserLimits::production_defaults()
+        ),
+        Err(SecParserError::DuplicateMetadataAssociation)
+    ));
 
     let one_record = SecParserLimits::try_new(1024 * 1024, 1, 128, 16, 64 * 1024, 4 * 1024 * 1024)?;
     assert!(

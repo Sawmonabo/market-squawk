@@ -4,15 +4,16 @@ use std::sync::Arc;
 
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
-    CatalogConfig, CatalogLimit, CommittedDataset, DatasetBuildError,
-    DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder, DatasetId,
-    FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
+    CatalogConfig, CatalogLimit, CommittedDataset, CompanyIdentityReadCapability,
+    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
+    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
     IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
     ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput,
     RightsError, SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition, Timestamp,
+    CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
+    Timestamp,
 };
 use market_squawk_platform::{LocalPaths, PathError};
 use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
@@ -30,6 +31,7 @@ pub struct ResearchIngestRequest {
     analytical_dataset: DatasetId,
     batch: ExtractionBatch,
     revisions: Option<ExtractionRevisionPlan>,
+    company_identity: Option<CompanyIdentityObservation>,
     precommit_authority: Option<Arc<dyn IngestPrecommitAuthority>>,
 }
 
@@ -88,6 +90,7 @@ impl ResearchIngestRequest {
             analytical_dataset,
             batch,
             revisions,
+            company_identity: None,
             precommit_authority: None,
         })
     }
@@ -98,6 +101,23 @@ impl ResearchIngestRequest {
     ) -> Self {
         self.precommit_authority = Some(precommit_authority);
         self
+    }
+
+    pub(crate) fn with_company_identity(
+        mut self,
+        company_identity: CompanyIdentityObservation,
+    ) -> Result<Self, ResearchServiceError> {
+        if self.revisions.is_none()
+            || company_identity.source_id() != self.source.source_id()
+            || company_identity
+                .parent_ingest_payload_evidence()
+                .content_digest()
+                != self.identity.payload_digest()
+        {
+            return Err(ResearchServiceError::IngestAuthorityMismatch);
+        }
+        self.company_identity = Some(company_identity);
+        Ok(self)
     }
 }
 
@@ -252,8 +272,37 @@ impl ResearchService {
                 &cancellation,
             )
             .await?;
-        match (request.revisions, request.precommit_authority) {
-            (Some(revisions), Some(precommit_authority)) => self
+        match (
+            request.revisions,
+            request.company_identity,
+            request.precommit_authority,
+        ) {
+            (Some(revisions), Some(company_identity), Some(precommit_authority)) => self
+                .analytical
+                .ingest_with_revision_plan_company_identity_and_precommit_authority(
+                    reservation,
+                    request.analytical_dataset,
+                    request.batch,
+                    revisions,
+                    company_identity,
+                    cancellation,
+                    precommit_authority,
+                )
+                .await
+                .map_err(Into::into),
+            (Some(revisions), Some(company_identity), None) => self
+                .analytical
+                .ingest_with_revision_plan_and_company_identity(
+                    reservation,
+                    request.analytical_dataset,
+                    request.batch,
+                    revisions,
+                    company_identity,
+                    cancellation,
+                )
+                .await
+                .map_err(Into::into),
+            (Some(revisions), None, Some(precommit_authority)) => self
                 .analytical
                 .ingest_with_revision_plan_and_precommit_authority(
                     reservation,
@@ -265,7 +314,7 @@ impl ResearchService {
                 )
                 .await
                 .map_err(Into::into),
-            (Some(revisions), None) => self
+            (Some(revisions), None, None) => self
                 .analytical
                 .ingest_with_revision_plan(
                     reservation,
@@ -276,7 +325,7 @@ impl ResearchService {
                 )
                 .await
                 .map_err(Into::into),
-            (None, Some(precommit_authority)) => self
+            (None, None, Some(precommit_authority)) => self
                 .analytical
                 .ingest_with_precommit_authority(
                     reservation,
@@ -287,7 +336,7 @@ impl ResearchService {
                 )
                 .await
                 .map_err(Into::into),
-            (None, None) => self
+            (None, None, None) => self
                 .analytical
                 .ingest(
                     reservation,
@@ -297,6 +346,7 @@ impl ResearchService {
                 )
                 .await
                 .map_err(Into::into),
+            (None, Some(_), _) => Err(ResearchServiceError::IngestAuthorityMismatch),
         }
     }
 
@@ -350,6 +400,11 @@ impl ResearchService {
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
     pub fn instrument_definitions(&self) -> InstrumentDefinitionReadCapability {
         self.analytical.instrument_definitions()
+    }
+
+    /// Returns bounded company-identity reads over the canonical research catalog.
+    pub fn company_identities(&self) -> CompanyIdentityReadCapability {
+        self.analytical.company_identities()
     }
 
     /// Atomically reconciles validated code/config-owned definitions before product publication.

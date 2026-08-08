@@ -33,10 +33,12 @@ use market_squawk_data::{
     extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
-    AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
-    MacroObservation, MetadataRevision, PayloadReference, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+    AuthorizationBasis, AvailabilityEvidence as DomainAvailabilityEvidence, ChecksumCapability,
+    CompanyIdentityObservation, CompanyIdentityObservationInput, CompanyIdentitySurface,
+    CoverageDelay, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
+    EvidenceDigest, ExactPayloadEvidence, InstrumentId, MacroObservation, MetadataRevision,
+    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionBoundPayloadEvidence, RevisionNumber, SchemaVersion, SequenceCapability, SourceId,
     SourceIdentifier, Timestamp, UniverseMembershipObservation,
 };
@@ -619,7 +621,7 @@ async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> T
 }
 
 #[tokio::test]
-async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestResult {
+async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
     let location = paths.catalog()?.clone();
@@ -660,27 +662,57 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
     )?;
     let analytical_dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
+    let company = company_identity(source.source_id().clone(), payload_digest, "Example", 200)?;
 
     let first = service
-        .ingest_with_revision_plan(
+        .ingest_with_revision_plan_and_company_identity(
             reservation.clone(),
             analytical_dataset.clone(),
             batch.clone(),
             revisions.clone(),
+            company.clone(),
             CancellationToken::new(),
         )
         .await?;
     assert_eq!(first.manifest().schema_version().get(), 3);
+    let search = service.company_identities().search(
+        "example",
+        4,
+        Instant::now() + Duration::from_secs(1),
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(search.matches().len(), 1);
+    assert_eq!(search.matches()[0].observation(), &company);
     let replay = service
-        .ingest_with_revision_plan(
-            reservation,
-            analytical_dataset,
-            batch,
-            revisions,
+        .ingest_with_revision_plan_and_company_identity(
+            reservation.clone(),
+            analytical_dataset.clone(),
+            batch.clone(),
+            revisions.clone(),
+            company_identity(source.source_id().clone(), payload_digest, "Example", 201)?,
             CancellationToken::new(),
         )
         .await?;
     assert_eq!(first, replay);
+    let conflict = service
+        .ingest_with_revision_plan_and_company_identity(
+            reservation,
+            analytical_dataset,
+            batch,
+            revisions,
+            company_identity(
+                source.source_id().clone(),
+                payload_digest,
+                "Conflicting",
+                201,
+            )?,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(IngestError::Catalog(CatalogError::EvidenceConflict))
+    ));
     let batches = service
         .object_store()
         .read_pinned(first.pinned(), &CancellationToken::new())?;
@@ -1546,6 +1578,38 @@ async fn initialized_service_with_batch(
 
 fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     extraction_batch_with_membership(false)
+}
+
+fn company_identity(
+    source_id: SourceId,
+    parent_digest: EvidenceDigest,
+    conformed_name: &str,
+    ingested_at: i64,
+) -> Result<CompanyIdentityObservation, Box<dyn Error>> {
+    Ok(CompanyIdentityObservation::try_new(
+        CompanyIdentityObservationInput {
+            schema_version: SchemaVersion::CURRENT,
+            source_id,
+            provider_company_id: SourceIdentifier::try_from("CIK0000000001")?,
+            surface: CompanyIdentitySurface::SecSubmissions,
+            conformed_name: conformed_name.to_owned(),
+            former_names: Vec::new(),
+            entity_type: Some("operating".to_owned()),
+            sic: Some("3571".to_owned()),
+            sic_description: Some("Electronic Computers".to_owned()),
+            associations: Vec::new(),
+            parent_ingest_payload_evidence: ExactPayloadEvidence::from_content_digest(
+                parent_digest,
+            ),
+            identity_payload_evidence: ExactPayloadEvidence::from_content_digest(digest(90)),
+            received_at: Timestamp::from_unix_nanos(100),
+            availability: DomainAvailabilityEvidence::local_first_observed(
+                Timestamp::from_unix_nanos(100),
+            ),
+            ingested_at: Timestamp::from_unix_nanos(ingested_at),
+            quality: DataQuality::OfficialDelayed,
+        },
+    )?)
 }
 
 fn dataset_extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {

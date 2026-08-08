@@ -3,8 +3,8 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use market_squawk_data::{
-    AnalyticalReadCapability, AnalyticalReadLimit, CatalogError,
-    InstrumentDefinitionReadCapability, InstrumentSearchMatch,
+    AnalyticalReadCapability, AnalyticalReadLimit, CatalogError, CompanyIdentityReadCapability,
+    CompanyIdentitySearchMatch, InstrumentDefinitionReadCapability, InstrumentSearchMatch,
 };
 use market_squawk_domain::{
     AssignmentVerification, ExternalIdentifier, IdentifierEntitlement, InstrumentDefinition,
@@ -33,7 +33,8 @@ const OVERVIEW: &str = "Analysis.GetDecisionOverview";
 const MAXIMUM_LOOKUP_ITEMS: usize = 64;
 const MAXIMUM_QUERY_BYTES: usize = 256;
 const MAXIMUM_INSTRUMENT_MATCH_REASONS: usize = 8;
-const ALL_CATEGORIES: [&str; 9] = [
+const ALL_CATEGORIES: [&str; 10] = [
+    "company",
     "command",
     "dataset",
     "instrument",
@@ -50,6 +51,7 @@ pub(super) struct InstalledAnalysisOperations {
     capabilities: ServiceCapabilities,
     providers: Arc<ProviderOnboardingService>,
     analytical: AnalyticalReadCapability,
+    company_identities: CompanyIdentityReadCapability,
     instrument_definitions: InstrumentDefinitionReadCapability,
     decisions: Arc<DecisionApplication>,
     jobs: JobApplication<SqliteJobRepository>,
@@ -61,6 +63,7 @@ impl InstalledAnalysisOperations {
             capabilities: product.application().capabilities(),
             providers: product.provider_onboarding(),
             analytical: product.research().analytical_reader(),
+            company_identities: product.research().company_identities(),
             instrument_definitions: product.research().instrument_definitions(),
             decisions: product.decisions(),
             jobs: JobApplication::new(jobs.repository(), jobs.authority()),
@@ -117,6 +120,27 @@ impl InstalledAnalysisOperations {
         for category in categories {
             ensure_live(context)?;
             match category.as_str() {
+                "company" => {
+                    let remaining = maximum.saturating_sub(matches.len());
+                    if remaining == 0 {
+                        truncated = true;
+                    } else {
+                        let page = self
+                            .company_identities
+                            .search(
+                                &query,
+                                remaining,
+                                context.deadline(),
+                                context.cancellation(),
+                            )
+                            .map_err(map_company_search)?;
+                        truncated |= page.has_more();
+                        for company in page.matches() {
+                            matches.push(company_lookup_match(company)?);
+                        }
+                    }
+                    status.push(available("company"));
+                }
                 "command" => {
                     for descriptor in self.capabilities.tools() {
                         if matches.len() >= maximum {
@@ -343,6 +367,7 @@ impl std::fmt::Debug for InstalledAnalysisOperations {
             .field("capabilities", &self.capabilities)
             .field("providers", &"[PROVIDER AUTHORITY]")
             .field("analytical", &self.analytical)
+            .field("company_identities", &self.company_identities)
             .field("instrument_definitions", &self.instrument_definitions)
             .field("decisions", &"[DECISION AUTHORITY]")
             .field("jobs", &"[JOB AUTHORITY]")
@@ -420,6 +445,78 @@ fn map_instrument_search(error: CatalogError) -> ServiceError {
         CatalogError::InvalidLimit | CatalogError::InvalidRecord => ServiceError::InvalidRequest,
         _ => ServiceError::Unavailable,
     }
+}
+
+fn map_company_search(error: CatalogError) -> ServiceError {
+    match error {
+        CatalogError::CompanyIdentityReadCancelled => ServiceError::Cancelled,
+        CatalogError::CompanyIdentityReadDeadlineExceeded => ServiceError::DeadlineExceeded,
+        CatalogError::InvalidLimit | CatalogError::InvalidRecord => ServiceError::InvalidRequest,
+        _ => ServiceError::Unavailable,
+    }
+}
+
+fn company_lookup_match(search_match: &CompanyIdentitySearchMatch) -> Result<Value, ServiceError> {
+    let observation = search_match.observation();
+    let provider_company_id = observation.provider_company_id().as_str();
+    let source_id = observation.source_id().as_str();
+    let surface = observation.surface().database_name();
+    let id = format!("{source_id}:{surface}:{provider_company_id}");
+    let match_reasons = search_match
+        .reasons()
+        .iter()
+        .map(|reason| {
+            json!({
+                "kind": reason.kind(),
+                "value": reason.value(),
+                "associationOrdinal": reason.association_ordinal()
+            })
+        })
+        .collect::<Vec<_>>();
+    let associations = observation
+        .associations()
+        .iter()
+        .map(|association| {
+            json!({
+                "ticker": association.ticker(),
+                "exchange": association.exchange(),
+                "verification": "provider_reported_unverified"
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "category": "company",
+        "id": id,
+        "label": observation.conformed_name(),
+        "destination": {
+            "kind": "research_company",
+            "sourceId": source_id,
+            "providerCompanyId": provider_company_id,
+            "surface": surface
+        },
+        "detail": {
+            "currentName": observation.conformed_name(),
+            "formerNames": observation.former_names(),
+            "entityType": observation.entity_type(),
+            "sic": observation.sic(),
+            "sicDescription": observation.sic_description(),
+            "providerReportedSecurityAssociations": associations,
+            "sourceId": source_id,
+            "providerCompanyId": provider_company_id,
+            "surface": surface,
+            "quality": observation.quality(),
+            "receivedAt": observation.received_at(),
+            "availability": observation.availability(),
+            "ingestedAt": observation.ingested_at(),
+            "publicationCompletedAt": search_match.completed_at(),
+            "parentIngestPayloadEvidence": observation.parent_ingest_payload_evidence(),
+            "identityPayloadEvidence": observation.identity_payload_evidence(),
+            "matchReasons": match_reasons,
+            "matchReasonsTruncated": search_match.reasons_truncated(),
+            "executionEligible": false,
+            "instrumentLinks": []
+        }
+    }))
 }
 
 fn instrument_lookup_match(

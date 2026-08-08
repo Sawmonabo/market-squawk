@@ -5,6 +5,8 @@ use serde::Serialize;
 
 use super::*;
 
+const MAX_ENTITY_NAME_BYTES: usize = 512;
+
 /// Instant or duration period from a Company Facts occurrence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CompanyFactPeriod {
@@ -76,6 +78,7 @@ impl CompanyFactOccurrence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompanyFactsDocument {
     cik: SourceIdentifier,
+    entity_name: String,
     occurrences: Vec<CompanyFactOccurrence>,
 }
 
@@ -94,6 +97,10 @@ impl CompanyFactsDocument {
         let root = parse_bounded_json_with_cancellation(bytes, limits, cancellation)?;
         let object = as_object(&root, "company facts root")?;
         let cik = parse_cik(required(object, "cik")?)?;
+        let entity_name = validated_metadata_text(
+            required_string(object, "entityName")?,
+            MAX_ENTITY_NAME_BYTES,
+        )?;
         let taxonomies = as_object(required(object, "facts")?, "facts")?;
         let mut occurrences = Vec::new();
         for (taxonomy, concepts_value) in taxonomies {
@@ -129,12 +136,21 @@ impl CompanyFactsDocument {
                 }
             }
         }
-        Ok(Self { cik, occurrences })
+        Ok(Self {
+            cik,
+            entity_name,
+            occurrences,
+        })
     }
 
     /// Returns the zero-padded CIK.
     pub const fn cik(&self) -> &SourceIdentifier {
         &self.cik
+    }
+
+    /// Returns Company Facts `entityName` as independent corroborating source evidence.
+    pub fn entity_name(&self) -> &str {
+        &self.entity_name
     }
 
     /// Returns every retained numeric occurrence without collapsing amendments.

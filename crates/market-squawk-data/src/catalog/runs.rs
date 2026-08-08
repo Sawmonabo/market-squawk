@@ -3,12 +3,13 @@
 use std::fmt;
 use std::ops::Deref;
 
-use market_squawk_domain::{SourceId, Timestamp};
+use market_squawk_domain::{CompanyIdentityObservation, SourceId, Timestamp};
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::RestoreCatalogBaseline;
+use super::company_identity::persist_company_identity;
 use super::publication::{PublishedIngest, publication_for_run};
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, digest_columns, existing_reservation, parse_digest,
@@ -333,8 +334,20 @@ impl Catalog {
         reservation: &IngestReservation,
         completion: ContractCompletion,
     ) -> Result<(), CatalogError> {
+        self.complete_ingest_with_company_identity(reservation, completion, None)
+    }
+
+    pub(crate) fn complete_ingest_with_company_identity(
+        &self,
+        reservation: &IngestReservation,
+        completion: ContractCompletion,
+        company_identity: Option<&CompanyIdentityObservation>,
+    ) -> Result<(), CatalogError> {
         if reservation.catalog_id != self.catalog_id {
             return Err(CatalogError::InvalidReservationCapability);
+        }
+        if company_identity.is_some() && completion != ContractCompletion::Succeeded {
+            return Err(CatalogError::RunStateConflict);
         }
         let transaction = self.connection.unchecked_transaction()?;
         let completed_at = trusted_catalog_now(&transaction)?;
@@ -362,6 +375,9 @@ impl Catalog {
                 return Err(CatalogError::RunStateConflict);
             }
         }
+        if let Some(company_identity) = company_identity {
+            persist_company_identity(&transaction, reservation, company_identity, completed_at)?;
+        }
         let changed = transaction.execute(
             "UPDATE ingest_runs SET state=?1, completed_at_ns=?2
              WHERE run_id=?3 AND state='reserved'",
@@ -381,6 +397,21 @@ impl Catalog {
             sha256(completion.database_name().as_bytes()),
             completed_at,
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_company_identity(
+        &self,
+        reservation: &IngestReservation,
+        company_identity: &CompanyIdentityObservation,
+    ) -> Result<(), CatalogError> {
+        if reservation.catalog_id != self.catalog_id {
+            return Err(CatalogError::InvalidReservationCapability);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let reconciled_at = trusted_catalog_now(&transaction)?;
+        persist_company_identity(&transaction, reservation, company_identity, reconciled_at)?;
         transaction.commit()?;
         Ok(())
     }

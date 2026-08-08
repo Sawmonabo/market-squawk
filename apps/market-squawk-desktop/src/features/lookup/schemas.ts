@@ -1,6 +1,7 @@
 import { z } from "zod"
 
 export const lookupCategories = [
+  "company",
   "command",
   "dataset",
   "instrument",
@@ -37,10 +38,18 @@ export const instrumentLookupDetailSchema = z.object({
   matchReasonsTruncated: z.boolean(),
 })
 
-const lookupDestinationSchema = z.object({
-  kind: z.literal("market_instrument"),
-  instrumentId: z.string().uuid(),
-})
+const lookupDestinationSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("market_instrument"),
+    instrumentId: z.string().uuid(),
+  }),
+  z.object({
+    kind: z.literal("research_company"),
+    sourceId: z.string(),
+    providerCompanyId: z.string(),
+    surface: z.string(),
+  }),
+])
 
 export const lookupMatchSchema = z.object({
   category: z.enum(lookupCategories),

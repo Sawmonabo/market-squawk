@@ -2,6 +2,7 @@ import * as React from "react"
 import {
   ArrowRight,
   BriefcaseBusiness,
+  Building2,
   ChartNoAxesCombined,
   Database,
   Gauge,
@@ -26,6 +27,7 @@ import {
 import { useLookup } from "./use-lookup"
 
 const categoryLabels: Record<LookupCategory, string> = {
+  company: "Companies",
   command: "Actions",
   dataset: "Research data",
   instrument: "Instruments",
@@ -237,7 +239,9 @@ function UnavailableCategories({
 
 function LookupIcon({ category }: { category: LookupCategory }) {
   const Icon =
-    category === "provider"
+    category === "company"
+      ? Building2
+      : category === "provider"
       ? ServerCog
       : category === "dataset"
         ? Database
@@ -266,6 +270,19 @@ function friendlyLabel(match: LookupMatch) {
 
 function detailFor(match: LookupMatch) {
   const detail = match.detail
+  if (match.category === "company") {
+    const associations = Array.isArray(detail.providerReportedSecurityAssociations)
+      ? detail.providerReportedSecurityAssociations
+      : []
+    const first = associations[0]
+    const ticker =
+      typeof first === "object" && first !== null && "ticker" in first && isText(first.ticker)
+        ? first.ticker
+        : null
+    return [ticker, detail.sicDescription, detail.providerCompanyId]
+      .filter(isText)
+      .join(" · ") || match.id
+  }
   if (match.category === "instrument") {
     const parsed = instrumentLookupDetailSchema.safeParse(detail)
     if (parsed.success) {
@@ -298,6 +315,9 @@ function detailFor(match: LookupMatch) {
 export function lookupRoute(match: LookupMatch) {
   if (match.destination?.kind === "market_instrument") {
     return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
+  }
+  if (match.destination?.kind === "research_company") {
+    return `/research?companyId=${encodeURIComponent(match.destination.providerCompanyId)}`
   }
   if (match.category === "provider") return "/sources"
   if (match.category === "dataset") return "/research"

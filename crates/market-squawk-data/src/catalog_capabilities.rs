@@ -10,12 +10,56 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    CatalogAuthority, CatalogError, CatalogLimit, FairValueCatalogCommit,
-    FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogSnapshot,
-    FairValueCatalogSnapshotLimits, InstrumentSearchPage, OnboardingAppendOutcome,
-    OnboardingReservation, OnboardingReservationRequest, PinnedInstrumentDefinitions,
-    ResumedProviderOnboarding,
+    CatalogAuthority, CatalogError, CatalogLimit, CompanyIdentitySearchPage,
+    FairValueCatalogCommit, FairValueCatalogOperation, FairValueCatalogPosition,
+    FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, InstrumentSearchPage,
+    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
+    PinnedInstrumentDefinitions, ResumedProviderOnboarding,
 };
+
+/// Cloneable bounded company-identity reader without general catalog authority.
+///
+/// Company identities remain research metadata. This capability cannot publish canonical
+/// instruments or grant execution authority.
+#[derive(Clone)]
+pub struct CompanyIdentityReadCapability {
+    authority: Arc<Mutex<CatalogAuthority>>,
+}
+
+impl fmt::Debug for CompanyIdentityReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanyIdentityReadCapability")
+            .field("authority", &"[SEALED COMPANY-IDENTITY READ AUTHORITY]")
+            .finish()
+    }
+}
+
+impl CompanyIdentityReadCapability {
+    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
+        Self { authority }
+    }
+
+    /// Searches current digest-verified company observations under hard bounds.
+    pub fn search(
+        &self,
+        query: &str,
+        maximum_companies: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CompanyIdentitySearchPage, CatalogError> {
+        let limit = CatalogLimit::new(maximum_companies)?;
+        self.lock()?
+            .catalog()
+            .search_company_identities(query, limit, deadline, cancellation)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
+        self.authority
+            .lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)
+    }
+}
 
 /// Cloneable, bounded canonical-instrument publication authority.
 ///

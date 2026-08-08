@@ -250,6 +250,14 @@ impl RetrievedSubmissions {
     pub fn components(&self) -> &[RetrievedSecBytes] {
         &self.components
     }
+
+    /// Returns the exact current submissions representation that authored company metadata.
+    ///
+    /// Complete submissions snapshots retain this as the first component beside their composite
+    /// manifest. A direct current-only retrieval uses [`Self::raw`] as that same representation.
+    pub fn current_component(&self) -> &RetrievedSecBytes {
+        self.components.first().unwrap_or(&self.raw)
+    }
 }
 
 /// Parsed Company Facts paired with retained exact source bytes.
@@ -394,6 +402,7 @@ pub(super) const fn validation_health_for_error(
         | SecClientError::RevisionAuthority(_)
         | SecClientError::Normalization(_) => Some(SecExtractionHealthState::LocalFailure),
         SecClientError::Parser(_)
+        | SecClientError::CompanyIdentity(_)
         | SecClientError::InvalidCompanionSet
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::CompanionObjectLimitExceeded
@@ -537,6 +546,8 @@ pub enum SecClientError {
     Normalization(crate::SecNormalizationError),
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
+    #[error(transparent)]
+    CompanyIdentity(#[from] market_squawk_domain::CompanyIdentityError),
     #[error(transparent)]
     RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
 }

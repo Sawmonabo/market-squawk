@@ -6,6 +6,105 @@ use serde::Serialize;
 
 use super::*;
 
+const MAX_COMPANY_NAME_BYTES: usize = 512;
+const MAX_ENTITY_TYPE_BYTES: usize = 64;
+const MAX_SIC_BYTES: usize = 16;
+const MAX_SIC_DESCRIPTION_BYTES: usize = 512;
+const MAX_TICKER_BYTES: usize = 64;
+const MAX_EXCHANGE_BYTES: usize = 128;
+const MAX_FORMER_NAMES: usize = 64;
+const MAX_TICKER_EXCHANGE_PAIRS: usize = 64;
+
+/// One former EDGAR-conformed company name and its source-reported validity interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SecFormerName {
+    name: String,
+    effective_from: Timestamp,
+    effective_to: Timestamp,
+}
+
+impl SecFormerName {
+    /// Returns the former EDGAR-conformed company name exactly as supplied.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the beginning of the source-reported name interval.
+    pub const fn effective_from(&self) -> Timestamp {
+        self.effective_from
+    }
+
+    /// Returns the end of the source-reported name interval.
+    pub const fn effective_to(&self) -> Timestamp {
+        self.effective_to
+    }
+}
+
+/// One exact ticker and exchange association from the SEC submissions document.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SecTickerExchangePair {
+    ticker: String,
+    exchange: String,
+}
+
+impl SecTickerExchangePair {
+    /// Returns the source ticker without normalization or venue inference.
+    pub fn ticker(&self) -> &str {
+        &self.ticker
+    }
+
+    /// Returns the source exchange paired with this ticker at the same array position.
+    pub fn exchange(&self) -> &str {
+        &self.exchange
+    }
+}
+
+/// Bounded company metadata retained from the official SEC submissions shape.
+///
+/// This record is source evidence. It does not establish canonical instrument identity or venue
+/// coverage by itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SecSubmissionCompanyMetadata {
+    conformed_name: String,
+    former_names: Vec<SecFormerName>,
+    entity_type: Option<String>,
+    sic: Option<String>,
+    sic_description: Option<String>,
+    ticker_exchange_pairs: Vec<SecTickerExchangePair>,
+}
+
+impl SecSubmissionCompanyMetadata {
+    /// Returns the current EDGAR-conformed company name exactly as supplied.
+    pub fn conformed_name(&self) -> &str {
+        &self.conformed_name
+    }
+
+    /// Returns source-reported former names in provider order.
+    pub fn former_names(&self) -> &[SecFormerName] {
+        &self.former_names
+    }
+
+    /// Returns the source entity type when SEC supplied a nonempty value.
+    pub fn entity_type(&self) -> Option<&str> {
+        self.entity_type.as_deref()
+    }
+
+    /// Returns the source SIC code when SEC supplied a nonempty value.
+    pub fn sic(&self) -> Option<&str> {
+        self.sic.as_deref()
+    }
+
+    /// Returns the source SIC description when SEC supplied a nonempty value.
+    pub fn sic_description(&self) -> Option<&str> {
+        self.sic_description.as_deref()
+    }
+
+    /// Returns exact positional ticker and exchange associations.
+    pub fn ticker_exchange_pairs(&self) -> &[SecTickerExchangePair] {
+        &self.ticker_exchange_pairs
+    }
+}
+
 /// One SEC filing reconstructed from the submissions columnar representation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SecFiling {
@@ -51,6 +150,7 @@ impl SecFiling {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmissionsDocument {
     cik: SourceIdentifier,
+    company_metadata: SecSubmissionCompanyMetadata,
     filings: Vec<SecFiling>,
     companion_files: Vec<SourceIdentifier>,
 }
@@ -70,6 +170,7 @@ impl SubmissionsDocument {
         let root = parse_bounded_json_with_cancellation(bytes, limits, cancellation)?;
         let object = as_object(&root, "submissions root")?;
         let cik = parse_cik(required(object, "cik")?)?;
+        let company_metadata = parse_company_metadata(object, limits, cancellation)?;
         let filings_object = as_object(required(object, "filings")?, "filings")?;
         let filings = parse_filing_columns(
             as_object(required(filings_object, "recent")?, "recent filings")?,
@@ -80,6 +181,7 @@ impl SubmissionsDocument {
             parse_companion_files(filings_object.get("files"), limits, cancellation)?;
         Ok(Self {
             cik,
+            company_metadata,
             filings,
             companion_files,
         })
@@ -107,6 +209,10 @@ impl SubmissionsDocument {
     /// Returns the exact zero-padded ten-digit CIK.
     pub const fn cik(&self) -> &SourceIdentifier {
         &self.cik
+    }
+    /// Returns bounded source company metadata without promoting it to canonical identity.
+    pub const fn company_metadata(&self) -> &SecSubmissionCompanyMetadata {
+        &self.company_metadata
     }
     /// Returns accessions ordered deterministically by filing date and accession.
     pub fn filings(&self) -> &[SecFiling] {
@@ -168,9 +274,131 @@ pub fn reconcile_submissions_with_cancellation(
     filings.sort_by_key(|filing| (filing.filed_on, filing.accession.as_str().to_owned()));
     Ok(SubmissionsDocument {
         cik: recent.cik.clone(),
+        company_metadata: recent.company_metadata.clone(),
         filings,
         companion_files: recent.companion_files.clone(),
     })
+}
+
+fn parse_company_metadata(
+    object: &Map<String, Value>,
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<SecSubmissionCompanyMetadata, SecParserError> {
+    let conformed_name =
+        validated_metadata_text(required_string(object, "name")?, MAX_COMPANY_NAME_BYTES)?;
+    let former_names = parse_former_names(object.get("formerNames"), limits, cancellation)?;
+    let entity_type = optional_metadata_text(object, "entityType", MAX_ENTITY_TYPE_BYTES)?;
+    let sic = optional_metadata_text(object, "sic", MAX_SIC_BYTES)?;
+    let sic_description =
+        optional_metadata_text(object, "sicDescription", MAX_SIC_DESCRIPTION_BYTES)?;
+    let ticker_exchange_pairs = parse_ticker_exchange_pairs(object, limits, cancellation)?;
+    Ok(SecSubmissionCompanyMetadata {
+        conformed_name,
+        former_names,
+        entity_type,
+        sic,
+        sic_description,
+        ticker_exchange_pairs,
+    })
+}
+
+fn parse_former_names(
+    value: Option<&Value>,
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SecFormerName>, SecParserError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = as_array(value, "former names")?;
+    if entries.len() > limits.records() || entries.len() > MAX_FORMER_NAMES {
+        return Err(SecParserError::RecordLimitExceeded);
+    }
+    let mut former_names = Vec::new();
+    former_names
+        .try_reserve(entries.len())
+        .map_err(|_| SecParserError::AllocationFailed)?;
+    let mut seen = BTreeMap::new();
+    for value in entries {
+        check_parser_cancelled(cancellation)?;
+        let object = as_object(value, "former name")?;
+        let name =
+            validated_metadata_text(required_string(object, "name")?, MAX_COMPANY_NAME_BYTES)?;
+        let effective_from = parse_rfc3339_timestamp(required_string(object, "from")?)?;
+        let effective_to = parse_rfc3339_timestamp(required_string(object, "to")?)?;
+        if effective_from > effective_to {
+            return Err(SecParserError::InvalidPeriod);
+        }
+        let interval = (effective_from, effective_to);
+        match seen.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(interval);
+            }
+            Entry::Occupied(entry) if *entry.get() == interval => {
+                return Err(SecParserError::DuplicateMetadataAssociation);
+            }
+            Entry::Occupied(_) => {
+                return Err(SecParserError::ConflictingMetadataAssociation);
+            }
+        }
+        former_names.push(SecFormerName {
+            name,
+            effective_from,
+            effective_to,
+        });
+    }
+    Ok(former_names)
+}
+
+fn parse_ticker_exchange_pairs(
+    object: &Map<String, Value>,
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SecTickerExchangePair>, SecParserError> {
+    let tickers = required_array(object, "tickers")?;
+    let exchanges = required_array(object, "exchanges")?;
+    if tickers.len() != exchanges.len() {
+        return Err(SecParserError::MetadataAssociationLengthMismatch);
+    }
+    if tickers.len() > limits.records() || tickers.len() > MAX_TICKER_EXCHANGE_PAIRS {
+        return Err(SecParserError::RecordLimitExceeded);
+    }
+    let mut pairs = Vec::new();
+    pairs
+        .try_reserve(tickers.len())
+        .map_err(|_| SecParserError::AllocationFailed)?;
+    let mut seen = BTreeMap::new();
+    for index in 0..tickers.len() {
+        check_parser_cancelled(cancellation)?;
+        let ticker = validated_metadata_text(array_string(tickers, index)?, MAX_TICKER_BYTES)?;
+        let exchange =
+            validated_metadata_text(array_string(exchanges, index)?, MAX_EXCHANGE_BYTES)?;
+        match seen.entry(ticker.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(exchange.clone());
+            }
+            Entry::Occupied(entry) if entry.get() == &exchange => {
+                return Err(SecParserError::DuplicateMetadataAssociation);
+            }
+            Entry::Occupied(_) => {
+                return Err(SecParserError::ConflictingMetadataAssociation);
+            }
+        }
+        pairs.push(SecTickerExchangePair { ticker, exchange });
+    }
+    Ok(pairs)
+}
+
+fn optional_metadata_text(
+    object: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, SecParserError> {
+    optional_string(object, key)?
+        .filter(|value| !value.is_empty())
+        .map(|value| validated_metadata_text(value, max_bytes))
+        .transpose()
 }
 
 fn parse_filing_columns(

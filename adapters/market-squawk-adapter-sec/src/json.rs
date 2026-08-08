@@ -6,7 +6,7 @@ mod submissions;
 use std::fmt;
 use std::str::FromStr as _;
 
-use chrono::{Datelike as _, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike as _, NaiveDate, NaiveDateTime};
 use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
 use serde::de;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use company_facts::{CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument};
 pub use submissions::{
-    SecFiling, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
+    SecFiling, SecFormerName, SecSubmissionCompanyMetadata, SecTickerExchangePair,
+    SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
 
@@ -421,6 +422,25 @@ fn parse_acceptance_timestamp(value: &str) -> Result<Timestamp, SecParserError> 
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
+fn parse_rfc3339_timestamp(value: &str) -> Result<Timestamp, SecParserError> {
+    let timestamp = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| SecParserError::InvalidTimestamp)?
+        .timestamp_nanos_opt()
+        .ok_or(SecParserError::InvalidTimestamp)?;
+    Ok(Timestamp::from_unix_nanos(timestamp))
+}
+
+fn validated_metadata_text(value: &str, max_bytes: usize) -> Result<String, SecParserError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(SecParserError::InvalidCompanyMetadata);
+    }
+    owned_string(value)
+}
+
 fn validate_accession(value: &str) -> Result<(), SecParserError> {
     let bytes = value.as_bytes();
     if bytes.len() != 20
@@ -595,6 +615,10 @@ pub enum SecParserError {
     InvalidDecimal,
     NonNumericCompanyFact,
     ConflictingAccession,
+    InvalidCompanyMetadata,
+    MetadataAssociationLengthMismatch,
+    DuplicateMetadataAssociation,
+    ConflictingMetadataAssociation,
     Json(serde_json::Error),
     Identity(market_squawk_domain::IdentityError),
     Time(market_squawk_domain::TimeError),

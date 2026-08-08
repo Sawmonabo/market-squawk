@@ -55,20 +55,21 @@ pub use authority_transition::{
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogDiagnosticSnapshot, CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits,
-    ContractCompletion, DatasetManifestRecord, FairValueCatalogAuditEvent, FairValueCatalogCommit,
-    FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
-    FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
-    FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
-    IngestReservation, IngestRunRecord, IngestRunState, InstrumentSearchMatch,
-    InstrumentSearchPage, OnboardingAppendOutcome, OnboardingReservation,
-    OnboardingReservationRequest, PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic,
-    PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
-    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
-    StoredObservedRevision,
+    CompanyIdentityMatchKind, CompanyIdentityMatchReason, CompanyIdentitySearchMatch,
+    CompanyIdentitySearchPage, ContractCompletion, DatasetManifestRecord,
+    FairValueCatalogAuditEvent, FairValueCatalogCommit, FairValueCatalogLink,
+    FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogRecord,
+    FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
+    FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind, IngestReservation,
+    IngestRunRecord, IngestRunState, InstrumentSearchMatch, InstrumentSearchPage,
+    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
+    PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic, PublishedIngest,
+    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
+    ResumedIngest, ResumedProviderOnboarding, SourceCursor, StoredObservedRevision,
 };
 pub use catalog_capabilities::{
-    FairValueCatalogCapability, InstrumentCatalogCapability, InstrumentDefinitionReadCapability,
-    OnboardingCatalogCapability,
+    CompanyIdentityReadCapability, FairValueCatalogCapability, InstrumentCatalogCapability,
+    InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
 };
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,

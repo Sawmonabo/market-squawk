@@ -931,6 +931,12 @@ pub enum CatalogError {
     /// The caller's monotonic deadline elapsed while instrument definitions were being pinned.
     #[error("catalog instrument-definition read deadline elapsed")]
     InstrumentDefinitionReadDeadlineExceeded,
+    /// Cancellation was observed while bounded company identities were being read.
+    #[error("catalog company-identity read was cancelled")]
+    CompanyIdentityReadCancelled,
+    /// The caller's monotonic deadline elapsed while company identities were being read.
+    #[error("catalog company-identity read deadline elapsed")]
+    CompanyIdentityReadDeadlineExceeded,
     /// An append identity already names different immutable evidence.
     #[error("catalog append identity conflicts with retained evidence")]
     EvidenceConflict,

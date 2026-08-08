@@ -10,11 +10,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use market_squawk_data::{
     DatasetId, IngestError, IngestPrecommitAuthority, RightsBasis, RightsDecisionInput,
     SourceOperation, extraction_provider_payload_digest,
 };
-use market_squawk_domain::{EvidenceDigest, SourceId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -361,8 +364,35 @@ impl ResearchSourceDiscoveryRights {
 #[error("research extraction revision evidence is invalid")]
 pub struct ResearchRevisionPlanError;
 
+/// One source-agnostic analytical batch plus optional adapter-owned reference metadata.
+#[derive(Debug)]
+pub struct ManagedExtraction {
+    batch: ExtractionBatch,
+    company_identity: Option<CompanyIdentityObservation>,
+}
+
+impl ManagedExtraction {
+    fn analytical_only(batch: ExtractionBatch) -> Self {
+        Self {
+            batch,
+            company_identity: None,
+        }
+    }
+}
+
 /// Production extraction adapter plus its source-specific revision authority.
 pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'static {
+    /// Extracts one analytical batch with source-specific reference metadata from the same bytes.
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract(authority, request, cancellation);
+        Box::pin(async move { extracted.await.map(ManagedExtraction::analytical_only) })
+    }
+
     /// Returns the exact provider dataset used to begin discovery, when one fixed dataset is
     /// carried by the admitted adapter configuration.
     fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
@@ -466,6 +496,24 @@ impl fmt::Debug for PrepublishedResearchSourceRegistration {
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSource {
+    fn extract_managed(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+        let extracted = self.extract_with_company_identity(authority, request, cancellation);
+        Box::pin(async move {
+            extracted.await.map(|result| {
+                let (batch, company_identity) = result.into_parts();
+                ManagedExtraction {
+                    batch,
+                    company_identity,
+                }
+            })
+        })
+    }
+
     fn revision_plan(
         &self,
         batch: &ExtractionBatch,
@@ -1157,16 +1205,22 @@ impl ProductionResearchIngestCoordinator {
         let extraction_request =
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
                 .map_err(|_error| ServiceError::InvalidRequest)?;
-        let batch = await_extraction(
-            prepared
-                .source
-                .extract(prepared.authority, extraction_request, operation.clone()),
+        let managed = await_extraction(
+            prepared.source.extract_managed(
+                prepared.authority,
+                extraction_request,
+                operation.clone(),
+            ),
             context,
             operation,
             &prepared.admission,
             operation_deadline,
         )
         .await?;
+        let ManagedExtraction {
+            batch,
+            company_identity,
+        } = managed;
         let revisions = prepared
             .source
             .revision_plan(&batch)
@@ -1186,6 +1240,7 @@ impl ProductionResearchIngestCoordinator {
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
             batch,
+            company_identity,
             revisions,
             analytical_dataset,
             payload_digest,
@@ -1308,6 +1363,7 @@ struct PreparedExtraction {
 struct AuthorizedExtraction {
     metadata: SourceMetadata,
     batch: ExtractionBatch,
+    company_identity: Option<CompanyIdentityObservation>,
     revisions: Option<ExtractionRevisionPlan>,
     analytical_dataset: DatasetId,
     payload_digest: EvidenceDigest,
@@ -1366,6 +1422,7 @@ impl ProductionResearchIngestCoordinator {
         let AuthorizedExtraction {
             metadata: source_metadata,
             batch,
+            company_identity,
             revisions,
             analytical_dataset,
             payload_digest,
@@ -1400,7 +1457,13 @@ impl ProductionResearchIngestCoordinator {
                 batch,
             ),
         }
-        .map_err(map_research_error)?
+        .map_err(map_research_error)?;
+        let ingest = match company_identity {
+            Some(company_identity) => ingest
+                .with_company_identity(company_identity)
+                .map_err(map_research_error)?,
+            None => ingest,
+        }
         .with_precommit_authority(precommit);
         let committed = await_publication(
             self.research.ingest(ingest, operation.clone()),

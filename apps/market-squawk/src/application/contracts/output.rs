@@ -302,7 +302,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             vec![
                 ("query", text()),
                 ("matches", bounded_array(record(), 64)),
-                ("categories", bounded_array(record(), 9)),
+                ("categories", bounded_array(record(), 10)),
                 ("truncated", boolean()),
             ],
             &["query", "matches", "categories", "truncated"],

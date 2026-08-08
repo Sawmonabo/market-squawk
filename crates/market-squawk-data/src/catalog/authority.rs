@@ -144,7 +144,8 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM dataset_manifests)
                  + (SELECT COUNT(*) FROM analytical_generations)
                  + (SELECT COUNT(*) FROM analytical_generation_objects)
-                 + (SELECT COUNT(*) FROM query_artifact_results)",
+                 + (SELECT COUNT(*) FROM query_artifact_results)
+                 + (SELECT COUNT(*) FROM company_identity_observations)",
             [],
             |row| row.get(0),
         )?;
