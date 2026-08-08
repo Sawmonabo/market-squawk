@@ -5903,7 +5903,7 @@
     },
     {
       "path": "crates/market-squawk-python/src/lib.rs",
-      "sha256": "156c2f142c9db874d0ebf73562679f0f635802ba8d7c086e9a32086fc9f2d86b",
+      "sha256": "3b2a14d07376c2495cd382c6cba0b892f2ca6a4b2544da9a7b3e6407aae41bd0",
       "size_bytes": 6757
     },
     {
@@ -6643,8 +6643,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "5a12136e3eba862d79d57d72a82ed4fdd68cb75fcec32dbff12f8328fc458650",
-      "size_bytes": 26507
+      "sha256": "25ea0f868fb80e377aaeaa1dddd3b641d814048e8d857bc7cb985ed4df0a8d8d",
+      "size_bytes": 26822
     },
     {
       "path": "python/tests/test_visualization_examples.py",

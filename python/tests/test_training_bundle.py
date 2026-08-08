@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 
+import market_squawk
 import market_squawk.training as installed_training
 import pyarrow as pa
 from market_squawk import training_environment_receipt
@@ -37,6 +38,12 @@ from market_squawk.worker_protocol import (
     WorkerProtocolWriter,
 )
 from test_data import _fixture
+
+
+requires_sealed_release = unittest.skipUnless(
+    market_squawk.__market_squawk_build_identity__ == "sealed-release-v1",
+    "requires the sealed installed Python product",
+)
 
 
 def _run(
@@ -267,6 +274,7 @@ class TrainingBundleContracts(unittest.TestCase):
             },
         )
 
+    @requires_sealed_release
     def test_signed_environment_rejects_regenerated_record_and_receipt(self) -> None:
         baseline = training_environment_receipt().sha256
         self.assertEqual(len(baseline), 64)
@@ -406,6 +414,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 path.chmod(mode)
             authority.chmod(authority_mode)
 
+    @requires_sealed_release
     def test_task11_bound_training_exports_identical_externally_authorized_bundle(self) -> None:
         with (
             tempfile.TemporaryDirectory() as dataset_root,
@@ -476,6 +485,7 @@ class TrainingBundleContracts(unittest.TestCase):
                     model_kind="linear", context=OperationContext(60_000, 1_000_000)
                 )
 
+    @requires_sealed_release
     def test_partial_dataset_and_mutated_external_authority_fail_before_publication(self) -> None:
         with (
             tempfile.TemporaryDirectory() as dataset_root,
@@ -515,6 +525,7 @@ class TrainingBundleContracts(unittest.TestCase):
                 )
             self.assertEqual(list(Path(output_root).iterdir()), [])
 
+    @requires_sealed_release
     def test_sealed_driver_produces_deterministic_onnx_and_exact_admission_request(self) -> None:
         cases = (
             (

@@ -381,6 +381,11 @@ it for the frozen pnpm install. On Windows, the setup recipe uses `nvm-windows` 
 command is available. An interactive terminal may run `nvm use` explicitly before other direct
 Node or pnpm commands.
 
+The setup command is repeatable: it preserves the managed Python environment, reapplies the
+hash-locked dependency set, and rebuilds and installs the repository's Rust-backed Python package.
+Signed training-environment checks remain part of sealed installed-product verification and are
+not weakened for source development.
+
 The complete development desktop uses the ignored repository-local
 `.market-squawk/development` data root. It builds and discovers its required debug sibling programs
 without admitting that fallback into non-debug packages. The shared development service may outlive

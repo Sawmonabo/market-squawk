@@ -320,6 +320,11 @@ worker before starting the Tauri desktop with Vite hot reload. Its ignored
 service may remain available after the desktop exits so the development CLI and MCP clients can
 reuse it. `just dev-web` is frontend-only diagnostic mode, not the complete product.
 
+`just setup` is safe to rerun. It preserves the managed Python environment, synchronizes the
+hash-locked dependencies, and rebuilds and installs Market Squawk's Rust-backed Python package.
+Tests that verify the signed training environment run only against the sealed installed product;
+the ordinary development suite keeps that authority boundary fail-closed.
+
 Use `just --list` to see the supported developer commands and `just doctor` to inspect the active
 tool and Tauri host-prerequisite state. For a focused headless release build, the underlying locked
 commands remain:

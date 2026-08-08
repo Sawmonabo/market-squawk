@@ -62,8 +62,9 @@ _python-tests:
 # Prepare frozen frontend, Python, and Rust development inputs.
 setup: _tools _frontend-setup
     uv --directory "{{ python_project }}" python install 3.14.6
-    uv --directory "{{ python_project }}" venv --python 3.14.6 .venv
+    uv --directory "{{ python_project }}" venv --python 3.14.6 --allow-existing .venv
     uv --directory "{{ python_project }}" pip sync --python "{{ python_executable }}" --require-hashes --strict "{{ python_requirements }}"
+    uv --directory "{{ python_project }}" pip install --python "{{ python_executable }}" --no-deps --strict --reinstall-package market-squawk "{{ python_project }}"
     cargo fetch --locked
 
 # Run the complete desktop product with Vite hot reload and isolated development data.
