@@ -506,10 +506,7 @@ jobs:
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: >-
-            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-                (github.event_name == 'pull_request' &&
-                 github.event.pull_request.head.repo.full_name == github.repository) }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: rustc --version
       - run: cargo --version
       - name: Run the locked workspace tests within the Cargo target ceiling
@@ -550,10 +547,7 @@ jobs:
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: >-
-            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-                (github.event_name == 'pull_request' &&
-                 github.event.pull_request.head.repo.full_name == github.repository) }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: rustc --version
       - run: cargo --version
       # The optional capture-benchmark evidence runner requires Linux/macOS process-group
@@ -676,10 +670,7 @@ jobs:
           cache-on-failure: "false"
           cache-all-crates: "false"
           cache-workspace-crates: "false"
-          save-if: >-
-            ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-                (github.event_name == 'pull_request' &&
-                 github.event.pull_request.head.repo.full_name == github.repository) }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Enforce the pre-build Cargo target ceiling
         shell: bash
         run: |
