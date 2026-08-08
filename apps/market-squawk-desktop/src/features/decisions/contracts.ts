@@ -110,6 +110,46 @@ const dossierSchema = z.object({
   ),
 })
 
+const decisionJobReceiptSchema = z
+  .object({
+    jobId: z.string().uuid(),
+    generation: z.number().int().positive(),
+    sequence: z.number().int().nonnegative(),
+    state: z.literal("queued"),
+  })
+  .strict()
+
+const dossierEvidenceSchema = z.enum([
+  "candidate",
+  "dataset",
+  "universe",
+  "portfolio_impact",
+])
+
+const dossierPreparationInventorySchema = z
+  .object({
+    candidateId: z.string().min(1),
+    screenRunId: z.string().min(1),
+    instrumentId: z.string().uuid(),
+    selectedAt: timestampSchema,
+    requiredEvidence: z.array(dossierEvidenceSchema).min(3).max(3),
+    portfolioImpactAvailable: z.boolean(),
+  })
+  .strict()
+
+const dossierPreparationPreviewSchema = z
+  .object({
+    receiptId: z.string().uuid(),
+    dossierId: z.string().min(1),
+    candidateId: z.string().min(1),
+    screenRunId: z.string().min(1),
+    instrumentId: z.string().uuid(),
+    evidence: z.array(dossierEvidenceSchema).min(3).max(4),
+    assembledAt: timestampSchema,
+    receiptExpiresAt: timestampSchema,
+  })
+  .strict()
+
 const reviewSchema = z.object({
   id: z.string().min(1),
   targetId: z.string().min(1),
@@ -486,6 +526,13 @@ const savedScreenResultMetadataSchema = z
 
 export type CandidateView = z.infer<typeof candidateSchema>
 export type DecisionDossierView = z.infer<typeof dossierSchema>
+export type DecisionJobReceipt = z.infer<typeof decisionJobReceiptSchema>
+export type DossierPreparationInventory = z.infer<
+  typeof dossierPreparationInventorySchema
+>
+export type DossierPreparationPreview = z.infer<
+  typeof dossierPreparationPreviewSchema
+>
 export type SavedScreenView = z.infer<typeof screenSchema>
 export type ScreenRunIndexView = z.infer<typeof screenRunIndexSchema>
 export type TargetStateView = z.infer<typeof targetStateSchema>
@@ -532,6 +579,38 @@ export function parseDecisionDossier(
   result: ApplicationResult,
 ): DecisionDossierView {
   return parseResult(dossierSchema, result, "decision dossier")
+}
+
+export function parseDecisionJobReceipt(
+  result: ApplicationResult,
+): DecisionJobReceipt {
+  return parseResult(decisionJobReceiptSchema, result, "screen-job receipt")
+}
+
+export function parseDossierPreparationInventory(
+  result: ApplicationResult,
+): DossierPreparationInventory {
+  return parseResult(
+    dossierPreparationInventorySchema,
+    result,
+    "dossier-preparation inventory",
+  )
+}
+
+export function parseDossierPreparationPreview(
+  result: ApplicationResult,
+): DossierPreparationPreview {
+  return parseResult(
+    dossierPreparationPreviewSchema,
+    result,
+    "dossier-preparation preview",
+  )
+}
+
+export function parseDossierCreateOutcome(
+  result: ApplicationResult,
+): SavedScreenOutcome {
+  return parseResult(savedScreenReceiptSchema, result, "dossier commit").outcome
 }
 
 export function parseDecisionCandidateDossierPage(

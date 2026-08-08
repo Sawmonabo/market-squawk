@@ -19,7 +19,6 @@ use market_squawk_domain::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::DecisionApplicationError;
 use super::codec::candidate::CandidateInputWire;
@@ -28,9 +27,11 @@ use super::codec::screen::RunWire;
 const MAXIMUM_SCREEN_DATASET_ROWS: usize = 100_000;
 const MAXIMUM_SCREEN_DATASET_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_SCREEN_OBSERVATIONS: usize = 32_768;
+const LIQUIDITY_FEATURE_NAME: &str = "liquidity.available-quantity";
 const SCREEN_INPUT_DIGEST_DOMAIN: &[u8] = b"market-squawk/screen-job-input/v1\0";
 const SCREEN_DATASET_DIGEST_DOMAIN: &[u8] = b"market-squawk/screen-dataset-evidence/v1\0";
 const SCREEN_CANDIDATE_DIGEST_DOMAIN: &[u8] = b"market-squawk/screen-candidate-evidence/v1\0";
+const SCREEN_RUN_ID_DOMAIN: &[u8] = b"market-squawk/screen-run-id/v1\0";
 
 /// Minimal presentation request for a service-owned saved-screen execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +184,12 @@ impl ScreenJobPlan {
             run_id: self.run.id().clone(),
         })
     }
+
+    pub(super) fn matches_request(&self, screen: &SavedScreen, request: &ScreenJobRequest) -> bool {
+        self.run.screen() == screen.revision()
+            && self.run.as_of() == request.as_of()
+            && self.dataset.manifest == *request.dataset_manifest()
+    }
 }
 
 struct LatestFeatureRows<'a> {
@@ -201,7 +208,13 @@ pub(super) async fn prepare(
     if screen.revision().id() != request.screen_id()
         || screen.revision().revision() != request.screen_revision()
         || request.as_of() > selected_at
-        || screen.constraints().minimum_liquidity().get() > 0.0
+        || (screen.constraints().minimum_liquidity().get() > 0.0
+            && screen
+                .feature_bindings()
+                .iter()
+                .filter(|binding| binding.key().name() == LIQUIDITY_FEATURE_NAME)
+                .count()
+                != 1)
         || !screen
             .constraints()
             .admitted_data_qualities()
@@ -237,8 +250,11 @@ fn build_plan(
         return Err(ScreenWorkflowError::DatasetUnavailable);
     }
     let dataset_identity = dataset_identity(&evidence)?;
-    let run_id = ScreenRunId::try_new(format!("run.{}", Uuid::new_v4().simple()))
-        .map_err(|_error| ScreenWorkflowError::Capacity)?;
+    let run_id = expected_run_id(
+        screen,
+        evidence.fence().manifest(),
+        evidence.fence().as_of(),
+    )?;
     let run = ScreenRun::try_new(
         run_id,
         screen.revision().clone(),
@@ -265,6 +281,29 @@ fn build_plan(
         dataset,
         input_digest,
     })
+}
+
+pub(super) fn expected_request_run_id(
+    screen: &SavedScreen,
+    request: &ScreenJobRequest,
+) -> Result<ScreenRunId, ScreenWorkflowError> {
+    expected_run_id(screen, request.dataset_manifest(), request.as_of())
+}
+
+fn expected_run_id(
+    screen: &SavedScreen,
+    manifest: &DatasetManifestRef,
+    as_of: Timestamp,
+) -> Result<ScreenRunId, ScreenWorkflowError> {
+    let mut hash = Sha256::new();
+    hash.update(SCREEN_RUN_ID_DOMAIN);
+    hash_bytes(&mut hash, screen.revision().id().as_str().as_bytes())?;
+    hash.update(screen.revision().revision().get().to_be_bytes());
+    hash_manifest(&mut hash, manifest)?;
+    hash.update(as_of.unix_nanos().to_be_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    ScreenRunId::try_new(format!("run.{}", hex(&digest)))
+        .map_err(|_error| ScreenWorkflowError::Capacity)
 }
 
 fn candidate_inputs(
@@ -322,6 +361,7 @@ fn candidate_inputs(
             .try_reserve_exact(screen.feature_bindings().len())
             .map_err(|_error| ScreenWorkflowError::Capacity)?;
         let mut present = 0_usize;
+        let mut liquidity = None;
         let mut candidate_hash = Sha256::new();
         candidate_hash.update(SCREEN_CANDIDATE_DIGEST_DOMAIN);
         candidate_hash.update(run.dataset_identity().evidence_digest().bytes());
@@ -362,13 +402,21 @@ fn candidate_inputs(
                     None
                 }
             };
+            if binding.key().name() == LIQUIDITY_FEATURE_NAME {
+                if liquidity.is_some() {
+                    return Err(ScreenWorkflowError::InvalidRequest);
+                }
+                liquidity = value;
+            }
             observations.push(ScreenFeatureObservation::new(binding.clone(), value));
         }
         let coverage =
             StatisticalF64::try_new(present as f64 / screen.feature_bindings().len() as f64)
                 .map_err(|_error| ScreenWorkflowError::DatasetUnavailable)?;
-        let liquidity = StatisticalF64::try_new(0.0)
-            .map_err(|_error| ScreenWorkflowError::DatasetUnavailable)?;
+        let liquidity = liquidity.unwrap_or(
+            StatisticalF64::try_new(0.0)
+                .map_err(|_error| ScreenWorkflowError::DatasetUnavailable)?,
+        );
         let evidence_identity = content_identity(candidate_hash.finalize().into())?;
         let mut id_hasher = Sha256::new();
         id_hasher.update(b"market-squawk/screen-candidate-id/v1\0");

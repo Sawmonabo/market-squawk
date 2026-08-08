@@ -19,6 +19,7 @@ import type { ProductTransport } from "@/lib/transport"
 import {
   digestEvidence,
   digestHex,
+  parseDecisionJobReceipt,
   parseFeatureDatasetPage,
   parseSavedScreenOutcome,
   type FeatureDatasetView,
@@ -96,6 +97,7 @@ export function ScreenBuilder({
   const [minimumLiquidity, setMinimumLiquidity] = React.useState("0")
   const [qualities, setQualities] = React.useState<DataQuality[]>(DEFAULT_QUALITIES)
   const [receipt, setReceipt] = React.useState<SavedScreenReceipt | null>(null)
+  const [asOf, setAsOf] = React.useState(defaultCutoff())
 
   const selectedScreen = screens.find(
     (screen) => screenKey(screen) === selectedRevision,
@@ -208,6 +210,26 @@ export function ScreenBuilder({
       await onSaved()
       setSelectedRevision(`${String(input.screen.id)}:${Number(input.screen.revision)}`)
     },
+  })
+
+  const run = useMutation({
+    mutationFn: async (input: {
+      screen: SavedScreenView
+      dataset: FeatureDatasetView
+      asOf: string
+    }) =>
+      parseDecisionJobReceipt(
+        await transport.decisionControl(
+          {
+            action: "runScreen",
+            screenId: input.screen.id,
+            screenRevision: input.screen.revision,
+            datasetManifest: input.dataset.manifest,
+            asOf: input.asOf,
+          },
+          true,
+        ),
+      ),
   })
 
   const validation = validateDraft({
@@ -574,25 +596,99 @@ export function ScreenBuilder({
                 <AlertDescription>{messageFrom(save.error)}</AlertDescription>
               </Alert>
             )}
+            {run.isError && (
+              <Alert variant="destructive">
+                <AlertCircle aria-hidden="true" />
+                <AlertTitle>The screen run was not started</AlertTitle>
+                <AlertDescription>{messageFrom(run.error)}</AlertDescription>
+              </Alert>
+            )}
             {receipt && <Receipt receipt={receipt} />}
+            {run.data && (
+              <Alert>
+                <ListFilter aria-hidden="true" />
+                <AlertTitle>Screen queued</AlertTitle>
+                <AlertDescription>
+                  Job {run.data.jobId} is retained as generation {run.data.generation}. Its ranked
+                  candidates will appear in the candidate funnel when the durable run completes.
+                </AlertDescription>
+              </Alert>
+            )}
 
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <div className="grid gap-4 border-t border-border pt-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.55fr)] lg:items-end">
               <p className="max-w-2xl text-xs leading-5 text-muted-foreground">
                 Saving records one immutable definition revision. Running the screen is a separate
                 point-in-time research job that binds its exact dataset and cutoff.
               </p>
-              <Button type="submit" disabled={!validation.valid || save.isPending}>
-                {save.isPending ? (
-                  <RefreshCw className="animate-spin" aria-hidden="true" />
-                ) : (
-                  <ListFilter aria-hidden="true" />
-                )}
-                Save revision {revision}
-              </Button>
+              <Field
+                label="Research cutoff"
+                htmlFor="screen-research-cutoff"
+                help="Only evidence available by this local date and time is eligible."
+              >
+                <Input
+                  id="screen-research-cutoff"
+                  className="mt-2"
+                  type="datetime-local"
+                  step={1}
+                  value={asOf}
+                  onChange={(event) => {
+                    setAsOf(event.target.value)
+                    run.reset()
+                  }}
+                />
+              </Field>
+              <div className="flex flex-wrap justify-end gap-2 lg:col-span-2">
+                <Button type="submit" disabled={!validation.valid || save.isPending}>
+                  {save.isPending ? (
+                    <RefreshCw className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <ListFilter aria-hidden="true" />
+                  )}
+                  Save revision {revision}
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={
+                    !selectedScreen ||
+                    !selectedDataset ||
+                    cutoffNanos(asOf) === null ||
+                    run.isPending
+                  }
+                  onClick={() => {
+                    const cutoff = cutoffNanos(asOf)
+                    if (!selectedScreen || !selectedDataset || cutoff === null) return
+                    run.mutate({
+                      screen: selectedScreen,
+                      dataset: selectedDataset,
+                      asOf: cutoff,
+                    })
+                  }}
+                >
+                  {run.isPending ? (
+                    <RefreshCw className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <ListFilter aria-hidden="true" />
+                  )}
+                  Run saved revision
+                </Button>
+              </div>
             </div>
           </form>
         )}
       </div>
     </section>
   )
+}
+
+function defaultCutoff(): string {
+  const now = new Date()
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 19)
+}
+
+function cutoffNanos(value: string): string | null {
+  const milliseconds = Date.parse(value)
+  if (!Number.isFinite(milliseconds)) return null
+  return (BigInt(Math.trunc(milliseconds)) * 1_000_000n).toString()
 }

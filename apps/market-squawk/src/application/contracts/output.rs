@@ -171,7 +171,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Analysis.StartFeatureDatasetBuild"
         | "Analysis.StartPreparedFeatureDatasetBuild"
         | "Analysis.StartPreparedBacktest"
-        | "Analysis.StartBacktest" => job_receipt(),
+        | "Analysis.StartBacktest"
+        | "Decision.RunScreen" => job_receipt(),
         "Research.IngestSource" => closed(
             vec![
                 ("manifest", manifest()),
@@ -472,15 +473,52 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             &["vintageId", "outcomes", "available", "truncated"],
         ),
         "Decision.SaveScreen"
+        | "Decision.CreateDossier"
         | "Decision.CreateTargetSet"
         | "Decision.ReviewTargetSet"
         | "Decision.ReevaluateTargetSet" => closed(
             vec![("outcome", enumeration(&["appended", "already_present"]))],
             &["outcome"],
         ),
-        "Decision.RunScreen" => closed(
-            vec![("run", record()), ("candidates", array(record()))],
-            &["run", "candidates"],
+        "Decision.GetDossierPreparation" => closed(
+            vec![
+                ("candidateId", text()),
+                ("screenRunId", text()),
+                ("instrumentId", uuid()),
+                ("selectedAt", timestamp()),
+                ("requiredEvidence", bounded_array(text(), 4)),
+                ("portfolioImpactAvailable", boolean()),
+            ],
+            &[
+                "candidateId",
+                "screenRunId",
+                "instrumentId",
+                "selectedAt",
+                "requiredEvidence",
+                "portfolioImpactAvailable",
+            ],
+        ),
+        "Decision.PrepareDossier" => closed(
+            vec![
+                ("receiptId", uuid()),
+                ("dossierId", text()),
+                ("candidateId", text()),
+                ("screenRunId", text()),
+                ("instrumentId", uuid()),
+                ("evidence", bounded_array(text(), 4)),
+                ("assembledAt", timestamp()),
+                ("receiptExpiresAt", timestamp()),
+            ],
+            &[
+                "receiptId",
+                "dossierId",
+                "candidateId",
+                "screenRunId",
+                "instrumentId",
+                "evidence",
+                "assembledAt",
+                "receiptExpiresAt",
+            ],
         ),
         "Decision.GetDossier" => signature(vec![
             ("id", text()),

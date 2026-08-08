@@ -23,8 +23,9 @@ use self::persistence::DecisionJournal;
 
 pub(crate) use self::backup::RetainedDecisionBackupSnapshot;
 pub(crate) use self::dossier_preparation::{
-    DossierEvidenceInventory, DossierPreparationDraft, DossierPreparationError,
-    DossierPreparationFence, DossierPreparationReceipt, PreparedDossierPreview,
+    DossierEvidenceInventory, DossierEvidenceSelection, DossierPreparationDraft,
+    DossierPreparationError, DossierPreparationFence, DossierPreparationReceipt,
+    PreparedDossierPreview,
 };
 pub(crate) use self::screen_workflow::{AdmittedScreenJob, ScreenJobRequest, ScreenWorkflowError};
 use self::target_preparation::{
@@ -171,6 +172,27 @@ impl DecisionApplication {
                 }
                 other => ScreenWorkflowError::Application(other),
             })?;
+        let expected_run_id = screen_workflow::expected_request_run_id(&screen, &request)?;
+        {
+            let state = self.reader()?;
+            if let Some(existing) = state.screen_job_inputs.get(expected_run_id.as_str()) {
+                return if existing.matches_request(&screen, &request) {
+                    existing.admitted()
+                } else {
+                    Err(ScreenWorkflowError::Conflict)
+                };
+            }
+            if state
+                .authority
+                .repository()
+                .screen_execution(&expected_run_id)
+                .is_some()
+            {
+                return Err(ScreenWorkflowError::Application(
+                    DecisionApplicationError::InvalidPersistentState,
+                ));
+            }
+        }
         let plan = screen_workflow::prepare(
             &screen,
             &request,
@@ -189,7 +211,7 @@ impl DecisionApplication {
             .map_err(DecisionApplicationError::from)?;
         screen_workflow::validate_fence(&plan, authoritative_screen)?;
         if let Some(existing) = state.screen_job_inputs.get(plan.run().id().as_str()) {
-            return if existing == &plan {
+            return if existing.matches_request(authoritative_screen, &request) {
                 existing.admitted()
             } else {
                 Err(ScreenWorkflowError::Conflict)

@@ -132,6 +132,7 @@ export type DashboardQuery =
       limit: number
     }
   | { query: "decisionDossier"; dossierId: string }
+  | { query: "decisionDossierPreparation"; candidateId: string }
   | { query: "decisionTargetPreparation"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"
@@ -453,6 +454,15 @@ export type DecisionControlRequest =
       expectedRevision?: number
       screen: Record<string, unknown>
     }
+  | {
+      action: "runScreen"
+      screenId: string
+      screenRevision: number
+      datasetManifest: Record<string, unknown>
+      asOf: string
+    }
+  | { action: "prepareDossier"; draft: Record<string, unknown> }
+  | { action: "createDossier"; receiptId: string }
   | { action: "prepareTargetSet"; draft: Record<string, unknown> }
   | { action: "createTargetSet" | "reevaluateTargetSet"; receiptId: string }
   | {

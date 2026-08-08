@@ -312,6 +312,9 @@ pub(crate) enum DashboardQueryCommand {
     DecisionDossier {
         dossier_id: String,
     },
+    DecisionDossierPreparation {
+        candidate_id: String,
+    },
     DecisionTargetPreparation {
         dossier_id: String,
     },
@@ -640,6 +643,18 @@ pub(crate) enum DecisionControlCommand {
     SaveScreen {
         expected_revision: Option<u32>,
         screen: Map<String, Value>,
+    },
+    RunScreen {
+        screen_id: String,
+        screen_revision: u32,
+        dataset_manifest: Map<String, Value>,
+        as_of: String,
+    },
+    PrepareDossier {
+        draft: Map<String, Value>,
+    },
+    CreateDossier {
+        receipt_id: Uuid,
     },
     PrepareTargetSet {
         draft: Map<String, Value>,

@@ -254,6 +254,10 @@ impl InstalledJobRunners {
         &self.forecast
     }
 
+    pub(crate) const fn screen(&self) -> &Arc<ScreenJobRunner> {
+        &self.screen
+    }
+
     pub(crate) const fn backup(&self) -> &Arc<BackupJobRunner> {
         &self.backup
     }

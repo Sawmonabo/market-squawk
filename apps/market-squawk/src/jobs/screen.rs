@@ -181,9 +181,15 @@ impl JobRunner for ScreenJobRunner {
             .await
             .map_err(|_error| failed("screen-progress-unavailable", true))?;
         let permit = context.claim_terminal_publication(progressed.sequence())?;
-        self.decisions
-            .run_prepared_screen_job(spec.input().identity(), spec.input().digest())
-            .map_err(|_error| failed("screen-evaluation-rejected", false))?;
+        let existing = self
+            .decisions
+            .prepared_screen_result(spec.input().identity(), spec.input().digest())
+            .map_err(|_error| failed("screen-input-unavailable", false))?;
+        if existing.is_none() {
+            self.decisions
+                .run_prepared_screen_job(spec.input().identity(), spec.input().digest())
+                .map_err(|_error| failed("screen-evaluation-rejected", false))?;
+        }
         Ok(JobCompletion::Published(result, permit.seal()))
     }
 

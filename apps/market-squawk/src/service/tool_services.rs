@@ -25,7 +25,7 @@ use crate::{
 use super::{
     analysis::InstalledAnalysisOperations,
     backtest_preparation::{InstalledBacktestPreparation, START_PREPARED_BACKTEST},
-    decision::InstalledDecisionOperations,
+    decision::{InstalledDecisionOperations, RUN_SCREEN},
     forecast_preparation::{InstalledForecastPreparation, START_PREPARED_FORECAST},
     jobs::InstalledJobOperations,
     operations::InstalledOperations,
@@ -152,6 +152,7 @@ impl InstalledToolServices {
             analysis: InstalledAnalysisOperations::new(product, jobs),
             decisions: InstalledDecisionOperations::try_new(
                 product.decisions(),
+                product.research().analytical_reader(),
                 product.portfolio().fair_value_reader(),
                 runtime,
             )?,
@@ -331,6 +332,18 @@ impl InstalledToolServices {
                     .map_err(map_forecast_admission)?;
                 (admission, JobAdmissionOwner::Forecast)
             }
+            RUN_SCREEN => {
+                let prepared = self
+                    .decisions
+                    .prepare_screen_job(request, context, captured_at)
+                    .await?;
+                let admission = self
+                    .runners
+                    .screen()
+                    .admit(crate::jobs::ScreenJobCommand::new(prepared), captured_at)
+                    .map_err(map_screen_admission)?;
+                (admission, JobAdmissionOwner::Screen)
+            }
             _ => return Ok(None),
         };
         let retained = admission.clone();
@@ -413,6 +426,9 @@ impl InstalledToolServices {
             JobAdmissionOwner::Forecast => {
                 let _result = self.runners.forecast().revoke(admission);
             }
+            JobAdmissionOwner::Screen => {
+                let _result = self.runners.screen().revoke(admission);
+            }
         }
     }
 }
@@ -427,6 +443,7 @@ enum JobAdmissionOwner {
     Backtest,
     Training,
     Forecast,
+    Screen,
 }
 
 impl std::fmt::Debug for InstalledToolServices {
@@ -770,5 +787,12 @@ fn map_forecast_admission(error: crate::jobs::ForecastJobRunnerError) -> Service
         | crate::jobs::ForecastJobRunnerError::Conflict => ServiceError::InvalidRequest,
         crate::jobs::ForecastJobRunnerError::Capacity => ServiceError::ResourceExhausted,
         crate::jobs::ForecastJobRunnerError::Unavailable => ServiceError::Unavailable,
+    }
+}
+
+fn map_screen_admission(error: crate::jobs::ScreenJobRunnerError) -> ServiceError {
+    match error {
+        crate::jobs::ScreenJobRunnerError::Conflict => ServiceError::InvalidRequest,
+        crate::jobs::ScreenJobRunnerError::InvalidConfiguration => ServiceError::Unavailable,
     }
 }

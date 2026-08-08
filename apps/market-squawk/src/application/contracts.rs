@@ -224,9 +224,16 @@ const DECISION_SAVE_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("screen", ArgumentKind::Object),
 ];
 const DECISION_RUN_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("run", ArgumentKind::Object),
-    ArgumentSpec::required("candidates", ArgumentKind::Array),
-    ArgumentSpec::required("selectedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("screenId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "screenRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("datasetManifest", ArgumentKind::Object),
+    ArgumentSpec::required("asOf", ArgumentKind::Timestamp),
 ];
 const DECISION_LIST_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
     "limit",
@@ -262,6 +269,14 @@ const DECISION_DOSSIER_LIST_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
+const DECISION_DOSSIER_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "candidateId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_DOSSIER_PREVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("draft", ArgumentKind::Object)];
+const DECISION_DOSSIER_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receiptId", ArgumentKind::Uuid)];
 const DECISION_TARGET_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
     "dossierId",
     ArgumentKind::Identifier,
@@ -1364,6 +1379,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         DECISION_DOSSIER_LIST_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetDossierPreparation",
+        "Return the exact retained evidence available for one candidate dossier.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.PrepareDossier",
+        "Assemble one candidate dossier preview behind a bounded one-use receipt.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.CreateDossier",
+        "Consume one exact preparation receipt and retain its immutable candidate dossier.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
     ),
     read(
         "Decision.GetTargetPreparation",

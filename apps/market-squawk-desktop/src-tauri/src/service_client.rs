@@ -185,6 +185,11 @@ pub(crate) async fn dashboard_query(
             arguments.insert("dossierId".to_owned(), json!(dossier_id));
             ("Decision.GetDossier", arguments)
         }
+        DashboardQueryCommand::DecisionDossierPreparation { candidate_id } => {
+            let mut arguments = Map::new();
+            arguments.insert("candidateId".to_owned(), json!(candidate_id));
+            ("Decision.GetDossierPreparation", arguments)
+        }
         DashboardQueryCommand::DecisionTargetPreparation { dossier_id } => {
             let mut arguments = Map::new();
             arguments.insert("dossierId".to_owned(), json!(dossier_id));
@@ -614,6 +619,52 @@ pub(crate) async fn decision_control(
                 arguments,
                 &state,
                 InvocationAuthority::ExactConfirmed("Decision.SaveScreen"),
+            )
+            .await
+        }
+        DecisionControlCommand::RunScreen {
+            screen_id,
+            screen_revision,
+            dataset_manifest,
+            as_of,
+        } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("screenId".to_owned(), json!(screen_id));
+            arguments.insert("screenRevision".to_owned(), json!(screen_revision));
+            arguments.insert(
+                "datasetManifest".to_owned(),
+                Value::Object(dataset_manifest),
+            );
+            arguments.insert("asOf".to_owned(), json!(as_of));
+            invoke_private_application(
+                "Decision.RunScreen",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.RunScreen"),
+            )
+            .await
+        }
+        DecisionControlCommand::PrepareDossier { draft } => {
+            let mut arguments = Map::new();
+            arguments.insert("draft".to_owned(), Value::Object(draft));
+            invoke_private_application(
+                "Decision.PrepareDossier",
+                arguments,
+                &state,
+                InvocationAuthority::ReadOnly,
+            )
+            .await
+        }
+        DecisionControlCommand::CreateDossier { receipt_id } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("receiptId".to_owned(), json!(receipt_id));
+            invoke_private_application(
+                "Decision.CreateDossier",
+                arguments,
+                &state,
+                InvocationAuthority::ExactConfirmed("Decision.CreateDossier"),
             )
             .await
         }

@@ -1,5 +1,7 @@
 //! Closed transport adapter over the sole durable investment-decision authority.
 
+mod dossier_preparation;
+mod screen_workflow;
 mod target_preparation;
 
 use std::{
@@ -10,16 +12,16 @@ use std::{
 
 use market_squawk_analytics::{FeatureCompatibility, FeatureKey, StatisticalF64};
 use market_squawk_decisions::{
-    AppendOutcome, AsOfSemantics, CandidateAssessment, CandidateFlag, CandidateId, CandidateInput,
+    AppendOutcome, AsOfSemantics, CandidateAssessment, CandidateFlag, CandidateId,
     ComparisonOperator, DecisionActorId, DecisionContentDigest, DecisionDossier,
     DecisionRepositoryError, DecisionText, DossierId, DossierSection, GovernedTargetSet,
     InvestmentTargetSet, InvestmentTargetSetId, NullPolicy, RankingDirection, SavedScreen,
-    ScreenConstraints, ScreenFeatureBinding, ScreenFeatureObservation, ScreenId, ScreenPredicate,
-    ScreenRanking, ScreenRevision, ScreenRun, ScreenRunId, TargetMethod, TargetReview,
-    TargetReviewDisposition, TargetReviewId, TargetState, TargetStatus,
+    ScreenConstraints, ScreenFeatureBinding, ScreenId, ScreenPredicate, ScreenRanking,
+    ScreenRevision, ScreenRunId, TargetMethod, TargetReview, TargetReviewDisposition,
+    TargetReviewId, TargetState, TargetStatus,
 };
 use market_squawk_domain::{
-    Currency, DataQuality, EvidenceDigest, InstrumentId, Money, RevisionNumber, Timestamp,
+    Currency, DataQuality, EvidenceDigest, Money, RevisionNumber, Timestamp,
 };
 use market_squawk_modeling::ProductionFeatureRegistry;
 use market_squawk_portfolio::PortfolioRevisionToken;
@@ -33,10 +35,13 @@ use serde_json::{Map, Value, json};
 use crate::application::decision::{DecisionApplication, DecisionApplicationError};
 use crate::portfolio_application::PortfolioFairValueReadCapability;
 
-use self::target_preparation::TargetPreparationOperations;
+use self::{
+    dossier_preparation::DossierPreparationOperations, screen_workflow::ScreenWorkflowOperations,
+    target_preparation::TargetPreparationOperations,
+};
 
 const SAVE_SCREEN: &str = "Decision.SaveScreen";
-const RUN_SCREEN: &str = "Decision.RunScreen";
+pub(super) const RUN_SCREEN: &str = screen_workflow::RUN_SCREEN;
 const LIST_SCREENS: &str = "Decision.ListScreens";
 const GET_CANDIDATES: &str = "Decision.GetCandidates";
 const LIST_SCREEN_RUNS: &str = "Decision.ListScreenRuns";
@@ -52,18 +57,26 @@ const TARGET_STATUS: &str = "Decision.GetTargetSetStatus";
 pub(super) struct InstalledDecisionOperations {
     decisions: Arc<DecisionApplication>,
     features: ProductionFeatureRegistry,
+    dossier_preparation: DossierPreparationOperations,
+    screen_workflow: ScreenWorkflowOperations,
     target_preparation: TargetPreparationOperations,
 }
 
 impl InstalledDecisionOperations {
     pub(super) fn try_new(
         decisions: Arc<DecisionApplication>,
+        analytical_reader: market_squawk_data::AnalyticalReadCapability,
         portfolio: PortfolioFairValueReadCapability,
         runtime: market_squawk_runtime::RuntimeIdentity,
     ) -> Result<Self, ServiceError> {
         let features =
             ProductionFeatureRegistry::try_new().map_err(|_error| ServiceError::Unavailable)?;
         Ok(Self {
+            dossier_preparation: DossierPreparationOperations::new(Arc::clone(&decisions), runtime),
+            screen_workflow: ScreenWorkflowOperations::new(
+                Arc::clone(&decisions),
+                analytical_reader,
+            ),
             target_preparation: TargetPreparationOperations::new(
                 Arc::clone(&decisions),
                 portfolio,
@@ -75,7 +88,8 @@ impl InstalledDecisionOperations {
     }
 
     pub(super) fn owns(operation: &str) -> bool {
-        TargetPreparationOperations::owns(operation)
+        DossierPreparationOperations::owns(operation)
+            || TargetPreparationOperations::owns(operation)
             || matches!(
                 operation,
                 SAVE_SCREEN
@@ -93,12 +107,29 @@ impl InstalledDecisionOperations {
             )
     }
 
+    pub(super) async fn prepare_screen_job(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        selected_at: Timestamp,
+    ) -> Result<crate::application::decision::AdmittedScreenJob, ServiceError> {
+        if request.name() != RUN_SCREEN {
+            return Err(ServiceError::NotFound);
+        }
+        self.screen_workflow
+            .prepare(request, context, selected_at)
+            .await
+    }
+
     pub(super) fn call(
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
+        if DossierPreparationOperations::owns(request.name()) {
+            return self.dossier_preparation.call(request, context);
+        }
         if TargetPreparationOperations::owns(request.name()) {
             return self.target_preparation.call(request, context);
         }
@@ -112,21 +143,6 @@ impl InstalledDecisionOperations {
                     .save_screen(input.expected_revision.map(revision).transpose()?, screen)
                     .map_err(map_application)?;
                 (append_outcome_value(outcome), 1)
-            }
-            RUN_SCREEN => {
-                let input: RunScreenRequest = decode(&arguments)?;
-                let run = input.run.decode(self.features.feature_registry())?;
-                let candidates = input
-                    .candidates
-                    .into_iter()
-                    .map(|candidate| candidate.decode(self.features.feature_registry()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let execution = self
-                    .decisions
-                    .run_screen(run, candidates, input.selected_at)
-                    .map_err(map_application)?;
-                let count = execution.candidates().len().max(1);
-                (execution_value(&execution), count)
             }
             LIST_SCREENS => {
                 let input: ListRequest = decode(&arguments)?;
@@ -294,6 +310,8 @@ impl std::fmt::Debug for InstalledDecisionOperations {
             .debug_struct("InstalledDecisionOperations")
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("features", &"[CODE-OWNED FEATURE REGISTRY]")
+            .field("dossier_preparation", &self.dossier_preparation)
+            .field("screen_workflow", &self.screen_workflow)
             .field("target_preparation", &self.target_preparation)
             .finish()
     }
@@ -304,14 +322,6 @@ impl std::fmt::Debug for InstalledDecisionOperations {
 struct SaveScreenRequest {
     expected_revision: Option<u32>,
     screen: ScreenInput,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct RunScreenRequest {
-    run: ScreenRunInput,
-    candidates: Vec<CandidateInputDto>,
-    selected_at: Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -527,111 +537,6 @@ impl ScreenInput {
             NonZeroUsize::new(self.maximum_results).ok_or(ServiceError::InvalidRequest)?,
             constraints,
             registry,
-        )
-        .map_err(invalid)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ScreenRunInput {
-    id: String,
-    screen_id: String,
-    screen_revision: u32,
-    as_of: Timestamp,
-    dataset_identity: EvidenceDigest,
-    universe_identity: EvidenceDigest,
-    feature_bindings: Vec<FeatureBindingInput>,
-}
-
-impl ScreenRunInput {
-    fn decode(
-        self,
-        registry: &market_squawk_analytics::FeatureRegistry,
-    ) -> Result<ScreenRun, ServiceError> {
-        ScreenRun::try_new(
-            ScreenRunId::try_new(self.id).map_err(invalid)?,
-            ScreenRevision::new(
-                ScreenId::try_new(self.screen_id).map_err(invalid)?,
-                revision(self.screen_revision)?,
-            ),
-            self.as_of,
-            content_digest(self.dataset_identity)?,
-            content_digest(self.universe_identity)?,
-            self.feature_bindings
-                .into_iter()
-                .map(|binding| binding.decode(registry))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .map_err(invalid)
-    }
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CandidateFlagInput {
-    MissingFeatureIncluded,
-    ModelDependent,
-    PortfolioImpactBound,
-    NonDirectData,
-}
-
-impl From<CandidateFlagInput> for CandidateFlag {
-    fn from(value: CandidateFlagInput) -> Self {
-        match value {
-            CandidateFlagInput::MissingFeatureIncluded => Self::MissingFeatureIncluded,
-            CandidateFlagInput::ModelDependent => Self::ModelDependent,
-            CandidateFlagInput::PortfolioImpactBound => Self::PortfolioImpactBound,
-            CandidateFlagInput::NonDirectData => Self::NonDirectData,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObservationInput {
-    binding: FeatureBindingInput,
-    value: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CandidateInputDto {
-    id: String,
-    instrument_id: InstrumentId,
-    observations: Vec<ObservationInput>,
-    coverage: f64,
-    liquidity: f64,
-    data_quality: DataQuality,
-    portfolio_revision: Option<[u8; 32]>,
-    flags: Vec<CandidateFlagInput>,
-    evidence_identity: EvidenceDigest,
-}
-
-impl CandidateInputDto {
-    fn decode(
-        self,
-        registry: &market_squawk_analytics::FeatureRegistry,
-    ) -> Result<CandidateInput, ServiceError> {
-        CandidateInput::try_new(
-            CandidateId::try_new(self.id).map_err(invalid)?,
-            self.instrument_id,
-            self.observations
-                .into_iter()
-                .map(|observation| {
-                    Ok(ScreenFeatureObservation::new(
-                        observation.binding.decode(registry)?,
-                        observation.value.map(statistical).transpose()?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ServiceError>>()?,
-            statistical(self.coverage)?,
-            statistical(self.liquidity)?,
-            self.data_quality,
-            self.portfolio_revision
-                .map(PortfolioRevisionToken::from_bytes),
-            self.flags.into_iter().map(Into::into).collect(),
-            content_digest(self.evidence_identity)?,
         )
         .map_err(invalid)
     }
@@ -856,22 +761,6 @@ fn screen_run_index_value(entry: &market_squawk_decisions::ScreenRunIndexEntry) 
         "datasetIdentity": run.dataset_identity().evidence_digest(),
         "universeIdentity": run.universe_identity().evidence_digest(),
         "candidateCount": entry.candidate_count(),
-    })
-}
-
-fn execution_value(execution: &market_squawk_decisions::ScreenExecution) -> Value {
-    let run = execution.run();
-    json!({
-        "run": {
-            "id": run.id().as_str(),
-            "screenId": run.screen().id().as_str(),
-            "screenRevision": run.screen().revision().get(),
-            "asOf": run.as_of(),
-            "datasetIdentity": run.dataset_identity().evidence_digest(),
-            "universeIdentity": run.universe_identity().evidence_digest(),
-            "featureBindings": run.feature_bindings().iter().map(binding_value).collect::<Vec<_>>(),
-        },
-        "candidates": execution.candidates().iter().map(candidate_value).collect::<Vec<_>>(),
     })
 }
 
