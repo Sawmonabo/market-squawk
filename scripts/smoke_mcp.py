@@ -399,7 +399,7 @@ def main() -> int:
     with (
         tempfile.TemporaryDirectory() as temporary_data_dir,
         temporary_user_context as temporary_user_root,
-        temporary_installation_context as temporary_installation_root,
+        temporary_installation_context as temporary_installation_parent,
         temporary_appimage_context as temporary_appimage_root,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
         tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
@@ -412,8 +412,11 @@ def main() -> int:
         )
         installation_data_root = (
             None
-            if temporary_installation_root is None
-            else str(pathlib.Path(temporary_installation_root).resolve(strict=True))
+            if temporary_installation_parent is None
+            else str(
+                pathlib.Path(temporary_installation_parent).resolve(strict=True)
+                / "installation"
+            )
         )
         installation_arguments = (
             []
