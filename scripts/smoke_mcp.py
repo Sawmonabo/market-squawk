@@ -10,6 +10,7 @@ import queue
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -377,6 +378,36 @@ def wait_for_service(
     )
 
 
+def wait_for_service_root(
+    installation_data_root: str,
+    service: subprocess.Popen[str],
+) -> None:
+    """Wait until the service has admitted and created its fresh verification root."""
+    root = pathlib.Path(installation_data_root)
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if service.poll() is not None:
+            raise RuntimeError(
+                f"installed service exited before startup with status {service.returncode}"
+            )
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            time.sleep(0.05)
+            continue
+        except OSError as error:
+            raise RuntimeError("failed to inspect the service verification root") from error
+        require(
+            stat.S_ISDIR(metadata.st_mode),
+            "installed service verification root is not a real directory",
+        )
+        return
+    raise TimeoutError(
+        "installed service did not create its verification root within "
+        f"{SERVICE_START_TIMEOUT_SECONDS:.3f}s"
+    )
+
+
 def main() -> int:
     arguments = parse_arguments()
     binary = pathlib.Path(arguments.binary).resolve()
@@ -498,6 +529,7 @@ def main() -> int:
                     ),
                 )
                 require(environment is not None, "isolated service environment is unavailable")
+                wait_for_service_root(installation_data_root, service)
                 wait_for_service(
                     service_cli,
                     data_dir,
