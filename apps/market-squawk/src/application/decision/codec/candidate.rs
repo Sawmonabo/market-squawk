@@ -22,6 +22,92 @@ enum CandidateFlagWire {
     NonDirectData,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationWire {
+    binding: FeatureBindingWire,
+    value_bits: Option<u64>,
+}
+
+/// Exact application-derived candidate input retained before durable job admission.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::application::decision) struct CandidateInputWire {
+    id: String,
+    instrument_id: InstrumentId,
+    observations: Vec<ObservationWire>,
+    coverage_bits: u64,
+    liquidity_bits: u64,
+    data_quality: DataQuality,
+    portfolio_revision: Option<[u8; 32]>,
+    flags: Vec<CandidateFlagWire>,
+    evidence_identity: EvidenceDigest,
+}
+
+impl From<&CandidateInput> for CandidateInputWire {
+    fn from(value: &CandidateInput) -> Self {
+        Self {
+            id: value.id().as_str().to_owned(),
+            instrument_id: value.instrument_id(),
+            observations: value
+                .observations()
+                .iter()
+                .map(|observation| ObservationWire {
+                    binding: observation.binding().into(),
+                    value_bits: observation.value().map(|value| value.get().to_bits()),
+                })
+                .collect(),
+            coverage_bits: value.coverage().get().to_bits(),
+            liquidity_bits: value.liquidity().get().to_bits(),
+            data_quality: value.data_quality(),
+            portfolio_revision: value.portfolio_impact().map(PortfolioRevisionToken::bytes),
+            flags: value.flags().iter().copied().map(Into::into).collect(),
+            evidence_identity: value.evidence_identity().evidence_digest(),
+        }
+    }
+}
+
+impl CandidateInputWire {
+    pub(in crate::application::decision) fn decode(
+        &self,
+        bindings: &[ScreenFeatureBinding],
+        registry: &FeatureRegistry,
+    ) -> Result<CandidateInput, DecisionApplicationError> {
+        let observations = self
+            .observations
+            .iter()
+            .map(|observation| {
+                Ok(ScreenFeatureObservation::new(
+                    observation.binding.decode(registry)?,
+                    observation.value_bits.map(statistical).transpose()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DecisionApplicationError>>()?;
+        if observations.len() != bindings.len()
+            || !observations
+                .iter()
+                .zip(bindings)
+                .all(|(observation, binding)| observation.binding() == binding)
+        {
+            return Err(DecisionApplicationError::InvalidPersistentState);
+        }
+        CandidateInput::try_new(
+            CandidateId::try_new(&self.id)
+                .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?,
+            self.instrument_id,
+            observations,
+            statistical(self.coverage_bits)?,
+            statistical(self.liquidity_bits)?,
+            self.data_quality,
+            self.portfolio_revision
+                .map(PortfolioRevisionToken::from_bytes),
+            self.flags.iter().copied().map(Into::into).collect(),
+            content_digest(self.evidence_identity)?,
+        )
+        .map_err(|_error| DecisionApplicationError::InvalidPersistentState)
+    }
+}
+
 impl From<CandidateFlag> for CandidateFlagWire {
     fn from(value: CandidateFlag) -> Self {
         match value {

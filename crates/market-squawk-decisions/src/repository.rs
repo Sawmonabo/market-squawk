@@ -395,6 +395,13 @@ impl DecisionRepository {
         {
             return Err(DecisionRepositoryError::EvidenceMismatch);
         }
+        if execution
+            .candidates()
+            .iter()
+            .any(|candidate| self.candidate(candidate.record().id()).is_some())
+        {
+            return Err(DecisionRepositoryError::Conflict);
+        }
         if self.screen_run_count() >= self.limits.maximum_screen_runs {
             return Err(DecisionRepositoryError::Capacity);
         }
@@ -581,6 +588,21 @@ impl DecisionRepository {
             DecisionRecord::ScreenExecution(execution) if execution.run().id() == id => {
                 Some(execution)
             }
+            _ => None,
+        })
+    }
+
+    /// Finds one globally unique candidate together with its immutable parent run.
+    ///
+    /// Dossiers identify candidates independently of a run coordinate, so accepting the same
+    /// candidate identity in two runs would make downstream evidence resolution ambiguous.
+    pub fn candidate(&self, id: &CandidateId) -> Option<(&ScreenRun, &crate::CandidateAssessment)> {
+        self.records.iter().find_map(|record| match record {
+            DecisionRecord::ScreenExecution(execution) => execution
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.record().id() == id)
+                .map(|candidate| (execution.run(), candidate)),
             _ => None,
         })
     }

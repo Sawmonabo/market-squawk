@@ -213,7 +213,8 @@ fn screen_run_binds_exact_pit_inputs_and_rejects_semantic_substitution()
         vec![CandidateFlag::ModelDependent],
         content_digest(32)?,
     )?;
-    let execution = authority.run_screen(run, vec![input], Timestamp::from_unix_nanos(51))?;
+    let execution =
+        authority.run_screen(run, vec![input.clone()], Timestamp::from_unix_nanos(51))?;
 
     assert_eq!(execution.run().dataset_identity(), dataset);
     assert_eq!(execution.run().universe_identity(), universe);
@@ -222,6 +223,23 @@ fn screen_run_binds_exact_pit_inputs_and_rejects_semantic_substitution()
         std::slice::from_ref(&binding)
     );
     assert_eq!(execution.candidates().len(), 1);
+
+    let duplicate_candidate_run = ScreenRun::try_new(
+        ScreenRunId::try_new("run.quality.collision")?,
+        saved.revision().clone(),
+        Timestamp::from_unix_nanos(52),
+        dataset,
+        universe,
+        vec![binding.clone()],
+    )?;
+    assert_eq!(
+        authority.run_screen(
+            duplicate_candidate_run,
+            vec![input],
+            Timestamp::from_unix_nanos(52),
+        ),
+        Err(DecisionRepositoryError::Conflict)
+    );
 
     let dossier = DecisionDossier::try_new(
         Dossier::try_new(

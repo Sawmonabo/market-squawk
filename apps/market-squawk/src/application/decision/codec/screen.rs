@@ -197,7 +197,7 @@ impl ScreenWire {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RunWire {
+pub(in crate::application::decision) struct RunWire {
     id: String,
     screen_id: String,
     screen_revision: u32,
@@ -222,11 +222,11 @@ impl From<&ScreenRun> for RunWire {
 }
 
 impl RunWire {
-    pub(super) fn key(&self) -> &str {
+    pub(in crate::application::decision) fn key(&self) -> &str {
         &self.id
     }
 
-    pub(super) fn decode(
+    pub(in crate::application::decision) fn decode(
         &self,
         registry: &FeatureRegistry,
     ) -> Result<ScreenRun, DecisionApplicationError> {

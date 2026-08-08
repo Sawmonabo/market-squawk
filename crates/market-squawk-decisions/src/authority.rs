@@ -71,6 +71,16 @@ impl DecisionAuthority {
             .ok_or(DecisionRepositoryError::NotFound)
     }
 
+    /// Returns one globally unique retained candidate and its immutable parent run.
+    pub fn get_candidate(
+        &self,
+        candidate_id: &crate::CandidateId,
+    ) -> Result<(&ScreenRun, &CandidateAssessment), DecisionRepositoryError> {
+        self.repository
+            .candidate(candidate_id)
+            .ok_or(DecisionRepositoryError::NotFound)
+    }
+
     /// Lists bounded retained saved-screen runs for discovery before exact candidate lookup.
     pub fn list_screen_runs(
         &self,

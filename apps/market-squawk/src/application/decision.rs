@@ -2,10 +2,12 @@
 
 mod backup;
 mod codec;
+pub(crate) mod dossier_preparation;
 mod persistence;
+pub(crate) mod screen_workflow;
 pub(crate) mod target_preparation;
 
-use std::{fmt, sync::Mutex};
+use std::{collections::BTreeMap, fmt, sync::Mutex, time::Instant};
 
 use market_squawk_decisions::{
     AppendOutcome, CandidateAssessment, CandidateInput, DecisionAuthority, DecisionDossier,
@@ -13,13 +15,18 @@ use market_squawk_decisions::{
     SavedScreen, ScreenExecution, ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry,
     TargetInvalidation, TargetReview, TargetState, TargetStatus,
 };
-use market_squawk_domain::{RevisionNumber, Timestamp};
+use market_squawk_domain::{EvidenceDigest, RevisionNumber, SourceIdentifier, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
 
 use self::codec::{EncodedRecord, RecoveryContext};
 use self::persistence::DecisionJournal;
 
 pub(crate) use self::backup::RetainedDecisionBackupSnapshot;
+pub(crate) use self::dossier_preparation::{
+    DossierEvidenceInventory, DossierPreparationDraft, DossierPreparationError,
+    DossierPreparationFence, DossierPreparationReceipt, PreparedDossierPreview,
+};
+pub(crate) use self::screen_workflow::{AdmittedScreenJob, ScreenJobRequest, ScreenWorkflowError};
 use self::target_preparation::{
     PreparedTargetPreview, TargetEvidenceInventory, TargetPreparationCommitKind,
     TargetPreparationDraft, TargetPreparationError, TargetPreparationFence,
@@ -71,6 +78,8 @@ struct DecisionState {
     authority: DecisionAuthority,
     journal: DecisionJournal,
     preparation: target_preparation::TargetPreparationAuthority,
+    dossier_preparation: dossier_preparation::DossierPreparationAuthority,
+    screen_job_inputs: BTreeMap<String, screen_workflow::ScreenJobPlan>,
     limits: DecisionRepositoryLimits,
     backup_retained: bool,
     poisoned: bool,
@@ -94,11 +103,14 @@ impl DecisionApplication {
         let mut authority = DecisionAuthority::new(repository);
         let mut recovery = RecoveryContext::try_new()?;
         let _semantic_sha256 = journal.recover(&mut authority, &mut recovery)?;
+        let screen_job_inputs = recovery.into_screen_job_inputs();
         Ok(Self {
             state: Mutex::new(DecisionState {
                 authority,
                 journal,
                 preparation: target_preparation::TargetPreparationAuthority::default(),
+                dossier_preparation: dossier_preparation::DossierPreparationAuthority::default(),
+                screen_job_inputs,
                 limits,
                 backup_retained: false,
                 poisoned: false,
@@ -139,6 +151,127 @@ impl DecisionApplication {
             return Err(error);
         }
         Ok(execution)
+    }
+
+    /// Resolves one retained screen and exact feature generation, derives all candidate inputs,
+    /// and commits the immutable job input before returning an admission locator.
+    pub async fn prepare_screen_job(
+        &self,
+        request: ScreenJobRequest,
+        reader: &market_squawk_data::AnalyticalReadCapability,
+        selected_at: Timestamp,
+        deadline: Instant,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<AdmittedScreenJob, ScreenWorkflowError> {
+        let screen = self
+            .get_screen(request.screen_id(), request.screen_revision())
+            .map_err(|error| match error {
+                DecisionApplicationError::Repository(DecisionRepositoryError::NotFound) => {
+                    ScreenWorkflowError::NotFound
+                }
+                other => ScreenWorkflowError::Application(other),
+            })?;
+        let plan = screen_workflow::prepare(
+            &screen,
+            &request,
+            reader,
+            selected_at,
+            deadline,
+            cancellation,
+        )
+        .await?;
+        let encoded = codec::screen_job_input(&plan)?;
+        let admitted = plan.admitted()?;
+        let mut state = self.writer()?;
+        let authoritative_screen = state
+            .authority
+            .get_screen(plan.run().screen().id(), plan.run().screen().revision())
+            .map_err(DecisionApplicationError::from)?;
+        screen_workflow::validate_fence(&plan, authoritative_screen)?;
+        if let Some(existing) = state.screen_job_inputs.get(plan.run().id().as_str()) {
+            return if existing == &plan {
+                existing.admitted()
+            } else {
+                Err(ScreenWorkflowError::Conflict)
+            };
+        }
+        if state
+            .authority
+            .repository()
+            .screen_execution(plan.run().id())
+            .is_some()
+        {
+            return Err(ScreenWorkflowError::Conflict);
+        }
+        match state.journal.append(&encoded) {
+            Ok(AppendOutcome::Appended) => {
+                state
+                    .screen_job_inputs
+                    .insert(plan.run().id().as_str().to_owned(), plan);
+                Ok(admitted)
+            }
+            Ok(AppendOutcome::AlreadyPresent) => {
+                state.poisoned = true;
+                Err(ScreenWorkflowError::Application(
+                    DecisionApplicationError::InvalidPersistentState,
+                ))
+            }
+            Err(DecisionApplicationError::Capacity) => Err(ScreenWorkflowError::Capacity),
+            Err(error) => {
+                state.poisoned = true;
+                Err(ScreenWorkflowError::Application(error))
+            }
+        }
+    }
+
+    /// Executes one previously committed screen-job input. No caller-supplied candidate or run
+    /// record crosses this boundary.
+    pub fn run_prepared_screen_job(
+        &self,
+        input_identity: &SourceIdentifier,
+        input_digest: EvidenceDigest,
+    ) -> Result<ScreenExecution, ScreenWorkflowError> {
+        let plan = self.screen_job_plan(input_identity, input_digest)?;
+        let (run, candidates, selected_at) = plan.into_execution();
+        self.run_screen(run, candidates, selected_at)
+            .map_err(ScreenWorkflowError::Application)
+    }
+
+    /// Resolves the immutable run associated with one exact prepared input.
+    pub fn prepared_screen_run_id(
+        &self,
+        input_identity: &SourceIdentifier,
+        input_digest: EvidenceDigest,
+    ) -> Result<ScreenRunId, ScreenWorkflowError> {
+        Ok(self
+            .screen_job_plan(input_identity, input_digest)?
+            .run()
+            .id()
+            .clone())
+    }
+
+    /// Returns whether the decision journal already contains the exact prepared run result.
+    pub fn prepared_screen_result(
+        &self,
+        input_identity: &SourceIdentifier,
+        input_digest: EvidenceDigest,
+    ) -> Result<Option<ScreenExecution>, ScreenWorkflowError> {
+        let state = self.reader()?;
+        let plan = resolve_screen_job_plan(&state, input_identity, input_digest)?;
+        Ok(state
+            .authority
+            .repository()
+            .screen_execution(plan.run().id())
+            .cloned())
+    }
+
+    fn screen_job_plan(
+        &self,
+        input_identity: &SourceIdentifier,
+        input_digest: EvidenceDigest,
+    ) -> Result<screen_workflow::ScreenJobPlan, ScreenWorkflowError> {
+        let state = self.reader()?;
+        Ok(resolve_screen_job_plan(&state, input_identity, input_digest)?.clone())
     }
 
     /// `Decision.ListScreens` typed implementation with caller-selected bounded output.
@@ -204,6 +337,44 @@ impl DecisionApplication {
         let mut state = self.writer()?;
         let outcome = state.authority.append_dossier(dossier)?;
         persist_outcome(&mut state, &encoded, outcome)
+    }
+
+    /// Enumerates application-owned evidence options for one retained selected candidate.
+    pub fn dossier_evidence_inventory(
+        &self,
+        candidate_id: &market_squawk_decisions::CandidateId,
+    ) -> Result<DossierEvidenceInventory, DossierPreparationError> {
+        let state = self.reader()?;
+        state
+            .dossier_preparation
+            .inventory(&state.authority, candidate_id)
+    }
+
+    /// Assembles an immutable dossier from retained candidate evidence behind a one-use receipt.
+    pub fn prepare_dossier(
+        &self,
+        fence: DossierPreparationFence,
+        draft: DossierPreparationDraft,
+        now: Timestamp,
+    ) -> Result<PreparedDossierPreview, DossierPreparationError> {
+        let mut state = self.writer()?;
+        let DecisionState {
+            authority,
+            dossier_preparation,
+            ..
+        } = &mut *state;
+        dossier_preparation.prepare(authority, fence, draft, now)
+    }
+
+    /// Consumes one dossier receipt after revalidating its complete installed authority fence.
+    pub fn consume_dossier_preparation(
+        &self,
+        receipt: DossierPreparationReceipt,
+        fence: DossierPreparationFence,
+        now: Timestamp,
+    ) -> Result<AppendOutcome, DossierPreparationError> {
+        let mut state = self.writer()?;
+        dossier_preparation::consume_prepared(&mut state, receipt, fence, now)
     }
 
     /// `Decision.GetDossier` typed implementation.
@@ -419,6 +590,21 @@ impl DecisionApplication {
             Ok(state)
         }
     }
+}
+
+fn resolve_screen_job_plan<'a>(
+    state: &'a DecisionState,
+    input_identity: &SourceIdentifier,
+    input_digest: EvidenceDigest,
+) -> Result<&'a screen_workflow::ScreenJobPlan, ScreenWorkflowError> {
+    let plan = state
+        .screen_job_inputs
+        .get(input_identity.as_str())
+        .ok_or(ScreenWorkflowError::NotFound)?;
+    if plan.input_digest() != input_digest {
+        return Err(ScreenWorkflowError::Conflict);
+    }
+    Ok(plan)
 }
 
 fn persist_outcome(

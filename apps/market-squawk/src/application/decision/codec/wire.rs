@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::super::screen_workflow::ScreenJobPlanWire;
 use super::candidate::ExecutionWire;
 use super::dossier::DossierWire;
 use super::screen::ScreenWire;
@@ -12,6 +13,7 @@ pub(super) const KIND_DOSSIER: i64 = 3;
 pub(super) const KIND_TARGET: i64 = 4;
 pub(super) const KIND_REVIEW: i64 = 5;
 pub(super) const KIND_INVALIDATION: i64 = 6;
+pub(super) const KIND_SCREEN_JOB_INPUT: i64 = 7;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +31,7 @@ pub(super) enum WireRecord {
     Target(Box<TargetWire>),
     Review(ReviewWire),
     Invalidation(InvalidationWire),
+    ScreenJobInput(Box<ScreenJobPlanWire>),
 }
 
 impl WireRecord {
@@ -40,6 +43,7 @@ impl WireRecord {
             Self::Target(_) => KIND_TARGET,
             Self::Review(_) => KIND_REVIEW,
             Self::Invalidation(_) => KIND_INVALIDATION,
+            Self::ScreenJobInput(_) => KIND_SCREEN_JOB_INPUT,
         }
     }
 }

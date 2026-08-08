@@ -134,6 +134,60 @@ impl CandidateInput {
         })
     }
 
+    /// Stable candidate identity allocated by the decision workflow authority.
+    #[must_use]
+    pub const fn id(&self) -> &CandidateId {
+        &self.id
+    }
+
+    /// Instrument represented by this exact point-in-time input row.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Complete sorted feature-semantic closure consumed by the saved screen.
+    #[must_use]
+    pub fn observations(&self) -> &[ScreenFeatureObservation] {
+        &self.observations
+    }
+
+    /// Fraction of required feature values present in this input row.
+    #[must_use]
+    pub const fn coverage(&self) -> StatisticalF64 {
+        self.coverage
+    }
+
+    /// Finite upstream liquidity statistic in the saved screen's declared unit.
+    #[must_use]
+    pub const fn liquidity(&self) -> StatisticalF64 {
+        self.liquidity
+    }
+
+    /// Evidentiary quality assigned by the source-owning application workflow.
+    #[must_use]
+    pub const fn data_quality(&self) -> DataQuality {
+        self.data_quality
+    }
+
+    /// Exact portfolio revision used for candidate-impact evidence, when available.
+    #[must_use]
+    pub const fn portfolio_impact(&self) -> Option<&PortfolioRevisionToken> {
+        self.portfolio_impact.as_ref()
+    }
+
+    /// Closed provenance flags derived by the application workflow.
+    #[must_use]
+    pub fn flags(&self) -> &[CandidateFlag] {
+        &self.flags
+    }
+
+    /// Commitment to the exact upstream rows used to construct this input.
+    #[must_use]
+    pub const fn evidence_identity(&self) -> DecisionContentDigest {
+        self.evidence_identity
+    }
+
     fn observation(&self, binding: &ScreenFeatureBinding) -> Option<Option<StatisticalF64>> {
         self.observations
             .binary_search_by(|candidate| candidate.binding.key().cmp(binding.key()))

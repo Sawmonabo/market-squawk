@@ -1,10 +1,10 @@
 //! Strict, versioned wire records for the append-only decision journal.
 
-mod candidate;
+pub(super) mod candidate;
 mod common;
 mod dossier;
 mod recovery;
-mod screen;
+pub(super) mod screen;
 mod target;
 mod wire;
 
@@ -23,10 +23,11 @@ pub(super) use self::recovery::RecoveryContext;
 use self::screen::ScreenWire;
 use self::target::{InvalidationWire, ReviewWire, TargetWire};
 use self::wire::{
-    KIND_DOSSIER, KIND_EXECUTION, KIND_INVALIDATION, KIND_REVIEW, KIND_SCREEN, KIND_TARGET,
-    WIRE_VERSION, WireEnvelope, WireRecord,
+    KIND_DOSSIER, KIND_EXECUTION, KIND_INVALIDATION, KIND_REVIEW, KIND_SCREEN,
+    KIND_SCREEN_JOB_INPUT, KIND_TARGET, WIRE_VERSION, WireEnvelope, WireRecord,
 };
 use super::DecisionApplicationError;
+use super::screen_workflow::{ScreenJobPlan, ScreenJobPlanWire};
 
 #[derive(Debug)]
 pub(super) struct EncodedRecord {
@@ -84,6 +85,16 @@ pub(super) fn dossier(
         KIND_DOSSIER,
         dossier.dossier().id().as_str().to_owned(),
         WireRecord::Dossier(DossierWire::from(dossier)),
+    )
+}
+
+pub(super) fn screen_job_input(
+    plan: &ScreenJobPlan,
+) -> Result<EncodedRecord, DecisionApplicationError> {
+    EncodedRecord::try_new(
+        KIND_SCREEN_JOB_INPUT,
+        plan.run().id().as_str().to_owned(),
+        WireRecord::ScreenJobInput(Box::new(ScreenJobPlanWire::from_plan(plan))),
     )
 }
 

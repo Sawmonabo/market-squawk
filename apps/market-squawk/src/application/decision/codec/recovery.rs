@@ -4,6 +4,7 @@ use market_squawk_decisions::{AppendOutcome, CandidateRecord, DecisionAuthority}
 use market_squawk_modeling::ProductionFeatureRegistry;
 
 use super::super::DecisionApplicationError;
+use super::super::screen_workflow::ScreenJobPlan;
 use super::candidate::ExecutionWire;
 use super::wire::{WIRE_VERSION, WireEnvelope, WireRecord};
 
@@ -11,6 +12,7 @@ use super::wire::{WIRE_VERSION, WireEnvelope, WireRecord};
 pub(in crate::application::decision) struct RecoveryContext {
     registry: ProductionFeatureRegistry,
     candidates: BTreeMap<String, CandidateRecord>,
+    screen_job_inputs: BTreeMap<String, ScreenJobPlan>,
 }
 
 impl RecoveryContext {
@@ -19,7 +21,14 @@ impl RecoveryContext {
             registry: ProductionFeatureRegistry::try_new()
                 .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?,
             candidates: BTreeMap::new(),
+            screen_job_inputs: BTreeMap::new(),
         })
+    }
+
+    pub(in crate::application::decision) fn into_screen_job_inputs(
+        self,
+    ) -> BTreeMap<String, ScreenJobPlan> {
+        self.screen_job_inputs
     }
 
     pub(in crate::application::decision) fn apply(
@@ -126,6 +135,18 @@ impl RecoveryContext {
                     .target()
                     .clone();
                 ensure_appended(authority.invalidate_target(wire.decode(&target)?)?)
+            }
+            WireRecord::ScreenJobInput(wire) => {
+                if wire.key() != key || self.screen_job_inputs.contains_key(key) {
+                    return Err(DecisionApplicationError::InvalidPersistentState);
+                }
+                let plan = wire.decode(self.registry.feature_registry())?;
+                let screen = authority
+                    .get_screen(plan.run().screen().id(), plan.run().screen().revision())?;
+                super::super::screen_workflow::validate_fence(&plan, screen)
+                    .map_err(|_error| DecisionApplicationError::InvalidPersistentState)?;
+                self.screen_job_inputs.insert(key.to_owned(), plan);
+                Ok(())
             }
         }
     }
