@@ -39,7 +39,8 @@ impl ScreenWorkflowOperations {
         selected_at: Timestamp,
     ) -> Result<AdmittedScreenJob, ServiceError> {
         ensure_live(context)?;
-        let input: RunScreenRequest = decode(&mutation_arguments(request.arguments()))?;
+        let input: RunScreenRequest =
+            decode(&super::super::business_arguments(request.arguments()))?;
         let request = ScreenJobRequest::new(
             ScreenId::try_new(input.screen_id).map_err(|_error| ServiceError::InvalidRequest)?,
             RevisionNumber::new(input.screen_revision)
@@ -146,12 +147,6 @@ fn hex_nibble(value: u8) -> Result<u8, ServiceError> {
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
     serde_json::from_value(Value::Object(arguments.clone()))
         .map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn mutation_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
-    let mut arguments = arguments.clone();
-    arguments.remove("confirmation");
-    arguments
 }
 
 fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {

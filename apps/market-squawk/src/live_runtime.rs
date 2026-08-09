@@ -79,6 +79,25 @@ impl LiveRuntimeComposition {
         })
     }
 
+    /// Starts every shard with a bounded qualified-market export and no execution authority.
+    ///
+    /// This is the source-only runtime used by market display, research, and valuation consumers.
+    /// It deliberately installs no strategy or execution action hook.
+    pub async fn start_with_qualified_market_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeCompositionError> {
+        Ok(Self {
+            runtime: LiveRuntime::start_with_qualified_market_exports(
+                config,
+                routes,
+                qualified_market_exports,
+            )
+            .await?,
+        })
+    }
+
     /// Returns bounded authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.runtime.snapshots()

@@ -298,7 +298,7 @@ lockfile. Crates are grouped by product responsibility:
 ### Build from source
 
 Source development requires Git, exact `just` `1.57.0`, the repository-pinned Rust `1.97.1`
-toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.1`, and the official
+toolchain, Node.js `24.18.0`, pnpm `10.31.0`, uv `0.12.3`, and the official
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for the host platform. Install
 `just` once through the already-required Rust toolchain, then use the repository-owned commands:
 
@@ -310,20 +310,28 @@ just setup
 just dev
 ```
 
-The repository includes `.nvmrc`. When `nvm` is installed, `just setup` loads it in the
-non-interactive setup shell, installs Node.js `24.18.0` if needed, and runs the frontend setup with
-that exact version. Developers can also run `nvm use` directly in an interactive shell.
+The repository `.nvmrc` pins Node.js `24.18.0`. Every `just` frontend command selects that version
+with `nvm` or `nvm-windows` when available and validates it in the same process that runs pnpm. When
+`nvm` is unavailable, the command proceeds only if the active Node.js version is already exact;
+`just setup` also prepares pinned pnpm `10.31.0`.
 
-`just dev` incrementally builds the required CLI, service, MCP relay, capture helper, and ONNX
-worker before starting the Tauri desktop with Vite hot reload. Its ignored
-`.market-squawk/development` data root is separate from installed-product data. The one shared
-service may remain available after the desktop exits so the development CLI and MCP clients can
-reuse it. `just dev-web` is frontend-only diagnostic mode, not the complete product.
+`just setup` creates the verified, reusable model and training cache at
+`.market-squawk/development-model-runtime`. `just dev` validates that cache and refreshes it when
+shipping inputs have changed before starting the Tauri desktop with Vite hot reload. Its ignored
+`.market-squawk/development` workspace-data root and `.market-squawk/development-installation`
+service-authority root are separate from the installed product. The one shared development service
+may remain available after the desktop exits so the development CLI and MCP clients can reuse it.
+`just dev-web` is frontend-only diagnostic mode, not the complete product.
 
 `just setup` is safe to rerun. It preserves the managed Python environment, synchronizes the
 hash-locked dependencies, and rebuilds and installs Market Squawk's Rust-backed Python package.
 Tests that verify the signed training environment run only against the sealed installed product;
 the ordinary development suite keeps that authority boundary fail-closed.
+
+Use `just refresh-model-runtime` to rebuild the cache explicitly, `just verify-model-runtime` to
+check it without rebuilding, and `just reset-model-runtime` to remove only that reproducible cache
+after stopping the desktop and service. `just reset-dev` separately removes only the development
+workspace-data and service-authority roots.
 
 Use `just --list` to see the supported developer commands and `just doctor` to inspect the active
 tool and Tauri host-prerequisite state. For a focused headless release build, the underlying locked

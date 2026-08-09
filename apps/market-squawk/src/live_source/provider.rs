@@ -34,12 +34,16 @@ pub(super) struct ProductionSourceProfile {
     subscription_ack_timeout: Duration,
     control_message_capacity: usize,
     control_byte_capacity: usize,
+    pre_acknowledgement_data_message_capacity: usize,
+    pre_acknowledgement_data_byte_capacity: usize,
 }
 
 impl ProductionSourceProfile {
     pub(super) fn coinbase(
         profile: ProductionCoinbaseProfile,
         config: &market_squawk_platform::CoinbaseSourceConfig,
+        pre_acknowledgement_data_message_capacity: usize,
+        pre_acknowledgement_data_byte_capacity: usize,
     ) -> Result<Self, ProductionProviderError> {
         let mut products = Vec::new();
         products
@@ -58,6 +62,8 @@ impl ProductionSourceProfile {
             subscription_ack_timeout: config.subscription_ack_timeout(),
             control_message_capacity: controls.message_capacity().get(),
             control_byte_capacity: controls.byte_capacity().get(),
+            pre_acknowledgement_data_message_capacity,
+            pre_acknowledgement_data_byte_capacity,
         })
     }
 
@@ -72,6 +78,8 @@ impl ProductionSourceProfile {
             subscription_ack_timeout: config.subscription_ack_timeout(),
             control_message_capacity: controls.message_capacity().get(),
             control_byte_capacity: controls.byte_capacity().get(),
+            pre_acknowledgement_data_message_capacity: 0,
+            pre_acknowledgement_data_byte_capacity: 0,
         }
     }
 
@@ -103,6 +111,14 @@ impl ProductionSourceProfile {
         self.control_byte_capacity
     }
 
+    pub(super) const fn pre_acknowledgement_data_message_capacity(&self) -> usize {
+        self.pre_acknowledgement_data_message_capacity
+    }
+
+    pub(super) const fn pre_acknowledgement_data_byte_capacity(&self) -> usize {
+        self.pre_acknowledgement_data_byte_capacity
+    }
+
     pub(super) fn decoder(&self) -> Result<ProductionMarketDecoder, ProductionProviderError> {
         self.connector.decoder()
     }
@@ -125,6 +141,8 @@ impl ProductionSourceProfile {
             subscription_ack_timeout,
             control_message_capacity,
             control_byte_capacity,
+            pre_acknowledgement_data_message_capacity,
+            pre_acknowledgement_data_byte_capacity,
         } = self;
         let ProductionConnectorProfile::Kraken(profile) = connector else {
             return Err(ProductionProviderError::TestConnectorMismatch);
@@ -137,6 +155,8 @@ impl ProductionSourceProfile {
             subscription_ack_timeout,
             control_message_capacity,
             control_byte_capacity,
+            pre_acknowledgement_data_message_capacity,
+            pre_acknowledgement_data_byte_capacity,
         })
     }
 }

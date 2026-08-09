@@ -26,6 +26,7 @@ import {
   type ResearchSourceInput,
   type ResearchSourceObject,
 } from "./research-contracts"
+import { ResearchFileImport } from "./research-file-import"
 
 export function ResearchIngestion({
   bootstrap,
@@ -138,15 +139,20 @@ export function ResearchIngestion({
 
   if (!available) {
     return (
-      <ActionUnavailable
-        title="Source ingestion is not available"
-        detail="The installed service does not expose the complete listing, discovery, and durable-ingestion contract."
-      />
+      <>
+        <ResearchFileImport bootstrap={bootstrap} onStarted={onStarted} />
+        <ActionUnavailable
+          title="Connected-source ingestion is not available"
+          detail="The installed service does not expose the complete listing, discovery, and durable-ingestion contract."
+        />
+      </>
     )
   }
 
   return (
-    <section className="mt-5 rounded-xl border border-border bg-card/35 p-5">
+    <>
+      <ResearchFileImport bootstrap={bootstrap} onStarted={onStarted} />
+      <section className="mt-5 rounded-xl border border-border bg-card/35 p-5">
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
         <div>
           <div className="flex items-center gap-2">
@@ -306,7 +312,8 @@ export function ResearchIngestion({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </section>
+      </section>
+    </>
   )
 }
 

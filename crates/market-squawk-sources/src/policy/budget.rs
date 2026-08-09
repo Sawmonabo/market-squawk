@@ -20,7 +20,7 @@ use budget_coordinator::BudgetClock;
 pub(in crate::policy) use budget_coordinator::CleanShutdownProof;
 pub(in crate::policy) use budget_coordinator::SystemBudgetClock;
 pub(crate) use budget_coordinator::{BudgetAvailabilityLease, ProviderBudgetPool};
-pub use budget_coordinator::{BudgetPermit, BudgetPoolError};
+pub use budget_coordinator::{BudgetPermit, BudgetPermitLease, BudgetPoolError};
 pub(in crate::policy) use budget_identity::BudgetCollisionMergeError;
 pub use budget_identity::{
     BackoffPolicy, BudgetScope, BudgetWindowSemantics, ProviderBudgetPolicy, ProviderBudgetWindow,

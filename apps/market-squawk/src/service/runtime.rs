@@ -1,24 +1,22 @@
-//! Persistent runtime identity, named credentials, listener ownership, and process verification.
+//! Persistent installation identity and service-lifetime runtime authority.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use getrandom::fill as fill_random;
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{
-    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalPaths, SecretCancellation,
-    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretMutationPlan,
-    SecretOperationControl, SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
+    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalPaths, SecretBackend,
+    SecretInteractionPolicy, SecretMutationPlan, SecretRef, SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationProtocolRange, ApplicationProtocolVersion, ApplicationRequestScope,
-    ClientCredentialProvisioningPlan, ClientCredentialRegistration, ClientId, CorrelationId,
-    CredentialRegistry, InstallationId, LoopbackApplicationClient, NamedClient, ProcessIdentity,
-    ProcessIdentityVerifier, RendezvousAuthority, RendezvousError, RendezvousRecord,
-    RuntimeIdentity,
+    ClientCredentialRegistration, ClientId, CorrelationId, CredentialRegistry, InstallationId,
+    LoopbackApplicationClient, NamedClient, ProcessIdentity, ProcessIdentityVerifier,
+    RendezvousAuthority, RendezvousError, RendezvousRecord, RuntimeIdentity,
 };
 use market_squawk_services::JsonStructureLimits;
 use serde::{Deserialize, Serialize};
@@ -33,74 +31,60 @@ use super::{
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
-const STATE_FORMAT_VERSION: u16 = 1;
+const STATE_FORMAT_VERSION: u16 = 2;
+const LEGACY_STATE_FORMAT_VERSION: u16 = 1;
 const SERVICE_DIRECTORY: &str = "installed-service";
 const IDENTITY_DIRECTORY: &str = "identity";
 const RENDEZVOUS_DIRECTORY: &str = "rendezvous";
-const SIGNING_SECRET_SCOPE: &str = "runtime-service";
-const SIGNING_SECRET_NAME: &str = "rendezvous-signing";
-const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGNING_SECRET_BYTES: usize = 32;
+const MAXIMUM_LEGACY_SECRET_REFERENCES: usize = 5;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct InstalledRuntimeState {
+struct DurableRuntimeState {
     format_version: u16,
-    runtime: RuntimeIdentity,
-    endpoint: SocketAddr,
-    credentials: Vec<ClientCredentialRegistration>,
-    rendezvous_signing_secret: SecretRef,
+    installation_id: InstallationId,
+    /// Retired V1 references are non-authoritative, cleanup-pending debt. They remain durable
+    /// until an explicit foreground owner deletes and verifies the exact secrets.
+    #[serde(default)]
+    legacy_secret_cleanup: Vec<SecretRef>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct InstalledRuntimeInitialization {
-    format_version: u16,
-    runtime: RuntimeIdentity,
-    credentials: Box<[ClientCredentialProvisioningPlan]>,
-    rendezvous_signing_plan: SecretMutationPlan,
-}
+impl DurableRuntimeState {
+    fn new(installation_id: InstallationId) -> Self {
+        Self {
+            format_version: STATE_FORMAT_VERSION,
+            installation_id,
+            legacy_secret_cleanup: Vec::new(),
+        }
+    }
 
-impl InstalledRuntimeInitialization {
     fn validate(self) -> Result<Self, InstalledServiceError> {
         if self.format_version != STATE_FORMAT_VERSION
-            || self.credentials.len() != 4
-            || [
-                NamedClient::Desktop,
-                NamedClient::Cli,
-                NamedClient::ClaudeCode,
-                NamedClient::Codex,
-            ]
-            .into_iter()
-            .any(|client| {
-                self.credentials
-                    .iter()
-                    .filter(|plan| plan.client() == client)
-                    .count()
-                    != 1
-            })
+            || self.legacy_secret_cleanup.len() > MAXIMUM_LEGACY_SECRET_REFERENCES
         {
+            return Err(InstalledServiceError::InvalidRuntimeState);
+        }
+        let mut references = self.legacy_secret_cleanup.clone();
+        references.sort();
+        references.dedup();
+        if references.len() != self.legacy_secret_cleanup.len() {
             return Err(InstalledServiceError::InvalidRuntimeState);
         }
         Ok(self)
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "phase")]
-enum InstalledRuntimeDocument {
-    Initializing {
-        initialization: InstalledRuntimeInitialization,
-    },
-    Active {
-        state: InstalledRuntimeState,
-    },
+#[derive(Clone, Debug)]
+struct InstalledRuntimeState {
+    runtime: RuntimeIdentity,
+    endpoint: SocketAddr,
+    credentials: Vec<ClientCredentialRegistration>,
 }
 
 impl InstalledRuntimeState {
     fn validate(self) -> Result<Self, InstalledServiceError> {
-        if self.format_version != STATE_FORMAT_VERSION
-            || self.endpoint.ip() != Ipv4Addr::LOCALHOST
+        if self.endpoint.ip() != Ipv4Addr::LOCALHOST
             || self.endpoint.port() == 0
             || self.credentials.len() != 4
             || [
@@ -130,10 +114,55 @@ impl InstalledRuntimeState {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyCredentialRegistration {
+    client_id: ClientId,
+    client: NamedClient,
+    reference: SecretRef,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyCredentialPlan {
+    client_id: ClientId,
+    client: NamedClient,
+    mutation: SecretMutationPlan,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyRuntimeInitialization {
+    format_version: u16,
+    runtime: RuntimeIdentity,
+    credentials: Vec<LegacyCredentialPlan>,
+    rendezvous_signing_plan: SecretMutationPlan,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyRuntimeState {
+    format_version: u16,
+    runtime: RuntimeIdentity,
+    endpoint: SocketAddr,
+    credentials: Vec<LegacyCredentialRegistration>,
+    rendezvous_signing_secret: SecretRef,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "phase")]
+enum LegacyRuntimeDocument {
+    Initializing {
+        initialization: LegacyRuntimeInitialization,
+    },
+    Active {
+        state: LegacyRuntimeState,
+    },
+}
+
 /// Prepared single-instance runtime. The rendezvous remains unpublished until composition ends.
 pub(super) struct PreparedRuntime {
     state: InstalledRuntimeState,
-    identity_root: std::path::PathBuf,
     secret_store: Arc<dyn SecretStore>,
     credentials: Arc<CredentialRegistry>,
     desktop_credential: SecretValue,
@@ -163,70 +192,38 @@ impl PreparedRuntime {
         secret_store: Arc<dyn SecretStore>,
         selected: WorkspaceRuntimeIdentity,
         installation_id: InstallationId,
+        _interaction: SecretInteractionPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let identity_store =
             LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
-        let identity_root = service_root.join(IDENTITY_DIRECTORY);
-        let loaded = identity_store.load()?;
-        let (mut state, signing_key, listener) = match loaded
-            .map(|encoded| decode_document(&encoded))
-            .transpose()?
-        {
-            Some(InstalledRuntimeDocument::Active { state }) => {
-                let mut state = state.validate()?;
-                let listener = bind_loopback().await?;
-                state.endpoint = listener.local_addr()?;
-                state.runtime = selected
-                    .to_runtime(state.runtime.installation_id())
-                    .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
-                let signing_key = secret_store
-                    .read(
-                        &state.rendezvous_signing_secret,
-                        &secret_control("installed-runtime-signing-load")?,
-                    )
-                    .map_err(|_error| InstalledServiceError::SecretStore)?;
-                identity_store.store(&encode_document(&InstalledRuntimeDocument::Active {
-                    state: state.clone(),
-                })?)?;
-                (state, signing_key, listener)
-            }
-            Some(InstalledRuntimeDocument::Initializing { mut initialization }) => {
-                initialization.runtime = selected
-                    .to_runtime(initialization.runtime.installation_id())
-                    .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
-                identity_store.store(&encode_document(
-                    &InstalledRuntimeDocument::Initializing {
-                        initialization: initialization.validate()?,
-                    },
-                )?)?;
-                let InstalledRuntimeDocument::Initializing { initialization } = decode_document(
-                    &identity_store
-                        .load()?
-                        .ok_or(InstalledServiceError::InvalidRuntimeState)?,
-                )?
-                else {
-                    return Err(InstalledServiceError::InvalidRuntimeState);
-                };
-                let (state, _credentials, signing_key, listener) = resume_initialization(
-                    &identity_store,
-                    Arc::clone(&secret_store),
-                    initialization,
-                )
-                .await?;
-                (state, signing_key, listener)
-            }
-            None => {
-                let (state, _credentials, signing_key, listener) = initialize_runtime(
-                    &identity_store,
-                    Arc::clone(&secret_store),
-                    selected,
-                    installation_id,
-                )
-                .await?;
-                (state, signing_key, listener)
-            }
-        };
+        let durable = load_or_migrate_runtime_state(&identity_store, installation_id)?;
+        let runtime = selected
+            .to_runtime(durable.installation_id)
+            .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
+        let clients = [
+            NamedClient::Desktop,
+            NamedClient::Cli,
+            NamedClient::ClaudeCode,
+            NamedClient::Codex,
+        ]
+        .map(|client| {
+            ClientId::try_from_uuid(Uuid::new_v4())
+                .map(|client_id| (client_id, client))
+                .map_err(InstalledServiceError::from)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let (credential_registry, registrations) = CredentialRegistry::provision_set(clients)?;
+        let credentials = Arc::new(credential_registry);
+        let listener = bind_loopback().await?;
+        let state = InstalledRuntimeState {
+            runtime,
+            endpoint: listener.local_addr()?,
+            credentials: registrations.into_vec(),
+        }
+        .validate()?;
+        let signing_key = random_secret()?;
         let mcp_roots = [
             state
                 .registration(NamedClient::ClaudeCode)
@@ -243,31 +240,12 @@ impl PreparedRuntime {
             &secret_store,
             mcp_roots,
         )?;
-        let effective_mcp = mcp_clients.registrations()?;
-        let mut effective_registrations = state.credentials.clone();
-        for effective in effective_mcp {
-            let root = effective_registrations
-                .iter_mut()
-                .find(|registration| registration.client() == effective.client())
-                .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-            *root = effective;
-        }
-        state.credentials = effective_registrations.clone();
-        identity_store.store(&encode_document(&InstalledRuntimeDocument::Active {
-            state: state.clone(),
-        })?)?;
-        let credentials = Arc::new(CredentialRegistry::try_load(
-            Arc::clone(&secret_store),
-            effective_registrations,
-        )?);
-        let desktop_credential = load_client_credential(
-            &secret_store,
+        let desktop_credential = credentials.credential(
             state
                 .registration(NamedClient::Desktop)
                 .ok_or(InstalledServiceError::InvalidRuntimeState)?,
         )?;
-        let cli_credential = load_client_credential(
-            &secret_store,
+        let cli_credential = credentials.credential(
             state
                 .registration(NamedClient::Cli)
                 .ok_or(InstalledServiceError::InvalidRuntimeState)?,
@@ -290,7 +268,6 @@ impl PreparedRuntime {
         )?;
         Ok(Self {
             state,
-            identity_root,
             secret_store,
             credentials,
             desktop_credential,
@@ -329,8 +306,6 @@ impl PreparedRuntime {
         Ok(McpClientActivationAuthority::new(
             self.state.runtime,
             desktop_client_id,
-            self.identity_root.clone(),
-            Arc::clone(&self.secret_store),
             Arc::clone(&self.credentials),
         ))
     }
@@ -397,64 +372,6 @@ impl PreparedRuntime {
     }
 }
 
-async fn initialize_runtime(
-    identity_store: &LocalAuthorityStateStore,
-    secret_store: Arc<dyn SecretStore>,
-    selected: WorkspaceRuntimeIdentity,
-    installation_id: InstallationId,
-) -> Result<
-    (
-        InstalledRuntimeState,
-        Arc<CredentialRegistry>,
-        SecretValue,
-        TcpListener,
-    ),
-    InstalledServiceError,
-> {
-    let clients = [
-        NamedClient::Desktop,
-        NamedClient::Cli,
-        NamedClient::ClaudeCode,
-        NamedClient::Codex,
-    ]
-    .map(|client| {
-        ClientId::try_from_uuid(Uuid::new_v4())
-            .map(|client_id| (client_id, client))
-            .map_err(InstalledServiceError::from)
-    })
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()?;
-    let credentials = CredentialRegistry::plan_set(secret_store.as_ref(), clients)?;
-    let signing_key = signing_secret_key()?;
-    let signing_plan = secret_store
-        .plan_create(
-            &signing_key,
-            SecretGeneration::new(1).map_err(|_error| InstalledServiceError::SecretStore)?,
-            &secret_control("installed-runtime-signing-plan")?,
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)?;
-    let initialization = InstalledRuntimeInitialization {
-        format_version: STATE_FORMAT_VERSION,
-        runtime: selected
-            .to_runtime(installation_id)
-            .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?,
-        credentials,
-        rendezvous_signing_plan: signing_plan,
-    }
-    .validate()?;
-    identity_store.store(&encode_document(&InstalledRuntimeDocument::Initializing {
-        initialization,
-    })?)?;
-    let encoded = identity_store
-        .load()?
-        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    let InstalledRuntimeDocument::Initializing { initialization } = decode_document(&encoded)?
-    else {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    };
-    resume_initialization(identity_store, secret_store, initialization).await
-}
-
 pub(super) fn acquire_instance(
     paths: &LocalPaths,
 ) -> Result<InstalledServiceInstanceGuard, InstalledServiceError> {
@@ -470,54 +387,10 @@ pub(super) fn installation_id(
     let Some(encoded) = identity_store.load()? else {
         return Ok(None);
     };
-    let runtime = match decode_document(&encoded)? {
-        InstalledRuntimeDocument::Initializing { initialization } => {
-            initialization.validate()?.runtime
-        }
-        InstalledRuntimeDocument::Active { state } => state.validate()?.runtime,
-    };
-    Ok(Some(runtime.installation_id()))
+    Ok(Some(decode_runtime_state(&encoded)?.installation_id))
 }
 
-pub(super) fn persist_mcp_registration(
-    identity_root: &std::path::Path,
-    runtime: RuntimeIdentity,
-    registration: ClientCredentialRegistration,
-) -> Result<(), InstalledServiceError> {
-    if !matches!(
-        registration.client(),
-        NamedClient::ClaudeCode | NamedClient::Codex
-    ) {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    }
-    let store = LocalAuthorityStateStore::try_open(identity_root)?;
-    let encoded = store
-        .load()?
-        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    let InstalledRuntimeDocument::Active { mut state } = decode_document(&encoded)? else {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    };
-    state = state.validate()?;
-    if state.runtime != runtime {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    }
-    let current = state
-        .credentials
-        .iter_mut()
-        .find(|current| current.client() == registration.client())
-        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    if current.client_id() != registration.client_id()
-        || current.generation().get() > registration.generation().get()
-    {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    }
-    *current = registration;
-    store.store(&encode_document(&InstalledRuntimeDocument::Active {
-        state,
-    })?)?;
-    Ok(())
-}
-
+/// Returns only retired, non-authoritative V1 references retained for explicit foreground cleanup.
 pub(super) fn credential_references(
     paths: &LocalPaths,
 ) -> Result<Vec<SecretRef>, InstalledServiceError> {
@@ -526,101 +399,15 @@ pub(super) fn credential_references(
     let Some(encoded) = identity_store.load()? else {
         return Ok(Vec::new());
     };
-    match decode_document(&encoded)? {
-        InstalledRuntimeDocument::Initializing { initialization } => {
-            let initialization = initialization.validate()?;
-            let mut references = initialization
-                .credentials
-                .iter()
-                .map(|plan| plan.mutation().target().clone())
-                .collect::<Vec<_>>();
-            references.push(initialization.rendezvous_signing_plan.target().clone());
-            Ok(references)
-        }
-        InstalledRuntimeDocument::Active { state } => {
-            let state = state.validate()?;
-            let mut references = state
-                .credentials
-                .iter()
-                .map(|registration| registration.reference().clone())
-                .collect::<Vec<_>>();
-            references.push(state.rendezvous_signing_secret);
-            Ok(references)
-        }
-    }
+    Ok(decode_runtime_state(&encoded)?.legacy_secret_cleanup)
 }
 
-async fn resume_initialization(
-    identity_store: &LocalAuthorityStateStore,
-    secret_store: Arc<dyn SecretStore>,
-    initialization: InstalledRuntimeInitialization,
-) -> Result<
-    (
-        InstalledRuntimeState,
-        Arc<CredentialRegistry>,
-        SecretValue,
-        TcpListener,
-    ),
-    InstalledServiceError,
-> {
-    let (credentials, registrations) = CredentialRegistry::provision_planned_set(
-        Arc::clone(&secret_store),
-        &initialization.credentials,
-    )?;
-    let signing_key = signing_secret_key()?;
-    let control = secret_control("installed-runtime-signing-inspect")?;
-    match secret_store
-        .inspect_planned(
-            &signing_key,
-            &initialization.rendezvous_signing_plan,
-            &control,
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)?
-    {
-        SecretReconciliationObservation::Absent => {
-            if let Err(failure) = secret_store.execute_planned(
-                &signing_key,
-                &initialization.rendezvous_signing_plan,
-                random_secret()?,
-                &secret_control("installed-runtime-signing-create")?,
-            ) && !matches!(
-                secret_store.inspect_planned(
-                    &signing_key,
-                    &initialization.rendezvous_signing_plan,
-                    &secret_control("installed-runtime-signing-reinspect")?,
-                ),
-                Ok(SecretReconciliationObservation::PresentUnverified)
-                    | Ok(SecretReconciliationObservation::Matches)
-            ) {
-                let _redacted = failure.into_error();
-                return Err(InstalledServiceError::SecretStore);
-            }
-        }
-        SecretReconciliationObservation::PresentUnverified
-        | SecretReconciliationObservation::Matches => {}
-        SecretReconciliationObservation::Mismatch => {
-            return Err(InstalledServiceError::SecretStore);
-        }
-    }
-    let signing_value = secret_store
-        .read(
-            initialization.rendezvous_signing_plan.target(),
-            &secret_control("installed-runtime-signing-load")?,
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)?;
-    let listener = bind_loopback().await?;
-    let state = InstalledRuntimeState {
-        format_version: STATE_FORMAT_VERSION,
-        runtime: initialization.runtime,
-        endpoint: listener.local_addr()?,
-        credentials: registrations.into_vec(),
-        rendezvous_signing_secret: initialization.rendezvous_signing_plan.target().clone(),
-    }
-    .validate()?;
-    identity_store.store(&encode_document(&InstalledRuntimeDocument::Active {
-        state: state.clone(),
-    })?)?;
-    Ok((state, Arc::new(credentials), signing_value, listener))
+pub(super) fn encrypted_fallback_eligible(
+    paths: &LocalPaths,
+) -> Result<bool, InstalledServiceError> {
+    Ok(credential_references(paths)?
+        .iter()
+        .all(|reference| reference.backend() == SecretBackend::EncryptedFile))
 }
 
 async fn bind_loopback() -> Result<TcpListener, InstalledServiceError> {
@@ -629,27 +416,142 @@ async fn bind_loopback() -> Result<TcpListener, InstalledServiceError> {
         .map_err(|_error| InstalledServiceError::EndpointUnavailable)
 }
 
-fn encode_document(document: &InstalledRuntimeDocument) -> Result<Vec<u8>, InstalledServiceError> {
-    serde_json::to_vec(document).map_err(|_error| InstalledServiceError::InvalidRuntimeState)
+fn load_or_migrate_runtime_state(
+    store: &LocalAuthorityStateStore,
+    installation_id: InstallationId,
+) -> Result<DurableRuntimeState, InstalledServiceError> {
+    let state = store
+        .load()?
+        .map(|encoded| decode_runtime_state(&encoded))
+        .transpose()?
+        .unwrap_or_else(|| DurableRuntimeState::new(installation_id));
+    store_runtime_state(store, &state)?;
+    Ok(state)
 }
 
-fn decode_document(encoded: &[u8]) -> Result<InstalledRuntimeDocument, InstalledServiceError> {
-    serde_json::from_slice(encoded)
-        .or_else(|_error| {
-            serde_json::from_slice::<InstalledRuntimeState>(encoded)
-                .map(|state| InstalledRuntimeDocument::Active { state })
+fn decode_runtime_state(encoded: &[u8]) -> Result<DurableRuntimeState, InstalledServiceError> {
+    if let Ok(state) = serde_json::from_slice::<DurableRuntimeState>(encoded) {
+        return state.validate();
+    }
+    if let Ok(document) = serde_json::from_slice::<LegacyRuntimeDocument>(encoded) {
+        return migrate_legacy_document(document);
+    }
+    serde_json::from_slice::<LegacyRuntimeState>(encoded)
+        .map(migrate_legacy_state)
+        .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?
+}
+
+fn migrate_legacy_document(
+    document: LegacyRuntimeDocument,
+) -> Result<DurableRuntimeState, InstalledServiceError> {
+    match document {
+        LegacyRuntimeDocument::Initializing { initialization } => {
+            migrate_legacy_initialization(initialization)
+        }
+        LegacyRuntimeDocument::Active { state } => migrate_legacy_state(state),
+    }
+}
+
+fn migrate_legacy_initialization(
+    initialization: LegacyRuntimeInitialization,
+) -> Result<DurableRuntimeState, InstalledServiceError> {
+    let clients = initialization
+        .credentials
+        .iter()
+        .map(|plan| (plan.client_id, plan.client))
+        .collect::<Vec<_>>();
+    validate_legacy_clients(initialization.format_version, &clients)?;
+    let mut references = initialization
+        .credentials
+        .into_iter()
+        .map(|plan| plan.mutation.target().clone())
+        .collect::<Vec<_>>();
+    references.push(initialization.rendezvous_signing_plan.target().clone());
+    migrated_state(initialization.runtime.installation_id(), references)
+}
+
+fn migrate_legacy_state(
+    state: LegacyRuntimeState,
+) -> Result<DurableRuntimeState, InstalledServiceError> {
+    if state.endpoint.ip() != Ipv4Addr::LOCALHOST || state.endpoint.port() == 0 {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    let clients = state
+        .credentials
+        .iter()
+        .map(|registration| (registration.client_id, registration.client))
+        .collect::<Vec<_>>();
+    validate_legacy_clients(state.format_version, &clients)?;
+    let mut references = state
+        .credentials
+        .into_iter()
+        .map(|registration| registration.reference)
+        .collect::<Vec<_>>();
+    references.push(state.rendezvous_signing_secret);
+    migrated_state(state.runtime.installation_id(), references)
+}
+
+fn validate_legacy_clients(
+    format_version: u16,
+    clients: &[(ClientId, NamedClient)],
+) -> Result<(), InstalledServiceError> {
+    let expected = [
+        NamedClient::Desktop,
+        NamedClient::Cli,
+        NamedClient::ClaudeCode,
+        NamedClient::Codex,
+    ];
+    if format_version != LEGACY_STATE_FORMAT_VERSION
+        || clients.len() != expected.len()
+        || expected.into_iter().any(|expected| {
+            clients
+                .iter()
+                .filter(|(_id, client)| *client == expected)
+                .count()
+                != 1
         })
-        .map_err(|_error| InstalledServiceError::InvalidRuntimeState)
+    {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    let mut ids = clients.iter().map(|(id, _client)| *id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != clients.len() {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    Ok(())
 }
 
-fn signing_secret_key() -> Result<SecretKey, InstalledServiceError> {
-    SecretKey::try_new(SIGNING_SECRET_SCOPE, SIGNING_SECRET_NAME)
-        .map_err(|_error| InstalledServiceError::SecretStore)
+fn migrated_state(
+    installation_id: InstallationId,
+    mut references: Vec<SecretRef>,
+) -> Result<DurableRuntimeState, InstalledServiceError> {
+    references.sort();
+    references.dedup();
+    DurableRuntimeState {
+        format_version: STATE_FORMAT_VERSION,
+        installation_id,
+        legacy_secret_cleanup: references,
+    }
+    .validate()
+}
+
+fn store_runtime_state(
+    store: &LocalAuthorityStateStore,
+    state: &DurableRuntimeState,
+) -> Result<(), InstalledServiceError> {
+    let encoded =
+        serde_json::to_vec(state).map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
+    store.store(&encoded)?;
+    Ok(())
 }
 
 fn random_secret() -> Result<SecretValue, InstalledServiceError> {
     let mut bytes = [0_u8; SIGNING_SECRET_BYTES];
     fill_random(&mut bytes).map_err(|_error| InstalledServiceError::EntropyUnavailable)?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(InstalledServiceError::EntropyUnavailable);
+    }
     let mut encoded = String::with_capacity(SIGNING_SECRET_BYTES * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in bytes {
@@ -662,20 +564,6 @@ fn random_secret() -> Result<SecretValue, InstalledServiceError> {
 fn duplicate_secret(secret: &SecretValue) -> Result<SecretValue, InstalledServiceError> {
     SecretValue::new(secret.expose_secret().to_owned())
         .map_err(|_error| InstalledServiceError::SecretStore)
-}
-
-fn secret_control(owner: &'static str) -> Result<SecretOperationControl, InstalledServiceError> {
-    let deadline = Instant::now()
-        .checked_add(SECRET_OPERATION_TIMEOUT)
-        .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-    SecretOperationControl::try_new(
-        owner,
-        deadline,
-        1,
-        SecretInteractionPolicy::Forbid,
-        SecretCancellation::new(),
-    )
-    .map_err(|_error| InstalledServiceError::SecretStore)
 }
 
 fn wall_now() -> Result<Timestamp, InstalledServiceError> {
@@ -728,18 +616,6 @@ fn process_identity(process_id: u32) -> Result<Option<ProcessIdentity>, Installe
 
 pub(super) fn current_timestamp() -> Result<Timestamp, InstalledServiceError> {
     wall_now()
-}
-
-pub(super) fn load_client_credential(
-    secret_store: &Arc<dyn SecretStore>,
-    registration: &ClientCredentialRegistration,
-) -> Result<SecretValue, InstalledServiceError> {
-    secret_store
-        .read(
-            registration.reference(),
-            &secret_control("installed-runtime-client-credential-load")?,
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)
 }
 
 pub(super) fn connect_admitted_client(

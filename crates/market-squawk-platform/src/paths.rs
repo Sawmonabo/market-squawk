@@ -16,6 +16,7 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 
+use crate::input::{ControlledImportInputRoot, InputFileError};
 use crate::journal::ParentDirectorySync;
 use crate::{
     JournalError, JournalReader, JournalSinkConstructionError, JournalSinkLimits, JournalWriter,
@@ -242,6 +243,25 @@ impl ArtifactRoot {
             return Err(PathError::PreparedRootChanged);
         }
         Ok(directory)
+    }
+
+    /// Opens one existing controlled-import directory beneath this retained artifact root.
+    ///
+    /// The relative directory chain is bounded and every component is opened relative to the
+    /// preceding retained handle with no-follow semantics. The result retains this artifact-root
+    /// authority and the exact component identities for revalidation before every file operation.
+    /// It is deliberately distinct from a user-authorized input root and cannot issue original
+    /// local-ownership evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, absolute, parent-traversing, over-deep, symlinked, reparsed, replaced, or
+    /// non-directory references and path-redacted capability failures.
+    pub fn open_controlled_import_root(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<ControlledImportInputRoot, InputFileError> {
+        ControlledImportInputRoot::open_beneath_artifact_root(self, relative.as_ref())
     }
 
     /// Validates a canonical portable reference and binds it to this open directory capability.

@@ -125,14 +125,14 @@ pub use order::{
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
-    BudgetPoolError, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
-    EndpointDenialReason, EndpointPolicy, HttpClientProfile, HttpRequestBounds, MonotonicInstant,
-    NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
-    ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId, ProviderRatePermitId,
-    ProviderRateRegistration, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
-    QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
-    apply_http_retry_after,
+    BudgetPermitLease, BudgetPoolError, BudgetScope, BudgetUnavailableReason,
+    BudgetWindowSemantics, EndpointDenialReason, EndpointPolicy, HttpClientProfile,
+    HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope, ProviderBudgetPolicy,
+    ProviderBudgetWindow, ProviderRateAuthority, ProviderRateCollisionIdentity,
+    ProviderRateCollisionKind, ProviderRateDecision, ProviderRateDeclaration, ProviderRateGroupId,
+    ProviderRatePermitId, ProviderRateRegistration, ProviderRateRunId, ProviderRateStore,
+    ProviderRateStoreError, QueryParameterRule, QuerySensitivity, RedirectAuthorization,
+    RetryAfter, SharedProviderBudget, apply_http_retry_after,
 };
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,

@@ -71,10 +71,11 @@ impl ApplicationDomainService for MarketDomainService {
         let filters = MarketFilters::parse(&request)?;
         let reference_at = system_timestamp()?;
         let lease = self.controller.market_snapshots(&context).await?;
-        let streams = collect_streams(&lease, &filters, &context)?;
-        if streams.is_empty() {
-            return Err(ServiceError::NotFound);
-        }
+        let streams = lease
+            .as_ref()
+            .map(|lease| collect_streams(lease, &filters, &context))
+            .transpose()?
+            .unwrap_or_default();
 
         let source_coverage = source_coverage_value(&streams, &filters);
         let output = match request.name() {
@@ -145,28 +146,49 @@ impl PaperController {
     async fn market_snapshots(
         &self,
         context: &RequestContext,
-    ) -> Result<LiveRuntimeSnapshotLease, ServiceError> {
+    ) -> Result<Option<LiveRuntimeSnapshotLease>, ServiceError> {
         ensure_live(context)?;
         let reader = {
             let state =
                 bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-            let PaperState::Running {
-                runtime,
-                exports,
-                cancellation,
-                ..
-            } = &*state
-            else {
-                return Err(ServiceError::Unavailable);
-            };
-            if cancellation.is_cancelled() || !runtime.source_is_healthy() || !exports.is_healthy()
-            {
-                return Err(ServiceError::Unavailable);
+            match &*state {
+                PaperState::LiveOnly {
+                    runtime,
+                    exports,
+                    cancellation,
+                    ..
+                } => {
+                    if cancellation.is_cancelled() || !runtime.is_healthy() || !exports.is_healthy()
+                    {
+                        return Ok(None);
+                    }
+                    runtime.snapshots()
+                }
+                PaperState::Running {
+                    runtime,
+                    exports,
+                    cancellation,
+                    ..
+                } => {
+                    if cancellation.is_cancelled()
+                        || !runtime.source_is_healthy()
+                        || !exports.is_healthy()
+                    {
+                        return Ok(None);
+                    }
+                    runtime.snapshots()
+                }
+                PaperState::Stopped { .. } => return Ok(None),
+                PaperState::LiveStarting { .. }
+                | PaperState::Starting { .. }
+                | PaperState::Stopping => return Err(ServiceError::Unavailable),
             }
-            runtime.snapshots()
         };
         ensure_live(context)?;
-        reader.try_load_all().map_err(map_snapshot_read_error)
+        reader
+            .try_load_all()
+            .map(Some)
+            .map_err(map_snapshot_read_error)
     }
 }
 

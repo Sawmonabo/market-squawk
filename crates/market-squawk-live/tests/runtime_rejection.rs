@@ -43,7 +43,7 @@ fn rejection_runtime_config(
             .maximum_venues_per_cross_venue_instrument()
             .get(),
         maximum_feature_snapshot_bytes: base.maximum_feature_snapshot_bytes().get(),
-        maximum_action_hook_bytes_per_route: base.maximum_action_hook_bytes_per_route().get(),
+        maximum_action_hook_bytes_per_route: base.maximum_action_hook_bytes_per_route(),
         registration_control_capacity: base.registration_control_capacity().get(),
         registration_deadline: base.registration_deadline(),
         health_event_capacity: base.health_event_capacity().get(),

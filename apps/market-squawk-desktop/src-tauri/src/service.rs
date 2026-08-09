@@ -1,12 +1,14 @@
 //! Native lifecycle boundary for the shared installed Market Squawk service.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
 
+#[cfg(debug_assertions)]
+use market_squawk::verified_development_service_program;
 use market_squawk::{
     service::{
         BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceConnector,
@@ -14,8 +16,12 @@ use market_squawk::{
     },
     verified_installed_service_program,
 };
+use market_squawk_installer::default_installation_data_root;
 use market_squawk_platform::{AppConfig, SecretValue};
-use market_squawk_runtime::{ApplicationClientError, LoopbackApplicationClient, NamedClient};
+use market_squawk_runtime::{
+    ApplicationClientError, LoopbackApplicationClient, NamedClient, ServiceStartupEvidenceError,
+    ServiceStartupPhase, ServiceStartupState, read_service_startup_evidence,
+};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +29,10 @@ use tokio_util::sync::CancellationToken;
 const DESKTOP_ORIGIN: &str = "tauri://localhost";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const FOREGROUND_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(debug_assertions)]
+const DEVELOPMENT_SERVICE_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM";
 
 pub(crate) struct DesktopServiceConnection {
     pub(crate) application: LoopbackApplicationClient,
@@ -37,6 +46,7 @@ pub(crate) enum DesktopServiceStartup {
 
 pub(crate) struct DesktopServiceBootstrap {
     connector: Arc<InstalledServiceConnector>,
+    installation_data_root: PathBuf,
     requirement: BootstrapRequirement,
 }
 
@@ -59,6 +69,14 @@ pub(crate) enum DesktopServiceError {
     Launch(#[source] std::io::Error),
     #[error("the installed service did not become ready before the startup deadline")]
     StartupDeadline,
+    #[error("the installed service process exited before becoming ready")]
+    StartupExited,
+    #[error("the installed service failed during {phase:?}")]
+    StartupFailed { phase: ServiceStartupPhase },
+    #[error("installed-service startup evidence is unavailable")]
+    StartupEvidence(#[from] ServiceStartupEvidenceError),
+    #[error("the installed service process state is unavailable")]
+    ProcessState(#[source] std::io::Error),
     #[error("the installed service returned an invalid bootstrap contract")]
     InvalidBootstrap,
 }
@@ -68,12 +86,12 @@ pub(crate) async fn connect_or_start(
     config_path: Option<&Path>,
     installation_data_root: Option<&Path>,
 ) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    let installation_data_root = installation_data_root
+        .map(Path::to_path_buf)
+        .map_or_else(default_installation_data_root, Ok)
+        .map_err(|_error| DesktopServiceError::Discovery)?;
     let connector = Arc::new(
-        installation_data_root
-            .map_or_else(
-                || InstalledServiceConnector::try_new(config),
-                |root| InstalledServiceConnector::try_new_at_installation_root(config, root),
-            )
+        InstalledServiceConnector::try_new_at_installation_root(config, &installation_data_root)
             .map_err(|_error| DesktopServiceError::Discovery)?,
     );
     match connect(&connector).await {
@@ -83,14 +101,15 @@ pub(crate) async fn connect_or_start(
             return Err(DesktopServiceError::InvalidBootstrap);
         }
     }
-    if let Some(bootstrap) = bootstrap_required(&connector).await? {
+    if let Some(bootstrap) = bootstrap_required(&connector, &installation_data_root).await? {
         return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
     }
 
-    let program =
-        verified_installed_service_program().map_err(|_error| DesktopServiceError::Discovery)?;
+    let program = selected_service_program()?;
     let mut command = Command::new(program);
     command
+        .env_remove("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM")
+        .env_remove("MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM")
         .arg("--data-dir")
         .arg(config.data_dir())
         .stdin(Stdio::null())
@@ -102,38 +121,91 @@ pub(crate) async fn connect_or_start(
     if let Some(path) = config.training_release_root() {
         command.arg("--training-release-root").arg(path);
     }
-    if let Some(root) = installation_data_root {
-        command.arg("--installation-data-root").arg(root);
-    }
+    command
+        .arg("--installation-data-root")
+        .arg(&installation_data_root);
     let mut child = command.spawn().map_err(DesktopServiceError::Launch)?;
+    wait_for_started_service(&connector, &installation_data_root, &mut child).await
+}
+
+fn selected_service_program() -> Result<PathBuf, DesktopServiceError> {
+    #[cfg(debug_assertions)]
+    if let Some(program) = std::env::var_os(DEVELOPMENT_SERVICE_PROGRAM) {
+        return verified_development_service_program(Path::new(&program))
+            .map_err(|_error| DesktopServiceError::Discovery);
+    }
+    verified_installed_service_program().map_err(|_error| DesktopServiceError::Discovery)
+}
+
+async fn wait_for_started_service(
+    connector: &Arc<InstalledServiceConnector>,
+    installation_data_root: &Path,
+    child: &mut Child,
+) -> Result<DesktopServiceStartup, DesktopServiceError> {
     let deadline = Instant::now()
         .checked_add(STARTUP_TIMEOUT)
         .ok_or(DesktopServiceError::StartupDeadline)?;
+    let mut observed_fresh_start = false;
     loop {
-        match connect(&connector).await {
-            Ok(connection) => return Ok(DesktopServiceStartup::Ready(Box::new(connection))),
-            Err(ConnectionAttempt::InvalidBootstrap) => {
-                stop_failed_start(&mut child);
-                return Err(DesktopServiceError::InvalidBootstrap);
-            }
-            Err(ConnectionAttempt::NotRunning) => match bootstrap_required(&connector).await {
-                Ok(Some(bootstrap)) => {
+        if child
+            .try_wait()
+            .map_err(DesktopServiceError::ProcessState)?
+            .is_some()
+        {
+            return connect_after_competing_start(connector, installation_data_root).await;
+        }
+        let startup = read_service_startup_evidence(installation_data_root)
+            .map(|evidence| evidence.map(|evidence| evidence.state()));
+        match startup {
+            Ok(Some(ServiceStartupState::Starting { .. })) => {
+                observed_fresh_start = true;
+                if let Some(bootstrap) =
+                    bootstrap_required(connector, installation_data_root).await?
+                {
                     return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    stop_failed_start(&mut child);
-                    return Err(error);
+            }
+            Ok(Some(ServiceStartupState::Ready)) => match connect(connector).await {
+                Ok(connection) => {
+                    return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
+                }
+                Err(ConnectionAttempt::NotRunning) => {}
+                Err(ConnectionAttempt::InvalidBootstrap) if !observed_fresh_start => {}
+                Err(ConnectionAttempt::InvalidBootstrap) => {
+                    stop_failed_start(child);
+                    return Err(DesktopServiceError::InvalidBootstrap);
                 }
             },
+            Ok(Some(ServiceStartupState::Failed { phase })) if observed_fresh_start => {
+                stop_failed_start(child);
+                return Err(DesktopServiceError::StartupFailed { phase });
+            }
+            Ok(Some(ServiceStartupState::Stopped)) if observed_fresh_start => {
+                stop_failed_start(child);
+                return Err(DesktopServiceError::StartupExited);
+            }
+            Ok(Some(ServiceStartupState::Failed { .. } | ServiceStartupState::Stopped) | None)
+            | Err(_) => {}
         }
         if Instant::now() >= deadline {
-            stop_failed_start(&mut child);
+            stop_failed_start(child);
             return Err(DesktopServiceError::StartupDeadline);
         }
-        let _ = child.try_wait();
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn connect_after_competing_start(
+    connector: &Arc<InstalledServiceConnector>,
+    installation_data_root: &Path,
+) -> Result<DesktopServiceStartup, DesktopServiceError> {
+    if let Ok(connection) = connect(connector).await {
+        return Ok(DesktopServiceStartup::Ready(Box::new(connection)));
+    }
+    if let Some(bootstrap) = bootstrap_required(connector, installation_data_root).await? {
+        return Ok(DesktopServiceStartup::BootstrapRequired(bootstrap));
+    }
+    Err(DesktopServiceError::StartupExited)
 }
 
 pub(crate) async fn complete_bootstrap(
@@ -157,7 +229,12 @@ pub(crate) async fn complete_bootstrap(
     {
         return Err(DesktopServiceError::InvalidBootstrap);
     }
-    connect_until_ready(&bootstrap.connector).await
+    connect_until_ready(
+        &bootstrap.connector,
+        &bootstrap.installation_data_root,
+        FOREGROUND_BOOTSTRAP_TIMEOUT,
+    )
+    .await
 }
 
 fn admit_bootstrap_action(
@@ -182,6 +259,7 @@ fn admit_bootstrap_action(
 
 async fn bootstrap_required(
     connector: &Arc<InstalledServiceConnector>,
+    installation_data_root: &Path,
 ) -> Result<Option<DesktopServiceBootstrap>, DesktopServiceError> {
     match connector.bootstrap_status().await {
         Ok(status)
@@ -190,6 +268,7 @@ async fn bootstrap_required(
         {
             Ok(Some(DesktopServiceBootstrap {
                 connector: Arc::clone(connector),
+                installation_data_root: installation_data_root.to_path_buf(),
                 requirement: status
                     .requirement()
                     .ok_or(DesktopServiceError::InvalidBootstrap)?,
@@ -202,6 +281,7 @@ async fn bootstrap_required(
             Ok(None)
         }
         Err(InstalledServiceError::BootstrapUnavailable) => Ok(None),
+        Err(InstalledServiceError::ServiceUnavailable) => Ok(None),
         Err(InstalledServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(None)
         }
@@ -211,17 +291,30 @@ async fn bootstrap_required(
 
 async fn connect_until_ready(
     connector: &InstalledServiceConnector,
+    installation_data_root: &Path,
+    timeout: Duration,
 ) -> Result<DesktopServiceConnection, DesktopServiceError> {
     let deadline = Instant::now()
-        .checked_add(STARTUP_TIMEOUT)
+        .checked_add(timeout)
         .ok_or(DesktopServiceError::StartupDeadline)?;
     loop {
-        match connect(connector).await {
-            Ok(connection) => return Ok(connection),
-            Err(ConnectionAttempt::InvalidBootstrap) => {
-                return Err(DesktopServiceError::InvalidBootstrap);
+        let startup =
+            read_service_startup_evidence(installation_data_root)?.map(|evidence| evidence.state());
+        match startup {
+            Some(ServiceStartupState::Starting { .. }) => {}
+            Some(ServiceStartupState::Failed { phase }) => {
+                return Err(DesktopServiceError::StartupFailed { phase });
             }
-            Err(ConnectionAttempt::NotRunning) => {}
+            Some(ServiceStartupState::Stopped) => {
+                return Err(DesktopServiceError::StartupExited);
+            }
+            Some(ServiceStartupState::Ready) | None => match connect(connector).await {
+                Ok(connection) => return Ok(connection),
+                Err(ConnectionAttempt::InvalidBootstrap) => {
+                    return Err(DesktopServiceError::InvalidBootstrap);
+                }
+                Err(ConnectionAttempt::NotRunning) => {}
+            },
         }
         if Instant::now() >= deadline {
             return Err(DesktopServiceError::StartupDeadline);

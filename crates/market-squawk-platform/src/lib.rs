@@ -39,7 +39,7 @@ pub use capture::{
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub use capture::{CaptureReceiverTestCoordinationError, ProcessCaptureHelperTestBehavior};
 pub use config::{
-    AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
+    AppConfig, COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseAuthorizationAttestation,
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
     CoinbaseSourceConfig, ConfigError, ConfigOrigin, ConfigOverrides, ConfigProvenance,
     ConfigSetting, ConfigSources, EffectiveConfig, EffectiveConfigView, EffectiveSettingView,
@@ -48,10 +48,10 @@ pub use config::{
     SecretValue,
 };
 pub use input::{
-    BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,
-    InputReadCheckpoint, InputReadControl, InputReadControlError, InputReadPass,
-    UserAuthorizedInputRoot, UserOwnedInputAuthority, UserOwnedInputEvidence,
-    UserOwnedInputRootIdentityDigest, VerifiedInputFile,
+    BoundedInput, ControlledImportInputRoot, ControlledInputFileError, InputFileCapability,
+    InputFileError, InputFileIdentity, InputReadCheckpoint, InputReadControl,
+    InputReadControlError, InputReadPass, UserAuthorizedInputRoot, UserOwnedInputAuthority,
+    UserOwnedInputEvidence, UserOwnedInputRootIdentityDigest, VerifiedInputFile,
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,

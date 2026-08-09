@@ -10,6 +10,36 @@ import type {
 
 type RecordValue = Record<string, unknown>
 
+const LIVE_SOURCES = new Set([
+  "coinbase.public-market-data",
+  "coinbase.exchange-direct-market-data",
+  "kraken.spot-public-market-data",
+])
+const PUBLIC_LIVE_SOURCES = new Set([
+  "coinbase.public-market-data",
+  "kraken.spot-public-market-data",
+])
+
+export interface StoredDataEvidence {
+  datasetId: string
+  sourceId: string
+  generationKind: string
+  manifestVersion: number
+  rowCount: number
+  totalBytes: number
+  objectCount: number
+}
+
+export interface StoredDataQuarantine {
+  datasetId: string
+  expectedSourceId: string | null
+  observedSourceIds: string[]
+  reason:
+    | "source_identity_missing"
+    | "source_identity_mismatch"
+    | "ambiguous_dataset_identity"
+}
+
 export interface SourceEvidence {
   id: string
   name: string
@@ -21,6 +51,8 @@ export interface SourceEvidence {
   credentialRequirement: string | null
   setupState: string | null
   nextAction: string | null
+  lifecycleSupport: "managed" | "not_applicable" | null
+  operationalState: string | null
   runtimeState: string | null
   sourceId: string | null
   venueId: string | null
@@ -31,7 +63,10 @@ export interface SourceEvidence {
   quality: string | null
   coverageState: string | null
   observedAt: string | null
-  onboardingSessionId: string | null
+  latestSetupSessionId: string | null
+  providerDatasetIdentifier: string | null
+  storedData: StoredDataEvidence | null
+  storedDataQuarantine: StoredDataQuarantine | null
   lifecycle: LifecycleEvidence | null
 }
 
@@ -46,7 +81,9 @@ interface LifecycleEvidence {
   provider: string
   state: string
   stateRevision: number
+  configurationSessionId: string | null
   currentGeneration?: number
+  runtimeGenerationSha256?: string
   publicConfigurationSha256?: string
   blocker: string | null
   observedAt: string | null
@@ -100,12 +137,15 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
     expectedStateRevision: lifecycle.stateRevision,
   }
   const current = lifecycle.currentGeneration
+  const hasConfiguration =
+    lifecycle.configurationSessionId !== null &&
+    lifecycle.publicConfigurationSha256 !== undefined
   const reconfigure =
-    source.onboardingSessionId && lifecycle.publicConfigurationSha256
+    hasConfiguration
       ? [
           control("reconfigure", "Apply prepared configuration", {
             ...base,
-            onboardingSessionId: source.onboardingSessionId,
+            onboardingSessionId: lifecycle.configurationSessionId ?? undefined,
             publicConfigurationSha256: lifecycle.publicConfigurationSha256,
           }),
         ]
@@ -116,18 +156,35 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
     { ...base, reason: "desktop-user-request" },
     true,
   )
+  const removeControls =
+    LIVE_SOURCES.has(source.id) || hasConfiguration || lifecycle.state === "active"
+      ? [remove]
+      : []
 
   switch (lifecycle.state) {
     case "stopped":
       return [
-        control("start", "Start", base),
-        control("verify", "Verify", base),
+        ...(PUBLIC_LIVE_SOURCES.has(source.id)
+          ? [control("start", "Start", base)]
+          : hasConfiguration
+            ? [
+                control("retry", "Resume", {
+                  ...base,
+                  reason: "desktop-user-request",
+                }),
+              ]
+            : []),
+        ...(LIVE_SOURCES.has(source.id)
+          ? [control("verify", "Verify", base)]
+          : []),
         ...reconfigure,
-        remove,
+        ...removeControls,
       ]
     case "active":
       return [
-        control("verify", "Verify", base),
+        ...(LIVE_SOURCES.has(source.id)
+          ? [control("verify", "Verify", base)]
+          : []),
         ...(current
           ? [
               control("resynchronize", "Resynchronize", {
@@ -144,21 +201,104 @@ export function lifecycleControls(source: SourceEvidence): LifecycleControl[] {
           true,
         ),
         ...reconfigure,
-        remove,
+        ...removeControls,
       ]
     case "blocked":
       return [
-        control("verify", "Verify", base),
-        control("retry", "Retry", {
-          ...base,
-          reason: "desktop-user-request",
-        }),
+        ...(LIVE_SOURCES.has(source.id)
+          ? [control("verify", "Verify", base)]
+          : []),
+        ...(PUBLIC_LIVE_SOURCES.has(source.id) || hasConfiguration
+          ? [
+              control("retry", "Retry", {
+                ...base,
+                reason: "desktop-user-request",
+              }),
+            ]
+            : []),
         ...reconfigure,
-        remove,
+        ...removeControls,
       ]
+    case "removed":
+      return PUBLIC_LIVE_SOURCES.has(source.id)
+        ? [control("start", "Start again", base)]
+        : []
     default:
       return []
   }
+}
+
+export function sourceNeedsSetup(source: SourceEvidence): boolean {
+  const lifecycle = source.lifecycle
+  if (!lifecycle || source.lifecycleSupport !== "managed") return false
+  if (lifecycle.state === "active") return false
+  if (PUBLIC_LIVE_SOURCES.has(source.id)) return false
+  return !(
+    lifecycle.configurationSessionId &&
+    lifecycle.publicConfigurationSha256
+  )
+}
+
+export function attachStoredData(
+  sources: SourceEvidence[],
+  stored: StoredDataEvidence[],
+): SourceEvidence[] {
+  const storedByDataset = new Map<string, StoredDataEvidence[]>()
+  for (const item of stored) {
+    const existing = storedByDataset.get(item.datasetId) ?? []
+    existing.push(item)
+    storedByDataset.set(item.datasetId, existing)
+  }
+
+  return sources.map((source) => {
+    const datasetId = source.providerDatasetIdentifier
+    const candidates = datasetId
+      ? (storedByDataset.get(datasetId) ?? [])
+      : []
+    if (!datasetId || candidates.length === 0) {
+      return { ...source, storedData: null, storedDataQuarantine: null }
+    }
+    const observedSourceIds = [
+      ...new Set(candidates.map((candidate) => candidate.sourceId)),
+    ].sort()
+    const sourceId = source.sourceId
+    if (!sourceId) {
+      return {
+        ...source,
+        storedData: null,
+        storedDataQuarantine: {
+          datasetId,
+          expectedSourceId: null,
+          observedSourceIds,
+          reason: "source_identity_missing",
+        },
+      }
+    }
+    const exact = candidates.filter(
+      (candidate) =>
+        candidate.sourceId === sourceId && candidate.datasetId === datasetId,
+    )
+    if (candidates.length === 1 && exact.length === 1) {
+      return {
+        ...source,
+        storedData: exact[0] ?? null,
+        storedDataQuarantine: null,
+      }
+    }
+    return {
+      ...source,
+      storedData: null,
+      storedDataQuarantine: {
+        datasetId,
+        expectedSourceId: sourceId,
+        observedSourceIds,
+        reason:
+          candidates.length > 1
+            ? "ambiguous_dataset_identity"
+            : "source_identity_mismatch",
+      },
+    }
+  })
 }
 
 function toEvidence(
@@ -174,6 +314,10 @@ function toEvidence(
   const runtime = record(status?.runtime)
   const runtimeCoverage = record(coverage?.runtimeCoverage)
   const runtimeHealth = record(health?.runtimeHealth)
+  const lifecycle = lifecycleEvidence(status?.lifecycle)
+  const lifecycleSupport = lifecycleSupportEvidence(status?.lifecycleSupport)
+  const runtimeState = text(runtime?.state) ?? text(runtimeHealth?.state)
+  const providerDatasetIdentifier = text(status?.providerDatasetIdentifier)
 
   return {
     id,
@@ -207,7 +351,9 @@ function toEvidence(
       text(session?.state) ?? bootstrapSession?.state ?? text(health?.onboardingState),
     nextAction:
       text(session?.next_action) ?? bootstrapSession?.next_action ?? null,
-    runtimeState: text(runtime?.state) ?? text(runtimeHealth?.state),
+    lifecycleSupport,
+    operationalState: lifecycle?.state ?? runtimeState,
+    runtimeState,
     sourceId: text(runtime?.sourceId) ?? text(runtimeHealth?.sourceId),
     venueId: text(runtime?.venueId) ?? text(runtimeHealth?.venueId),
     instrumentId:
@@ -220,9 +366,12 @@ function toEvidence(
     observedAt: unixNanos(
       runtime?.observedAtUnixNanos ?? runtimeHealth?.observedAtUnixNanos,
     ),
-    onboardingSessionId:
+    latestSetupSessionId:
       text(session?.session_id) ?? bootstrapSession?.session_id ?? null,
-    lifecycle: lifecycleEvidence(status?.lifecycle),
+    providerDatasetIdentifier,
+    storedData: null,
+    storedDataQuarantine: null,
+    lifecycle,
   }
 }
 
@@ -233,18 +382,29 @@ function lifecycleEvidence(value: unknown): LifecycleEvidence | null {
   const stateRevision = positiveInteger(row?.stateRevision)
   if (!provider || !state || stateRevision === null) return null
 
+  const configurationSessionId = uuid(row?.configurationSessionId)
   const currentGeneration = positiveInteger(row?.currentGeneration)
   return {
     provider,
     state,
     stateRevision,
+    configurationSessionId,
     ...(currentGeneration ? { currentGeneration } : {}),
+    ...(sha256(row?.runtimeGenerationSha256)
+      ? { runtimeGenerationSha256: text(row?.runtimeGenerationSha256) ?? undefined }
+      : {}),
     ...(sha256(row?.publicConfigurationSha256)
       ? { publicConfigurationSha256: text(row?.publicConfigurationSha256) ?? undefined }
       : {}),
     blocker: text(row?.blocker),
     observedAt: text(row?.observedAt),
   }
+}
+
+function lifecycleSupportEvidence(
+  value: unknown,
+): "managed" | "not_applicable" | null {
+  return value === "managed" || value === "not_applicable" ? value : null
 }
 
 function control(
@@ -305,6 +465,15 @@ function unixNanos(value: unknown): string | null {
 
 function sha256(value: unknown) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+}
+
+function uuid(value: unknown): string | null {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+    ? value
+    : null
 }
 
 function record(value: unknown): RecordValue | null {

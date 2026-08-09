@@ -1,6 +1,6 @@
-//! Bounded Coinbase Exchange public and authenticated Direct market-data adapters.
+//! Bounded Coinbase public Advanced Trade and authenticated Direct market-data adapters.
 //!
-//! The public profile remains pinned to the Exchange Market Data endpoint and a
+//! The public profile is pinned to the Advanced Trade Market Data endpoint and a
 //! `DirectUnverified` ceiling. The authenticated profile combines `ws-direct` `full` with exact
 //! REST product and level-3 snapshot capture. Both emit provider evidence only; current
 //! qualification, canonical events, order composition, and execution eligibility remain owned by
@@ -13,8 +13,8 @@ mod direct_transport;
 mod source;
 
 pub use config::{
-    COINBASE_EXCHANGE_ENDPOINT, CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig,
-    CoinbaseProductMapping, CoinbaseTransportLimits,
+    COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseChannel, CoinbaseConfigError,
+    CoinbaseExchangeConfig, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 pub use decoder::CoinbaseExchangeDecoder;
 pub use direct::{

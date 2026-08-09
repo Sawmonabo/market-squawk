@@ -165,6 +165,19 @@ const PORTFOLIO_IMPORT_COMMIT_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("approvalId", ArgumentKind::Uuid)];
 const PORTFOLIO_IMPORT_DISCARD_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("previewId", ArgumentKind::Sha256)];
+const RESEARCH_FILE_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "format",
+        ArgumentKind::Enumeration(&["csv", "json", "ndjson", "parquet"]),
+    ),
+];
+const RESEARCH_FILE_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Sha256),
+    ArgumentSpec::required("mapping", ArgumentKind::ResearchFileMapping),
+];
+const RESEARCH_FILE_DISCARD_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("previewId", ArgumentKind::Sha256)];
 const LIST_ACCOUNTS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
     "afterAccountId",
     ArgumentKind::Identifier,
@@ -916,6 +929,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Research,
         SOURCE_SCOPE,
         INGEST_SOURCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.PreviewStagedFile",
+        "Claim one staged user-owned research file and return a bounded path-free preview.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_PREVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    source_evidence_mutation(
+        "Research.CommitStagedFile",
+        "Bind one guided mapping to exact staged bytes and start durable research ingestion.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.DiscardStagedFile",
+        "Discard one uncommitted user-owned research-file preview.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_DISCARD_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     mutation(
@@ -1990,6 +2027,29 @@ const fn mutation(
     }
 }
 
+const fn source_evidence_mutation(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+    authorization: ToolAuthorization,
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: true,
+        idempotent: false,
+        open_world: false,
+    }
+}
+
 const fn idempotent_mutation(
     name: &'static str,
     description: &'static str,
@@ -2187,6 +2247,7 @@ enum ArgumentKind {
     FairValueMeasurement,
     ForecastRequest,
     PortfolioImportInterpretations,
+    ResearchFileMapping,
     SettingsChanges,
     Enumeration(&'static [&'static str]),
     Unsigned { minimum: u64, maximum: u64 },
@@ -2345,6 +2406,7 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::ForecastRequest => forecast_request_schema(),
         ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
+        ArgumentKind::ResearchFileMapping => research_file_mapping_schema(),
         ArgumentKind::SettingsChanges => settings_changes_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
@@ -2582,6 +2644,7 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::PortfolioImportInterpretations => {
             admit_portfolio_import_interpretations(value)
         }
+        ArgumentKind::ResearchFileMapping => admit_research_file_mapping(value),
         ArgumentKind::SettingsChanges => admit_settings_changes(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
@@ -2630,6 +2693,180 @@ fn portfolio_import_interpretations_schema() -> Value {
             "additionalProperties": false,
         },
     })
+}
+
+fn research_file_mapping_schema() -> Value {
+    let source_field = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAXIMUM_IDENTIFIER_BYTES,
+        })
+    };
+    let identifier = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAXIMUM_IDENTIFIER_BYTES,
+            "pattern": "^[A-Za-z0-9_.:/-]+$",
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "dataset": identifier(),
+            "identityField": source_field(),
+            "fields": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": source_field(),
+                        "field": identifier(),
+                        "decimalScale": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 28,
+                        },
+                        "unit": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                        },
+                    },
+                    "required": ["source", "field", "decimalScale"],
+                    "additionalProperties": false,
+                },
+            },
+            "effectiveAt": {"type": "string", "format": "date-time"},
+            "publishedAt": {"type": "string", "format": "date-time"},
+            "effectiveField": source_field(),
+            "publishedField": source_field(),
+            "availableField": source_field(),
+            "revisionField": source_field(),
+            "revisionNumberField": source_field(),
+            "supersededField": source_field(),
+            "instrumentId": {"type": "string", "format": "uuid"},
+            "universe": identifier(),
+        },
+        "required": ["dataset", "identityField", "fields", "effectiveAt"],
+        "additionalProperties": false,
+    })
+}
+
+fn admit_research_file_mapping(value: &Value) -> Result<(), ToolInputError> {
+    const OPTIONAL_SOURCE_FIELDS: [&str; 6] = [
+        "effectiveField",
+        "publishedField",
+        "availableField",
+        "revisionField",
+        "revisionNumberField",
+        "supersededField",
+    ];
+    const ALLOWED: [&str; 13] = [
+        "dataset",
+        "identityField",
+        "fields",
+        "effectiveAt",
+        "publishedAt",
+        "effectiveField",
+        "publishedField",
+        "availableField",
+        "revisionField",
+        "revisionNumberField",
+        "supersededField",
+        "instrumentId",
+        "universe",
+    ];
+    let mapping = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if mapping.len() < 4
+        || mapping.len() > ALLOWED.len()
+        || mapping.keys().any(|key| !ALLOWED.contains(&key.as_str()))
+        || !mapping
+            .get("dataset")
+            .and_then(Value::as_str)
+            .is_some_and(valid_identifier)
+        || !mapping
+            .get("identityField")
+            .and_then(Value::as_str)
+            .is_some_and(valid_source_field)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_timestamp(mapping.get("effectiveAt").ok_or(ToolInputError::Invalid)?)?;
+    if let Some(published) = mapping.get("publishedAt") {
+        admit_timestamp(published)?;
+    }
+    for name in OPTIONAL_SOURCE_FIELDS {
+        if let Some(value) = mapping.get(name)
+            && !value.as_str().is_some_and(valid_source_field)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    if mapping
+        .get("universe")
+        .is_some_and(|value| !value.as_str().is_some_and(valid_identifier))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let instrument = mapping.get("instrumentId");
+    if instrument
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ToolInputError::Invalid)?
+        .is_none()
+        && mapping.contains_key("universe")
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let fields = mapping
+        .get("fields")
+        .and_then(Value::as_array)
+        .filter(|fields| !fields.is_empty() && fields.len() <= 64)
+        .ok_or(ToolInputError::Invalid)?;
+    let mut source_fields = HashSet::new();
+    let mut output_fields = HashSet::new();
+    for field in fields {
+        let field = field.as_object().ok_or(ToolInputError::Invalid)?;
+        if field.len() < 3
+            || field.len() > 4
+            || field
+                .keys()
+                .any(|key| !matches!(key.as_str(), "source" | "field" | "decimalScale" | "unit"))
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        let source = field
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|value| valid_source_field(value))
+            .ok_or(ToolInputError::Invalid)?;
+        let output = field
+            .get("field")
+            .and_then(Value::as_str)
+            .filter(|value| valid_identifier(value))
+            .ok_or(ToolInputError::Invalid)?;
+        field
+            .get("decimalScale")
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= 28)
+            .ok_or(ToolInputError::Invalid)?;
+        if !source_fields.insert(source)
+            || !output_fields.insert(output)
+            || field.get("unit").is_some_and(|unit| {
+                !unit
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty() && value.len() <= 64)
+            })
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
 }
 
 fn admit_portfolio_import_interpretations(value: &Value) -> Result<(), ToolInputError> {
@@ -3385,4 +3622,10 @@ fn valid_identifier(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
+}
+
+fn valid_source_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAXIMUM_IDENTIFIER_BYTES
+        && !value.chars().any(char::is_control)
 }

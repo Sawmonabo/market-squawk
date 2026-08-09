@@ -11,6 +11,7 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::LocalPaths;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::application::PaperSourceLifecycleControl;
 use crate::application::source::{
@@ -67,6 +68,51 @@ impl ProductionSourceLifecycleAuthority {
             durable,
             live,
         }
+    }
+
+    /// Restores the one live source whose durable desired state is active.
+    ///
+    /// Installed-service shutdown deliberately stops process-owned sockets without changing the
+    /// user's durable source choice. On the next service generation, this method re-establishes
+    /// that exact source before the service publishes readiness. Provider, credential, budget, or
+    /// network failures remain explicit lifecycle blockers and do not fabricate an active runtime.
+    pub(crate) async fn restore_active_live_source(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SourceIdentifier>, SourceLifecycleError> {
+        ensure_status_live(cancellation, deadline)?;
+        let mut selected = None;
+        for surface in LIVE_SURFACES {
+            let record = self
+                .durable
+                .source_lifecycle_record(surface)
+                .map_err(map_durable_error)?;
+            if record.phase() != DurableSourceLifecyclePhase::Active {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(SourceLifecycleError::Conflict);
+            }
+            selected = Some((
+                SourceIdentifier::try_from(surface)
+                    .map_err(|_error| SourceLifecycleError::InvalidResult)?,
+                record.session_id(),
+            ));
+        }
+        let Some((provider, session_id)) = selected else {
+            return Ok(None);
+        };
+        ensure_status_live(cancellation, deadline)?;
+        let evidence = self
+            .live
+            .start(&provider, session_id, deadline, cancellation)
+            .await
+            .map_err(map_live_error)?;
+        if evidence.provider != provider {
+            return Err(SourceLifecycleError::InvalidResult);
+        }
+        Ok(Some(provider))
     }
 
     async fn execute_owned(
@@ -128,6 +174,26 @@ impl ProductionSourceLifecycleAuthority {
                 return Err(error);
             }
         };
+        if LIVE_SURFACES.contains(&provider.as_str())
+            && outcome.phase == DurableSourceLifecyclePhase::Active
+            && matches!(
+                command.action(),
+                SourceLifecycleAction::Start
+                    | SourceLifecycleAction::Retry
+                    | SourceLifecycleAction::Reconfigure
+            )
+            && let Err(error) = self.durable.retire_other_active_live_surfaces(
+                &provider,
+                &LIVE_SURFACES,
+                &operation_id,
+                command_digest,
+            )
+        {
+            let _blocked = self
+                .durable
+                .require_source_lifecycle_reconciliation(&provider, transition_digest);
+            return Err(map_durable_error(error));
+        }
         ensure_live(command)?;
         let record = self
             .durable
@@ -185,6 +251,12 @@ impl ProductionSourceLifecycleAuthority {
                     state = SourceLifecycleState::Blocked;
                     blocker = Some(SourceLifecycleBlocker::ProviderAvailability);
                 }
+                Err(market_squawk_services::ServiceError::InvalidRequest) => {
+                    // A different provider currently owns the sole live runtime. Report this
+                    // retained source as unavailable instead of rejecting the status read.
+                    state = SourceLifecycleState::Blocked;
+                    blocker = Some(SourceLifecycleBlocker::ProviderAvailability);
+                }
                 Err(error) => return Err(map_live_error(error)),
             }
         } else if state == SourceLifecycleState::Active {
@@ -206,6 +278,7 @@ impl ProductionSourceLifecycleAuthority {
             provider: provider.clone(),
             state_revision: record.revision(),
             state,
+            configuration_session_id: record.session_id(),
             current_generation: live,
             runtime_generation_digest: research,
             public_configuration_digest: record.public_configuration_digest(),

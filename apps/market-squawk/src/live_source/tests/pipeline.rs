@@ -92,11 +92,11 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
 fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration()
 -> Result<(), Box<dyn std::error::Error>> {
     let json = r#"{
-      "endpoint":"wss://ws-feed.exchange.coinbase.com",
+      "endpoint":"wss://advanced-trade-ws.coinbase.com",
       "event_classes":["book_snapshot","book_delta","trade"],
       "depth":"price_level",
       "freshness_ms":5000,
-      "max_frame_bytes":1048576,
+      "max_frame_bytes":16777216,
       "subscription_ack_timeout_ms":5000,
       "control_message_capacity":64,
       "control_byte_capacity":65536,
@@ -105,8 +105,8 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
         "provider":"coinbase-exchange",
         "basis":"user-reviewed-coinbase-public-interface",
         "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-        "evidence_version":"reviewed-2026-07-20",
+        "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+        "evidence_version":"reviewed-2026-08-08",
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },

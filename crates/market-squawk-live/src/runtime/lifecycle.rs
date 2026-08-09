@@ -292,9 +292,7 @@ impl LiveRuntime {
                 routes: shard_routes,
                 action_hooks: shard_action_hooks,
                 qualified_market_exports: shard_qualified_market_exports,
-                maximum_action_hook_bytes_per_route: config
-                    .maximum_action_hook_bytes_per_route()
-                    .get(),
+                maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route(),
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
                 maximum_streams_per_route: config.maximum_streams_per_route().get(),
                 feature_capacity: config.feature_capacity(),
@@ -605,7 +603,7 @@ fn validate_action_hooks(
         if !known_routes.contains(&route) {
             return Err(LiveRuntimeStartError::UnknownActionHook { route });
         }
-        hook.validate_retained_bytes(config.maximum_action_hook_bytes_per_route().get())
+        hook.validate_retained_bytes(config.maximum_action_hook_bytes_per_route())
             .map_err(|error| LiveRuntimeStartError::InvalidActionHook {
                 route: route.clone(),
                 error,

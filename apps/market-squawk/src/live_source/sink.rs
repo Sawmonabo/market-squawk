@@ -1,22 +1,28 @@
 //! Capture-first Coinbase sink and bounded live-route activation.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    mem::size_of,
+    time::Instant,
+};
 
 use super::{
     provider::ProductionMarketDecoder,
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
-    subscription_state::{GenerationIdentity, SubscriptionFailure, SubscriptionStateMachine},
+    subscription_state::{
+        GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
+    },
 };
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, CaptureGenerationCapabilities,
-    ConnectionLiveness, ControlFrameKind, CurrentHealthReporter, CurrentSourceSession,
-    DecodeInternalError, DecodeOutcome, FreshnessPolicy, MarketDecoder, ProviderTimestampEvidence,
-    QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError, ResynchronizationReason,
-    SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider,
-    ValidatedSessionDecodeOutcome,
+    AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, BudgetPermitLease,
+    CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind, CurrentHealthReporter,
+    CurrentSourceSession, DecodeInternalError, DecodeOutcome, FreshnessPolicy, MarketDecoder,
+    ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink, RegistryError,
+    ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot, SourceMetadata,
+    SourceMetadataProvider, ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 
@@ -57,6 +63,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     metadata: SourceMetadata,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
+    pending_data: PendingDataBuffer,
     live_ingress: LiveRuntimeIngress,
     routes: HashMap<ShardKey, RouteActivationPublisher>,
     last_transport_at: Option<Timestamp>,
@@ -65,6 +72,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     health_rebind_at: Option<Timestamp>,
     health_valid_until: Option<Timestamp>,
     acknowledgement_evidence: Option<ExactPayloadEvidence>,
+    active_request_budget: Option<BudgetPermitLease>,
     terminal: Option<ProductionSinkFailure>,
 }
 
@@ -129,6 +137,8 @@ impl<'a> ProductionRawMarketSink<'a> {
                 return Err(ProductionSinkConstructionError::DuplicateRoute);
             }
         }
+        let pending_data =
+            PendingDataBuffer::try_new(subscription.pre_acknowledgement_data_limits())?;
         Ok(Self {
             capture,
             registry,
@@ -138,6 +148,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             metadata,
             generation: GenerationIdentity::from_session(session),
             subscription,
+            pending_data,
             live_ingress,
             routes,
             last_transport_at: None,
@@ -146,6 +157,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             health_rebind_at: None,
             health_valid_until: None,
             acknowledgement_evidence: None,
+            active_request_budget: None,
             terminal: None,
         })
     }
@@ -271,6 +283,7 @@ impl<'a> ProductionRawMarketSink<'a> {
                     .map_err(ProductionSinkFailure::Subscription)?;
                 self.acknowledgement_evidence =
                     Some(ExactPayloadEvidence::from_content_digest(payload_digest));
+                self.flush_pending_data(received_at)?;
             }
             ControlFrameKind::Heartbeat => {
                 self.subscription
@@ -304,6 +317,40 @@ impl<'a> ProductionRawMarketSink<'a> {
         latest_source_at: Option<Timestamp>,
         received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
+        if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
+            && self.pending_data.is_enabled()
+        {
+            return self
+                .pending_data
+                .try_push(data, route, latest_source_at, received_at);
+        }
+        self.process_active_data(data, route, latest_source_at, received_at, received_at)
+    }
+
+    fn flush_pending_data(
+        &mut self,
+        acknowledgement_received_at: Timestamp,
+    ) -> Result<(), ProductionSinkFailure> {
+        while let Some(pending) = self.pending_data.try_pop_front()? {
+            self.process_active_data(
+                pending.data,
+                pending.route,
+                pending.latest_source_at,
+                pending.received_at,
+                acknowledgement_received_at.max(pending.received_at),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn process_active_data(
+        &mut self,
+        data: market_squawk_sources::CapturedDecodedProviderBatch,
+        route: ShardKey,
+        latest_source_at: Option<Timestamp>,
+        received_at: Timestamp,
+        health_observed_at: Timestamp,
+    ) -> Result<(), ProductionSinkFailure> {
         self.subscription
             .observe_data(&self.generation, Instant::now())
             .map_err(ProductionSinkFailure::Subscription)?;
@@ -323,7 +370,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             None
         };
         if requires_rebind {
-            self.record_health(received_at)?;
+            self.record_health(health_observed_at)?;
         }
         let current = self
             .registry
@@ -350,7 +397,10 @@ impl<'a> ProductionRawMarketSink<'a> {
             .ok_or(ProductionSinkFailure::UnknownRoute)?;
         if let Some(dormant) = dormant {
             manager.start_activation(dormant, batch)?;
-            self.health_rebind_at = Some(rebind_at(received_at, self.metadata.freshness_policy())?);
+            self.health_rebind_at = Some(rebind_at(
+                health_observed_at,
+                self.metadata.freshness_policy(),
+            )?);
             self.health_valid_until = Some(valid_until);
         } else {
             manager.try_publish(batch)?;
@@ -421,10 +471,13 @@ impl<'a> ProductionRawMarketSink<'a> {
             Vec::new(),
         )
         .map_err(ProductionSinkFailure::Health)?;
-        let update = self
-            .health_reporter
-            .report(health)
-            .map_err(ProductionSinkFailure::Registry)?;
+        let update = match self.active_request_budget.as_ref() {
+            Some(request) => self
+                .health_reporter
+                .report_with_active_request(health, request),
+            None => self.health_reporter.report(health),
+        }
+        .map_err(ProductionSinkFailure::Registry)?;
         self.registry
             .record_health(self.session, update)
             .map_err(ProductionSinkFailure::Registry)
@@ -438,7 +491,101 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 }
 
+#[derive(Debug)]
+struct PendingDecodedData {
+    data: market_squawk_sources::CapturedDecodedProviderBatch,
+    route: ShardKey,
+    latest_source_at: Option<Timestamp>,
+    received_at: Timestamp,
+    retained_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingDataBuffer {
+    entries: VecDeque<PendingDecodedData>,
+    retained_bytes: usize,
+    maximum_messages: usize,
+    maximum_bytes: usize,
+}
+
+impl PendingDataBuffer {
+    fn try_new(
+        (maximum_messages, maximum_bytes): (usize, usize),
+    ) -> Result<Self, ProductionSinkConstructionError> {
+        let mut entries = VecDeque::new();
+        entries
+            .try_reserve_exact(maximum_messages)
+            .map_err(|_error| ProductionSinkConstructionError::AllocationFailed)?;
+        Ok(Self {
+            entries,
+            retained_bytes: 0,
+            maximum_messages,
+            maximum_bytes,
+        })
+    }
+
+    const fn is_enabled(&self) -> bool {
+        self.maximum_messages != 0
+    }
+
+    fn try_push(
+        &mut self,
+        data: market_squawk_sources::CapturedDecodedProviderBatch,
+        route: ShardKey,
+        latest_source_at: Option<Timestamp>,
+        received_at: Timestamp,
+    ) -> Result<(), ProductionSinkFailure> {
+        if self.entries.len() == self.maximum_messages {
+            return Err(ProductionSinkFailure::PreAcknowledgementBufferCountSaturated);
+        }
+        let retained_bytes = data
+            .retained_bytes()
+            .map_err(|_error| ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?
+            .checked_add(size_of::<PendingDecodedData>())
+            .and_then(|bytes| bytes.checked_add(route.venue().retained_bytes()))
+            .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?;
+        let next_total = self
+            .retained_bytes
+            .checked_add(retained_bytes)
+            .ok_or(ProductionSinkFailure::PreAcknowledgementRetainedSizeOverflow)?;
+        if next_total > self.maximum_bytes {
+            return Err(ProductionSinkFailure::PreAcknowledgementBufferBytesSaturated);
+        }
+        self.entries.push_back(PendingDecodedData {
+            data,
+            route,
+            latest_source_at,
+            received_at,
+            retained_bytes,
+        });
+        self.retained_bytes = next_total;
+        Ok(())
+    }
+
+    fn try_pop_front(&mut self) -> Result<Option<PendingDecodedData>, ProductionSinkFailure> {
+        let Some(entry) = self.entries.pop_front() else {
+            if self.retained_bytes != 0 {
+                return Err(ProductionSinkFailure::PreAcknowledgementBufferAccounting);
+            }
+            return Ok(None);
+        };
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_sub(entry.retained_bytes)
+            .ok_or(ProductionSinkFailure::PreAcknowledgementBufferAccounting)?;
+        Ok(Some(entry))
+    }
+}
+
 impl RawMarketSink for ProductionRawMarketSink<'_> {
+    fn bind_active_request_budget(&mut self, request: BudgetPermitLease) -> Result<(), SinkError> {
+        if self.active_request_budget.is_some() {
+            return Err(self.fail(ProductionSinkFailure::DuplicateActiveRequestBudget));
+        }
+        self.active_request_budget = Some(request);
+        Ok(())
+    }
+
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError> {
         if let Some(failure) = self.terminal {
             return Err(failure.as_sink_error());
@@ -508,9 +655,9 @@ fn rebind_at(
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RouteActivationFailure {
-    #[error("live route activation failed")]
+    #[error("live route activation binding failed: {0}")]
     Bind(LiveIngressBindError),
-    #[error("first current batch failed live ingress")]
+    #[error("first current batch failed live ingress: {0}")]
     Ingress(LiveIngressError),
     #[error("route actor received a command before generation activation")]
     CommandOrder,
@@ -520,7 +667,7 @@ pub enum RouteActivationFailure {
 pub enum ProductionSinkFailure {
     #[error("raw capture publication failed")]
     Capture(CapturePublishError),
-    #[error("source authority validation failed")]
+    #[error("source authority validation failed: {0}")]
     Registry(RegistryError),
     #[error("decoder implementation failed")]
     Decode(DecodeInternalError),
@@ -530,20 +677,28 @@ pub enum ProductionSinkFailure {
     UnexpectedDecoder,
     #[error("subscription state failed")]
     Subscription(SubscriptionFailure),
-    #[error("source requested resynchronization")]
+    #[error("source requested resynchronization: {0:?}")]
     Resynchronize(ResynchronizationReason),
-    #[error("source generation was quarantined")]
+    #[error("source generation was quarantined: {0:?}")]
     Quarantine(QuarantineReason),
     #[error("source health construction failed")]
     Health(SourceHealthError),
     #[error("live ingress publication failed")]
     Ingress(LiveIngressError),
-    #[error("live route activation failed")]
+    #[error("live route activation failed: {0}")]
     RouteActivation(RouteActivationFailure),
     #[error("route actor command count capacity is full")]
     ActivationBufferCountSaturated,
     #[error("route actor retained-batch byte capacity is full")]
     ActivationBufferBytesSaturated,
+    #[error("pre-acknowledgement data buffer count capacity is full")]
+    PreAcknowledgementBufferCountSaturated,
+    #[error("pre-acknowledgement data buffer retained-byte capacity is full")]
+    PreAcknowledgementBufferBytesSaturated,
+    #[error("pre-acknowledgement retained-size accounting overflowed")]
+    PreAcknowledgementRetainedSizeOverflow,
+    #[error("pre-acknowledgement retained-size accounting is inconsistent")]
+    PreAcknowledgementBufferAccounting,
     #[error("route activation worker is closed")]
     ActivationWorkerClosed,
     #[error("decoded data route is not configured")]
@@ -560,12 +715,19 @@ pub enum ProductionSinkFailure {
     HealthDeadlineRange,
     #[error("decoded route is unavailable before current-data upgrade")]
     RouteUnavailableBeforeUpgrade,
+    #[error("active provider request budget was bound more than once")]
+    DuplicateActiveRequestBudget,
 }
 
 impl ProductionSinkFailure {
     pub(super) const fn requires_generation_resynchronization(self) -> bool {
         match self {
-            Self::Resynchronize(_) | Self::Quarantine(_) => true,
+            Self::Resynchronize(_)
+            | Self::Quarantine(_)
+            | Self::PreAcknowledgementBufferCountSaturated
+            | Self::PreAcknowledgementBufferBytesSaturated
+            | Self::PreAcknowledgementRetainedSizeOverflow
+            | Self::PreAcknowledgementBufferAccounting => true,
             Self::Subscription(
                 SubscriptionFailure::AcknowledgementMismatch
                 | SubscriptionFailure::DuplicateAcknowledgement
@@ -596,6 +758,7 @@ impl ProductionSinkFailure {
             | Self::UnboundedAuthorization
             | Self::MissingLiveCoverage
             | Self::HealthDeadlineRange
+            | Self::DuplicateActiveRequestBudget
             | Self::RouteUnavailableBeforeUpgrade => false,
         }
     }
@@ -607,7 +770,9 @@ impl ProductionSinkFailure {
                 LiveIngressError::CountCapacityFull | LiveIngressError::ByteCapacityFull,
             )
             | Self::ActivationBufferCountSaturated
-            | Self::ActivationBufferBytesSaturated => SinkError::Saturated,
+            | Self::ActivationBufferBytesSaturated
+            | Self::PreAcknowledgementBufferCountSaturated
+            | Self::PreAcknowledgementBufferBytesSaturated => SinkError::Saturated,
             Self::Capture(
                 CapturePublishError::QueueClosed
                 | CapturePublishError::WriterUnavailable
@@ -626,12 +791,15 @@ impl ProductionSinkFailure {
             | Self::Health(_)
             | Self::Ingress(_)
             | Self::RouteActivation(_)
+            | Self::PreAcknowledgementRetainedSizeOverflow
+            | Self::PreAcknowledgementBufferAccounting
             | Self::UnknownRoute
             | Self::RouteMismatch
             | Self::UnexpectedRouteCount
             | Self::UnboundedAuthorization
             | Self::MissingLiveCoverage
             | Self::HealthDeadlineRange
+            | Self::DuplicateActiveRequestBudget
             | Self::RouteUnavailableBeforeUpgrade => SinkError::CaptureIncomplete,
         }
     }

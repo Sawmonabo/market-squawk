@@ -14,6 +14,8 @@ mod provider_activation_state;
 mod source_lifecycle;
 
 use std::num::{NonZeroU32, NonZeroUsize};
+#[cfg(debug_assertions)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,13 +47,23 @@ pub use self::cli_dataset::CliDatasetError;
 pub use self::cli_model::CliModelAdmissionError;
 pub use self::cli_portfolio::CliPortfolioImportError;
 pub use self::cli_provider::CliProviderActivationError;
+pub(crate) use self::cli_provider::{
+    ControlledLocalFileRequest, ProviderResearchActivationService,
+};
 pub use self::cli_transport::{
     CliProductError, CliProductResult, execute_cli_command, execute_installed_cli_command,
 };
 use self::executable::{
-    ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
-    installed_application_program, installed_release_programs, installed_service_program,
+    ExecutableIdentityError, current_executable_sha256, installed_application_program,
+    installed_service_program,
 };
+#[cfg(debug_assertions)]
+use self::executable::{
+    admit_development_onnx_worker, development_mcp_relay_program, development_service_program,
+    development_training_release_programs,
+};
+#[cfg(not(debug_assertions))]
+use self::executable::{admit_installed_onnx_worker, installed_release_programs};
 use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
 use self::governance::{DecisionGovernanceAdapter, ProductionFairValueGovernanceActionFactory};
 use self::provider_activation_state::{
@@ -120,6 +132,8 @@ const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS: usize = 101;
+const COINBASE_LIVE_AUTHORITY_KEY: &str = "coinbase-exchange-public";
+const KRAKEN_LIVE_AUTHORITY_KEY: &str = "kraken-public-book-v2";
 
 /// Returns the installed CLI path after stable-file and permission verification.
 ///
@@ -147,6 +161,29 @@ pub fn verified_installed_service_program() -> Result<PathBuf, LocalServiceAvail
     installed_service_program().map_err(|_error| LocalServiceAvailabilityError::InstalledService)
 }
 
+/// Returns an explicit development service after stable-file and permission verification.
+///
+/// This boundary exists only in debug builds. Production binaries can launch only their verified
+/// installed sibling.
+#[cfg(debug_assertions)]
+pub fn verified_development_service_program(
+    program: &Path,
+) -> Result<PathBuf, LocalServiceAvailabilityError> {
+    development_service_program(program)
+        .map_err(|_error| LocalServiceAvailabilityError::InstalledService)
+}
+
+/// Returns an explicit development MCP relay after stable-file and permission verification.
+///
+/// This boundary exists only in debug builds. Production binaries can select only the managed
+/// installed relay.
+#[cfg(debug_assertions)]
+pub fn verified_development_mcp_relay_program(
+    program: &Path,
+) -> Result<PathBuf, LocalMcpAvailabilityError> {
+    development_mcp_relay_program(program).map_err(|_error| LocalMcpAvailabilityError::InstalledCli)
+}
+
 /// Lifecycle owner for every production local authority required by the product surface.
 pub struct LocalProduct {
     paths: LocalPaths,
@@ -154,10 +191,11 @@ pub struct LocalProduct {
     application: Arc<Application>,
     research: Arc<ResearchService>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
-    source_lifecycle: Arc<dyn SourceLifecycleAuthority>,
+    source_lifecycle: Arc<ProductionSourceLifecycleAuthority>,
     paper_activity: Arc<dyn PaperRuntimeActivityAuthority>,
     provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
+    provider_research_activation: Arc<cli_provider::ProviderResearchActivationService>,
     provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority>,
     provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
@@ -258,6 +296,27 @@ impl LocalProduct {
         let artifact_repository: Arc<dyn ArtifactRepository> = artifacts.clone();
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
 
+        // The installation-global guard proves that no predecessor service can still own this
+        // selected workspace. Reconcile each configured live authority once, before any runtime
+        // can be constructed. Ordinary in-process source starts retain the strict predecessor
+        // rejection path.
+        if let SourceAuthorityStartupPolicy::ExclusiveInstalledReplacement(selected_workspace) =
+            &source_authority_startup_policy
+        {
+            if config.coinbase().is_some() {
+                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                    selected_workspace,
+                    COINBASE_LIVE_AUTHORITY_KEY,
+                )?;
+            }
+            if config.kraken().is_some() {
+                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                    selected_workspace,
+                    KRAKEN_LIVE_AUTHORITY_KEY,
+                )?;
+            }
+        }
+
         let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
             Arc::new(provider_rate.clone());
         let source_registry = match source_authority_startup_policy {
@@ -343,15 +402,15 @@ impl LocalProduct {
             Arc::clone(&provider_activation),
             Arc::clone(&decisions),
         );
-        let source_lifecycle: Arc<dyn SourceLifecycleAuthority> =
-            Arc::new(ProductionSourceLifecycleAuthority::new(
-                paths.clone(),
-                Arc::clone(&onboarding),
-                Arc::clone(&provider_activation),
-                Arc::clone(&provider_portal_activation),
-                provider_activation_state.clone(),
-                paper.source_lifecycle_control(),
-            ));
+        let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
+            paths.clone(),
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_activation),
+            Arc::clone(&provider_portal_activation),
+            provider_activation_state.clone(),
+            paper.source_lifecycle_control(),
+        ));
+        let source_lifecycle_service: Arc<dyn SourceLifecycleAuthority> = source_lifecycle.clone();
         let paper_activity = paper.runtime_activity_authority();
         let source_discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> =
             Arc::clone(&research_ingest) as Arc<_>;
@@ -360,8 +419,8 @@ impl LocalProduct {
             paper.source_runtime_view(),
             source_discovery,
             portal_activation.clone(),
-            portal_activation,
-            Arc::clone(&source_lifecycle),
+            portal_activation.clone(),
+            source_lifecycle_service,
         )?);
         let research_domains = ResearchApplicationServices::new_with_artifacts(
             Arc::clone(&research),
@@ -473,6 +532,7 @@ impl LocalProduct {
             paper_activity,
             provider_onboarding: onboarding,
             provider_activation,
+            provider_research_activation: portal_activation,
             provider_portal_activation,
             provider_activation_state,
             portfolio,
@@ -553,6 +613,12 @@ impl LocalProduct {
     /// Returns provider onboarding authority for explicit CLI adapter activation boundaries.
     pub fn provider_onboarding(&self) -> Arc<ProviderOnboardingService> {
         Arc::clone(&self.provider_onboarding)
+    }
+
+    pub(crate) fn controlled_file_activation(
+        &self,
+    ) -> Arc<cli_provider::ProviderResearchActivationService> {
+        Arc::clone(&self.provider_research_activation)
     }
 
     /// Returns the shared durable provider activation boundary used by local presentation modes.
@@ -664,7 +730,20 @@ impl LocalProduct {
     }
 
     pub(crate) fn source_lifecycle_authority(&self) -> Arc<dyn SourceLifecycleAuthority> {
-        Arc::clone(&self.source_lifecycle)
+        self.source_lifecycle.clone()
+    }
+
+    pub(crate) async fn restore_active_live_source(
+        &self,
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        Option<market_squawk_domain::SourceIdentifier>,
+        crate::application::source::SourceLifecycleError,
+    > {
+        self.source_lifecycle
+            .restore_active_live_source(deadline, cancellation)
+            .await
     }
 
     pub(crate) fn paper_runtime_activity_authority(
@@ -880,9 +959,18 @@ fn open_model_domain(
         None if durable => return Err(LocalProductError::TrainingReleaseRequired),
         None => (None, ProductionModelRuntime::empty_snapshot(limits)?),
         Some(root) => {
+            #[cfg(debug_assertions)]
+            let (application, onnx_worker_path) = development_training_release_programs(root)?;
+            #[cfg(not(debug_assertions))]
             let (application, onnx_worker_path) = installed_release_programs()?;
             let training =
                 verify_application_training_environment(root, &application, &onnx_worker_path)?;
+            #[cfg(debug_assertions)]
+            let onnx_worker = Some(admit_development_onnx_worker(
+                &onnx_worker_path,
+                training.onnx_worker_sha256(),
+            )?);
+            #[cfg(not(debug_assertions))]
             let onnx_worker = Some(admit_installed_onnx_worker(training.onnx_worker_sha256())?);
             let runtime = Arc::new(ProductionModelRuntime::try_open(
                 paths,

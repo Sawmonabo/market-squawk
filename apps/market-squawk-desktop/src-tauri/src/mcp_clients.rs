@@ -26,7 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::{
-    bridge::{DesktopState, map_application_client_error},
+    bridge::{DesktopState, decode_application_result, map_application_client_error},
     contracts::DesktopCommandError,
 };
 
@@ -68,6 +68,7 @@ impl DesktopMcpClientState {
     pub(crate) fn try_new(
         paths: &LocalPaths,
         relay_program: impl AsRef<Path>,
+        installation_data_root: impl AsRef<Path>,
         runtime: RuntimeIdentity,
         endpoint_identity: impl Into<String>,
         claude_credential_identity: impl Into<String>,
@@ -96,7 +97,11 @@ impl DesktopMcpClientState {
             runtime,
             control_gate: AsyncMutex::new(()),
             inner: Arc::new(Mutex::new(DesktopMcpClientAuthority {
-                manager: McpClientRegistrationManager::try_new(paths, relay_program)?,
+                manager: McpClientRegistrationManager::try_new(
+                    paths,
+                    relay_program,
+                    installation_data_root,
+                )?,
                 authorities,
             })),
         })
@@ -507,7 +512,12 @@ impl From<&McpProtocolVerification> for McpVerificationPresentation {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum McpClientControlCommand {
     Connect { client: McpClientKind },
     Reconnect { client: McpClientKind },
@@ -734,7 +744,8 @@ async fn invoke_mcp_service<T: DeserializeOwned>(
         )
         .await
         .map_err(map_application_client_error)?;
-    serde_json::from_value(response.result().clone()).map_err(|_error| {
+    let result = decode_application_result(response.result())?;
+    serde_json::from_value(result).map_err(|_error| {
         DesktopCommandError::new(
             "mcp_service_contract_invalid",
             "The shared MCP service returned an incompatible runtime contract.",
@@ -830,9 +841,10 @@ fn map_mcp_client_error(error: McpClientRegistrationError) -> DesktopCommandErro
             "The owned MCP registration receipt is corrupt or incompatible and requires repair.",
         ),
         McpClientRegistrationError::InvalidRelayProgram
+        | McpClientRegistrationError::InvalidInstallationRoot
         | McpClientRegistrationError::UnsafeExecutable => DesktopCommandError::new(
             "mcp_relay_unavailable",
-            "The verified installed Market Squawk MCP relay is unavailable.",
+            "The verified Market Squawk MCP relay or installed service location is unavailable.",
         ),
         McpClientRegistrationError::InvalidAuthorityIdentity => DesktopCommandError::new(
             "mcp_authority_unavailable",

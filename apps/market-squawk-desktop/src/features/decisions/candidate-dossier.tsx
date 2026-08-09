@@ -18,7 +18,7 @@ import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { humanize } from "@/lib/formatters"
+import { formatMoney, humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -32,6 +32,7 @@ import {
   parseDecisionScreenRunPage,
   type CandidateView,
   type DecisionDossierView,
+  type DossierPreparationInventory,
   type DossierPreparationPreview,
   type ScreenRunIndexView,
 } from "./contracts"
@@ -53,6 +54,8 @@ export function CandidateDossierWorkspace({
   const queryClient = useQueryClient()
   const [runId, setRunId] = React.useState("")
   const [candidateId, setCandidateId] = React.useState("")
+  const [forecastSelector, setForecastSelector] = React.useState("")
+  const [fairValueSelector, setFairValueSelector] = React.useState("")
   const runs = useInfiniteQuery({
     queryKey: productKeys.operation(scope, "decision", "screen-runs", {
       limit: DISCOVERY_LIMIT,
@@ -110,10 +113,35 @@ export function CandidateDossierWorkspace({
         }),
       ),
   })
+  React.useEffect(() => {
+    const inventory = dossierPreparation.data
+    if (!inventory) return
+    setForecastSelector((current) =>
+      inventory.forecastOptions.some((option) => option.selector === current)
+        ? current
+        : (inventory.forecastOptions[0]?.selector ?? ""),
+    )
+    setFairValueSelector((current) =>
+      inventory.fairValueOptions.some((option) => option.selector === current)
+        ? current
+        : (inventory.fairValueOptions[0]?.selector ?? ""),
+    )
+  }, [dossierPreparation.data])
   const prepareDossier = useMutation({
     mutationFn: async () => {
       const inventory = dossierPreparation.data
       if (!inventory) throw new Error("Candidate evidence is not available yet.")
+      const selectedForecast = inventory.forecastOptions.find(
+        (option) => option.selector === forecastSelector,
+      )
+      const selectedFairValue = inventory.fairValueOptions.find(
+        (option) => option.selector === fairValueSelector,
+      )
+      if (!selectedForecast && !selectedFairValue) {
+        throw new Error(
+          "Select a compatible forecast or fair-value measurement before preparing the dossier.",
+        )
+      }
       return parseDossierPreparationPreview(
         await transport.decisionControl(
           {
@@ -126,6 +154,8 @@ export function CandidateDossierWorkspace({
                   ? (["portfolio_impact"] as const)
                   : []),
               ],
+              forecastSelector: selectedForecast?.selector ?? null,
+              fairValueSelector: selectedFairValue?.selector ?? null,
             },
           },
           false,
@@ -185,6 +215,8 @@ export function CandidateDossierWorkspace({
                   onSelect={() => {
                     setRunId(run.id)
                     setCandidateId("")
+                    setForecastSelector("")
+                    setFairValueSelector("")
                     prepareDossier.reset()
                     createDossier.reset()
                   }}
@@ -228,6 +260,8 @@ export function CandidateDossierWorkspace({
                   selected={candidate.id === candidateId}
                   onSelect={() => {
                     setCandidateId(candidate.id)
+                    setForecastSelector("")
+                    setFairValueSelector("")
                     prepareDossier.reset()
                     createDossier.reset()
                   }}
@@ -246,8 +280,9 @@ export function CandidateDossierWorkspace({
                 <h3 className="text-sm font-semibold">Build an evidence-bound dossier</h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
                   Market Squawk assembles the selected candidate, exact dataset, historical
-                  universe, and available portfolio evidence. Review the preview before retaining
-                  it for targets and later paper decisions.
+                  universe, compatible forecast and fair-value evidence, and available portfolio
+                  impact. Review the preview before retaining it for targets and later paper
+                  decisions.
                 </p>
                 {dossierPreparation.isPending ? (
                   <Skeleton className="mt-3 h-9 w-40" />
@@ -258,25 +293,46 @@ export function CandidateDossierWorkspace({
                     retry={() => void dossierPreparation.refetch()}
                   />
                 ) : (
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={prepareDossier.isPending}
-                      onClick={() => prepareDossier.mutate()}
-                    >
-                      {prepareDossier.isPending ? (
-                        <RefreshCw className="animate-spin" aria-hidden="true" />
-                      ) : (
-                        <BookOpenCheck aria-hidden="true" />
-                      )}
-                      Prepare dossier
-                    </Button>
-                    {dossierPreparation.data?.portfolioImpactAvailable ? (
-                      <StateLabel value="portfolio evidence included" />
+                  <div className="mt-4 grid gap-4">
+                    <DossierEvidenceChoices
+                      inventory={dossierPreparation.data}
+                      forecastSelector={forecastSelector}
+                      fairValueSelector={fairValueSelector}
+                      onForecastChange={(selector) => {
+                        setForecastSelector(selector)
+                        prepareDossier.reset()
+                        createDossier.reset()
+                      }}
+                      onFairValueChange={(selector) => {
+                        setFairValueSelector(selector)
+                        prepareDossier.reset()
+                        createDossier.reset()
+                      }}
+                    />
+                    {forecastSelector || fairValueSelector ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={prepareDossier.isPending}
+                          onClick={() => prepareDossier.mutate()}
+                        >
+                          {prepareDossier.isPending ? (
+                            <RefreshCw className="animate-spin" aria-hidden="true" />
+                          ) : (
+                            <BookOpenCheck aria-hidden="true" />
+                          )}
+                          Prepare dossier
+                        </Button>
+                        {dossierPreparation.data?.portfolioImpactAvailable ? (
+                          <StateLabel value="portfolio evidence included" />
+                        ) : (
+                          <StateLabel value="no portfolio evidence" />
+                        )}
+                      </div>
                     ) : (
-                      <StateLabel value="no portfolio evidence" />
+                      <PromptState text="No compatible forecast or classified fair-value measurement is retained at this candidate's cutoff. Create that evidence, then run the saved screen again at a current cutoff." />
                     )}
                   </div>
                 )}
@@ -294,6 +350,10 @@ export function CandidateDossierWorkspace({
                     </p>
                     <p className="mt-1 text-xs text-muted-foreground">
                       Evidence: {prepareDossier.data.evidence.join(", ")}
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Forecast: {prepareDossier.data.forecastSelector ?? "Not included"} · fair
+                      value: {prepareDossier.data.fairValueSelector ?? "Not included"}
                     </p>
                     <Button
                       type="button"
@@ -370,6 +430,121 @@ export function CandidateDossierWorkspace({
         </RecordPanel>
       </div>
     </section>
+  )
+}
+
+function DossierEvidenceChoices({
+  inventory,
+  forecastSelector,
+  fairValueSelector,
+  onForecastChange,
+  onFairValueChange,
+}: {
+  inventory: DossierPreparationInventory
+  forecastSelector: string
+  fairValueSelector: string
+  onForecastChange: (selector: string) => void
+  onFairValueChange: (selector: string) => void
+}) {
+  const forecast = inventory.forecastOptions.find(
+    (option) => option.selector === forecastSelector,
+  )
+  const fairValue = inventory.fairValueOptions.find(
+    (option) => option.selector === fairValueSelector,
+  )
+
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <div className="rounded-lg border border-border/70 bg-background/50 p-3">
+        <label htmlFor="dossier-forecast-evidence" className="text-xs font-medium">
+          Forecast evidence
+        </label>
+        <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+          A completed model forecast available by the candidate cutoff supports forecast-based
+          targets.
+        </p>
+        <select
+          id="dossier-forecast-evidence"
+          className="mt-3 h-9 w-full rounded-md border border-input bg-background px-3 text-xs shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          value={forecastSelector}
+          disabled={inventory.forecastOptions.length === 0}
+          onChange={(event) => onForecastChange(event.target.value)}
+        >
+          <option value="">
+            {inventory.forecastOptions.length === 0
+              ? "No compatible forecast available"
+              : "Do not include a forecast"}
+          </option>
+          {inventory.forecastOptions.map((option) => (
+            <option key={option.selector} value={option.selector}>
+              {option.modelId} · bundle v{option.bundleVersion} · {option.horizonPoints} points
+            </option>
+          ))}
+        </select>
+        {forecast ? (
+          <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+            <CandidateFact
+              label="Observed through"
+              value={formatTimestamp(forecast.observedThrough)}
+            />
+            <CandidateFact label="Expires" value={formatTimestamp(forecast.expiresAt)} />
+            <CandidateFact label="Model" value={forecast.modelId} />
+            <CandidateFact
+              label="Intervals"
+              value={forecast.calibrated ? "Calibrated" : "Point forecast only"}
+            />
+          </dl>
+        ) : (
+          <p className="mt-3 text-[11px] text-muted-foreground">
+            No forecast will be bound to this dossier.
+          </p>
+        )}
+      </div>
+
+      <div className="rounded-lg border border-border/70 bg-background/50 p-3">
+        <label htmlFor="dossier-fair-value-evidence" className="text-xs font-medium">
+          Fair-value evidence
+        </label>
+        <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+          A classified measurement available by the cutoff supports fair-value targets and
+          comparisons.
+        </p>
+        <select
+          id="dossier-fair-value-evidence"
+          className="mt-3 h-9 w-full rounded-md border border-input bg-background px-3 text-xs shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          value={fairValueSelector}
+          disabled={inventory.fairValueOptions.length === 0}
+          onChange={(event) => onFairValueChange(event.target.value)}
+        >
+          <option value="">
+            {inventory.fairValueOptions.length === 0
+              ? "No compatible measurement available"
+              : "Do not include a fair-value measurement"}
+          </option>
+          {inventory.fairValueOptions.map((option) => (
+            <option key={option.selector} value={option.selector}>
+              {formatMoney(option.amount)} · {humanize(option.hierarchy)} ·{" "}
+              {humanize(option.method)}
+            </option>
+          ))}
+        </select>
+        {fairValue ? (
+          <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+            <CandidateFact
+              label="Measured"
+              value={formatTimestamp(fairValue.measurementAt)}
+            />
+            <CandidateFact label="Fair value" value={formatMoney(fairValue.amount)} />
+            <CandidateFact label="Classification" value={humanize(fairValue.hierarchy)} />
+            <CandidateFact label="Method" value={humanize(fairValue.method)} />
+          </dl>
+        ) : (
+          <p className="mt-3 text-[11px] text-muted-foreground">
+            No fair-value measurement will be bound to this dossier.
+          </p>
+        )}
+      </div>
+    </div>
   )
 }
 

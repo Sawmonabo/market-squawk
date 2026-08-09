@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_jobs::{JobListPageLimit, SqliteJobRepository};
 use market_squawk_services::{
-    RequestContext, ServiceCapabilities, ServiceError, ToolResultMetadata, TypedToolRequest,
-    TypedToolResult,
+    RequestContext, ServiceCapabilities, ServiceError, TOOL_RESULT_LIMITS_FIELD,
+    ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -404,7 +404,9 @@ fn available(category: &str) -> Value {
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
-    serde_json::from_value(Value::Object(arguments.clone()))
+    let mut business_arguments = arguments.clone();
+    business_arguments.remove(TOOL_RESULT_LIMITS_FIELD);
+    serde_json::from_value(Value::Object(business_arguments))
         .map_err(|_error| ServiceError::InvalidRequest)
 }
 

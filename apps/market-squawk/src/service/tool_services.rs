@@ -3,9 +3,14 @@
 use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_jobs::{
+    JobAuthority, JobAuthorityError, JobGeneration, JobId, JobOrigin, JobRepository,
+    JobRepositoryError, JobSnapshot, JobState, SqliteJobRepository,
+};
 use market_squawk_runtime::{ClientId, InputStager, InputTicketId, RuntimeIdentity};
 use market_squawk_services::{
-    RequestContext, ServiceCapabilities, ServiceError, ToolResultMetadata, ToolServices,
+    RequestContext, RequestId, ServiceCapabilities, ServiceError, ToolResultMetadata, ToolServices,
     TypedToolRequest, TypedToolResult,
 };
 use serde::Deserialize;
@@ -31,6 +36,7 @@ use super::{
     operations::InstalledOperations,
     portfolio_import::InstalledPortfolioImportOperations,
     research_dataset::InstalledResearchDatasetPreparation,
+    research_file_import::{InstalledResearchFileImportOperations, PreparedResearchFileCommit},
 };
 
 const START_INGEST: &str = "Research.StartIngestSource";
@@ -46,6 +52,9 @@ const START_TRAINING: &str = "Model.StartTraining";
 const START_FORECAST: &str = "Model.StartForecast";
 const TRAINING_CONFIG_MEDIA_TYPE: &str = "market-squawk.training-config.v1";
 const TRAINING_AUTHORITY_MEDIA_TYPE: &str = "market-squawk.model-authority.v1";
+const RESEARCH_INGEST_JOB_KIND: &str = "research.ingest-source.v1";
+const RESEARCH_INGEST_INPUT_AUTHORITY: &str = "research.ingest-request.v1";
+const RESEARCH_INGEST_RESULT_AUTHORITY: &str = "research.dataset-publication.v1";
 
 /// Sole transport-neutral installed-service composition.
 pub(super) struct InstalledToolServices {
@@ -61,6 +70,9 @@ pub(super) struct InstalledToolServices {
     decisions: InstalledDecisionOperations,
     operations: InstalledOperations,
     portfolio_import: InstalledPortfolioImportOperations,
+    research_file_import: InstalledResearchFileImportOperations,
+    research_file_job_repository: Arc<SqliteJobRepository>,
+    research_file_job_authority: Arc<JobAuthority<SqliteJobRepository>>,
 }
 
 /// Application authorities required to compose the installed tool surface.
@@ -93,6 +105,7 @@ pub(super) struct InstalledToolServiceRuntime {
     inputs: Arc<InputStager>,
     runtime: RuntimeIdentity,
     portfolio_import: InstalledPortfolioImportOperations,
+    research_file_import: InstalledResearchFileImportOperations,
 }
 
 impl InstalledToolServiceRuntime {
@@ -101,12 +114,14 @@ impl InstalledToolServiceRuntime {
         inputs: Arc<InputStager>,
         runtime: RuntimeIdentity,
         portfolio_import: InstalledPortfolioImportOperations,
+        research_file_import: InstalledResearchFileImportOperations,
     ) -> Self {
         Self {
             runners,
             inputs,
             runtime,
             portfolio_import,
+            research_file_import,
         }
     }
 }
@@ -127,6 +142,7 @@ impl InstalledToolServices {
             inputs,
             runtime,
             portfolio_import,
+            research_file_import,
         } = runtime_resources;
         let forecast_preparation =
             InstalledForecastPreparation::try_new(product, &application.capabilities(), runtime)?;
@@ -138,7 +154,7 @@ impl InstalledToolServices {
             Arc::clone(runners.update()),
         );
         Ok(Self {
-            application,
+            application: Arc::clone(&application),
             jobs: InstalledJobOperations::new(jobs),
             runners,
             inputs: Arc::clone(&inputs),
@@ -151,6 +167,7 @@ impl InstalledToolServices {
             forecast_preparation,
             analysis: InstalledAnalysisOperations::new(product, jobs),
             decisions: InstalledDecisionOperations::try_new(
+                Arc::clone(&application),
                 product.decisions(),
                 product.research().analytical_reader(),
                 product.portfolio().fair_value_reader(),
@@ -158,6 +175,9 @@ impl InstalledToolServices {
             )?,
             operations: installed_operations,
             portfolio_import,
+            research_file_import,
+            research_file_job_repository: jobs.repository(),
+            research_file_job_authority: jobs.authority(),
         })
     }
 
@@ -166,6 +186,67 @@ impl InstalledToolServices {
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
         self.portfolio_import.recover_promoting(context)
+    }
+
+    pub(super) async fn recover_promoting_research_file_imports(
+        &self,
+        context: &RequestContext,
+    ) -> Result<(), ServiceError> {
+        let committed = self.research_file_import.committed_jobs()?;
+        self.research_file_import.discard_pending_after_restart()?;
+        for preview_id in self.research_file_import.recovery_ids()? {
+            self.restart_research_file_import(&preview_id, context)
+                .await?;
+        }
+        for (preview_id, receipt) in committed {
+            let view = self.jobs.view(receipt.job_id()).await?;
+            if view.generation().get() != receipt.generation()
+                || view.kind().as_str() != RESEARCH_INGEST_JOB_KIND
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            if research_file_import_requires_restart(&view)? {
+                if self
+                    .research_file_import
+                    .reopen_committed_job(&preview_id, receipt.job_id())?
+                {
+                    self.restart_research_file_import(&preview_id, context)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn restart_research_file_import(
+        &self,
+        preview_id: &str,
+        context: &RequestContext,
+    ) -> Result<(), ServiceError> {
+        loop {
+            let mut prepared = self
+                .research_file_import
+                .prepare_recovery(preview_id, context)
+                .await?;
+            let job_id = prepared.job_start().job_id().to_owned();
+            let (result, reconciled_existing) = self
+                .start_research_file_import_job(&mut prepared, context)
+                .await?;
+            self.research_file_import
+                .complete_commit(prepared.preview_id(), &result)?;
+            drop(prepared);
+            if !reconciled_existing {
+                return Ok(());
+            }
+            let view = self.jobs.view(&job_id).await?;
+            if !research_file_import_requires_restart(&view)?
+                || !self
+                    .research_file_import
+                    .reopen_committed_job(preview_id, &job_id)?
+            {
+                return Ok(());
+            }
+        }
     }
 
     async fn start_job(
@@ -222,8 +303,7 @@ impl InstalledToolServices {
                 }
             }
             START_PREPARED_FEATURE_DATASET => {
-                let input: PreparedFeatureDatasetStart =
-                    decode_without_confirmation(request.arguments())?;
+                let input: PreparedFeatureDatasetStart = decode(request.arguments())?;
                 let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
                 let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
                     .map_err(|_error| ServiceError::Unavailable)?;
@@ -347,11 +427,99 @@ impl InstalledToolServices {
             _ => return Ok(None),
         };
         let retained = admission.clone();
-        match self.jobs.start(admission, context).await {
+        let metadata = job_receipt_metadata(request)?;
+        match self.jobs.start(admission, context, metadata).await {
             Ok(result) => Ok(Some(result)),
             Err(error) => {
                 self.revoke(revoke, &retained);
                 Err(error)
+            }
+        }
+    }
+
+    async fn start_research_file_import_job(
+        &self,
+        prepared: &mut super::research_file_import::PreparedStart,
+        context: &RequestContext,
+    ) -> Result<(TypedToolResult, bool), ServiceError> {
+        ensure_live(context)?;
+        let start = prepared.job_start();
+        let job_id =
+            JobId::try_from_str(start.job_id()).map_err(|_error| ServiceError::Internal)?;
+        let generation = JobGeneration::try_new(1).map_err(|_error| ServiceError::Internal)?;
+        let admitted_at = Timestamp::from_unix_nanos(start.admitted_at_unix_nanos());
+        let request_id = RequestId::try_string(start.request_id().to_owned())
+            .map_err(|_error| ServiceError::Internal)?;
+        let workspace = SourceIdentifier::try_from(prepared.workspace_id())
+            .map_err(|_error| ServiceError::Internal)?;
+        let client = SourceIdentifier::try_from(prepared.client_id())
+            .map_err(|_error| ServiceError::Internal)?;
+        let origin = JobOrigin::new(workspace, client);
+
+        match self
+            .research_file_job_repository
+            .get(job_id, generation)
+            .await
+        {
+            Ok(snapshot) => {
+                prepared.mark_job_admission_may_exist();
+                validate_research_file_job_binding(
+                    &snapshot,
+                    job_id,
+                    &origin,
+                    &request_id,
+                    admitted_at,
+                )?;
+                ensure_live(context)?;
+                return Ok((prepared.queued_result(), true));
+            }
+            Err(JobRepositoryError::NotFound) => {}
+            Err(_error) => {
+                prepared.mark_job_admission_may_exist();
+                return Err(ServiceError::Unavailable);
+            }
+        }
+
+        let admission = self
+            .runners
+            .ingest()
+            .admit(prepared.request().clone(), context.limits(), admitted_at)
+            .map_err(map_research_admission)?;
+        let spec = admission
+            .clone()
+            .into_spec(job_id, origin.clone(), request_id.clone(), admitted_at)
+            .map_err(|_error| ServiceError::Internal)?;
+        prepared.mark_job_admission_may_exist();
+        match self.research_file_job_authority.start(&spec).await {
+            Ok(snapshot) => {
+                if snapshot.spec() != &spec
+                    || snapshot.state() != JobState::Queued
+                    || snapshot.sequence().get() != 0
+                {
+                    return Err(ServiceError::InvalidResult);
+                }
+                ensure_live(context)?;
+                Ok((prepared.queued_result(), false))
+            }
+            Err(error) => {
+                match self
+                    .research_file_job_repository
+                    .get(job_id, generation)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        if snapshot.spec() != &spec {
+                            return Err(ServiceError::InvalidResult);
+                        }
+                        Ok((prepared.queued_result(), false))
+                    }
+                    Err(JobRepositoryError::NotFound) => {
+                        self.revoke(JobAdmissionOwner::Ingest, &admission);
+                        prepared.mark_job_not_admitted();
+                        Err(map_research_file_job_authority(error))
+                    }
+                    Err(_error) => Err(ServiceError::Unavailable),
+                }
             }
         }
     }
@@ -433,6 +601,92 @@ impl InstalledToolServices {
     }
 }
 
+fn research_file_import_requires_restart(
+    view: &crate::application::job::JobView,
+) -> Result<bool, ServiceError> {
+    match view.state() {
+        JobState::Completed | JobState::Cancelled => Ok(false),
+        JobState::Queued | JobState::Preparing | JobState::Running | JobState::Recovering => {
+            Ok(true)
+        }
+        JobState::Interrupted => Ok(!view.cancellation_requested()),
+        JobState::Failed => Ok(view.failure().is_some_and(|failure| {
+            failure.class().as_str() == "recovery"
+                && failure.diagnostic().as_str() == "runner-recovery-failed"
+        })),
+        JobState::AwaitingConfirmation | JobState::Cancelling => Err(ServiceError::InvalidResult),
+    }
+}
+
+fn validate_research_file_job_binding(
+    snapshot: &JobSnapshot,
+    job_id: JobId,
+    origin: &JobOrigin,
+    request_id: &RequestId,
+    admitted_at: Timestamp,
+) -> Result<(), ServiceError> {
+    let spec = snapshot.spec();
+    if snapshot.id() != job_id
+        || snapshot.generation().get() != 1
+        || spec.id() != job_id
+        || spec.generation().get() != 1
+        || spec.kind().as_str() != RESEARCH_INGEST_JOB_KIND
+        || spec.origin() != origin
+        || spec.request_id() != request_id
+        || spec.input().authority().as_str() != RESEARCH_INGEST_INPUT_AUTHORITY
+        || spec.authority().authority().as_str() != RESEARCH_INGEST_RESULT_AUTHORITY
+        || spec.authority().identity().as_str() != RESEARCH_INGEST_RESULT_AUTHORITY
+        || spec.authority().captured_at() != admitted_at
+        || spec.attempt_limit().get() != 1
+        || spec.admitted_at() != admitted_at
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(())
+}
+
+fn map_research_file_job_authority(error: JobAuthorityError) -> ServiceError {
+    match error {
+        JobAuthorityError::Capacity => ServiceError::ResourceExhausted,
+        JobAuthorityError::UnknownKind
+        | JobAuthorityError::Repository
+        | JobAuthorityError::Contract
+        | JobAuthorityError::ShutdownIncomplete => ServiceError::Unavailable,
+    }
+}
+
+fn job_receipt_metadata(request: &TypedToolRequest) -> Result<ToolResultMetadata, ServiceError> {
+    if request.name() != START_INGEST {
+        return Ok(ToolResultMetadata::complete_not_applicable());
+    }
+    let provider = required_argument(request, "provider")?;
+    let dataset = required_argument(request, "dataset")?;
+    let object = required_argument(request, "object")?;
+    ToolResultMetadata::try_complete(
+        serde_json::json!({
+            "provider": provider,
+            "dataset": dataset,
+        }),
+        serde_json::json!({
+            "sourceObject": object,
+            "discoveryReceiptBound": true,
+            "executionEligible": false,
+        }),
+    )
+    .map_err(Into::into)
+}
+
+fn required_argument<'a>(
+    request: &'a TypedToolRequest,
+    name: &str,
+) -> Result<&'a str, ServiceError> {
+    request
+        .arguments()
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)
+}
+
 #[derive(Clone, Copy)]
 enum JobAdmissionOwner {
     Ingest,
@@ -471,6 +725,7 @@ impl std::fmt::Debug for InstalledToolServices {
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("operations", &self.operations)
             .field("portfolio_import", &self.portfolio_import)
+            .field("research_file_import", &self.research_file_import)
             .finish()
     }
 }
@@ -486,6 +741,42 @@ impl ToolServices for InstalledToolServices {
         request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        if InstalledResearchFileImportOperations::owns_commit(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            return match self
+                .research_file_import
+                .prepare_commit(&request, &context)
+                .await?
+            {
+                PreparedResearchFileCommit::Existing(result) => {
+                    result
+                        .validate_for(&descriptor)
+                        .map_err(ServiceError::from)?;
+                    Ok(result)
+                }
+                PreparedResearchFileCommit::Ready(mut prepared) => {
+                    let (result, _reconciled_existing) = self
+                        .start_research_file_import_job(&mut prepared, &context)
+                        .await?;
+                    result
+                        .validate_for(&descriptor)
+                        .map_err(ServiceError::from)?;
+                    self.research_file_import
+                        .complete_commit(prepared.preview_id(), &result)?;
+                    Ok(result)
+                }
+            };
+        }
         if let Some(result) = self.start_job(&request, &context).await? {
             let descriptor = self
                 .application
@@ -541,7 +832,14 @@ impl ToolServices for InstalledToolServices {
                         .dataset_preparation
                         .options(context.deadline(), context.cancellation().clone())
                         .await
-                        .map_err(ServiceError::from)?;
+                        .map_err(|error| {
+                            tracing::warn!(
+                                operation = GET_FEATURE_DATASET_PREPARATION,
+                                error = ?error,
+                                "guided feature-dataset preparation failed"
+                            );
+                            ServiceError::from(error)
+                        })?;
                     let item_count = options.datasets.len().max(1);
                     (encode(&options)?, item_count)
                 }
@@ -630,7 +928,7 @@ impl ToolServices for InstalledToolServices {
             {
                 return Err(ServiceError::InvalidRequest);
             }
-            let result = self.decisions.call(&request, &context)?;
+            let result = self.decisions.call(&request, &context).await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;
@@ -649,6 +947,24 @@ impl ToolServices for InstalledToolServices {
                 return Err(ServiceError::InvalidRequest);
             }
             let result = self.portfolio_import.call(request, context).await?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
+        if InstalledResearchFileImportOperations::owns_direct(request.name()) {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let result = self.research_file_import.call(request, context).await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;
@@ -701,16 +1017,8 @@ struct PreparedFeatureDatasetStart {
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
-    serde_json::from_value(Value::Object(arguments.clone()))
+    serde_json::from_value(Value::Object(super::business_arguments(arguments)))
         .map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn decode_without_confirmation<T: for<'de> Deserialize<'de>>(
-    arguments: &Map<String, Value>,
-) -> Result<T, ServiceError> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    decode(&admitted)
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Value, ServiceError> {

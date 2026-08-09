@@ -20,6 +20,7 @@ use market_squawk::{
     },
     termination::TerminationSignals,
 };
+use market_squawk_installer::default_installation_data_root;
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use market_squawk_runtime::{
     ServiceStartupEvidenceWriter, ServiceStartupPhase, ServiceStartupState,
@@ -94,21 +95,18 @@ fn run_service() -> Result<InstalledServiceRunOutcome> {
 
 async fn run() -> Result<InstalledServiceRunOutcome> {
     let arguments = ServiceArguments::parse();
+    let installation_data_root = arguments
+        .installation_data_root
+        .clone()
+        .map_or_else(default_installation_data_root, Ok)?;
     let ephemeral_verification_root = if arguments.ephemeral_verification_credentials {
-        Some(EphemeralVerificationRoot::try_new(
-            arguments
-                .installation_data_root
-                .as_deref()
-                .context("ephemeral verification requires an installation data root")?,
-        )?)
+        Some(EphemeralVerificationRoot::try_new(&installation_data_root)?)
     } else {
         None
     };
-    let startup = arguments
-        .installation_data_root
-        .as_deref()
-        .map(ServiceStartupEvidenceWriter::try_open)
-        .transpose()?;
+    let startup = Some(ServiceStartupEvidenceWriter::try_open(
+        &installation_data_root,
+    )?);
     publish_startup(
         startup.as_ref(),
         ServiceStartupState::Starting {
@@ -140,14 +138,11 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     } else {
         TerminalLogFormat::Human
     };
-    let logging_result = match arguments.installation_data_root.as_deref() {
-        Some(root) => InstalledServiceLogging::install_at_installation_root(
-            &arguments.log,
-            terminal_format,
-            root,
-        ),
-        None => InstalledServiceLogging::install(&arguments.log, terminal_format),
-    };
+    let logging_result = InstalledServiceLogging::install_at_installation_root(
+        &arguments.log,
+        terminal_format,
+        &installation_data_root,
+    );
     let mut logging = match logging_result {
         Ok(logging) => logging,
         Err(error) => {
@@ -167,7 +162,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
     let result = run_installed_service(
         config,
         logging.store(),
-        arguments.installation_data_root.as_deref(),
+        &installation_data_root,
         ephemeral_verification_root,
         startup.as_ref(),
     )
@@ -196,7 +191,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
 async fn run_installed_service(
     config: AppConfig,
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
-    installation_data_root: Option<&Path>,
+    installation_data_root: &Path,
     ephemeral_verification_root: Option<EphemeralVerificationRoot>,
     startup: Option<&ServiceStartupEvidenceWriter>,
 ) -> Result<InstalledServiceRunOutcome> {
@@ -216,22 +211,39 @@ async fn run_installed_service(
             );
         }
     };
-    let service_result = match (installation_data_root, ephemeral_verification_root) {
-        (Some(_root), Some(ephemeral_root)) => {
-            InstalledService::start_ephemeral_verification_with_logging_store_at_installation_root(
-                config,
-                ephemeral_root,
-                logs,
-            )
-            .await
-        }
-        (Some(root), None) => {
-            InstalledService::start_with_logging_store_at_installation_root(config, root, logs)
+    let mut starting = Box::pin(async move {
+        match ephemeral_verification_root {
+            Some(ephemeral_root) => {
+                InstalledService::start_ephemeral_verification_with_logging_store_at_installation_root(
+                    config,
+                    ephemeral_root,
+                    logs,
+                )
                 .await
+            }
+            None => {
+                InstalledService::start_with_logging_store_at_installation_root(
+                    config,
+                    installation_data_root,
+                    logs,
+                )
+                    .await
+            }
         }
-        (None, None) => InstalledService::start_with_logging_store(config, logs).await,
-        (None, Some(_)) => {
-            anyhow::bail!("ephemeral verification requires an explicit installation data root")
+    });
+    let service_result = tokio::select! {
+        result = &mut starting => result,
+        signal = termination.wait() => {
+            signal?;
+            publish_startup(
+                startup,
+                ServiceStartupState::Starting {
+                    phase: ServiceStartupPhase::Shutdown,
+                },
+            )?;
+            drop(starting);
+            publish_startup(startup, ServiceStartupState::Stopped)?;
+            return Ok(InstalledServiceRunOutcome::Stopped);
         }
     };
     let service = match service_result {
@@ -357,5 +369,6 @@ fn load_config(
             training_release_root,
             ..ConfigOverrides::default()
         },
-    ))?)
+    ))?
+    .with_installed_public_market_profiles()?)
 }

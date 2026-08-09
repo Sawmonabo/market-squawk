@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_platform::{EncryptedFileSecretStore, LocalPaths, SecretStore, SecretValue};
+use market_squawk_platform::{LocalPaths, SecretValue};
 use market_squawk_services::{JsonStructureLimits, RequestId};
 use serde_json::json;
 use sha2::Digest as _;
@@ -13,29 +13,23 @@ use super::*;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
-fn planned_client_credentials_resume_the_exact_targets_after_restart() -> TestResult {
-    let directory = TempDir::new()?;
-    let unlock = "runtime-test-unlock-material";
-    let first_store: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
-        directory.path(),
-        SecretValue::new(unlock.to_owned())?,
-    )?);
+fn service_restart_rejects_prior_in_memory_credentials() -> TestResult {
     let clients = [
         (client_id(11)?, NamedClient::Desktop),
         (client_id(12)?, NamedClient::Cli),
     ];
-    let plans = CredentialRegistry::plan_set(first_store.as_ref(), clients)?;
-    let (first_registry, first) = CredentialRegistry::provision_planned_set(first_store, &plans)?;
-    drop(first_registry);
-
-    let restarted_store: Arc<dyn SecretStore> = Arc::new(EncryptedFileSecretStore::try_open(
-        directory.path(),
-        SecretValue::new(unlock.to_owned())?,
-    )?);
-    let (_restarted_registry, restarted) =
-        CredentialRegistry::provision_planned_set(restarted_store, &plans)?;
-
+    let (first_registry, first) = CredentialRegistry::provision_set(clients)?;
+    let prior = first_registry.credential(&first[0])?;
+    let (restarted_registry, restarted) = CredentialRegistry::provision_set(clients)?;
     assert_eq!(first, restarted);
+    assert!(matches!(
+        restarted_registry.authenticate(
+            restarted[0].client_id(),
+            restarted[0].generation(),
+            prior.expose_secret().as_bytes(),
+        ),
+        Err(CredentialError::AuthenticationFailed)
+    ));
     Ok(())
 }
 

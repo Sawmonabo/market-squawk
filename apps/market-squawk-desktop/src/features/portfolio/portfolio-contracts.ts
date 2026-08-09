@@ -422,8 +422,11 @@ export function parsePortfolioImportCommit(value: unknown): PortfolioImportCommi
 export function parsePortfolioResult<Schema extends z.ZodType>(
   result: ApplicationResult,
   schema: Schema,
+  emptyValue?: z.input<Schema>,
 ): PortfolioResult<z.infer<Schema>> {
-  const parsed = schema.safeParse(result.data)
+  const parsed = schema.safeParse(
+    result.data === null && emptyValue !== undefined ? emptyValue : result.data,
+  )
   if (!parsed.success) {
     throw new Error(
       "The installed service returned portfolio data this dashboard cannot safely interpret.",

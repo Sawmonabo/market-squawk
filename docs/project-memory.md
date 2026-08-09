@@ -1476,3 +1476,38 @@ dated audit anchors. Current candidate version, component identities, head/tree,
 review state, blockers, issue state, and cleanup disposition live only in
 [`docs/plans/delivery-ledger.md`](plans/delivery-ledger.md); this memory is not a second mutable
 ledger.
+
+## 2026-08-09 unified Markets V1 contract
+
+The V1 installed-product goal includes one unified, non-technical Markets feed, search surface,
+and instrument workspace as a release-blocking product capability. Users select investments and
+questions, not upstream providers. A Market Squawk-owned resolver chooses the richest admitted
+observation that meets the requested asset, timing, depth, quality, operation, health, budget, and
+rights requirements while preserving an exact source-selection and downgrade receipt.
+
+The simple product view sits above independently governed provider surfaces. One per-user service
+owns bounded provider connections, subscriptions, budgets, caches, cursors, and recovery
+generations for Desktop, CLI, MCP, models, and jobs. Provider-native snapshot, sequencing,
+checksum, reconnect, and quarantine state remains isolated. A fallback never inherits another
+source's quality, coverage, venue, depth, or execution eligibility.
+
+The full admitted multi-asset universe is searchable locally; live subscriptions prioritize
+holdings, positions and paper orders, watchlists, active screens, the currently viewed instrument,
+and a bounded benchmark set. The desktop combines market pulse, personalized opportunities,
+quotes/trades/books/bars, features, forecasts, buy/add/trim/sell targets, backtests,
+fundamentals/filings, portfolio impact, and risk. Plain availability labels lead; exact provider,
+venue, timing, depth, quality, and coverage remain expandable under Data confidence.
+
+The installation retains no mandatory paid data requirement and provides the best available depth
+from admitted sources. Order-level depth is shown only where the exact provider supplies it;
+universal free order-level US equity/options/futures/FX/crypto coverage is not a V1 claim, and a
+calculated index never receives an invented order book. Separately licensed sources can improve
+coverage through the same contracts but cannot bypass rights, quality, source integrity, or central
+risk authority.
+
+The binding evidence, provider posture, reuse constraints, implementation DAG, and thin critical
+acceptance path are maintained in
+[`docs/research/2026-08-08-unified-markets-provider-ecosystem.md`](research/2026-08-08-unified-markets-provider-ecosystem.md),
+the installed-product design and plan, and issue `#45`. Public README content remains product-
+focused; mutable head, progress, blocker, verification, and issue state remains only in the delivery
+ledger.

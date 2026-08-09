@@ -10,26 +10,39 @@ import { productKeys } from "./query-client"
 type ProductState =
   | {
       status: "loading"
+      availability: "loading"
       bootstrap: null
       serviceBootstrap: null
       error: null
     }
   | {
       status: "ready"
+      availability: "ready"
       bootstrap: DesktopBootstrap
       serviceBootstrap: null
       error: null
     }
   | {
       status: "error"
+      availability: "degraded"
       bootstrap: null
-      serviceBootstrap: DesktopServiceBootstrap | null
+      serviceBootstrap: DesktopServiceBootstrap
+      error: string
+    }
+  | {
+      status: "error"
+      availability: "unavailable"
+      bootstrap: null
+      serviceBootstrap: null
       error: string
     }
 
 type ProductActions = {
   transport: ProductTransport
   refresh: () => void
+  recoverService: (unlock?: string) => Promise<void>
+  recoveryPending: boolean
+  recoveryError: string | null
 }
 
 type ProductContextValue = ProductState & ProductActions
@@ -44,6 +57,9 @@ export function ProductProvider({
   children: React.ReactNode
 }) {
   const queryClient = useQueryClient()
+  const recoveryInFlight = React.useRef<Promise<void> | null>(null)
+  const [recoveryPending, setRecoveryPending] = React.useState(false)
+  const [recoveryError, setRecoveryError] = React.useState<string | null>(null)
   const bootstrap = useQuery({
     queryKey: productKeys.bootstrap,
     queryFn: () => transport.bootstrap(),
@@ -92,16 +108,73 @@ export function ProductProvider({
     }
   }, [bootstrap.data, queryClient, transport])
 
+  React.useEffect(() => {
+    if (bootstrap.data && !("status" in bootstrap.data)) {
+      setRecoveryError(null)
+    }
+  }, [bootstrap.data])
+
+  const recoverService = React.useCallback(
+    (unlock?: string): Promise<void> => {
+      if (recoveryInFlight.current) return recoveryInFlight.current
+      const startup = bootstrap.data
+      if (!startup || !("status" in startup)) return Promise.resolve()
+      if (startup.requirement === "encrypted_fallback_locked" && !unlock) {
+        setRecoveryError("Enter the local security password before continuing.")
+        return Promise.resolve()
+      }
+
+      setRecoveryPending(true)
+      setRecoveryError(null)
+      const attempt = (async () => {
+        try {
+          let actionError: unknown = null
+          let actionFailed = false
+          try {
+            await transport.bootstrapService(
+              startup.requirement === "encrypted_fallback_locked"
+                ? {
+                    action: "unlock_encrypted_fallback",
+                    unlock: unlock ?? "",
+                  }
+                : { action: "retry_after_foreground_keyring" },
+            )
+          } catch (error) {
+            actionError = error
+            actionFailed = true
+          }
+          const refreshed = await bootstrap.refetch()
+          if (actionFailed) {
+            setRecoveryError(messageFrom(actionError))
+          } else if (refreshed.isError) {
+            setRecoveryError(messageFrom(refreshed.error))
+          }
+        } catch (error) {
+          setRecoveryError(messageFrom(error))
+        } finally {
+          recoveryInFlight.current = null
+          setRecoveryPending(false)
+        }
+      })()
+      recoveryInFlight.current = attempt
+      return attempt
+    },
+    [bootstrap, transport],
+  )
+
   const state: ProductState = bootstrap.data
     ? "status" in bootstrap.data
       ? {
           status: "error",
+          availability: "degraded",
           bootstrap: null,
           serviceBootstrap: bootstrap.data,
-          error: "The installed service needs one foreground credential action.",
+          error:
+            "Secure local storage needs the foreground recovery action shown above. Navigation and stored workspace routes remain available.",
         }
       : {
           status: "ready",
+          availability: "ready",
           bootstrap: bootstrap.data,
           serviceBootstrap: null,
           error: null,
@@ -109,12 +182,14 @@ export function ProductProvider({
     : bootstrap.isError
       ? {
           status: "error",
+          availability: "unavailable",
           bootstrap: null,
           serviceBootstrap: null,
           error: messageFrom(bootstrap.error),
         }
       : {
           status: "loading",
+          availability: "loading",
           bootstrap: null,
           serviceBootstrap: null,
           error: null,
@@ -124,11 +199,14 @@ export function ProductProvider({
     () => ({
       ...state,
       transport,
+      recoverService,
+      recoveryPending,
+      recoveryError,
       refresh: () => {
         void bootstrap.refetch()
       },
     }),
-    [bootstrap, state, transport],
+    [bootstrap, recoverService, recoveryError, recoveryPending, state, transport],
   )
 
   return (

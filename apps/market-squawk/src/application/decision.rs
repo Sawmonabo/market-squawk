@@ -23,9 +23,9 @@ use self::persistence::DecisionJournal;
 
 pub(crate) use self::backup::RetainedDecisionBackupSnapshot;
 pub(crate) use self::dossier_preparation::{
-    DossierEvidenceInventory, DossierEvidenceSelection, DossierPreparationDraft,
-    DossierPreparationError, DossierPreparationFence, DossierPreparationReceipt,
-    PreparedDossierPreview,
+    DossierEvidenceInventory, DossierEvidenceSelection, DossierFairValueEvidence,
+    DossierForecastEvidence, DossierPreparationDraft, DossierPreparationError,
+    DossierPreparationFence, DossierPreparationReceipt, PreparedDossierPreview,
 };
 pub(crate) use self::screen_workflow::{AdmittedScreenJob, ScreenJobRequest, ScreenWorkflowError};
 use self::target_preparation::{

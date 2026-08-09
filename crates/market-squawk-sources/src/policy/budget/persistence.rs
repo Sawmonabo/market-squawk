@@ -396,10 +396,23 @@ impl BudgetCheckpointState {
     }
 
     fn recover_exclusive_installed_replacement(&mut self) -> Result<(), AuthorityPersistenceError> {
-        if self.in_flight == 0 {
+        let terminalized_predecessor = self.terminal && self.poisoned && self.disabled;
+        if self.terminal != self.poisoned || (self.terminal && !self.disabled) {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        if self.in_flight == 0 && !terminalized_predecessor {
             return Ok(());
         }
         self.in_flight = 0;
+        if terminalized_predecessor {
+            // A normal constructor terminalizes an unclean predecessor before rejecting it. The
+            // installation-global workspace guard proves that an exclusive replacement cannot
+            // overlap that predecessor, so the replacement may retire this exact fail-closed
+            // marker while preserving windows, request counts, deadlines, and authority history.
+            self.terminal = false;
+            self.poisoned = false;
+            self.disabled = false;
+        }
         self.availability_generation = self
             .availability_generation
             .checked_add(1)

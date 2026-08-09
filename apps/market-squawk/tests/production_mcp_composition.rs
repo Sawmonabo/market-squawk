@@ -16,17 +16,20 @@ use market_squawk::{
     application::application_capabilities,
     mcp::LocalMcpComposition,
     service::{
-        BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
-        InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
+        InstalledService, InstalledServiceConnector, InstalledServiceError,
+        InstalledServiceRunOutcome,
     },
 };
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay, validate_service_capabilities};
 use market_squawk_platform::{
     AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
 };
-use market_squawk_runtime::{ApplicationClient, EventPageLimit, NamedClient};
+use market_squawk_runtime::{
+    ApplicationClient, EventPageLimit, InputAdmission, LoopbackApplicationClient, NamedClient,
+};
 use market_squawk_services::{ArtifactPublication, ArtifactPublicationContext, RequestId};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
@@ -35,11 +38,32 @@ type TestResult<T = ()> = anyhow::Result<T>;
 const INSTALLED_SERVICE_PROCESS_ROLE_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROLE";
 const INSTALLED_SERVICE_PROCESS_ROOT_ENV: &str = "MARKET_SQUAWK_TEST_SERVICE_PROCESS_ROOT";
 const INSTALLED_SERVICE_TEST_UNLOCK: &str = "installed-service-test-unlock";
+const INSTALLED_SERVICE_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 const CRASH_RECOVERY_SOURCE_PROFILE: &str = "kraken.spot-public-market-data";
 const INSTALLED_MCP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
+const OWNER_RESEARCH_DATASET: &str = "owner_price_history";
+const OWNER_RESEARCH_CSV: &[u8] = b"row_id,Close Price\nrow-1,12.34\nrow-2,13.05\n";
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
+#[test]
+fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() -> TestResult {
+    let scenario = std::thread::Builder::new()
+        .name("market-squawk-installed-service-test".to_owned())
+        .stack_size(INSTALLED_SERVICE_MAIN_STACK_BYTES)
+        .spawn(|| -> TestResult {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("construct installed-service test runtime")?
+                .block_on(Box::pin(run_installed_service_authority_scenario()))
+        })
+        .context("start installed-service test thread")?;
+    scenario.join().map_err(|_panic| {
+        anyhow::anyhow!("installed-service test thread terminated unexpectedly")
+    })?
+}
+
+async fn run_installed_service_authority_scenario() -> TestResult {
     if let Some(role) = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROLE_ENV) {
         let root = std::env::var_os(INSTALLED_SERVICE_PROCESS_ROOT_ENV)
             .map(PathBuf::from)
@@ -77,7 +101,7 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         .context("start initial installed service")?;
     let shutdown = CancellationToken::new();
     let service_task = tokio::spawn(service.run(shutdown.clone()));
-    let initial_phase = AssertUnwindSafe(async {
+    let initial_phase = AssertUnwindSafe(Box::pin(async {
         assert!(matches!(
             InstalledService::start_with_secret_store(config.clone(), Arc::clone(&secrets)).await,
             Err(InstalledServiceError::AlreadyRunning)
@@ -145,6 +169,10 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         assert_eq!(jobs.result()["ok"], true);
         assert_eq!(jobs.result()["value"]["data"]["jobs"], json!([]));
 
+        import_owner_research_file(&desktop)
+            .await
+            .context("import and query one guided owner research file")?;
+
         let rotated = desktop
             .invoke_operation(
                 RequestId::try_string("installed-claude-rotation")
@@ -186,7 +214,7 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
             .await
             .context("probe initial CLI client readiness")?;
         Ok::<(), anyhow::Error>(())
-    })
+    }))
     .catch_unwind()
     .await;
     shutdown.cancel();
@@ -211,10 +239,13 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         .context("restart installed service with durable credentials")?;
     let restarted_shutdown = CancellationToken::new();
     let restarted_task = tokio::spawn(restarted.run(restarted_shutdown.clone()));
-    let restarted_phase = AssertUnwindSafe(async {
+    let restarted_phase = AssertUnwindSafe(Box::pin(async {
         let restarted_desktop = connector
             .connect(NamedClient::Desktop, Some("tauri://localhost".to_owned()))
             .context("admit desktop client after service restart")?;
+        assert_owner_research_file_available(&restarted_desktop)
+            .await
+            .context("query guided owner research file after service restart")?;
         exercise_installed_relay(
             NamedClient::ClaudeCode,
             connector
@@ -248,7 +279,7 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
         .await
         .context("exercise reactivated Codex relay")?;
         Ok::<(), anyhow::Error>(())
-    })
+    }))
     .catch_unwind()
     .await;
     restarted_shutdown.cancel();
@@ -270,101 +301,45 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
     assert_eq!(Arc::strong_count(&secrets), 1);
     drop(secrets);
 
-    let bootstrap_seed_root = temporary.path().join("bootstrap-seed");
-    run_installed_subprocess(&bootstrap_seed_root, "seed")
-        .await
-        .context("seed encrypted installed-service runtime")?;
-    let bootstrap_config = installed_service_process_config(&bootstrap_seed_root)
-        .context("load locked-bootstrap service configuration")?;
-    let locked_connector = InstalledServiceConnector::try_new_at_installation_root(
-        &bootstrap_config,
-        installed_service_authority_root(&bootstrap_seed_root),
+    let process_root = temporary.path().join("process-restart");
+    let process_config = installed_service_process_config(&process_root)
+        .context("load installed process-restart service configuration")?;
+    let process_connector = InstalledServiceConnector::try_new_at_installation_root(
+        &process_config,
+        installed_service_authority_root(&process_root),
     )
-    .context("construct locked-bootstrap connector")?;
-    let mut service = start_installed_service_subprocess(&bootstrap_seed_root)
-        .context("start locked installed-service subprocess")?;
-    let bootstrap = wait_for_bootstrap(&locked_connector)
+    .context("construct installed process-restart connector")?;
+    let mut service = start_installed_service_subprocess(&process_root)
+        .context("start installed-service subprocess")?;
+    wait_until_ready(&process_connector)
         .await
-        .context("wait for initial encrypted-fallback bootstrap")?;
-    assert_eq!(bootstrap.state(), InstalledServiceBootstrapState::Required);
-    assert_eq!(
-        bootstrap.requirement(),
-        Some(BootstrapRequirement::EncryptedFallbackLocked)
-    );
-    assert!(locked_connector.connect(NamedClient::Cli, None).is_err());
-    let installation = bootstrap.installation_id();
-    let first_bootstrap_generation = bootstrap.generation();
-
-    let accepted = locked_connector
-        .bootstrap_unlock(
-            SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                .context("construct initial bootstrap unlock")?,
-        )
-        .await
-        .context("submit initial encrypted-fallback unlock")?;
-    assert_eq!(accepted.state(), InstalledServiceBootstrapState::Retrying);
-    assert!(
-        locked_connector
-            .bootstrap_unlock(
-                SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                    .context("construct rejected repeated bootstrap unlock")?,
-            )
-            .await
-            .is_err()
-    );
-    wait_until_ready(&locked_connector)
-        .await
-        .context("wait for initially unlocked installed service")?;
+        .context("wait for initial installed-service subprocess")?;
     assert!(matches!(
-        locked_connector.bootstrap_status().await,
+        process_connector.bootstrap_status().await,
         Err(InstalledServiceError::ServiceUnavailable)
     ));
 
-    run_installed_subprocess(&bootstrap_seed_root, "clients")
+    run_installed_subprocess(&process_root, "clients")
         .await
         .context("exercise installed subprocess clients before crash")?;
     service
         .crash()
         .context("crash installed-service subprocess")?;
     assert!(matches!(
-        locked_connector.connect(NamedClient::Cli, None),
+        process_connector.connect(NamedClient::Cli, None),
         Err(InstalledServiceError::ServiceUnavailable)
     ));
 
-    let mut restarted_service = start_installed_service_subprocess(&bootstrap_seed_root)
+    let mut restarted_service = start_installed_service_subprocess(&process_root)
         .context("restart crashed installed-service subprocess")?;
-    let restarted_bootstrap = wait_for_bootstrap(&locked_connector)
+    wait_until_ready(&process_connector)
         .await
-        .context("wait for restarted encrypted-fallback bootstrap")?;
-    assert_eq!(
-        restarted_bootstrap.state(),
-        InstalledServiceBootstrapState::Required
-    );
-    assert_eq!(
-        restarted_bootstrap.requirement(),
-        Some(BootstrapRequirement::EncryptedFallbackLocked)
-    );
-    assert_eq!(restarted_bootstrap.installation_id(), installation);
-    assert_ne!(restarted_bootstrap.generation(), first_bootstrap_generation);
-    let restarted_accepted = locked_connector
-        .bootstrap_unlock(
-            SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                .context("construct restarted bootstrap unlock")?,
-        )
-        .await
-        .context("submit restarted encrypted-fallback unlock")?;
-    assert_eq!(
-        restarted_accepted.state(),
-        InstalledServiceBootstrapState::Retrying
-    );
-    assert_eq!(
-        restarted_accepted.generation(),
-        restarted_bootstrap.generation()
-    );
-    wait_until_ready(&locked_connector)
-        .await
-        .context("wait for restarted unlocked installed service")?;
-    run_installed_subprocess(&bootstrap_seed_root, "cli")
+        .context("wait for restarted installed-service subprocess")?;
+    assert!(matches!(
+        process_connector.bootstrap_status().await,
+        Err(InstalledServiceError::ServiceUnavailable)
+    ));
+    run_installed_subprocess(&process_root, "cli")
         .await
         .context("exercise CLI subprocess after service restart")?;
     restarted_service
@@ -373,11 +348,180 @@ async fn service_runtime_is_the_single_authority_for_native_and_mcp_clients() ->
     Ok(())
 }
 
+async fn import_owner_research_file(client: &LoopbackApplicationClient) -> TestResult {
+    let admission = InputAdmission::try_sha256(
+        "market-squawk.research-source-file.v1",
+        u64::try_from(OWNER_RESEARCH_CSV.len()).context("measure owner research CSV")?,
+        Sha256::digest(OWNER_RESEARCH_CSV).into(),
+    )
+    .context("admit owner research CSV")?;
+    let mut bytes = OWNER_RESEARCH_CSV;
+    let ticket = client
+        .stage_input(admission, &mut bytes, CancellationToken::new())
+        .await
+        .context("stage owner research CSV")?;
+    let preview = client
+        .invoke_operation(
+            RequestId::try_string("installed-research-file-preview")
+                .context("construct research-file preview request ID")?,
+            "Research.PreviewStagedFile",
+            json!({
+                "inputTicketId": ticket.id(),
+                "format": "csv",
+                "confirm": true,
+                "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            }),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .context("preview owner research CSV")?;
+    assert_eq!(preview.result()["ok"], true, "{}", preview.result());
+    let preview_data = &preview.result()["value"]["data"];
+    assert_eq!(preview_data["rowCount"], 2);
+    assert!(
+        preview_data["columns"].as_array().is_some_and(|columns| {
+            columns
+                .iter()
+                .any(|column| column["name"] == "Close Price" && column["kind"] == "exact_decimal")
+        }),
+        "{}",
+        preview.result()
+    );
+    let encoded_preview = serde_json::to_string(preview_data)?;
+    assert!(!encoded_preview.contains(&ticket.id().as_uuid().to_string()));
+    assert!(!encoded_preview.contains("inputTicketId"));
+    assert!(!encoded_preview.contains("path"));
+    let preview_id = preview_data["previewId"]
+        .as_str()
+        .context("research preview omitted its identity")?;
+
+    let committed = client
+        .invoke_operation(
+            RequestId::try_string("installed-research-file-commit")
+                .context("construct research-file commit request ID")?,
+            "Research.CommitStagedFile",
+            json!({
+                "previewId": preview_id,
+                "mapping": {
+                    "dataset": OWNER_RESEARCH_DATASET,
+                    "identityField": "row_id",
+                    "fields": [{
+                        "source": "Close Price",
+                        "field": "close_price",
+                        "decimalScale": 2,
+                        "unit": "USD"
+                    }],
+                    "effectiveAt": "2026-08-08T00:00:00Z"
+                },
+                "confirm": true,
+                "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            }),
+            INSTALLED_MCP_SERVICE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .context("commit owner research CSV")?;
+    assert_eq!(committed.result()["ok"], true, "{}", committed.result());
+    assert_eq!(committed.result()["value"]["data"]["state"], "queued");
+    let job_id = committed.result()["value"]["data"]["jobId"]
+        .as_str()
+        .context("research commit omitted its durable job identity")?;
+    wait_for_job_completion(client, job_id).await?;
+    assert_owner_research_file_available(client).await
+}
+
+async fn wait_for_job_completion(client: &LoopbackApplicationClient, job_id: &str) -> TestResult {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .context("compute research-file job deadline")?;
+    loop {
+        let job = client
+            .invoke_operation(
+                RequestId::try_string(format!("installed-research-job-{job_id}"))
+                    .context("construct research job request ID")?,
+                "Job.Get",
+                json!({"jobId": job_id}),
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .context("read guided research-file job")?;
+        assert_eq!(job.result()["ok"], true, "{}", job.result());
+        match job.result()["value"]["data"]["state"].as_str() {
+            Some("completed") => return Ok(()),
+            Some("failed" | "cancelled" | "interrupted") => {
+                anyhow::bail!(
+                    "guided research-file job did not complete: {}",
+                    job.result()
+                );
+            }
+            Some(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            _ => anyhow::bail!(
+                "guided research-file job missed its deadline: {}",
+                job.result()
+            ),
+        }
+    }
+}
+
+async fn assert_owner_research_file_available(client: &LoopbackApplicationClient) -> TestResult {
+    let manifest = client
+        .invoke_operation(
+            RequestId::try_string("installed-research-file-manifest")
+                .context("construct research manifest request ID")?,
+            "Research.GetManifest",
+            json!({
+                "dataset": OWNER_RESEARCH_DATASET,
+                "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            }),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .context("read guided research-file manifest")?;
+    assert_eq!(manifest.result()["ok"], true, "{}", manifest.result());
+    assert_eq!(
+        manifest.result()["value"]["data"]["manifest"]["datasetId"],
+        OWNER_RESEARCH_DATASET
+    );
+    assert_eq!(manifest.result()["value"]["data"]["rowCount"], 2);
+
+    let history = client
+        .invoke_operation(
+            RequestId::try_string("installed-research-file-history")
+                .context("construct research history request ID")?,
+            "Research.GetHistory",
+            json!({
+                "dataset": OWNER_RESEARCH_DATASET,
+                "resultLimits": {"maximumItems": 64, "maximumBytes": 1_048_576},
+            }),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .context("query guided research-file observations")?;
+    assert_eq!(history.result()["ok"], true, "{}", history.result());
+    let rows = history.result()["value"]["data"]["rows"]
+        .as_array()
+        .context("guided research-file query did not return inline rows")?;
+    assert_eq!(rows.len(), 2, "{}", history.result());
+    assert!(
+        rows.iter().any(|row| {
+            row["source_identifier"] == "row-1"
+                && row["value_mantissa"] == 1_234
+                && row["value_scale"] == 2
+        }),
+        "{}",
+        history.result()
+    );
+    Ok(())
+}
+
 async fn run_installed_service_process_role(role: &OsString, root: PathBuf) -> TestResult {
     match role.to_str() {
-        Some("seed") => seed_encrypted_runtime(root)
-            .await
-            .context("run encrypted-runtime seed subprocess role"),
         Some("service") => {
             let config = installed_service_process_config(&root)
                 .context("load installed-service subprocess configuration")?;
@@ -532,25 +676,6 @@ fn installed_service_authority_root(root: &Path) -> PathBuf {
     root.join(".market-squawk-installed-service")
 }
 
-async fn wait_for_bootstrap(
-    connector: &InstalledServiceConnector,
-) -> TestResult<market_squawk::service::InstalledServiceBootstrapStatus> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match connector.bootstrap_status().await {
-                Ok(status) => break Ok::<_, InstalledServiceError>(status),
-                Err(InstalledServiceError::ServiceUnavailable) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => break Err(error),
-            }
-        }
-    })
-    .await
-    .context("time out waiting for installed-service bootstrap status")?
-    .context("poll installed-service bootstrap status")
-}
-
 async fn wait_until_ready(connector: &InstalledServiceConnector) -> TestResult {
     let client = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
@@ -684,43 +809,6 @@ fn start_installed_service_subprocess(root: &Path) -> TestResult<InstalledServic
         .spawn()
         .context("spawn installed-service subprocess")?;
     Ok(InstalledServiceProcess { child })
-}
-
-async fn seed_encrypted_runtime(root: PathBuf) -> TestResult {
-    let environment = BTreeMap::<OsString, OsString>::new();
-    let config = AppConfig::load(ConfigSources::new(
-        None,
-        &environment,
-        ConfigOverrides {
-            data_dir: Some(root.join("product")),
-            source_shutdown_ms: Some(60_000),
-            ..ConfigOverrides::default()
-        },
-    ))
-    .context("load encrypted-runtime seed configuration")?;
-    let secrets: Arc<dyn SecretStore> = Arc::new(
-        EncryptedFileSecretStore::try_open(
-            installed_service_authority_root(&root)
-                .join("control")
-                .join("secrets/installed-runtime"),
-            SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
-                .context("construct encrypted-runtime seed unlock")?,
-        )
-        .context("open encrypted-runtime seed secret store")?,
-    );
-    let service = InstalledService::start_with_secret_store(config, secrets)
-        .await
-        .context("start encrypted-runtime seed service")?;
-    let cancellation = CancellationToken::new();
-    let task = tokio::spawn(service.run(cancellation.clone()));
-    cancellation.cancel();
-    assert_eq!(
-        task.await
-            .context("join encrypted-runtime seed service task")?
-            .context("stop encrypted-runtime seed service")?,
-        InstalledServiceRunOutcome::Stopped
-    );
-    Ok(())
 }
 
 async fn exercise_installed_relay(

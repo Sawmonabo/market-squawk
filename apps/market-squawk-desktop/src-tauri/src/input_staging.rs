@@ -24,11 +24,45 @@ const MAXIMUM_TRAINING_CONFIG_BYTES: u64 = 256 * 1024;
 const MAXIMUM_MODEL_AUTHORITY_BYTES: u64 = 4 * 1024 * 1024;
 const MAXIMUM_BACKTEST_REGISTRATION_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_PORTFOLIO_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
+const MAXIMUM_RESEARCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const PORTFOLIO_IMPORT_MEDIA_TYPE: &str = "market-squawk.portfolio-extraction-batch.v1";
+const RESEARCH_FILE_MEDIA_TYPE: &str = "market-squawk.research-source-file.v1";
 const PREVIEW_PORTFOLIO_IMPORT: &str = "Portfolio.PreviewStagedImport";
 const APPROVE_PORTFOLIO_IMPORT: &str = "Portfolio.ApproveStagedImport";
 const COMMIT_PORTFOLIO_IMPORT: &str = "Portfolio.CommitStagedImport";
 const DISCARD_PORTFOLIO_IMPORT: &str = "Portfolio.DiscardStagedImport";
+const PREVIEW_RESEARCH_FILE: &str = "Research.PreviewStagedFile";
+const COMMIT_RESEARCH_FILE: &str = "Research.CommitStagedFile";
+const DISCARD_RESEARCH_FILE: &str = "Research.DiscardStagedFile";
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ResearchFileFormat {
+    Csv,
+    Json,
+    Ndjson,
+    Parquet,
+}
+
+impl ResearchFileFormat {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+            Self::Ndjson => "ndjson",
+            Self::Parquet => "parquet",
+        }
+    }
+
+    const fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Csv => &["csv"],
+            Self::Json => &["json"],
+            Self::Ndjson => &["ndjson"],
+            Self::Parquet => &["parquet"],
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -47,7 +81,7 @@ pub(crate) async fn preview_portfolio_import(
     app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<Value>, DesktopCommandError> {
-    require_portfolio_confirmation(
+    require_confirmation(
         confirmed,
         "Confirm the account before selecting a portfolio extraction file.",
     )?;
@@ -100,7 +134,7 @@ pub(crate) async fn commit_portfolio_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    require_portfolio_confirmation(
+    require_confirmation(
         confirmed,
         "Confirm the exact preview and interpretations before committing this portfolio import.",
     )?;
@@ -158,7 +192,7 @@ pub(crate) async fn discard_portfolio_import(
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
-    require_portfolio_confirmation(
+    require_confirmation(
         confirmed,
         "Confirm that this uncommitted portfolio preview should be discarded.",
     )?;
@@ -168,6 +202,112 @@ pub(crate) async fn discard_portfolio_import(
         arguments,
         &state,
         InvocationAuthority::ExactConfirmed(DISCARD_PORTFOLIO_IMPORT),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn preview_research_file_import(
+    format: ResearchFileFormat,
+    confirmed: bool,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Option<Value>, DesktopCommandError> {
+    require_confirmation(
+        confirmed,
+        "Confirm the research format before selecting a file to preview.",
+    )?;
+    let extensions = format.extensions();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Research data", extensions)
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected.into_path().map_err(|_error| {
+        DesktopCommandError::invalid_request("The selected research input is not a local file.")
+    })?;
+    let admitted = tauri::async_runtime::spawn_blocking(move || {
+        open_and_hash_with_extensions(
+            path,
+            MAXIMUM_RESEARCH_FILE_BYTES,
+            extensions,
+            "Select a file matching the chosen research-data format.",
+        )
+    })
+    .await
+    .map_err(|_error| DesktopCommandError::internal())??;
+    let ticket = stage_admitted_input(admitted, RESEARCH_FILE_MEDIA_TYPE, &state).await?;
+    let arguments = Map::from_iter([
+        (
+            "inputTicketId".to_owned(),
+            Value::String(ticket.id().as_uuid().to_string()),
+        ),
+        (
+            "format".to_owned(),
+            Value::String(format.as_str().to_owned()),
+        ),
+    ]);
+    invoke_private_application(
+        PREVIEW_RESEARCH_FILE,
+        arguments,
+        &state,
+        InvocationAuthority::ExactConfirmed(PREVIEW_RESEARCH_FILE),
+    )
+    .await
+    .map(Some)
+}
+
+#[tauri::command]
+pub(crate) async fn commit_research_file_import(
+    preview_id: String,
+    mapping: Value,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    require_confirmation(
+        confirmed,
+        "Confirm the preview and field mapping before importing this research file.",
+    )?;
+    if !mapping.is_object() {
+        return Err(DesktopCommandError::invalid_request(
+            "The research file mapping must be an object.",
+        ));
+    }
+    let arguments = Map::from_iter([
+        ("previewId".to_owned(), Value::String(preview_id)),
+        ("mapping".to_owned(), mapping),
+    ]);
+    invoke_private_application(
+        COMMIT_RESEARCH_FILE,
+        arguments,
+        &state,
+        InvocationAuthority::ExactConfirmed(COMMIT_RESEARCH_FILE),
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn discard_research_file_import(
+    preview_id: String,
+    confirmed: bool,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    require_confirmation(
+        confirmed,
+        "Confirm that this uncommitted research preview should be discarded.",
+    )?;
+    let arguments = Map::from_iter([("previewId".to_owned(), Value::String(preview_id))]);
+    invoke_private_application(
+        DISCARD_RESEARCH_FILE,
+        arguments,
+        &state,
+        InvocationAuthority::ExactConfirmed(DISCARD_RESEARCH_FILE),
     )
     .await
 }
@@ -279,7 +419,16 @@ fn open_and_hash(
     maximum_bytes: u64,
     invalid_extension_message: &'static str,
 ) -> Result<AdmittedFile, DesktopCommandError> {
-    validate_extension(&path, invalid_extension_message)?;
+    open_and_hash_with_extensions(path, maximum_bytes, &["json"], invalid_extension_message)
+}
+
+fn open_and_hash_with_extensions(
+    path: PathBuf,
+    maximum_bytes: u64,
+    allowed_extensions: &[&str],
+    invalid_extension_message: &'static str,
+) -> Result<AdmittedFile, DesktopCommandError> {
+    validate_extension(&path, allowed_extensions, invalid_extension_message)?;
     let parent = path.parent().ok_or_else(|| {
         DesktopCommandError::invalid_request("The selected input path is invalid.")
     })?;
@@ -319,12 +468,17 @@ fn open_and_hash(
 
 fn validate_extension(
     path: &Path,
+    allowed_extensions: &[&str],
     invalid_extension_message: &'static str,
 ) -> Result<(), DesktopCommandError> {
     let valid = path
         .extension()
         .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        .is_some_and(|extension| {
+            allowed_extensions
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        });
     if valid {
         Ok(())
     } else {
@@ -349,10 +503,7 @@ async fn stage_admitted_input(
         .map_err(super::bridge::map_application_client_error)
 }
 
-fn require_portfolio_confirmation(
-    confirmed: bool,
-    message: &'static str,
-) -> Result<(), DesktopCommandError> {
+fn require_confirmation(confirmed: bool, message: &'static str) -> Result<(), DesktopCommandError> {
     if confirmed {
         Ok(())
     } else {

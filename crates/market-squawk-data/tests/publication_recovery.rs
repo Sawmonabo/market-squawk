@@ -524,6 +524,50 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
     assert_eq!(ownership.expires_at(), expires_at);
     assert_eq!(ownership.artifact_id(), artifact.artifact_id());
     assert!(store.verify(&object)?);
+
+    let repeated_request = QueryRequest::try_new(committed.manifest().clone(), ARTIFACT_QUERY)?;
+    let repeated_reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                owner.clone(),
+                repeated_request.artifact_identity(&limits),
+                limits.max_bytes(),
+                expires_at,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let repeated = engine
+        .query(
+            repeated_request.with_artifact_reservation(repeated_reservation),
+            limits,
+            CancellationToken::new(),
+        )
+        .await?;
+    let QueryResult::Artifact {
+        object: repeated_object,
+        artifact: repeated_artifact,
+        ownership: repeated_ownership,
+    } = repeated
+    else {
+        return Err("expected repeated authorized artifact result".into());
+    };
+    assert_eq!(
+        repeated_object.relative_reference(),
+        object.relative_reference()
+    );
+    assert_eq!(repeated_artifact.artifact_id(), artifact.artifact_id());
+    service
+        .query_artifact_publication()
+        .read_verified_bytes(
+            &repeated_object,
+            &repeated_artifact,
+            &repeated_ownership,
+            4 * 1024 * 1024,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
     drop(engine);
     drop(store);
     drop(service);

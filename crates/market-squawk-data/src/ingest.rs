@@ -307,7 +307,7 @@ impl QueryArtifactPublication {
             || artifact.content_digest().algorithm() != DigestAlgorithm::Sha256
             || artifact.content_digest().bytes() != object.content_hash().bytes()
             || artifact.size_bytes() != object.size_bytes()
-            || artifact.created_at() != object.created_at()
+            || artifact.created_at() < object.created_at()
             || usize::try_from(object.size_bytes())
                 .ok()
                 .is_none_or(|size| size > maximum_bytes)
@@ -457,11 +457,15 @@ impl QueryArtifactPublication {
                 ParquetStoreError::ObjectMetadataMismatch,
             ));
         }
+        // Content-addressed publication may return an older, already verified immutable object.
+        // The catalog timestamp records this reservation's publication, while the object retains
+        // its original filesystem creation time.
+        let created_at = object.created_at().max(reservation.requested_at());
         let artifact = ArtifactRecord::try_new(
             object.relative_reference(),
             object.content_hash().evidence(),
             object.size_bytes(),
-            object.created_at(),
+            created_at,
         )
         .map_err(crate::QueryError::Catalog)?;
         let mut checkpoint = |checkpoint| {

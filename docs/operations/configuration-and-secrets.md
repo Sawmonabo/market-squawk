@@ -507,10 +507,13 @@ commands for those separate checks.
 - **Runtime fails after an otherwise valid change:** quiesce it, restore the prior configuration
   layers, validate, and restart. If the new version opened durable state, use the coherent
   pre-change backup unless backward compatibility is explicitly verified.
+- **The operating system requests foreground credential approval:** complete the native Apple
+  Keychain or Secret Service prompt. Market Squawk retries the unchanged durable plan and reconnects
+  the dashboard; this condition does not select or unlock the encrypted fallback.
 - **Keyring operation is unavailable or indeterminate:** preserve the onboarding session status
-  and error. For a code-admitted foreground workflow, explicitly unlock the configured fallback in
-  the same portal process and retry only the lifecycle-owned operation; otherwise follow the
-  session's fail-closed reconciliation state.
+  and error. A proved unavailable, session-unavailable, or unsupported primary may use the already
+  configured and explicitly unlocked fallback for a new eligible plan. Existing keyring-bound
+  references remain bound to that keyring and follow their lifecycle-owned recovery state.
 - **Encrypted fallback is locked after restart:** reopen the loopback portal and submit the same
   unlock through its write-only fallback control. Do not place the unlock in startup configuration
   or automation.
@@ -533,7 +536,8 @@ commands for those separate checks.
 | Changed file has no effect | Environment or CLI layer wins, or the existing process has not restarted | Inspect launch inputs, stop the old process, validate, and start anew |
 | A reported origin is unexpected | A higher-precedence environment or CLI layer supplied the effective value | Inspect the inherited environment and exact launch arguments; correct the highest-precedence source |
 | `sourceSecretConfigured.value` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
-| OS credential prompt or service is unavailable | Primary keyring backend/session unavailable | Unlock the code-owned fallback through the foreground portal before an admitted credential mutation, or fail closed |
+| Native OS credential approval prompt appears | The primary keyring requires one foreground user decision | Complete the operating-system prompt; the Desktop keeps navigation available and reconnects automatically |
+| OS credential service is unavailable | The primary backend or session cannot provide the required exact lifecycle | Use the explicitly unlocked fallback only for a new eligible plan; preserve existing backend-bound references and fail closed when they cannot be recovered |
 | Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
 | Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
 | `config validate` succeeds but `doctor` reports unavailable storage | Configuration validity does not prove that `init` created a safe, current layout and catalog | Preserve the doctor result; run the explicit bootstrap/upgrade procedure or repair the stable diagnostic class |

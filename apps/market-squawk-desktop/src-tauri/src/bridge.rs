@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -48,7 +48,8 @@ const SOURCE_SETUP_OPERATION: &str = "Source.Setup";
 const SOURCE_STATUS_OPERATION: &str = "Source.GetStatus";
 
 pub(crate) struct DesktopCompositionContext {
-    data_root: PathBuf,
+    configured_data_root: PathBuf,
+    service_data_root: PathBuf,
     installation_root: PathBuf,
     installation_status: InstallStatus,
     relay_program: PathBuf,
@@ -56,13 +57,15 @@ pub(crate) struct DesktopCompositionContext {
 
 impl DesktopCompositionContext {
     pub(crate) fn new(
-        data_root: PathBuf,
+        configured_data_root: PathBuf,
+        service_data_root: PathBuf,
         installation_root: PathBuf,
         installation_status: InstallStatus,
         relay_program: PathBuf,
     ) -> Self {
         Self {
-            data_root,
+            configured_data_root,
+            service_data_root,
             installation_root,
             installation_status,
             relay_program,
@@ -125,20 +128,22 @@ fn manage_ready_desktop(
     {
         return Err(DesktopCommandError::internal());
     }
-    let local_paths = LocalPaths::open_existing(&context.data_root)
-        .map_err(|_error| DesktopCommandError::internal())?;
     let state = DesktopState::try_new(
         connection.application,
         connection.bootstrap,
-        context.data_root.clone(),
+        &context.configured_data_root,
+        &context.service_data_root,
         context.installation_root.clone(),
         context.installation_status.clone(),
     )?;
+    let local_paths = LocalPaths::open_existing(state.data_root())
+        .map_err(|_error| DesktopCommandError::internal())?;
     let (endpoint_identity, claude_credential_identity, codex_credential_identity) =
         state.mcp_authority_identities();
     let mcp_clients = DesktopMcpClientState::try_new(
         &local_paths,
         context.relay_program.clone(),
+        &context.service_data_root,
         state.runtime(),
         endpoint_identity,
         claude_credential_identity,
@@ -186,6 +191,7 @@ impl ServiceOperation {
 #[derive(Debug)]
 struct ServiceBootstrapSnapshot {
     runtime: RuntimeIdentity,
+    workspace_placement: ServiceWorkspacePlacement,
     mcp_endpoint_identity: String,
     claude_code_credential_identity: String,
     codex_credential_identity: String,
@@ -194,6 +200,12 @@ struct ServiceBootstrapSnapshot {
     operations: Vec<ServiceOperation>,
     mcp_ready: bool,
     model_runtime_configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceWorkspacePlacement {
+    Managed,
+    LegacyMigrationRequired,
 }
 
 impl TryFrom<Value> for ServiceBootstrapSnapshot {
@@ -223,6 +235,20 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
                 .ok_or_else(DesktopCommandError::internal)?,
         )
         .map_err(|_error| DesktopCommandError::internal())?;
+        if value.pointer("/workspace/id").and_then(Value::as_str)
+            != Some(runtime.workspace_id().as_uuid().to_string().as_str())
+            || value
+                .pointer("/workspace/generation")
+                .and_then(Value::as_u64)
+                != Some(runtime.service_generation().get())
+        {
+            return Err(DesktopCommandError::internal());
+        }
+        let workspace_placement = match required_string(&value, "/workspace/placement")? {
+            "managed" => ServiceWorkspacePlacement::Managed,
+            "legacy_migration_required" => ServiceWorkspacePlacement::LegacyMigrationRequired,
+            _ => return Err(DesktopCommandError::internal()),
+        };
         let mcp_endpoint_identity =
             required_string(&value, "/mcpAuthority/endpointIdentity")?.to_owned();
         let claude_code_credential_identity =
@@ -291,6 +317,7 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             .ok_or_else(DesktopCommandError::internal)?;
         Ok(Self {
             runtime,
+            workspace_placement,
             mcp_endpoint_identity,
             claude_code_credential_identity,
             codex_credential_identity,
@@ -333,13 +360,20 @@ impl DesktopState {
     pub(crate) fn try_new(
         application: LoopbackApplicationClient,
         service_bootstrap: Value,
-        data_root: PathBuf,
+        configured_data_root: &Path,
+        service_data_root: &Path,
         installation_root: PathBuf,
         installation_status: InstallStatus,
     ) -> Result<Self, DesktopCommandError> {
+        let service_bootstrap = ServiceBootstrapSnapshot::try_from(service_bootstrap)?;
+        let data_root = resolve_workspace_data_root(
+            &service_bootstrap,
+            configured_data_root,
+            service_data_root,
+        )?;
         Ok(Self {
             application: Arc::new(application),
-            service_bootstrap: ServiceBootstrapSnapshot::try_from(service_bootstrap)?,
+            service_bootstrap,
             data_root,
             installation_root,
             installation_status,
@@ -347,6 +381,10 @@ impl DesktopState {
             restart_program: OnceLock::new(),
             governance_authorizations: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn data_root(&self) -> &Path {
+        &self.data_root
     }
 
     fn schedule_restart(&self, program: PathBuf) -> Result<(), DesktopCommandError> {
@@ -624,6 +662,25 @@ impl DesktopState {
     }
 }
 
+fn resolve_workspace_data_root(
+    bootstrap: &ServiceBootstrapSnapshot,
+    configured_data_root: &Path,
+    service_data_root: &Path,
+) -> Result<PathBuf, DesktopCommandError> {
+    let candidate = match bootstrap.workspace_placement {
+        ServiceWorkspacePlacement::Managed => service_data_root
+            .join("workspaces")
+            .join(bootstrap.runtime.workspace_id().as_uuid().to_string()),
+        ServiceWorkspacePlacement::LegacyMigrationRequired => configured_data_root.to_path_buf(),
+    };
+    if !candidate.is_absolute() {
+        return Err(DesktopCommandError::internal());
+    }
+    let paths =
+        LocalPaths::open_existing(candidate).map_err(|_error| DesktopCommandError::internal())?;
+    Ok(paths.root().to_path_buf())
+}
+
 fn required_uuid(
     object: &Map<String, Value>,
     field: &'static str,
@@ -877,13 +934,6 @@ pub(crate) async fn invoke_application(
             "The selected Market Squawk operation is invalid.",
         ));
     }
-    request.arguments.insert(
-        "resultLimits".to_owned(),
-        json!({
-            "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
-            "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
-        }),
-    );
     if matches!(
         authority,
         InvocationAuthority::ExactConfirmed(_) | InvocationAuthority::RiskMediated(_)
@@ -892,7 +942,14 @@ pub(crate) async fn invoke_application(
             .arguments
             .insert("confirm".to_owned(), Value::Bool(true));
     }
-    invoke_service_operation(state, &request.operation, request.arguments, authority).await
+    invoke_service_operation(
+        state,
+        &request.operation,
+        request.arguments,
+        authority,
+        true,
+    )
+    .await
 }
 
 /// Invokes one private installed-client operation without copying transport bookkeeping fields into
@@ -910,14 +967,15 @@ pub(crate) async fn invoke_private_application(
     ) {
         arguments.insert("confirm".to_owned(), Value::Bool(true));
     }
-    invoke_service_operation(state, operation, arguments, authority).await
+    invoke_service_operation(state, operation, arguments, authority, false).await
 }
 
 async fn invoke_service_operation(
     state: &DesktopState,
     operation: &str,
-    arguments: Map<String, Value>,
+    mut arguments: Map<String, Value>,
     authority: InvocationAuthority,
+    apply_desktop_result_limits: bool,
 ) -> Result<Value, DesktopCommandError> {
     let descriptor = state
         .service_bootstrap
@@ -945,6 +1003,20 @@ async fn invoke_service_operation(
             "unauthorized",
             "The dashboard is not authorized to invoke this operation.",
         ));
+    }
+    if apply_desktop_result_limits
+        && descriptor
+            .input_schema
+            .pointer("/properties/resultLimits")
+            .is_some()
+    {
+        arguments.insert(
+            "resultLimits".to_owned(),
+            json!({
+                "maximumItems": MAXIMUM_DESKTOP_RESULT_ITEMS,
+                "maximumBytes": MAXIMUM_DESKTOP_RESULT_BYTES,
+            }),
+        );
     }
     let arguments = Value::Object(arguments);
     let argument_bytes =
@@ -1189,7 +1261,7 @@ fn map_installation_error(error: impl std::fmt::Display) -> DesktopCommandError 
     DesktopCommandError::new("installation_failed", error.to_string())
 }
 
-fn decode_application_result(response: &Value) -> Result<Value, DesktopCommandError> {
+pub(crate) fn decode_application_result(response: &Value) -> Result<Value, DesktopCommandError> {
     let object = response
         .as_object()
         .ok_or_else(DesktopCommandError::internal)?;

@@ -283,7 +283,6 @@ fn map_mcp_error(error: McpControlError) -> DispatchError {
         | McpControlError::HttpAuthentication(_)
         | McpControlError::InvalidState
         | McpControlError::Path(_)
-        | McpControlError::RecoveryPending
         | McpControlError::SecretStore => DispatchError::Unavailable,
     }
 }

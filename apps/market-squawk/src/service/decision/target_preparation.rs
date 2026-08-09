@@ -62,7 +62,7 @@ impl TargetPreparationOperations {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
-        let arguments = mutation_arguments(request.arguments());
+        let arguments = super::super::business_arguments(request.arguments());
         let now = super::super::runtime::current_timestamp()
             .map_err(|_error| ServiceError::Unavailable)?;
         if matches!(request.name(), GET_TARGET_PREPARATION | PREPARE_TARGET) {
@@ -441,12 +441,6 @@ const fn intent_name(value: TargetIntent) -> &'static str {
 
 fn boxed_strings(values: Vec<String>) -> Vec<Box<str>> {
     values.into_iter().map(String::into_boxed_str).collect()
-}
-
-fn mutation_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    admitted
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {

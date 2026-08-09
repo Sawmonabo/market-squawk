@@ -14,17 +14,20 @@ use market_squawk_sources::{
     QuarantineReason, ResynchronizationReason, SourceMetadata, SourceMetadataProvider,
     TransportFrameKind, ValidatedRawMarketFrame,
 };
-use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::{CoinbaseConfigError, CoinbaseExchangeConfig};
+use crate::{CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig};
 
-const MAX_LEVELS_PER_SIDE: usize = 10_000;
-const MAX_CHANGES: usize = market_squawk_sources::MAX_DECODED_BOOK_ITEMS;
+const MAX_ENVELOPE_EVENTS: usize = market_squawk_sources::MAX_DECODED_EVENTS;
+const MAX_L2_UPDATES: usize = market_squawk_sources::MAX_DECODED_BOOK_ITEMS;
+const MAX_TRADES: usize = market_squawk_sources::MAX_DECODED_EVENTS;
 const MAX_ACK_CHANNELS: usize = 3;
 const MAX_ACK_PRODUCTS: usize = 100;
+const MAX_HEARTBEAT_EVENTS: usize = 4;
+const MAX_HEARTBEAT_TIME_BYTES: usize = 160;
 
-/// Exact bounded decoder for Coinbase Exchange WebSocket v1.
+/// Exact bounded decoder for the Coinbase Advanced Trade public market-data WebSocket.
 #[derive(Clone, Debug)]
 pub struct CoinbaseExchangeDecoder {
     metadata: SourceMetadata,
@@ -36,8 +39,9 @@ pub struct CoinbaseExchangeDecoder {
     checksum_rule: IntegrityRule,
     aggressor_rule: IntegrityRule,
     trade_snapshot_rule: IntegrityRule,
-    products: BTreeSet<String>,
-    channels: BTreeSet<String>,
+    expected_subscriptions: BTreeMap<String, BTreeSet<String>>,
+    observed_subscriptions: BTreeMap<String, BTreeSet<String>>,
+    acknowledgement_complete: bool,
     max_frame_bytes: usize,
 }
 
@@ -77,6 +81,23 @@ impl CoinbaseExchangeDecoder {
                 market_squawk_domain::SnapshotApplicability::Required => None,
             })
             .ok_or(CoinbaseConfigError::InvalidProtocolProfile)?;
+        let products = config
+            .mappings()
+            .iter()
+            .map(|mapping| mapping.product().as_source_identifier().as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let expected_subscriptions = config
+            .channels()
+            .iter()
+            .map(|channel| {
+                let channel_products = if *channel == CoinbaseChannel::Heartbeats {
+                    BTreeSet::from(["heartbeats".to_owned()])
+                } else {
+                    products.clone()
+                };
+                (channel.as_str().to_owned(), channel_products)
+            })
+            .collect();
         Ok(Self {
             metadata: config.metadata().clone(),
             instruments: config
@@ -96,22 +117,15 @@ impl CoinbaseExchangeDecoder {
             checksum_rule,
             aggressor_rule: live.semantic_interpretation().aggressor_rule().clone(),
             trade_snapshot_rule,
-            products: config
-                .mappings()
-                .iter()
-                .map(|mapping| mapping.product().as_source_identifier().as_str().to_owned())
-                .collect(),
-            channels: config
-                .channels()
-                .iter()
-                .map(|channel| channel.as_str().to_owned())
-                .collect(),
+            expected_subscriptions,
+            observed_subscriptions: BTreeMap::new(),
+            acknowledgement_complete: false,
             max_frame_bytes: config.transport_limits().max_frame_bytes(),
         })
     }
 
     fn decode_text(
-        &self,
+        &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
         evidence: DecoderEvidence,
     ) -> Result<DecodeOutcome, DecodeInternalError> {
@@ -134,262 +148,374 @@ impl CoinbaseExchangeDecoder {
                 return Ok(quarantine(evidence, reason, None));
             }
         };
-        let provider_code = match SourceIdentifier::try_from(probe.kind.clone()) {
-            Ok(code) => code,
-            Err(_) => {
-                return Ok(quarantine(
-                    evidence,
-                    QuarantineReason::SchemaViolation,
-                    None,
-                ));
-            }
+        if probe.kind.as_deref() == Some("error") {
+            return Ok(self.decode_provider_error(payload, evidence));
+        }
+        let Some(channel) = probe.channel else {
+            return Ok(match probe.kind {
+                Some(kind) => match SourceIdentifier::try_from(kind) {
+                    Ok(code) => DecodeOutcome::Ignored(DecodedIgnoredFrame::new(
+                        evidence,
+                        IgnoredFrameReason::DocumentedForwardCompatibleExtension,
+                        Some(code),
+                    )),
+                    Err(_) => quarantine(evidence, QuarantineReason::SchemaViolation, None),
+                },
+                None => quarantine(evidence, QuarantineReason::SchemaViolation, None),
+            });
         };
-        let outcome = match probe.kind.as_str() {
-            "snapshot" => self.decode_snapshot(payload, evidence),
-            "l2update" => self.decode_delta(payload, evidence),
-            "match" | "last_match" => self.decode_trade(payload, evidence),
-            "heartbeat" => self.decode_heartbeat(payload, evidence),
+        let outcome = match channel.as_str() {
+            "l2_data" => self.decode_l2(payload, evidence),
+            "market_trades" => self.decode_market_trades(payload, evidence),
+            "heartbeats" => self.decode_heartbeats(payload, evidence),
             "subscriptions" => self.decode_subscriptions(payload, evidence),
-            "error" => self.decode_provider_error(payload, evidence),
-            _ => DecodeOutcome::Ignored(DecodedIgnoredFrame::new(
-                evidence,
-                IgnoredFrameReason::DocumentedForwardCompatibleExtension,
-                Some(provider_code),
-            )),
+            _ => match SourceIdentifier::try_from(channel) {
+                Ok(code) => DecodeOutcome::Ignored(DecodedIgnoredFrame::new(
+                    evidence,
+                    IgnoredFrameReason::DocumentedForwardCompatibleExtension,
+                    Some(code),
+                )),
+                Err(_) => quarantine(evidence, QuarantineReason::SchemaViolation, None),
+            },
         };
         Ok(outcome)
     }
 
-    fn decode_snapshot(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
-        let wire = match serde_json::from_slice::<SnapshotWire>(payload) {
-            Ok(wire) if wire.kind == "snapshot" => wire,
-            Ok(_) | Err(_) => {
-                return quarantine(evidence, QuarantineReason::SchemaViolation, None);
-            }
+    fn decode_l2(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+        let wire = match serde_json::from_slice::<L2Envelope>(payload) {
+            Ok(wire) => wire,
+            Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
         };
-        let instrument = match self.instrument(&wire.product_id) {
-            Ok(instrument) => instrument,
-            Err(reason) => return quarantine(evidence, reason, source_code(&wire.product_id)),
-        };
-        if wire.bids.0.is_empty() && wire.asks.0.is_empty() {
+        let envelope_at =
+            match validate_header(&wire.channel, "l2_data", &wire.client_id, &wire.timestamp) {
+                Ok(timestamp) => timestamp,
+                Err(reason) => return quarantine(evidence, reason, None),
+            };
+        if wire.events.0.is_empty() {
             return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
         }
-        let bids = match wire
-            .bids
-            .0
-            .into_iter()
-            .map(|level| parse_level(level, false))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(levels) => levels,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let asks = match wire
-            .asks
-            .0
-            .into_iter()
-            .map(|level| parse_level(level, false))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(levels) => levels,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let provider_payload =
-            match ProviderObservationPayload::book_snapshot(MarketDepth::PriceLevel, bids, asks) {
-                Ok(value) => value,
-                Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
+        let mut observations = Vec::new();
+        if observations.try_reserve_exact(wire.events.0.len()).is_err() {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        }
+        for (index, event) in wire.events.0.into_iter().enumerate() {
+            let instrument = match self.instrument(&event.product_id) {
+                Ok(instrument) => instrument,
+                Err(reason) => {
+                    return quarantine(evidence, reason, source_code(&event.product_id));
+                }
             };
-        self.data(
-            evidence,
-            observation_input(
-                format!("snapshot:{}", wire.product_id),
+            if event.updates.0.is_empty() {
+                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+            }
+            let payload = match event.kind.as_str() {
+                "snapshot" => {
+                    let mut bids = Vec::new();
+                    let mut asks = Vec::new();
+                    if bids.try_reserve_exact(event.updates.0.len()).is_err()
+                        || asks.try_reserve_exact(event.updates.0.len()).is_err()
+                    {
+                        return quarantine(
+                            evidence,
+                            QuarantineReason::ProtocolInvariantViolation,
+                            None,
+                        );
+                    }
+                    for update in event.updates.0 {
+                        let (side, level, _event_at) = match parse_l2_update(update, false) {
+                            Ok(update) => update,
+                            Err(reason) => return quarantine(evidence, reason, None),
+                        };
+                        match side {
+                            ProviderBookSide::Bid => bids.push(level),
+                            ProviderBookSide::Ask => asks.push(level),
+                        }
+                    }
+                    match ProviderObservationPayload::book_snapshot(
+                        MarketDepth::PriceLevel,
+                        bids,
+                        asks,
+                    ) {
+                        Ok(payload) => (
+                            ProviderSnapshotEvidence::InitializingSnapshot {
+                                provider_reference: None,
+                            },
+                            payload,
+                        ),
+                        Err(_) => {
+                            return quarantine(evidence, QuarantineReason::SchemaViolation, None);
+                        }
+                    }
+                }
+                "update" => {
+                    let mut changes = Vec::new();
+                    if changes.try_reserve_exact(event.updates.0.len()).is_err() {
+                        return quarantine(
+                            evidence,
+                            QuarantineReason::ProtocolInvariantViolation,
+                            None,
+                        );
+                    }
+                    for update in event.updates.0 {
+                        let (side, level, _event_at) = match parse_l2_update(update, true) {
+                            Ok(update) => update,
+                            Err(reason) => return quarantine(evidence, reason, None),
+                        };
+                        changes.push(ProviderBookChange::new(side, level));
+                    }
+                    match ProviderObservationPayload::book_delta(MarketDepth::PriceLevel, changes) {
+                        Ok(payload) => (
+                            ProviderSnapshotEvidence::Delta {
+                                provider_snapshot_reference: None,
+                            },
+                            payload,
+                        ),
+                        Err(_) => {
+                            return quarantine(
+                                evidence,
+                                QuarantineReason::ProtocolInvariantViolation,
+                                None,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    return quarantine(evidence, QuarantineReason::UnsupportedSemanticChange, None);
+                }
+            };
+            // Coinbase documents `event_time` as the trading-engine time of each price-level
+            // change and even shows epoch-zero values inside a current snapshot. It is validated
+            // above as provider evidence, but it cannot represent freshness for the complete
+            // snapshot/update observation. The envelope timestamp is the source publication time
+            // for this message and therefore owns observation-level freshness.
+            observations.push(observation_input(
+                format!("l2-{}-{index}-{}", wire.sequence_num, event.product_id),
                 instrument,
-                ProviderTimestampEvidence::AuthoritativelyAbsent(self.timestamp_rule.clone()),
-                ProviderSnapshotEvidence::InitializingSnapshot {
-                    provider_reference: None,
+                ProviderTimestampEvidence::Provided {
+                    value: envelope_at,
+                    rule: self.timestamp_rule.clone(),
                 },
-                provider_payload,
-            ),
-        )
+                payload.0,
+                payload.1,
+            ));
+        }
+        self.data(evidence, observations)
     }
 
-    fn decode_delta(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
-        let wire = match serde_json::from_slice::<DeltaWire>(payload) {
-            Ok(wire) if wire.kind == "l2update" => wire,
-            Ok(_) | Err(_) => {
-                return quarantine(evidence, QuarantineReason::SchemaViolation, None);
+    fn decode_market_trades(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+        let wire = match serde_json::from_slice::<MarketTradesEnvelope>(payload) {
+            Ok(wire) => wire,
+            Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
+        };
+        if let Err(reason) = validate_header(
+            &wire.channel,
+            "market_trades",
+            &wire.client_id,
+            &wire.timestamp,
+        ) {
+            return quarantine(evidence, reason, None);
+        }
+        let mut observations = Vec::new();
+        let mut trade_ids = BTreeSet::new();
+        for event in wire.events.0 {
+            if !matches!(event.kind.as_str(), "snapshot" | "update") {
+                return quarantine(evidence, QuarantineReason::UnsupportedSemanticChange, None);
             }
-        };
-        let instrument = match self.instrument(&wire.product_id) {
-            Ok(instrument) => instrument,
-            Err(reason) => return quarantine(evidence, reason, source_code(&wire.product_id)),
-        };
-        let timestamp = match parse_timestamp(&wire.time) {
-            Ok(timestamp) => timestamp,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let changes = match wire
-            .changes
-            .0
-            .into_iter()
-            .map(parse_change)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(changes) => changes,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let provider_payload =
-            match ProviderObservationPayload::book_delta(MarketDepth::PriceLevel, changes) {
-                Ok(value) => value,
-                Err(_) => {
+            if observations.try_reserve(event.trades.0.len()).is_err() {
+                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+            }
+            for trade in event.trades.0 {
+                if !trade_ids.insert(trade.trade_id.clone()) {
                     return quarantine(
                         evidence,
                         QuarantineReason::ProtocolInvariantViolation,
                         None,
                     );
                 }
-            };
-        self.data(
-            evidence,
-            observation_input(
-                format!("l2update:{}", wire.product_id),
-                instrument,
-                ProviderTimestampEvidence::Provided {
-                    value: timestamp,
-                    rule: self.timestamp_rule.clone(),
-                },
-                ProviderSnapshotEvidence::Delta {
-                    provider_snapshot_reference: None,
-                },
-                provider_payload,
-            ),
-        )
+                let instrument = match self.instrument(&trade.product_id) {
+                    Ok(instrument) => instrument,
+                    Err(reason) => {
+                        return quarantine(evidence, reason, source_code(&trade.product_id));
+                    }
+                };
+                let timestamp = match parse_timestamp(&trade.time) {
+                    Ok(timestamp) => timestamp,
+                    Err(reason) => return quarantine(evidence, reason, None),
+                };
+                let price = match parse_price(trade.price) {
+                    Ok(price) => price,
+                    Err(reason) => return quarantine(evidence, reason, None),
+                };
+                let quantity = match parse_quantity(trade.size, false) {
+                    Ok(quantity) => quantity,
+                    Err(reason) => return quarantine(evidence, reason, None),
+                };
+                let (aggressor, maker_code) = match trade.side.as_str() {
+                    "SELL" => (AggressorSide::Buy, "maker:sell"),
+                    "BUY" => (AggressorSide::Sell, "maker:buy"),
+                    _ => {
+                        return quarantine(
+                            evidence,
+                            QuarantineReason::UnsupportedSemanticChange,
+                            None,
+                        );
+                    }
+                };
+                let maker_code = match SourceIdentifier::try_from(maker_code) {
+                    Ok(code) => code,
+                    Err(_) => {
+                        return quarantine(
+                            evidence,
+                            QuarantineReason::ProtocolInvariantViolation,
+                            None,
+                        );
+                    }
+                };
+                let trade_identifier = match SourceIdentifier::try_from(trade.trade_id.as_str()) {
+                    Ok(identifier) => identifier,
+                    Err(_) => {
+                        return quarantine(
+                            evidence,
+                            QuarantineReason::ProtocolInvariantViolation,
+                            None,
+                        );
+                    }
+                };
+                observations.push(observation_input(
+                    trade.trade_id,
+                    instrument,
+                    ProviderTimestampEvidence::Provided {
+                        value: timestamp,
+                        rule: self.timestamp_rule.clone(),
+                    },
+                    ProviderSnapshotEvidence::NotApplicable(self.trade_snapshot_rule.clone()),
+                    ProviderObservationPayload::Trade {
+                        trade_id: trade_identifier,
+                        price,
+                        quantity,
+                        aggressor: ProviderAggressorEvidence::new(
+                            aggressor,
+                            Some(maker_code),
+                            self.aggressor_rule.clone(),
+                        ),
+                    },
+                ));
+            }
+        }
+        if observations.is_empty() {
+            DecodeOutcome::Control(DecodedControlFrame::new(
+                evidence,
+                ControlFrameKind::ProviderFlowControl,
+                source_code(&wire.sequence_num.to_string()),
+            ))
+        } else {
+            self.data(evidence, observations)
+        }
     }
 
-    fn decode_trade(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
-        let wire = match serde_json::from_slice::<TradeWire>(payload) {
-            Ok(wire) if matches!(wire.kind.as_str(), "match" | "last_match") => wire,
-            Ok(_) | Err(_) => {
+    fn decode_heartbeats(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+        let wire = match serde_json::from_slice::<HeartbeatsEnvelope>(payload) {
+            Ok(wire) => wire,
+            Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
+        };
+        if let Err(reason) = validate_header(
+            &wire.channel,
+            "heartbeats",
+            &wire.client_id,
+            &wire.timestamp,
+        ) {
+            return quarantine(evidence, reason, None);
+        }
+        if wire.events.0.is_empty() {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        }
+        let _sequence_num = wire.sequence_num;
+        let mut last_counter = None;
+        for event in wire.events.0 {
+            if event.current_time.is_empty() || event.current_time.len() > MAX_HEARTBEAT_TIME_BYTES
+            {
                 return quarantine(evidence, QuarantineReason::SchemaViolation, None);
             }
-        };
-        let instrument = match self.instrument(&wire.product_id) {
-            Ok(instrument) => instrument,
-            Err(reason) => return quarantine(evidence, reason, source_code(&wire.product_id)),
-        };
-        let timestamp = match parse_timestamp(&wire.time) {
-            Ok(timestamp) => timestamp,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let _provider_sequence = wire.sequence;
-        let _maker_order_id = &wire.maker_order_id;
-        let _taker_order_id = &wire.taker_order_id;
-        let price = match parse_price(wire.price) {
-            Ok(price) => price,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let quantity = match parse_quantity(wire.size, false) {
-            Ok(quantity) => quantity,
-            Err(reason) => return quarantine(evidence, reason, None),
-        };
-        let (aggressor, maker_code) = match wire.side.as_str() {
-            "sell" => (AggressorSide::Buy, "maker:sell"),
-            "buy" => (AggressorSide::Sell, "maker:buy"),
-            _ => return quarantine(evidence, QuarantineReason::UnsupportedSemanticChange, None),
-        };
-        let maker_code = match SourceIdentifier::try_from(maker_code) {
-            Ok(code) => code,
-            Err(_) => {
-                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
-            }
-        };
-        let trade_id = wire.trade_id.to_string();
-        let trade_identifier = match SourceIdentifier::try_from(trade_id.as_str()) {
-            Ok(value) => value,
-            Err(_) => {
-                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
-            }
-        };
-        let provider_payload = ProviderObservationPayload::Trade {
-            trade_id: trade_identifier,
-            price,
-            quantity,
-            aggressor: ProviderAggressorEvidence::new(
-                aggressor,
-                Some(maker_code),
-                self.aggressor_rule.clone(),
-            ),
-        };
-        self.data(
-            evidence,
-            observation_input(
-                format!("{}:{}", wire.kind, wire.trade_id),
-                instrument,
-                ProviderTimestampEvidence::Provided {
-                    value: timestamp,
-                    rule: self.timestamp_rule.clone(),
-                },
-                ProviderSnapshotEvidence::NotApplicable(self.trade_snapshot_rule.clone()),
-                provider_payload,
-            ),
-        )
-    }
-
-    fn decode_heartbeat(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
-        let wire = match serde_json::from_slice::<HeartbeatWire>(payload) {
-            Ok(wire) if wire.kind == "heartbeat" => wire,
-            Ok(_) | Err(_) => {
-                return quarantine(evidence, QuarantineReason::SchemaViolation, None);
-            }
-        };
-        if let Err(reason) = self.instrument(&wire.product_id) {
-            return quarantine(evidence, reason, source_code(&wire.product_id));
+            last_counter = Some(event.heartbeat_counter.0);
         }
-        if parse_timestamp(&wire.time).is_err() {
-            return quarantine(evidence, QuarantineReason::InvalidTimestamp, None);
-        }
-        let _sequence = wire.sequence;
-        let _last_trade_id = wire.last_trade_id;
         DecodeOutcome::Control(DecodedControlFrame::new(
             evidence,
             ControlFrameKind::Heartbeat,
-            source_code(&wire.product_id),
+            last_counter.and_then(|counter| source_code(&counter.to_string())),
         ))
     }
 
-    fn decode_subscriptions(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
-        let wire = match serde_json::from_slice::<SubscriptionsWire>(payload) {
-            Ok(wire) if wire.kind == "subscriptions" => wire,
-            Ok(_) | Err(_) => {
-                return quarantine(evidence, QuarantineReason::SchemaViolation, None);
-            }
+    fn decode_subscriptions(&mut self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
+        let wire = match serde_json::from_slice::<SubscriptionsEnvelope>(payload) {
+            Ok(wire) => wire,
+            Err(_) => return quarantine(evidence, QuarantineReason::SchemaViolation, None),
         };
-        let mut names = BTreeSet::new();
-        for channel in wire.channels.0 {
-            if !names.insert(channel.name.clone()) {
+        if let Err(reason) = validate_header(
+            &wire.channel,
+            "subscriptions",
+            &wire.client_id,
+            &wire.timestamp,
+        ) {
+            return quarantine(evidence, reason, None);
+        }
+        if wire.events.0.len() != 1 {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        }
+        let mut events = wire.events.0.into_iter();
+        let Some(event) = events.next() else {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        };
+        let actual = event
+            .subscriptions
+            .0
+            .into_iter()
+            .map(|(channel, products)| (channel, products.0.into_iter().collect()))
+            .collect::<BTreeMap<String, BTreeSet<String>>>();
+        if actual.is_empty() {
+            return quarantine(evidence, QuarantineReason::WrongChannel, None);
+        }
+        for (channel, products) in &actual {
+            let Some(expected_products) = self.expected_subscriptions.get(channel) else {
                 return quarantine(
                     evidence,
                     QuarantineReason::WrongChannel,
-                    source_code(&channel.name),
+                    source_code(channel),
                 );
-            }
-            let products = channel.product_ids.0.into_iter().collect::<BTreeSet<_>>();
-            if products != self.products {
+            };
+            if products != expected_products {
                 return quarantine(
                     evidence,
                     QuarantineReason::WrongProduct,
-                    source_code(&channel.name),
+                    source_code(channel),
                 );
             }
         }
-        if names != self.channels {
+        if self
+            .observed_subscriptions
+            .iter()
+            .any(|(channel, products)| actual.get(channel) != Some(products))
+        {
             return quarantine(evidence, QuarantineReason::WrongChannel, None);
         }
-        DecodeOutcome::Control(DecodedControlFrame::new(
-            evidence,
-            ControlFrameKind::SubscriptionAcknowledgement,
-            None,
-        ))
+        if actual != self.observed_subscriptions {
+            self.observed_subscriptions = actual;
+        }
+        if self.observed_subscriptions == self.expected_subscriptions
+            && !self.acknowledgement_complete
+        {
+            self.acknowledgement_complete = true;
+            DecodeOutcome::Control(DecodedControlFrame::new(
+                evidence,
+                ControlFrameKind::SubscriptionAcknowledgement,
+                None,
+            ))
+        } else {
+            DecodeOutcome::Control(DecodedControlFrame::new(
+                evidence,
+                ControlFrameKind::ProviderFlowControl,
+                source_code(&wire.sequence_num.to_string()),
+            ))
+        }
     }
 
     fn decode_provider_error(&self, payload: &[u8], evidence: DecoderEvidence) -> DecodeOutcome {
@@ -399,11 +525,11 @@ impl CoinbaseExchangeDecoder {
                 return quarantine(evidence, QuarantineReason::SchemaViolation, None);
             }
         };
-        let provider_code = source_code(&wire.message);
+        let _provider_message = wire.message.or(wire.reason);
         DecodeOutcome::Resynchronize(DecodedRecoveryAction::new(
             evidence,
             ResynchronizationReason::ProviderRequestedReset,
-            provider_code,
+            source_code("coinbase-provider-error"),
         ))
     }
 
@@ -414,33 +540,48 @@ impl CoinbaseExchangeDecoder {
             .ok_or(QuarantineReason::WrongProduct)
     }
 
-    fn data(&self, evidence: DecoderEvidence, input: ObservationInput) -> DecodeOutcome {
-        let source_identifier = match SourceIdentifier::try_from(input.source_identifier) {
-            Ok(identifier) => identifier,
-            Err(_) => {
-                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
-            }
-        };
-        let observation = match ProviderNormalizedObservation::try_new(
-            source_identifier,
-            self.venue.clone(),
-            input.instrument,
-            input.timestamp,
-            ProviderSequenceEvidence::Unsupported {
-                rule: self.sequence_rule.clone(),
-            },
-            input.snapshot,
-            ProviderChecksumEvidence::Unsupported {
-                rule: self.checksum_rule.clone(),
-            },
-            input.payload,
-        ) {
-            Ok(observation) => observation,
-            Err(_) => {
-                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
-            }
-        };
-        match DecodedProviderBatch::try_new(evidence.clone(), vec![observation]) {
+    fn data(&self, evidence: DecoderEvidence, inputs: Vec<ObservationInput>) -> DecodeOutcome {
+        let mut observations = Vec::new();
+        if observations.try_reserve_exact(inputs.len()).is_err() {
+            return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+        }
+        for input in inputs {
+            let source_identifier = match SourceIdentifier::try_from(input.source_identifier) {
+                Ok(identifier) => identifier,
+                Err(_) => {
+                    return quarantine(
+                        evidence,
+                        QuarantineReason::ProtocolInvariantViolation,
+                        None,
+                    );
+                }
+            };
+            let observation = match ProviderNormalizedObservation::try_new(
+                source_identifier,
+                self.venue.clone(),
+                input.instrument,
+                input.timestamp,
+                ProviderSequenceEvidence::Unsupported {
+                    rule: self.sequence_rule.clone(),
+                },
+                input.snapshot,
+                ProviderChecksumEvidence::Unsupported {
+                    rule: self.checksum_rule.clone(),
+                },
+                input.payload,
+            ) {
+                Ok(observation) => observation,
+                Err(_) => {
+                    return quarantine(
+                        evidence,
+                        QuarantineReason::ProtocolInvariantViolation,
+                        None,
+                    );
+                }
+            };
+            observations.push(observation);
+        }
+        match DecodedProviderBatch::try_new(evidence.clone(), observations) {
             Ok(batch) => DecodeOutcome::Data(batch),
             Err(_) => quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None),
         }
@@ -510,6 +651,18 @@ fn source_code(value: &str) -> Option<SourceIdentifier> {
     SourceIdentifier::try_from(value).ok()
 }
 
+fn validate_header(
+    actual_channel: &str,
+    expected_channel: &str,
+    client_id: &str,
+    timestamp: &str,
+) -> Result<Timestamp, QuarantineReason> {
+    if actual_channel != expected_channel || !client_id.is_empty() {
+        return Err(QuarantineReason::WrongChannel);
+    }
+    parse_timestamp(timestamp)
+}
+
 fn parse_timestamp(value: &str) -> Result<Timestamp, QuarantineReason> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -536,104 +689,174 @@ fn parse_quantity(value: String, allow_zero: bool) -> Result<ProviderQuantity, Q
     Ok(ProviderQuantity::new(lexeme))
 }
 
-fn parse_level(
-    level: [String; 2],
+fn parse_l2_update(
+    update: L2UpdateWire,
     allow_zero: bool,
-) -> Result<ProviderBookLevel, QuarantineReason> {
-    let [price, quantity] = level;
-    Ok(ProviderBookLevel::new(
-        parse_price(price)?,
-        parse_quantity(quantity, allow_zero)?,
-    ))
-}
-
-fn parse_change(change: [String; 3]) -> Result<ProviderBookChange, QuarantineReason> {
-    let [side, price, quantity] = change;
-    let side = match side.as_str() {
-        "buy" => ProviderBookSide::Bid,
-        "sell" => ProviderBookSide::Ask,
+) -> Result<(ProviderBookSide, ProviderBookLevel, Timestamp), QuarantineReason> {
+    let side = match update.side.as_str() {
+        "bid" => ProviderBookSide::Bid,
+        "offer" => ProviderBookSide::Ask,
         _ => return Err(QuarantineReason::UnsupportedSemanticChange),
     };
-    Ok(ProviderBookChange::new(
+    Ok((
         side,
-        ProviderBookLevel::new(parse_price(price)?, parse_quantity(quantity, true)?),
+        ProviderBookLevel::new(
+            parse_price(update.price_level)?,
+            parse_quantity(update.new_quantity, allow_zero)?,
+        ),
+        parse_timestamp(&update.event_time)?,
     ))
 }
 
 #[derive(Deserialize)]
 struct MessageProbe {
+    channel: Option<String>,
     #[serde(rename = "type")]
-    kind: String,
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SnapshotWire {
-    #[serde(rename = "type")]
-    kind: String,
-    product_id: String,
-    bids: BoundedSequence<[String; 2], MAX_LEVELS_PER_SIDE>,
-    asks: BoundedSequence<[String; 2], MAX_LEVELS_PER_SIDE>,
+struct L2Envelope {
+    channel: String,
+    #[serde(default)]
+    client_id: String,
+    timestamp: String,
+    sequence_num: u64,
+    events: BoundedSequence<L2EventWire, MAX_ENVELOPE_EVENTS>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeltaWire {
+struct L2EventWire {
     #[serde(rename = "type")]
     kind: String,
     product_id: String,
-    time: String,
-    changes: BoundedSequence<[String; 3], MAX_CHANGES>,
+    updates: BoundedSequence<L2UpdateWire, MAX_L2_UPDATES>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TradeWire {
-    #[serde(rename = "type")]
-    kind: String,
-    trade_id: u64,
-    sequence: u64,
-    maker_order_id: String,
-    taker_order_id: String,
-    time: String,
-    product_id: String,
-    size: String,
-    price: String,
+struct L2UpdateWire {
     side: String,
+    event_time: String,
+    price_level: String,
+    new_quantity: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HeartbeatWire {
+struct MarketTradesEnvelope {
+    channel: String,
+    #[serde(default)]
+    client_id: String,
+    timestamp: String,
+    sequence_num: u64,
+    events: BoundedSequence<MarketTradesEventWire, MAX_ENVELOPE_EVENTS>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketTradesEventWire {
     #[serde(rename = "type")]
     kind: String,
-    sequence: u64,
-    last_trade_id: u64,
+    trades: BoundedSequence<MarketTradeWire, MAX_TRADES>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketTradeWire {
+    trade_id: String,
     product_id: String,
+    price: String,
+    size: String,
+    side: String,
     time: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SubscriptionsWire {
-    #[serde(rename = "type")]
-    kind: String,
-    channels: BoundedSequence<SubscriptionChannelWire, MAX_ACK_CHANNELS>,
+struct HeartbeatsEnvelope {
+    channel: String,
+    #[serde(default)]
+    client_id: String,
+    timestamp: String,
+    sequence_num: u64,
+    events: BoundedSequence<HeartbeatEventWire, MAX_HEARTBEAT_EVENTS>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SubscriptionChannelWire {
-    name: String,
-    product_ids: BoundedSequence<String, MAX_ACK_PRODUCTS>,
+struct HeartbeatEventWire {
+    current_time: String,
+    heartbeat_counter: HeartbeatCounterWire,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeartbeatCounterWire(u64);
+
+impl<'de> Deserialize<'de> for HeartbeatCounterWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct HeartbeatCounterVisitor;
+
+        impl Visitor<'_> for HeartbeatCounterVisitor {
+            type Value = HeartbeatCounterWire;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a non-negative 64-bit heartbeat counter or decimal string")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HeartbeatCounterWire(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() || value.len() > 20 {
+                    return Err(E::custom("heartbeat counter is outside its decimal bound"));
+                }
+                value
+                    .parse::<u64>()
+                    .map(HeartbeatCounterWire)
+                    .map_err(|_error| E::custom("heartbeat counter is not an unsigned integer"))
+            }
+        }
+
+        deserializer.deserialize_any(HeartbeatCounterVisitor)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SubscriptionsEnvelope {
+    channel: String,
+    #[serde(default)]
+    client_id: String,
+    timestamp: String,
+    sequence_num: u64,
+    events: BoundedSequence<SubscriptionsEventWire, 1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscriptionsEventWire {
+    subscriptions: BoundedMap<String, BoundedSequence<String, MAX_ACK_PRODUCTS>, MAX_ACK_CHANNELS>,
+}
+
+#[derive(Deserialize)]
 struct ProviderErrorWire {
     #[serde(rename = "type")]
     kind: String,
-    message: String,
+    message: Option<String>,
+    reason: Option<String>,
 }
 
 struct BoundedSequence<T, const N: usize>(Vec<T>);
@@ -674,5 +897,50 @@ where
         }
 
         deserializer.deserialize_seq(SequenceVisitor(std::marker::PhantomData))
+    }
+}
+
+struct BoundedMap<K, V, const N: usize>(BTreeMap<K, V>);
+
+impl<'de, K, V, const N: usize> Deserialize<'de> for BoundedMap<K, V, N>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MapVisitor<K, V, const N: usize>(std::marker::PhantomData<(K, V)>);
+
+        impl<'de, K, V, const N: usize> Visitor<'de> for MapVisitor<K, V, N>
+        where
+            K: Deserialize<'de> + Ord,
+            V: Deserialize<'de>,
+        {
+            type Value = BoundedMap<K, V, N>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "at most {N} unique map entries")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    if values.len() == N {
+                        return Err(A::Error::custom("bounded map capacity exceeded"));
+                    }
+                    if values.insert(key, value).is_some() {
+                        return Err(A::Error::custom("duplicate map key"));
+                    }
+                }
+                Ok(BoundedMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
     }
 }

@@ -26,7 +26,11 @@ export function useLookup(
   const normalized = text.trim().slice(0, 256)
   const deferred = React.useDeferredValue(normalized)
   const input = React.useMemo(
-    () => ({ query: "lookup" as const, text: deferred, categories }),
+    () => ({
+      query: "lookup" as const,
+      text: deferred,
+      categories: categories.length === 0 ? undefined : categories,
+    }),
     [categories, deferred],
   )
   const query = useQuery({

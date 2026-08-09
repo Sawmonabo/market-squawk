@@ -1442,6 +1442,35 @@ financial/time/quality presentation without duplicating business calculations.
 **Produces:** beginner-readable product truth, global lookup, live/research workflows, provider
 health/coverage, and reconnectable job control.
 
+**Binding V1 Markets expansion — approved 2026-08-09:** implement one unified Markets experience
+over a bounded federation of independently admitted providers. This is a release blocker, not a
+future enhancement. The implementation follows this dependency DAG:
+
+```mermaid
+flowchart LR
+    M1["Wave M1: capability, rights, budget, and selection contracts"]
+    M2A["Wave M2A: admitted crypto surfaces"]
+    M2B["Wave M2B: admitted equity/options surfaces"]
+    M2C["Wave M2C: reference and benchmark surfaces"]
+    M3["Wave M3: multi-provider registry and presentation read model"]
+    M4["Wave M4: unified desktop feed, search, and instrument journey"]
+    M5["Wave M5: installed restart and end-to-end proof"]
+
+    M1 --> M2A
+    M1 --> M2B
+    M1 --> M2C
+    M2A --> M3
+    M2B --> M3
+    M2C --> M3
+    M3 --> M4
+    M4 --> M5
+```
+
+Only the disjoint provider-adapter waves may run concurrently. Shared domain contracts, manifests,
+lockfiles, application composition, source selection, and desktop transport remain serialized.
+The evidence and acceptance boundary are maintained in
+[`Unified Markets provider ecosystem`](../../research/2026-08-08-unified-markets-provider-ecosystem.md).
+
 - [ ] **Step 1: Build the decision-oriented Overview**
 
   Render total portfolio/market truth with mark provenance; watchlist/candidate/target attention;
@@ -1458,10 +1487,20 @@ health/coverage, and reconnectable job control.
 
 - [ ] **Step 3: Build Markets and Sources**
 
-  Markets shows selected instruments, trade/quote/book summaries, freshness, quality, venue
-  coverage, chart, live features, and explicit no-data/degraded states. Sources reuses the guided
-  provider cards and displays credential state, coverage, budgets, lineage, connection generation,
-  freshness/integrity, and typed start/stop/retry/resync/verify/reconfigure/remove actions.
+  Replace the one-instrument/one-provider projection with a bounded concurrent provider registry,
+  locally searchable multi-asset universe, deterministic requirement/quality resolver, explicit
+  selection and downgrade receipts, and one presentation read model. Markets presents one feed,
+  one search, and one instrument journey containing market pulse, holdings/watchlists, ranked
+  opportunities, quotes/trades/books/bars, charts, features, forecasts, buy/add/trim/sell targets,
+  backtest evidence, fundamentals/filings, portfolio impact, risk, and `Data confidence`. It shows
+  best available depth without inventing free order-level coverage or index books. Sources retains
+  the advanced provider controls: credentials, exact coverage, budgets, lineage, connection
+  generation, freshness/integrity, and typed start/stop/retry/resync/verify/reconfigure/remove.
+
+  Reuse the existing test targets. Add only one consolidated critical path covering concurrent
+  source isolation, deterministic source selection, an explicit downgrade, restart restoration,
+  and the usable desktop journey. Do not add per-provider UI tests, screenshot tests, prose checks,
+  or a broad live-network matrix during implementation.
 
 - [ ] **Step 4: Build Research**
 

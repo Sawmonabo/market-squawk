@@ -86,6 +86,7 @@ const PORTAL_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const PORTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PORTAL_MAX_REQUESTS: u64 = 512;
 const PORTAL_MAX_CONNECTIONS: usize = 16;
+const LOCAL_PAPER_EXECUTION_SURFACE: &str = "local.paper-execution";
 
 /// Validated authority request for one non-persistent provider page inspection.
 pub struct EphemeralSourceInspectionRequest {
@@ -848,14 +849,6 @@ impl SourceController {
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_request_live(context, &self.lifecycle)?;
         let filters = requested_sources(request)?;
-        let lifecycle_status = if matches!(kind, SourceReadKind::Status) && filters.len() == 1 {
-            Some(
-                self.current_source_lifecycle_status(&filters[0], context)
-                    .await?,
-            )
-        } else {
-            None
-        };
         let profiles = self.onboarding.profiles();
         let sessions = self
             .onboarding
@@ -916,13 +909,22 @@ impl SourceController {
             );
             let profile_value = to_json(profile)?;
             let session_value = sessions.get(profile.id()).map(to_json).transpose()?;
-            let provider_dataset_identifier = if matches!(kind, SourceReadKind::Status) {
-                let profile_identifier = SourceIdentifier::try_from(profile.id())
-                    .map_err(|_error| ServiceError::InvalidResult)?;
-                self.discovery
-                    .registered_discovery_dataset(&profile_identifier)?
-            } else {
-                None
+            let profile_identifier = matches!(kind, SourceReadKind::Status)
+                .then(|| SourceIdentifier::try_from(profile.id()))
+                .transpose()
+                .map_err(|_error| ServiceError::InvalidResult)?;
+            let provider_dataset_identifier = profile_identifier
+                .as_ref()
+                .map(|identifier| self.discovery.registered_discovery_dataset(identifier))
+                .transpose()?
+                .flatten();
+            let lifecycle_managed = profile.id() != LOCAL_PAPER_EXECUTION_SURFACE;
+            let lifecycle_status = match profile_identifier.as_ref() {
+                Some(identifier) if lifecycle_managed => Some(
+                    self.current_source_lifecycle_status(identifier, context)
+                        .await?,
+                ),
+                Some(_) | None => None,
             };
             if selected_runtime.is_empty() {
                 let mut row = inactive_row(
@@ -932,7 +934,13 @@ impl SourceController {
                     session_value,
                     provider_dataset_identifier.as_ref(),
                 )?;
-                attach_lifecycle_status(&mut row, lifecycle_status.as_ref())?;
+                if matches!(kind, SourceReadKind::Status) {
+                    attach_lifecycle_status(
+                        &mut row,
+                        lifecycle_managed,
+                        lifecycle_status.as_ref(),
+                    )?;
+                }
                 rows.push(row);
             } else {
                 rows.try_reserve(selected_runtime.len())
@@ -946,7 +954,13 @@ impl SourceController {
                         provider_dataset_identifier.as_ref(),
                         record,
                     )?;
-                    attach_lifecycle_status(&mut row, lifecycle_status.as_ref())?;
+                    if matches!(kind, SourceReadKind::Status) {
+                        attach_lifecycle_status(
+                            &mut row,
+                            lifecycle_managed,
+                            lifecycle_status.as_ref(),
+                        )?;
+                    }
                     rows.push(row);
                 }
             }
@@ -1008,6 +1022,9 @@ impl SourceController {
             ) => result.map_err(map_source_lifecycle_error)?,
         };
         ensure_request_live(context, &self.lifecycle)?;
+        if &status.fields().provider != provider {
+            return Err(ServiceError::InvalidResult);
+        }
         source_lifecycle_status_value(&status)
     }
 
@@ -1382,6 +1399,7 @@ fn source_lifecycle_status_value(status: &SourceLifecycleStatus) -> Result<Value
         "provider": fields.provider.as_str(),
         "stateRevision": fields.state_revision.get(),
         "state": lifecycle_state_name(fields.state),
+        "configurationSessionId": fields.configuration_session_id.map(|value| value.to_string()),
         "currentGeneration": fields.current_generation.map(ConnectionGeneration::get),
         "runtimeGenerationSha256": fields.runtime_generation_digest.map(sha256_value).transpose()?,
         "publicConfigurationSha256": fields
@@ -1393,13 +1411,23 @@ fn source_lifecycle_status_value(status: &SourceLifecycleStatus) -> Result<Value
     }))
 }
 
-fn attach_lifecycle_status(row: &mut Value, status: Option<&Value>) -> Result<(), ServiceError> {
-    let Some(status) = status else {
-        return Ok(());
-    };
-    row.as_object_mut()
-        .ok_or(ServiceError::InvalidResult)?
-        .insert("lifecycle".to_owned(), status.clone());
+fn attach_lifecycle_status(
+    row: &mut Value,
+    managed: bool,
+    status: Option<&Value>,
+) -> Result<(), ServiceError> {
+    if managed != status.is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let row = row.as_object_mut().ok_or(ServiceError::InvalidResult)?;
+    row.insert(
+        "lifecycleSupport".to_owned(),
+        Value::String(if managed { "managed" } else { "not_applicable" }.to_owned()),
+    );
+    row.insert(
+        "lifecycle".to_owned(),
+        status.cloned().unwrap_or(Value::Null),
+    );
     Ok(())
 }
 

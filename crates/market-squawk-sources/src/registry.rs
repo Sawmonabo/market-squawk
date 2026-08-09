@@ -23,8 +23,8 @@ use crate::authority_time::{
 use crate::bounded::BoundedVec;
 use crate::policy::{
     AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
-    BudgetPolicyResolutionError, DurableBudgetGroup, PersistedProviderBudgetPolicy,
-    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
+    BudgetPermitLease, BudgetPolicyResolutionError, DurableBudgetGroup,
+    PersistedProviderBudgetPolicy, ProviderBudgetPool, ResolvedProviderBudgetPolicy,
 };
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
@@ -51,6 +51,7 @@ struct SessionLeaseState {
     terminal: AtomicBool,
     live_qualified: AtomicBool,
     health_epoch: AtomicU64,
+    minimum_valid_health_epoch: AtomicU64,
     valid_from_nanos: AtomicI64,
     valid_until_nanos: AtomicI64,
     last_health_observed_nanos: AtomicI64,
@@ -101,6 +102,8 @@ impl SessionLeaseState {
 
     fn terminally_invalidate_health_authority(&self) {
         self.live_qualified.store(false, Ordering::Release);
+        self.minimum_valid_health_epoch
+            .store(u64::MAX, Ordering::Release);
         self.valid_from_nanos.store(i64::MAX, Ordering::Release);
         self.valid_until_nanos.store(i64::MIN, Ordering::Release);
         self.current.store(false, Ordering::Release);
@@ -122,6 +125,7 @@ impl SessionLeaseState {
         valid_until: Option<Timestamp>,
     ) {
         self.live_qualified.store(false, Ordering::Release);
+        let previous_epoch = self.health_epoch.load(Ordering::Acquire);
         self.valid_from_nanos.store(
             valid_from.map_or(i64::MAX, Timestamp::unix_nanos),
             Ordering::Release,
@@ -130,6 +134,17 @@ impl SessionLeaseState {
             valid_until.map_or(i64::MIN, Timestamp::unix_nanos),
             Ordering::Release,
         );
+        // A routine healthy refresh overlaps the immediately preceding immutable authority until
+        // that authority's own deadline. This lets already-admitted FIFO work drain without
+        // treating a freshness renewal as data loss. An unhealthy update publishes no overlap,
+        // and the next healthy update cannot resurrect an older qualified epoch.
+        let minimum_valid_epoch = if qualified && previous_epoch != 0 {
+            previous_epoch
+        } else {
+            epoch
+        };
+        self.minimum_valid_health_epoch
+            .store(minimum_valid_epoch, Ordering::Release);
         self.health_epoch.store(epoch, Ordering::Release);
         self.live_qualified.store(qualified, Ordering::Release);
     }
@@ -139,9 +154,12 @@ impl SessionLeaseState {
     }
 
     fn validate_health_epoch(&self, epoch: u64, at: Timestamp) -> bool {
+        let current_epoch = self.health_epoch.load(Ordering::Acquire);
+        let minimum_epoch = self.minimum_valid_health_epoch.load(Ordering::Acquire);
         self.is_current()
             && self.is_live_qualified()
-            && self.health_epoch.load(Ordering::Acquire) == epoch
+            && epoch >= minimum_epoch
+            && epoch <= current_epoch
             && at.unix_nanos() >= self.valid_from_nanos.load(Ordering::Acquire)
             && at.unix_nanos() <= self.valid_until_nanos.load(Ordering::Acquire)
     }
@@ -215,6 +233,7 @@ impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectRes
 enum CurrentBudgetAuthority {
     NotRequired,
     Available(BudgetAvailabilityLease),
+    ActiveRequest(BudgetPermitLease),
     Unavailable,
 }
 
@@ -229,10 +248,22 @@ impl CurrentBudgetAuthority {
         }
     }
 
+    fn observe_active_request(
+        budget: Option<&SharedProviderBudget>,
+        lease: &BudgetPermitLease,
+    ) -> Result<Self, RegistryError> {
+        let budget = budget.ok_or(RegistryError::BudgetAuthorityMismatch)?;
+        if !lease.shares_allocation_with(budget) || !lease.is_current() {
+            return Err(RegistryError::BudgetAuthorityMismatch);
+        }
+        Ok(Self::ActiveRequest(lease.clone()))
+    }
+
     fn is_available(&self) -> bool {
         match self {
             Self::NotRequired => true,
             Self::Available(lease) => lease.is_available(),
+            Self::ActiveRequest(lease) => lease.is_current(),
             Self::Unavailable => false,
         }
     }
@@ -248,6 +279,9 @@ impl CurrentBudgetAuthority {
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
         match self {
             Self::Available(lease) => lease
+                .shared_allocation_charge()
+                .ok_or(RegistryError::RetainedSizeOverflow),
+            Self::ActiveRequest(lease) => lease
                 .shared_allocation_charge()
                 .ok_or(RegistryError::RetainedSizeOverflow),
             Self::NotRequired | Self::Unavailable => Ok(0),

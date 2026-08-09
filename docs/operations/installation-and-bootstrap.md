@@ -375,11 +375,10 @@ just setup
 just dev
 ```
 
-The repository `.nvmrc` pins Node.js `24.18.0`. On macOS or Linux, when `nvm` is available,
-`just setup` loads it inside the setup process, installs the pinned version if necessary, and uses
-it for the frozen pnpm install. On Windows, the setup recipe uses `nvm-windows` when its `nvm`
-command is available. An interactive terminal may run `nvm use` explicitly before other direct
-Node or pnpm commands.
+The repository `.nvmrc` pins Node.js `24.18.0`. Every `just` frontend command selects that version
+with `nvm` or `nvm-windows` when available and validates it in the same process that runs pnpm. If
+`nvm` is unavailable, the command proceeds only when the active Node.js version is already exact;
+`just setup` also prepares pinned pnpm `10.31.0`.
 
 The setup command is repeatable: it preserves the managed Python environment, reapplies the
 hash-locked dependency set, and rebuilds and installs the repository's Rust-backed Python package.
@@ -387,11 +386,17 @@ Signed training-environment checks remain part of sealed installed-product verif
 not weakened for source development.
 
 The complete development desktop uses the ignored repository-local
-`.market-squawk/development` data root. It builds and discovers its required debug sibling programs
-without admitting that fallback into non-debug packages. The shared development service may outlive
-the desktop so CLI and MCP clients can use the same runtime. Stop the desktop and service before
-using the confirmed `just reset-dev` command. `just dev-web` runs only Vite and cannot demonstrate
-service, MCP, data, model, risk, or execution readiness.
+`.market-squawk/development` workspace-data root and
+`.market-squawk/development-installation` service-authority root. It builds and discovers its
+required debug sibling programs without admitting that fallback into non-debug packages. The
+shared development service may outlive the desktop so CLI and MCP clients can use the same runtime.
+The verified model and training cache is separate at
+`.market-squawk/development-model-runtime`; use `just refresh-model-runtime` to rebuild it,
+`just verify-model-runtime` to check it without rebuilding, and `just reset-model-runtime` to remove
+only that reproducible cache. Stop the desktop and service before either reset. `just reset-dev`
+removes only the workspace-data and service-authority roots; neither reset touches the installed
+product. `just dev-web` runs only Vite and cannot demonstrate service, MCP, data, model, risk, or
+execution readiness.
 
 See the repository [Development instructions](../../README.md#development) for installation and the
 complete command index. A source build may demonstrate a code path; it does not inherit package

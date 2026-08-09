@@ -49,6 +49,7 @@ export function usePortfolioAccounts(
           ...(pageParam ? { afterAccountId: pageParam } : {}),
         }),
         z.array(portfolioAccountSchema),
+        [],
       ),
     getNextPageParam: (page) => {
       if (page.evidence.completeness === "complete") return undefined
@@ -84,6 +85,7 @@ export function usePortfolioDetails(
           accountId: requiredAccount(accountId),
         }),
         z.array(holdingSchema),
+        [],
       ),
   })
   const performance = useQuery({
@@ -179,6 +181,7 @@ export function usePortfolioHistory(
           accountId: requiredAccount(accountId),
         }),
         z.array(portfolioTransactionSchema),
+        [],
       ),
   })
 
@@ -196,6 +199,7 @@ export function usePortfolioHistory(
           ...(pageParam ? { afterRevisionId: pageParam } : {}),
         }),
         z.array(portfolioRevisionSchema),
+        [],
       ),
     getNextPageParam: (page) => {
       if (page.evidence.completeness === "complete") return undefined

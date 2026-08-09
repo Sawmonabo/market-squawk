@@ -8,8 +8,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, ControlFrameKind, DecodeOutcome, IgnoredFrameReason,
-    MarketDecoder, ProviderBookSide, ProviderChecksumEvidence, ProviderObservationPayload,
-    ProviderSequenceEvidence, QuarantineReason, SessionId, TransportFrameKind,
+    MAX_DECODED_BOOK_ITEMS, MarketDecoder, ProviderBookSide, ProviderChecksumEvidence,
+    ProviderObservationPayload, ProviderSequenceEvidence, QuarantineReason, SessionId,
+    TransportFrameKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -38,16 +39,16 @@ fn official_protocol_fixtures_match_the_pinned_manifest() -> TestResult {
     for (field, expected) in [
         (
             "authoritative_url",
-            "https://docs.cdp.coinbase.com/exchange/websocket-feed/channels",
+            "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels",
         ),
-        ("retrieved_at", "2026-07-21"),
+        ("retrieved_at", "2026-08-08"),
         (
             "derivation",
-            "Minimal deterministic fixtures transcribed from the documented unauthenticated level2_batch snapshot/update, match, heartbeat, and subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
+            "Minimal deterministic fixtures transcribed from the documented public Advanced Trade level2, market_trades, heartbeats, and cumulative subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
         ),
         (
             "protocol_revision",
-            "Coinbase Exchange WebSocket Feed documentation (unversioned; retrieved 2026-07-21)",
+            "Coinbase Advanced Trade WebSocket documentation (unversioned; retrieved 2026-08-08)",
         ),
         ("terms_url", "https://www.coinbase.com/legal/market_data"),
     ] {
@@ -104,6 +105,19 @@ fn decodes_exact_book_and_trade_evidence_without_promoting_integrity() -> TestRe
     assert_eq!(book.bids()[0].price().value().as_str(), "100.10");
     assert_eq!(book.bids()[0].quantity().value().as_str(), "1.2500");
 
+    let documented_snapshot_time = Timestamp::from_unix_nanos(1_786_190_400_000_000_000);
+    let stale_level_snapshot = decode(
+        br#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","event_time":"1970-01-01T00:00:00Z","price_level":"100.10","new_quantity":"1.25"}]}]}"#,
+    )?;
+    let DecodeOutcome::Data(stale_level_snapshot) = stale_level_snapshot else {
+        return Err("documented stale-level snapshot was not data".into());
+    };
+    assert!(matches!(
+        stale_level_snapshot.observations()[0].timestamp(),
+        market_squawk_sources::ProviderTimestampEvidence::Provided { value, .. }
+            if *value == documented_snapshot_time
+    ));
+
     let delta = decode(include_bytes!("../fixtures/l2update.json"))?;
     let DecodeOutcome::Data(delta) = delta else {
         return Err("delta was not data".into());
@@ -150,6 +164,13 @@ fn classifies_control_extensions_and_provider_input_failures() -> TestResult {
         heartbeat,
         DecodeOutcome::Control(value) if value.kind() == ControlFrameKind::Heartbeat
     ));
+    let live_numeric_heartbeat = decode(
+        br#"{"channel":"heartbeats","timestamp":"2026-08-08T12:00:00.423456Z","sequence_num":3,"events":[{"current_time":"2026-08-08 12:00:00.423456 +0000 UTC","heartbeat_counter":90}]}"#,
+    )?;
+    assert!(matches!(
+        live_numeric_heartbeat,
+        DecodeOutcome::Control(value) if value.kind() == ControlFrameKind::Heartbeat
+    ));
     let extension = decode(br#"{"type":"future_safe_extension","bounded":"value"}"#)?;
     assert!(matches!(
         extension,
@@ -159,31 +180,31 @@ fn classifies_control_extensions_and_provider_input_failures() -> TestResult {
 
     for (payload, reason) in [
         (
-            br#"{"type":"l2update","product_id":"BTC-USD","time":"not-a-time","changes":[["buy","100.00","1.00"]]}"#.as_slice(),
+            br#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"type":"update","product_id":"BTC-USD","updates":[{"side":"bid","event_time":"not-a-time","price_level":"100.00","new_quantity":"1.00"}]}]}"#.as_slice(),
             QuarantineReason::InvalidTimestamp,
         ),
         (
-            br#"{"type":"match","trade_id":10,"sequence":50,"maker_order_id":"a","taker_order_id":"b","time":"2026-07-20T12:00:00Z","product_id":"BTC-USD","size":"-1","price":"100","side":"sell"}"#.as_slice(),
+            br#"{"channel":"market_trades","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"type":"update","trades":[{"trade_id":"10","product_id":"BTC-USD","price":"100","size":"-1","side":"SELL","time":"2026-08-08T12:00:00Z"}]}]}"#.as_slice(),
             QuarantineReason::NegativeQuantity,
         ),
         (
-            br#"{"type":"snapshot","product_id":"ETH-USD","bids":[["100","1"]],"asks":[["101","1"]]}"#.as_slice(),
+            br#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"type":"snapshot","product_id":"ETH-USD","updates":[{"side":"bid","event_time":"2026-08-08T12:00:00Z","price_level":"100","new_quantity":"1"}]}]}"#.as_slice(),
             QuarantineReason::WrongProduct,
         ),
         (
-            br#"{"type":"snapshot","type":"snapshot","product_id":"BTC-USD","bids":[],"asks":[]}"#.as_slice(),
+            br#"{"channel":"l2_data","channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[]}"#.as_slice(),
             QuarantineReason::SchemaViolation,
         ),
         (
-            br#"{"type":"snapshot","product_id":"BTC-USD","bids":[],"asks":[],"unexpected":true}"#.as_slice(),
+            br#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[],"unexpected":true}"#.as_slice(),
             QuarantineReason::SchemaViolation,
         ),
         (
-            br#"{"type":"snapshot","product_id":"BTC-USD","bids":[["1e2","1"]],"asks":[["101","1"]]}"#.as_slice(),
+            br#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","event_time":"2026-08-08T12:00:00Z","price_level":"1e2","new_quantity":"1"}]}]}"#.as_slice(),
             QuarantineReason::InexactNumericValue,
         ),
         (
-            br#"{"type":"subscriptions","channels":[{"name":"level2","product_ids":["BTC-USD"]},{"name":"matches","product_ids":["BTC-USD"]}]}"#.as_slice(),
+            br#"{"channel":"subscriptions","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"subscriptions":{"ticker":["BTC-USD"]}}]}"#.as_slice(),
             QuarantineReason::WrongChannel,
         ),
     ] {
@@ -220,14 +241,18 @@ fn binary_and_oversized_cardinality_fail_closed() -> TestResult {
             if value.reason() == QuarantineReason::SchemaViolation
     ));
 
-    let mut levels = String::from(r#"{"type":"snapshot","product_id":"BTC-USD","bids":["#);
-    for index in 0..=10_000 {
+    let mut levels = String::from(
+        r#"{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00Z","sequence_num":1,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":["#,
+    );
+    for index in 0..=MAX_DECODED_BOOK_ITEMS {
         if index > 0 {
             levels.push(',');
         }
-        levels.push_str(r#"["1","1"]"#);
+        levels.push_str(
+            r#"{"side":"bid","event_time":"2026-08-08T12:00:00Z","price_level":"1","new_quantity":"1"}"#,
+        );
     }
-    levels.push_str(r#"],"asks":[["2","1"]]}"#);
+    levels.push_str(r#"]}]}"#);
     let outcome = decode(levels.as_bytes())?;
     assert!(matches!(
         outcome,

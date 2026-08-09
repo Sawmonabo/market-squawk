@@ -39,13 +39,14 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 6] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 7] = [
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
     "treasury.daily-rates-xml",
     "treasury.fiscal-data",
     "fred-alfred.api-v1-v2",
+    "local.files",
 ];
 pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 8] = [
     "sec.edgar-public",
@@ -487,25 +488,41 @@ impl DurableProviderActivationState {
         let key = lifecycle_surface_key(surface_id)?;
         let store = LocalAuthorityStateStore::try_open(self.lifecycle_root(key))?;
         let Some(encoded) = store.load()? else {
-            let recipe_exists = surface_key(surface_id)
+            let recipe = surface_key(surface_id)
                 .ok()
                 .map(|recipe_key| {
                     LocalAuthorityStateStore::try_open(self.recipe_root(recipe_key))?.load()
                 })
                 .transpose()?
                 .flatten()
-                .is_some();
+                .map(|encoded| decode_activation_state(surface_id, &encoded))
+                .transpose()?;
+            let (phase, session_id) = match recipe {
+                Some(DurableActivationRecipeState::Desired(recipe)) => {
+                    (DurableSourceLifecyclePhase::Active, Some(recipe.session_id))
+                }
+                Some(
+                    DurableActivationRecipeState::Staged(recipe)
+                    | DurableActivationRecipeState::Cutover(recipe),
+                ) => (
+                    DurableSourceLifecyclePhase::ReconciliationRequired,
+                    Some(recipe.session_id),
+                ),
+                Some(DurableActivationRecipeState::Quarantined(quarantine)) => (
+                    DurableSourceLifecyclePhase::ReconciliationRequired,
+                    quarantine.session_id,
+                ),
+                Some(DurableActivationRecipeState::Missing) | None => {
+                    (DurableSourceLifecyclePhase::Stopped, None)
+                }
+            };
             return Ok(DurableSourceLifecycleRecord {
                 revision: NonZeroU64::MIN,
-                phase: if recipe_exists {
-                    DurableSourceLifecyclePhase::Active
-                } else {
-                    DurableSourceLifecyclePhase::Stopped
-                },
+                phase,
                 operation_id: None,
                 command_digest: None,
                 transition_digest: None,
-                session_id: None,
+                session_id,
                 public_configuration_digest: None,
             });
         };
@@ -604,6 +621,71 @@ impl DurableProviderActivationState {
         };
         self.store_source_lifecycle(surface_id, &completed)?;
         Ok(completed)
+    }
+
+    /// Retires every other active live surface during one admitted owner switch.
+    ///
+    /// The caller holds the process-wide activation gate. Every candidate record is validated
+    /// before the first write. If the process stops between records, the selected surface remains
+    /// in `applying` state and restart fails closed until the exact switch is reconciled.
+    pub(super) fn retire_other_active_live_surfaces(
+        &self,
+        selected_surface: &str,
+        live_surfaces: &[&str],
+        operation_id: &SourceIdentifier,
+        command_digest: EvidenceDigest,
+    ) -> Result<(), DurableProviderActivationStateError> {
+        if !live_surfaces.contains(&selected_surface) || command_digest.bytes() == [0; 32] {
+            return Err(DurableProviderActivationStateError::InvalidLifecycle);
+        }
+        let mut retirements = Vec::new();
+        retirements
+            .try_reserve_exact(live_surfaces.len().saturating_sub(1))
+            .map_err(|_| DurableProviderActivationStateError::ResourceExhausted)?;
+        for surface_id in live_surfaces {
+            if *surface_id == selected_surface {
+                continue;
+            }
+            let current = self.source_lifecycle_record(surface_id)?;
+            if matches!(
+                current.phase,
+                DurableSourceLifecyclePhase::Applying
+                    | DurableSourceLifecyclePhase::ReconciliationRequired
+            ) {
+                return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
+            }
+            if current.phase != DurableSourceLifecyclePhase::Active {
+                continue;
+            }
+            let revision = current
+                .revision
+                .get()
+                .checked_add(1)
+                .and_then(NonZeroU64::new)
+                .ok_or(DurableProviderActivationStateError::ResourceExhausted)?;
+            let transition_digest = source_lifecycle_transition_digest(
+                surface_id,
+                revision,
+                operation_id,
+                command_digest,
+            )?;
+            retirements.push((
+                *surface_id,
+                DurableSourceLifecycleRecord {
+                    revision,
+                    phase: DurableSourceLifecyclePhase::Stopped,
+                    operation_id: Some(operation_id.clone()),
+                    command_digest: Some(command_digest),
+                    transition_digest: Some(transition_digest),
+                    session_id: current.session_id,
+                    public_configuration_digest: current.public_configuration_digest,
+                },
+            ));
+        }
+        for (surface_id, retirement) in retirements {
+            self.store_source_lifecycle(surface_id, &retirement)?;
+        }
+        Ok(())
     }
 
     /// Converts an interrupted or indeterminate transition into an explicit recovery barrier.
@@ -1625,6 +1707,7 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "treasury.daily-rates-xml" => Ok("treasury-daily-rates"),
         "treasury.fiscal-data" => Ok("treasury-fiscal"),
         "fred-alfred.api-v1-v2" => Ok("fred-alfred"),
+        "local.files" => Ok("local-files"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }

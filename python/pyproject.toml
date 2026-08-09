@@ -21,7 +21,7 @@ dependencies = [
 market-squawk-train = "market_squawk.training_driver:main"
 
 [tool.uv]
-required-version = "==0.12.1"
+required-version = "==0.12.3"
 python-preference = "managed"
 
 [project.optional-dependencies]
@@ -33,3 +33,8 @@ python-source = "."
 module-name = "market_squawk.market_squawk"
 bindings = "pyo3"
 strip = true
+exclude = [
+  "**/__pycache__",
+  "**/*.pyc",
+  "**/*.pyo",
+]

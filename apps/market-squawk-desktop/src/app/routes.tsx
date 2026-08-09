@@ -1,5 +1,5 @@
-import { lazy, Suspense } from "react"
-import { Navigate, Route, Routes } from "react-router-dom"
+import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from "react"
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom"
 
 import { McpPage } from "@/components/mcp-page"
 
@@ -59,31 +59,74 @@ const SettingsPage = lazy(() =>
 )
 
 export function AppRoutes() {
+  const location = useLocation()
+
   return (
-    <Suspense fallback={<RouteLoading />}>
-      <Routes>
-        <Route path="/overview" element={<OverviewPage />} />
-        <Route path="/lookup" element={<LookupPage />} />
-        <Route path="/markets" element={<MarketsPage />} />
-        <Route path="/sources" element={<SourcesPage />} />
-        <Route path="/research" element={<ResearchPage />} />
-        <Route path="/portfolios" element={<PortfolioPage />} />
-        <Route path="/models" element={<ModelsPage />} />
-        <Route path="/decisions" element={<DecisionsPage />} />
-        <Route path="/backtests" element={<BacktestsPage />} />
-        <Route path="/paper-execution" element={<PaperExecutionPage />} />
-        <Route path="/risk" element={<RiskPage />} />
-        <Route path="/fair-value" element={<FairValuePage />} />
-        <Route path="/updates" element={<LifecyclePage />} />
-        <Route path="/mcp" element={<McpPage />} />
-        <Route path="/operations" element={<OperationsPage />} />
-        <Route path="/logs" element={<LogsPage />} />
-        <Route path="/backup-recovery" element={<BackupRecoveryPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<Navigate to="/overview" replace />} />
-      </Routes>
-    </Suspense>
+    <RouteErrorBoundary key={location.pathname}>
+      <Suspense fallback={<RouteLoading />}>
+        <Routes>
+          <Route path="/overview" element={<OverviewPage />} />
+          <Route path="/lookup" element={<LookupPage />} />
+          <Route path="/markets" element={<MarketsPage />} />
+          <Route path="/sources" element={<SourcesPage />} />
+          <Route path="/research" element={<ResearchPage />} />
+          <Route path="/portfolios" element={<PortfolioPage />} />
+          <Route path="/models" element={<ModelsPage />} />
+          <Route path="/decisions" element={<DecisionsPage />} />
+          <Route path="/backtests" element={<BacktestsPage />} />
+          <Route path="/paper-execution" element={<PaperExecutionPage />} />
+          <Route path="/risk" element={<RiskPage />} />
+          <Route path="/fair-value" element={<FairValuePage />} />
+          <Route path="/updates" element={<LifecyclePage />} />
+          <Route path="/mcp" element={<McpPage />} />
+          <Route path="/operations" element={<OperationsPage />} />
+          <Route path="/logs" element={<LogsPage />} />
+          <Route path="/backup-recovery" element={<BackupRecoveryPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="*" element={<Navigate to="/overview" replace />} />
+        </Routes>
+      </Suspense>
+    </RouteErrorBoundary>
   )
+}
+
+class RouteErrorBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  componentDidCatch(error: Error, information: ErrorInfo) {
+    console.error("Market Squawk page failed to render", error, information)
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children
+    return (
+      <main className="grid min-h-[55vh] place-items-center px-6">
+        <section className="w-full max-w-lg rounded-xl border border-border bg-card/55 p-6 shadow-2xl">
+          <p className="text-xs font-medium uppercase tracking-[0.16em] text-primary">
+            Page recovery
+          </p>
+          <h1 className="mt-2 text-xl font-semibold">This page could not load</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your local service and the rest of the workspace remain available. Return to Overview,
+            then reopen this page after checking its status.
+          </p>
+          <Link
+            className="mt-5 inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"
+            to="/overview"
+          >
+            Return to Overview
+          </Link>
+        </section>
+      </main>
+    )
+  }
 }
 
 function RouteLoading() {

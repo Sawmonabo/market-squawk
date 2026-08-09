@@ -801,11 +801,78 @@ pub enum BudgetPoolError {
     Persistence,
 }
 
+/// Non-serializable proof that one exact provider request permit remains active.
+///
+/// The lease is tied to the permit allocation, its post-admission availability generation, and
+/// the permit's lifetime. It cannot be reconstructed from provider health DTOs and becomes invalid
+/// immediately when the permit is released or the shared budget is revoked or terminal.
+#[derive(Clone)]
+pub struct BudgetPermitLease {
+    allocation: Arc<BudgetAllocation>,
+    availability_generation: u64,
+    active: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for BudgetPermitLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BudgetPermitLease")
+            .field("availability_generation", &self.availability_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BudgetPermitLease {
+    pub(crate) fn is_current(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+            && !self.allocation.terminal.load(Ordering::Acquire)
+            && !self.allocation.state.is_poisoned()
+            && self
+                .allocation
+                .durability
+                .as_ref()
+                .is_none_or(|binding| binding.session.is_available())
+            && self
+                .allocation
+                .availability_generation
+                .load(Ordering::Acquire)
+                == self.availability_generation
+            && self.active.load(Ordering::Acquire)
+            && !self.allocation.state.is_poisoned()
+            && !self.allocation.terminal.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shares_allocation_with(&self, budget: &SharedProviderBudget) -> bool {
+        Arc::ptr_eq(&self.allocation, &budget.allocation)
+    }
+
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        let state_dynamic = self.allocation.state.lock().ok()?.dynamic_retained_bytes()?;
+        std::mem::size_of::<BudgetAllocation>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                BudgetAllocation,
+            >())
+            .and_then(|bytes| {
+                self.allocation
+                    .policy
+                    .dynamic_retained_bytes()
+                    .and_then(|dynamic| bytes.checked_add(dynamic))
+            })
+            .and_then(|bytes| bytes.checked_add(state_dynamic))
+            .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<AtomicBool>()))
+            .and_then(|bytes| {
+                bytes.checked_add(crate::conservative_arc_control_block_charge::<AtomicBool>())
+            })
+    }
+}
+
 /// RAII reservation for one in-flight provider request.
 pub struct BudgetPermit {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
     pub(in crate::policy) runtime_admission: RuntimeOperationAdmission,
     pub(in crate::policy) provider_rate: Option<ProviderRatePermit>,
+    pub(in crate::policy) active: Arc<AtomicBool>,
     pub(in crate::policy) released: bool,
 }
 
@@ -819,6 +886,18 @@ impl std::fmt::Debug for BudgetPermit {
 }
 
 impl BudgetPermit {
+    /// Borrows the exact active request as an opaque process-local authority lease.
+    pub fn active_lease(&self) -> BudgetPermitLease {
+        BudgetPermitLease {
+            allocation: Arc::clone(&self.allocation),
+            availability_generation: self
+                .allocation
+                .availability_generation
+                .load(Ordering::Acquire),
+            active: Arc::clone(&self.active),
+        }
+    }
+
     /// Explicitly releases the concurrency slot; request-window consumption remains recorded.
     pub fn release(mut self) {
         self.release_inner();
@@ -828,6 +907,7 @@ impl BudgetPermit {
         if self.released {
             return;
         }
+        self.active.store(false, Ordering::Release);
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };

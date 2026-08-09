@@ -439,6 +439,23 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
 
 /// Nonblocking bounded sink used by a live source reader before decoding.
 pub trait RawMarketSink: Send {
+    /// Binds an exact active provider request to health derived from this live stream.
+    ///
+    /// Sources whose connection itself consumes a provider concurrency slot call this once after
+    /// the transport handshake and before publishing the first frame. Sinks that do not qualify
+    /// live authority may ignore the opaque lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed sink error when the sink cannot accept the request authority.
+    fn bind_active_request_budget(
+        &mut self,
+        request: crate::BudgetPermitLease,
+    ) -> Result<(), SinkError> {
+        let _request = request;
+        Ok(())
+    }
+
     /// Attempts to publish one exact raw frame without waiting for capacity.
     ///
     /// # Errors

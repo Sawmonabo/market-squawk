@@ -189,6 +189,46 @@ impl AuthoritativeSourceRegistry {
         )
     }
 
+    /// Reconciles one live-source authority store while the installed service exclusively owns
+    /// the exact selected workspace.
+    ///
+    /// This is a startup-only recovery boundary. It derives the live authority store from the
+    /// installation-bound workspace guard, advances a structurally valid orphaned run, and then
+    /// publishes a clean terminal marker before any live runtime is constructed. Ordinary live
+    /// constructors continue to reject unclean predecessors, so an in-process retry cannot use
+    /// this operation to overlap a producer that may still be alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::AuthorityPersistence`] when `source_key` is not one safe path
+    /// component or the exact store cannot be opened. All durable state, clock, capacity, and
+    /// shutdown failures retain their existing typed errors.
+    pub fn reconcile_live_authority_for_exclusive_installed_service_replacement(
+        selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
+        source_key: &str,
+    ) -> Result<(), RegistryError> {
+        if !is_safe_live_authority_key(source_key) {
+            return Err(RegistryError::AuthorityPersistence);
+        }
+        let store = market_squawk_platform::LocalAuthorityStateStore::try_open(
+            selected_workspace
+                .workspace_paths()
+                .root()
+                .join("authority")
+                .join(source_key),
+        )
+        .map_err(|_error| RegistryError::AuthorityPersistence)?;
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        let registry = Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            None,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        )?;
+        registry.shutdown()
+    }
+
     #[cfg(test)]
     pub(super) fn try_new_durable_with_store_for_exclusive_installed_replacement_for_test(
         store: Arc<dyn crate::policy::AuthorityStateStore>,
@@ -616,4 +656,13 @@ impl AuthoritativeSourceRegistry {
         }
         Ok(())
     }
+}
+
+fn is_safe_live_authority_key(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }

@@ -162,7 +162,7 @@ pub(crate) fn route_feature_owner_bytes(
             config.maximum_feature_window_bytes_per_route().get() as u64,
             feature_sets,
         )?,
-        config.maximum_action_hook_bytes_per_route().get() as u64,
+        config.maximum_action_hook_bytes_per_route() as u64,
     )
 }
 

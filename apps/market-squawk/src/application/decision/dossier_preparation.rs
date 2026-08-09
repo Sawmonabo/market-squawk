@@ -10,8 +10,10 @@ use market_squawk_decisions::{
     DossierEvidence, DossierId, DossierReference, DossierSection, ScreenRunId,
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
+use market_squawk_modeling::BundleId;
 use market_squawk_runtime::{ServiceGeneration, WorkspaceId};
 use market_squawk_services::RequestOrigin;
+use market_squawk_valuation::DecisionId;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
@@ -22,6 +24,7 @@ const MAXIMUM_PREPARED_DOSSIERS: usize = 256;
 const RECEIPT_LIFETIME: Duration = Duration::from_secs(300);
 const RECEIPT_LIFETIME_NANOS: i64 = 300_000_000_000;
 const ID_ALLOCATION_ATTEMPTS: usize = 16;
+const MAXIMUM_EVIDENCE_SELECTOR_BYTES: usize = 192;
 const DOSSIER_DIGEST_DOMAIN: &[u8] = b"market-squawk/decision-dossier/v1\0";
 
 /// Dossier preparation or confirmation failure.
@@ -102,6 +105,104 @@ pub enum DossierEvidenceSelection {
     Universe,
     /// Immutable portfolio-impact revision already retained by the candidate.
     PortfolioImpact,
+    /// Immutable completed forecast resolved by the installed model authority.
+    Forecast,
+    /// Immutable classification decision resolved by the installed fair-value authority.
+    FairValue,
+}
+
+/// One completed forecast resolved from an installed-service selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DossierForecastEvidence {
+    selector: Box<str>,
+    content_identity: DecisionContentDigest,
+    model_bundle: BundleId,
+}
+
+impl DossierForecastEvidence {
+    /// Retains only a bounded selector and typed identities resolved by the model authority.
+    pub fn try_new(
+        selector: impl Into<Box<str>>,
+        content_identity: DecisionContentDigest,
+        model_bundle: BundleId,
+    ) -> Result<Self, DossierPreparationError> {
+        let selector = selector.into();
+        if selector.is_empty()
+            || selector.len() > MAXIMUM_EVIDENCE_SELECTOR_BYTES
+            || selector.bytes().any(|byte| {
+                byte.is_ascii_control() || byte.is_ascii_whitespace() || !byte.is_ascii()
+            })
+        {
+            return Err(DossierPreparationError::InvalidRequest);
+        }
+        Ok(Self {
+            selector,
+            content_identity,
+            model_bundle,
+        })
+    }
+
+    /// Stable service-issued selector used only for re-resolution and presentation.
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Exact immutable forecast-vintage identity.
+    pub const fn content_identity(&self) -> DecisionContentDigest {
+        self.content_identity
+    }
+
+    /// Admitted model bundle that produced the forecast.
+    pub const fn model_bundle(&self) -> &BundleId {
+        &self.model_bundle
+    }
+}
+
+/// One classification decision resolved from an installed-service selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DossierFairValueEvidence {
+    selector: Box<str>,
+    content_identity: DecisionContentDigest,
+    decision_id: DecisionId,
+}
+
+impl DossierFairValueEvidence {
+    /// Retains only a bounded selector and typed identities resolved by Fair Value authority.
+    pub fn try_new(
+        selector: impl Into<Box<str>>,
+        content_identity: DecisionContentDigest,
+        decision_id: DecisionId,
+    ) -> Result<Self, DossierPreparationError> {
+        let selector = selector.into();
+        if selector.is_empty()
+            || selector.len() > MAXIMUM_EVIDENCE_SELECTOR_BYTES
+            || selector.bytes().any(|byte| {
+                byte.is_ascii_control() || byte.is_ascii_whitespace() || !byte.is_ascii()
+            })
+        {
+            return Err(DossierPreparationError::InvalidRequest);
+        }
+        Ok(Self {
+            selector,
+            content_identity,
+            decision_id,
+        })
+    }
+
+    /// Stable service-issued selector used only for re-resolution and presentation.
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Exact immutable classification-decision content identity.
+    pub const fn content_identity(&self) -> DecisionContentDigest {
+        self.content_identity
+    }
+
+    /// Typed fair-value classification decision bound into the dossier core.
+    pub const fn decision_id(&self) -> DecisionId {
+        self.decision_id
+    }
 }
 
 /// Authority-free presentation request for dossier assembly.
@@ -109,6 +210,8 @@ pub enum DossierEvidenceSelection {
 pub struct DossierPreparationDraft {
     pub candidate_id: CandidateId,
     pub evidence: Vec<DossierEvidenceSelection>,
+    pub forecast: Option<DossierForecastEvidence>,
+    pub fair_value: Option<DossierFairValueEvidence>,
 }
 
 /// Selectable evidence availability for one retained candidate.
@@ -158,6 +261,8 @@ pub struct PreparedDossierPreview {
     pub screen_run_id: ScreenRunId,
     pub instrument_id: InstrumentId,
     pub evidence: Vec<DossierEvidenceSelection>,
+    pub forecast_selector: Option<Box<str>>,
+    pub fair_value_selector: Option<Box<str>>,
     pub assembled_at: Timestamp,
     pub receipt_expires_at: Timestamp,
 }
@@ -210,8 +315,12 @@ impl DossierPreparationAuthority {
         if self.prepared.len() >= MAXIMUM_PREPARED_DOSSIERS {
             return Err(DossierPreparationError::Capacity);
         }
+        let forecast_selected = draft.evidence.contains(&DossierEvidenceSelection::Forecast);
+        let fair_value_selected = draft
+            .evidence
+            .contains(&DossierEvidenceSelection::FairValue);
         if draft.evidence.is_empty()
-            || draft.evidence.len() > 4
+            || draft.evidence.len() > 6
             || draft
                 .evidence
                 .iter()
@@ -222,6 +331,9 @@ impl DossierPreparationAuthority {
                 .contains(&DossierEvidenceSelection::Candidate)
             || !draft.evidence.contains(&DossierEvidenceSelection::Dataset)
             || !draft.evidence.contains(&DossierEvidenceSelection::Universe)
+            || forecast_selected != draft.forecast.is_some()
+            || fair_value_selected != draft.fair_value.is_some()
+            || (!forecast_selected && !fair_value_selected)
         {
             return Err(DossierPreparationError::InvalidRequest);
         }
@@ -276,6 +388,22 @@ impl DossierPreparationAuthority {
                         .map_err(|_error| DossierPreparationError::InvalidRequest)?,
                     ))
                 }
+                DossierEvidenceSelection::Forecast => Ok(DossierReference::new(
+                    DossierSection::Forecast,
+                    draft
+                        .forecast
+                        .as_ref()
+                        .ok_or(DossierPreparationError::NotFound)?
+                        .content_identity(),
+                )),
+                DossierEvidenceSelection::FairValue => Ok(DossierReference::new(
+                    DossierSection::FairValue,
+                    draft
+                        .fair_value
+                        .as_ref()
+                        .ok_or(DossierPreparationError::NotFound)?
+                        .content_identity(),
+                )),
             })
             .collect::<Result<Vec<_>, DossierPreparationError>>()?;
         let dossier_id = allocate_dossier_id(authority, &self.prepared)?;
@@ -287,7 +415,18 @@ impl DossierPreparationAuthority {
             &references,
             portfolio.as_ref().map(|token| token.bytes()),
         )?;
-        let evidence = DossierEvidence::new(None, portfolio, None, content_identity);
+        let evidence = DossierEvidence::new(
+            draft
+                .forecast
+                .as_ref()
+                .map(|forecast| forecast.model_bundle().clone()),
+            portfolio,
+            draft
+                .fair_value
+                .as_ref()
+                .map(DossierFairValueEvidence::decision_id),
+            content_identity,
+        );
         let dossier = Dossier::try_new(dossier_id.clone(), candidate.record(), now, evidence)
             .map_err(|_error| DossierPreparationError::InvalidRequest)?;
         let dossier = DecisionDossier::try_new(dossier, references)
@@ -317,6 +456,12 @@ impl DossierPreparationAuthority {
             screen_run_id: run.id().clone(),
             instrument_id: candidate.record().instrument_id(),
             evidence: draft.evidence,
+            forecast_selector: draft
+                .forecast
+                .map(|forecast| forecast.selector().to_owned().into_boxed_str()),
+            fair_value_selector: draft
+                .fair_value
+                .map(|fair_value| fair_value.selector().to_owned().into_boxed_str()),
             assembled_at: now,
             receipt_expires_at: expires_at,
         })
@@ -480,6 +625,8 @@ const fn selection_ordinal(selection: DossierEvidenceSelection) -> u8 {
         DossierEvidenceSelection::Dataset => 2,
         DossierEvidenceSelection::Universe => 3,
         DossierEvidenceSelection::PortfolioImpact => 4,
+        DossierEvidenceSelection::Forecast => 5,
+        DossierEvidenceSelection::FairValue => 6,
     }
 }
 

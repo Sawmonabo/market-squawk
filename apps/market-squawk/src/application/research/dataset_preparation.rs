@@ -583,9 +583,19 @@ impl DatasetPreparationAuthority {
             let remaining = MAXIMUM_QUERY_BYTES
                 .checked_sub(estimated_observation_bytes(&observations))
                 .ok_or(DatasetPreparationError::Capacity)?;
-            let (mut decoded, _) =
-                ResearchArrowBatch::decode_record_batch_bounded(batch.clone(), remaining)
-                    .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+            let (mut decoded, _) = ResearchArrowBatch::decode_query_projection_bounded(
+                batch.clone(),
+                remaining,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    dataset = generation.manifest().dataset_id().as_str(),
+                    generation = generation.manifest().manifest_version(),
+                    error = ?error,
+                    "canonical research generation could not be decoded for guided dataset preparation"
+                );
+                DatasetPreparationError::InvalidEvidence
+            })?;
             observations.append(&mut decoded);
             if observations.len() > MAXIMUM_OBSERVATIONS_PER_GENERATION {
                 return Err(DatasetPreparationError::Capacity);
@@ -609,8 +619,8 @@ impl fmt::Debug for DatasetPreparationAuthority {
 impl From<DatasetPreparationError> for ServiceError {
     fn from(value: DatasetPreparationError) -> Self {
         match value {
-            DatasetPreparationError::InvalidSelection
-            | DatasetPreparationError::InvalidEvidence => Self::InvalidRequest,
+            DatasetPreparationError::InvalidSelection => Self::InvalidRequest,
+            DatasetPreparationError::InvalidEvidence => Self::InvalidResult,
             DatasetPreparationError::NotFound | DatasetPreparationError::Expired => Self::NotFound,
             DatasetPreparationError::Unauthorized | DatasetPreparationError::Authority => {
                 Self::Unauthorized

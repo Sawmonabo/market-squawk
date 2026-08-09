@@ -77,7 +77,8 @@ impl InstalledBacktestPreparation {
                 (encode(&options)?, count)
             }
             PREVIEW_BACKTEST => {
-                let input: BacktestPreviewRequest = decode(request.arguments())?;
+                let input: BacktestPreviewRequest =
+                    decode(&super::business_arguments(request.arguments()))?;
                 let preview = self
                     .authority
                     .preview(
@@ -110,7 +111,7 @@ impl InstalledBacktestPreparation {
         context: &RequestContext,
     ) -> Result<GovernedBacktestInputRegistrationInput, ServiceError> {
         ensure_live(context)?;
-        let input: BacktestStartRequest = decode_without_confirmation(request.arguments())?;
+        let input: BacktestStartRequest = decode(&super::business_arguments(request.arguments()))?;
         let catalog = self.catalog(context).await?;
         self.authority
             .consume(
@@ -250,14 +251,6 @@ fn display_name(dataset_id: &str) -> String {
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
     serde_json::from_value(Value::Object(arguments.clone()))
         .map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn decode_without_confirmation<T: for<'de> Deserialize<'de>>(
-    arguments: &Map<String, Value>,
-) -> Result<T, ServiceError> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    decode(&admitted)
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Value, ServiceError> {

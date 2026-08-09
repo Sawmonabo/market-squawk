@@ -27,6 +27,21 @@ const tradingStatusSchema = z
   .nullable()
 const completenessSchema = z.enum(["complete", "truncated", "unavailable"])
 const resultCompletenessSchema = z.enum(["complete", "truncated"])
+const shardIdSchema = z
+  .string()
+  .regex(/^(0|[1-9]\d{0,4})\/([1-9]\d{0,4})$/)
+  .superRefine((value, context) => {
+    const separator = value.indexOf("/")
+    if (separator < 1) {
+      context.addIssue({ code: "custom", message: "Invalid live-state shard identity." })
+      return
+    }
+    const index = Number(value.slice(0, separator))
+    const count = Number(value.slice(separator + 1))
+    if (index > 65_535 || count > 65_535 || index >= count) {
+      context.addIssue({ code: "custom", message: "Invalid live-state shard identity." })
+    }
+  })
 
 const identityShape = {
   sourceId: z.string().min(1),
@@ -36,7 +51,7 @@ const identityShape = {
   providerChannel: z.string().min(1),
   connectionGeneration: losslessIntegerSchema,
   stateRevision: losslessIntegerSchema,
-  shardId: z.string().uuid(),
+  shardId: shardIdSchema,
   shardSnapshotRevision: losslessIntegerSchema,
 }
 

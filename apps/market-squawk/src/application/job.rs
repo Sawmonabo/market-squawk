@@ -215,16 +215,34 @@ impl JobView {
         self.sequence
     }
 
+    /// Code-owned runner kind for this job.
+    #[must_use]
+    pub const fn kind(&self) -> &SourceIdentifier {
+        &self.kind
+    }
+
     /// Current durable lifecycle state.
     #[must_use]
     pub const fn state(&self) -> JobState {
         self.state
     }
 
+    /// Whether cooperative cancellation was requested for this generation.
+    #[must_use]
+    pub const fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
     /// Immutable terminal result reference, if the domain authority completed publication.
     #[must_use]
     pub const fn result(&self) -> Option<&JobResultReference> {
         self.result.as_ref()
+    }
+
+    /// Typed terminal failure, when the job failed.
+    #[must_use]
+    pub const fn failure(&self) -> Option<&JobFailure> {
+        self.failure.as_ref()
     }
 }
 

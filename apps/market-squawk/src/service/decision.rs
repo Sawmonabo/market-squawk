@@ -32,7 +32,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::application::decision::{DecisionApplication, DecisionApplicationError};
+use crate::application::{
+    Application,
+    decision::{DecisionApplication, DecisionApplicationError},
+};
 use crate::portfolio_application::PortfolioFairValueReadCapability;
 
 use self::{
@@ -64,6 +67,7 @@ pub(super) struct InstalledDecisionOperations {
 
 impl InstalledDecisionOperations {
     pub(super) fn try_new(
+        application: Arc<Application>,
         decisions: Arc<DecisionApplication>,
         analytical_reader: market_squawk_data::AnalyticalReadCapability,
         portfolio: PortfolioFairValueReadCapability,
@@ -72,7 +76,11 @@ impl InstalledDecisionOperations {
         let features =
             ProductionFeatureRegistry::try_new().map_err(|_error| ServiceError::Unavailable)?;
         Ok(Self {
-            dossier_preparation: DossierPreparationOperations::new(Arc::clone(&decisions), runtime),
+            dossier_preparation: DossierPreparationOperations::new(
+                Arc::clone(&decisions),
+                application,
+                runtime,
+            ),
             screen_workflow: ScreenWorkflowOperations::new(
                 Arc::clone(&decisions),
                 analytical_reader,
@@ -121,19 +129,19 @@ impl InstalledDecisionOperations {
             .await
     }
 
-    pub(super) fn call(
+    pub(super) async fn call(
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
         if DossierPreparationOperations::owns(request.name()) {
-            return self.dossier_preparation.call(request, context);
+            return self.dossier_preparation.call(request, context).await;
         }
         if TargetPreparationOperations::owns(request.name()) {
             return self.target_preparation.call(request, context);
         }
-        let arguments = mutation_arguments(request.arguments());
+        let arguments = super::business_arguments(request.arguments());
         let (content, item_count) = match request.name() {
             SAVE_SCREEN => {
                 let input: SaveScreenRequest = decode(&arguments)?;
@@ -629,12 +637,6 @@ impl ReviewInput {
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
     serde_json::from_value(Value::Object(arguments.clone())).map_err(invalid)
-}
-
-fn mutation_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    admitted
 }
 
 fn revision(value: u32) -> Result<RevisionNumber, ServiceError> {

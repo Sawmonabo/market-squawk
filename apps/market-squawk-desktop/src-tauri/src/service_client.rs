@@ -1122,7 +1122,8 @@ pub(crate) async fn source_control(
         SourceLifecycleAction::Remove => "Source.Remove",
     };
     let mut arguments = Map::new();
-    arguments.insert("provider".to_owned(), json!(request.provider));
+    arguments.insert("provider".to_owned(), json!(&request.provider));
+    arguments.insert("sourceCoverage".to_owned(), json!([&request.provider]));
     arguments.insert(
         "expectedStateRevision".to_owned(),
         json!(request.expected_state_revision),

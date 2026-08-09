@@ -1038,7 +1038,8 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
     let mut reporter = registry.take_current_health_reporter(&session)?;
     let budget = session.budget().ok_or("remote session budget missing")?;
     let first_health_at = now_timestamp()?;
-    let qualified_health_at = next_timestamp_after(first_health_at)?;
+    let active_health_at = next_timestamp_after(first_health_at)?;
+    let qualified_health_at = next_timestamp_after(active_health_at)?;
     let cooling_health_at = next_timestamp_after(qualified_health_at)?;
     let disabled_health_at = next_timestamp_after(cooling_health_at)?;
 
@@ -1054,7 +1055,23 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
         registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
+    let active_request = permit.active_lease();
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, active_health_at.unix_nanos())?,
+            &active_request,
+        )?,
+    )?;
+    let active = registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    assert!(active.validate_at(active_health_at).is_ok());
     permit.release();
+    assert_eq!(
+        active.validate_at(active_health_at),
+        Err(RegistryError::HealthNotQualified)
+    );
 
     registry.record_health(
         &session,

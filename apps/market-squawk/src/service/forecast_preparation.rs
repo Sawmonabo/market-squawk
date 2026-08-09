@@ -110,7 +110,8 @@ impl InstalledForecastPreparation {
                 (catalog_value(&catalog, &labels), item_count)
             }
             PREPARE_FORECAST => {
-                let input: ForecastPreparationRequest = decode(request.arguments())?;
+                let input: ForecastPreparationRequest =
+                    decode(&super::business_arguments(request.arguments()))?;
                 let selection = input.selection.try_into_domain()?;
                 let prepared = authority
                     .prepare(
@@ -144,7 +145,7 @@ impl InstalledForecastPreparation {
     ) -> Result<TypedToolRequest, ServiceError> {
         ensure_live(context)?;
         let authority = self.authority.as_ref().ok_or(ServiceError::Unavailable)?;
-        let input: PreparedForecastStart = decode_without_confirmation(request.arguments())?;
+        let input: PreparedForecastStart = decode(&super::business_arguments(request.arguments()))?;
         let receipt = input.receipt.try_into_domain()?;
         authority
             .consume(
@@ -505,14 +506,6 @@ const fn semantics_name(value: ModelOutputSemantics) -> &'static str {
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
     serde_json::from_value(Value::Object(arguments.clone()))
         .map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn decode_without_confirmation<T: for<'de> Deserialize<'de>>(
-    arguments: &Map<String, Value>,
-) -> Result<T, ServiceError> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    decode(&admitted)
 }
 
 fn parse_u64(value: &str) -> Result<u64, ServiceError> {

@@ -144,7 +144,7 @@ impl SharedProviderBudget {
 mod durability;
 pub(in crate::policy) use durability::CleanShutdownProof;
 pub(crate) use durability::ProviderBudgetPool;
-pub use durability::{BudgetPermit, BudgetPoolError};
+pub use durability::{BudgetPermit, BudgetPermitLease, BudgetPoolError};
 
 pub(super) trait BudgetClock: Send + Sync {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason>;

@@ -14,8 +14,9 @@ use std::marker::PhantomData;
 
 use crate::{ExtractionLimits, FileAdapterError};
 
-pub(super) const MANIFEST_SCHEMA_VERSION: u16 = 4;
-const PREVIOUS_MANIFEST_SCHEMA_VERSION: u16 = 3;
+pub(super) const MANIFEST_SCHEMA_VERSION: u16 = 5;
+const PREVIOUS_MANIFEST_SCHEMA_VERSION: u16 = 4;
+const LEGACY_MANIFEST_SCHEMA_VERSION: u16 = 3;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
 pub(super) const MAX_MAPPINGS: usize = 1_024;
 
@@ -41,7 +42,9 @@ impl FileSourceManifest {
     pub(crate) fn validate(&self) -> Result<(), FileAdapterError> {
         if !matches!(
             self.schema_version,
-            PREVIOUS_MANIFEST_SCHEMA_VERSION | MANIFEST_SCHEMA_VERSION
+            LEGACY_MANIFEST_SCHEMA_VERSION
+                | PREVIOUS_MANIFEST_SCHEMA_VERSION
+                | MANIFEST_SCHEMA_VERSION
         ) || self.objects.is_empty()
             || self.objects.len() > MAX_MANIFEST_OBJECTS
         {
@@ -56,8 +59,9 @@ impl FileSourceManifest {
                     .superseded_at
                     .is_some_and(|value| value <= object.effective_at)
                 || object.revision_number == 0
-                || (self.schema_version == PREVIOUS_MANIFEST_SCHEMA_VERSION
+                || (self.schema_version == LEGACY_MANIFEST_SCHEMA_VERSION
                     && object.universe_membership.is_some())
+                || (self.schema_version != MANIFEST_SCHEMA_VERSION && object.row_time.is_some())
                 || object
                     .universe_membership
                     .as_ref()
@@ -79,6 +83,9 @@ impl FileSourceManifest {
             }
             object.format.validate()?;
             object.row_policy.validate()?;
+            if let Some(row_time) = &object.row_time {
+                row_time.validate()?;
+            }
             object.validate_format_policy()?;
         }
         Ok(())
@@ -101,6 +108,9 @@ pub(crate) struct FileObjectSpec {
     pub(crate) superseded_at: Option<Timestamp>,
     /// Record coordinates retained independently from the exact discovery-object interval.
     pub(crate) record_time: FileRecordTimeSpec,
+    /// Optional exact source-field overrides for canonical per-row time and revision semantics.
+    #[serde(default)]
+    pub(crate) row_time: Option<RowTimeFieldSpec>,
     pub(crate) instrument_binding: InstrumentBinding,
     /// Optional explicit source-authored historical-universe evidence for this exact object.
     #[serde(default)]
@@ -152,6 +162,40 @@ pub(crate) struct FileRecordTimeSpec {
     pub(crate) superseded: Option<ResearchTemporalCoordinate>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RowTimeFieldSpec {
+    pub(crate) effective_field: Option<String>,
+    pub(crate) published_field: Option<String>,
+    pub(crate) available_field: Option<String>,
+    pub(crate) revision_field: Option<String>,
+    pub(crate) revision_number_field: Option<String>,
+    pub(crate) superseded_field: Option<String>,
+}
+
+impl RowTimeFieldSpec {
+    fn validate(&self) -> Result<(), FileAdapterError> {
+        let mut fields = self.fields().peekable();
+        if fields.peek().is_none() || fields.any(|field| !valid_source_column_name(field)) {
+            return Err(FileAdapterError::InvalidManifest);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fields(&self) -> impl Iterator<Item = &str> {
+        [
+            self.effective_field.as_deref(),
+            self.published_field.as_deref(),
+            self.available_field.as_deref(),
+            self.revision_field.as_deref(),
+            self.revision_number_field.as_deref(),
+            self.superseded_field.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 impl FileObjectSpec {
     fn validate_format_policy(&self) -> Result<(), FileAdapterError> {
         let FileFormat::Sqlite { columns, .. } = &self.format else {
@@ -164,6 +208,10 @@ impl FileObjectSpec {
                 .fields
                 .iter()
                 .any(|mapping| !selected.contains(mapping.source.as_str()))
+            || self
+                .row_time
+                .as_ref()
+                .is_some_and(|row_time| row_time.fields().any(|field| !selected.contains(field)))
         {
             return Err(FileAdapterError::InvalidManifest);
         }
@@ -471,12 +519,12 @@ impl<'de> Deserialize<'de> for FormatStrings {
 }
 
 impl FileFormat {
-    fn validate(&self) -> Result<(), FileAdapterError> {
+    pub(crate) fn validate(&self) -> Result<(), FileAdapterError> {
         match self {
             Self::Csv { delimiter } if matches!(*delimiter, b'\n' | b'\r' | b'"' | 0) => {
                 Err(FileAdapterError::InvalidManifest)
             }
-            Self::Xml { record_element } if !valid_field_name(record_element) => {
+            Self::Xml { record_element } if !valid_canonical_field_name(record_element) => {
                 Err(FileAdapterError::InvalidManifest)
             }
             Self::Sqlite {
@@ -550,13 +598,13 @@ pub(crate) struct RowPolicy {
 
 impl RowPolicy {
     fn validate(&self) -> Result<(), FileAdapterError> {
-        if !valid_field_name(&self.identity_field) {
+        if !valid_source_column_name(&self.identity_field) {
             return Err(FileAdapterError::InvalidManifest);
         }
         let mut sources = BTreeSet::new();
         let mut outputs = BTreeSet::new();
         for field in &self.fields {
-            if !valid_field_name(&field.source)
+            if !valid_source_column_name(&field.source)
                 || field.decimal_scale > Decimal::MAX_SCALE
                 || !sources.insert(field.source.as_str())
                 || !outputs.insert(field.field.as_str())
@@ -577,12 +625,16 @@ pub(crate) struct FieldMapping {
     pub(crate) unit: Option<SourceIdentifier>,
 }
 
-fn valid_field_name(value: &str) -> bool {
+fn valid_canonical_field_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })
+}
+
+fn valid_source_column_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 fn valid_sql_identifier(value: &str) -> bool {

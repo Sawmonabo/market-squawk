@@ -74,8 +74,8 @@ struct ProductionPaperRecovery {
 
 pub(crate) use defaults::{
     PaperStrategyMode, local_coinbase_direct_paper_bot_with_activation_and_strategy_mode,
-    local_paper_bot_with_provider_rate_and_strategy_mode, manual_paper_account_id,
-    manual_paper_reason_code, manual_paper_strategy_id,
+    local_live_market_with_provider_rate, local_paper_bot_with_provider_rate_and_strategy_mode,
+    manual_paper_account_id, manual_paper_reason_code, manual_paper_strategy_id,
 };
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
 #[cfg(test)]

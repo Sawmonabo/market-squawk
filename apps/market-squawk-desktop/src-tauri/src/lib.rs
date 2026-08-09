@@ -7,11 +7,13 @@ use std::{
 
 use clap::Parser;
 use market_squawk::cli::McpClientArgument;
+#[cfg(debug_assertions)]
+use market_squawk::verified_development_mcp_relay_program;
 #[cfg(target_os = "linux")]
 use market_squawk::verified_installed_cli_program;
 use market_squawk_installer::{
     InstallError, PlatformError, ProgramName, UninstallRequest, default_install_root,
-    program_install_snapshot, uninstall,
+    default_installation_data_root, program_install_snapshot, uninstall,
 };
 use market_squawk_platform::{AppConfig, ConfigError, ConfigOverrides, ConfigSources};
 use tauri::Manager;
@@ -31,9 +33,11 @@ use bridge::{
     desktop_service_bootstrap, installation_control, open_official_provider_page,
     open_protected_provider_setup, provider_onboarding,
 };
+use contracts::DesktopCommandError;
 use events::subscribe_service_events;
 use input_staging::{
-    commit_portfolio_import, discard_portfolio_import, preview_portfolio_import,
+    commit_portfolio_import, commit_research_file_import, discard_portfolio_import,
+    discard_research_file_import, preview_portfolio_import, preview_research_file_import,
     stage_training_input, start_backtest_from_file,
 };
 use mcp_clients::{mcp_client_control, mcp_status};
@@ -51,6 +55,8 @@ const APPIMAGE_HEADER_BYTES: usize = 11;
 const DESKTOP_EXECUTABLE_BASENAME: &str = "market-squawk-desktop";
 #[cfg(target_os = "linux")]
 const CLI_EXECUTABLE_BASENAME: &str = "market-squawk";
+#[cfg(debug_assertions)]
+const DEVELOPMENT_MCP_RELAY_PROGRAM: &str = "MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM";
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk-desktop")]
@@ -113,14 +119,24 @@ enum DesktopStartupError {
     },
     #[error("desktop configuration is invalid")]
     Configuration(#[from] ConfigError),
-    #[error("complete product installation failed")]
+    #[error("complete product installation failed: {0}")]
     Installation(#[from] installation::InstallationStartupError),
-    #[error("installed service initialization failed")]
+    #[error("installed service initialization failed: {0}")]
     Service(#[from] service::DesktopServiceError),
-    #[error("installed service bootstrap is incompatible with this dashboard")]
-    InvalidServiceBootstrap,
+    #[error("installed service data location is unavailable")]
+    ServiceDataRoot {
+        #[source]
+        source: PlatformError,
+    },
+    #[error("installed service bootstrap is incompatible with this dashboard: {source}")]
+    InvalidServiceBootstrap {
+        #[source]
+        source: DesktopCommandError,
+    },
     #[error("desktop runtime initialization failed")]
     Tauri(#[from] tauri::Error),
+    #[error("desktop main window is unavailable")]
+    MainWindowUnavailable,
     #[error("desktop state was already installed")]
     DuplicateState,
     #[error("installed MCP client authority is unavailable")]
@@ -234,16 +250,22 @@ fn run_stdio_mcp(_args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 }
 
 fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
-    let installation_data_root = args.installation_data_root.clone();
+    let installation_data_root = args
+        .installation_data_root
+        .clone()
+        .map_or_else(default_installation_data_root, Ok)
+        .map_err(|source| DesktopStartupError::ServiceDataRoot { source })?;
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             analysis_control,
+            commit_research_file_import,
             dashboard_query,
             decision_control,
             desktop_bootstrap,
             desktop_service_bootstrap,
             discard_portfolio_import,
+            discard_research_file_import,
             fair_value_control,
             governance_control,
             governance_query,
@@ -257,6 +279,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             open_protected_provider_setup,
             paper_control,
             preview_portfolio_import,
+            preview_research_file_import,
             provider_onboarding,
             research_control,
             source_control,
@@ -275,6 +298,11 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
     environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
+    #[cfg(debug_assertions)]
+    {
+        environment.remove(&OsString::from("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM"));
+        environment.remove(&OsString::from(DEVELOPMENT_MCP_RELAY_PROGRAM));
+    }
     let config_path = args
         .config
         .as_deref()
@@ -298,7 +326,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let service = tauri::async_runtime::block_on(service::connect_or_start(
         &config,
         config_path.as_deref(),
-        installation_data_root.as_deref(),
+        Some(&installation_data_root),
     ))?;
     let relay_program = mcp_relay_program(&installation.root)?;
     let bootstrap_state = DesktopBootstrapState::compose(
@@ -306,15 +334,25 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         service,
         DesktopCompositionContext::new(
             config.data_dir().to_path_buf(),
+            installation_data_root,
             installation.root,
             installation.status,
             relay_program,
         ),
     )
-    .map_err(|_error| DesktopStartupError::InvalidServiceBootstrap)?;
+    .map_err(|source| DesktopStartupError::InvalidServiceBootstrap { source })?;
     if !app.manage(bootstrap_state) {
         return Err(DesktopStartupError::DuplicateState);
     }
+    let window = app
+        .get_webview_window("main")
+        .ok_or(DesktopStartupError::MainWindowUnavailable)?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("MSQ_DEVTOOLS").is_some() {
+        window.open_devtools();
+    }
+    window.show()?;
+    window.set_focus()?;
     let exit_code = app.run_return(|handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } => {
             if let Some(state) = handle.try_state::<DesktopState>() {
@@ -341,6 +379,11 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
 }
 
 fn mcp_relay_program(installation_root: &Path) -> Result<PathBuf, DesktopStartupError> {
+    #[cfg(debug_assertions)]
+    if let Some(program) = std::env::var_os(DEVELOPMENT_MCP_RELAY_PROGRAM) {
+        return verified_development_mcp_relay_program(Path::new(&program))
+            .map_err(|_error| DesktopStartupError::McpClientAuthority);
+    }
     let installed = program_install_snapshot(installation_root, ProgramName::McpRelay)?;
     #[cfg(debug_assertions)]
     {

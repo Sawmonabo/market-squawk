@@ -9,12 +9,14 @@ use rmcp::model::{
     ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, RequestId, ServerJsonRpcMessage,
 };
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     McpLimits, ServerExit,
@@ -170,6 +172,7 @@ pub struct McpStdioRelay {
     client: NamedClient,
     transport: Arc<dyn McpRelayTransport>,
     limits: McpLimits,
+    request_namespace: Arc<str>,
 }
 
 impl fmt::Debug for McpStdioRelay {
@@ -202,6 +205,7 @@ impl McpStdioRelay {
             client,
             transport,
             limits,
+            request_namespace: Arc::from(Uuid::new_v4().simple().to_string()),
         })
     }
 
@@ -245,15 +249,24 @@ impl McpStdioRelay {
         let session = cancellation.child_token();
 
         let initialization = match next_frame(&mut reader, &session, self.limits).await? {
-            Some(frame) => prepare_initialization(frame, self.limits)?,
+            Some(frame) => prepare_initialization(frame, &self.request_namespace, self.limits)?,
             None if cancellation.is_cancelled() => return Ok(ServerExit::Cancelled),
             None => return Ok(ServerExit::EndOfInput),
         };
-        let initialization_id = initialization.request_id.clone();
+        let PreparedInitialization {
+            request_id: initialization_id,
+            transport_request_id,
+            client_info,
+            client_capabilities,
+            exchange,
+        } = initialization;
         let response = execute_exchange(
             Arc::clone(&self.transport),
-            initialization.exchange,
-            Some(initialization_id.clone()),
+            exchange,
+            Some(RelayRequestIdentity {
+                client: initialization_id.clone(),
+                transport: transport_request_id,
+            }),
             session.child_token(),
             self.limits,
         )
@@ -266,8 +279,8 @@ impl McpStdioRelay {
             };
         };
         let metadata = RelayClientMetadata::from_initialize_response(
-            initialization.client_info,
-            initialization.client_capabilities,
+            client_info,
+            client_capabilities,
             &response,
             &initialization_id,
             self.limits,
@@ -314,14 +327,23 @@ impl McpStdioRelay {
                         drain_tasks(&mut tasks, self.limits).await;
                         return Ok(ServerExit::EndOfInput);
                     };
-                    match prepare_message(frame, &metadata, self.limits)? {
+                    match prepare_message(
+                        frame,
+                        &metadata,
+                        &self.request_namespace,
+                        self.limits,
+                    )? {
                         PreparedRelayMessage::Initialized => {}
                         PreparedRelayMessage::Cancelled(request_id) => {
                             if let Some(request) = pending.get(&request_id) {
                                 request.cancel();
                             }
                         }
-                        PreparedRelayMessage::Exchange { request_id, exchange } => {
+                        PreparedRelayMessage::Exchange {
+                            request_id,
+                            transport_request_id,
+                            exchange,
+                        } => {
                             if tasks.len() >= self.limits.maximum_active_requests() {
                                 session.cancel();
                                 drain_tasks(&mut tasks, self.limits).await;
@@ -340,11 +362,14 @@ impl McpStdioRelay {
                             }
                             let transport = Arc::clone(&self.transport);
                             let limits = self.limits;
+                            let response_identity = request_id.clone().zip(transport_request_id);
                             tasks.spawn(async move {
                                 let result = execute_exchange(
                                     transport,
                                     exchange,
-                                    request_id.clone(),
+                                    response_identity.map(|(client, transport)| {
+                                        RelayRequestIdentity { client, transport }
+                                    }),
                                     request_cancellation,
                                     limits,
                                 )
@@ -384,6 +409,7 @@ pub enum McpRelayError {
 
 struct PreparedInitialization {
     request_id: RequestId,
+    transport_request_id: RequestId,
     client_info: Value,
     client_capabilities: Value,
     exchange: McpRelayExchange,
@@ -459,6 +485,7 @@ enum PreparedRelayMessage {
     Cancelled(RequestId),
     Exchange {
         request_id: Option<RequestId>,
+        transport_request_id: Option<RequestId>,
         exchange: McpRelayExchange,
     },
 }
@@ -468,11 +495,18 @@ struct ExchangeCompletion {
     result: Result<Option<Box<[u8]>>, McpRelayError>,
 }
 
+#[derive(Clone, Debug)]
+struct RelayRequestIdentity {
+    client: RequestId,
+    transport: RequestId,
+}
+
 fn prepare_initialization(
     frame: Vec<u8>,
+    request_namespace: &str,
     limits: McpLimits,
 ) -> Result<PreparedInitialization, McpRelayError> {
-    let value = parse_message(&frame, limits)?;
+    let mut value = parse_message(&frame, limits)?;
     let message: ClientJsonRpcMessage =
         serde_json::from_value(value.clone()).map_err(|_error| McpRelayError::InvalidInput)?;
     let JsonRpcMessage::Request(request) = message else {
@@ -486,15 +520,23 @@ fn prepare_initialization(
         .map_err(|_error| McpRelayError::InvalidInput)?;
     let client_capabilities = serde_json::to_value(initialize.params.capabilities)
         .map_err(|_error| McpRelayError::InvalidInput)?;
+    let request_id = request.id;
+    let transport_request_id = namespaced_request_id(request_namespace, &request_id)?;
+    replace_request_id(&mut value, &transport_request_id)?;
+    let body = serde_json::to_vec(&value).map_err(|_error| McpRelayError::InvalidInput)?;
+    if body.len() > limits.maximum_body_bytes() {
+        return Err(McpRelayError::InvalidInput);
+    }
     Ok(PreparedInitialization {
-        request_id: request.id,
+        request_id,
+        transport_request_id,
         client_info,
         client_capabilities,
         exchange: McpRelayExchange {
             protocol_version,
             method: Arc::from("initialize"),
             name: None,
-            body: frame.into_boxed_slice(),
+            body: body.into_boxed_slice(),
             maximum_response_bytes: limits.maximum_frame_bytes(),
         },
     })
@@ -503,6 +545,7 @@ fn prepare_initialization(
 fn prepare_message(
     frame: Vec<u8>,
     metadata: &RelayClientMetadata,
+    request_namespace: &str,
     limits: McpLimits,
 ) -> Result<PreparedRelayMessage, McpRelayError> {
     let mut value = parse_message(&frame, limits)?;
@@ -528,6 +571,13 @@ fn prepare_message(
             })?;
         return Ok(PreparedRelayMessage::Cancelled(request_id));
     }
+    let transport_request_id = request_id
+        .as_ref()
+        .map(|request_id| namespaced_request_id(request_namespace, request_id))
+        .transpose()?;
+    if let Some(transport_request_id) = transport_request_id.as_ref() {
+        replace_request_id(&mut value, transport_request_id)?;
+    }
     metadata.attach(&mut value)?;
     let body = serde_json::to_vec(&value).map_err(|_error| McpRelayError::InvalidInput)?;
     if body.len() > limits.maximum_body_bytes() {
@@ -536,6 +586,7 @@ fn prepare_message(
     let name = exchange_name(&value, &method).map(Arc::from);
     Ok(PreparedRelayMessage::Exchange {
         request_id,
+        transport_request_id,
         exchange: McpRelayExchange {
             protocol_version: Arc::from(MCP_PROTOCOL_VERSION),
             method,
@@ -587,14 +638,44 @@ fn insert_exact(
     Ok(())
 }
 
+fn namespaced_request_id(
+    request_namespace: &str,
+    request_id: &RequestId,
+) -> Result<RequestId, McpRelayError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let encoded = serde_json::to_vec(request_id).map_err(|_error| McpRelayError::InvalidInput)?;
+    let digest = Sha256::digest(encoded);
+    let mut namespaced = String::with_capacity(11 + request_namespace.len() + 1 + digest.len() * 2);
+    namespaced.push_str("msq-relay:");
+    namespaced.push_str(request_namespace);
+    namespaced.push(':');
+    for byte in digest {
+        namespaced.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespaced.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(RequestId::String(Arc::from(namespaced)))
+}
+
+fn replace_request_id(value: &mut Value, request_id: &RequestId) -> Result<(), McpRelayError> {
+    let root = value.as_object_mut().ok_or(McpRelayError::InvalidInput)?;
+    if !root.contains_key("id") {
+        return Err(McpRelayError::InvalidInput);
+    }
+    root.insert(
+        "id".to_owned(),
+        serde_json::to_value(request_id).map_err(|_error| McpRelayError::InvalidInput)?,
+    );
+    Ok(())
+}
+
 async fn execute_exchange(
     transport: Arc<dyn McpRelayTransport>,
     exchange: McpRelayExchange,
-    request_id: Option<RequestId>,
+    request_identity: Option<RelayRequestIdentity>,
     cancellation: CancellationToken,
     limits: McpLimits,
 ) -> Result<Option<Box<[u8]>>, McpRelayError> {
-    let expects_response = request_id.is_some();
     let outcome = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(None),
@@ -616,12 +697,40 @@ async fn execute_exchange(
             ));
         }
     };
-    validate_http_response(&response, request_id.as_ref(), limits)?;
-    if expects_response {
-        Ok(Some(response.body))
-    } else {
-        Ok(None)
+    validate_http_response(
+        &response,
+        request_identity
+            .as_ref()
+            .map(|identity| &identity.transport),
+        limits,
+    )?;
+    match request_identity {
+        Some(identity) => restore_response_identity(response.body, &identity, limits).map(Some),
+        None => Ok(None),
     }
+}
+
+fn restore_response_identity(
+    body: Box<[u8]>,
+    identity: &RelayRequestIdentity,
+    limits: McpLimits,
+) -> Result<Box<[u8]>, McpRelayError> {
+    validate_response_message(&body, &identity.transport, limits)?;
+    let mut value: Value =
+        serde_json::from_slice(&body).map_err(|_error| McpRelayError::InvalidResponse)?;
+    let root = value
+        .as_object_mut()
+        .ok_or(McpRelayError::InvalidResponse)?;
+    root.insert(
+        "id".to_owned(),
+        serde_json::to_value(&identity.client).map_err(|_error| McpRelayError::InvalidResponse)?,
+    );
+    let restored = serde_json::to_vec(&value).map_err(|_error| McpRelayError::InvalidResponse)?;
+    if restored.len() > limits.maximum_frame_bytes() {
+        return Err(McpRelayError::InvalidResponse);
+    }
+    validate_response_message(&restored, &identity.client, limits)?;
+    Ok(restored.into_boxed_slice())
 }
 
 fn validate_http_response(
@@ -634,16 +743,19 @@ fn validate_http_response(
     }
     match request_id {
         Some(request_id) => {
-            if response.status != 200
-                || !response
-                    .content_type
-                    .as_deref()
-                    .is_some_and(is_json_content_type)
+            if !response
+                .content_type
+                .as_deref()
+                .is_some_and(is_json_content_type)
                 || response.body.is_empty()
             {
                 return Err(McpRelayError::InvalidResponse);
             }
-            validate_response_message(&response.body, request_id, limits)
+            let kind = validate_response_message(&response.body, request_id, limits)?;
+            match (response.status, kind) {
+                (200, _) | (400 | 404, ResponseMessageKind::Error) => Ok(()),
+                _ => Err(McpRelayError::InvalidResponse),
+            }
         }
         None => {
             if response.status == 202 && response.body.is_empty() {
@@ -659,7 +771,7 @@ fn validate_response_message(
     body: &[u8],
     request_id: &RequestId,
     limits: McpLimits,
-) -> Result<(), McpRelayError> {
+) -> Result<ResponseMessageKind, McpRelayError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_error| McpRelayError::InvalidResponse)?;
     validate_json_contract(
@@ -670,18 +782,27 @@ fn validate_response_message(
     .map_err(|_error| McpRelayError::InvalidResponse)?;
     let response: ServerJsonRpcMessage =
         serde_json::from_value(value).map_err(|_error| McpRelayError::InvalidResponse)?;
-    let response_id = match response {
-        JsonRpcMessage::Response(response) => response.id,
-        JsonRpcMessage::Error(error) => error.id.ok_or(McpRelayError::InvalidResponse)?,
+    let (response_id, kind) = match response {
+        JsonRpcMessage::Response(response) => (response.id, ResponseMessageKind::Result),
+        JsonRpcMessage::Error(error) => (
+            error.id.ok_or(McpRelayError::InvalidResponse)?,
+            ResponseMessageKind::Error,
+        ),
         JsonRpcMessage::Request(_) | JsonRpcMessage::Notification(_) => {
             return Err(McpRelayError::InvalidResponse);
         }
     };
     if &response_id == request_id {
-        Ok(())
+        Ok(kind)
     } else {
         Err(McpRelayError::InvalidResponse)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseMessageKind {
+    Result,
+    Error,
 }
 
 fn is_json_content_type(value: &str) -> bool {

@@ -139,8 +139,9 @@ pub use research_use::{
     ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput,
 };
 pub use rights::{
-    IngestIdentity, RegisteredRightsGrant, ReviewedTermsBasis, RightsBasis, RightsDecisionInput,
-    RightsError, SourceOperation, UserOwnedLocalBasis,
+    ImportedUserInputBasis, ImportedUserInputEvidence, IngestIdentity, RegisteredRightsGrant,
+    ReviewedTermsBasis, RightsBasis, RightsDecisionInput, RightsError, SourceOperation,
+    UserOwnedLocalBasis,
 };
 pub use universe::{
     ContractRollEvidence, DerivativeBoundary, DerivativeCivilDate, DerivativeLifecycle,

@@ -57,6 +57,10 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Unified Markets provider ecosystem](2026-08-08-unified-markets-provider-ecosystem.md) — audited
+  review of 16 maintained investment/data repositories and 53 additional research, official, and
+  reputable sources; defines the approved one-feed experience, provider federation, best-available-
+  depth boundary, source-selection evidence, provider posture, and V1 acceptance contract.
 - [Installed service credential bootstrap and Python integrity](2026-08-03-installed-service-credential-bootstrap-and-python-integrity.md)
   — evidence-verified per-user credential authority, owner-authenticated native bootstrap,
   platform-specific local IPC composition, installed `RECORD` path semantics, and immutable

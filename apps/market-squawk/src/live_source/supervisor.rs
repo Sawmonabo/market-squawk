@@ -1,6 +1,9 @@
 //! Durable, supervisor-owned lifecycle for the sealed Coinbase production source.
 
-use std::{num::NonZeroUsize, time::Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use market_squawk_domain::{ConnectionGeneration, IdentityError, SourceIdentifier};
 use market_squawk_live::{LiveIngressBindError, LiveRuntimeIngress, ShardKey};
@@ -37,6 +40,11 @@ use super::{
 };
 
 const CAPTURE_FLUSH_RECORDS: usize = 256;
+// A freshly linked helper can incur first-execution operating-system verification before it can
+// complete the authenticated readiness handshake. Startup and shutdown are different policies:
+// keeping this bounded deadline independent prevents the five-second shutdown budget from
+// incorrectly quarantining a healthy source after a rebuild.
+const CAPTURE_HELPER_STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
 
 /// One completed exact-generation source run after all generation-owned resources were reaped.
@@ -190,7 +198,7 @@ impl ProductionSourceSupervisor {
             let process_config = ProcessJournalCaptureConfig::try_new(
                 self.paths.root(),
                 self.profile.source_key(),
-                self.config.capture_shutdown(),
+                CAPTURE_HELPER_STARTUP_DEADLINE,
             )?;
             let handle = spawn_process_journal_capture_writer(writer, process_config, policy)?;
             capture_control = Some(control);
@@ -224,6 +232,8 @@ impl ProductionSourceSupervisor {
                 SubscriptionLimits::try_new(
                     self.profile.control_message_capacity(),
                     self.profile.control_byte_capacity(),
+                    self.profile.pre_acknowledgement_data_message_capacity(),
+                    self.profile.pre_acknowledgement_data_byte_capacity(),
                 )?,
             )?;
             tracing::debug!(
@@ -254,6 +264,14 @@ impl ProductionSourceSupervisor {
             }
             let result = source.run(&mut sink, cancellation).await;
             let terminal = sink.terminal_failure();
+            if let Some(failure) = terminal {
+                tracing::warn!(
+                    source = self.profile.source_key(),
+                    generation = generation.get(),
+                    failure = %failure,
+                    "production source generation stopped after a sink failure"
+                );
+            }
             drop(sink);
             match (result, terminal) {
                 (Err(_error), Some(failure)) if failure.requires_generation_resynchronization() => {
@@ -300,7 +318,9 @@ impl ProductionSourceSupervisor {
                         && !termination.outcome().is_incomplete()
                 });
             if !clean && cleanup_error.is_none() {
-                cleanup_error = Some(ProductionSupervisorError::IncompleteCaptureShutdown);
+                cleanup_error = Some(ProductionSupervisorError::IncompleteCaptureShutdown(
+                    shutdown,
+                ));
             }
         }
         if let Some(error) = cleanup_error {
@@ -357,12 +377,12 @@ impl ProductionSourceSupervisor {
                 }
                 SourceError::Network
                 | SourceError::ConnectionIdle
-                | SourceError::FrameTooLarge { .. }
                 | SourceError::GenerationResynchronizationRequired
                 | SourceError::ProviderUnavailable => {
                     self.wait_after_refusal(cancellation).await?;
                 }
                 SourceError::InvalidProtocolState
+                | SourceError::FrameTooLarge { .. }
                 | SourceError::Unauthorized
                 | SourceError::Sink(_)
                 | SourceError::Cancelled
@@ -465,8 +485,8 @@ pub enum ProductionSupervisorError {
     MissingCaptureControlOwnership,
     #[error("capture activation began without cleanup-owned writer")]
     MissingCaptureWriterOwnership,
-    #[error("capture writer did not complete bounded shutdown")]
-    IncompleteCaptureShutdown,
+    #[error("capture writer did not complete bounded shutdown: {0:?}")]
+    IncompleteCaptureShutdown(market_squawk_platform::ProcessCaptureShutdownOutcome),
     #[error("production source startup observer was dropped")]
     StartupObserverDropped,
     #[error("production source generation failed terminally: {0}")]

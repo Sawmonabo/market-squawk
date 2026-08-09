@@ -70,6 +70,7 @@ const MACRO_GET_REVISIONS: &str = "Macro.GetRevisions";
 const MAX_ANALYTICAL_PAGE: usize = 64;
 const QUERY_ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
 const QUERY_ARTIFACT_OWNER: &str = "market-squawk.research-query";
+const MINIMUM_ANALYTICAL_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Provider extraction and rights-admitted ingestion used by the Research domain.
 ///
@@ -731,9 +732,12 @@ fn query_limits(
         .map_err(|_error| ServiceError::InvalidRequest)?;
     let bytes = limits.maximum_result_bytes();
     let bytes = u64::try_from(bytes).map_err(|_error| ServiceError::InvalidRequest)?;
+    // The result envelope is intentionally small for desktop and MCP callers, but DataFusion's
+    // bounded planning and Parquet publication receipts are independent working-set costs. Keep
+    // that internal budget finite without making a small response limit impossible to execute.
     let memory = bytes
         .saturating_mul(4)
-        .clamp(1024 * 1024, 1024 * 1024 * 1024);
+        .clamp(MINIMUM_ANALYTICAL_QUERY_MEMORY_BYTES, 1024 * 1024 * 1024);
     QueryLimits::try_new_with_inline_bytes(
         rows,
         inline_bytes,

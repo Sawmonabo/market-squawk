@@ -44,9 +44,10 @@ use specs::BlsAdapterConfiguration;
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub use specs::{
     BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
-    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation, FredAdapterActivation,
-    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
-    ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
+    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
+    ControlledLocalFileAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
+    PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
+    SecAdapterActivation, TreasuryAdapterActivation,
 };
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
@@ -551,6 +552,10 @@ impl ProviderAdapterActivation {
                 &spec.metadata,
                 fred_research_rights(lease, spec.metadata.source_id(), &spec.policy)?,
             ),
+            ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => (
+                &spec.metadata,
+                controlled_local_file_rights(lease, spec.metadata.source_id(), &spec.evidence)?,
+            ),
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
@@ -648,6 +653,29 @@ impl ProviderAdapterActivation {
                 )
                 .await?
             }
+            ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => {
+                require_surface(&lease, LOCAL_FILES_SURFACE)?;
+                let rights = controlled_local_file_rights(
+                    &lease,
+                    spec.metadata.source_id(),
+                    &spec.evidence,
+                )?;
+                let source = FileExtractionSource::try_new_controlled_import(
+                    spec.metadata,
+                    spec.root,
+                    spec.representation_state_root,
+                    spec.manifest,
+                    spec.limits,
+                )?;
+                self.prepare_runtime_replacement(
+                    &lease,
+                    expected,
+                    candidate.clone(),
+                    source,
+                    rights,
+                )
+                .await?
+            }
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::Sec(_)
@@ -728,6 +756,9 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
             }
+            ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => self
+                .activate_controlled_local_files(lease, spec)
+                .map(Into::into),
             ProviderAdapterActivationRequest::Portfolio(spec) => {
                 self.activate_portfolio(lease, spec).map(Into::into)
             }
@@ -763,6 +794,9 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
             }
+            ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => self
+                .activate_controlled_local_files(lease, spec)
+                .map(Into::into),
             ProviderAdapterActivationRequest::Portfolio(spec) => {
                 self.activate_portfolio(lease, spec).map(Into::into)
             }
@@ -928,6 +962,24 @@ impl ProviderAdapterActivation {
             None,
         )?;
         let source = FileExtractionSource::try_new(
+            spec.metadata,
+            spec.root,
+            spec.representation_state_root,
+            spec.manifest,
+            spec.limits,
+        )?;
+        self.register(lease, source, rights)
+    }
+
+    fn activate_controlled_local_files(
+        &self,
+        lease: ProviderActivationLease,
+        spec: ControlledLocalFileAdapterActivation,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        require_surface(&lease, LOCAL_FILES_SURFACE)?;
+        let source_id = spec.metadata.source_id().clone();
+        let rights = controlled_local_file_rights(&lease, &source_id, &spec.evidence)?;
+        let source = FileExtractionSource::try_new_controlled_import(
             spec.metadata,
             spec.root,
             spec.representation_state_root,
@@ -1225,6 +1277,23 @@ fn provider_research_rights(
         basis,
         lease.rights_decision_digest(),
         lease.verification_expires_at(),
+    )
+    .map_err(Into::into)
+}
+
+fn controlled_local_file_rights(
+    lease: &ProviderActivationLease,
+    source_id: &SourceId,
+    evidence: &market_squawk_data::ImportedUserInputEvidence,
+) -> Result<ResearchRightsAuthority, ProviderAdapterActivationError> {
+    if !lease.admits(DataUseOperation::Persist) {
+        return Err(ProviderAdapterActivationError::InvalidRights);
+    }
+    ResearchRightsAuthority::try_new(
+        source_id.clone(),
+        RightsBasis::imported_user_input(evidence.clone()),
+        lease.capability_digest(),
+        None,
     )
     .map_err(Into::into)
 }

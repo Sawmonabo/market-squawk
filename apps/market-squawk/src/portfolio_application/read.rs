@@ -354,7 +354,11 @@ fn portfolio_page(
         }
         .map_err(|_| PortfolioApplicationServiceError::Publication)?;
         match TypedToolResult::try_new(
-            Value::Array(rows[..count].to_vec()),
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Array(rows[..count].to_vec())
+            },
             count,
             metadata,
             limits,

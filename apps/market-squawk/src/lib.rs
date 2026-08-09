@@ -64,6 +64,10 @@ pub use local_product::{
     LocalMcpAvailabilityError, LocalProduct, LocalProductError, LocalServiceAvailabilityError,
     verified_installed_cli_program, verified_installed_service_program,
 };
+#[cfg(debug_assertions)]
+pub use local_product::{
+    verified_development_mcp_relay_program, verified_development_service_program,
+};
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };

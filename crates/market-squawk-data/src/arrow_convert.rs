@@ -56,6 +56,15 @@ enum RowLineage {
     },
 }
 
+impl RowLineage {
+    fn dataset(&self) -> &SourceIdentifier {
+        match self {
+            Self::Extraction(lineage) => &lineage.dataset,
+            Self::CanonicalObservation { dataset, .. } => dataset,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct ExtractionRowLineage {
     schema_version: u16,
@@ -516,6 +525,71 @@ impl ResearchArrowBatch {
     ) -> Result<(Vec<ResearchObservation>, usize), ArrowConversionError> {
         Self::validate_and_decode_record_batch(batch, max_additional_bytes)
             .map(|(_, observations, retained)| (observations, retained))
+    }
+
+    /// Decodes a canonical research projection whose query engine discarded schema metadata.
+    ///
+    /// The registered fields, common producer-dataset identity retained by every row lineage,
+    /// payload digests, and every projected value are revalidated. The producer dataset is not the
+    /// same identity as a derived publication manifest, so it is recovered from the exact row
+    /// lineage instead of being inferred from that manifest. This does not itself establish
+    /// publication-generation authority; callers must retain the non-forgeable pinned-query
+    /// receipt that supplied the batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrowConversionError::InvalidSchema`] when the projection is not the complete
+    /// canonical row shape, [`ArrowConversionError::ExtractionBindingMismatch`] when rows do not
+    /// share one exact producer dataset or disagree with their lineage, or
+    /// [`ArrowConversionError::RetainedLimitExceeded`] when the caller's memory ceiling cannot
+    /// admit validation.
+    pub fn decode_query_projection_bounded(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+    ) -> Result<(Vec<ResearchObservation>, usize), ArrowConversionError> {
+        let registry = DatasetSchemaRegistry::local();
+        let schema_ref = registry.canonical_research_observations()?;
+        let comparison_schema = registry.resolve(&schema_ref)?;
+        if batch.schema().fields() != comparison_schema.fields() {
+            return Err(ArrowConversionError::InvalidSchema);
+        }
+        if batch.num_rows() == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let candidate = Self { schema_ref, batch };
+        let (working_bytes, observation_bytes) = candidate.decode_admission()?;
+        if working_bytes > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded);
+        }
+        let observations = candidate.decode_payloads()?;
+        let request_digests = candidate.decode_request_digests()?;
+        let row_lineages = candidate.decode_row_lineages()?;
+        let producer_dataset = row_lineages
+            .first()
+            .map(RowLineage::dataset)
+            .cloned()
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        if row_lineages
+            .iter()
+            .any(|lineage| lineage.dataset() != &producer_dataset)
+        {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
+        }
+        let batch_digest = request_digests
+            .first()
+            .copied()
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let rebuilt = Self::try_from_observations_with_requests(
+            producer_dataset,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, batch_digest),
+            request_digests,
+            row_lineages,
+            &observations,
+        )?;
+        if rebuilt.batch.columns() != candidate.batch.columns() {
+            return Err(ArrowConversionError::ProjectionMismatch);
+        }
+        Ok((observations, observation_bytes))
     }
 
     fn validate_and_decode_record_batch(

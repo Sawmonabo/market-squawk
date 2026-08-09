@@ -525,7 +525,7 @@ fn runtime_shard_and_source_validation_fail_closed_in_order() -> TestResult {
 }
 
 #[test]
-fn health_rebind_reuses_generation_while_rollover_replaces_it() -> TestResult {
+fn health_rebind_and_rollover_replace_generation_without_cross_invalidation() -> TestResult {
     let mut source = SourceHarness::try_new("source-a", 1, INSTRUMENT_ONE)?;
     let old_lease = source.current_lease()?;
     let mut registry = GenerationAuthorityRegistry::try_new(2)?;
@@ -534,10 +534,10 @@ fn health_rebind_reuses_generation_while_rollover_replaces_it() -> TestResult {
     source.refresh_health()?;
     let refreshed_lease = source.current_lease()?;
     let refreshed = registry.bind_current(&refreshed_lease, now()?)?;
-    assert!(old.validate_at(now()?).is_err());
+    old.validate_at(now()?)?;
     refreshed.validate_at(now()?)?;
     old.invalidate_on_admission_failure();
-    assert!(refreshed.validate_at(now()?).is_err());
+    refreshed.validate_at(now()?)?;
 
     let source = source.rollover(2)?;
     let successor_lease = source.current_lease()?;

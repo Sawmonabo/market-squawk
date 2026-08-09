@@ -112,14 +112,11 @@ impl McpProtocolVerification {
 pub(super) fn verify(
     relay_program: &Path,
     client: McpClientKind,
+    relay_arguments: &[String],
 ) -> Result<McpProtocolVerification, McpClientRegistrationError> {
     let mut child = ChildGuard::new(
         Command::new(relay_program)
-            .arg("--client")
-            .arg(match client {
-                McpClientKind::ClaudeCode => "claude",
-                McpClientKind::Codex => "codex",
-            })
+            .args(relay_arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

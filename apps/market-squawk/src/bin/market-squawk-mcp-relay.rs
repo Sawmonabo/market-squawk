@@ -3,7 +3,8 @@
 
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, ValueEnum};
 use market_squawk::{service::InstalledServiceConnector, termination::TerminationSignals};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
@@ -38,7 +39,13 @@ struct RelayArguments {
     /// Explicit local configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Installer-owned encoded override for a non-default service authority root.
+    #[arg(long, hide = true)]
+    installation_data_root_encoded: Option<String>,
 }
+
+const MAXIMUM_INSTALLATION_ROOT_BYTES: usize = 4 * 1024;
+const MAXIMUM_INSTALLATION_ROOT_ARGUMENT_BYTES: usize = 6 * 1024;
 
 fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
@@ -51,7 +58,16 @@ async fn run() -> Result<()> {
     let arguments = RelayArguments::parse();
     let config = load_config(arguments.config.as_deref(), arguments.data_dir)?;
     let client = NamedClient::from(arguments.client);
-    let transport = InstalledServiceConnector::try_new(&config)?.connect_mcp_relay(client)?;
+    let connector = arguments
+        .installation_data_root_encoded
+        .as_deref()
+        .map(decode_installation_data_root)
+        .transpose()?
+        .map_or_else(
+            || InstalledServiceConnector::try_new(&config),
+            |root| InstalledServiceConnector::try_new_at_installation_root(&config, root),
+        )?;
+    let transport = connector.connect_mcp_relay(client)?;
     let relay = McpStdioRelay::try_new(
         client,
         Arc::clone(&transport),
@@ -71,6 +87,28 @@ async fn run() -> Result<()> {
     let _ = signal.await;
     result?;
     Ok(())
+}
+
+fn decode_installation_data_root(encoded: &str) -> Result<PathBuf> {
+    if encoded.is_empty() || encoded.len() > MAXIMUM_INSTALLATION_ROOT_ARGUMENT_BYTES {
+        bail!("the installed service root argument is invalid");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("the installed service root argument is invalid")?;
+    if decoded.is_empty() || decoded.len() > MAXIMUM_INSTALLATION_ROOT_BYTES {
+        bail!("the installed service root argument is invalid");
+    }
+    let value =
+        String::from_utf8(decoded).context("the installed service root argument is invalid")?;
+    if value.contains('\0') {
+        bail!("the installed service root argument is invalid");
+    }
+    let root = PathBuf::from(value);
+    if !root.is_absolute() {
+        bail!("the installed service root argument is invalid");
+    }
+    Ok(root)
 }
 
 fn load_config(

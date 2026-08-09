@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use market_squawk_services::{RequestContext, ServiceError, TypedToolRequest, TypedToolResult};
+use market_squawk_services::{
+    RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
+};
 
 use crate::{
     application::{
@@ -73,7 +75,15 @@ impl InstalledOperations {
                     }
                 };
                 let retained = admission.clone();
-                match self.jobs.start(admission, context).await {
+                match self
+                    .jobs
+                    .start(
+                        admission,
+                        context,
+                        ToolResultMetadata::complete_not_applicable(),
+                    )
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(error) => {
                         let _ignored = self.backup.revoke(&retained);
@@ -91,7 +101,15 @@ impl InstalledOperations {
                     }
                 };
                 let retained = admission.clone();
-                match self.jobs.start(admission, context).await {
+                match self
+                    .jobs
+                    .start(
+                        admission,
+                        context,
+                        ToolResultMetadata::complete_not_applicable(),
+                    )
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(error) => {
                         let _ignored = self.recovery.revoke(&retained);
@@ -109,7 +127,15 @@ impl InstalledOperations {
                     }
                 };
                 let retained = admission.clone();
-                match self.jobs.start(admission, context).await {
+                match self
+                    .jobs
+                    .start(
+                        admission,
+                        context,
+                        ToolResultMetadata::complete_not_applicable(),
+                    )
+                    .await
+                {
                     Ok(result) => Ok(result),
                     Err(error) => {
                         let _ignored = self.update.revoke(&retained);

@@ -605,9 +605,8 @@ struct PreviewIdentityRequest {
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    serde_json::from_value(Value::Object(admitted)).map_err(|_error| ServiceError::InvalidRequest)
+    serde_json::from_value(Value::Object(super::business_arguments(arguments)))
+        .map_err(|_error| ServiceError::InvalidRequest)
 }
 
 fn resolve_interpretations(

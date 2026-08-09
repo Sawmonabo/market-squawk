@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use market_squawk_installer::default_installation_data_root;
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths, PathError,
 };
@@ -36,6 +38,9 @@ const RECEIPT_DIRECTORY: &str = "mcp/client-registrations";
 const RECEIPT_FORMAT_VERSION: u16 = 1;
 const MAXIMUM_COMMAND_OUTPUT_BYTES: u64 = 512 * 1024;
 const CLIENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const INSTALLATION_ROOT_ARGUMENT: &str = "--installation-data-root-encoded";
+const MAXIMUM_INSTALLATION_ROOT_BYTES: usize = 4 * 1024;
+const MAXIMUM_INSTALLATION_ROOT_ARGUMENT_BYTES: usize = 6 * 1024;
 
 /// Supported installed MCP clients with independently scoped credentials and audit identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -243,16 +248,25 @@ impl McpClientRegistration {
     fn try_new(
         relay_program: &Path,
         client: McpClientKind,
+        installation_root_argument: Option<&str>,
     ) -> Result<Self, McpClientRegistrationError> {
         let command = relay_program
             .to_str()
             .filter(|value| !value.is_empty())
             .ok_or(McpClientRegistrationError::InvalidRelayProgram)?
             .to_owned();
+        let mut arguments = vec!["--client".to_owned(), client.relay_argument().to_owned()];
+        if let Some(encoded_root) = installation_root_argument {
+            if !valid_encoded_installation_root(encoded_root) {
+                return Err(McpClientRegistrationError::InvalidInstallationRoot);
+            }
+            arguments.push(INSTALLATION_ROOT_ARGUMENT.to_owned());
+            arguments.push(encoded_root.to_owned());
+        }
         Ok(Self {
             scope: client.registration_scope(),
             command,
-            arguments: vec!["--client".to_owned(), client.relay_argument().to_owned()],
+            arguments,
         })
     }
 
@@ -301,6 +315,7 @@ impl McpClientRegistration {
 pub struct McpClientRegistrationManager {
     receipts: LocalAuthorityStateStore,
     relay_program: PathBuf,
+    installation_root_argument: Option<String>,
     search_directories: Vec<PathBuf>,
     client_mutation_gates: [Mutex<()>; 2],
     mutation_gate: Mutex<()>,
@@ -322,18 +337,33 @@ impl McpClientRegistrationManager {
     pub fn try_new(
         paths: &LocalPaths,
         relay_program: impl AsRef<Path>,
+        installation_data_root: impl AsRef<Path>,
     ) -> Result<Self, McpClientRegistrationError> {
         let relay_program = verify_executable(relay_program.as_ref())?;
+        let installation_root_argument =
+            encode_non_default_installation_root(installation_data_root.as_ref())?;
         let receipts = LocalAuthorityStateStore::try_open(
             paths.control_root()?.root().join(RECEIPT_DIRECTORY),
         )?;
         Ok(Self {
             receipts,
             relay_program,
+            installation_root_argument,
             search_directories: discovery_directories(),
             client_mutation_gates: [Mutex::new(()), Mutex::new(())],
             mutation_gate: Mutex::new(()),
         })
+    }
+
+    fn registration(
+        &self,
+        client: McpClientKind,
+    ) -> Result<McpClientRegistration, McpClientRegistrationError> {
+        McpClientRegistration::try_new(
+            &self.relay_program,
+            client,
+            self.installation_root_argument.as_deref(),
+        )
     }
 
     /// Inspects one client without mutating its configuration.
@@ -383,7 +413,7 @@ impl McpClientRegistrationManager {
                 Some("The installed client does not expose the required official MCP commands."),
             ));
         }
-        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let registration = self.registration(client)?;
         let observed = observe(client, &program)?;
         let document = self.load_receipts()?;
         let receipt = document.receipt(client).cloned();
@@ -465,7 +495,7 @@ impl McpClientRegistrationManager {
             .as_deref()
             .map(PathBuf::from)
             .ok_or(McpClientRegistrationError::ClientUnavailable { client })?;
-        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let registration = self.registration(client)?;
         match status.state {
             McpClientState::Ready => {
                 run_success(&add_command(client, &program, &registration), client)?;
@@ -519,7 +549,7 @@ impl McpClientRegistrationManager {
             .as_deref()
             .map(PathBuf::from)
             .ok_or(McpClientRegistrationError::ClientUnavailable { client })?;
-        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let registration = self.registration(client)?;
         let observed = observe(client, &program)?;
         match &observed {
             ObservedRegistration::Missing => {
@@ -571,7 +601,7 @@ impl McpClientRegistrationManager {
             .as_deref()
             .map(PathBuf::from)
             .ok_or(McpClientRegistrationError::ClientUnavailable { client })?;
-        let registration = McpClientRegistration::try_new(&self.relay_program, client)?;
+        let registration = self.registration(client)?;
         let observed = observe(client, &program)?;
         if !matches!(observed, ObservedRegistration::Missing) {
             if !registration.matches(&observed)
@@ -598,7 +628,8 @@ impl McpClientRegistrationManager {
         if status.state != McpClientState::Owned {
             return Err(McpClientRegistrationError::OwnershipRequired { client });
         }
-        let verification = protocol::verify(&self.relay_program, client)?;
+        let registration = self.registration(client)?;
+        let verification = protocol::verify(&self.relay_program, client, registration.arguments())?;
         self.mutate_receipts(|document| {
             if let Some(receipt) = document.receipt_mut(client) {
                 receipt.last_verification = Some(verification.clone());
@@ -734,11 +765,7 @@ impl ReceiptDocument {
                 || receipt.client_version.is_empty()
                 || receipt.client_version.len() > 128
                 || receipt.command_sha256 != registration.digest()?
-                || receipt.arguments
-                    != [
-                        "--client".to_owned(),
-                        receipt.client.relay_argument().to_owned(),
-                    ]
+                || !valid_registration_arguments(receipt.client, &receipt.arguments)
                 || !valid_identity(&receipt.authority.endpoint_identity)
                 || !valid_identity(&receipt.authority.credential_identity)
                 || receipt
@@ -1081,6 +1108,62 @@ fn valid_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
 }
 
+fn encode_non_default_installation_root(
+    root: &Path,
+) -> Result<Option<String>, McpClientRegistrationError> {
+    let canonical = fs::canonicalize(root)
+        .map_err(|_error| McpClientRegistrationError::InvalidInstallationRoot)?;
+    if !canonical.is_dir() {
+        return Err(McpClientRegistrationError::InvalidInstallationRoot);
+    }
+    let default = default_installation_data_root()
+        .map_err(|_error| McpClientRegistrationError::InvalidInstallationRoot)?;
+    let default = fs::canonicalize(&default).unwrap_or(default);
+    if canonical == default {
+        return Ok(None);
+    }
+    let value = canonical
+        .to_str()
+        .filter(|value| !value.is_empty() && value.len() <= MAXIMUM_INSTALLATION_ROOT_BYTES)
+        .ok_or(McpClientRegistrationError::InvalidInstallationRoot)?;
+    let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
+    if !valid_encoded_installation_root(&encoded) {
+        return Err(McpClientRegistrationError::InvalidInstallationRoot);
+    }
+    Ok(Some(encoded))
+}
+
+fn valid_registration_arguments(client: McpClientKind, arguments: &[String]) -> bool {
+    let prefix = ["--client", client.relay_argument()];
+    match arguments {
+        [flag, value] => [flag.as_str(), value.as_str()] == prefix,
+        [flag, value, root_flag, encoded_root] => {
+            [flag.as_str(), value.as_str()] == prefix
+                && root_flag == INSTALLATION_ROOT_ARGUMENT
+                && valid_encoded_installation_root(encoded_root)
+        }
+        _ => false,
+    }
+}
+
+fn valid_encoded_installation_root(encoded: &str) -> bool {
+    if encoded.is_empty() || encoded.len() > MAXIMUM_INSTALLATION_ROOT_ARGUMENT_BYTES {
+        return false;
+    }
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return false;
+    };
+    if decoded.is_empty() || decoded.len() > MAXIMUM_INSTALLATION_ROOT_BYTES {
+        return false;
+    }
+    let Ok(value) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    !value.contains('\0')
+        && Path::new(value).is_absolute()
+        && URL_SAFE_NO_PAD.encode(decoded) == encoded
+}
+
 fn discovery_directories() -> Vec<PathBuf> {
     let mut directories = env::var_os("PATH")
         .map(|value| env::split_paths(&value).collect::<Vec<_>>())
@@ -1161,6 +1244,8 @@ pub enum McpClientRegistrationError {
     ReceiptStore(#[from] LocalAuthorityStateStoreError),
     #[error("the installed MCP relay is absent or unsafe")]
     InvalidRelayProgram,
+    #[error("the installed service authority root is invalid")]
+    InvalidInstallationRoot,
     #[error("an MCP client executable is unsafe")]
     UnsafeExecutable,
     #[error("MCP registration authority identity is invalid")]
@@ -1216,8 +1301,11 @@ mod tests {
             "",
         )?;
 
-        assert!(McpClientRegistration::try_new(relay, McpClientKind::ClaudeCode)?.matches(&claude));
-        assert!(McpClientRegistration::try_new(relay, McpClientKind::Codex)?.matches(&codex));
+        assert!(
+            McpClientRegistration::try_new(relay, McpClientKind::ClaudeCode, None)?
+                .matches(&claude)
+        );
+        assert!(McpClientRegistration::try_new(relay, McpClientKind::Codex, None)?.matches(&codex));
         Ok(())
     }
 }

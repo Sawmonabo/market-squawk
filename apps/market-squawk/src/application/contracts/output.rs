@@ -43,18 +43,33 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "currentSession",
             ],
         ),
-        "Source.GetStatus" => nullable_rows(signature(vec![
-            ("profile", record()),
-            ("currentSession", nullable(record())),
-            ("providerDatasetIdentifier", nullable(text())),
-            ("runtime", record()),
-        ])),
+        "Source.GetStatus" => nullable_rows(closed(
+            vec![
+                ("profile", record()),
+                ("currentSession", nullable(record())),
+                ("providerDatasetIdentifier", nullable(text())),
+                (
+                    "lifecycleSupport",
+                    enumeration(&["managed", "not_applicable"]),
+                ),
+                ("lifecycle", nullable(source_lifecycle_status())),
+                ("runtime", record()),
+            ],
+            &[
+                "profile",
+                "currentSession",
+                "providerDatasetIdentifier",
+                "lifecycleSupport",
+                "lifecycle",
+                "runtime",
+            ],
+        )),
         "Source.GetCoverage" => nullable_rows(signature(vec![
             ("surfaceId", text()),
             ("releaseState", text()),
             ("declaredCoverage", text()),
             ("qualityCeiling", text()),
-            ("rights", array(text())),
+            ("rights", bounded_array(data_use_right(), 6)),
             ("runtimeCoverage", record()),
         ])),
         "Source.GetHealth" => nullable_rows(signature(vec![
@@ -165,6 +180,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Macro.GetVintages"
         | "Macro.GetRevisions" => observation_result(),
         "Research.StartIngestSource"
+        | "Research.CommitStagedFile"
         | "Research.StartDatasetBuild"
         | "Research.StartExport"
         | "Analysis.StartScenarioBatch"
@@ -188,6 +204,37 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "objectCount",
                 "lineageDigest",
             ],
+        ),
+        "Research.PreviewStagedFile" => closed(
+            vec![
+                ("previewId", sha256()),
+                ("sha256", sha256()),
+                ("format", enumeration(&["csv", "json", "ndjson", "parquet"])),
+                ("rowCount", unsigned()),
+                (
+                    "columns",
+                    bounded_array(research_file_preview_column(), 256),
+                ),
+                (
+                    "sampleRows",
+                    bounded_array(bounded_array(research_file_preview_cell(), 256), 20),
+                ),
+            ],
+            &[
+                "previewId",
+                "sha256",
+                "format",
+                "rowCount",
+                "columns",
+                "sampleRows",
+            ],
+        ),
+        "Research.DiscardStagedFile" => closed(
+            vec![
+                ("previewId", sha256()),
+                ("status", enumeration(&["discarded"])),
+            ],
+            &["previewId", "status"],
         ),
         "Portfolio.Import" => closed(
             vec![
@@ -488,6 +535,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("selectedAt", timestamp()),
                 ("requiredEvidence", bounded_array(text(), 4)),
                 ("portfolioImpactAvailable", boolean()),
+                ("forecastOptions", bounded_array(record(), 64)),
+                ("fairValueOptions", bounded_array(record(), 64)),
             ],
             &[
                 "candidateId",
@@ -496,6 +545,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "selectedAt",
                 "requiredEvidence",
                 "portfolioImpactAvailable",
+                "forecastOptions",
+                "fairValueOptions",
             ],
         ),
         "Decision.PrepareDossier" => closed(
@@ -505,7 +556,9 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("candidateId", text()),
                 ("screenRunId", text()),
                 ("instrumentId", uuid()),
-                ("evidence", bounded_array(text(), 4)),
+                ("evidence", bounded_array(text(), 6)),
+                ("forecastSelector", nullable(text())),
+                ("fairValueSelector", nullable(text())),
                 ("assembledAt", timestamp()),
                 ("receiptExpiresAt", timestamp()),
             ],
@@ -516,6 +569,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 "screenRunId",
                 "instrumentId",
                 "evidence",
+                "forecastSelector",
+                "fairValueSelector",
                 "assembledAt",
                 "receiptExpiresAt",
             ],
@@ -1124,6 +1179,34 @@ fn observation_result() -> Value {
     ])
 }
 
+fn research_file_preview_column() -> Value {
+    closed(
+        vec![
+            ("name", bounded_text(256)),
+            (
+                "kind",
+                enumeration(&["exact_decimal", "text", "mixed", "unsupported", "null"]),
+            ),
+            ("nullable", boolean()),
+        ],
+        &["name", "kind", "nullable"],
+    )
+}
+
+fn research_file_preview_cell() -> Value {
+    closed(
+        vec![
+            (
+                "kind",
+                enumeration(&["text", "null", "unsupported", "missing"]),
+            ),
+            ("value", nullable(bounded_text(256))),
+            ("truncated", boolean()),
+        ],
+        &["kind", "value", "truncated"],
+    )
+}
+
 fn generation() -> Value {
     closed(
         vec![
@@ -1653,8 +1736,56 @@ fn source_lifecycle_receipt() -> Value {
         ("rightsEvidence", nullable(record())),
         ("blocker", nullable(text())),
         ("publicConfigurationSha256", nullable(text())),
-        ("observedAt", integer()),
+        ("observedAt", timestamp()),
     ])
+}
+
+fn source_lifecycle_status() -> Value {
+    closed(
+        vec![
+            ("provider", text()),
+            ("stateRevision", unsigned()),
+            (
+                "state",
+                enumeration(&[
+                    "stopped",
+                    "starting",
+                    "active",
+                    "resynchronizing",
+                    "blocked",
+                    "removed",
+                ]),
+            ),
+            ("configurationSessionId", nullable(uuid())),
+            ("currentGeneration", nullable(unsigned())),
+            ("runtimeGenerationSha256", nullable(text())),
+            ("publicConfigurationSha256", nullable(text())),
+            (
+                "blocker",
+                nullable(enumeration(&[
+                    "credential",
+                    "rights",
+                    "rate_budget",
+                    "integrity",
+                    "provider_availability",
+                    "reconciliation",
+                    "stale_precondition",
+                ])),
+            ),
+            ("observedAt", timestamp()),
+        ],
+        &[
+            "provider",
+            "stateRevision",
+            "state",
+            "configurationSessionId",
+            "currentGeneration",
+            "runtimeGenerationSha256",
+            "publicConfigurationSha256",
+            "blocker",
+            "observedAt",
+        ],
+    )
 }
 
 fn portfolio_advanced_report() -> Value {
@@ -2000,6 +2131,29 @@ fn bot_status() -> Value {
 
 fn nullable_rows(item: Value) -> Value {
     one_of(vec![null(), array(item)])
+}
+
+fn data_use_right() -> Value {
+    closed(
+        vec![
+            (
+                "operation",
+                enumeration(&[
+                    "retrieve",
+                    "display",
+                    "persist",
+                    "model_training",
+                    "export",
+                    "redistribute",
+                ]),
+            ),
+            (
+                "admission",
+                enumeration(&["admitted", "pending", "blocked"]),
+            ),
+        ],
+        &["operation", "admission"],
+    )
 }
 
 fn nullable(schema: Value) -> Value {

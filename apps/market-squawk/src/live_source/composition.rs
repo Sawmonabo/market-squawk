@@ -43,9 +43,9 @@ use super::route_actor::RouteBufferLimits;
 use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
 
 const SOURCE_ID: &str = "coinbase-exchange-public";
-const PROVISIONAL_METADATA_REVISION: &str = "coinbase-exchange-v1-provisional";
+const PROVISIONAL_METADATA_REVISION: &str = "coinbase-advanced-trade-v1-provisional";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
-const IMPLEMENTATION_PROFILE_VERSION: &str = "coinbase-exchange-v1-profile-2026-07-20";
+const IMPLEMENTATION_PROFILE_VERSION: &str = "coinbase-advanced-trade-v1-profile-2026-08-08";
 const CONFIGURATION_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/coinbase-production-configuration/v2\0";
 const PROFILE_EVIDENCE_DOMAIN: &[u8] = b"market-squawk/coinbase-production-profile/v2\0";
@@ -56,6 +56,8 @@ const INITIAL_BACKOFF_NANOS: u64 = 250_000_000;
 const MAXIMUM_BACKOFF_NANOS: u64 = 30_000_000_000;
 const BACKOFF_JITTER_BASIS_POINTS: u16 = 2_000;
 const MAX_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
+const PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY: usize = 64;
+const PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 
 /// Validated, connector-sealed production Coinbase composition.
 ///
@@ -115,6 +117,8 @@ impl ProductionLiveSourceComposition {
                 ProductionSourceProfile::coinbase(
                     ProductionCoinbaseProfile::try_from(source)?,
                     source,
+                    PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
+                    PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
                 )?
             }
             ProductionSourceProvider::Kraken => {
@@ -306,6 +310,44 @@ impl ProductionLiveSourceComposition {
         .await
     }
 
+    /// Starts the sealed source with one bounded qualified-market export per route and no
+    /// execution authority.
+    ///
+    /// This is the production market-data path for dashboard, research, and valuation consumers.
+    /// The complete route set is validated before local resources or provider networking start.
+    pub async fn start_with_qualified_market_exports(
+        self,
+        runtime_config: LiveRuntimeConfig,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        self.validate_qualified_market_export_routes(&qualified_market_exports)?;
+        let route_buffer_limits = RouteBufferLimits::new(
+            runtime_config.mailbox_count_per_shard(),
+            runtime_config.maximum_message_bytes(),
+        );
+        let paths = LocalPaths::prepare(self.config.data_dir())?;
+        let capture_process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                self.config
+                    .capture_destination_registry_memory_ceiling_bytes(),
+            ))?;
+        let live = LiveRuntimeComposition::start_with_qualified_market_exports(
+            runtime_config,
+            self.routes.clone(),
+            qualified_market_exports,
+        )
+        .await?;
+        self.start_on_live_runtime(
+            live,
+            route_buffer_limits,
+            paths,
+            capture_process,
+            cancellation,
+        )
+        .await
+    }
+
     async fn start_on_live_runtime(
         self,
         live: LiveRuntimeComposition,
@@ -408,6 +450,12 @@ pub struct ProductionLiveSourceRuntime {
 }
 
 impl ProductionLiveSourceRuntime {
+    /// Reports whether the source supervisor still owns the live producer generation.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        !self.supervisor_cancellation.token.is_cancelled() && !self.supervisor.is_finished()
+    }
+
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
@@ -485,17 +533,18 @@ fn validate_coinbase_routes(
             return Err(ProductionLiveSourceCompositionError::DuplicateRoute);
         }
     }
+    let venue = market_squawk_domain::VenueId::try_from(COINBASE_PROVIDER)?;
     for mapping in config.instruments() {
-        let expected = ShardKey::new(
-            mapping
-                .definition()
-                .venue_mappings()
-                .first()
-                .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?
-                .venue_id()
-                .clone(),
-            mapping.definition().instrument_id(),
-        );
+        let venue_mapping = mapping
+            .definition()
+            .venue_mappings()
+            .iter()
+            .find(|candidate| candidate.venue_id() == &venue)
+            .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+        if venue_mapping.venue_symbol().as_str() != mapping.product() {
+            return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+        }
+        let expected = ShardKey::new(venue.clone(), mapping.definition().instrument_id());
         let route = routes
             .iter()
             .find(|route| route.route() == &expected)
@@ -514,10 +563,17 @@ fn validate_kraken_routes(
     if routes.len() != 1 {
         return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
     }
-    let expected = ShardKey::new(
-        market_squawk_domain::VenueId::try_from("kraken")?,
-        config.definition().instrument_id(),
-    );
+    let venue = market_squawk_domain::VenueId::try_from("kraken")?;
+    let venue_mapping = config
+        .definition()
+        .venue_mappings()
+        .iter()
+        .find(|candidate| candidate.venue_id() == &venue)
+        .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+    if venue_mapping.venue_symbol().as_str() != config.symbol() {
+        return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+    }
+    let expected = ShardKey::new(venue, config.definition().instrument_id());
     let route = routes
         .first()
         .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
@@ -620,7 +676,9 @@ impl ProductionCoinbaseProfile {
                 connect_timeout_nanos: duration_nanos(transport_limits.connect_timeout())?,
                 io_timeout_nanos: duration_nanos(transport_limits.io_timeout())?,
             },
-            channels: ["level2", "matches", "heartbeat"],
+            channels: ["level2", "market_trades", "heartbeats"],
+            pre_acknowledgement_data_message_capacity: PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
+            pre_acknowledgement_data_byte_capacity: PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
         };
         let (profile_evidence, digest) =
             exact_evidence_with_digest(PROFILE_EVIDENCE_DOMAIN, &complete_profile)?;
@@ -720,6 +778,8 @@ struct CompleteProfileEvidence<'a> {
     configuration: ProfileInputsEvidence<'a>,
     transport: TransportEvidence,
     channels: [&'static str; 3],
+    pre_acknowledgement_data_message_capacity: usize,
+    pre_acknowledgement_data_byte_capacity: usize,
 }
 
 #[derive(Serialize)]
@@ -780,7 +840,7 @@ fn content_addressed_revision(
 ) -> Result<SourceIdentifier, ProductionCoinbaseProfileError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut revision = String::with_capacity(77);
-    revision.push_str("coinbase-v1-");
+    revision.push_str("coinbase-v2-");
     for byte in digest {
         revision.push(char::from(HEX[usize::from(byte >> 4)]));
         revision.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -791,8 +851,8 @@ fn content_addressed_revision(
 fn production_channels() -> Vec<CoinbaseChannel> {
     vec![
         CoinbaseChannel::Level2,
-        CoinbaseChannel::Matches,
-        CoinbaseChannel::Heartbeat,
+        CoinbaseChannel::MarketTrades,
+        CoinbaseChannel::Heartbeats,
     ]
 }
 

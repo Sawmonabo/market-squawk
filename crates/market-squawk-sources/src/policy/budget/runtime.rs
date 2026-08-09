@@ -816,6 +816,7 @@ impl SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
             runtime_admission: operation,
             provider_rate: provider_rate_permit.take(),
+            active: Arc::new(AtomicBool::new(true)),
             released: false,
         })
     }

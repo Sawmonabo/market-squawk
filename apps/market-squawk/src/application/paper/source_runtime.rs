@@ -49,8 +49,24 @@ impl SourceRuntimeView for PaperSourceRuntimeView {
             .map_err(map_lock_error)?;
             match &*state {
                 PaperState::Stopped { .. } => None,
-                PaperState::Starting { .. } | PaperState::Stopping => {
+                PaperState::LiveStarting { .. }
+                | PaperState::Starting { .. }
+                | PaperState::Stopping => {
                     return Err(SourceRuntimeViewError::Unavailable);
+                }
+                PaperState::LiveOnly {
+                    provider,
+                    runtime,
+                    exports,
+                    cancellation,
+                    ..
+                } => {
+                    if cancellation.is_cancelled() || !runtime.is_healthy() || !exports.is_healthy()
+                    {
+                        None
+                    } else {
+                        Some((PaperProvider::Public(*provider), runtime.snapshots()))
+                    }
                 }
                 PaperState::Running {
                     provider,
@@ -63,9 +79,10 @@ impl SourceRuntimeView for PaperSourceRuntimeView {
                         || !runtime.source_is_healthy()
                         || !exports.is_healthy()
                     {
-                        return Err(SourceRuntimeViewError::Unavailable);
+                        None
+                    } else {
+                        Some((*provider, runtime.snapshots()))
                     }
-                    Some((*provider, runtime.snapshots()))
                 }
             }
         };

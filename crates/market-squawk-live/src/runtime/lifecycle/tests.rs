@@ -303,7 +303,7 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         routes: Vec::new(),
         action_hooks: Vec::new(),
         qualified_market_exports: Vec::new(),
-        maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route().get(),
+        maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route(),
         maximum_sources_per_route: 1,
         maximum_streams_per_route: 1,
         feature_capacity: config.feature_capacity(),

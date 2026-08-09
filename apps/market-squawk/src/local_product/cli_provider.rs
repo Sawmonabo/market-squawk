@@ -17,6 +17,7 @@ use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
+use market_squawk_adapter_files::{ExtractionLimits, ExtractionLimitsInput};
 use market_squawk_adapter_fred::{
     CURRENT_FRED_RIGHTS_ARTIFACT_SHA256, CURRENT_UNRATE_RIGHTS_ARTIFACT_SHA256, FredOperation,
     FredRightsArtifact, FredRightsPolicy, FredSeriesRightsEvidence, FredSeriesRightsGrant,
@@ -28,6 +29,7 @@ use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
 use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySourceConfig};
+use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
     AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
@@ -59,7 +61,8 @@ use uuid::Uuid;
 
 use crate::application::ResearchProviderRuntimeGeneration;
 use crate::provider_activation::{
-    CommittedProviderAdapterReplacement, PreparedProviderAdapterReplacement,
+    CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
+    PreparedProviderAdapterReplacement,
 };
 use crate::provider_onboarding::{
     AcquiredFredTermsDocument, FredPortalEvidenceInput, FredPortalGrantInput,
@@ -72,7 +75,7 @@ use crate::{
     ProviderAdapterActivationRequest, ProviderOnboardingError, ProviderOnboardingService,
     ProviderPortalActivationAuthority, ProviderPortalActivationError,
     ProviderPortalActivationRequest, ProviderPortalActivationView, SecAdapterActivation,
-    TreasuryAdapterActivation,
+    StartOnboardingRequest, TreasuryAdapterActivation,
 };
 
 use super::LocalProduct;
@@ -82,8 +85,9 @@ use super::provider_activation_state::{
 };
 
 const LEGACY_REQUEST_SCHEMA_VERSION: u16 = 2;
-const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 3;
-const REQUEST_SCHEMA_VERSION: u16 = 4;
+const EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION: u16 = 3;
+const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 4;
+const REQUEST_SCHEMA_VERSION: u16 = 5;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
 const FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES: u64 = 256 * 1024;
@@ -105,6 +109,7 @@ const KRAKEN_PUBLIC_SURFACE: &str = "kraken.spot-public-market-data";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
+const LOCAL_FILES_SURFACE: &str = "local.files";
 const FRED_RIGHTS_MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../../docs/verification/fred-rights-decision.json");
 const FRED_UNRATE_RIGHTS_BYTES: &[u8] =
@@ -133,7 +138,7 @@ const PORTAL_SOURCE_SURFACES: [&str; 3] = [
 
 /// Shared application authority behind local portal adapter activation and durable restart.
 #[derive(Clone)]
-pub(super) struct ProviderResearchActivationService {
+pub(crate) struct ProviderResearchActivationService {
     paths: LocalPaths,
     onboarding: Arc<ProviderOnboardingService>,
     activation: Arc<ProviderAdapterActivation>,
@@ -155,6 +160,75 @@ impl ProviderResearchActivationService {
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
         }
+    }
+
+    /// Publishes one exact workspace-controlled local-file bundle through the same durable
+    /// activation and replacement authority used by provider onboarding.
+    pub(crate) async fn activate_controlled_local_files(
+        &self,
+        configuration: ControlledLocalFileRequest,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        self.tasks.require_admission()?;
+        if cancellation.is_cancelled() {
+            return Err(CliProviderActivationError::Cancelled);
+        }
+        let session = self
+            .onboarding
+            .start(
+                StartOnboardingRequest::try_new(LOCAL_FILES_SURFACE, None, None)
+                    .map_err(CliProviderActivationError::Onboarding)?,
+                cancellation.child_token(),
+            )
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        let session_id = session.session_id();
+        let completion = CancellationToken::new();
+        let lease = self
+            .onboarding
+            .prepare_runtime_activation_target(session_id, completion.clone())
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        require_surface(&lease, ProviderSurface::Exact(LOCAL_FILES_SURFACE))?;
+        let request = ActivationRequest {
+            schema_version: REQUEST_SCHEMA_VERSION,
+            session_id,
+            provider: ProviderRequest::ControlledLocalFiles { configuration },
+        };
+        let request_bytes =
+            serde_json::to_vec(&request).map_err(|_| CliProviderActivationError::InvalidRequest)?;
+        if request_bytes.is_empty()
+            || u64::try_from(request_bytes.len())
+                .map_or(true, |length| length > REQUEST_MAXIMUM_BYTES)
+        {
+            return Err(CliProviderActivationError::InvalidRequest);
+        }
+        let evidence = LoadedActivationEvidence {
+            objects: BTreeMap::new(),
+        };
+        let activation =
+            build_research_activation(&self.paths, &lease, &request_bytes, request, &evidence)?;
+        let _activation_guard = self
+            .state
+            .acquire_activation(LOCAL_FILES_SURFACE)
+            .await
+            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+        publish_research_activation(
+            &self.state,
+            &self.activation,
+            &self.onboarding,
+            &lease,
+            &request_bytes,
+            &evidence,
+            activation,
+            completion.clone(),
+        )
+        .await?;
+        self.onboarding
+            .reconcile_cleanup(session_id, completion)
+            .await
+            .map_err(CliProviderActivationError::Onboarding)?;
+        Ok(())
     }
 
     async fn activate_from_portal(
@@ -2228,6 +2302,62 @@ fn build_research_activation(
             )?;
             ProviderAdapterActivationRequest::Fred(FredAdapterActivation::new(metadata, policy))
         }
+        ProviderRequest::ControlledLocalFiles { configuration } => {
+            let manifest_digest = sha256_evidence(&configuration.manifest_sha256)?;
+            let admitted_input_set = sha256_evidence(&configuration.admitted_input_set_sha256)?;
+            let local_admission = sha256_evidence(&configuration.local_admission_evidence_sha256)?;
+            let workspace_receipt =
+                sha256_evidence(&configuration.workspace_receipt_evidence_sha256)?;
+            let import_receipt = sha256_evidence(&configuration.import_receipt_evidence_sha256)?;
+            let evidence = ImportedUserInputEvidence::try_new(
+                admitted_input_set,
+                manifest_digest,
+                local_admission,
+                workspace_receipt,
+                import_receipt,
+            )
+            .map_err(|_| CliProviderActivationError::InvalidRights)?;
+            let limits = ExtractionLimits::try_new(ExtractionLimitsInput::standard())
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let root = paths
+                .artifacts()
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?
+                .open_controlled_import_root(&configuration.root_reference)
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?;
+            let manifest = root
+                .resolve(&configuration.manifest_reference)
+                .and_then(|input| {
+                    input.open_bounded(ExtractionLimitsInput::standard().max_manifest_bytes)
+                })
+                .and_then(|input| input.read_bounded())
+                .map_err(|_| CliProviderActivationError::InputUnavailable)?;
+            if manifest.digest() != manifest_digest {
+                return Err(CliProviderActivationError::InvalidRequest);
+            }
+            let metadata = controlled_local_file_metadata(
+                lease,
+                activation_evidence,
+                manifest_digest,
+                Timestamp::from_unix_nanos(configuration.admitted_at_unix_nanos),
+            )?;
+            let digest_hex = lower_hex(&manifest_digest.bytes());
+            let representation_state_root = paths
+                .control_root()
+                .map_err(|_| CliProviderActivationError::StateUnavailable)?
+                .root()
+                .join("sources/controlled-file-representations")
+                .join(digest_hex);
+            ProviderAdapterActivationRequest::ControlledLocalFiles(
+                ControlledLocalFileAdapterActivation::new(
+                    metadata,
+                    root,
+                    representation_state_root,
+                    manifest,
+                    limits,
+                    evidence,
+                ),
+            )
+        }
     };
     Ok(activation)
 }
@@ -2292,6 +2422,22 @@ enum ProviderRequest {
     FredAlfred {
         configuration: Box<FredProviderRequest>,
     },
+    ControlledLocalFiles {
+        configuration: ControlledLocalFileRequest,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlledLocalFileRequest {
+    pub(crate) root_reference: PathBuf,
+    pub(crate) manifest_reference: PathBuf,
+    pub(crate) manifest_sha256: String,
+    pub(crate) admitted_input_set_sha256: String,
+    pub(crate) local_admission_evidence_sha256: String,
+    pub(crate) workspace_receipt_evidence_sha256: String,
+    pub(crate) import_receipt_evidence_sha256: String,
+    pub(crate) admitted_at_unix_nanos: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2309,6 +2455,7 @@ impl ProviderRequest {
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
+            Self::ControlledLocalFiles { .. } => ProviderSurface::Exact(LOCAL_FILES_SURFACE),
         }
     }
 }
@@ -3353,7 +3500,9 @@ fn evidence_references(
                 return Err(CliProviderActivationError::ProviderConfiguration);
             }
         }
-        ProviderRequest::TreasuryFiscal { .. } | ProviderRequest::TreasuryDailyRates { .. } => {}
+        ProviderRequest::TreasuryFiscal { .. }
+        | ProviderRequest::TreasuryDailyRates { .. }
+        | ProviderRequest::ControlledLocalFiles { .. } => {}
         ProviderRequest::Bls {
             series_metadata, ..
         } => {
@@ -3502,7 +3651,25 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
             let mut request: ActivationRequest = serde_json::from_slice(bytes)
                 .map_err(|_| CliProviderActivationError::InvalidRequest)?;
             if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
-                || matches!(&request.provider, ProviderRequest::FredAlfred { .. })
+                || matches!(
+                    &request.provider,
+                    ProviderRequest::ControlledLocalFiles { .. }
+                )
+            {
+                return Err(CliProviderActivationError::InvalidRequest);
+            }
+            request.schema_version = REQUEST_SCHEMA_VERSION;
+            Ok(request)
+        }
+        EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION => {
+            let mut request: ActivationRequest = serde_json::from_slice(bytes)
+                .map_err(|_| CliProviderActivationError::InvalidRequest)?;
+            if request.schema_version != EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION
+                || matches!(
+                    &request.provider,
+                    ProviderRequest::FredAlfred { .. }
+                        | ProviderRequest::ControlledLocalFiles { .. }
+                )
             {
                 return Err(CliProviderActivationError::InvalidRequest);
             }
@@ -3611,6 +3778,73 @@ fn source_id(
 ) -> Result<SourceId, CliProviderActivationError> {
     SourceId::try_from(format!("{source_tag}-{}", surface.as_str()))
         .map_err(|_| CliProviderActivationError::InvalidRequest)
+}
+
+fn sha256_evidence(value: &str) -> Result<EvidenceDigest, CliProviderActivationError> {
+    let digest = Sha256Digest::from_lower_hex(value)
+        .map_err(|_| CliProviderActivationError::InvalidRequest)?;
+    Ok(EvidenceDigest::new(DigestAlgorithm::Sha256, digest.bytes()))
+}
+
+fn controlled_local_file_metadata(
+    lease: &ProviderActivationLease,
+    activation_evidence: EvidenceDigest,
+    manifest_digest: EvidenceDigest,
+    admitted_at: Timestamp,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let source_id = source_id("controlled-files", lease.surface_id())?;
+    let digest = lower_hex(&manifest_digest.bytes());
+    let short = digest
+        .get(..24)
+        .ok_or(CliProviderActivationError::InvalidMetadata)?;
+    let revision = MetadataRevision::new(
+        SourceIdentifier::try_from(format!("manifest-{short}"))
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    );
+    let provider = SourceIdentifier::try_from("user-imported-local-files")
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let basis = SourceIdentifier::try_from("controlled-user-import")
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let manifest_evidence = ExactPayloadEvidence::from_content_digest(manifest_digest);
+    let authorization_evidence = ExactPayloadEvidence::from_content_digest(activation_evidence);
+    let effective = EffectiveInterval::new(admitted_at, None)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(revision, manifest_evidence.clone()),
+        SourceClass::LocalFile,
+        provider,
+        AuthorizationGrant::new(
+            AuthorizationMode::UserOwnedLocal,
+            AuthorizationBasis::new(basis),
+            authorization_evidence,
+            effective,
+        ),
+        SourceCoverage::try_non_instrument(
+            manifest_evidence,
+            effective,
+            CoverageDomain::AlternativeData,
+            CoverageDelay::Delayed(1),
+            DeliveryEvidence::Unknown,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        DataQuality::DirectUnverified,
+        NetworkAccessPolicy::Denied,
+        FreshnessPolicy::try_new(1, 1, 1, 1, 0)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        None,
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::RevisionPreserving,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
 #[allow(

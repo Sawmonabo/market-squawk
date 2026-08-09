@@ -456,6 +456,8 @@ pub struct SourceLifecycleStatusInput {
     pub state_revision: NonZeroU64,
     /// Current durable lifecycle state.
     pub state: SourceLifecycleState,
+    /// Onboarding session that owns the retained public configuration, when one exists.
+    pub configuration_session_id: Option<Uuid>,
     /// Exact current live generation when this is a live stream.
     pub current_generation: Option<ConnectionGeneration>,
     /// Exact callable research-runtime generation when this is a research source.
@@ -513,6 +515,7 @@ impl fmt::Debug for SourceLifecycleStatusInput {
             .field("provider", &self.provider)
             .field("state_revision", &self.state_revision)
             .field("state", &self.state)
+            .field("configuration_session_id", &self.configuration_session_id)
             .field("current_generation", &self.current_generation)
             .field(
                 "has_runtime_generation_digest",

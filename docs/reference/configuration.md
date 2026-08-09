@@ -94,11 +94,12 @@ Both profiles carry a closed `authorization` object:
 | `evidence_sha256` | Exactly 64 hexadecimal characters |
 | `effective_from_unix_nanos`, `effective_until_unix_nanos` | Signed nanoseconds; the half-open interval must be increasing and cover the use instant |
 
-Coinbase is fixed to `wss://ws-feed.exchange.coinbase.com`, exactly one each of
+Coinbase is fixed to `wss://advanced-trade-ws.coinbase.com`, exactly one each of
 `book_snapshot`, `book_delta`, and `trade`, and `price_level` depth. Its freshness is
-`250..=600000` ms; frame and control-byte ceilings are `1..=4194304`; the acknowledgement timeout
-is `1..=60000` ms; control message capacity is `1..=4096`; and it admits `1..=100` unique crypto
-instrument mappings. Its serialized subscription is capped at 16 KiB.
+`250..=600000` ms; the frame ceiling is `1..=16777216`; the control-byte ceiling is
+`1..=4194304`; the acknowledgement timeout is `1..=60000` ms; control message capacity is
+`1..=4096`; and the public runtime admits exactly one crypto instrument mapping per connection.
+Its serialized subscription is capped at 16 KiB.
 
 Kraken is fixed to `wss://ws.kraken.com/v2`, `book`, and depth `10`. It has the same freshness,
 frame, acknowledgement, and control-capacity ranges, but admits one canonical crypto instrument

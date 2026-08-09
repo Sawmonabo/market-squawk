@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     fmt,
     num::NonZeroUsize,
+    str::FromStr,
     time::Duration,
 };
 
@@ -20,8 +21,9 @@ use thiserror::Error;
 
 use super::ConfigError;
 
-/// Pinned public Coinbase Exchange WebSocket endpoint accepted by production configuration.
-pub const COINBASE_EXCHANGE_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.com";
+/// Pinned public Coinbase Advanced Trade market-data endpoint accepted by production configuration.
+pub const COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT: &str =
+    "wss://advanced-trade-ws.coinbase.com";
 /// Pinned public Kraken Spot WebSocket v2 endpoint accepted by production configuration.
 pub const KRAKEN_WEBSOCKET_V2_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 
@@ -29,7 +31,7 @@ const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const KRAKEN_VENUE: &str = "kraken";
 const KRAKEN_PROVIDER: &str = "kraken";
-const MAX_INSTRUMENTS: usize = 100;
+const MAX_INSTRUMENTS: usize = 1;
 const MAX_COINBASE_PRODUCT_BYTES: usize = 64;
 const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024;
 const MAX_ENVIRONMENT_PROFILE_BYTES: usize = 128 * 1024;
@@ -40,6 +42,14 @@ const MAX_FRESHNESS_MS: u64 = 600_000;
 const MAX_ACK_TIMEOUT_MS: u64 = 60_000;
 const MAX_CONTROL_MESSAGES: usize = 4_096;
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+const RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS: i64 = 1_784_779_200_000_000_000;
+const RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS: i64 = 1_816_315_200_000_000_000;
+const RECOMMENDED_INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
+const RECOMMENDED_PRIMARY_ASSET_ID: &str = "b9f6d14f-9140-4ca3-a412-9bd59b3b5e67";
+const COINBASE_REVIEW_EVIDENCE_SHA256: &str =
+    "18e2c5d1c52a32b3bf734415a579ec99aea8ef2cb8d3c34a38f4fea577ab73bb";
+const KRAKEN_REVIEW_EVIDENCE_SHA256: &str =
+    "4e2ffd272197009ca5d5cfd3f8e5adc3f84a7fc87d40159d1185d58a7aa54f44";
 
 const REQUIRED_EVENT_CLASSES: [LiveEventClass; 3] = [
     LiveEventClass::BookSnapshot,
@@ -100,7 +110,7 @@ pub struct CoinbaseSourceConfig {
 impl CoinbaseSourceConfig {
     /// Returns the sole permitted production endpoint.
     pub const fn endpoint(&self) -> &'static str {
-        COINBASE_EXCHANGE_ENDPOINT
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT
     }
 
     /// Returns the explicit locally admitted public-interface authorization attestation.
@@ -149,6 +159,55 @@ impl CoinbaseSourceConfig {
     }
 }
 
+pub(super) fn recommended_coinbase_public_config()
+-> Result<CoinbaseSourceConfig, CoinbaseConfigurationError> {
+    let wire = format!(
+        r#"{{
+          "endpoint":"{COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT}",
+          "event_classes":["book_snapshot","book_delta","trade"],
+          "depth":"price_level",
+          "freshness_ms":5000,
+          "max_frame_bytes":16777216,
+          "subscription_ack_timeout_ms":5000,
+          "control_message_capacity":64,
+          "control_byte_capacity":65536,
+          "authorization":{{
+            "mode":"public_interface",
+            "provider":"coinbase-exchange",
+            "basis":"market-squawk-reviewed-coinbase-public-interface",
+            "evidence_sha256":"{COINBASE_REVIEW_EVIDENCE_SHA256}",
+            "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+            "evidence_version":"reviewed-2026-08-08",
+            "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
+            "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
+          }},
+          "instruments":[{{
+            "product":"BTC-USD",
+            "instrument_id":"{RECOMMENDED_INSTRUMENT_ID}",
+            "definition_revision":1,
+            "asset_class":"crypto",
+            "primary_asset":"{RECOMMENDED_PRIMARY_ASSET_ID}",
+            "quote_currency":"USD",
+            "tick_size":"0.01",
+            "lot_size":"0.00000001",
+            "contract_multiplier":"1",
+            "venue":"coinbase-exchange",
+            "trading_status":"active"
+          }}]
+        }}"#
+    );
+    let mut config: CoinbaseSourceConfig = serde_json::from_str(&wire)
+        .map_err(|_error| CoinbaseConfigurationError::InvalidEmbeddedRecommendedProfile)?;
+    let definition = recommended_public_btc_usd_definition()
+        .map_err(|_error| CoinbaseConfigurationError::InvalidEmbeddedRecommendedProfile)?;
+    let mapping = config
+        .instruments
+        .first_mut()
+        .ok_or(CoinbaseConfigurationError::InvalidEmbeddedRecommendedProfile)?;
+    mapping.definition = definition;
+    Ok(config)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CoinbaseSourceConfigWire {
@@ -164,7 +223,7 @@ struct CoinbaseSourceConfigWire {
     instruments: Vec<CoinbaseInstrumentWire>,
 }
 
-/// Explicit user-admitted authorization evidence for the Coinbase public interface.
+/// Explicit locally admitted authorization evidence for the Coinbase public interface.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CoinbaseAuthorizationAttestation {
     provider: SourceIdentifier,
@@ -179,7 +238,7 @@ impl CoinbaseAuthorizationAttestation {
         &self.provider
     }
 
-    /// Returns the user-supplied audited authorization basis.
+    /// Returns the locally admitted audited authorization basis.
     pub const fn basis(&self) -> &AuthorizationBasis {
         &self.basis
     }
@@ -366,7 +425,7 @@ impl CoinbaseInstrumentWire {
 fn validate_source_profile(
     wire: &CoinbaseSourceConfigWire,
 ) -> Result<(), CoinbaseConfigurationError> {
-    if wire.endpoint != COINBASE_EXCHANGE_ENDPOINT {
+    if wire.endpoint != COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT {
         return Err(CoinbaseConfigurationError::InvalidEndpoint);
     }
     if wire.instruments.is_empty() || wire.instruments.len() > MAX_INSTRUMENTS {
@@ -548,6 +607,94 @@ impl KrakenSourceConfig {
     pub const fn control_limits(&self) -> CoinbaseControlLimits {
         self.control_limits
     }
+}
+
+pub(super) fn recommended_kraken_public_config()
+-> Result<KrakenSourceConfig, KrakenConfigurationError> {
+    let wire = format!(
+        r#"{{
+          "endpoint":"{KRAKEN_WEBSOCKET_V2_ENDPOINT}",
+          "channel":"book",
+          "depth":10,
+          "freshness_ms":5000,
+          "max_frame_bytes":1048576,
+          "subscription_ack_timeout_ms":5000,
+          "control_message_capacity":64,
+          "control_byte_capacity":65536,
+          "authorization":{{
+            "mode":"public_interface",
+            "provider":"kraken",
+            "basis":"market-squawk-reviewed-kraken-public-interface",
+            "evidence_sha256":"{KRAKEN_REVIEW_EVIDENCE_SHA256}",
+            "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
+            "evidence_version":"reviewed-2026-07-23",
+            "effective_from_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_FROM_UNIX_NANOS},
+            "effective_until_unix_nanos":{RECOMMENDED_PROFILE_EFFECTIVE_UNTIL_UNIX_NANOS}
+          }},
+          "instrument":{{
+            "symbol":"BTC/USD",
+            "instrument_id":"{RECOMMENDED_INSTRUMENT_ID}",
+            "definition_revision":1,
+            "asset_class":"crypto",
+            "primary_asset":"{RECOMMENDED_PRIMARY_ASSET_ID}",
+            "quote_currency":"USD",
+            "tick_size":"0.01",
+            "lot_size":"0.00000001",
+            "contract_multiplier":"1",
+            "venue":"kraken",
+            "trading_status":"active"
+          }}
+        }}"#
+    );
+    let mut config: KrakenSourceConfig = serde_json::from_str(&wire)
+        .map_err(|_error| KrakenConfigurationError::InvalidEmbeddedRecommendedProfile)?;
+    config.instrument.definition = recommended_public_btc_usd_definition()
+        .map_err(|_error| KrakenConfigurationError::InvalidEmbeddedRecommendedProfile)?;
+    Ok(config)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EmbeddedRecommendedProfileError;
+
+fn recommended_public_btc_usd_definition()
+-> Result<InstrumentDefinition, EmbeddedRecommendedProfileError> {
+    let instrument_id =
+        InstrumentId::from_str(RECOMMENDED_INSTRUMENT_ID).map_err(invalid_recommended_profile)?;
+    let primary_asset = InstrumentId::from_str(RECOMMENDED_PRIMARY_ASSET_ID)
+        .map_err(invalid_recommended_profile)?;
+    let coinbase_venue = VenueId::try_from(COINBASE_VENUE).map_err(invalid_recommended_profile)?;
+    let kraken_venue = VenueId::try_from(KRAKEN_VENUE).map_err(invalid_recommended_profile)?;
+    InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id,
+        definition_revision: InstrumentDefinitionRevision::try_from(1_u64)
+            .map_err(invalid_recommended_profile)?,
+        asset_class: AssetClass::Crypto,
+        primary_denomination: Denomination::Asset(primary_asset),
+        quote_currency: Currency::try_from("USD").map_err(invalid_recommended_profile)?,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))
+            .map_err(invalid_recommended_profile)?,
+        lot_size: LotSize::try_from_decimal(Decimal::new(1, 8))
+            .map_err(invalid_recommended_profile)?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![
+            VenueMapping::new(
+                coinbase_venue,
+                VenueSymbol::try_from("BTC-USD").map_err(invalid_recommended_profile)?,
+            ),
+            VenueMapping::new(
+                kraken_venue,
+                VenueSymbol::try_from("BTC/USD").map_err(invalid_recommended_profile)?,
+            ),
+        ],
+        provider_identities: Vec::new(),
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })
+    .map_err(invalid_recommended_profile)
+}
+
+fn invalid_recommended_profile<T>(_error: T) -> EmbeddedRecommendedProfileError {
+    EmbeddedRecommendedProfileError
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -762,6 +909,8 @@ pub(super) fn parse_kraken_environment_profile(
 /// Strict Kraken configuration failure without rendering source input.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum KrakenConfigurationError {
+    #[error("embedded recommended Kraken public profile is invalid")]
+    InvalidEmbeddedRecommendedProfile,
     #[error("Kraken production protocol profile is invalid")]
     InvalidProtocolProfile,
     #[error("Kraken authorization attestation is invalid or unbounded")]
@@ -812,21 +961,38 @@ pub(super) fn validate_product_list(products: &[String]) -> Result<(), ConfigErr
 struct Subscription<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    product_ids: Vec<&'a str>,
-    channels: [&'static str; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    product_ids: Option<Vec<&'a str>>,
+    channel: &'static str,
 }
 
 fn encoded_subscription_bytes(
     products: &BTreeSet<String>,
 ) -> Result<NonZeroUsize, CoinbaseConfigurationError> {
-    let subscription = Subscription {
-        kind: "subscribe",
-        product_ids: products.iter().map(String::as_str).collect(),
-        channels: ["level2", "matches", "heartbeat"],
-    };
-    let bytes = serde_json::to_vec(&subscription)
-        .map_err(|_error| CoinbaseConfigurationError::SubscriptionSerialization)?
-        .len();
+    let product_ids = products.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut bytes = 0_usize;
+    for (channel, carries_products) in [
+        ("level2", true),
+        ("market_trades", true),
+        ("heartbeats", false),
+    ] {
+        let subscription = Subscription {
+            kind: "subscribe",
+            product_ids: if carries_products {
+                Some(product_ids.clone())
+            } else {
+                None
+            },
+            channel,
+        };
+        bytes = bytes
+            .checked_add(
+                serde_json::to_vec(&subscription)
+                    .map_err(|_error| CoinbaseConfigurationError::SubscriptionSerialization)?
+                    .len(),
+            )
+            .ok_or(CoinbaseConfigurationError::SubscriptionTooLarge)?;
+    }
     NonZeroUsize::new(bytes)
         .filter(|size| size.get() <= MAX_SUBSCRIPTION_BYTES)
         .ok_or(CoinbaseConfigurationError::SubscriptionTooLarge)
@@ -835,6 +1001,8 @@ fn encoded_subscription_bytes(
 /// Strict Coinbase configuration failure without rendering source input.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CoinbaseConfigurationError {
+    #[error("embedded recommended Coinbase public profile is invalid")]
+    InvalidEmbeddedRecommendedProfile,
     #[error("Coinbase production endpoint is invalid")]
     InvalidEndpoint,
     #[error("Coinbase authorization attestation is invalid or unbounded")]

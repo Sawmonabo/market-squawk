@@ -22,6 +22,30 @@ impl CurrentHealthReporter {
         &mut self,
         snapshot: crate::SourceHealthSnapshot,
     ) -> Result<CurrentHealthUpdate, RegistryError> {
+        let budget = CurrentBudgetAuthority::observe(self.budget.as_ref());
+        self.report_with_budget(snapshot, budget)
+    }
+
+    /// Binds health to the exact currently active provider request that carries this live stream.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an inactive or transplanted request permit in addition to the ordinary health
+    /// identity, policy, session, and temporal validation failures.
+    pub fn report_with_active_request(
+        &mut self,
+        snapshot: crate::SourceHealthSnapshot,
+        request: &crate::BudgetPermitLease,
+    ) -> Result<CurrentHealthUpdate, RegistryError> {
+        let budget = CurrentBudgetAuthority::observe_active_request(self.budget.as_ref(), request)?;
+        self.report_with_budget(snapshot, budget)
+    }
+
+    fn report_with_budget(
+        &mut self,
+        snapshot: crate::SourceHealthSnapshot,
+        budget: CurrentBudgetAuthority,
+    ) -> Result<CurrentHealthUpdate, RegistryError> {
         if !self.lease.is_current()
             || !snapshot.uses_freshness_policy(self.freshness)
             || !snapshot
@@ -43,7 +67,7 @@ impl CurrentHealthReporter {
             snapshot,
             binding: self.binding.clone(),
             lease: Arc::clone(&self.lease),
-            budget: CurrentBudgetAuthority::observe(self.budget.as_ref()),
+            budget,
             trusted_reported_at,
         })
     }
@@ -459,6 +483,7 @@ impl FrameSessionLease {
             terminal: AtomicBool::new(false),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
+            minimum_valid_health_epoch: AtomicU64::new(0),
             valid_from_nanos: AtomicI64::new(i64::MAX),
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
@@ -958,8 +983,8 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
     ///
     /// # Errors
     ///
-    /// Rejects a stale session, changed health epoch, unhealthy capture generation, or expired
-    /// current-health deadline.
+    /// Rejects a stale session, an authority outside the bounded healthy-refresh overlap,
+    /// unhealthy capture generation, degradation, or an expired current-health deadline.
     pub fn try_current_lease(&self) -> Result<CurrentSourceAuthorityLease, RegistryError> {
         let mint_at = self.clock.observe()?;
         self.validated.session.validate_current_lease()?;

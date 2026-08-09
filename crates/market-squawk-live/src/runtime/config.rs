@@ -305,7 +305,10 @@ impl LiveRuntimeConfig {
     pub const fn maximum_feature_snapshot_bytes(&self) -> NonZeroU32 {
         self.feature_capacity.maximum_feature_snapshot_bytes
     }
-    pub const fn maximum_action_hook_bytes_per_route(&self) -> NonZeroUsize {
+    /// Maximum bytes retained by an optional action hook for one route.
+    ///
+    /// Zero is valid for market-data-only runtimes that do not install action hooks.
+    pub const fn maximum_action_hook_bytes_per_route(&self) -> usize {
         self.feature_capacity.maximum_action_hook_bytes_per_route
     }
     pub const fn registration_control_capacity(&self) -> NonZeroUsize {

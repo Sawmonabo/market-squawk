@@ -1710,6 +1710,16 @@ impl McpRelayTransport for RecordingRelayTransport {
             .map_err(|_error| McpRelayTransportError::Unavailable)?
             .push(body.clone());
         let id = body.get("id").cloned().unwrap_or(Value::Null);
+        if request.method() == "tools/call" && request.name() == Some("Invalid.Params") {
+            let encoded = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "error":{"code":-32602,"message":"Invalid params"}
+            }))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+            return McpRelayResponse::try_new(400, Some("application/json"), encoded)
+                .map_err(|_error| McpRelayTransportError::InvalidResponse);
+        }
         let result = match request.method() {
             "initialize" => json!({
                 "protocolVersion":"2026-07-28",
@@ -1815,6 +1825,18 @@ async fn stdio_relay_proxies_tools_and_resources_to_the_shared_service()
         resource["result"]["contents"][0]["uri"],
         "market-squawk://service"
     );
+    let invalid = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"invalid",
+            "method":"tools/call",
+            "params":{"name":"Invalid.Params","arguments":{}}
+        }),
+    )
+    .await?;
+    assert_eq!(invalid["error"]["code"], -32602);
 
     let waiting_started = transport.waiting_started.notified();
     tokio::pin!(waiting_started);
@@ -1841,7 +1863,23 @@ async fn stdio_relay_proxies_tools_and_resources_to_the_shared_service()
         .exchanges
         .lock()
         .map_err(|_error| "relay exchange log was poisoned")?;
-    assert_eq!(exchanges.len(), 4);
+    assert_eq!(exchanges.len(), 5);
+    let mut request_namespace = None;
+    for exchange in exchanges.iter() {
+        let forwarded_id = exchange["id"]
+            .as_str()
+            .ok_or("relay did not namespace a request identifier")?;
+        let (namespace, digest) = forwarded_id
+            .rsplit_once(':')
+            .ok_or("relay request namespace was malformed")?;
+        assert!(namespace.starts_with("msq-relay:"));
+        assert_eq!(digest.len(), 64);
+        if let Some(expected) = request_namespace.as_deref() {
+            assert_eq!(namespace, expected);
+        } else {
+            request_namespace = Some(namespace.to_owned());
+        }
+    }
     for exchange in &exchanges[1..] {
         assert_eq!(
             exchange.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion"),

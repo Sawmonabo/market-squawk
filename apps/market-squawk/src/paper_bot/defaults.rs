@@ -20,7 +20,7 @@ use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, InstrumentDefinition, Money, OrderId,
     OrderReasonCode, PriceTicks, ProviderProduct, RuleVersion, SourceIdentifier, StrategyId,
-    Timestamp,
+    Timestamp, VenueId,
 };
 use market_squawk_execution::portfolio_execution_state;
 use market_squawk_execution::{
@@ -33,8 +33,8 @@ use market_squawk_execution::{
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, DepthLimit, DirectBookLimits, LiveRouteConfig, LiveRouteConfigInput,
-    LiveRuntimeConfig, LiveRuntimeConfigInput, RouteActionHook, ShardKey, ShardRoutingVersion,
-    SnapshotLimits,
+    LiveRuntimeConfig, LiveRuntimeConfigInput, RouteActionHook, RouteQualifiedMarketExport,
+    ShardKey, ShardRoutingVersion, SnapshotLimits,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_portfolio::{
@@ -54,8 +54,9 @@ use super::{
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, CoinbaseDirectAccountActivation, CoinbaseDirectAdapterActivation,
-    CoinbaseDirectProductActivation, ProductionLiveSourceComposition, ProductionSourceProvider,
-    ProviderActivationOutcome, ProviderAdapterActivation, ProviderAdapterActivationRequest,
+    CoinbaseDirectProductActivation, ProductionLiveSourceComposition, ProductionLiveSourceRuntime,
+    ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProviderActivationOutcome,
+    ProviderAdapterActivation, ProviderAdapterActivationRequest,
 };
 
 const LOCAL_PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
@@ -159,6 +160,57 @@ pub(crate) fn local_paper_bot_with_provider_rate_and_strategy_mode(
         0,
         move |route| strategy_mode.for_route(route),
     )
+}
+
+/// Validated public market-data composition without strategy or execution authority.
+#[derive(Debug)]
+pub(crate) struct ProductionLiveMarketComposition {
+    source: ProductionLiveSourceComposition,
+    runtime_config: LiveRuntimeConfig,
+}
+
+impl ProductionLiveMarketComposition {
+    /// Returns the complete immutable route set used to create bounded market exports.
+    pub(crate) fn live_routes(&self) -> &[LiveRouteConfig] {
+        self.source.routes()
+    }
+
+    /// Returns the admitted conservative retained-byte ceiling for one source message.
+    pub(crate) const fn maximum_message_bytes(&self) -> NonZeroU32 {
+        self.runtime_config.maximum_message_bytes()
+    }
+
+    /// Starts the source-only runtime with one exact qualified-market export per route.
+    pub(crate) async fn start_with_qualified_market_exports(
+        self,
+        exports: Vec<RouteQualifiedMarketExport>,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        self.source
+            .start_with_qualified_market_exports(self.runtime_config, exports, cancellation)
+            .await
+    }
+}
+
+/// Builds the bounded public market-data runtime used independently of paper execution.
+pub(crate) fn local_live_market_with_provider_rate(
+    config: AppConfig,
+    provider: ProductionSourceProvider,
+    provider_rate: ProviderRateAuthority,
+) -> Result<ProductionLiveMarketComposition> {
+    let configured = configured_source(&config, provider)?;
+    let (runtime_config, _peak) =
+        live_runtime_config(&configured.routes, configured.maximum_message_bytes, 0)?;
+    let source = ProductionLiveSourceComposition::try_for_provider_with_rate_authority(
+        config,
+        configured.routes,
+        provider,
+        provider_rate,
+    )?;
+    Ok(ProductionLiveMarketComposition {
+        source,
+        runtime_config,
+    })
 }
 
 /// Builds one activated Coinbase Direct paper source with an explicitly selected closed strategy.
@@ -292,6 +344,7 @@ fn configured_source(
                     .iter()
                     .map(|mapping| mapping.definition().clone())
                     .collect(),
+                VenueId::try_from("coinbase-exchange")?,
                 COINBASE_RETAINED_DEPTH,
                 u32::try_from(source.max_frame_bytes().get())?,
                 u64::try_from(source.freshness().as_nanos())?,
@@ -303,6 +356,7 @@ fn configured_source(
                 .ok_or_else(|| anyhow!("production Kraken configuration is required"))?;
             configured_paper_source(
                 vec![source.definition().clone()],
+                VenueId::try_from("kraken")?,
                 source.depth(),
                 u32::try_from(source.max_frame_bytes().get())?,
                 u64::try_from(source.freshness().as_nanos())?,
@@ -313,22 +367,24 @@ fn configured_source(
 
 fn configured_paper_source(
     definitions: Vec<InstrumentDefinition>,
+    venue: VenueId,
     retained_depth: usize,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
 ) -> Result<ConfiguredPaperSource> {
-    let first = definitions
-        .first()
-        .ok_or_else(|| anyhow!("production source instrument set is empty"))?;
-    let venue = first
-        .venue_mappings()
-        .first()
-        .ok_or_else(|| anyhow!("production source instrument has no venue mapping"))?
-        .venue_id()
-        .clone();
+    if definitions.is_empty() {
+        bail!("production source instrument set is empty");
+    }
     let mut routes = Vec::new();
     routes.try_reserve_exact(definitions.len())?;
     for definition in definitions {
+        if !definition
+            .venue_mappings()
+            .iter()
+            .any(|mapping| mapping.venue_id() == &venue)
+        {
+            bail!("production source instrument has no mapping for its selected venue");
+        }
         routes.push(LiveRouteConfig::try_new(LiveRouteConfigInput {
             route: ShardKey::new(venue.clone(), definition.instrument_id()),
             definition,
@@ -628,10 +684,22 @@ pub(super) fn release_benchmark_paper_bot<F>(
 where
     F: FnMut(&LiveRouteConfig) -> Result<PaperRouteStrategy>,
 {
+    let venue = definition
+        .venue_mappings()
+        .first()
+        .ok_or_else(|| anyhow!("release benchmark instrument has no venue mapping"))?
+        .venue_id()
+        .clone();
     build_local_paper_bot(
         config,
         PaperBotBuildSource::ReleaseBenchmark,
-        configured_paper_source(vec![definition], 10, 16 * 1024 * 1024, 60_000_000_000)?,
+        configured_paper_source(
+            vec![definition],
+            venue,
+            10,
+            16 * 1024 * 1024,
+            60_000_000_000,
+        )?,
         Decimal::new(1_000_000, 0),
         0,
         action_hook_overhead_bytes,

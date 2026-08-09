@@ -277,9 +277,9 @@ describe("Market Squawk desktop boundary", () => {
       </MemoryRouter>,
     )
 
-    const field = await screen.findByLabelText("Fallback unlock")
+    const field = await screen.findByLabelText("Local security password")
     await user.type(field, "process-local-test-unlock")
-    await user.click(screen.getByRole("button", { name: "Unlock local service" }))
+    await user.click(screen.getByRole("button", { name: "Unlock secure storage" }))
 
     expect((field as HTMLInputElement).value).toBe("")
     expect(submittedUnlock).toBe("process-local-test-unlock")
@@ -360,10 +360,10 @@ describe("Market Squawk desktop boundary", () => {
       throw new Error("Market Squawk navigation is absent")
     }
     expect(navigation.querySelectorAll("a,button")).toHaveLength(18)
-    const paperExecution = Array.from(
-      navigation.querySelectorAll("button"),
-    ).find((button) => button.textContent?.includes("Paper Execution"))
-    expect(paperExecution?.getAttribute("aria-disabled")).toBe("true")
+    const paperExecution = await within(navigation).findByRole("link", {
+      name: "Paper Execution",
+    })
+    expect(paperExecution.getAttribute("aria-disabled")).toBeNull()
     expect(
       await within(navigation).findByRole("link", {
         name: "Backup & Recovery",

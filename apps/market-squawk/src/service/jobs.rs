@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    application::job::{JobAdmission, JobApplication, JobApplicationError},
+    application::job::{JobAdmission, JobApplication, JobApplicationError, JobView},
     jobs::InstalledJobAuthority,
 };
 
@@ -41,7 +41,7 @@ impl InstalledJobOperations {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
-        let arguments = mutation_arguments(request.arguments());
+        let arguments = super::business_arguments(request.arguments());
         let content = match request.name() {
             "Job.List" => {
                 let input: ListRequest = decode(&arguments)?;
@@ -152,6 +152,7 @@ impl InstalledJobOperations {
         &self,
         admission: JobAdmission,
         context: &RequestContext,
+        metadata: ToolResultMetadata,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
         let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
@@ -170,13 +171,15 @@ impl InstalledJobOperations {
             .await
             .map_err(map_application)?;
         ensure_live(context)?;
-        TypedToolResult::try_new(
-            encode(receipt)?,
-            1,
-            ToolResultMetadata::complete_not_applicable(),
-            context.limits(),
-        )
-        .map_err(Into::into)
+        TypedToolResult::try_new(encode(receipt)?, 1, metadata, context.limits())
+            .map_err(Into::into)
+    }
+
+    pub(super) async fn view(&self, job_id: &str) -> Result<JobView, ServiceError> {
+        self.application
+            .get(parse_id(job_id)?)
+            .await
+            .map_err(map_application)
     }
 }
 
@@ -227,12 +230,6 @@ struct ConfirmRequest {
     expected_sequence: u64,
     identity: SourceIdentifier,
     digest: String,
-}
-
-fn mutation_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
-    let mut admitted = arguments.clone();
-    admitted.remove("confirm");
-    admitted
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {

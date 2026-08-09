@@ -323,7 +323,7 @@ async fn run_generation(
             [spec.config.product().as_source_identifier().as_str()],
             spec.config.limits().websocket().io_timeout(),
             Instant::now(),
-            SubscriptionLimits::try_new(CONTROL_AUDIT_RECORDS, CONTROL_AUDIT_BYTES)?,
+            SubscriptionLimits::try_new(CONTROL_AUDIT_RECORDS, CONTROL_AUDIT_BYTES, 0, 0)?,
         )?;
         let mut source = CoinbaseDirectSession::try_new(
             spec.config.clone(),

@@ -1,8 +1,9 @@
 import * as React from "react"
-import { Search } from "lucide-react"
+import { CircleAlert, KeyRound, LoaderCircle, Search } from "lucide-react"
 import { useLocation, useNavigate } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
+import { Button } from "@/components/ui/button"
 import {
   CommandDialog,
   CommandEmpty,
@@ -12,11 +13,12 @@ import {
   CommandList,
   CommandShortcut,
 } from "@/components/ui/command"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import {
   allNavigation,
-  navigationAdmission,
   navigationForPath,
 } from "@/lib/navigation"
 
@@ -46,6 +48,18 @@ export function AppHeader() {
     product.status === "ready" && product.bootstrap.platform === "macos"
       ? "⌘K"
       : "Ctrl+K"
+  const serviceBootstrap =
+    product.availability === "degraded" ? product.serviceBootstrap : null
+  const requiresUnlock =
+    serviceBootstrap?.requirement === "encrypted_fallback_locked"
+
+  const recover = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const fields = new FormData(event.currentTarget)
+    const unlock = String(fields.get("unlock") ?? "")
+    event.currentTarget.reset()
+    void product.recoverService(unlock)
+  }
 
   return (
     <>
@@ -82,6 +96,75 @@ export function AppHeader() {
         </button>
       </header>
 
+      {serviceBootstrap ? (
+        <section
+          aria-label="Secure local storage recovery"
+          aria-live="polite"
+          className="shrink-0 border-b border-amber-400/25 bg-amber-400/[0.07] px-4 py-3"
+        >
+          <div className="mx-auto flex max-w-[1180px] flex-wrap items-center gap-3">
+            <CircleAlert
+              className="size-4 shrink-0 text-amber-300"
+              aria-hidden="true"
+            />
+            <div className="min-w-60 flex-1">
+              <p className="text-xs font-semibold text-foreground">
+                Secure local storage needs your attention
+              </p>
+              <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
+                {requiresUnlock
+                  ? "Enter the local security password to unlock Market Squawk's encrypted credential fallback."
+                  : "Continue once to let your operating system approve Market Squawk's secure credential storage."}
+                {" The workspace shell and navigation remain available."}
+              </p>
+            </div>
+            <form
+              onSubmit={recover}
+              className="flex min-w-0 flex-wrap items-end gap-2"
+            >
+              {requiresUnlock ? (
+                <div className="min-w-52">
+                  <Label htmlFor="service-fallback-unlock" className="sr-only">
+                    Local security password
+                  </Label>
+                  <div className="relative">
+                    <KeyRound
+                      className="pointer-events-none absolute top-2.5 left-3 size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    <Input
+                      id="service-fallback-unlock"
+                      name="unlock"
+                      type="password"
+                      autoComplete="current-password"
+                      spellCheck={false}
+                      className="h-9 pl-9 font-mono"
+                      placeholder="Local security password"
+                      disabled={product.recoveryPending}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              <Button type="submit" size="sm" disabled={product.recoveryPending}>
+                {product.recoveryPending ? (
+                  <LoaderCircle className="animate-spin" aria-hidden="true" />
+                ) : null}
+                {product.recoveryPending
+                  ? "Finishing secure setup…"
+                  : requiresUnlock
+                    ? "Unlock secure storage"
+                    : "Continue securely"}
+              </Button>
+            </form>
+            {product.recoveryError ? (
+              <p role="alert" className="w-full pl-7 text-xs text-red-300">
+                {product.recoveryError}
+              </p>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+
       <CommandDialog
         open={open}
         onOpenChange={setOpen}
@@ -93,40 +176,15 @@ export function AppHeader() {
           <CommandEmpty>No matching route.</CommandEmpty>
           <CommandGroup heading="Product">
             {allNavigation.map((item) => {
-              const admission =
-                product.status === "ready"
-                  ? navigationAdmission(item, product.bootstrap)
-                  : {
-                      admitted: item.path === "/overview",
-                      reason:
-                        item.path === "/overview"
-                          ? null
-                          : "Local application is still starting.",
-                    }
               return (
                 <CommandItem
                   key={item.path}
-                  value={`${item.label} ${admission.reason ?? ""}`}
-                  onSelect={() => {
-                    if (admission.admitted) {
-                      choose(item.path)
-                    }
-                  }}
-                  aria-disabled={!admission.admitted}
-                  className={
-                    admission.admitted
-                      ? undefined
-                      : "cursor-not-allowed opacity-55"
-                  }
+                  value={item.label}
+                  onSelect={() => choose(item.path)}
                 >
                   <item.icon aria-hidden="true" />
                   <span>{item.label}</span>
-                  <CommandShortcut>
-                    {admission.admitted ? "Go" : "Blocked"}
-                  </CommandShortcut>
-                  {!admission.admitted ? (
-                    <span className="sr-only">{admission.reason}</span>
-                  ) : null}
+                  <CommandShortcut>Go</CommandShortcut>
                 </CommandItem>
               )
             })}

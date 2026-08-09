@@ -8,6 +8,7 @@ import {
   RefreshCw,
   ShieldCheck,
 } from "lucide-react"
+import { Link } from "react-router-dom"
 
 import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
@@ -26,9 +27,18 @@ import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
+  parseResearchManifest,
+  type ResearchDataset,
+} from "@/features/research/research-contracts"
+
+import {
   type LifecycleControl,
+  type SourceEvidence,
+  type StoredDataEvidence,
+  attachStoredData,
   lifecycleControls,
   sourceEvidence,
+  sourceNeedsSetup,
 } from "./source-evidence"
 
 export function SourcesPage() {
@@ -87,27 +97,73 @@ function ReadySourcesPage({
     ),
     queryFn: () => transport.query({ query: "sourceHealth" }),
   })
-  const sources = sourceEvidence(
+  const sourceRows = sourceEvidence(
     bootstrap.providerProfiles,
     bootstrap.providerSessions,
     statusReads.flatMap((query) => (query.data ? [query.data] : [])),
     coverage.data,
     health.data,
   )
+  const manifestReadsAvailable = bootstrap.operations.some(
+    (operation) => operation.name === "Research.GetManifest",
+  )
+  const providerDatasets = manifestReadsAvailable
+    ? [
+        ...new Set(
+          sourceRows.flatMap((source) =>
+            source.providerDatasetIdentifier
+              ? [source.providerDatasetIdentifier]
+              : [],
+          ),
+        ),
+      ].sort()
+    : []
+  const manifestReads = useQueries({
+    queries: providerDatasets.map((dataset) => ({
+      queryKey: productKeys.operation(
+        bootstrap.runtime,
+        "Research",
+        "Research.GetManifest",
+        { dataset },
+      ),
+      queryFn: async () =>
+        parseResearchManifest(
+          await transport.query({ query: "researchManifest", dataset }),
+          dataset,
+        ),
+    })),
+  })
+  const sources = attachStoredData(
+    sourceRows,
+    manifestReads.flatMap((query) =>
+      query.data ? [storedDataEvidence(query.data)] : [],
+    ),
+  )
   const refreshing =
     statusReads.some((query) => query.isFetching) ||
     coverage.isFetching ||
-    health.isFetching
+    health.isFetching ||
+    manifestReads.some((query) => query.isFetching)
   const failedStatusReads = statusReads.filter((query) => query.isError).length
   const failedReads =
-    failedStatusReads + Number(coverage.isError) + Number(health.isError)
-  const totalReads = statusReads.length + 2
-  const active = sources.filter((source) => source.runtimeState === "active").length
+    failedStatusReads +
+    Number(coverage.isError) +
+    Number(health.isError) +
+    manifestReads.filter((query) => query.isError).length
+  const totalReads = statusReads.length + manifestReads.length + 2
+  const active = sources.filter(
+    (source) => source.operationalState === "active",
+  ).length
   const fresh = sources.filter((source) => source.marketFreshness === "fresh").length
+  const stored = sources.filter((source) => source.storedData !== null).length
+  const quarantined = sources.filter(
+    (source) => source.storedDataQuarantine !== null,
+  ).length
 
   const refresh = () => {
     void Promise.all([
       ...statusReads.map((query) => query.refetch()),
+      ...manifestReads.map((query) => query.refetch()),
       coverage.refetch(),
       health.refetch(),
     ])
@@ -132,7 +188,8 @@ function ReadySourcesPage({
           detail={messageFrom(
             statusReads.find((query) => query.error)?.error ??
               coverage.error ??
-              health.error,
+              health.error ??
+              manifestReads.find((query) => query.error)?.error,
           )}
         />
       ) : sources.length === 0 && refreshing ? (
@@ -147,9 +204,15 @@ function ReadySourcesPage({
           {failedReads > 0 ? (
             <Notice text={`${failedReads} of ${totalReads} source evidence reads could not be completed. Missing fields remain explicitly unreported.`} />
           ) : null}
-          <div className="grid gap-3 sm:grid-cols-3">
+          {quarantined > 0 ? (
+            <Notice
+              text={`${quarantined} stored dataset association${quarantined === 1 ? " is" : "s are"} quarantined because the source and dataset identities did not establish one exact match.`}
+            />
+          ) : null}
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <Summary label="Known sources" value={sources.length} icon={DatabaseZap} />
-            <Summary label="Runtime active" value={active} icon={Activity} />
+            <Summary label="Operational" value={active} icon={Activity} />
+            <Summary label="Stored datasets" value={stored} icon={DatabaseZap} />
             <Summary label="Market fresh" value={fresh} icon={ShieldCheck} />
           </div>
           <div className="mt-4 grid gap-4 xl:grid-cols-2">
@@ -173,7 +236,7 @@ function SourceCard({
   transport,
   onChanged,
 }: {
-  source: ReturnType<typeof sourceEvidence>[number]
+  source: SourceEvidence
   transport: ProductTransport
   onChanged: () => Promise<void>
 }) {
@@ -182,7 +245,8 @@ function SourceCard({
   const [confirming, setConfirming] = React.useState<LifecycleControl | null>(null)
   const controls = lifecycleControls(source)
   const setupReady = source.nextAction === "active"
-  const runtimeActive = source.runtimeState === "active"
+  const operationalActive = source.operationalState === "active"
+  const setupAgain = sourceNeedsSetup(source)
 
   const run = async (control: LifecycleControl) => {
     setConfirming(null)
@@ -215,24 +279,50 @@ function SourceCard({
           </p>
         </div>
         <StateBadge
-          label={runtimeActive ? "Runtime active" : runtimeName(source.runtimeState)}
-          active={runtimeActive}
+          label={operationalActive ? "Operational" : runtimeName(source.operationalState)}
+          active={operationalActive}
         />
       </div>
 
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
         <EvidencePanel
-          title="Setup"
+          title="Operational state"
+          icon={ShieldCheck}
+          headline={runtimeName(source.operationalState)}
+          detail={operationalDetail(source)}
+        />
+        <EvidencePanel
+          title="Latest setup attempt"
           icon={KeyRound}
-          headline={setupReady ? "Setup ready" : runtimeName(source.setupState)}
+          headline={
+            source.setupState
+              ? setupReady
+                ? "Completed"
+                : runtimeName(source.setupState)
+              : "No setup attempt"
+          }
           detail={
             source.nextAction
-              ? `Next setup action: ${humanize(source.nextAction)}`
-              : "No setup action reported"
+              ? `Latest recorded next action: ${humanize(source.nextAction)}`
+              : "No historical setup action is recorded."
           }
         />
         <EvidencePanel
-          title="Runtime"
+          title="Stored data"
+          icon={DatabaseZap}
+          headline={
+            source.storedData
+              ? `${source.storedData.rowCount.toLocaleString()} rows available`
+              : source.storedDataQuarantine
+                ? "Stored data quarantined"
+                : source.providerDatasetIdentifier
+                  ? "Stored data not established"
+                  : "No stored dataset"
+          }
+          detail={storedDataDetail(source)}
+        />
+        <EvidencePanel
+          title="Live runtime"
           icon={Activity}
           headline={runtimeName(source.runtimeState)}
           detail={source.connection ? `Connection: ${humanize(source.connection)}` : "Connection not reported"}
@@ -248,6 +338,11 @@ function SourceCard({
         <Fact label="Current quality" value={runtimeName(source.quality)} />
         <Fact label="Coverage state" value={runtimeName(source.coverageState)} />
         <Fact label="Quality ceiling" value={runtimeName(source.qualityCeiling)} />
+        <Fact label="Lifecycle support" value={runtimeName(source.lifecycleSupport)} />
+        <Fact
+          label="Provider dataset"
+          value={source.providerDatasetIdentifier ?? "None published"}
+        />
         <Fact label="Runtime observed" value={dateTime(source.observedAt)} />
         <Fact label="Cost condition" value={source.zeroFee ?? "Not reported"} />
         <Fact label="Release state" value={runtimeName(source.releaseState)} />
@@ -255,7 +350,7 @@ function SourceCard({
         <Fact label="Credential" value={source.credentialRequirement ?? "Not reported"} />
       </dl>
 
-      {controls.length > 0 ? (
+      {controls.length > 0 || setupAgain ? (
         <div className="mt-5 flex flex-wrap gap-2 border-t border-border/70 pt-4">
           {controls.map((control) => (
             <Button
@@ -271,9 +366,17 @@ function SourceCard({
               {pending === control.action ? "Working…" : control.label}
             </Button>
           ))}
-          <p className="w-full text-[10px] text-muted-foreground">
-            Revision {source.lifecycle?.stateRevision}; controls use this exact returned state.
-          </p>
+          {setupAgain ? (
+            <Button asChild size="sm">
+              <Link to="/">Set up again</Link>
+            </Button>
+          ) : null}
+          {source.lifecycle ? (
+            <p className="w-full text-[10px] text-muted-foreground">
+              Revision {source.lifecycle.stateRevision}; controls use this exact returned state and
+              its retained configuration only.
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -314,6 +417,67 @@ function SourceCard({
       </Dialog>
     </article>
   )
+}
+
+function storedDataEvidence(dataset: ResearchDataset): StoredDataEvidence {
+  return {
+    datasetId: dataset.manifest.datasetId,
+    sourceId: dataset.sourceId,
+    generationKind: dataset.generationKind,
+    manifestVersion: dataset.manifest.manifestVersion,
+    rowCount: dataset.rowCount,
+    totalBytes: dataset.totalBytes,
+    objectCount: dataset.objectCount,
+  }
+}
+
+function operationalDetail(source: SourceEvidence): string {
+  if (source.lifecycle?.blocker) {
+    return `Callable source blocked: ${humanize(source.lifecycle.blocker)}.`
+  }
+  if (source.lifecycleSupport === "not_applicable") {
+    return "This surface is managed by its product domain rather than source lifecycle controls."
+  }
+  if (!source.lifecycle) {
+    return "Lifecycle evidence could not be verified."
+  }
+  if (source.lifecycle.currentGeneration) {
+    return `Verified live generation ${source.lifecycle.currentGeneration}.`
+  }
+  if (source.lifecycle.runtimeGenerationSha256) {
+    return "A callable research runtime generation is verified."
+  }
+  return `Lifecycle revision ${source.lifecycle.stateRevision} is authoritative.`
+}
+
+function storedDataDetail(source: SourceEvidence): string {
+  if (source.storedData) {
+    return `${source.storedData.datasetId} · manifest ${source.storedData.manifestVersion} · ${source.storedData.objectCount.toLocaleString()} objects · ${source.storedData.totalBytes.toLocaleString()} bytes.`
+  }
+  if (source.storedDataQuarantine) {
+    const quarantine = source.storedDataQuarantine
+    const observed = quarantine.observedSourceIds.join(", ")
+    if (quarantine.reason === "source_identity_missing") {
+      return (
+        `${quarantine.datasetId} reports stored source ${observed}, but this source has no ` +
+        "current source identity. The manifest is not attached."
+      )
+    }
+    if (quarantine.reason === "ambiguous_dataset_identity") {
+      return (
+        `${quarantine.datasetId} resolved to multiple stored manifest records ` +
+        `(sources: ${observed}). None is attached.`
+      )
+    }
+    return (
+      `${quarantine.datasetId} belongs to stored source ${observed}, not current source ` +
+      `${quarantine.expectedSourceId}. The mismatched manifest is not attached.`
+    )
+  }
+  if (source.providerDatasetIdentifier) {
+    return `The source reports ${source.providerDatasetIdentifier}, but its current manifest was not verified.`
+  }
+  return "No immutable dataset manifest is currently associated with this source."
 }
 
 function EvidencePanel({

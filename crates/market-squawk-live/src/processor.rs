@@ -478,11 +478,26 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 {
                     return Ok(());
                 }
-                return Err(LiveApplyError::GenerationAdmissionTransplant);
+                if current.current_lease().health_epoch() <= existing.health_epoch() {
+                    return Err(LiveApplyError::GenerationAdmissionTransplant);
+                }
             }
             if generation < existing.connection_generation() {
                 return Err(LiveApplyError::GenerationNotAdvanced);
             }
+        }
+
+        if source_transition == SourceGenerationTransition::Current
+            && let Some(existing) = self.streams.get_mut(key)
+            && !existing
+                .generation_lease()
+                .shares_allocation_with(&admission.generation())
+        {
+            // `GenerationAuthorityRegistry` admitted this strictly newer health epoch from the
+            // same source/session/connection lineage. Preserve market state while moving all new
+            // qualification authority to its isolated allocation.
+            existing.rebind_health_generation(admission.generation());
+            return Ok(());
         }
 
         let retained_streams = if source_transition == SourceGenerationTransition::Replace {

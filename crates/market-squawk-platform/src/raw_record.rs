@@ -17,7 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// Maximum serialized JSON body accepted by the committed journal frame.
-pub(crate) const MAX_SERIALIZED_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_SERIALIZED_RECORD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPATIBILITY_PAYLOAD_BYTES: usize = MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES;
 const MAX_LIVE_WORST_CASE_SERIALIZED_BYTES: usize =
     MAX_LIVE_CAPTURE_PAYLOAD_BYTES * 4 + RawCaptureRecord::MAX_LIVE_SOURCE_BYTES * 6 + 4_096;

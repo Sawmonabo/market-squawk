@@ -832,14 +832,16 @@ async fn job(
         JobCommand::List {
             after_job_id,
             limit,
-        } => (
-            "Job.List",
-            json!({
-                "afterJobId": after_job_id.map(|value| value.to_string()),
-                "limit": limit,
-            }),
-            "durable jobs listed",
-        ),
+        } => {
+            let mut arguments = json_object(json!({"limit": limit}))?;
+            if let Some(after_job_id) = after_job_id {
+                arguments.insert(
+                    "afterJobId".to_owned(),
+                    Value::String(after_job_id.to_string()),
+                );
+            }
+            ("Job.List", Value::Object(arguments), "durable jobs listed")
+        }
         JobCommand::Get { job_id } => (
             "Job.Get",
             json!({"jobId": job_id.to_string()}),

@@ -20,10 +20,22 @@ const TEMP_A_FILE: &str = ".authority-state-a.tmp";
 const TEMP_B_FILE: &str = ".authority-state-b.tmp";
 const LOCK_FILE: &str = ".authority-state.lock";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Slot {
     A,
     B,
+}
+
+pub(super) struct PublicationResidue {
+    pub(super) slot: Slot,
+    pub(super) bytes: Zeroizing<Vec<u8>>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+struct BoundedFile {
+    bytes: Zeroizing<Vec<u8>>,
+    metadata: cap_std::fs::Metadata,
 }
 
 impl Slot {
@@ -113,13 +125,21 @@ impl StateFiles {
         &self,
         slot: Slot,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, LocalAuthorityStateStoreError> {
-        let Some(mut file) = open_existing_regular(&self.directory, slot.file())? else {
+        self.read_bounded_regular(slot.file())
+            .map(|result| result.map(|file| file.bytes))
+    }
+
+    fn read_bounded_regular(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<BoundedFile>, LocalAuthorityStateStoreError> {
+        let Some(mut file) = open_existing_regular(&self.directory, name)? else {
             return Ok(None);
         };
-        let file_bytes = file
+        let metadata = file
             .metadata()
-            .map_err(|source| io_error("inspect authority slot", source))?
-            .len();
+            .map_err(|source| io_error("inspect authority state", source))?;
+        let file_bytes = metadata.len();
         let maximum = u64::try_from(MAX_ENVELOPE_BYTES)
             .map_err(|_| LocalAuthorityStateStoreError::Allocation)?;
         if file_bytes > maximum {
@@ -145,7 +165,68 @@ impl StateFiles {
         {
             return Err(LocalAuthorityStateStoreError::CorruptEnvelope);
         }
-        Ok(Some(bytes))
+        Ok(Some(BoundedFile { bytes, metadata }))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn publication_residue(
+        &self,
+    ) -> Result<Option<PublicationResidue>, LocalAuthorityStateStoreError> {
+        let mut residue = None;
+        for slot in [Slot::A, Slot::B] {
+            let Some(file) = self.read_bounded_regular(slot.temporary())? else {
+                continue;
+            };
+            if residue.is_some() {
+                return Err(LocalAuthorityStateStoreError::UnsafeFileType);
+            }
+            residue = Some(PublicationResidue {
+                slot,
+                identity: (file.metadata.dev(), file.metadata.ino()),
+                bytes: file.bytes,
+            });
+        }
+        Ok(residue)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) const fn publication_residue(
+        &self,
+    ) -> Result<Option<PublicationResidue>, LocalAuthorityStateStoreError> {
+        Ok(None)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn discard_publication_residue(
+        &self,
+        residue: &PublicationResidue,
+    ) -> Result<(), LocalAuthorityStateStoreError> {
+        let observed = self
+            .directory
+            .symlink_metadata(residue.slot.temporary())
+            .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
+        if !is_unambiguous_regular(&observed)
+            || (observed.dev(), observed.ino()) != residue.identity
+        {
+            return Err(LocalAuthorityStateStoreError::RecoveryRequired);
+        }
+        self.directory
+            .remove_file(residue.slot.temporary())
+            .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
+        self.synchronize_directory()
+            .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
+        match self.directory.symlink_metadata(residue.slot.temporary()) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) | Err(_) => Err(LocalAuthorityStateStoreError::RecoveryRequired),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) const fn discard_publication_residue(
+        &self,
+        _residue: &PublicationResidue,
+    ) -> Result<(), LocalAuthorityStateStoreError> {
+        Err(LocalAuthorityStateStoreError::SecureRootUnsupported)
     }
 
     pub(super) fn publish(
@@ -295,6 +376,9 @@ impl StateFiles {
                 Ok(metadata) => metadata,
                 Err(source) => return Err(io_error("inspect publication residue", source)),
             };
+            if temporary.is_file() && temporary.nlink() == 1 {
+                continue;
+            }
             let installed = self
                 .directory
                 .symlink_metadata(slot.file())

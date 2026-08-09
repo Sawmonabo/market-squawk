@@ -9,9 +9,7 @@ use std::sync::Mutex;
 use market_squawk_domain::{
     EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::{
-    LocalAuthorityStateStore, LocalAuthorityStateStoreError, UserAuthorizedInputRoot,
-};
+use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_sources::AvailabilityEvidence;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -69,15 +67,11 @@ struct BoundedStateWriter {
 
 impl FileRepresentationAuthority {
     pub(crate) fn try_open(
-        input_root: &UserAuthorizedInputRoot,
         state_root: impl AsRef<Path>,
         source_id: &SourceId,
         metadata_revision: &MetadataRevision,
         manifest_digest: EvidenceDigest,
     ) -> Result<Self, FileAdapterError> {
-        input_root
-            .ensure_disjoint_root(state_root.as_ref())
-            .map_err(|_| FileAdapterError::RepresentationAuthorityScope)?;
         let store = LocalAuthorityStateStore::try_open(state_root).map_err(map_store_error)?;
         let state = match store.load().map_err(map_store_error)? {
             Some(payload) => {

@@ -21,6 +21,7 @@ mod operations_composition;
 mod portfolio_import;
 mod ready_admission;
 mod research_dataset;
+mod research_file_import;
 mod resources;
 mod runtime;
 mod tool_services;
@@ -54,9 +55,11 @@ use market_squawk_runtime::{
     RuntimeRouterLimits,
 };
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceLimits, ToolServices,
+    JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceDomain, ServiceLimits,
+    ToolServices,
 };
 use resources::InstalledResourceProvider;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tool_services::{
@@ -78,6 +81,7 @@ use operations_bootstrap::{PreparedInstalledOperations, ReadyInstalledOperations
 use crate::{AppConfig, LocalProduct, LocalProductError, jobs::InstalledJobAuthority};
 
 use self::portfolio_import::InstalledPortfolioImportOperations;
+use self::research_file_import::InstalledResearchFileImportOperations;
 use self::runtime::{PreparedRuntime, current_timestamp};
 use self::workspace_selector::{WorkspacePlacement, WorkspaceSelector, WorkspaceSelectorError};
 use self::{
@@ -98,6 +102,14 @@ const REPLAY_CAPACITY: usize = 4_096;
 const RETAINED_EVENTS: usize = 4_096;
 const MAXIMUM_EVENT_BYTES: usize = 1024 * 1024;
 const MAXIMUM_STAGED_INPUTS: usize = 64;
+
+/// Returns only operation-owned arguments after the shared transport fields have been admitted.
+fn business_arguments(arguments: &Map<String, Value>) -> Map<String, Value> {
+    let mut admitted = arguments.clone();
+    admitted.remove("confirm");
+    admitted.remove("resultLimits");
+    admitted
+}
 const MAXIMUM_STAGED_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const CURSOR_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const INPUT_TICKET_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -422,29 +434,43 @@ impl InstalledService {
         let cleanup_paths = installation_paths.clone();
         let cleanup_store = Arc::clone(&secret_store);
         let result = async move {
+            let mut interaction = SecretInteractionPolicy::Forbid;
             let mut runtime = loop {
                 match PreparedRuntime::prepare(
                     &installation_paths,
                     Arc::clone(&secret_store),
                     selection.identity(),
                     installation_id,
+                    interaction,
                 )
                 .await
                 {
                     Ok(runtime) => break runtime,
                     Err(error) => {
-                        let Some(requirement) =
-                            recoverable_bootstrap_requirement(secret_store.as_ref(), &error)?
+                        let Some(requirement) = recoverable_bootstrap_requirement(
+                            &installation_paths,
+                            secret_store.as_ref(),
+                            &error,
+                            interaction,
+                        )?
                         else {
                             return Err(error);
                         };
-                        let _action = bootstrap::wait_for_action(
+                        let action = bootstrap::wait_for_action(
                             &installation_paths,
                             Arc::clone(&secret_store),
                             installation_id,
                             requirement,
                         )
                         .await?;
+                        interaction = match action {
+                            bootstrap::BootstrapAction::Retry => {
+                                SecretInteractionPolicy::AllowPlatformPrompt
+                            }
+                            bootstrap::BootstrapAction::UnlockAccepted => {
+                                SecretInteractionPolicy::Forbid
+                            }
+                        };
                     }
                 }
             };
@@ -453,10 +479,23 @@ impl InstalledService {
                 .bind_instance_guard(instance_guard)
                 .map_err(map_workspace_selector_startup)?;
             let workspace_paths = selected_workspace_guard.workspace_paths().clone();
+            let config = config.bind_selected_workspace(workspace_paths.root().to_path_buf());
             let product = LocalProduct::try_new_at_selected_workspace(
                 config.clone(),
                 &selected_workspace_guard,
             )?;
+            let source_recovery_deadline = std::time::Instant::now()
+                .checked_add(CLIENT_TIMEOUT)
+                .ok_or(InstalledServiceError::InvalidComposition)?;
+            if let Err(error) = product
+                .restore_active_live_source(source_recovery_deadline, &CancellationToken::new())
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "durably active live source could not be restored during service startup"
+                );
+            }
             let prepared_operations = PreparedInstalledOperations::prepare(
                 &config,
                 &installation_paths,
@@ -516,7 +555,9 @@ impl InstalledService {
                 operations: &operations,
                 workspace_selector: Arc::clone(&workspace_selector),
                 workspace_placement: selection.placement(),
-            }) {
+            })
+            .await
+            {
                 Ok(composed) => composed,
                 Err(error) => {
                     cleanup_startup(&product, &jobs).await;
@@ -778,7 +819,7 @@ struct TransportComposition<'a> {
     workspace_placement: WorkspacePlacement,
 }
 
-fn compose_transport(
+async fn compose_transport(
     composition: TransportComposition<'_>,
 ) -> Result<ComposedTransport, InstalledServiceError> {
     let TransportComposition {
@@ -876,6 +917,15 @@ fn compose_transport(
         runtime.runtime(),
     )
     .map_err(|error| InstalledServiceError::PortfolioImportState(error.to_string()))?;
+    let research_file_import = InstalledResearchFileImportOperations::try_new(
+        product.paths(),
+        Arc::clone(&application),
+        product.research_ingest(),
+        product.controlled_file_activation(),
+        Arc::clone(&inputs),
+        runtime.runtime(),
+    )
+    .map_err(|error| InstalledServiceError::ResearchFileImportState(error.to_string()))?;
     let services = Arc::new(
         InstalledToolServices::try_new(
             InstalledToolServiceAuthorities::new(
@@ -889,6 +939,7 @@ fn compose_transport(
                 Arc::clone(&inputs),
                 runtime.runtime(),
                 portfolio_import,
+                research_file_import,
             ),
         )
         .map_err(|_error| InstalledServiceError::CompositionStage("installed tool services"))?,
@@ -913,6 +964,19 @@ fn compose_transport(
             .with_origin(recovery_origin),
         )
         .map_err(|error| InstalledServiceError::PortfolioImportState(error.to_string()))?;
+    services
+        .recover_promoting_research_file_imports(
+            &RequestContext::new(
+                RequestId::try_string("startup-research-file-import-recovery")
+                    .map_err(|_error| InstalledServiceError::InvalidComposition)?,
+                CancellationToken::new(),
+                recovery_deadline,
+                service_limits,
+            )
+            .with_origin(recovery_origin),
+        )
+        .await
+        .map_err(|error| InstalledServiceError::ResearchFileImportState(error.to_string()))?;
     let dispatcher = Arc::new(
         InstalledApplicationDispatcher::try_new(
             InstalledDispatcherComposition {
@@ -1076,7 +1140,25 @@ async fn shutdown_application(application: Arc<crate::application::Application>)
     else {
         return false;
     };
-    application.shutdown(deadline).await.is_complete()
+    let report = application.shutdown(deadline).await;
+    for domain in [
+        ServiceDomain::Source,
+        ServiceDomain::Market,
+        ServiceDomain::Research,
+        ServiceDomain::Fundamental,
+        ServiceDomain::Macro,
+        ServiceDomain::Portfolio,
+        ServiceDomain::Analysis,
+        ServiceDomain::Model,
+        ServiceDomain::FairValue,
+        ServiceDomain::Bot,
+        ServiceDomain::Execution,
+    ] {
+        if let Some(error) = report.failure(domain) {
+            tracing::error!(?domain, %error, "application domain shutdown did not complete");
+        }
+    }
+    report.is_complete()
 }
 
 fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
@@ -1222,9 +1304,19 @@ fn prepare_installation_paths(root: &Path) -> Result<LocalPaths, InstalledServic
 }
 
 fn recoverable_bootstrap_requirement(
+    paths: &LocalPaths,
     secret_store: &dyn SecretStore,
     error: &InstalledServiceError,
+    interaction: SecretInteractionPolicy,
 ) -> Result<Option<BootstrapRequirement>, InstalledServiceError> {
+    if matches!(
+        error,
+        InstalledServiceError::SecretInteractionRequired
+            | InstalledServiceError::Credential(CredentialError::SecretInteractionRequired)
+    ) {
+        return Ok(matches!(interaction, SecretInteractionPolicy::Forbid)
+            .then_some(BootstrapRequirement::ForegroundKeyringRetry));
+    }
     let credential_condition = matches!(
         error,
         InstalledServiceError::SecretStore
@@ -1232,6 +1324,10 @@ fn recoverable_bootstrap_requirement(
     );
     if !credential_condition {
         return Ok(None);
+    }
+    if !runtime::encrypted_fallback_eligible(paths)? {
+        return Ok(matches!(interaction, SecretInteractionPolicy::Forbid)
+            .then_some(BootstrapRequirement::ForegroundKeyringRetry));
     }
     match secret_store
         .encrypted_file_fallback_status()
@@ -1307,12 +1403,18 @@ pub enum InstalledServiceError {
     /// The local secret authority rejected the requested operation.
     #[error("installed-service secret storage is unavailable")]
     SecretStore,
+    /// The operating-system secret authority requires one foreground user interaction.
+    #[error("installed-service secret storage requires foreground user interaction")]
+    SecretInteractionRequired,
     /// Durable governance registrations, audit, or authority state could not be composed.
     #[error("installed-service governance state is unavailable")]
     GovernanceState,
     /// Durable governed portfolio-import approval or recovery state is unavailable.
     #[error("installed-service portfolio import state is unavailable: {0}")]
     PortfolioImportState(String),
+    /// Durable guided research-file import or recovery state is unavailable.
+    #[error("installed-service research file import state is unavailable: {0}")]
+    ResearchFileImportState(String),
     /// A concrete backup, recovery, or update authority rejected startup state.
     #[error("installed-service operations {stage} is unavailable")]
     OperationsAuthority {
@@ -1461,7 +1563,6 @@ impl From<mcp_control::McpControlError> for InstalledServiceError {
             McpControlError::InvalidRequest => "request-invalid",
             McpControlError::Unauthorized => "request-unauthorized",
             McpControlError::Interrupted => "request-interrupted",
-            McpControlError::RecoveryPending => "credential-recovery-pending",
             McpControlError::SecretStore => "secret-store-unavailable",
             McpControlError::Clock => "system-clock-invalid",
         };

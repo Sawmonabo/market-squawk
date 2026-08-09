@@ -418,6 +418,7 @@ mod tests {
             terminal: AtomicBool::new(false),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
+            minimum_valid_health_epoch: AtomicU64::new(0),
             valid_from_nanos: AtomicI64::new(i64::MAX),
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
@@ -872,20 +873,21 @@ mod tests {
         crashed_permit.release();
         drop(registered);
         crashed.shutdown()?;
-        let predecessor_envelope: serde_json::Value = serde_json::from_slice(&payload)?;
-        let default_store = Arc::new(FailingAuthorityStore {
-            payload: Mutex::new(Some(payload.clone())),
-            ..FailingAuthorityStore::default()
-        });
-        assert!(matches!(
-            durable_registry_with_test_store(default_store),
-            Err(RegistryError::UncleanAuthorityPredecessor)
-        ));
-
         let replacement_store = Arc::new(FailingAuthorityStore {
             payload: Mutex::new(Some(payload)),
             ..FailingAuthorityStore::default()
         });
+        assert!(matches!(
+            durable_registry_with_test_store(replacement_store.clone()),
+            Err(RegistryError::UncleanAuthorityPredecessor)
+        ));
+        let rejected_payload = replacement_store
+            .payload
+            .lock()
+            .map_err(|_| "rejected authority payload lock was poisoned")?
+            .clone()
+            .ok_or("rejected authority payload was absent")?;
+        let predecessor_envelope: serde_json::Value = serde_json::from_slice(&rejected_payload)?;
         let mut replacement = durable_registry_with_test_store_for_exclusive_installed_replacement(
             replacement_store.clone(),
         )?;
@@ -928,6 +930,16 @@ mod tests {
                 .ok_or("predecessor in-flight count was invalid")?;
             if in_flight != 0 {
                 checkpoint["in_flight"] = serde_json::Value::from(0);
+            }
+            let terminalized = checkpoint["terminal"] == serde_json::Value::Bool(true)
+                && checkpoint["poisoned"] == serde_json::Value::Bool(true)
+                && checkpoint["disabled"] == serde_json::Value::Bool(true);
+            if terminalized {
+                checkpoint["terminal"] = serde_json::Value::Bool(false);
+                checkpoint["poisoned"] = serde_json::Value::Bool(false);
+                checkpoint["disabled"] = serde_json::Value::Bool(false);
+            }
+            if in_flight != 0 || terminalized {
                 let generation = checkpoint["availability_generation"]
                     .as_u64()
                     .ok_or("predecessor availability generation was invalid")?;

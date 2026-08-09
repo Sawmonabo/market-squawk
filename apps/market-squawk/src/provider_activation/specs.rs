@@ -15,11 +15,12 @@ use market_squawk_adapter_fred::FredRightsPolicy;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
+use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
 use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
-    BoundedInput, LocalAuthorityStateStore, SecretReference, UserAuthorizedInputRoot,
-    UserOwnedInputEvidence,
+    BoundedInput, ControlledImportInputRoot, LocalAuthorityStateStore, SecretReference,
+    UserAuthorizedInputRoot, UserOwnedInputEvidence,
 };
 use market_squawk_sources::{FreshnessPolicy, SourceMetadata};
 
@@ -356,6 +357,51 @@ impl fmt::Debug for LocalFileAdapterActivation {
     }
 }
 
+/// Controlled, path-free import bundle for the installed guided local-file workflow.
+pub struct ControlledLocalFileAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    pub(super) root: ControlledImportInputRoot,
+    pub(super) representation_state_root: PathBuf,
+    pub(super) manifest: BoundedInput,
+    pub(super) limits: ExtractionLimits,
+    pub(super) evidence: ImportedUserInputEvidence,
+}
+
+impl ControlledLocalFileAdapterActivation {
+    /// Retains a controlled import root, exact manifest, parser limits, and import evidence.
+    #[must_use]
+    pub fn new(
+        metadata: SourceMetadata,
+        root: ControlledImportInputRoot,
+        representation_state_root: impl AsRef<Path>,
+        manifest: BoundedInput,
+        limits: ExtractionLimits,
+        evidence: ImportedUserInputEvidence,
+    ) -> Self {
+        Self {
+            metadata,
+            root,
+            representation_state_root: representation_state_root.as_ref().to_path_buf(),
+            manifest,
+            limits,
+            evidence,
+        }
+    }
+}
+
+impl fmt::Debug for ControlledLocalFileAdapterActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlledLocalFileAdapterActivation")
+            .field("source_id", self.metadata.source_id())
+            .field("metadata_revision", self.metadata.revision())
+            .field("root", &"[CONTROLLED IMPORT]")
+            .field("manifest", &self.manifest)
+            .field("representation_state_root", &"[CONTROLLED]")
+            .finish()
+    }
+}
+
 /// Explicit user-root, manifest, and durable archive authority for portfolio imports.
 pub struct PortfolioAdapterActivation {
     pub(super) metadata: SourceMetadata,
@@ -434,6 +480,8 @@ pub enum ProviderAdapterActivationRequest {
     Fred(FredAdapterActivation),
     /// User-owned local file extraction.
     LocalFiles(LocalFileAdapterActivation),
+    /// Workspace-controlled exact bytes admitted by the guided local-file workflow.
+    ControlledLocalFiles(ControlledLocalFileAdapterActivation),
     /// User-owned portfolio holdings and transactions extraction.
     Portfolio(PortfolioAdapterActivation),
 }
@@ -449,6 +497,7 @@ impl ProviderAdapterActivationRequest {
             | Self::Treasury(_)
             | Self::Fred(_)
             | Self::LocalFiles(_)
+            | Self::ControlledLocalFiles(_)
             | Self::Portfolio(_) => None,
         }
     }

@@ -96,7 +96,8 @@ impl CurrentSourceAuthorityLease {
     ///
     /// # Errors
     ///
-    /// Fails after rollover/revision/health/capture changes or deadline expiry.
+    /// Fails after rollover, revision or capture changes, degradation, departure from the bounded
+    /// healthy-refresh overlap, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
         if trusted.monotonic() < self.trusted_valid_from_monotonic {

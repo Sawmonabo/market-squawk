@@ -26,6 +26,7 @@ const DEFAULT_MAX_RECORDS: usize = 1_000_000;
 const DEFAULT_MAX_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_JOURNAL_BUFFER_CAPACITY_BYTES: usize = 64 * 1024;
 const DEFAULT_JOURNAL_RETAINED_BYTE_CEILING: usize = 1024 * 1024;
+const STARTUP_VALIDATION_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Separate fixed-storage limits for one journal sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -651,7 +652,7 @@ fn validate_existing_reader<R: Read>(
     reader: &mut JournalReader<R>,
 ) -> Result<JournalFormat, JournalError> {
     let format = reader.ensure_format()?;
-    let mut records = 0_usize;
+    let mut chunk = [0_u8; STARTUP_VALIDATION_CHUNK_BYTES];
     loop {
         let has_record = !reader
             .reader
@@ -661,14 +662,59 @@ fn validate_existing_reader<R: Read>(
         if !has_record {
             break;
         }
-        let _record = reader.next_record()?.ok_or_else(|| {
-            JournalError::InvalidRecord("journal stream changed while validating".to_owned())
-        })?;
-        records = records.checked_add(1).ok_or_else(|| {
-            JournalError::InvalidRecord("journal record count overflow".to_owned())
-        })?;
+        validate_next_frame(reader, &mut chunk)?;
     }
     Ok(format)
+}
+
+fn validate_next_frame<R: Read>(
+    reader: &mut JournalReader<R>,
+    chunk: &mut [u8; STARTUP_VALIDATION_CHUNK_BYTES],
+) -> Result<(), JournalError> {
+    let mut length_bytes = [0_u8; 4];
+    reader
+        .reader
+        .read_exact(&mut length_bytes)
+        .map_err(|source| JournalError::io("truncated record length", source))?;
+    let mut crc_bytes = [0_u8; 4];
+    reader
+        .reader
+        .read_exact(&mut crc_bytes)
+        .map_err(|source| JournalError::io("truncated record checksum", source))?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length > MAX_RECORD_BYTES {
+        return Err(JournalError::InvalidRecord(format!(
+            "journal record at offset {} is too large: {length}",
+            reader.offset
+        )));
+    }
+    let framed_bytes = 8_u64
+        .checked_add(u64::try_from(length)?)
+        .ok_or_else(|| JournalError::InvalidRecord("journal frame length overflow".to_owned()))?;
+    let mut remaining = length;
+    let mut hasher = Hasher::new();
+    while remaining > 0 {
+        let count = remaining.min(chunk.len());
+        reader
+            .reader
+            .read_exact(&mut chunk[..count])
+            .map_err(|source| JournalError::io("truncated record payload", source))?;
+        hasher.update(&chunk[..count]);
+        remaining -= count;
+    }
+    let expected_crc = u32::from_le_bytes(crc_bytes);
+    let actual_crc = hasher.finalize();
+    if actual_crc != expected_crc {
+        return Err(JournalError::InvalidRecord(format!(
+            "journal checksum mismatch at offset {}: expected={expected_crc}, actual={actual_crc}",
+            reader.offset
+        )));
+    }
+    reader.offset = reader
+        .offset
+        .checked_add(framed_bytes)
+        .ok_or_else(|| JournalError::InvalidRecord("journal offset overflow".to_owned()))?;
+    Ok(())
 }
 
 #[cfg(test)]

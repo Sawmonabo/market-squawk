@@ -17,8 +17,10 @@ const MAX_PRODUCTS: usize = 100;
 const MAX_PRODUCT_BYTES: usize = 64;
 const MAX_CONTROL_MESSAGES: usize = 4_096;
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PRE_ACKNOWLEDGEMENT_DATA_MESSAGES: usize = 256;
+const MAX_PRE_ACKNOWLEDGEMENT_DATA_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
-const REQUIRED_CHANNELS: [&str; 3] = ["heartbeat", "level2", "matches"];
+const REQUIRED_CHANNELS: [&str; 3] = ["heartbeats", "level2", "market_trades"];
 
 /// Value identity of one already registry-validated source generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,12 +62,16 @@ impl GenerationIdentity {
 pub(super) struct SubscriptionLimits {
     control_messages: NonZeroUsize,
     control_bytes: NonZeroUsize,
+    pre_acknowledgement_data_messages: usize,
+    pre_acknowledgement_data_bytes: usize,
 }
 
 impl SubscriptionLimits {
     pub(super) fn try_new(
         control_messages: usize,
         control_bytes: usize,
+        pre_acknowledgement_data_messages: usize,
+        pre_acknowledgement_data_bytes: usize,
     ) -> Result<Self, SubscriptionConstructionError> {
         let control_messages = NonZeroUsize::new(control_messages)
             .filter(|value| value.get() <= MAX_CONTROL_MESSAGES)
@@ -75,9 +81,17 @@ impl SubscriptionLimits {
                 value.get() >= size_of::<ControlAuditRecord>() && value.get() <= MAX_CONTROL_BYTES
             })
             .ok_or(SubscriptionConstructionError::InvalidLimits)?;
+        if (pre_acknowledgement_data_messages == 0) != (pre_acknowledgement_data_bytes == 0)
+            || pre_acknowledgement_data_messages > MAX_PRE_ACKNOWLEDGEMENT_DATA_MESSAGES
+            || pre_acknowledgement_data_bytes > MAX_PRE_ACKNOWLEDGEMENT_DATA_BYTES
+        {
+            return Err(SubscriptionConstructionError::InvalidLimits);
+        }
         Ok(Self {
             control_messages,
             control_bytes,
+            pre_acknowledgement_data_messages,
+            pre_acknowledgement_data_bytes,
         })
     }
 
@@ -173,6 +187,7 @@ impl SubscriptionStateMachine {
             &expected_products,
             expected_products.capacity(),
             control_audit.capacity(),
+            limits.pre_acknowledgement_data_bytes,
         )?;
         Ok(Self {
             generation,
@@ -189,9 +204,15 @@ impl SubscriptionStateMachine {
         })
     }
 
-    #[cfg(test)]
     pub(super) const fn phase(&self) -> SubscriptionPhase {
         self.phase
+    }
+
+    pub(super) const fn pre_acknowledgement_data_limits(&self) -> (usize, usize) {
+        (
+            self.limits.pre_acknowledgement_data_messages,
+            self.limits.pre_acknowledgement_data_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -445,6 +466,7 @@ fn estimate_peak_bytes(
     products: &[String],
     product_capacity: usize,
     control_capacity: usize,
+    pre_acknowledgement_data_bytes: usize,
 ) -> Result<NonZeroUsize, SubscriptionConstructionError> {
     let allocation_overhead = size_of::<usize>()
         .checked_mul(2)
@@ -484,6 +506,7 @@ fn estimate_peak_bytes(
         .checked_add(generation_bytes)
         .and_then(|bytes| bytes.checked_add(product_bytes))
         .and_then(|bytes| bytes.checked_add(control_bytes))
+        .and_then(|bytes| bytes.checked_add(pre_acknowledgement_data_bytes))
         .ok_or(SubscriptionConstructionError::RetainedSizeOverflow)?;
     NonZeroUsize::new(peak).ok_or(SubscriptionConstructionError::RetainedSizeOverflow)
 }

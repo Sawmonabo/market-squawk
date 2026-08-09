@@ -124,7 +124,45 @@ const dossierEvidenceSchema = z.enum([
   "dataset",
   "universe",
   "portfolio_impact",
+  "forecast",
+  "fair_value",
 ])
+
+const dossierForecastOptionSchema = z
+  .object({
+    selector: z.string().regex(/^forecast:[0-9a-f]{64}$/),
+    modelId: z.string().min(1),
+    bundleId: z.string().min(1),
+    bundleVersion: z.number().int().positive(),
+    observedThrough: timestampSchema,
+    createdAt: timestampSchema,
+    expiresAt: timestampSchema,
+    horizonPoints: z.number().int().positive(),
+    horizonStepNanos: z.number().int().positive(),
+    calibrated: z.boolean(),
+    quality: z.literal("modeled"),
+  })
+  .strict()
+
+const dossierFairValueOptionSchema = z
+  .object({
+    selector: z.string().regex(/^fair-value:[0-9a-f]{64}$/),
+    measurementId: z.string().regex(/^[0-9a-f]{64}$/),
+    accountId: z.string().min(1),
+    amount: moneySchema.extend({ scale: z.number().int().nonnegative() }).strict(),
+    measurementAt: timestampSchema,
+    preparedAt: timestampSchema,
+    method: z.enum([
+      "quoted_market_price",
+      "market_approach",
+      "income_approach",
+      "cost_approach",
+    ]),
+    hierarchy: z.enum(["level_1", "level_2", "level_3", "unclassified"]),
+    rulesetVersion: z.number().int().positive(),
+    reasonCount: z.number().int().nonnegative(),
+  })
+  .strict()
 
 const dossierPreparationInventorySchema = z
   .object({
@@ -132,8 +170,14 @@ const dossierPreparationInventorySchema = z
     screenRunId: z.string().min(1),
     instrumentId: z.string().uuid(),
     selectedAt: timestampSchema,
-    requiredEvidence: z.array(dossierEvidenceSchema).min(3).max(3),
+    requiredEvidence: z.tuple([
+      z.literal("candidate"),
+      z.literal("dataset"),
+      z.literal("universe"),
+    ]),
     portfolioImpactAvailable: z.boolean(),
+    forecastOptions: z.array(dossierForecastOptionSchema).max(64),
+    fairValueOptions: z.array(dossierFairValueOptionSchema).max(64),
   })
   .strict()
 
@@ -144,11 +188,38 @@ const dossierPreparationPreviewSchema = z
     candidateId: z.string().min(1),
     screenRunId: z.string().min(1),
     instrumentId: z.string().uuid(),
-    evidence: z.array(dossierEvidenceSchema).min(3).max(4),
+    evidence: z.array(dossierEvidenceSchema).min(4).max(6),
+    forecastSelector: z.string().regex(/^forecast:[0-9a-f]{64}$/).nullable(),
+    fairValueSelector: z.string().regex(/^fair-value:[0-9a-f]{64}$/).nullable(),
     assembledAt: timestampSchema,
     receiptExpiresAt: timestampSchema,
   })
   .strict()
+  .superRefine((preview, context) => {
+    const includesForecast = preview.evidence.includes("forecast")
+    const includesFairValue = preview.evidence.includes("fair_value")
+    if (includesForecast !== (preview.forecastSelector !== null)) {
+      context.addIssue({
+        code: "custom",
+        message: "Forecast evidence and selector must agree.",
+        path: ["forecastSelector"],
+      })
+    }
+    if (includesFairValue !== (preview.fairValueSelector !== null)) {
+      context.addIssue({
+        code: "custom",
+        message: "Fair-value evidence and selector must agree.",
+        path: ["fairValueSelector"],
+      })
+    }
+    if (!includesForecast && !includesFairValue) {
+      context.addIssue({
+        code: "custom",
+        message: "A dossier requires forecast or fair-value evidence.",
+        path: ["evidence"],
+      })
+    }
+  })
 
 const reviewSchema = z.object({
   id: z.string().min(1),

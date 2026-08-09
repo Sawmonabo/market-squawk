@@ -70,6 +70,9 @@ CHILD_MARKER = ".market-squawk-owned-v1"
 ROOT_PURPOSE = "market-squawk-python-release-artifacts"
 COMPONENT_ROOT_MARKER = ".market-squawk-release-components-v1"
 COMPONENT_ROOT_PURPOSE = "market-squawk-locked-release-components"
+DEVELOPMENT_ROOT_MARKER = ".market-squawk-development-runtime-v1"
+DEVELOPMENT_ROOT_PURPOSE = "market-squawk-development-model-runtime"
+DEVELOPMENT_RUNTIME_RELATIVE = Path(".market-squawk/development-model-runtime")
 ALLOWED_LICENSES = {
     "Apache-2.0",
     "MIT",
@@ -566,7 +569,12 @@ class ReleaseSigner:
         return completed.stdout
 
 
-def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
+def load_lock(
+    path: Path,
+    target: str | None = None,
+    *,
+    platform_lock_directory: Path | None = None,
+) -> ReleaseLock:
     try:
         if path.is_symlink():
             raise ReleaseBuildError("Python release lock must not be a symbolic link")
@@ -731,7 +739,9 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
         artifacts.append(Artifact(**artifact_value))
         names.add(item["filename"])
     profile = platform_profile(target or host_profile().target)
-    profile_path = path.parent / "wheelhouse" / f"{profile.target}.json"
+    profile_path = (
+        platform_lock_directory or path.parent / "wheelhouse"
+    ) / f"{profile.target}.json"
     profile_artifacts = _load_platform_wheel_lock(
         profile_path, profile, value["inventory_generation"]
     )
@@ -1035,11 +1045,17 @@ def acquire_release_components(
     repository_root: Path,
     *,
     allow_network: bool,
+    development_runtime_root: Path | None = None,
 ) -> AcquiredReleaseComponents:
     """Acquire and safely expand the exact uv, CPython, and Linux Zig archives."""
 
     _raw, target = load_release_components(path, profile)
-    root = _admit_component_root(component_root, repository_root, profile)
+    root = _admit_component_root(
+        component_root,
+        repository_root,
+        profile,
+        development_runtime_root=development_runtime_root,
+    )
     downloads = root / "downloads"
     expanded = root / "expanded"
     for directory in (downloads, expanded):
@@ -1119,6 +1135,8 @@ def _admit_component_root(
     path: Path,
     repository_root: Path,
     profile: PlatformProfile,
+    *,
+    development_runtime_root: Path | None = None,
 ) -> Path:
     repository_root = repository_root.resolve(strict=True)
     home = Path.home().resolve(strict=True)
@@ -1131,9 +1149,14 @@ def _admit_component_root(
         canonical = candidate.resolve(strict=True)
     else:
         canonical = candidate.parent.resolve(strict=True) / candidate.name
-    if (
-        canonical in {Path("/"), home, repository_root}
-        or canonical.is_relative_to(repository_root)
+    allowed_development_root = (
+        development_runtime_root.resolve(strict=True) / "components"
+        if development_runtime_root is not None
+        else None
+    )
+    if canonical in {Path("/"), home, repository_root} or (
+        canonical.is_relative_to(repository_root)
+        and canonical != allowed_development_root
     ):
         raise ReleaseBuildError("release component root resolves to a protected location")
     purpose = f"{COMPONENT_ROOT_PURPOSE}:{profile.target}"
@@ -1337,6 +1360,72 @@ def _admit_extracted_tree(root: Path) -> None:
             raise ReleaseBuildError("release component extraction exceeds its fixed bounds")
 
 
+def admit_development_runtime_root(
+    path: Path,
+    repository_root: Path,
+    *,
+    create: bool,
+) -> Path:
+    """Admit the one ignored, builder-owned development model-runtime root."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected = repository_root / DEVELOPMENT_RUNTIME_RELATIVE
+    candidate = Path(os.path.abspath(path.expanduser()))
+    if candidate != expected or candidate.is_symlink():
+        raise ReleaseBuildError("development runtime root is not the repository-owned path")
+
+    parent = expected.parent
+    if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+        raise ReleaseBuildError("development runtime parent is unsafe")
+    if not parent.exists():
+        if not create:
+            raise ReleaseBuildError("development runtime is not prepared")
+        parent.mkdir(mode=0o700)
+
+    marker = expected / DEVELOPMENT_ROOT_MARKER
+    marker_content = _marker_content(expected, DEVELOPMENT_ROOT_PURPOSE)
+    if expected.exists():
+        if not expected.is_dir() or expected.is_symlink():
+            raise ReleaseBuildError("development runtime root is unsafe")
+        entries = tuple(expected.iterdir())
+        if marker not in entries:
+            if entries or not create:
+                raise ReleaseBuildError("development runtime root is not builder-owned")
+            marker.write_text(marker_content, encoding="utf-8")
+        elif (
+            marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8") != marker_content
+        ):
+            raise ReleaseBuildError("development runtime ownership marker is invalid")
+    elif create:
+        expected.mkdir(mode=0o700)
+        marker.write_text(marker_content, encoding="utf-8")
+    else:
+        raise ReleaseBuildError("development runtime is not prepared")
+    if os.name != "nt":
+        expected.chmod(0o700)
+        marker.chmod(0o600)
+    return expected.resolve(strict=True)
+
+
+def reset_development_runtime_root(path: Path, repository_root: Path) -> None:
+    """Remove only the admitted ignored development model-runtime cache."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected = repository_root / DEVELOPMENT_RUNTIME_RELATIVE
+    candidate = Path(os.path.abspath(path.expanduser()))
+    if candidate != expected:
+        raise ReleaseBuildError("development runtime root is not the repository-owned path")
+    if not candidate.exists() and not candidate.is_symlink():
+        return
+    admitted = admit_development_runtime_root(candidate, repository_root, create=False)
+    release = admitted / "python" / CANONICAL_RELEASE
+    if release.exists() and not release.is_symlink():
+        _unseal_owned_release_authority(release)
+    _remove_owned_tree(admitted)
+
+
 def admit_artifact_root(path: Path, repository_root: Path) -> ArtifactLayout:
     """Claim or re-open one explicit root; only its marked direct children are mutable."""
 
@@ -1521,11 +1610,7 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
 
     root = root.resolve(strict=True)
     paths = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
-    for relative in (
-        "python/market_squawk",
-        "python/tests",
-        "python/examples",
-    ):
+    for relative in ("python/market_squawk",):
         paths.update(_regular_files(root, root / relative))
     paths.update(
         {
@@ -1537,7 +1622,6 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
             "python/wheelhouse/x86_64-pc-windows-msvc.json",
             "python/wheelhouse/x86_64-unknown-linux-gnu.json",
             "scripts/build_python_release.py",
-            "scripts/tests/test_build_python_release.py",
         }
     )
     workspace = _toml(root / "Cargo.toml")
@@ -1692,6 +1776,82 @@ def refresh_source_closure(lock_path: Path, root: Path) -> None:
 
     value["sources"] = entries
     _atomic_write_json(lock_path, value)
+
+
+def refresh_development_source_closure(
+    template_path: Path,
+    development_root: Path,
+    repository_root: Path,
+) -> Path:
+    """Create a development lock with current sources without changing the shipping lock."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected_template = repository_root / "python/wheelhouse-lock.json"
+    template_candidate = template_path.expanduser().absolute()
+    if template_candidate != expected_template or template_candidate.is_symlink():
+        raise ReleaseBuildError("development source template is not the shipping lock")
+    template_path = template_candidate.resolve(strict=True)
+    before = template_path.stat(follow_symlinks=False)
+    raw = template_path.read_bytes()
+    if not raw or len(raw) > MAX_LOCK_BYTES:
+        raise ReleaseBuildError("Python release lock exceeds its byte bound")
+
+    destination = development_root / "source-lock.json"
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ReleaseBuildError("development source lock path is unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".source-lock.", suffix=".refresh", dir=development_root
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if os.name != "nt":
+                os.fchmod(output.fileno(), 0o600)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        refresh_source_closure(temporary, repository_root)
+        after = template_path.stat(follow_symlinks=False)
+        if template_path.is_symlink() or (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ReleaseBuildError("shipping source lock changed during development refresh")
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+            directory = os.open(
+                development_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def admit_development_source_template(lock_path: Path, repository_root: Path) -> None:
+    """Require the development lock to differ from shipping only in source identities."""
+
+    development = _load_refresh_lock(lock_path)
+    shipping = _load_refresh_lock(repository_root / "python/wheelhouse-lock.json")
+    development = dict(development)
+    shipping = dict(shipping)
+    development.pop("sources", None)
+    shipping.pop("sources", None)
+    if development != shipping:
+        raise ReleaseBuildError("development lock differs from the shipping dependency authority")
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
@@ -2794,6 +2954,8 @@ def build_release(
     release_components_sha256: str,
     uv_executable: Path,
     native_code_signing: NativeCodeSigning | None,
+    *,
+    development_runtime: bool = False,
 ) -> None:
     with ExitStack() as cleanup:
         _build_release(
@@ -2806,6 +2968,7 @@ def build_release(
             release_components_sha256,
             uv_executable,
             native_code_signing,
+            development_runtime,
             cleanup,
         )
 
@@ -2820,6 +2983,7 @@ def _build_release(
     release_components_sha256: str,
     uv_executable: Path,
     native_code_signing: NativeCodeSigning | None,
+    development_runtime: bool,
     cleanup: ExitStack,
 ) -> None:
     admit_sources(lock, root)
@@ -3220,6 +3384,14 @@ def _build_release(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    if development_runtime:
+        _write_development_runtime_receipt(
+            root,
+            layout.root.parent,
+            layout,
+            lock_path,
+            profile,
+        )
     _remove_owned_child(layout.build_venv, layout.root, "build-venv")
     _remove_owned_child(layout.build_home, layout.root, "build-home")
 
@@ -3286,8 +3458,166 @@ def _build_native_release_executables(
     return executables
 
 
+def _development_runtime_receipt(
+    root: Path,
+    development_root: Path,
+    layout: ArtifactLayout,
+    lock_path: Path,
+    profile: PlatformProfile,
+) -> dict[str, object]:
+    suffix = profile.executable_suffix
+    native_bin = _cargo_release_dir(root, profile)
+    release_bin = layout.root / CANONICAL_RELEASE / "bin"
+    program_paths = {
+        "application": native_bin / f"market-squawk{suffix}",
+        "onnx_worker": native_bin / f"market-squawk-onnx-worker{suffix}",
+    }
+    programs = {}
+    for name, path in program_paths.items():
+        maximum_bytes = (
+            MAX_ONNX_WORKER_EXECUTABLE_BYTES
+            if name == "onnx_worker"
+            else MAX_APPLICATION_EXECUTABLE_BYTES
+        )
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size == 0
+            or path.stat().st_size > maximum_bytes
+        ):
+            raise ReleaseBuildError("development runtime program is unavailable")
+        size_bytes, sha256 = _file_digest(path)
+        programs[name] = {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+    installed_application = release_bin / f"market-squawk{suffix}"
+    installed_worker = release_bin / f"market-squawk-onnx-worker{suffix}"
+    if (
+        installed_application.is_symlink()
+        or not installed_application.is_file()
+        or installed_application.stat().st_size == 0
+        or installed_application.stat().st_size > MAX_APPLICATION_EXECUTABLE_BYTES
+        or installed_worker.is_symlink()
+        or not installed_worker.is_file()
+        or installed_worker.stat().st_size == 0
+        or installed_worker.stat().st_size > MAX_ONNX_WORKER_EXECUTABLE_BYTES
+    ):
+        raise ReleaseBuildError("development runtime installed program is unavailable")
+    if (
+        _file_digest(installed_application)
+        != _file_digest(program_paths["application"])
+        or _file_digest(installed_worker) != _file_digest(program_paths["onnx_worker"])
+    ):
+        raise ReleaseBuildError("development runtime sibling identity differs")
+    return {
+        "foundation_sha256": _file_digest(layout.root / "training-foundation.json")[1],
+        "programs": programs,
+        "release_manifest_sha256": _file_digest(
+            layout.root / "market-squawk-release.json"
+        )[1],
+        "release_root": (layout.root / CANONICAL_RELEASE)
+        .relative_to(development_root)
+        .as_posix(),
+        "schema_version": 2,
+        "source_lock_sha256": _file_digest(lock_path)[1],
+        "target": profile.target,
+    }
+
+
+def _write_development_runtime_receipt(
+    root: Path,
+    development_root: Path,
+    layout: ArtifactLayout,
+    lock_path: Path,
+    profile: PlatformProfile,
+) -> None:
+    destination = development_root / "runtime.json"
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ReleaseBuildError("development runtime receipt path is unsafe")
+    if not destination.exists():
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+    _atomic_write_json(
+        destination,
+        _development_runtime_receipt(
+            root,
+            development_root,
+            layout,
+            lock_path,
+            profile,
+        ),
+    )
+
+
 def _cargo_release_dir(root: Path, profile: PlatformProfile) -> Path:
     return root / "target" / profile.target / "release"
+
+
+def admit_development_runtime(
+    root: Path,
+    development_root: Path,
+    lock: ReleaseLock,
+) -> None:
+    """Verify the cached release and its training-authority programs."""
+
+    artifact_root = development_root / "python"
+    canonical_release = artifact_root / CANONICAL_RELEASE
+    if (
+        not artifact_root.is_dir()
+        or artifact_root.is_symlink()
+        or not (artifact_root / ROOT_MARKER).is_file()
+        or not canonical_release.is_dir()
+        or canonical_release.is_symlink()
+        or not (canonical_release / CHILD_MARKER).is_file()
+    ):
+        raise ReleaseBuildError("development model runtime is not materialized")
+    layout = admit_artifact_root(artifact_root, root)
+    _admit_owned_child(canonical_release, layout.root, CANONICAL_RELEASE)
+
+    profile = platform_profile(lock.target)
+    suffix = profile.executable_suffix
+    installed_bin = canonical_release / "bin"
+    native_bin = _cargo_release_dir(root, profile)
+    installed_application = installed_bin / f"market-squawk{suffix}"
+    installed_worker = installed_bin / f"market-squawk-onnx-worker{suffix}"
+    native_application = native_bin / f"market-squawk{suffix}"
+    native_worker = native_bin / f"market-squawk-onnx-worker{suffix}"
+    receipt_path = development_root / "runtime.json"
+    required = (
+        receipt_path,
+        artifact_root / "training-foundation.json",
+        artifact_root / "market-squawk-release.json",
+        artifact_root / "market-squawk-release-evidence.json",
+        canonical_release / "share/market-squawk/training-environment.json",
+        canonical_release / "share/market-squawk/market-squawk-release.json",
+        installed_application,
+        installed_worker,
+        installed_bin / f"market-squawk-model-validator{suffix}",
+        installed_bin / f"market-squawk-train{suffix}",
+        native_application,
+        native_worker,
+    )
+    if any(path.is_symlink() or not path.is_file() for path in required):
+        raise ReleaseBuildError("development model runtime is incomplete")
+    receipt_size = receipt_path.stat().st_size
+    if receipt_size == 0 or receipt_size > 64 * 1024:
+        raise ReleaseBuildError("development runtime receipt exceeds its byte bound")
+    try:
+        raw_receipt = receipt_path.read_bytes()
+        receipt = json.loads(raw_receipt)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("development runtime receipt is unreadable") from error
+    expected_receipt = _development_runtime_receipt(
+        root,
+        development_root,
+        layout,
+        development_root / "source-lock.json",
+        profile,
+    )
+    if len(raw_receipt) != receipt_size or receipt != expected_receipt:
+        raise ReleaseBuildError("development runtime receipt identity differs")
 
 
 def _copy_native_release_executables(
@@ -5276,8 +5606,20 @@ def main() -> int:
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--requirements", type=Path)
     parser.add_argument("--targets")
-    parser.add_argument("--refresh-lock-manifests", action="store_true")
-    parser.add_argument("--refresh-source-closure", action="store_true")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--refresh-lock-manifests", action="store_true")
+    actions.add_argument("--refresh-source-closure", action="store_true")
+    actions.add_argument("--verify-source-closure", action="store_true")
+    actions.add_argument("--verify-development-runtime", action="store_true")
+    actions.add_argument("--reset-development-runtime", action="store_true")
+    parser.add_argument(
+        "--development-runtime-root",
+        type=Path,
+        help=(
+            "Use the single ignored repository development model-runtime cache; "
+            "release builds never select this mode."
+        ),
+    )
     parser.add_argument("--packaging-ready", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--python", action="append", type=Path)
     parser.add_argument("--uv", type=Path)
@@ -5298,9 +5640,32 @@ def main() -> int:
     options = parser.parse_args()
     try:
         root = Path(__file__).resolve().parents[1]
+        build_arguments = (
+            options.target,
+            options.artifact_root,
+            options.requirements,
+            options.targets,
+            options.python,
+            options.uv,
+            options.zig,
+            options.component_root,
+            options.source_cache,
+            options.offline,
+            options.prepare_cache_only,
+            options.sign_native,
+        )
+        if options.reset_development_runtime:
+            if (
+                options.development_runtime_root is None
+                or options.lock is not None
+                or any(value is not None and value is not False for value in build_arguments)
+            ):
+                raise ReleaseBuildError("development runtime reset arguments are invalid")
+            reset_development_runtime_root(options.development_runtime_root, root)
+            return 0
         if options.refresh_lock_manifests:
             if (
-                options.refresh_source_closure
+                options.development_runtime_root is not None
                 or options.requirements is None
                 or options.lock is None
                 or options.targets is None
@@ -5320,22 +5685,117 @@ def main() -> int:
             )
             return 0
         if options.refresh_source_closure:
-            if options.lock is None or options.refresh_lock_manifests:
+            if (
+                options.lock is None
+                or any(value is not None and value is not False for value in build_arguments)
+            ):
                 raise ReleaseBuildError("source refresh arguments are incomplete")
-            refresh_source_closure(options.lock, root)
+            if options.development_runtime_root is None:
+                refresh_source_closure(options.lock, root)
+            else:
+                development_root = admit_development_runtime_root(
+                    options.development_runtime_root,
+                    root,
+                    create=True,
+                )
+                refresh_development_source_closure(
+                    options.lock,
+                    development_root,
+                    root,
+                )
             return 0
-        if options.lock is None or options.target is None or options.artifact_root is None:
-            raise ReleaseBuildError("release build arguments are incomplete")
-        lock_path = options.lock.expanduser().resolve(strict=True)
+        if options.verify_source_closure:
+            if (
+                any(value is not None and value is not False for value in build_arguments)
+                or not _packaging_is_exact()
+            ):
+                raise ReleaseBuildError("source verification arguments are incomplete")
+            if options.development_runtime_root is None:
+                if options.lock is None:
+                    raise ReleaseBuildError("source verification arguments are incomplete")
+                lock_path = options.lock.expanduser().resolve(strict=True)
+                platform_lock_directory = None
+            else:
+                if options.lock is not None:
+                    raise ReleaseBuildError("source verification arguments are incomplete")
+                development_root = admit_development_runtime_root(
+                    options.development_runtime_root,
+                    root,
+                    create=False,
+                )
+                lock_path = (development_root / "source-lock.json").resolve(strict=True)
+                platform_lock_directory = root / "python/wheelhouse"
+                admit_development_source_template(lock_path, root)
+            lock = load_lock(
+                lock_path,
+                platform_lock_directory=platform_lock_directory,
+            )
+            admit_sources(lock, root)
+            return 0
+        if options.verify_development_runtime:
+            if (
+                options.development_runtime_root is None
+                or options.lock is not None
+                or any(value is not None and value is not False for value in build_arguments)
+                or not _packaging_is_exact()
+            ):
+                raise ReleaseBuildError("development runtime verification arguments are invalid")
+            development_root = admit_development_runtime_root(
+                options.development_runtime_root,
+                root,
+                create=False,
+            )
+            lock_path = (development_root / "source-lock.json").resolve(strict=True)
+            admit_development_source_template(lock_path, root)
+            lock = load_lock(
+                lock_path,
+                platform_lock_directory=root / "python/wheelhouse",
+            )
+            admit_development_runtime(root, development_root, lock)
+            return 0
+        development_root = None
+        if options.development_runtime_root is not None:
+            if any(
+                value is not None
+                for value in (
+                    options.lock,
+                    options.artifact_root,
+                    options.component_root,
+                    options.source_cache,
+                    options.python,
+                    options.uv,
+                    options.zig,
+                    options.requirements,
+                    options.targets,
+                )
+            ) or options.sign_native:
+                raise ReleaseBuildError("development runtime build arguments are invalid")
+            development_root = admit_development_runtime_root(
+                options.development_runtime_root,
+                root,
+                create=False,
+            )
+            lock_path = (development_root / "source-lock.json").resolve(strict=True)
+            admit_development_source_template(lock_path, root)
+            artifact_root = development_root / "python"
+            component_root = development_root / "components"
+            selected_target = options.target or host_profile().target
+        else:
+            if options.lock is None or options.target is None or options.artifact_root is None:
+                raise ReleaseBuildError("release build arguments are incomplete")
+            lock_path = options.lock.expanduser().resolve(strict=True)
+            artifact_root = options.artifact_root
+            component_root = options.component_root
+            selected_target = options.target
         source_cache = (
             options.source_cache.expanduser().resolve(strict=True)
             if options.source_cache is not None
             else None
         )
-        profile = platform_profile(options.target)
+        profile = platform_profile(selected_target)
         if host_profile() != profile:
             raise ReleaseBuildError("release target does not match the native build host")
-        layout = admit_artifact_root(options.artifact_root, root)
+        layout = admit_artifact_root(artifact_root, root)
         allow_network = (
             options.prepare_cache_only
             and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1"
@@ -5346,7 +5806,7 @@ def main() -> int:
             source_cache,
             allow_network=allow_network,
         )
-        if options.component_root is not None:
+        if component_root is not None:
             if (
                 options.python is not None
                 or options.uv is not None
@@ -5358,9 +5818,10 @@ def main() -> int:
             acquired = acquire_release_components(
                 root / "distribution/release-components.json",
                 profile,
-                options.component_root,
+                component_root,
                 root,
                 allow_network=allow_network,
+                development_runtime_root=development_root,
             )
             python_paths = (acquired.python,)
             uv_path = acquired.uv
@@ -5373,7 +5834,13 @@ def main() -> int:
             python_paths = tuple(options.python)
             uv_path = options.uv
             zig_path = options.zig
-        lock = load_lock(lock_path, profile.target)
+        lock = load_lock(
+            lock_path,
+            profile.target,
+            platform_lock_directory=(
+                root / "python/wheelhouse" if development_root is not None else None
+            ),
+        )
         components_sha256 = admit_release_components(
             root / "distribution/release-components.json",
             profile,
@@ -5409,6 +5876,7 @@ def main() -> int:
                 components_sha256,
                 uv_executable,
                 native_code_signing,
+                development_runtime=development_root is not None,
             )
     except (OSError, ReleaseBuildError) as error:
         print(f"python release rejected: {error}", file=sys.stderr)

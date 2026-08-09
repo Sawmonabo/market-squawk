@@ -56,15 +56,18 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let subscription = socket
-            .next()
-            .await
-            .ok_or("subscription was not sent")??
-            .into_text()?;
-        assert_eq!(
-            subscription,
-            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["level2_batch","matches","heartbeat"]}"#
-        );
+        for expected in [
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"level2"}"#,
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"market_trades"}"#,
+            r#"{"type":"subscribe","channel":"heartbeats"}"#,
+        ] {
+            let subscription = socket
+                .next()
+                .await
+                .ok_or("subscription was not sent")??
+                .into_text()?;
+            assert_eq!(subscription, expected);
+        }
         socket
             .send(Message::Text(
                 include_str!("../../fixtures/subscriptions.json")
@@ -163,7 +166,9 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let _subscription = socket.next().await;
+        for _ in 0..3 {
+            let _subscription = socket.next().await;
+        }
         std::future::pending::<Result<(), Box<dyn Error + Send + Sync>>>().await
     });
     let stream = TcpStream::connect(address).await?;
@@ -288,7 +293,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
     CoinbaseExchangeConfig::try_new(
         SourceId::try_from("coinbase-exchange-public")?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(identifier("exchange-v1-2026-07-20")?),
+            MetadataRevision::new(identifier("advanced-trade-v1-2026-08-08")?),
             evidence(3),
         ),
         authorization,
@@ -300,8 +305,8 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         )?],
         vec![
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
         ],
         FreshnessPolicy::try_new(
             5_000_000_000,
@@ -312,7 +317,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         )?,
         budget,
         CoinbaseTransportLimits::try_new(
-            256 * 1024,
+            market_squawk_sources::MAX_RAW_FRAME_BYTES,
             Duration::from_secs(5),
             Duration::from_secs(5),
         )?,

@@ -187,7 +187,12 @@ pub(crate) struct ApplicationInvocation {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "query")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "query"
+)]
 pub(crate) enum DashboardQueryCommand {
     Overview,
     Lookup {
@@ -473,7 +478,12 @@ pub(crate) enum OperationSettingValue {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum OperationsControlCommand {
     CheckForUpdates,
     ExportLogs {
@@ -527,7 +537,12 @@ pub(crate) enum OperationsControlCommand {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum ResearchControlCommand {
     DiscoverSourceObjects {
         provider: String,
@@ -545,7 +560,12 @@ pub(crate) enum ResearchControlCommand {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum AnalysisControlCommand {
     FeatureDatasetOptions,
     PreviewFeatureDataset { selection: Map<String, Value> },
@@ -556,7 +576,12 @@ pub(crate) enum AnalysisControlCommand {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum ModelControlCommand {
     Evaluate {
         model_id: String,
@@ -576,7 +601,12 @@ pub(crate) enum ModelControlCommand {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum FairValueControlCommand {
     Measure {
         measurement: Map<String, Value>,
@@ -594,7 +624,12 @@ pub(crate) enum FairValueControlCommand {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub(crate) enum FairValueGovernanceProposal {
     Approve {
         measurement_id: String,
@@ -638,7 +673,12 @@ pub(crate) enum MarketAccessConclusionInput {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum DecisionControlCommand {
     SaveScreen {
         expected_revision: Option<u32>,
@@ -675,7 +715,12 @@ pub(crate) enum DecisionControlCommand {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub(crate) enum DecisionGovernanceProposal {
     Review {
         target_id: String,
@@ -710,7 +755,12 @@ pub(crate) enum DecisionInvalidationKindInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "query")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "query"
+)]
 pub(crate) enum GovernanceQueryCommand {
     ProvisioningStatus,
     Principals {
@@ -720,7 +770,12 @@ pub(crate) enum GovernanceQueryCommand {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum GovernanceControlCommand {
     ProvisionPrincipalSet {
         primary_display_name: String,
@@ -765,7 +820,12 @@ impl fmt::Debug for GovernanceControlCommand {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum PaperControlCommand {
     Targets,
     Submit {
@@ -805,7 +865,12 @@ pub(crate) enum TrainingInputKind {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum JobControlCommand {
     List {
         after_job_id: Option<String>,
@@ -903,7 +968,11 @@ impl DesktopEvent {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 enum DesktopEventBody {
     AuthorityChanged {
         domain: String,
@@ -916,7 +985,12 @@ enum DesktopEventBody {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum InstallationControlCommand {
     Status,
     Update,
@@ -932,7 +1006,12 @@ impl InstallationControlCommand {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "action")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
 pub(crate) enum ProviderOnboardingCommand {
     Bootstrap,
     Start {

@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use market_squawk_domain::{AssetClass, Denomination, LiveEventClass, MarketDepth, TradingStatus};
 use market_squawk_platform::{
-    AppConfig, COINBASE_EXCHANGE_ENDPOINT, ConfigError, ConfigOrigin, ConfigOverrides,
-    ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
+    AppConfig, COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, ConfigError, ConfigOrigin,
+    ConfigOverrides, ConfigSetting, ConfigSources, KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
 };
 use tempfile::tempdir;
 
@@ -18,7 +18,7 @@ fn coinbase_config_toml(max_frame_bytes: usize) -> String {
     format!(
         r#"
 [coinbase]
-endpoint = "{COINBASE_EXCHANGE_ENDPOINT}"
+endpoint = "{COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT}"
 event_classes = ["book_snapshot", "book_delta", "trade"]
 depth = "price_level"
 freshness_ms = 5000
@@ -32,8 +32,8 @@ mode = "public_interface"
 provider = "coinbase-exchange"
 basis = "user-reviewed-coinbase-public-interface"
 evidence_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-evidence_reference = "https://docs.cdp.coinbase.com/exchange/websocket-feed/overview"
-evidence_version = "reviewed-2026-07-20"
+evidence_reference = "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview"
+evidence_version = "reviewed-2026-08-08"
 effective_from_unix_nanos = 1700000000000000000
 effective_until_unix_nanos = 1900000000000000000
 
@@ -56,7 +56,7 @@ trading_status = "active"
 fn coinbase_config_json(max_frame_bytes: usize) -> String {
     format!(
         r#"{{
-  "endpoint":"{COINBASE_EXCHANGE_ENDPOINT}",
+  "endpoint":"{COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT}",
   "event_classes":["book_snapshot","book_delta","trade"],
   "depth":"price_level",
   "freshness_ms":5000,
@@ -69,8 +69,8 @@ fn coinbase_config_json(max_frame_bytes: usize) -> String {
     "provider":"coinbase-exchange",
     "basis":"user-reviewed-coinbase-public-interface",
     "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-    "evidence_version":"reviewed-2026-07-20",
+    "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "evidence_version":"reviewed-2026-08-08",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   }},
@@ -190,7 +190,10 @@ fn production_coinbase_config_is_explicit_typed_and_obeys_precedence()
     ))?;
     let coinbase = config.coinbase().ok_or("Coinbase configuration missing")?;
 
-    assert_eq!(coinbase.endpoint(), COINBASE_EXCHANGE_ENDPOINT);
+    assert_eq!(
+        coinbase.endpoint(),
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT
+    );
     assert_eq!(coinbase.max_frame_bytes().get(), 3_145_728);
     assert_eq!(coinbase.depth(), MarketDepth::PriceLevel);
     assert_eq!(
@@ -263,8 +266,10 @@ fn production_coinbase_config_fails_closed_on_ambiguous_or_unsafe_mappings()
 #[test]
 fn production_coinbase_config_rejects_custom_endpoints_and_subscription_overflow()
 -> Result<(), Box<dyn std::error::Error>> {
-    let custom_endpoint =
-        coinbase_config_json(1_048_576).replace(COINBASE_EXCHANGE_ENDPOINT, "ws://127.0.0.1:9000");
+    let custom_endpoint = coinbase_config_json(1_048_576).replace(
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT,
+        "ws://127.0.0.1:9000",
+    );
     let custom_environment = environment(&[("MARKET_SQUAWK_COINBASE_JSON", &custom_endpoint)]);
     assert!(
         AppConfig::load(ConfigSources::new(

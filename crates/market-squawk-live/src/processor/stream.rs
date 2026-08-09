@@ -84,6 +84,16 @@ impl StreamState {
     pub(super) fn generation_lease(&self) -> GenerationLease {
         self.generation.clone()
     }
+
+    /// Rebinds the same connection generation to a newer source-health epoch.
+    ///
+    /// Health refreshes preserve the provider connection, book, sequence, and stream revision,
+    /// but receive an independent generation allocation so a rejected stale queued batch cannot
+    /// revoke the current epoch. The registry retains the preceding allocation only for bounded
+    /// FIFO drain; stream revisions independently retire previously issued execution authority.
+    pub(super) fn rebind_health_generation(&mut self, generation: GenerationLease) {
+        self.generation = generation;
+    }
     pub(super) fn revision(&self) -> u64 {
         self.revision.diagnostic_revision()
     }

@@ -587,6 +587,36 @@ search, or remote code execution.
 Markets combines qualified live state, venue comparison, research context, and portfolio relevance
 without weakening the separation between live execution and research data.
 
+### Unified feed and provider federation
+
+Markets is one non-technical feed, search surface, and instrument workspace. Users choose an
+investment or question, not an upstream provider. A bounded resolver selects the richest admitted
+observation that satisfies the requested asset, timing, depth, quality, and operation requirements.
+The normal UI exposes plain availability and confidence language; exact provider, venue, coverage,
+depth, timestamps, rights, quality, integrity, selection reason, and downgrade evidence remain
+available under **Data confidence**.
+
+One per-user Market Squawk service owns all provider connections, shared request/subscription
+budgets, caches, cursors, and recovery generations for Desktop, CLI, MCP, models, and jobs.
+Provider-native actors retain their own snapshot, sequence, checksum, reconnect, and quarantine
+rules. Failure of one source cannot mutate another source's state, and a fallback never inherits the
+failed source's quality or coverage.
+
+The full admitted instrument universe is locally searchable. Live subscriptions remain bounded and
+prioritize holdings, open positions and paper orders, watchlists, active screens, the currently
+viewed instrument, and a small benchmark set. This provides broad discovery without continuously
+streaming thousands of unused instruments or duplicating requests across product clients.
+
+The V1 installation requires no mandatory paid data service and provides the best available depth
+from admitted sources. Order-level depth is shown only where the exact venue/product supplies it.
+The reviewed evidence does not establish universal free order-level coverage for US equities,
+options, futures, foreign exchange, and crypto; calculated indexes are benchmarks and have no
+native order book. Market Squawk must show a truthful gap rather than inventing depth or silently
+substituting a tradable ETF proxy for an index.
+
+The binding provider and reuse evidence is recorded in
+[`Unified Markets provider ecosystem`](../../research/2026-08-08-unified-markets-provider-ecosystem.md).
+
 ### Market workspace
 
 For a selected instrument, the primary workspace shows:
@@ -1286,7 +1316,7 @@ meeting the success/failure/recovery definition above, not a placeholder page.
 | --- | --- | --- |
 | Instrument identity and resolution | Lookup, Markets, Research, Portfolio imports and target selection | Complete bounded resolve/search metadata |
 | Provider onboarding and health | Setup, Sources and Overview attention queue | Register/configure/status/coverage/health |
-| Coinbase/Kraken live data | Markets, portfolio mark coverage, live features, target context, risk and paper decisions | Snapshots/trades/books/quality/comparison |
+| Multi-provider market data | Unified Markets feed/search/instrument view, portfolio marks, live features, opportunities, forecasts, targets, backtests, risk and paper decisions | Search, snapshots, trades, quotes, books, bars, benchmarks, source selection, quality, depth and comparison |
 | SEC, FRED/ALFRED, BLS, Treasury | Sources, Research, filings/fundamentals/macro, models and decision dossiers | Discover/extract/status/query with vintages |
 | CSV/JSON/NDJSON/Parquet and portfolio files | Guided import, preview, mapping, reconciliation and receipt | Bounded ingest and artifact operations |
 | Arrow/Parquet/DataFusion datasets | Research datasets, screens, features, models, backtests and exports | Typed dataset build/query/manifest tools; no unrestricted MCP SQL |
