@@ -10,7 +10,10 @@ use crate::provider_book::{
     exact_level_arc_allocation_bytes, maximum_book_items_for_message, provider_book_buffer_bytes,
     shard_book_scratch_bytes,
 };
+use crate::runtime::admission::CONTROL_COMMAND_SLOT_BYTES;
 use crate::{ShardRouter, ShardRoutingVersion};
+
+pub(crate) const CONTROL_SLOT_BYTES: u64 = CONTROL_COMMAND_SLOT_BYTES as u64;
 
 const ROUTE_FIXED_BYTES: u64 = 32 * 1024;
 /// Admission and generation-registry ownership per distinct source.
@@ -31,7 +34,12 @@ const STREAM_RUNTIME_EVIDENCE_ALLOCATION_BYTES: u64 =
 const STREAM_MAP_ALLOCATION_BYTES: u64 = 2 * 128;
 const ACTOR_FIXED_BYTES: u64 = 64 * 1024;
 const CHANNEL_COMMAND_SLOT_BYTES: u64 = 128;
-const CONTROL_SLOT_BYTES: u64 = 256;
+/// Runtime owner, shared activation state, bounded response inventory, and allocator slack.
+const ACTION_CONTROL_FIXED_BYTES: u64 = 4 * 1024;
+/// One shard sender, byte semaphore, exact group count, and bounded response ownership.
+const ACTION_CONTROL_SHARD_BYTES: u64 = 1024;
+/// Temporary partition/control-vector storage while ownership of one route hook is transferred.
+const ACTION_CONTROL_ROUTE_BYTES: u64 = size_of::<crate::RouteActionHook>() as u64 + 128;
 const HEALTH_EVENT_BYTES: u64 = 512;
 const SNAPSHOT_NOTIFICATION_BYTES: u64 = 256;
 /// Cloned route identity plus Vec/allocator slack retained while one actor sorts route ownership.
@@ -103,6 +111,12 @@ pub(super) fn estimate_peak_bytes(
         CONTROL_SLOT_BYTES,
     )?;
     total = add(total, multiply(shards, control_per_shard)?)?;
+    total = add(total, ACTION_CONTROL_FIXED_BYTES)?;
+    total = add(total, multiply(shards, ACTION_CONTROL_SHARD_BYTES)?)?;
+    total = add(
+        total,
+        multiply(routes.len() as u64, ACTION_CONTROL_ROUTE_BYTES)?,
+    )?;
 
     let snapshot_peak = snapshot_publication_reader_peak(
         config.snapshot_limits().maximum_retained_bytes().get(),

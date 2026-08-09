@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +17,13 @@ use tokio_util::sync::CancellationToken;
 use super::system_timestamp;
 use crate::authority::{RuntimeLease, ShardLease};
 use crate::processor::GenerationAdmission;
-use crate::{ShardId, ShardKey};
+use crate::{
+    ActionHookActivationLease, LiveActionHookGeneration, RouteActionHook, RouteActionHookError,
+    ShardId, ShardKey,
+};
 
 const COMMAND_SHARED_ALLOCATION_CHARGE: usize = 256;
+pub(crate) const CONTROL_COMMAND_SLOT_BYTES: usize = 256;
 
 /// One bounded best-effort diagnostic emitted outside the authority transition.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,6 +118,54 @@ pub(crate) struct RegistrationCommand {
     pub(crate) response: oneshot::Sender<Result<RegistrationGrant, RegistrationFailure>>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ActorControlCommand {
+    Register(RegistrationCommand),
+    InstallActionHooks(ActionHookInstallCommand),
+    RemoveActionHooks(ActionHookRemoveCommand),
+}
+
+#[derive(Debug)]
+pub(crate) struct ActionHookInstallCommand {
+    pub(crate) runtime_incarnation: NonZeroU64,
+    pub(crate) generation: LiveActionHookGeneration,
+    pub(crate) activation: ActionHookActivationLease,
+    pub(crate) hooks: Vec<RouteActionHook>,
+    pub(crate) response: oneshot::Sender<Result<usize, ActionHookControlFailure>>,
+    pub(crate) _byte_permits: Vec<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActionHookRemoveCommand {
+    pub(crate) runtime_incarnation: NonZeroU64,
+    pub(crate) generation: LiveActionHookGeneration,
+    pub(crate) activation: ActionHookActivationLease,
+    pub(crate) expected_hooks: usize,
+    pub(crate) response: oneshot::Sender<Result<usize, ActionHookControlFailure>>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ActionHookControlFailure {
+    #[error("action hook control targeted a different runtime incarnation")]
+    RuntimeMismatch,
+    #[error("action hook control targeted an invalid activation generation")]
+    InvalidActivation,
+    #[error("action hook control contained no route hooks")]
+    EmptyGroup,
+    #[error("action hook control contained a duplicate route")]
+    DuplicateRoute,
+    #[error("action hook control targeted an unknown route")]
+    UnknownRoute,
+    #[error("action hook control targeted a route that already owns a hook")]
+    HookAlreadyInstalled,
+    #[error("action hook control observed an incomplete actor-owned group")]
+    PartialGroup,
+    #[error(transparent)]
+    InvalidHook(#[from] RouteActionHookError),
+}
+
+const _: () = assert!(size_of::<ActorControlCommand>() <= CONTROL_COMMAND_SLOT_BYTES);
+
 /// Drop-invalidating transfer guard for one actor-minted generation admission.
 #[derive(Debug)]
 pub(crate) struct RegistrationGrant(Option<GenerationAdmission>);
@@ -152,10 +205,19 @@ pub(crate) struct RouteIngressChannels {
     pub(crate) shard_liveness: ShardLease,
     pub(crate) mailbox: mpsc::Sender<ShardCommand>,
     pub(crate) byte_budget: Arc<Semaphore>,
-    pub(crate) registration: mpsc::Sender<RegistrationCommand>,
+    pub(crate) control: mpsc::Sender<ActorControlCommand>,
     pub(crate) registration_deadline: Duration,
     pub(crate) maximum_message_bytes: u32,
     pub(crate) health: mpsc::Sender<LiveRuntimeHealthEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActionControlChannels {
+    pub(crate) shard: ShardId,
+    pub(crate) runtime: RuntimeLease,
+    pub(crate) shard_liveness: ShardLease,
+    pub(crate) control: mpsc::Sender<ActorControlCommand>,
+    pub(crate) byte_budget: Arc<Semaphore>,
 }
 
 /// Runtime-wide pre-feed binding facade. It intentionally has no unbound publish method.
@@ -188,14 +250,15 @@ impl LiveRuntimeIngress {
             .shard_liveness
             .validate()
             .map_err(|_| LiveIngressBindError::ShardClosed)?;
-        let registration = channels
-            .registration
-            .clone()
-            .try_reserve_owned()
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => LiveIngressBindError::ControlCapacityFull,
-                mpsc::error::TrySendError::Closed(_) => LiveIngressBindError::ControlClosed,
-            })?;
+        let registration =
+            channels
+                .control
+                .clone()
+                .try_reserve_owned()
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => LiveIngressBindError::ControlCapacityFull,
+                    mpsc::error::TrySendError::Closed(_) => LiveIngressBindError::ControlClosed,
+                })?;
         Ok(DormantRouteIngress {
             route,
             shard: channels.shard,
@@ -232,7 +295,7 @@ pub struct DormantRouteIngress {
     shard_liveness: ShardLease,
     mailbox: mpsc::Sender<ShardCommand>,
     byte_budget: Arc<Semaphore>,
-    registration: mpsc::OwnedPermit<RegistrationCommand>,
+    registration: mpsc::OwnedPermit<ActorControlCommand>,
     registration_deadline: Duration,
     maximum_message_bytes: u32,
     health: mpsc::Sender<LiveRuntimeHealthEvent>,
@@ -280,7 +343,8 @@ impl DormantRouteIngress {
         if cancellation.is_cancelled() {
             return Err(LiveIngressBindError::Cancelled);
         }
-        self.registration.send(command);
+        self.registration
+            .send(ActorControlCommand::Register(command));
         let grant = tokio::select! {
             biased;
             result = receiver => {

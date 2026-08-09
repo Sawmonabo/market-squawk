@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::admission::{
-    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, RegistrationCommand, ShardCommand,
+    ActorControlCommand, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, ShardCommand,
 };
 use super::{LiveFeatureCapacity, LiveRouteConfig, system_timestamp};
 use crate::authority::{RuntimeLease, ShardLeaseOwner};
@@ -62,7 +62,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) cross_venue: CrossVenuePlaneHandle,
     pub(crate) maximum_book_items_per_message: usize,
     pub(crate) mailbox: mpsc::Receiver<ShardCommand>,
-    pub(crate) registrations: mpsc::Receiver<RegistrationCommand>,
+    pub(crate) controls: mpsc::Receiver<ActorControlCommand>,
     pub(crate) snapshot_limits: SnapshotLimits,
     pub(crate) snapshot_interval: std::time::Duration,
     pub(crate) snapshot_event_trigger: usize,
@@ -161,8 +161,9 @@ struct ShardActor {
     runtime_incarnation: NonZeroU64,
     routes: HashMap<crate::ShardKey, RouteOwner>,
     book_scratch: BookProcessingScratch,
+    maximum_action_hook_bytes_per_route: usize,
     mailbox: mpsc::Receiver<ShardCommand>,
-    registrations: mpsc::Receiver<RegistrationCommand>,
+    controls: mpsc::Receiver<ActorControlCommand>,
     snapshot_limits: SnapshotLimits,
     maximum_feature_snapshot_bytes: usize,
     snapshot_interval: std::time::Duration,
@@ -282,8 +283,9 @@ impl ShardActor {
             runtime_incarnation: input.runtime_incarnation,
             routes,
             book_scratch,
+            maximum_action_hook_bytes_per_route: input.maximum_action_hook_bytes_per_route,
             mailbox: input.mailbox,
-            registrations: input.registrations,
+            controls: input.controls,
             snapshot_limits: input.snapshot_limits,
             maximum_feature_snapshot_bytes,
             snapshot_interval: input.snapshot_interval,
@@ -295,7 +297,7 @@ impl ShardActor {
             health_revision: 0,
             events_since_snapshot: 0,
             dirty: true,
-            fair_turn: FairTurn::Registration,
+            fair_turn: FairTurn::Control,
             snapshot_pending: false,
             terminal_health_emitted: false,
             observed_notification_drops: 0,
@@ -314,9 +316,9 @@ impl ShardActor {
         // Consume the immediate first tick because readiness already published the complete state.
         interval.tick().await;
         let mut mailbox_open = true;
-        let mut registrations_open = true;
+        let mut controls_open = true;
         loop {
-            if !mailbox_open && !registrations_open {
+            if !mailbox_open && !controls_open {
                 break;
             }
             let event = select_fair_event(
@@ -324,9 +326,9 @@ impl ShardActor {
                 self.snapshot_pending,
                 FairSources {
                     cancellation: &self.cancellation,
-                    registrations: &mut self.registrations,
+                    controls: &mut self.controls,
                     mailbox: &mut self.mailbox,
-                    registrations_open,
+                    controls_open,
                     mailbox_open,
                     interval: &mut interval,
                 },
@@ -337,11 +339,11 @@ impl ShardActor {
             }
             match event {
                 FairEvent::Cancelled => break,
-                FairEvent::Registration(command) => match command {
+                FairEvent::Control(command) => match command {
                     Some(command) => {
-                        self.register(command);
+                        self.control(command);
                     }
-                    None => registrations_open = false,
+                    None => controls_open = false,
                 },
                 FairEvent::Market(command) => match command {
                     Some(command) => {
@@ -359,10 +361,11 @@ impl ShardActor {
             }
         }
         self.mailbox.close();
-        self.registrations.close();
+        self.controls.close();
         while let Ok(command) = self.mailbox.try_recv() {
             command.admission.invalidate_on_admission_failure();
         }
+        while self.controls.try_recv().is_ok() {}
         self._guard.invalidate();
         for owner in self.routes.values_mut() {
             owner.generations.invalidate_all();

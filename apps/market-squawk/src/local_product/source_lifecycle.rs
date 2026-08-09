@@ -1,6 +1,7 @@
-//! Sole production source lifecycle authority over existing live and research owners.
+//! Production source lifecycle authority over live and research runtime owners.
 
 use std::{
+    num::NonZeroU64,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,13 +14,13 @@ use market_squawk_platform::LocalPaths;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::application::PaperSourceLifecycleControl;
+use crate::application::MarketRuntimeRegistry;
 use crate::application::source::{
     SourceAuthorizationState, SourceAvailabilityState, SourceLifecycleAction,
     SourceLifecycleAuthority, SourceLifecycleBlocker, SourceLifecycleCommand,
-    SourceLifecycleDisposition, SourceLifecycleError, SourceLifecycleReceipt,
-    SourceLifecycleReceiptInput, SourceLifecycleState, SourceLifecycleStatus,
-    SourceLifecycleStatusInput, SourceRateBudgetState, SourceRightsEvidence,
+    SourceLifecycleCommandInput, SourceLifecycleDisposition, SourceLifecycleError,
+    SourceLifecycleReceipt, SourceLifecycleReceiptInput, SourceLifecycleState,
+    SourceLifecycleStatus, SourceLifecycleStatusInput, SourceRateBudgetState, SourceRightsEvidence,
 };
 use crate::{
     ProviderAdapterActivation, ProviderOnboardingService, ProviderPortalActivationAuthority,
@@ -39,6 +40,44 @@ const LIVE_SURFACES: [&str; 3] = [
     "coinbase.exchange-direct-market-data",
     "kraken.spot-public-market-data",
 ];
+const PUBLIC_LIVE_SURFACES: [&str; 2] = [
+    "coinbase.public-market-data",
+    "kraken.spot-public-market-data",
+];
+
+/// Bounded result of restoring every independently active live source.
+#[derive(Debug)]
+pub(crate) struct LiveSourceRestoreReport {
+    restored: Vec<SourceIdentifier>,
+    failures: Vec<LiveSourceRestoreFailure>,
+}
+
+impl LiveSourceRestoreReport {
+    pub(crate) fn restored(&self) -> &[SourceIdentifier] {
+        &self.restored
+    }
+
+    pub(crate) fn failures(&self) -> &[LiveSourceRestoreFailure] {
+        &self.failures
+    }
+}
+
+/// One provider-scoped startup restoration failure.
+#[derive(Clone, Debug)]
+pub(crate) struct LiveSourceRestoreFailure {
+    provider: SourceIdentifier,
+    error: SourceLifecycleError,
+}
+
+impl LiveSourceRestoreFailure {
+    pub(crate) const fn provider(&self) -> &SourceIdentifier {
+        &self.provider
+    }
+
+    pub(crate) const fn error(&self) -> SourceLifecycleError {
+        self.error
+    }
+}
 
 /// Single lifecycle authority injected into the Source application domain.
 pub(crate) struct ProductionSourceLifecycleAuthority {
@@ -47,7 +86,7 @@ pub(crate) struct ProductionSourceLifecycleAuthority {
     activation: Arc<ProviderAdapterActivation>,
     portal: Arc<dyn ProviderPortalActivationAuthority>,
     durable: DurableProviderActivationState,
-    live: PaperSourceLifecycleControl,
+    live: Arc<MarketRuntimeRegistry>,
 }
 
 impl ProductionSourceLifecycleAuthority {
@@ -58,7 +97,7 @@ impl ProductionSourceLifecycleAuthority {
         activation: Arc<ProviderAdapterActivation>,
         portal: Arc<dyn ProviderPortalActivationAuthority>,
         durable: DurableProviderActivationState,
-        live: PaperSourceLifecycleControl,
+        live: Arc<MarketRuntimeRegistry>,
     ) -> Self {
         Self {
             paths,
@@ -70,49 +109,131 @@ impl ProductionSourceLifecycleAuthority {
         }
     }
 
-    /// Restores the one live source whose durable desired state is active.
+    /// Restores every live source whose durable desired state is active.
     ///
     /// Installed-service shutdown deliberately stops process-owned sockets without changing the
     /// user's durable source choice. On the next service generation, this method re-establishes
     /// that exact source before the service publishes readiness. Provider, credential, budget, or
     /// network failures remain explicit lifecycle blockers and do not fabricate an active runtime.
-    pub(crate) async fn restore_active_live_source(
+    pub(crate) async fn restore_active_live_sources(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Option<SourceIdentifier>, SourceLifecycleError> {
+    ) -> Result<LiveSourceRestoreReport, SourceLifecycleError> {
         ensure_status_live(cancellation, deadline)?;
-        let mut selected = None;
+        let mut active = Vec::new();
+        active
+            .try_reserve_exact(LIVE_SURFACES.len())
+            .map_err(|_error| SourceLifecycleError::Unavailable)?;
+        let mut restored = Vec::new();
+        restored
+            .try_reserve_exact(LIVE_SURFACES.len())
+            .map_err(|_error| SourceLifecycleError::Unavailable)?;
+        let mut failures = Vec::new();
+        failures
+            .try_reserve_exact(LIVE_SURFACES.len())
+            .map_err(|_error| SourceLifecycleError::Unavailable)?;
         for surface in LIVE_SURFACES {
+            let provider = SourceIdentifier::try_from(surface)
+                .map_err(|_error| SourceLifecycleError::InvalidResult)?;
             let record = self
                 .durable
                 .source_lifecycle_record(surface)
                 .map_err(map_durable_error)?;
-            if record.phase() != DurableSourceLifecyclePhase::Active {
-                continue;
+            match record.phase() {
+                DurableSourceLifecyclePhase::Active => {
+                    active.push((provider, record.session_id()));
+                }
+                DurableSourceLifecyclePhase::Stopped
+                    if PUBLIC_LIVE_SURFACES.contains(&surface)
+                        && self.live.is_account_free_source_configured(&provider)
+                        && record.revision() == NonZeroU64::MIN
+                        && record.operation_id().is_none() =>
+                {
+                    active.push((provider, None));
+                }
+                DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired
+                    if PUBLIC_LIVE_SURFACES.contains(&surface)
+                        && self.live.is_account_free_source_configured(&provider)
+                        && record.operation_id()
+                            == Some(&default_public_start_operation_id(&provider)?) =>
+                {
+                    let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                        provider: provider.clone(),
+                        action: SourceLifecycleAction::Retry,
+                        expected_state_revision: record.revision(),
+                        expected_generation: None,
+                        onboarding_session_id: None,
+                        public_configuration_digest: None,
+                        reason: Some(
+                            SourceIdentifier::try_from("automatic-public-source-recovery")
+                                .map_err(|_error| SourceLifecycleError::Internal)?,
+                        ),
+                        cancellation: cancellation.child_token(),
+                        deadline,
+                    })?;
+                    match self.execute_owned(&command).await {
+                        Ok(receipt) if receipt.fields().provider == provider => {
+                            restored.push(provider)
+                        }
+                        Ok(_receipt) => failures.push(LiveSourceRestoreFailure {
+                            provider,
+                            error: SourceLifecycleError::InvalidResult,
+                        }),
+                        Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
+                    }
+                }
+                DurableSourceLifecyclePhase::Stopped
+                | DurableSourceLifecyclePhase::Removed
+                | DurableSourceLifecyclePhase::Applying
+                | DurableSourceLifecyclePhase::ReconciliationRequired => {}
             }
-            if selected.is_some() {
-                return Err(SourceLifecycleError::Conflict);
+        }
+
+        for (provider, session_id) in active {
+            ensure_status_live(cancellation, deadline)?;
+            let record = self
+                .durable
+                .source_lifecycle_record(provider.as_str())
+                .map_err(map_durable_error)?;
+            if record.phase() == DurableSourceLifecyclePhase::Stopped {
+                let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+                    provider: provider.clone(),
+                    action: SourceLifecycleAction::Start,
+                    expected_state_revision: record.revision(),
+                    expected_generation: None,
+                    onboarding_session_id: None,
+                    public_configuration_digest: None,
+                    reason: None,
+                    cancellation: cancellation.child_token(),
+                    deadline,
+                })?;
+                match self.execute_owned(&command).await {
+                    Ok(receipt) if receipt.fields().provider == provider => restored.push(provider),
+                    Ok(_receipt) => failures.push(LiveSourceRestoreFailure {
+                        provider,
+                        error: SourceLifecycleError::InvalidResult,
+                    }),
+                    Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
+                }
+            } else {
+                match self
+                    .live
+                    .start(&provider, session_id, deadline, cancellation)
+                    .await
+                    .map_err(map_live_error)
+                {
+                    Ok(evidence) if evidence.provider == provider => restored.push(provider),
+                    Ok(_evidence) => failures.push(LiveSourceRestoreFailure {
+                        provider,
+                        error: SourceLifecycleError::InvalidResult,
+                    }),
+                    Err(error) => failures.push(LiveSourceRestoreFailure { provider, error }),
+                }
             }
-            selected = Some((
-                SourceIdentifier::try_from(surface)
-                    .map_err(|_error| SourceLifecycleError::InvalidResult)?,
-                record.session_id(),
-            ));
         }
-        let Some((provider, session_id)) = selected else {
-            return Ok(None);
-        };
-        ensure_status_live(cancellation, deadline)?;
-        let evidence = self
-            .live
-            .start(&provider, session_id, deadline, cancellation)
-            .await
-            .map_err(map_live_error)?;
-        if evidence.provider != provider {
-            return Err(SourceLifecycleError::InvalidResult);
-        }
-        Ok(Some(provider))
+        Ok(LiveSourceRestoreReport { restored, failures })
     }
 
     async fn execute_owned(
@@ -174,26 +295,6 @@ impl ProductionSourceLifecycleAuthority {
                 return Err(error);
             }
         };
-        if LIVE_SURFACES.contains(&provider.as_str())
-            && outcome.phase == DurableSourceLifecyclePhase::Active
-            && matches!(
-                command.action(),
-                SourceLifecycleAction::Start
-                    | SourceLifecycleAction::Retry
-                    | SourceLifecycleAction::Reconfigure
-            )
-            && let Err(error) = self.durable.retire_other_active_live_surfaces(
-                &provider,
-                &LIVE_SURFACES,
-                &operation_id,
-                command_digest,
-            )
-        {
-            let _blocked = self
-                .durable
-                .require_source_lifecycle_reconciliation(&provider, transition_digest);
-            return Err(map_durable_error(error));
-        }
         ensure_live(command)?;
         let record = self
             .durable
@@ -248,12 +349,6 @@ impl ProductionSourceLifecycleAuthority {
             match self.live.verify(provider, deadline, cancellation).await {
                 Ok(Some(evidence)) => live = Some(evidence.generation),
                 Ok(None) | Err(market_squawk_services::ServiceError::Unavailable) => {
-                    state = SourceLifecycleState::Blocked;
-                    blocker = Some(SourceLifecycleBlocker::ProviderAvailability);
-                }
-                Err(market_squawk_services::ServiceError::InvalidRequest) => {
-                    // A different provider currently owns the sole live runtime. Report this
-                    // retained source as unavailable instead of rejecting the status read.
                     state = SourceLifecycleState::Blocked;
                     blocker = Some(SourceLifecycleBlocker::ProviderAvailability);
                 }
@@ -718,6 +813,26 @@ impl ProductionSourceLifecycleAuthority {
     }
 }
 
+fn default_public_start_operation_id(
+    provider: &SourceIdentifier,
+) -> Result<SourceIdentifier, SourceLifecycleError> {
+    let deadline = Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .ok_or(SourceLifecycleError::Internal)?;
+    let command = SourceLifecycleCommand::try_new(SourceLifecycleCommandInput {
+        provider: provider.clone(),
+        action: SourceLifecycleAction::Start,
+        expected_state_revision: NonZeroU64::MIN,
+        expected_generation: None,
+        onboarding_session_id: None,
+        public_configuration_digest: None,
+        reason: None,
+        cancellation: CancellationToken::new(),
+        deadline,
+    })?;
+    operation_id(command_digest(&command)?)
+}
+
 impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -726,7 +841,7 @@ impl std::fmt::Debug for ProductionSourceLifecycleAuthority {
             .field("onboarding", &"[ONBOARDING AUTHORITY]")
             .field("activation", &"[ADAPTER AUTHORITY]")
             .field("durable", &"[DURABLE LIFECYCLE]")
-            .field("live", &"[PAPER LIVE OWNER]")
+            .field("live", &"[MARKET RUNTIME REGISTRY]")
             .finish_non_exhaustive()
     }
 }

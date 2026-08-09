@@ -487,14 +487,29 @@ impl InstalledService {
             let source_recovery_deadline = std::time::Instant::now()
                 .checked_add(CLIENT_TIMEOUT)
                 .ok_or(InstalledServiceError::InvalidComposition)?;
-            if let Err(error) = product
-                .restore_active_live_source(source_recovery_deadline, &CancellationToken::new())
+            match product
+                .restore_active_live_sources(source_recovery_deadline, &CancellationToken::new())
                 .await
             {
-                tracing::warn!(
-                    error = %error,
-                    "durably active live source could not be restored during service startup"
-                );
+                Ok(report) => {
+                    tracing::info!(
+                        restored_source_count = report.restored().len(),
+                        "durably active live sources restored during service startup"
+                    );
+                    for failure in report.failures() {
+                        tracing::warn!(
+                            provider = %failure.provider().as_str(),
+                            error = %failure.error(),
+                            "durably active live source could not be restored during service startup"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "durably active live-source restoration could not be completed during service startup"
+                    );
+                }
             }
             let prepared_operations = PreparedInstalledOperations::prepare(
                 &config,

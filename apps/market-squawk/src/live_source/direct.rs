@@ -65,6 +65,30 @@ impl CoinbaseDirectLiveRuntime {
         self.live.snapshots()
     }
 
+    /// Installs one complete disabled action-hook group without reconnecting the account source.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::PreparedLiveActionHookGroup, CoinbaseDirectSupervisorError>
+    {
+        self.live
+            .prepare_action_hooks(hooks, cancellation)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Removes the exact disabled dynamic action-hook group from the running actors.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::LiveActionHookReapReceipt, CoinbaseDirectSupervisorError> {
+        self.live
+            .reap_action_hooks(cancellation)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Cancels every product, reaps capture and route workers, then releases credential authority.
     ///
     /// # Errors

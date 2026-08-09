@@ -77,14 +77,17 @@ keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
 market-squawk = { path = "apps/market-squawk", version = "=1.0.0" }
 market-squawk-installer = { path = "apps/market-squawk-installer", version = "=1.0.0" }
+market-squawk-adapter-alpaca = { path = "adapters/market-squawk-adapter-alpaca", version = "=1.0.0" }
 market-squawk-adapter-bls = { path = "adapters/market-squawk-adapter-bls", version = "=1.0.0" }
 market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=1.0.0" }
 market-squawk-adapter-files = { path = "adapters/market-squawk-adapter-files", version = "=1.0.0" }
 market-squawk-adapter-fred = { path = "adapters/market-squawk-adapter-fred", version = "=1.0.0" }
 market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=1.0.0" }
+market-squawk-adapter-nasdaq-symbols = { path = "adapters/market-squawk-adapter-nasdaq-symbols", version = "=1.0.0" }
 market-squawk-adapter-paper = { path = "adapters/market-squawk-adapter-paper", version = "=1.0.0" }
 market-squawk-adapter-portfolio = { path = "adapters/market-squawk-adapter-portfolio", version = "=1.0.0" }
 market-squawk-adapter-sec = { path = "adapters/market-squawk-adapter-sec", version = "=1.0.0" }
+market-squawk-adapter-tradier = { path = "adapters/market-squawk-adapter-tradier", version = "=1.0.0" }
 market-squawk-adapter-treasury = { path = "adapters/market-squawk-adapter-treasury", version = "=1.0.0" }
 market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "=1.0.0" }
 market-squawk-data = { path = "crates/market-squawk-data", version = "=1.0.0" }
@@ -122,6 +125,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
     "rustls-no-provider",
     "stream",
 ] }
+rmp-serde = "=1.3.1"
 rpassword = "=7.5.4"
 loom = "=0.7.2"
 proptest = "1.7"

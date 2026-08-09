@@ -10,10 +10,10 @@
 //! app-local event/book/quality path are deleted rather than promoted.
 
 use market_squawk_live::{
-    BoundShardIngress, LiveIngressBindError, LiveRouteConfig, LiveRuntime, LiveRuntimeConfig,
-    LiveRuntimeHealthEvent, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
-    LiveRuntimeStartError, LiveSnapshotReader, RouteActionHook, RouteQualifiedMarketExport,
-    ShardId, ShardKey,
+    BoundShardIngress, LiveActionControlError, LiveActionHookReapReceipt, LiveIngressBindError,
+    LiveRouteConfig, LiveRuntime, LiveRuntimeConfig, LiveRuntimeHealthEvent, LiveRuntimeIngress,
+    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError, LiveSnapshotReader,
+    PreparedLiveActionHookGroup, RouteActionHook, RouteQualifiedMarketExport, ShardId, ShardKey,
 };
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use thiserror::Error;
@@ -146,6 +146,29 @@ impl LiveRuntimeComposition {
         self.runtime.try_next_snapshot_notification()
     }
 
+    /// Transfers one complete route-hook group into the running actors while it remains disabled.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedLiveActionHookGroup, LiveRuntimeCompositionError> {
+        self.runtime
+            .prepare_action_hooks(hooks, cancellation)
+            .await
+            .map_err(LiveRuntimeCompositionError::ActionControl)
+    }
+
+    /// Removes the exact disabled dynamic hook group from every owning actor.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<LiveActionHookReapReceipt, LiveRuntimeCompositionError> {
+        self.runtime
+            .reap_action_hooks(cancellation)
+            .await
+            .map_err(LiveRuntimeCompositionError::ActionControl)
+    }
+
     /// Fully shuts down the former incarnation before starting a clean replacement.
     pub async fn replace(
         self,
@@ -177,6 +200,8 @@ pub enum LiveRuntimeCompositionError {
     Bind(LiveIngressBindError),
     #[error(transparent)]
     Replace(#[from] LiveRuntimeReplaceError),
+    #[error(transparent)]
+    ActionControl(LiveActionControlError),
     #[error("production live runtime shutdown was incomplete")]
     IncompleteShutdown(LiveRuntimeShutdown),
 }

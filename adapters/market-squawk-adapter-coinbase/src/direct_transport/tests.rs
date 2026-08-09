@@ -8,9 +8,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use market_squawk_domain::{
-    AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
+    AuthorizationBasis, ConnectionGeneration, Currency, DataQuality, Denomination, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinitionRevision,
-    InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MetadataRevision,
+    InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MarketDepth, MetadataRevision,
     ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
 };
 use market_squawk_sources::{
@@ -18,8 +18,8 @@ use market_squawk_sources::{
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
     BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
     DirectBookLimits, DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide,
-    ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame,
-    RawMarketSink, SessionId, SinkError, SourceError,
+    ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload, ProviderOrderEvent,
+    ProviderOrderEventKind, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,8 +29,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     CoinbaseDirectBookUpdate, CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse,
-    CoinbaseDirectHttpTransport, CoinbaseDirectHttpTransportError, CoinbaseDirectOutput,
-    CoinbaseDirectSession, CoinbaseDirectSessionError,
+    CoinbaseDirectHttpTransport, CoinbaseDirectHttpTransportError, CoinbaseDirectOrderLevelPayload,
+    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectSession,
+    CoinbaseDirectSessionError,
 };
 use crate::{
     CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectLimits,
@@ -42,7 +43,7 @@ use crate::{
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
-const SNAPSHOT_BODY: &[u8] = br#"{"sequence":104,"time":"2026-07-24T21:34:10.604Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
+const SNAPSHOT_BODY: &[u8] = br#"{"sequence":102,"time":"2026-07-24T21:34:10.602Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
 const SEQUENCE_101: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":101,"order_id":"order-101","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_102: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":102,"order_id":"order-102","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_103: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":103,"order_id":"order-103","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
@@ -221,12 +222,27 @@ struct RecordedBook {
     asks: Vec<(i64, i64)>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum RecordedOrderLevel {
+    Snapshot {
+        generation: u64,
+        snapshot_sequence: u64,
+        orders: Vec<(String, ProviderBookSide, i64, i64)>,
+        replay_sequences: Vec<u64>,
+    },
+    Event {
+        sequence: u64,
+        order_identity: Option<String>,
+    },
+}
+
 #[derive(Debug, Default)]
 struct RecordingOutput {
     frames: Vec<RawMarketFrame>,
     product_statuses: Vec<String>,
     private_events: usize,
     books: Vec<RecordedBook>,
+    order_level: Vec<RecordedOrderLevel>,
     reject_raw_at: Option<usize>,
     sequence_101_captured: Arc<Notify>,
     sequence_102_captured: Arc<Notify>,
@@ -293,6 +309,47 @@ impl CoinbaseDirectOutput for RecordingOutput {
         Ok(())
     }
 
+    fn try_publish_order_level(
+        &mut self,
+        update: CoinbaseDirectOrderLevelUpdate<'_>,
+    ) -> Result<(), SinkError> {
+        update
+            .validate_current()
+            .map_err(|_error| SinkError::CaptureIncomplete)?;
+        if update.market_depth() != MarketDepth::OrderLevel {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        let recorded = match update.payload() {
+            CoinbaseDirectOrderLevelPayload::Snapshot {
+                snapshot_sequence,
+                orders,
+                replay,
+                ..
+            } => RecordedOrderLevel::Snapshot {
+                generation: update.connection_generation().get(),
+                snapshot_sequence: snapshot_sequence.get(),
+                orders: orders
+                    .iter()
+                    .map(|order| {
+                        (
+                            order.order_id().as_str().to_owned(),
+                            order.side(),
+                            order.price().get(),
+                            order.quantity().get(),
+                        )
+                    })
+                    .collect(),
+                replay_sequences: replay.iter().map(|event| event.sequence().get()).collect(),
+            },
+            CoinbaseDirectOrderLevelPayload::Event(event) => RecordedOrderLevel::Event {
+                sequence: event.sequence().get(),
+                order_identity: order_identity(event),
+            },
+        };
+        self.order_level.push(recorded);
+        Ok(())
+    }
+
     fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError> {
         let batch = update
             .try_publication_batch()
@@ -343,6 +400,22 @@ impl CoinbaseDirectOutput for RecordingOutput {
     }
 }
 
+fn order_identity(event: &ProviderOrderEvent) -> Option<String> {
+    match event.kind() {
+        ProviderOrderEventKind::Open(order) => Some(order.order_id().as_str().to_owned()),
+        ProviderOrderEventKind::Match { maker_order_id, .. }
+        | ProviderOrderEventKind::Done {
+            order_id: maker_order_id,
+            ..
+        }
+        | ProviderOrderEventKind::Change {
+            order_id: maker_order_id,
+            ..
+        } => Some(maker_order_id.as_str().to_owned()),
+        ProviderOrderEventKind::CursorOnly(_) => None,
+    }
+}
+
 fn record_level(level: &market_squawk_sources::ProviderBookLevel) -> (String, String) {
     (
         level.price().value().as_str().to_owned(),
@@ -354,6 +427,36 @@ fn record_level(level: &market_squawk_sources::ProviderBookLevel) -> (String, St
 async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_live() -> TestResult
 {
     let config = config()?;
+    assert_eq!(config.publication_depth(), MarketDepth::OrderLevel);
+    assert_eq!(
+        config.metadata().quality_ceiling(),
+        DataQuality::DirectUnverified
+    );
+    assert_eq!(
+        config.checked_maximum_retained_bytes()?,
+        config
+            .limits()
+            .checked_order_level_maximum_retained_bytes()?
+    );
+    assert!(
+        config.checked_maximum_retained_bytes()?
+            > config.limits().checked_maximum_retained_bytes()?
+    );
+    let live_coverage = config
+        .metadata()
+        .coverage()
+        .live()
+        .ok_or("missing Coinbase order-level coverage")?;
+    assert!(
+        live_coverage
+            .rule_for(LiveEventClass::BookSnapshot, Some(MarketDepth::OrderLevel))
+            .is_some()
+    );
+    assert!(
+        live_coverage
+            .rule_for(LiveEventClass::BookDelta, Some(MarketDepth::OrderLevel))
+            .is_some()
+    );
     let (mut registry, session, generation) = live_generation(&config, "direct-transport-happy")?;
     let budget = session
         .budget()
@@ -418,6 +521,9 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             .send(())
             .map_err(|_| "snapshot request was dropped")?;
 
+        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
+        socket.send(Message::Text(SEQUENCE_103.into())).await?;
+        socket.send(Message::Text(SEQUENCE_104.into())).await?;
         let frontier = socket
             .next()
             .await
@@ -427,9 +533,6 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         };
         assert_eq!(frontier.len(), 56);
         socket.send(Message::Pong(frontier)).await?;
-        socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
-        socket.send(Message::Text(SEQUENCE_103.into())).await?;
-        socket.send(Message::Text(SEQUENCE_104.into())).await?;
 
         first_book.notified().await;
         socket.send(Message::Text(SEQUENCE_105.into())).await?;
@@ -478,6 +581,42 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
     assert_eq!(output.frames[0].payload(), SUBSCRIPTION_ACK.as_bytes());
     assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 1);
+    assert_eq!(
+        output.order_level,
+        [
+            RecordedOrderLevel::Snapshot {
+                generation: 1,
+                snapshot_sequence: 102,
+                orders: vec![
+                    (
+                        "bid-1".to_owned(),
+                        ProviderBookSide::Bid,
+                        10_000,
+                        100_000_000,
+                    ),
+                    (
+                        "ask-1".to_owned(),
+                        ProviderBookSide::Ask,
+                        10_100,
+                        200_000_000,
+                    ),
+                ],
+                replay_sequences: vec![103, 104],
+            },
+            RecordedOrderLevel::Event {
+                sequence: 105,
+                order_identity: Some("order-105".to_owned()),
+            },
+            RecordedOrderLevel::Event {
+                sequence: 106,
+                order_identity: Some("order-105".to_owned()),
+            },
+            RecordedOrderLevel::Event {
+                sequence: 107,
+                order_identity: None,
+            },
+        ]
+    );
     assert_eq!(
         output.books,
         [
@@ -658,7 +797,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
             1_000,
         )?,
     )?;
-    CoinbaseDirectConfig::try_new(
+    CoinbaseDirectConfig::try_new_order_level(
         SourceId::try_from("coinbase-exchange-direct")?,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(identifier("coinbase-direct-transport-2026-07-24")?),

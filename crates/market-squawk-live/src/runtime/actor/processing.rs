@@ -1,7 +1,8 @@
 //! Registration and message-atomic committed observation processing.
 
 use super::super::admission::{
-    RegistrationCommand, RegistrationFailure, RegistrationGrant, ShardCommand,
+    ActionHookControlFailure, ActionHookInstallCommand, ActionHookRemoveCommand,
+    ActorControlCommand, RegistrationCommand, RegistrationFailure, RegistrationGrant, ShardCommand,
 };
 use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
@@ -13,6 +14,28 @@ use crate::{
 };
 
 impl ShardActor {
+    pub(super) fn control(&mut self, command: ActorControlCommand) {
+        match command {
+            ActorControlCommand::Register(command) => self.register(command),
+            ActorControlCommand::InstallActionHooks(mut command) => {
+                let result = self.install_action_hooks(&mut command);
+                if result.is_err() {
+                    self.health_revision = self.health_revision.saturating_add(1);
+                    self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
+                }
+                drop(command.response.send(result));
+            }
+            ActorControlCommand::RemoveActionHooks(command) => {
+                let result = self.remove_action_hooks(&command);
+                if result.is_err() {
+                    self.health_revision = self.health_revision.saturating_add(1);
+                    self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
+                }
+                drop(command.response.send(result));
+            }
+        }
+    }
+
     pub(super) fn register(&mut self, command: RegistrationCommand) {
         let result = self.register_inner(&command).map(RegistrationGrant::new);
         if result.is_err() {
@@ -41,6 +64,94 @@ impl ShardActor {
                 LiveApplyError::GenerationCapacityExhausted => RegistrationFailure::Capacity,
                 _ => RegistrationFailure::NotCurrent,
             })
+    }
+
+    fn install_action_hooks(
+        &mut self,
+        command: &mut ActionHookInstallCommand,
+    ) -> Result<usize, ActionHookControlFailure> {
+        if command.runtime_incarnation != self.runtime_incarnation {
+            return Err(ActionHookControlFailure::RuntimeMismatch);
+        }
+        command
+            .activation
+            .validate_prepared(command.runtime_incarnation, command.generation)
+            .map_err(|_| ActionHookControlFailure::InvalidActivation)?;
+        if command.hooks.is_empty() {
+            return Err(ActionHookControlFailure::EmptyGroup);
+        }
+        for (index, hook) in command.hooks.iter().enumerate() {
+            hook.validate_retained_bytes(self.maximum_action_hook_bytes_per_route)?;
+            if command.hooks[..index]
+                .iter()
+                .any(|prior| prior.route() == hook.route())
+            {
+                return Err(ActionHookControlFailure::DuplicateRoute);
+            }
+            let owner = self
+                .routes
+                .get(hook.route())
+                .ok_or(ActionHookControlFailure::UnknownRoute)?;
+            if owner.action_hook.is_some() {
+                return Err(ActionHookControlFailure::HookAlreadyInstalled);
+            }
+        }
+        let hooks = std::mem::take(&mut command.hooks);
+        let installed = hooks.len();
+        for hook in hooks {
+            let Some(owner) = self.routes.get_mut(hook.route()) else {
+                for owner in self.routes.values_mut() {
+                    if owner
+                        .action_hook
+                        .as_ref()
+                        .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+                    {
+                        owner.action_hook = None;
+                    }
+                }
+                return Err(ActionHookControlFailure::UnknownRoute);
+            };
+            owner.action_hook = Some(hook.into_prepared_dynamic(command.activation.clone()));
+        }
+        Ok(installed)
+    }
+
+    fn remove_action_hooks(
+        &mut self,
+        command: &ActionHookRemoveCommand,
+    ) -> Result<usize, ActionHookControlFailure> {
+        if command.runtime_incarnation != self.runtime_incarnation {
+            return Err(ActionHookControlFailure::RuntimeMismatch);
+        }
+        command
+            .activation
+            .validate_disabled(command.runtime_incarnation, command.generation)
+            .map_err(|_| ActionHookControlFailure::InvalidActivation)?;
+        let installed = self
+            .routes
+            .values()
+            .filter(|owner| {
+                owner
+                    .action_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+            })
+            .count();
+        if installed != 0 && installed != command.expected_hooks {
+            return Err(ActionHookControlFailure::PartialGroup);
+        }
+        if installed == command.expected_hooks {
+            for owner in self.routes.values_mut() {
+                if owner
+                    .action_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.belongs_to_dynamic_group(&command.activation))
+                {
+                    owner.action_hook = None;
+                }
+            }
+        }
+        Ok(installed)
     }
 
     pub(super) fn process(&mut self, command: ShardCommand) -> Result<(), ActorError> {
@@ -224,6 +335,7 @@ fn process_applied_observation(
     if !unavailable
         && let Some(authority) = applied.authority.as_ref()
         && let Some(action_hook) = owner.action_hook.as_mut()
+        && action_hook.action_enabled()
     {
         let feature_view = owner
             .features

@@ -96,11 +96,12 @@ use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
-    LiveFairValueObservationBufferError, PaperApplicationServices, PaperRuntimeActivityAuthority,
-    PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
-    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
-    SourceLifecycleAuthority, backup::ProductBackupError,
+    LiveFairValueObservationBufferError, MarketRuntimeRegistry, PaperApplicationServices,
+    PaperRuntimeActivityAuthority, PrepublishedResearchSourceRegistration,
+    ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
+    ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
+    ResearchSourceDiscoveryCoordinator, SourceDomainService, SourceLifecycleAuthority,
+    backup::ProductBackupError,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
@@ -395,12 +396,16 @@ impl LocalProduct {
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
         )?);
+        let market_runtime = MarketRuntimeRegistry::try_new(
+            config.clone(),
+            provider_rate.clone(),
+            Arc::clone(&provider_activation),
+            Arc::clone(&live_fair_value),
+        )?;
         let paper = PaperApplicationServices::new(
             config.clone(),
-            Arc::clone(&live_fair_value),
-            provider_rate,
-            Arc::clone(&provider_activation),
             Arc::clone(&decisions),
+            Arc::clone(&market_runtime),
         );
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
             paths.clone(),
@@ -408,7 +413,7 @@ impl LocalProduct {
             Arc::clone(&provider_activation),
             Arc::clone(&provider_portal_activation),
             provider_activation_state.clone(),
-            paper.source_lifecycle_control(),
+            market_runtime,
         ));
         let source_lifecycle_service: Arc<dyn SourceLifecycleAuthority> = source_lifecycle.clone();
         let paper_activity = paper.runtime_activity_authority();
@@ -733,16 +738,16 @@ impl LocalProduct {
         self.source_lifecycle.clone()
     }
 
-    pub(crate) async fn restore_active_live_source(
+    pub(crate) async fn restore_active_live_sources(
         &self,
         deadline: std::time::Instant,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<
-        Option<market_squawk_domain::SourceIdentifier>,
+        source_lifecycle::LiveSourceRestoreReport,
         crate::application::source::SourceLifecycleError,
     > {
         self.source_lifecycle
-            .restore_active_live_source(deadline, cancellation)
+            .restore_active_live_sources(deadline, cancellation)
             .await
     }
 
@@ -945,7 +950,17 @@ fn maximum_live_route_count(config: &AppConfig) -> Result<NonZeroUsize, LocalPro
         .coinbase()
         .map_or(0, |source| source.instruments().len());
     let kraken = usize::from(config.kraken().is_some());
-    NonZeroUsize::new(coinbase.max(kraken).max(1)).ok_or(LocalProductError::InvalidCodeOwnedLimit)
+    let public_routes = coinbase
+        .checked_add(kraken)
+        .ok_or(LocalProductError::InvalidCodeOwnedLimit)?;
+    let direct_routes = coinbase;
+    NonZeroUsize::new(
+        public_routes
+            .checked_add(direct_routes)
+            .ok_or(LocalProductError::InvalidCodeOwnedLimit)?
+            .max(1),
+    )
+    .ok_or(LocalProductError::InvalidCodeOwnedLimit)
 }
 
 fn open_model_domain(
@@ -1137,6 +1152,9 @@ pub enum LocalProductError {
     /// Live fair-value observation handoff construction failed.
     #[error(transparent)]
     LiveFairValue(#[from] LiveFairValueObservationBufferError),
+    /// Multi-provider market runtime construction failed.
+    #[error(transparent)]
+    MarketRuntime(#[from] market_squawk_services::ServiceError),
     /// Fair-value catalog, limits, or ruleset construction failed.
     #[error(transparent)]
     FairValue(#[from] market_squawk_valuation::FairValueError),

@@ -7,17 +7,17 @@ use std::{cmp::Ordering, fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use market_squawk_domain::{InstrumentId, Timestamp};
+use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
 use market_squawk_live::{
-    LiveRuntimeSnapshotLease, RouteSnapshot, ShardSnapshot, SnapshotCompleteness,
-    SnapshotDimension, SnapshotReadError, StreamSnapshot,
+    RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
 };
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, TypedToolRequest, TypedToolResult,
 };
 use serde_json::Value;
 
-use super::{PaperController, PaperState, bounded_lock, ensure_live};
+use super::ensure_live;
+use crate::application::market_runtime::{MarketRuntimeRegistry, MarketRuntimeSnapshotBatch};
 use crate::application::{ApplicationDomainService, effective_service_limits};
 use results::{
     build_book_result, build_comparison_result, build_quality_result, build_quote_result,
@@ -32,14 +32,14 @@ const MARKET_GET_BOOKS: &str = "Market.GetBooks";
 const MARKET_GET_QUALITY: &str = "Market.GetQuality";
 const MARKET_GET_COMPARISONS: &str = "Market.GetComparisons";
 
-/// Current-state Market service sharing the sole paper live-runtime owner.
+/// Current-state Market service over every healthy provider runtime.
 pub(super) struct MarketDomainService {
-    controller: Arc<PaperController>,
+    registry: Arc<MarketRuntimeRegistry>,
 }
 
 impl MarketDomainService {
-    pub(super) const fn new(controller: Arc<PaperController>) -> Self {
-        Self { controller }
+    pub(super) const fn new(registry: Arc<MarketRuntimeRegistry>) -> Self {
+        Self { registry }
     }
 }
 
@@ -70,12 +70,11 @@ impl ApplicationDomainService for MarketDomainService {
         let limits = effective_service_limits(&request, &context)?;
         let filters = MarketFilters::parse(&request)?;
         let reference_at = system_timestamp()?;
-        let lease = self.controller.market_snapshots(&context).await?;
-        let streams = lease
-            .as_ref()
-            .map(|lease| collect_streams(lease, &filters, &context))
-            .transpose()?
-            .unwrap_or_default();
+        let snapshots = self
+            .registry
+            .snapshots(context.deadline(), context.cancellation())
+            .await?;
+        let streams = collect_streams(&snapshots, &filters, &context)?;
 
         let source_coverage = source_coverage_value(&streams, &filters);
         let output = match request.name() {
@@ -134,70 +133,11 @@ impl ApplicationDomainService for MarketDomainService {
     }
 
     fn begin_shutdown(&self) {
-        self.controller.begin_shutdown();
+        self.registry.begin_shutdown();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
-        self.controller.finish_shutdown(deadline).await
-    }
-}
-
-impl PaperController {
-    async fn market_snapshots(
-        &self,
-        context: &RequestContext,
-    ) -> Result<Option<LiveRuntimeSnapshotLease>, ServiceError> {
-        ensure_live(context)?;
-        let reader = {
-            let state =
-                bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-            match &*state {
-                PaperState::LiveOnly {
-                    runtime,
-                    exports,
-                    cancellation,
-                    ..
-                } => {
-                    if cancellation.is_cancelled() || !runtime.is_healthy() || !exports.is_healthy()
-                    {
-                        return Ok(None);
-                    }
-                    runtime.snapshots()
-                }
-                PaperState::Running {
-                    runtime,
-                    exports,
-                    cancellation,
-                    ..
-                } => {
-                    if cancellation.is_cancelled()
-                        || !runtime.source_is_healthy()
-                        || !exports.is_healthy()
-                    {
-                        return Ok(None);
-                    }
-                    runtime.snapshots()
-                }
-                PaperState::Stopped { .. } => return Ok(None),
-                PaperState::LiveStarting { .. }
-                | PaperState::Starting { .. }
-                | PaperState::Stopping => return Err(ServiceError::Unavailable),
-            }
-        };
-        ensure_live(context)?;
-        reader
-            .try_load_all()
-            .map(Some)
-            .map_err(map_snapshot_read_error)
-    }
-}
-
-const fn map_snapshot_read_error(error: SnapshotReadError) -> ServiceError {
-    match error {
-        SnapshotReadError::ReaderLimitReached | SnapshotReadError::CapacityOverflow => {
-            ServiceError::ResourceExhausted
-        }
-        SnapshotReadError::UnknownShard | SnapshotReadError::Closed => ServiceError::Unavailable,
+        self.registry.finish_shutdown(deadline).await
     }
 }
 
@@ -267,6 +207,10 @@ impl<'request> MarketFilters<'request> {
                 || self
                     .sources
                     .binary_search(&stream.stream.source().as_str())
+                    .is_ok()
+                || self
+                    .sources
+                    .binary_search(&stream.surface_id.as_str())
                     .is_ok())
     }
 
@@ -298,41 +242,47 @@ fn parse_time_range(value: &Value) -> Result<(Timestamp, Timestamp), ServiceErro
 
 #[derive(Clone, Copy)]
 struct StreamView<'snapshot> {
+    surface_id: &'snapshot SourceIdentifier,
     shard: &'snapshot ShardSnapshot,
     route: &'snapshot RouteSnapshot,
     stream: &'snapshot StreamSnapshot,
 }
 
 fn collect_streams<'snapshot>(
-    lease: &'snapshot LiveRuntimeSnapshotLease,
+    snapshots: &'snapshot MarketRuntimeSnapshotBatch,
     filters: &MarketFilters<'_>,
     context: &RequestContext,
 ) -> Result<Vec<StreamView<'snapshot>>, ServiceError> {
     let mut count = 0_usize;
-    for shard in lease.snapshots() {
-        require_complete(shard.route_dimension())?;
-        for route in shard.routes() {
-            require_complete(route.stream_dimension())?;
-            count = count
-                .checked_add(route.streams().len())
-                .ok_or(ServiceError::ResourceExhausted)?;
+    for source in snapshots.sources() {
+        for shard in source.lease().snapshots() {
+            require_complete(shard.route_dimension())?;
+            for route in shard.routes() {
+                require_complete(route.stream_dimension())?;
+                count = count
+                    .checked_add(route.streams().len())
+                    .ok_or(ServiceError::ResourceExhausted)?;
+            }
         }
     }
     let mut streams = Vec::new();
     streams
         .try_reserve_exact(count)
         .map_err(|_error| ServiceError::ResourceExhausted)?;
-    for shard in lease.snapshots() {
-        ensure_live(context)?;
-        for route in shard.routes() {
-            for stream in route.streams() {
-                let view = StreamView {
-                    shard,
-                    route,
-                    stream,
-                };
-                if filters.matches_identity(&view) {
-                    streams.push(view);
+    for source in snapshots.sources() {
+        for shard in source.lease().snapshots() {
+            ensure_live(context)?;
+            for route in shard.routes() {
+                for stream in route.streams() {
+                    let view = StreamView {
+                        surface_id: source.surface_id(),
+                        shard,
+                        route,
+                        stream,
+                    };
+                    if filters.matches_identity(&view) {
+                        streams.push(view);
+                    }
                 }
             }
         }

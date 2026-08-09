@@ -64,8 +64,16 @@ pub(super) fn config(
 }
 
 pub(super) fn route() -> TestResult<LiveRouteConfig> {
-    let instrument_id = InstrumentId::from_str(INSTRUMENT)?;
-    let venue = VenueId::try_from(VENUE)?;
+    route_for(INSTRUMENT, VENUE, "BTC-USD")
+}
+
+pub(super) fn route_for(
+    instrument: &str,
+    venue: &str,
+    symbol: &str,
+) -> TestResult<LiveRouteConfig> {
+    let instrument_id = InstrumentId::from_str(instrument)?;
+    let venue = VenueId::try_from(venue)?;
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id,
         definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
@@ -77,7 +85,7 @@ pub(super) fn route() -> TestResult<LiveRouteConfig> {
         contract_multiplier: Decimal::ONE,
         venue_mappings: vec![VenueMapping::new(
             venue.clone(),
-            VenueSymbol::try_from("BTC-USD")?,
+            VenueSymbol::try_from(symbol)?,
         )],
         provider_identities: Vec::new(),
         identifiers: Vec::new(),
@@ -146,6 +154,10 @@ pub(super) fn runtime_shell(
         snapshot_notifications: bundle.notifications,
         notification_cursor: 0,
         health,
+        action_controls: Box::new([]),
+        dynamic_action_group: None,
+        startup_action_hooks: false,
+        next_action_hook_generation: 1,
         cancellation,
         actors: Some(actors),
         cross_venue_task: None,

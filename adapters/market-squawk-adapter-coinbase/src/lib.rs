@@ -28,7 +28,9 @@ pub use direct::{
     CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
 };
 pub use direct_transport::{
-    CoinbaseDirectBookUpdate, CoinbaseDirectOutput, CoinbaseDirectPublicationError,
-    CoinbaseDirectPublicationKind, CoinbaseDirectSession, CoinbaseDirectSessionError,
+    CoinbaseDirectBookUpdate, CoinbaseDirectOrderLevelPayload,
+    CoinbaseDirectOrderLevelPublicationError, CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput,
+    CoinbaseDirectPublicationError, CoinbaseDirectPublicationKind, CoinbaseDirectSession,
+    CoinbaseDirectSessionError,
 };
 pub use source::CoinbaseExchangeSource;

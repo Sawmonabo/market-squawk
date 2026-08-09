@@ -162,6 +162,52 @@ pub(crate) fn local_paper_bot_with_provider_rate_and_strategy_mode(
     )
 }
 
+/// Builds the paper/risk/dispatch graph for an already-running public market source.
+pub(crate) fn local_paper_bot_on_existing_public_market_with_strategy_mode(
+    config: AppConfig,
+    provider: ProductionSourceProvider,
+    initial_cash: Decimal,
+    fee_basis_points: u32,
+    strategy_mode: PaperStrategyMode,
+) -> Result<ProductionPaperBotComposition> {
+    let source = configured_source(&config, provider)?;
+    build_local_paper_bot(
+        config,
+        PaperBotBuildSource::ExistingLive {
+            provider,
+            direct: false,
+        },
+        source,
+        initial_cash,
+        fee_basis_points,
+        0,
+        move |route| strategy_mode.for_route(route),
+    )
+}
+
+/// Builds the paper/risk/dispatch graph for the running authenticated Coinbase surface.
+pub(crate) fn local_coinbase_direct_paper_bot_on_existing_market_with_strategy_mode(
+    config: AppConfig,
+    initial_cash: Decimal,
+    fee_basis_points: u32,
+    strategy_mode: PaperStrategyMode,
+) -> Result<ProductionPaperBotComposition> {
+    let provider = ProductionSourceProvider::Coinbase;
+    let source = configured_source(&config, provider)?;
+    build_local_paper_bot(
+        config,
+        PaperBotBuildSource::ExistingLive {
+            provider,
+            direct: true,
+        },
+        source,
+        initial_cash,
+        fee_basis_points,
+        0,
+        move |route| strategy_mode.for_route(route),
+    )
+}
+
 /// Validated public market-data composition without strategy or execution authority.
 #[derive(Debug)]
 pub(crate) struct ProductionLiveMarketComposition {
@@ -169,7 +215,31 @@ pub(crate) struct ProductionLiveMarketComposition {
     runtime_config: LiveRuntimeConfig,
 }
 
+/// Activated Coinbase Direct market-data composition without paper or execution authority.
+#[derive(Debug)]
+pub(crate) struct CoinbaseDirectLiveMarketComposition {
+    activation: CoinbaseDirectAccountActivation,
+    runtime_config: LiveRuntimeConfig,
+}
+
+impl CoinbaseDirectLiveMarketComposition {
+    /// Starts one credential-bound Coinbase Direct market runtime without action hooks.
+    pub(crate) async fn start(
+        self,
+        cancellation: CancellationToken,
+    ) -> Result<crate::CoinbaseDirectLiveRuntime, crate::CoinbaseDirectSupervisorError> {
+        self.activation
+            .start_live(self.runtime_config, cancellation)
+            .await
+    }
+}
+
 impl ProductionLiveMarketComposition {
+    /// Returns the exact canonical source identity whose observations this runtime publishes.
+    pub(crate) fn source_id(&self) -> &market_squawk_domain::SourceId {
+        self.source.metadata().source_id()
+    }
+
     /// Returns the complete immutable route set used to create bounded market exports.
     pub(crate) fn live_routes(&self) -> &[LiveRouteConfig] {
         self.source.routes()
@@ -199,8 +269,13 @@ pub(crate) fn local_live_market_with_provider_rate(
     provider_rate: ProviderRateAuthority,
 ) -> Result<ProductionLiveMarketComposition> {
     let configured = configured_source(&config, provider)?;
-    let (runtime_config, _peak) =
-        live_runtime_config(&configured.routes, configured.maximum_message_bytes, 0)?;
+    let maximum_action_hook_bytes_per_route =
+        maximum_local_paper_action_hook_bytes_per_route(&configured)?;
+    let (runtime_config, _peak) = live_runtime_config(
+        &configured.routes,
+        configured.maximum_message_bytes,
+        maximum_action_hook_bytes_per_route,
+    )?;
     let source = ProductionLiveSourceComposition::try_for_provider_with_rate_authority(
         config,
         configured.routes,
@@ -213,16 +288,13 @@ pub(crate) fn local_live_market_with_provider_rate(
     })
 }
 
-/// Builds one activated Coinbase Direct paper source with an explicitly selected closed strategy.
-pub(crate) async fn local_coinbase_direct_paper_bot_with_activation_and_strategy_mode(
+/// Builds one activated Coinbase Direct market-data runtime without strategy or execution state.
+pub(crate) async fn local_coinbase_direct_live_market_with_activation(
     config: AppConfig,
     provider_session_id: Uuid,
-    initial_cash: Decimal,
-    fee_basis_points: u32,
     provider_activation: &ProviderAdapterActivation,
     cancellation: CancellationToken,
-    strategy_mode: PaperStrategyMode,
-) -> Result<ProductionPaperBotComposition> {
+) -> Result<CoinbaseDirectLiveMarketComposition> {
     let source = configured_source(&config, ProductionSourceProvider::Coinbase)?;
     let request = coinbase_direct_activation_request(&config, &source)?;
     let activation = provider_activation
@@ -231,15 +303,17 @@ pub(crate) async fn local_coinbase_direct_paper_bot_with_activation_and_strategy
     let ProviderActivationOutcome::CoinbaseDirect(activation) = activation else {
         bail!("provider session did not activate the Coinbase Direct surface");
     };
-    build_local_paper_bot(
-        config,
-        PaperBotBuildSource::CoinbaseDirect(activation),
-        source,
-        initial_cash,
-        fee_basis_points,
-        0,
-        move |route| strategy_mode.for_route(route),
-    )
+    let maximum_action_hook_bytes_per_route =
+        maximum_local_paper_action_hook_bytes_per_route(&source)?;
+    let (runtime_config, _peak) = live_runtime_config(
+        &source.routes,
+        source.maximum_message_bytes,
+        maximum_action_hook_bytes_per_route,
+    )?;
+    Ok(CoinbaseDirectLiveMarketComposition {
+        activation: *activation,
+        runtime_config,
+    })
 }
 
 /// Backward-compatible Coinbase selection for existing application callers.
@@ -261,6 +335,96 @@ struct ConfiguredPaperSource {
     routes: Vec<LiveRouteConfig>,
     maximum_message_bytes: u32,
     freshness_nanos: u64,
+}
+
+fn maximum_local_paper_action_hook_bytes_per_route(
+    source: &ConfiguredPaperSource,
+) -> Result<usize> {
+    let first = source
+        .routes
+        .first()
+        .ok_or_else(|| anyhow!("production source route set is empty"))?;
+    let currency = first.definition().quote_currency();
+    let venue = first.route().venue().clone();
+    if source.routes.iter().any(|route| {
+        route.definition().quote_currency() != currency || route.route().venue() != &venue
+    }) {
+        bail!("one local paper run requires a single reporting currency and venue");
+    }
+    let maximum_fee_basis_points = u32::try_from(MAX_PAPER_FEE_BASIS_POINTS)?;
+    let cash = Money::new(Decimal::ONE, currency);
+    let risk_limits = local_risk_limits(&source.routes, cash, maximum_fee_basis_points)?;
+    let dispatcher = local_dispatcher_config()?;
+    let market_sink_retained_bytes = paper_config(
+        currency,
+        venue,
+        maximum_fee_basis_points,
+        source.freshness_nanos,
+    )?
+    .market_ingress_retained_bytes()?;
+    let mut maximum = 0_usize;
+    for route in &source.routes {
+        for mode in [PaperStrategyMode::Manual, PaperStrategyMode::BookImbalance] {
+            let strategy = mode.for_route(route)?;
+            let hook_retained_bytes = ExecutionLiveActionHook::retained_bytes_for_composition(
+                strategy.strategy.as_ref(),
+                &risk_limits,
+                dispatcher,
+                market_sink_retained_bytes,
+            )?;
+            let route_retained_bytes = RouteActionHook::retained_bytes_for_composition(
+                route.route(),
+                strategy.required_features.len(),
+                hook_retained_bytes,
+            )?;
+            maximum = maximum.max(route_retained_bytes);
+        }
+    }
+    if maximum == 0 {
+        bail!("paper action-hook capacity must be positive");
+    }
+    Ok(maximum)
+}
+
+fn local_risk_limits(
+    routes: &[LiveRouteConfig],
+    cash: Money,
+    fee_basis_points: u32,
+) -> Result<RiskLimits> {
+    let currency = cash.currency();
+    Ok(RiskLimits::try_new(RiskLimitsInput {
+        currency,
+        eligible_instruments: routes
+            .iter()
+            .map(|route| route.route().instrument())
+            .collect::<BTreeSet<_>>(),
+        maximum_position_lots: 1_000_000,
+        maximum_order_notional: cash,
+        maximum_gross_exposure: cash,
+        maximum_leverage: BasisPoints::new(10_000),
+        minimum_capital: Money::new(Decimal::ONE, currency),
+        maximum_loss: cash,
+        maximum_drawdown: cash,
+        maximum_fee: BasisPoints::new(i32::try_from(fee_basis_points)?),
+        maximum_price_deviation: BasisPoints::new(1_000),
+        maximum_slippage: BasisPoints::new(1_000),
+        maximum_orders_per_window: nonzero_u32(16)?,
+        order_rate_window_nanos: 60_000_000_000,
+        reservation_ttl_nanos: 5_000_000_000,
+        allow_short: false,
+        kill_switch: false,
+    })?)
+}
+
+fn local_dispatcher_config() -> Result<ExecutionDispatcherConfig> {
+    Ok(ExecutionDispatcherConfig {
+        maximum_queued_commands: nonzero_usize(256)?,
+        maximum_queued_bytes: nonzero_u32(16 * 1024 * 1024)?,
+        maximum_registry_entries: nonzero_usize(1_024)?,
+        maximum_pending_reconciliation_bytes: nonzero_u32(4 * 1024 * 1024)?,
+        operation_deadline: Duration::from_secs(2),
+        shutdown_deadline: Duration::from_secs(5),
+    })
 }
 
 /// Closed production paper-strategy selection.
@@ -324,7 +488,10 @@ enum PaperBotBuildSource {
         provider: ProductionSourceProvider,
         provider_rate: ProviderRateAuthority,
     },
-    CoinbaseDirect(Box<CoinbaseDirectAccountActivation>),
+    ExistingLive {
+        provider: ProductionSourceProvider,
+        direct: bool,
+    },
     #[cfg(feature = "release-evidence")]
     ReleaseBenchmark,
 }
@@ -523,28 +690,7 @@ where
     };
     let portfolio =
         paper_sandbox_portfolio_capability(account_id, cash, routes.len(), current_timestamp()?)?;
-    let risk_limits = RiskLimits::try_new(RiskLimitsInput {
-        currency,
-        eligible_instruments: routes
-            .iter()
-            .map(|route| route.route().instrument())
-            .collect::<BTreeSet<_>>(),
-        maximum_position_lots: 1_000_000,
-        maximum_order_notional: cash,
-        maximum_gross_exposure: cash,
-        maximum_leverage: BasisPoints::new(10_000),
-        minimum_capital: Money::new(Decimal::ONE, currency),
-        maximum_loss: cash,
-        maximum_drawdown: cash,
-        maximum_fee: BasisPoints::new(i32::try_from(fee_basis_points)?),
-        maximum_price_deviation: BasisPoints::new(1_000),
-        maximum_slippage: BasisPoints::new(1_000),
-        maximum_orders_per_window: nonzero_u32(16)?,
-        order_rate_window_nanos: 60_000_000_000,
-        reservation_ttl_nanos: 5_000_000_000,
-        allow_short: false,
-        kill_switch: false,
-    })?;
+    let risk_limits = local_risk_limits(&routes, cash, fee_basis_points)?;
     let paper = paper_config(currency, venue, fee_basis_points, freshness_nanos)?;
     let paths = LocalPaths::prepare(config.data_dir())?;
     let paper_checkpoint_repository = PaperCheckpointRepository::try_new(
@@ -552,14 +698,7 @@ where
         paper.clone(),
         nonzero_usize(LOCAL_PAPER_CHECKPOINT_MAXIMUM_BYTES)?,
     )?;
-    let dispatcher = ExecutionDispatcherConfig {
-        maximum_queued_commands: nonzero_usize(256)?,
-        maximum_queued_bytes: nonzero_u32(16 * 1024 * 1024)?,
-        maximum_registry_entries: nonzero_usize(1_024)?,
-        maximum_pending_reconciliation_bytes: nonzero_u32(4 * 1024 * 1024)?,
-        operation_deadline: Duration::from_secs(2),
-        shutdown_deadline: Duration::from_secs(5),
-    };
+    let dispatcher = local_dispatcher_config()?;
     let market_sink_retained_bytes = paper.market_ingress_retained_bytes()?;
     let mut strategies = Vec::new();
     strategies.try_reserve_exact(routes.len())?;
@@ -654,9 +793,9 @@ where
                 strategies,
             )?)
         }
-        PaperBotBuildSource::CoinbaseDirect(activation) => {
-            Ok(ProductionPaperBotComposition::try_new_coinbase_direct(
-                *activation,
+        PaperBotBuildSource::ExistingLive { .. } => {
+            Ok(ProductionPaperBotComposition::try_new_existing_live(
+                routes,
                 runtime_config,
                 execution,
                 strategies,
@@ -888,7 +1027,22 @@ fn bound_risk_policy(
             provider: ProductionSourceProvider::Kraken,
             ..
         } => "local-kraken-paper-risk",
-        PaperBotBuildSource::CoinbaseDirect(_) => "local-coinbase-direct-paper-risk",
+        PaperBotBuildSource::ExistingLive {
+            provider: ProductionSourceProvider::Coinbase,
+            direct: false,
+        } => "local-coinbase-paper-risk",
+        PaperBotBuildSource::ExistingLive {
+            provider: ProductionSourceProvider::Kraken,
+            direct: false,
+        } => "local-kraken-paper-risk",
+        PaperBotBuildSource::ExistingLive {
+            provider: ProductionSourceProvider::Coinbase,
+            direct: true,
+        } => "local-coinbase-direct-paper-risk",
+        PaperBotBuildSource::ExistingLive {
+            provider: ProductionSourceProvider::Kraken,
+            direct: true,
+        } => return Err(anyhow!("Kraken Direct paper source is not configured")),
         #[cfg(feature = "release-evidence")]
         PaperBotBuildSource::ReleaseBenchmark => "release-benchmark-paper-risk",
     };

@@ -327,6 +327,10 @@ impl DurableSourceLifecycleRecord {
         self.phase
     }
 
+    pub(super) const fn operation_id(&self) -> Option<&SourceIdentifier> {
+        self.operation_id.as_ref()
+    }
+
     pub(super) const fn session_id(&self) -> Option<Uuid> {
         self.session_id
     }
@@ -621,71 +625,6 @@ impl DurableProviderActivationState {
         };
         self.store_source_lifecycle(surface_id, &completed)?;
         Ok(completed)
-    }
-
-    /// Retires every other active live surface during one admitted owner switch.
-    ///
-    /// The caller holds the process-wide activation gate. Every candidate record is validated
-    /// before the first write. If the process stops between records, the selected surface remains
-    /// in `applying` state and restart fails closed until the exact switch is reconciled.
-    pub(super) fn retire_other_active_live_surfaces(
-        &self,
-        selected_surface: &str,
-        live_surfaces: &[&str],
-        operation_id: &SourceIdentifier,
-        command_digest: EvidenceDigest,
-    ) -> Result<(), DurableProviderActivationStateError> {
-        if !live_surfaces.contains(&selected_surface) || command_digest.bytes() == [0; 32] {
-            return Err(DurableProviderActivationStateError::InvalidLifecycle);
-        }
-        let mut retirements = Vec::new();
-        retirements
-            .try_reserve_exact(live_surfaces.len().saturating_sub(1))
-            .map_err(|_| DurableProviderActivationStateError::ResourceExhausted)?;
-        for surface_id in live_surfaces {
-            if *surface_id == selected_surface {
-                continue;
-            }
-            let current = self.source_lifecycle_record(surface_id)?;
-            if matches!(
-                current.phase,
-                DurableSourceLifecyclePhase::Applying
-                    | DurableSourceLifecyclePhase::ReconciliationRequired
-            ) {
-                return Err(DurableProviderActivationStateError::LifecycleReconciliationRequired);
-            }
-            if current.phase != DurableSourceLifecyclePhase::Active {
-                continue;
-            }
-            let revision = current
-                .revision
-                .get()
-                .checked_add(1)
-                .and_then(NonZeroU64::new)
-                .ok_or(DurableProviderActivationStateError::ResourceExhausted)?;
-            let transition_digest = source_lifecycle_transition_digest(
-                surface_id,
-                revision,
-                operation_id,
-                command_digest,
-            )?;
-            retirements.push((
-                *surface_id,
-                DurableSourceLifecycleRecord {
-                    revision,
-                    phase: DurableSourceLifecyclePhase::Stopped,
-                    operation_id: Some(operation_id.clone()),
-                    command_digest: Some(command_digest),
-                    transition_digest: Some(transition_digest),
-                    session_id: current.session_id,
-                    public_configuration_digest: current.public_configuration_digest,
-                },
-            ));
-        }
-        for (surface_id, retirement) in retirements {
-            self.store_source_lifecycle(surface_id, &retirement)?;
-        }
-        Ok(())
     }
 
     /// Converts an interrupted or indeterminate transition into an explicit recovery barrier.

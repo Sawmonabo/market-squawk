@@ -1,0 +1,26 @@
+[package]
+name = "market-squawk-adapter-nasdaq-symbols"
+description = "Bounded Nasdaq Trader Symbol Directory reference-universe extraction adapter"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-sources.workspace = true
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

@@ -347,6 +347,9 @@ fn map_live_buffer_error(
 ) -> FairValueProducerSelectionError {
     match error {
         LiveFairValueObservationBufferError::NotFound => FairValueProducerSelectionError::NotFound,
+        LiveFairValueObservationBufferError::AmbiguousSource => {
+            FairValueProducerSelectionError::InvalidSelection
+        }
         LiveFairValueObservationBufferError::ResourceExhausted
         | LiveFairValueObservationBufferError::Allocation => {
             FairValueProducerSelectionError::ResourceExhausted

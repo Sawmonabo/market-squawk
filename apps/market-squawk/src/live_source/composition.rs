@@ -461,6 +461,31 @@ impl ProductionLiveSourceRuntime {
         self.live.snapshots()
     }
 
+    /// Installs one complete disabled action-hook group without reconnecting the source.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        hooks: Vec<market_squawk_live::RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::PreparedLiveActionHookGroup, ProductionLiveSourceRuntimeError>
+    {
+        self.live
+            .prepare_action_hooks(hooks, cancellation)
+            .await
+            .map_err(ProductionLiveSourceRuntimeError::LiveRuntime)
+    }
+
+    /// Removes the exact disabled dynamic action-hook group from the running actors.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::LiveActionHookReapReceipt, ProductionLiveSourceRuntimeError>
+    {
+        self.live
+            .reap_action_hooks(cancellation)
+            .await
+            .map_err(ProductionLiveSourceRuntimeError::LiveRuntime)
+    }
+
     /// Stops the source supervisor before consuming the live runtime owner.
     ///
     /// # Errors

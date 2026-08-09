@@ -4317,14 +4317,17 @@ dependencies = [
  "hyper-util",
  "interprocess",
  "libc",
+ "market-squawk-adapter-alpaca",
  "market-squawk-adapter-bls",
  "market-squawk-adapter-coinbase",
  "market-squawk-adapter-files",
  "market-squawk-adapter-fred",
  "market-squawk-adapter-kraken",
+ "market-squawk-adapter-nasdaq-symbols",
  "market-squawk-adapter-paper",
  "market-squawk-adapter-portfolio",
  "market-squawk-adapter-sec",
+ "market-squawk-adapter-tradier",
  "market-squawk-adapter-treasury",
  "market-squawk-analytics",
  "market-squawk-backtesting",
@@ -4369,6 +4372,30 @@ dependencies = [
  "widestring",
  "win-security-identifier",
  "windows-permissions",
+ "zeroize",
+]
+
+[[package]]
+name = "market-squawk-adapter-alpaca"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "market-squawk-domain",
+ "market-squawk-sources",
+ "reqwest",
+ "rmp-serde",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "url",
  "zeroize",
 ]
 
@@ -4485,6 +4512,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-nasdaq-symbols"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "httpdate",
+ "market-squawk-domain",
+ "market-squawk-sources",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "market-squawk-adapter-paper"
 version = "1.0.0"
 dependencies = [
@@ -4555,6 +4600,27 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "market-squawk-adapter-tradier"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "market-squawk-domain",
+ "market-squawk-sources",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -6750,6 +6816,25 @@ dependencies = [
  "tower-service",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
 ]
 
 [[package]]

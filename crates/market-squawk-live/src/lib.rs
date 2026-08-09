@@ -15,10 +15,14 @@ mod sharding;
 mod snapshot;
 mod state;
 
+pub(crate) use action::ActionHookActivationLease;
 pub use action::{
-    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext,
-    CommittedMarketReference, CurrentAuthorityGate, CurrentAuthorityGateError, LiveActionHook,
-    LiveActionHookError, MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION, RouteActionHook,
+    ActionAuthorityIssueLimit, ActionHookDisposition, ActiveLiveActionHookGroup,
+    CommittedActionContext, CommittedMarketReference, CurrentAuthorityGate,
+    CurrentAuthorityGateError, DisabledLiveActionHookGroup, LiveActionControlError,
+    LiveActionControlRejection, LiveActionHook, LiveActionHookActivationError, LiveActionHookError,
+    LiveActionHookGeneration, LiveActionHookReapReceipt,
+    MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION, PreparedLiveActionHookGroup, RouteActionHook,
     RouteActionHookError,
 };
 pub use authority::{

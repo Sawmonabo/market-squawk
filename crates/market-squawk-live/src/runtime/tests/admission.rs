@@ -17,8 +17,8 @@ mod current_source;
 
 use self::current_source::{INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, now, route};
 use super::{
-    BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressBindError, LiveIngressError,
-    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress, RegistrationCommand,
+    ActorControlCommand, BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressBindError,
+    LiveIngressError, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
     RegistrationFailure, RegistrationGrant, RouteIngressChannels, ShardCommand,
     checked_command_retained_bytes,
 };
@@ -41,7 +41,7 @@ struct AdmissionHarness {
 #[derive(Debug)]
 struct ReservationHarness {
     ingress: LiveRuntimeIngress,
-    registrations: mpsc::Receiver<RegistrationCommand>,
+    controls: mpsc::Receiver<ActorControlCommand>,
     _mailbox: mpsc::Receiver<ShardCommand>,
     _health: mpsc::Receiver<LiveRuntimeHealthEvent>,
     _runtime_owner: RuntimeLeaseOwner,
@@ -54,7 +54,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
     let runtime = runtime_owner.lease();
     let shard_liveness = shard_owner.lease();
     let (mailbox, mailbox_receiver) = mpsc::channel(1);
-    let (registration, registrations) = mpsc::channel(1);
+    let (control, controls) = mpsc::channel(1);
     let (health, health_receiver) = mpsc::channel(1);
     let channels = RouteIngressChannels {
         shard: ShardId::new(0, 1)?,
@@ -62,7 +62,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
         shard_liveness,
         mailbox,
         byte_budget: Arc::new(Semaphore::new(65_536)),
-        registration: registration.clone(),
+        control: control.clone(),
         registration_deadline: Duration::from_secs(1),
         maximum_message_bytes: 65_536,
         health,
@@ -74,7 +74,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
             routes: Arc::new(routes),
             runtime,
         },
-        registrations,
+        controls,
         _mailbox: mailbox_receiver,
         _health: health_receiver,
         _runtime_owner: runtime_owner,
@@ -109,11 +109,10 @@ async fn consuming_activation_binds_once_and_cancelled_activation_releases_reser
     let dormant = harness.ingress.reserve_route(route.clone())?;
     let activation = dormant.activate(source.current_lease()?, CancellationToken::new());
     let registration = async {
-        let command = harness
-            .registrations
-            .recv()
-            .await
-            .ok_or("registration closed")?;
+        let command = harness.controls.recv().await.ok_or("registration closed")?;
+        let ActorControlCommand::Register(command) = command else {
+            return Err("unexpected non-registration control".into());
+        };
         let (registry, admission) = admission(&command.source)?;
         command
             .response

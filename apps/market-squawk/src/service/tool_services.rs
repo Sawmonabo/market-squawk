@@ -205,14 +205,13 @@ impl InstalledToolServices {
             {
                 return Err(ServiceError::InvalidResult);
             }
-            if research_file_import_requires_restart(&view)? {
-                if self
+            if research_file_import_requires_restart(&view)?
+                && self
                     .research_file_import
                     .reopen_committed_job(&preview_id, receipt.job_id())?
-                {
-                    self.restart_research_file_import(&preview_id, context)
-                        .await?;
-                }
+            {
+                self.restart_research_file_import(&preview_id, context)
+                    .await?;
             }
         }
         Ok(())
