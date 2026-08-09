@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-04
+Last updated: 2026-08-09
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -11,46 +11,53 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Active branch: `feature/v1-installed-product-experience`, based on
   `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
   release-branch integration is authorized in this execution scope.
-- The latest integrated product code is
-  `b0b4f6ead80577a129cf7f1e4581dbb0d411fbc5`, tree
-  `851b5dd41ab08e9287e69de309fec38424035175`. This ledger synchronization follows that product
-  commit and does not change application behavior. The branch contains the complete native
-  desktop, CLI, per-user service, shared Claude Code/Codex MCP relays, guided setup, backup and
-  recovery, settings, logs, updates, research/modeling Python product, and four-platform package
-  construction required by the approved V1 installed-product plan.
-- Hosted candidate `f93634e0eaba38d933fb0176178ed06b9cf5f372` was rejected rather than
-  approved by explicit run
-  [30922568757](https://github.com/Sawmonabo/market-squawk/actions/runs/30922568757). The Linux
-  terminal ZIP installed its complete release, but the registered service did not publish exact
-  authenticated readiness. The matrix was cancelled after the failure was reproduced and its
-  shared root cause was confirmed; results from this rejected candidate cannot approve a package.
-- Commit `b0b4f6ead80577a129cf7f1e4581dbb0d411fbc5` binds absolute workspace,
-  installation, and training roots into the Linux systemd user unit, macOS LaunchAgent, and Windows
-  current-user task; declares the installation-data root as the native working directory; includes
-  that Windows field in the admitted task semantics; and makes installer health probe the same
-  exact roots. The desktop workspace root uses the operating system's local-data directory and
-  `com.marketsquawk.desktop`, matching Tauri's installed default.
-- Focused integration evidence on the product code head is clean: the exact control-plane service
-  scenario passed, installer unit tests report 15 passed with only the package-only fixture ignored,
-  strict installer Clippy passed, the complete Python source closure passed, and formatting and diff
-  checks passed. An isolated LaunchAgent reproduced the rejected read-only working-directory
-  failure; the corrected registration reached authenticated `ready` state and shut down cleanly.
-  This is local integration evidence, not hosted package or release approval.
-- Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), draft PR
-  [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project item remain open and
-  `In Progress`. The main checkout owns the feature branch; `.worktrees` is empty; no temporary
-  lane branch is active; and generated Cargo output is 8.3 GiB, below the 20 GiB ceiling.
-- Exactly three barriers remain before the requested V1 handoff:
+- The integrated product-code checkpoint is
+  `6f0b4426cb029492f53ee32496848829498b2919`. It includes the instrument and SEC identity
+  publication/search, recoverable screening and dossier workflow, shared service/MCP authority,
+  desktop bootstrap recovery, guided research-file import, live/paper lifecycle reconciliation,
+  development runtime, source parsing, and source-closure corrections. The checkpoint and this
+  ledger update are pushed together; neither is a frozen release candidate.
+- The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
+  exists. The previously uncommitted integration state is now captured atomically at the code
+  checkpoint above, including every newly registered Tauri permission, migration, native identity
+  file, file-import module, and Python source identity required by the compiled product.
+- The approved Markets expansion is now a V1 release blocker in issue
+  [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
+  design/plan, and the
+  [provider-ecosystem decision](../research/2026-08-08-unified-markets-provider-ecosystem.md). V1
+  requires one unified non-technical feed/search/instrument experience over bounded concurrent
+  providers, a searchable multi-asset universe, best-available-depth disclosure, deterministic
+  source selection/downgrade evidence, and end-to-end use by forecasts, targets, backtests,
+  portfolio analytics, risk, and paper workflows.
+- The first dirty-tree integration review found concrete paper/live lifecycle, provider-switch,
+  research-file client-isolation/crash-recovery, desktop bootstrap, startup-window, stored-source
+  attribution, preview-retention, and development-runtime defects. The code checkpoint closes
+  those bounded defects with serialized live ownership, owner-scoped durable import recovery, one
+  explicit bootstrap action, delayed window reveal, source-bound stored evidence, bounded preview
+  retention, and a reusable two-program model runtime. This is remediation, not a new review
+  checkpoint or release approval.
+- Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), issue
+  [#45](https://github.com/Sawmonabo/market-squawk/issues/45), draft PR
+  [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project items remain open and
+  `In Progress`. Focused integration evidence passed Rust formatting, application library and
+  binary checks, desktop-native check, frontend typecheck and production bundle, `just` syntax,
+  Python builder syntax, JSON admission, diff hygiene, and the 1,169-path Python source closure.
+  Generated Cargo output is 16 GiB after reclaiming idle cross-target release output, below the
+  20 GiB ceiling. Automatically triggered broad run `31317133401` was canceled; broad CI remains
+  deferred until the feature candidate is frozen for release-branch integration.
+- Remaining barriers before the requested owner-test handoff are outcome-based:
 
-  1. One unchanged-head ordinary CI run plus the explicit installed-product campaign must pass the
-     Windows workspace and native packages for Linux x64, Windows x64, macOS Intel, and macOS Apple
-     Silicon.
-  2. The root integration owner must personally install and open the exact Apple Silicon package,
-     inspect all 18 dashboard routes, exercise every flow not blocked by an unavailable account or
-     API key, verify loading/empty/error/degraded/success states, restart and forced-service-crash
-     recovery, and prove fresh Claude Code and Codex clients share one backend service.
-  3. The unchanged candidate must pass the complete exact-head gates and final Quarter 4 grouped
-     review with no unresolved finding.
+  1. Implement and prove the bounded multi-provider registry, admitted provider surfaces,
+     searchable multi-asset universe, deterministic resolver, unified presentation read model, and
+     fully wired non-technical Markets desktop journey.
+  2. Complete the resumable guided setup execution and every remaining shared-service/MCP,
+     onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
+  3. Run one focused installed integration/e2e pass, including every desktop route and every flow
+     not blocked by an unavailable user account or key, plus fresh shared Claude Code and Codex MCP
+     clients and restart/stale-credential recovery.
+  4. Freeze one unchanged feature head, run the complete local release gate once, obtain all four
+     platform installed-product proofs, close every grouped Quarter 4 finding, update PR #43 and
+     the ledger with exact-head evidence, and prepare the owner-test package.
 - Completion stops at the feature-branch packaged V1 handoff. Publishing assets, creating a public
   release, or merging to the release branch or `main` remains explicitly outside this execution.
 
