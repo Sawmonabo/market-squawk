@@ -19,7 +19,8 @@ pub use level3::{
     KrakenL3BookBatch, KrakenL3ClientTier, KrakenL3Config, KrakenL3ConfigError, KrakenL3Control,
     KrakenL3DecodeError, KrakenL3DecodeOutcome, KrakenL3Decoder, KrakenL3DecoderState,
     KrakenL3Depth, KrakenL3MetadataError, KrakenL3MetadataInput, KrakenL3Order, KrakenL3OrderEvent,
-    KrakenL3OrderEventKind, KrakenL3ProductMapping, KrakenL3SecretPayload, KrakenL3WebSocketToken,
+    KrakenL3OrderEventKind, KrakenL3ProductMapping, KrakenL3ScaleError, KrakenL3ScaledOrder,
+    KrakenL3ScaledOrderEvent, KrakenL3SecretPayload, KrakenL3WebSocketToken,
 };
 pub use qualification::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,

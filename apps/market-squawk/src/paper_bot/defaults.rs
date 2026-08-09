@@ -51,6 +51,7 @@ use uuid::Uuid;
 use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
 };
+use crate::live_source::order_level::OrderLevelDirectory;
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, CoinbaseDirectAccountActivation, CoinbaseDirectAdapterActivation,
@@ -232,12 +233,28 @@ impl CoinbaseDirectLiveMarketComposition {
             .start_live(self.runtime_config, cancellation)
             .await
     }
+
+    /// Starts the source-only Direct runtime and retains individual provider orders centrally.
+    pub(crate) async fn start_with_order_level(
+        self,
+        order_level: OrderLevelDirectory,
+        cancellation: CancellationToken,
+    ) -> Result<crate::CoinbaseDirectLiveRuntime, crate::CoinbaseDirectSupervisorError> {
+        self.activation
+            .start_live_with_order_level(self.runtime_config, order_level, cancellation)
+            .await
+    }
 }
 
 impl ProductionLiveMarketComposition {
     /// Returns the exact canonical source identity whose observations this runtime publishes.
     pub(crate) fn source_id(&self) -> &market_squawk_domain::SourceId {
         self.source.metadata().source_id()
+    }
+
+    /// Returns exact metadata for the source that owns this composition.
+    pub(crate) fn metadata(&self) -> &market_squawk_sources::SourceMetadata {
+        self.source.metadata()
     }
 
     /// Returns the complete immutable route set used to create bounded market exports.

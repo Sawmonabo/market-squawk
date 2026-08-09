@@ -1,17 +1,22 @@
 //! Bounded multi-provider market-runtime ownership shared by every local presentation.
 
-use std::{fmt, num::NonZeroU64, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+    time::Instant,
+};
 
 use market_squawk_domain::{
-    ConnectionGeneration, CoverageStatus, DataQuality, SourceIdentifier, StreamIntegrityState,
-    Timestamp,
+    ConnectionGeneration, CoverageStatus, DataQuality, InstrumentId, SourceId, SourceIdentifier,
+    StreamIntegrityState, Timestamp, VenueId,
 };
 use market_squawk_live::{
     LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRuntimeSnapshotLease,
     LiveSnapshotReader, PreparedLiveActionHookGroup, RouteActionHook,
 };
 use market_squawk_services::ServiceError;
-use market_squawk_sources::ProviderRateAuthority;
+use market_squawk_sources::{ProviderRateAuthority, SourceMetadata};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +24,10 @@ use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservation
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
     ProviderAdapterActivation,
+    live_source::order_level::{
+        MAX_ORDER_LEVEL_DIRECTORY_BOOKS, OrderLevelBookKey, OrderLevelDirectory,
+        OrderLevelDirectoryError, OrderLevelOrdersRead, OrderLevelReadError,
+    },
     paper_bot::{
         local_coinbase_direct_live_market_with_activation, local_live_market_with_provider_rate,
     },
@@ -45,6 +54,7 @@ pub(crate) struct MarketSourceLifecycleEvidence {
 #[derive(Debug)]
 pub(crate) struct MarketSourceSnapshotLease {
     surface_id: SourceIdentifier,
+    metadata: Arc<[SourceMetadata]>,
     lease: LiveRuntimeSnapshotLease,
 }
 
@@ -56,18 +66,80 @@ impl MarketSourceSnapshotLease {
     pub(crate) const fn lease(&self) -> &LiveRuntimeSnapshotLease {
         &self.lease
     }
+
+    pub(crate) const fn metadata(&self) -> &Arc<[SourceMetadata]> {
+        &self.metadata
+    }
 }
 
 /// Complete bounded set of healthy provider snapshots observed for one application request.
 #[derive(Debug)]
 pub(crate) struct MarketRuntimeSnapshotBatch {
     sources: Vec<MarketSourceSnapshotLease>,
+    failures: Vec<MarketSourceSnapshotFailure>,
 }
 
 impl MarketRuntimeSnapshotBatch {
     pub(crate) fn sources(&self) -> &[MarketSourceSnapshotLease] {
         &self.sources
     }
+
+    pub(crate) fn failures(&self) -> &[MarketSourceSnapshotFailure] {
+        &self.failures
+    }
+}
+
+/// One bounded individual-order view bound to an exact source generation.
+#[derive(Debug)]
+pub(crate) struct MarketOrderLevelSnapshot {
+    key: OrderLevelBookKey,
+    orders: OrderLevelOrdersRead,
+}
+
+impl MarketOrderLevelSnapshot {
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        self.key.source_id()
+    }
+
+    pub(crate) const fn venue_id(&self) -> &VenueId {
+        self.key.venue_id()
+    }
+
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.key.instrument_id()
+    }
+
+    pub(crate) const fn generation(&self) -> ConnectionGeneration {
+        self.key.generation()
+    }
+
+    pub(crate) const fn orders(&self) -> &OrderLevelOrdersRead {
+        &self.orders
+    }
+}
+
+/// One source-local snapshot read failure retained without hiding healthy providers.
+#[derive(Clone, Debug)]
+pub(crate) struct MarketSourceSnapshotFailure {
+    surface_id: SourceIdentifier,
+    kind: MarketSourceSnapshotFailureKind,
+}
+
+impl MarketSourceSnapshotFailure {
+    pub(crate) const fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface_id
+    }
+
+    pub(crate) const fn kind(&self) -> MarketSourceSnapshotFailureKind {
+        self.kind
+    }
+}
+
+/// Closed presentation-safe reason why one provider snapshot could not be retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MarketSourceSnapshotFailureKind {
+    ResourceExhausted,
+    Unavailable,
 }
 
 /// Disabled dynamic hooks bound to one exact existing source runtime.
@@ -103,6 +175,7 @@ pub(crate) struct MarketRuntimeRegistry {
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
     accepting: std::sync::atomic::AtomicBool,
     lifecycle: CancellationToken,
+    order_level: OrderLevelDirectory,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
 }
@@ -118,13 +191,24 @@ impl MarketRuntimeRegistry {
         entries
             .try_reserve_exact(MAXIMUM_CONCURRENT_MARKET_SURFACES)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let lifecycle = CancellationToken::new();
+        let order_level = OrderLevelDirectory::try_new(
+            NonZeroUsize::new(MAX_ORDER_LEVEL_DIRECTORY_BOOKS)
+                .ok_or(ServiceError::ResourceExhausted)?,
+            lifecycle.child_token(),
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "order-level market directory construction failed");
+            ServiceError::ResourceExhausted
+        })?;
         Ok(Arc::new(Self {
             config,
             provider_rate,
             provider_activation,
             live_fair_value,
             accepting: std::sync::atomic::AtomicBool::new(true),
-            lifecycle: CancellationToken::new(),
+            lifecycle,
+            order_level,
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
         }))
@@ -186,6 +270,7 @@ impl MarketRuntimeRegistry {
                     tracing::error!(provider = ?provider_kind, %error, "market source composition failed");
                     ServiceError::Unavailable
                 })?;
+                let metadata: Arc<[SourceMetadata]> = Arc::from([composition.metadata().clone()]);
                 let (exports, drains) = LiveFairValueExportDrains::try_start(
                     composition.source_id().clone(),
                     composition.live_routes(),
@@ -219,6 +304,7 @@ impl MarketRuntimeRegistry {
                 MarketRuntimeEntry {
                     surface_id: provider.clone(),
                     onboarding_session_id: None,
+                    metadata,
                     cancellation: runtime_cancellation,
                     runtime: MarketRuntime::Public(runtime),
                     exports: Some(drains),
@@ -240,7 +326,10 @@ impl MarketRuntimeRegistry {
                 let started = await_before(
                     deadline,
                     cancellation,
-                    composition.start(runtime_cancellation.clone()),
+                    composition.start_with_order_level(
+                        self.order_level.clone(),
+                        runtime_cancellation.clone(),
+                    ),
                 )
                 .await;
                 let runtime = match started {
@@ -250,9 +339,11 @@ impl MarketRuntimeRegistry {
                         return Err(error);
                     }
                 };
+                let metadata = runtime.metadata();
                 MarketRuntimeEntry {
                     surface_id: provider.clone(),
                     onboarding_session_id: Some(session_id),
+                    metadata,
                     cancellation: runtime_cancellation,
                     runtime: MarketRuntime::CoinbaseDirect(runtime),
                     exports: None,
@@ -432,7 +523,11 @@ impl MarketRuntimeRegistry {
                 .try_reserve_exact(healthy)
                 .map_err(|_error| ServiceError::ResourceExhausted)?;
             for entry in entries.iter().filter(|entry| entry.is_healthy()) {
-                readers.push((entry.surface_id.clone(), entry.snapshots()));
+                readers.push((
+                    entry.surface_id.clone(),
+                    Arc::clone(&entry.metadata),
+                    entry.snapshots(),
+                ));
             }
             readers
         };
@@ -440,12 +535,63 @@ impl MarketRuntimeRegistry {
         sources
             .try_reserve_exact(readers.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
-        for (surface_id, reader) in readers {
+        let mut failures = Vec::new();
+        failures
+            .try_reserve_exact(readers.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for (surface_id, metadata, reader) in readers {
             ensure_before(deadline, cancellation)?;
-            let lease = reader.try_load_all().map_err(map_snapshot_error)?;
-            sources.push(MarketSourceSnapshotLease { surface_id, lease });
+            match reader.try_load_all() {
+                Ok(lease) => sources.push(MarketSourceSnapshotLease {
+                    surface_id,
+                    metadata,
+                    lease,
+                }),
+                Err(error) => failures.push(MarketSourceSnapshotFailure {
+                    surface_id,
+                    kind: map_snapshot_failure(error),
+                }),
+            }
         }
-        Ok(MarketRuntimeSnapshotBatch { sources })
+        Ok(MarketRuntimeSnapshotBatch { sources, failures })
+    }
+
+    /// Reads a bounded individual-order sample only from the exact retained source generation.
+    pub(crate) async fn order_level_snapshot(
+        &self,
+        source_id: &SourceId,
+        venue_id: &VenueId,
+        instrument_id: InstrumentId,
+        generation: ConnectionGeneration,
+        maximum_orders: NonZeroUsize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MarketOrderLevelSnapshot>, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let key =
+            OrderLevelBookKey::try_from_snapshot(source_id, venue_id, instrument_id, generation)
+                .map_err(map_order_level_key_error)?;
+        let orders = match self
+            .order_level
+            .read_orders(&key, maximum_orders, cancellation, deadline)
+            .await
+        {
+            Ok(orders) => orders,
+            Err(
+                OrderLevelReadError::Unavailable
+                | OrderLevelReadError::NotRegistered
+                | OrderLevelReadError::Unregistering
+                | OrderLevelReadError::WorkerClosed,
+            ) => return Ok(None),
+            Err(OrderLevelReadError::Cancelled) => return Err(ServiceError::Cancelled),
+            Err(OrderLevelReadError::Deadline) => return Err(ServiceError::DeadlineExceeded),
+            Err(error) => {
+                tracing::error!(%error, "bounded order-level market read failed");
+                return Err(ServiceError::Unavailable);
+            }
+        };
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        Ok(Some(MarketOrderLevelSnapshot { key, orders }))
     }
 
     /// Returns immutable snapshot access for one exact active source/session.
@@ -548,12 +694,34 @@ impl MarketRuntimeRegistry {
         for entry in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(failure.unwrap_or(ServiceError::DeadlineExceeded));
+                failure.get_or_insert(ServiceError::DeadlineExceeded);
+                break;
             }
             if let Err(error) = entry.shutdown(remaining).await
                 && failure.is_none()
             {
                 failure = Some(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            failure.get_or_insert(ServiceError::DeadlineExceeded);
+        } else {
+            match self.order_level.shutdown(&cleanup, deadline).await {
+                Ok(report) if report.is_complete() => {}
+                Ok(report) => {
+                    tracing::error!(
+                        graceful = report.graceful(),
+                        aborted_at_deadline = report.aborted_at_deadline(),
+                        aborted_on_cancellation = report.aborted_on_cancellation(),
+                        failed = report.failed(),
+                        "order-level market directory shutdown was incomplete"
+                    );
+                    failure.get_or_insert(ServiceError::Unavailable);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "order-level market directory shutdown failed");
+                    failure.get_or_insert(ServiceError::Unavailable);
+                }
             }
         }
         failure.map_or(Ok(()), Err)
@@ -650,6 +818,7 @@ impl MarketSurface {
 struct MarketRuntimeEntry {
     surface_id: SourceIdentifier,
     onboarding_session_id: Option<uuid::Uuid>,
+    metadata: Arc<[SourceMetadata]>,
     cancellation: CancellationToken,
     runtime: MarketRuntime,
     exports: Option<LiveFairValueExportDrains>,
@@ -966,13 +1135,25 @@ const fn quality_rank(value: DataQuality) -> u8 {
     }
 }
 
-const fn map_snapshot_error(error: market_squawk_live::SnapshotReadError) -> ServiceError {
+const fn map_snapshot_failure(
+    error: market_squawk_live::SnapshotReadError,
+) -> MarketSourceSnapshotFailureKind {
     match error {
         market_squawk_live::SnapshotReadError::ReaderLimitReached
         | market_squawk_live::SnapshotReadError::CapacityOverflow => {
-            ServiceError::ResourceExhausted
+            MarketSourceSnapshotFailureKind::ResourceExhausted
         }
         market_squawk_live::SnapshotReadError::UnknownShard
-        | market_squawk_live::SnapshotReadError::Closed => ServiceError::Unavailable,
+        | market_squawk_live::SnapshotReadError::Closed => {
+            MarketSourceSnapshotFailureKind::Unavailable
+        }
+    }
+}
+
+fn map_order_level_key_error(error: OrderLevelDirectoryError) -> ServiceError {
+    tracing::error!(%error, "order-level market lookup identity construction failed");
+    match error {
+        OrderLevelDirectoryError::Allocation => ServiceError::ResourceExhausted,
+        _ => ServiceError::Unavailable,
     }
 }

@@ -70,7 +70,7 @@ impl AlpacaIexLiveSource {
             .map_err(|_| SourceError::InvalidProtocolState)?;
         run_transport(
             self.config.endpoint(),
-            self.config.limits(),
+            self.config.transport_limits(),
             SubscriptionPayload::Json(self.config.subscription()),
             false,
             &self.credentials,
@@ -144,7 +144,7 @@ impl AlpacaOptionsLiveSource {
             .map_err(|_| SourceError::InvalidProtocolState)?;
         run_transport(
             self.config.endpoint(),
-            self.config.limits(),
+            self.config.transport_limits(),
             SubscriptionPayload::MessagePack(self.config.subscription()),
             true,
             &self.credentials,

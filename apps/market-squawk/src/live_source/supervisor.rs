@@ -221,12 +221,10 @@ impl ProductionSourceSupervisor {
                 route_workers.push(worker);
             }
 
-            let subscription = SubscriptionStateMachine::try_new(
+            let subscription_products = self.profile.subscription_product_snapshot()?;
+            let subscription = SubscriptionStateMachine::try_new_with_policy(
                 GenerationIdentity::from_session(&session),
-                self.profile
-                    .subscription_products()
-                    .iter()
-                    .map(String::as_str),
+                subscription_products.iter().map(String::as_str),
                 self.profile.subscription_ack_timeout(),
                 Instant::now(),
                 SubscriptionLimits::try_new(
@@ -235,6 +233,7 @@ impl ProductionSourceSupervisor {
                     self.profile.pre_acknowledgement_data_message_capacity(),
                     self.profile.pre_acknowledgement_data_byte_capacity(),
                 )?,
+                self.profile.subscription_acknowledgement_policy(),
             )?;
             tracing::debug!(
                 source = self.profile.source_key(),
@@ -242,10 +241,7 @@ impl ProductionSourceSupervisor {
                 subscription_state_peak_bytes = subscription.estimated_peak_bytes().get(),
                 "prepared bounded production subscription state"
             );
-            let mut source = self
-                .profile
-                .try_source(source_generation)
-                .map_err(ProductionSupervisorError::TerminalSource)?;
+            let mut source = self.profile.try_source(source_generation)?;
             let decoder = self.profile.decoder()?;
             let mut sink = ProductionRawMarketSink::try_new(ProductionRawMarketSinkInput {
                 capture: publisher,

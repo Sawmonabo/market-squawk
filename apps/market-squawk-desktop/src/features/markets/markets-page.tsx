@@ -6,6 +6,7 @@ import {
   Clock3,
   DatabaseZap,
   RefreshCw,
+  Search,
   ShieldCheck,
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
@@ -13,15 +14,11 @@ import { useSearchParams } from "react-router-dom"
 import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
-
-import {
-  instrumentLookupDetailSchema,
-  lookupResultSchema,
-} from "../lookup/schemas"
 
 import {
   type BookLevel,
@@ -29,9 +26,13 @@ import {
   instrumentComparison,
   instrumentQuotes,
   instrumentTrades,
-  marketEvidence,
   resultState,
 } from "./market-evidence"
+import {
+  type ReferenceMarketRow,
+  referenceMarketRows,
+} from "./reference-market"
+import { type UnifiedMarketRow, unifiedMarketRows } from "./unified-market"
 
 export function MarketsPage() {
   const product = useProduct()
@@ -65,65 +66,88 @@ function ReadyMarketsPage({
 }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const requestedInstrumentId = validInstrumentId(searchParams.get("instrumentId"))
-  const snapshot = useQuery({
+  const requestedReferenceId = validReferenceId(searchParams.get("referenceId"))
+  const operationNames = new Set(
+    bootstrap.operations.map((operation) => operation.name),
+  )
+  const feedAvailable = operationNames.has("Market.GetUnifiedFeed")
+  const feed = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "Market",
-      "Market.GetSnapshot",
+      "Market.GetUnifiedFeed",
       {},
     ),
-    queryFn: () => transport.query({ query: "marketSnapshot" }),
+    enabled: feedAvailable,
+    queryFn: () => transport.query({ query: "marketUnifiedFeed" }),
   })
-  const quality = useQuery({
+  const feedRead = parseRead(() => unifiedMarketRows(feed.data))
+  const rows = feedRead.value ?? []
+  const [searchText, setSearchText] = React.useState("")
+  const [referenceQuery, setReferenceQuery] = React.useState("")
+  React.useEffect(() => {
+    const timer = window.setTimeout(() => setReferenceQuery(searchText.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [searchText])
+  const universeAvailable = operationNames.has("Market.SearchUniverse")
+  const universe = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "Market",
-      "Market.GetQuality",
-      {},
+      "Market.SearchUniverse",
+      { query: referenceQuery },
     ),
-    queryFn: () => transport.query({ query: "marketQuality" }),
+    enabled: universeAvailable,
+    queryFn: () =>
+      transport.query({
+        query: "marketUniverse",
+        ...(referenceQuery ? { text: referenceQuery } : {}),
+      }),
   })
-  const evidenceRead = parseRead(() => marketEvidence(snapshot.data, quality.data))
-  const evidence = evidenceRead.value ?? []
+  const universeRead = parseRead(() => referenceMarketRows(universe.data))
+  const liveReferenceKeys = new Set(
+    rows.map((row) => `${row.symbol.toLocaleUpperCase()}|${row.symbolVenueId}`),
+  )
+  const referenceRows = (universeRead.value ?? []).filter(
+    (row) =>
+      !liveReferenceKeys.has(`${row.symbol.toLocaleUpperCase()}|${row.venueId}`),
+  )
+  const normalizedSearch = searchText.trim().toLocaleLowerCase()
+  const visibleRows = normalizedSearch
+    ? rows.filter((row) =>
+        [row.symbol, row.assetClass, row.quoteCurrency, row.selectedSource?.providerId]
+          .filter((value): value is string => Boolean(value))
+          .some((value) => value.toLocaleLowerCase().includes(normalizedSearch)),
+      )
+    : rows
   const instrumentIds = [
     ...new Set([
       ...(requestedInstrumentId ? [requestedInstrumentId] : []),
-      ...evidence.map((row) => row.instrumentId),
+      ...rows.map((row) => row.instrumentId),
     ]),
   ]
   const [selectedId, setSelectedId] =
     React.useState<string | null>(requestedInstrumentId)
+  const [selectedReferenceId, setSelectedReferenceId] =
+    React.useState<string | null>(requestedReferenceId)
   React.useEffect(() => {
-    if (requestedInstrumentId) setSelectedId(requestedInstrumentId)
-  }, [requestedInstrumentId])
+    if (requestedInstrumentId) {
+      setSelectedId(requestedInstrumentId)
+      setSelectedReferenceId(null)
+    } else if (requestedReferenceId) {
+      setSelectedReferenceId(requestedReferenceId)
+      setSelectedId(null)
+    }
+  }, [requestedInstrumentId, requestedReferenceId])
   const selectedInstrument =
-    instrumentIds.find((instrumentId) => instrumentId === selectedId) ??
-    instrumentIds[0] ??
-    null
-  const operationNames = new Set(
-    bootstrap.operations.map((operation) => operation.name),
-  )
-  const identity = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.runtime,
-      "Analysis",
-      "Analysis.Lookup",
-      { instrumentId: selectedInstrument },
-    ),
-    enabled:
-      selectedInstrument !== null && operationNames.has("Analysis.Lookup"),
-    queryFn: () =>
-      transport.query({
-        query: "lookup",
-        text: requiredInstrument(selectedInstrument),
-        categories: ["instrument"],
-      }),
-    staleTime: 30_000,
-  })
-  const selectedInstrumentLabel = lookupInstrumentLabel(
-    identity.data,
-    selectedInstrument,
-  )
+    selectedReferenceId === null
+      ? instrumentIds.find((instrumentId) => instrumentId === selectedId) ??
+        instrumentIds[0] ??
+        null
+      : null
+  const selectedRow = rows.find((row) => row.instrumentId === selectedInstrument) ?? null
+  const selectedReference =
+    referenceRows.find((row) => row.referenceId === selectedReferenceId) ?? null
   const tradesAvailable = operationNames.has("Market.GetTrades")
   const quotesAvailable = operationNames.has("Market.GetQuotes")
   const booksAvailable = operationNames.has("Market.GetBooks")
@@ -185,25 +209,21 @@ function ReadyMarketsPage({
       }),
   })
   const refreshing =
-    snapshot.isFetching ||
-    quality.isFetching ||
+    feed.isFetching ||
+    universe.isFetching ||
     trades.isFetching ||
     quotes.isFetching ||
     books.isFetching ||
     comparisons.isFetching
-  const failed =
-    evidenceRead.error !== null ||
-    (evidence.length === 0 && (snapshot.isError || quality.isError))
-  const partialFailure = snapshot.isError !== quality.isError
-  const fresh = evidence.filter((row) => row.fresh === true).length
-  const verified = evidence.filter(
-    (row) => row.currentQuality === "direct_verified",
-  ).length
+  const feedFailed = feedRead.error !== null || feed.isError
+  const universeFailed = universeRead.error !== null || universe.isError
+  const live = rows.filter((row) => row.availability === "Live").length
+  const verified = rows.filter((row) => row.confidence === "Verified").length
 
   const refresh = () => {
     void Promise.all([
-      snapshot.refetch(),
-      quality.refetch(),
+      feed.refetch(),
+      ...(universeAvailable ? [universe.refetch()] : []),
       ...(selectedInstrument && tradesAvailable ? [trades.refetch()] : []),
       ...(selectedInstrument && quotesAvailable ? [quotes.refetch()] : []),
       ...(selectedInstrument && booksAvailable ? [books.refetch()] : []),
@@ -215,7 +235,14 @@ function ReadyMarketsPage({
 
   const selectInstrument = (instrumentId: string) => {
     setSelectedId(instrumentId)
+    setSelectedReferenceId(null)
     setSearchParams({ instrumentId }, { replace: true })
+  }
+
+  const selectReference = (referenceId: string) => {
+    setSelectedReferenceId(referenceId)
+    setSelectedId(null)
+    setSearchParams({ referenceId }, { replace: true })
   }
 
   return (
@@ -227,86 +254,109 @@ function ReadyMarketsPage({
         </Button>
       }
     >
-      {failed ? (
+      {!feedAvailable && !universeAvailable ? (
         <EmptyState
-          title={
-            partialFailure
-              ? "Market evidence is incomplete"
-              : "Market evidence is unavailable"
-          }
-          detail={evidenceRead.error ?? messageFrom(snapshot.error ?? quality.error)}
+          title="Unified Markets is not available in this service build"
+          detail="Update the installed Market Squawk service, then reopen the app."
         />
-      ) : evidence.length === 0 && (snapshot.isLoading || quality.isLoading) ? (
-        <MarketGridLoading />
-      ) : evidence.length === 0 && selectedInstrument === null ? (
+      ) : feedFailed && universeFailed ? (
         <EmptyState
-          title="No active market observations"
-          detail="Connect and start a supported market source. Market Squawk will only show a market as current when the installed service returns timestamped runtime evidence."
+          title="Market data is temporarily unavailable"
+          detail={
+            universeRead.error ??
+            feedRead.error ??
+            messageFrom(universe.error ?? feed.error)
+          }
+        />
+      ) : rows.length === 0 && referenceRows.length === 0 && (feed.isLoading || universe.isLoading) ? (
+        <MarketGridLoading />
+      ) : rows.length === 0 && referenceRows.length === 0 ? (
+        <EmptyState
+          title="No markets are available yet"
+          detail="Market Squawk could not load either an active public market or the official U.S. listing reference. Check Sources, then retry."
         />
       ) : (
         <>
-          {partialFailure ? (
-            <Notice text="One market evidence view could not be read. The cards below show only the fields returned by the remaining view." />
+          {feedFailed ? (
+            <Notice text={`Live observations are unavailable. Official listing search remains usable. ${feedRead.error ?? messageFrom(feed.error)}`} />
+          ) : null}
+          {universeFailed ? (
+            <Notice text={`U.S. listing search is unavailable. Active live markets remain usable. ${universeRead.error ?? messageFrom(universe.error)}`} />
           ) : null}
           <div className="grid gap-3 sm:grid-cols-3">
-            <Summary label="Observed streams" value={evidence.length} icon={Activity} />
-            <Summary label="Fresh at check" value={fresh} icon={Clock3} />
-            <Summary label="Direct verified" value={verified} icon={ShieldCheck} />
+            <Summary label="Markets in view" value={rows.length + referenceRows.length} icon={Activity} />
+            <Summary label="Live now" value={live} icon={Clock3} />
+            <Summary label="High confidence" value={verified} icon={ShieldCheck} />
           </div>
           <section className="mt-4 rounded-xl border border-border bg-card/35 p-4">
-            <label htmlFor="market-instrument" className="text-xs font-semibold">
-              Selected instrument
+            <label htmlFor="market-search" className="text-xs font-semibold">
+              Find a stock, ETF, or crypto market
             </label>
-            <select
-              id="market-instrument"
-              className="mt-2 h-9 w-full max-w-xl rounded-md border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              value={selectedInstrument ?? ""}
-              onChange={(event) => selectInstrument(event.target.value)}
-            >
-              {instrumentIds.map((instrumentId) => (
-                <option key={instrumentId} value={instrumentId}>
-                  {instrumentId === selectedInstrument && selectedInstrumentLabel
-                    ? selectedInstrumentLabel
-                    : instrumentId}
-                </option>
-              ))}
-            </select>
-            <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
-              Every detail read below is bounded to this exact instrument identifier. Values remain
-              in authoritative ticks and lots because no display scale is present in this contract.
+            <div className="relative mt-2 max-w-xl">
+              <Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" aria-hidden="true" />
+              <Input
+                id="market-search"
+                className="pl-9"
+                value={searchText}
+                onChange={(event) => setSearchText(event.target.value)}
+                placeholder="Try AAPL, Microsoft, SPY, QQQ, or BTC"
+              />
+            </div>
+            <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+              Market Squawk chooses the best available source for each instrument and keeps any
+              delay, coverage limit, or confidence downgrade visible.
             </p>
           </section>
-          {selectedInstrument &&
-          !evidence.some((row) => row.instrumentId === selectedInstrument) ? (
-            <Notice text="This instrument is selected from the reference catalog, but no active live market observation is available for it. The instrument-scoped reads below remain bound to this exact identity." />
-          ) : null}
-          <div className="mt-4 grid gap-4 xl:grid-cols-2">
-            {evidence
-              .filter((row) => row.instrumentId === selectedInstrument)
-              .map((row) => (
+          {visibleRows.length === 0 && referenceRows.length === 0 ? (
+            <Notice text="No admitted market or official listing matches that search." />
+          ) : (
+            <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {visibleRows.map((row) => (
                 <MarketCard
-                  key={row.key}
-                  evidence={row}
-                  instrumentLabel={selectedInstrumentLabel}
+                  key={row.instrumentId}
+                  row={row}
+                  selected={row.instrumentId === selectedInstrument}
+                  onSelect={() => selectInstrument(row.instrumentId)}
                 />
               ))}
-          </div>
-          {selectedInstrument ? (
-            <InstrumentWorkspace
-              instrumentId={selectedInstrument}
-              trades={{ available: tradesAvailable, query: trades }}
-              quotes={{ available: quotesAvailable, query: quotes }}
-              books={{ available: booksAvailable, query: books }}
-              comparisons={{
-                available: comparisonsAvailable,
-                query: comparisons,
-              }}
+              {referenceRows.map((row) => (
+                <ReferenceMarketCard
+                  key={row.referenceId}
+                  row={row}
+                  selected={row.referenceId === selectedReferenceId}
+                  onSelect={() => selectReference(row.referenceId)}
+                />
+              ))}
+            </div>
+          )}
+          {selectedInstrument && !selectedRow ? (
+            <Notice text="The selected instrument has no active unified market observation."
             />
           ) : null}
-          <ResultBoundary
-            snapshot={resultState(snapshot.data)}
-            quality={resultState(quality.data)}
-          />
+          {selectedInstrument ? (
+            <details className="mt-5 rounded-xl border border-border bg-card/30 p-4">
+              <summary className="cursor-pointer text-sm font-semibold">
+                Show detailed trades, quotes, order book, and source comparison
+              </summary>
+              <InstrumentWorkspace
+                instrumentId={selectedInstrument}
+                orderBook={selectedRow?.orderBook ?? null}
+                trades={{ available: tradesAvailable, query: trades }}
+                quotes={{ available: quotesAvailable, query: quotes }}
+                books={{ available: booksAvailable, query: books }}
+                comparisons={{
+                  available: comparisonsAvailable,
+                  query: comparisons,
+                }}
+              />
+            </details>
+          ) : null}
+          {selectedReference ? (
+            <ReferenceWorkspace row={selectedReference} />
+          ) : selectedReferenceId ? (
+            <Notice text="That reference listing is no longer present in the current search result." />
+          ) : null}
+          <UnifiedResultBoundary feed={resultState(feed.data)} />
         </>
       )}
     </PageFrame>
@@ -322,79 +372,169 @@ function validInstrumentId(value: string | null): string | null {
     : null
 }
 
-function MarketCard({
-  evidence,
-  instrumentLabel,
-}: {
-  evidence: ReturnType<typeof marketEvidence>[number]
-  instrumentLabel: string | null
-}) {
-  const integrityIssues = [
-    evidence.snapshotInitialized === false ? "Snapshot not initialized" : null,
-    evidence.generationCurrent === false ? "Connection generation is not current" : null,
-    evidence.crossedBook === true ? "Crossed book" : null,
-  ].filter((value): value is string => value !== null)
+function validReferenceId(value: string | null): string | null {
+  return value && value.length <= 256 && /^[a-z0-9._:-]+$/i.test(value)
+    ? value
+    : null
+}
 
+function ReferenceMarketCard({ row, selected, onSelect }: {
+  row: ReferenceMarketRow
+  selected: boolean
+  onSelect: () => void
+}) {
   return (
-    <article className="rounded-xl border border-border bg-card/45 p-5">
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`rounded-xl border p-5 text-left transition-colors ${
+        selected
+          ? "border-primary/50 bg-primary/5"
+          : "border-border bg-card/45 hover:border-primary/25 hover:bg-card/70"
+      }`}
+      aria-pressed={selected}
+    >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-            {evidence.venueId} · {evidence.sourceId}
+            {row.isEtf ? "ETF" : "Stock"} · {row.venueId}
           </p>
-          <h2 className="mt-2 truncate text-lg font-semibold">
-            {instrumentLabel ?? evidence.instrumentId}
+          <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
+          <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-muted-foreground">
+            {row.name}
+          </p>
+        </div>
+        <EvidenceBadge label="Reference" tone="neutral" />
+      </div>
+      <div className="mt-5 rounded-lg border border-border/70 bg-background/35 p-3">
+        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Current price
+        </p>
+        <p className="mt-1 text-sm font-medium">Connect free U.S. market data</p>
+      </div>
+      <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
+        <Fact label="Identity" value="Official listing" />
+        <Fact label="Price coverage" value="Account required" />
+        <Fact label="Round lot" value={`${row.roundLotSize.toLocaleString()} shares`} />
+        <Fact label="Updated" value={dateTime(row.availableAt)} />
+      </dl>
+      <p className="mt-4 text-[10px] leading-5 text-muted-foreground">
+        This proves the listing identity only. It is not a quote, order book, or trading-status
+        claim.
+      </p>
+    </button>
+  )
+}
+
+function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
+  return (
+    <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
+      <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+        Official listing reference
+      </p>
+      <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {row.symbol} · {row.name}
           </h2>
-          {instrumentLabel ? (
-            <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
-              {evidence.instrumentId}
-            </p>
-          ) : null}
+          <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
+            Market Squawk found this U.S. listing without inventing a price. Connect a supported
+            free account to add current quotes, charts, signals, forecasts, backtests, and
+            portfolio impact to this same workspace.
+          </p>
+        </div>
+        <EvidenceBadge label="Account required for prices" tone="neutral" />
+      </div>
+      <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Fact label="Listing venue" value={row.venueId} />
+        <Fact label="Asset type" value={row.isEtf ? "ETF" : "Stock"} />
+        <Fact label="Reference quality" value="Official delayed" />
+        <Fact label="Observed" value={dateTime(row.availableAt)} />
+      </dl>
+      <details className="mt-5 rounded-lg border border-border bg-background/30 p-3">
+        <summary className="cursor-pointer text-xs font-semibold">Data confidence</summary>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Fact label="Provider" value={row.providerId} />
+          <Fact label="Source" value={row.sourceId} />
+          <Fact label="Source effective time" value={dateTime(row.effectiveAt)} />
+          <Fact label="Payload SHA-256" value={row.sourcePayloadSha256} />
+        </dl>
+      </details>
+    </section>
+  )
+}
+
+function MarketCard({ row, selected, onSelect }: {
+  row: UnifiedMarketRow
+  selected: boolean
+  onSelect: () => void
+}) {
+  const source = row.selectedSource
+  const primaryPrice = row.quote.lastPrice ?? row.quote.midPrice ?? row.quote.bidPrice
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`rounded-xl border p-5 text-left transition-colors ${
+        selected
+          ? "border-primary/50 bg-primary/5"
+          : "border-border bg-card/45 hover:border-primary/25 hover:bg-card/70"
+      }`}
+      aria-pressed={selected}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            {humanize(row.assetClass)} · {row.quoteCurrency}
+          </p>
+          <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
+          <p className="mt-1 truncate text-[11px] text-muted-foreground">
+            {source?.providerId ?? "No source available"}
+          </p>
         </div>
         <EvidenceBadge
-          label={qualityName(evidence.currentQuality)}
+          label={row.availability}
           tone={
-            evidence.currentQuality === "direct_verified" &&
-            evidence.fresh === true &&
-            integrityIssues.length === 0
+            row.availability === "Live" && source?.health === "healthy"
               ? "good"
-              : evidence.fresh === false || integrityIssues.length > 0
+              : row.availability === "Unavailable" || row.availability === "Stale"
                 ? "bad"
                 : "neutral"
           }
         />
       </div>
-
-      <div className="mt-5 grid grid-cols-2 gap-3">
-        <PriceLevel label="Best bid" level={evidence.bestBid} />
-        <PriceLevel label="Best ask" level={evidence.bestAsk} />
+      <div className="mt-5">
+        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Current price</p>
+        <p className="mt-1 font-mono text-2xl font-semibold">
+          {primaryPrice ? `${primaryPrice} ${row.quoteCurrency}` : "Not available"}
+        </p>
       </div>
-
-      <dl className="mt-5 grid gap-x-4 gap-y-3 border-t border-border/70 pt-4 sm:grid-cols-2">
-        <Fact label="As of" value={dateTime(evidence.asOf)} />
-        <Fact label="Freshness" value={truth(evidence.fresh, "Fresh", "Stale")} />
-        <Fact label="Valid until" value={dateTime(evidence.sourceValidUntil)} />
-        <Fact label="Feed phase" value={name(evidence.phase)} />
-        <Fact label="Recorded quality" value={qualityName(evidence.recordedQuality)} />
+      <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
+        <Fact label="Bid" value={row.quote.bidPrice ?? "Not available"} />
+        <Fact label="Ask" value={row.quote.askPrice ?? "Not available"} />
+        <Fact label="Confidence" value={row.confidence} />
+        <Fact label="Coverage" value={source ? humanize(source.coverage) : "Not available"} />
+        <Fact label="Market depth" value={source?.depthLabel ?? "Not available"} />
         <Fact
-          label="Book depth"
-          value={depth(evidence.bidDepth, evidence.askDepth)}
+          label="Individual orders"
+          value={
+            row.orderBook
+              ? `${row.orderBook.returnedOrderCount.toLocaleString()} of ${row.orderBook.totalOrderCount.toLocaleString()}`
+              : "Not available"
+          }
         />
-        <Fact
-          label="Last sequence"
-          value={evidence.lastSequence?.toLocaleString() ?? "Not reported"}
-        />
-        <Fact label="Provider product" value={name(evidence.providerProduct)} />
-        <Fact label="Channel" value={name(evidence.providerChannel)} />
+        <Fact label="Updated" value={dateTime(source?.freshness.availableAt ?? null)} />
       </dl>
-
-      {integrityIssues.length > 0 ? (
+      {source && (!source.integrity.generationCurrent || !source.integrity.snapshotInitialized) ? (
         <div className="mt-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-200">
           <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <span>{integrityIssues.join(" · ")}</span>
+          <span>Source synchronization is incomplete. This observation is not treated as current.</span>
         </div>
       ) : null}
-    </article>
+      <p className="mt-4 truncate font-mono text-[9px] text-muted-foreground">
+        {row.instrumentId}
+      </p>
+    </button>
   )
 }
 
@@ -405,12 +545,14 @@ type InstrumentQuery = {
 
 function InstrumentWorkspace({
   instrumentId,
+  orderBook,
   trades,
   quotes,
   books,
   comparisons,
 }: {
   instrumentId: string
+  orderBook: UnifiedMarketRow["orderBook"]
   trades: InstrumentQuery
   quotes: InstrumentQuery
   books: InstrumentQuery
@@ -437,6 +579,7 @@ function InstrumentWorkspace({
           Trades, quotes, book, and cross-source comparison
         </h2>
       </div>
+      {orderBook ? <IndividualOrderBook book={orderBook} /> : null}
       <div className="grid gap-4 xl:grid-cols-2">
         <InstrumentPanel
           title="Last trades"
@@ -556,6 +699,79 @@ function InstrumentWorkspace({
   )
 }
 
+function IndividualOrderBook({
+  book,
+}: {
+  book: NonNullable<UnifiedMarketRow["orderBook"]>
+}) {
+  const bids = book.orders.filter((order) => order.side === "bid")
+  const asks = book.orders.filter((order) => order.side === "ask")
+  return (
+    <section className="mb-4 rounded-xl border border-border bg-card/35 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Individual-order depth
+          </p>
+          <h3 className="mt-1 text-sm font-semibold">Orders behind the visible market</h3>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            Each row is a distinct provider order. Market Squawk keeps these separate even when
+            several orders share the same price.
+          </p>
+        </div>
+        <EvidenceBadge
+          label={book.usableForSelection ? "Current order-level book" : humanize(book.phase)}
+          tone={book.usableForSelection ? "good" : "bad"}
+        />
+      </div>
+      <div className="mt-4 grid gap-4 sm:grid-cols-2">
+        <IndividualOrderSide label="Buy orders" orders={bids} />
+        <IndividualOrderSide label="Sell orders" orders={asks} />
+      </div>
+      <p className="mt-3 text-[10px] leading-5 text-muted-foreground">
+        Showing {book.returnedOrderCount.toLocaleString()} of {book.totalOrderCount.toLocaleString()}
+        {book.sampleTruncated ? " distinct orders in a bounded identity-stable sample." : " distinct orders."}
+        {book.lastMarketAt ? ` Last market update ${dateTime(book.lastMarketAt)}.` : ""}
+      </p>
+    </section>
+  )
+}
+
+function IndividualOrderSide({
+  label,
+  orders,
+}: {
+  label: string
+  orders: NonNullable<UnifiedMarketRow["orderBook"]>["orders"]
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-background/35 p-3">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      {orders.length ? (
+        <ol className="mt-2 divide-y divide-border font-mono text-[10px]">
+          {orders.slice(0, 10).map((order) => (
+            <li key={order.orderId} className="grid grid-cols-[1fr_auto] gap-3 py-2 first:pt-0 last:pb-0">
+              <div>
+                <p>{order.price}</p>
+                <p className="mt-0.5 text-muted-foreground">{shortOrderId(order.orderId)}</p>
+              </div>
+              <p className="text-right">{order.quantity}</p>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="mt-2 text-[10px] text-muted-foreground">No orders in this bounded sample</p>
+      )}
+    </div>
+  )
+}
+
+function shortOrderId(orderId: string) {
+  return orderId.length <= 18 ? orderId : `${orderId.slice(0, 8)}…${orderId.slice(-6)}`
+}
+
 function InstrumentPanel({
   title,
   available,
@@ -669,18 +885,11 @@ function Summary({
   )
 }
 
-function ResultBoundary({
-  snapshot,
-  quality,
-}: {
-  snapshot: ReturnType<typeof resultState>
-  quality: ReturnType<typeof resultState>
-}) {
+function UnifiedResultBoundary({ feed }: { feed: ReturnType<typeof resultState> }) {
   return (
     <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-      Snapshot result: {boundary(snapshot)}. Quality result: {boundary(quality)}. Prices and
-      quantities remain in instrument ticks and lots because this view does not receive an
-      authoritative display scale.
+      Unified market result: {boundary(feed)}. Each displayed price uses the exact canonical
+      instrument scale, while source, coverage, freshness, and confidence remain attached.
     </p>
   )
 }
@@ -769,16 +978,8 @@ function qualityName(value: string | null) {
   return value ? humanize(value) : "Not reported"
 }
 
-function name(value: string | null) {
-  return value ? humanize(value) : "Not reported"
-}
-
 function truth(value: boolean | null, yes: string, no: string) {
   return value === null ? "Not reported" : value ? yes : no
-}
-
-function depth(bids: number | string | null, asks: number | string | null) {
-  return bids === null || asks === null ? "Not reported" : `${bids} bid / ${asks} ask levels`
 }
 
 function dateTime(value: string | null) {
@@ -796,24 +997,6 @@ function boundary(value: ReturnType<typeof resultState>) {
 function requiredInstrument(value: string | null) {
   if (!value) throw new Error("Select a market instrument first.")
   return value
-}
-
-function lookupInstrumentLabel(
-  result: ApplicationResult | undefined,
-  instrumentId: string | null,
-): string | null {
-  if (!result || !instrumentId) return null
-  const lookup = lookupResultSchema.safeParse(result.data)
-  if (!lookup.success) return null
-  const match = lookup.data.matches.find(
-    (candidate) =>
-      candidate.category === "instrument" && candidate.id === instrumentId,
-  )
-  if (!match) return null
-  const detail = instrumentLookupDetailSchema.safeParse(match.detail)
-  return detail.success
-    ? detail.data.companyName ?? detail.data.displayName
-    : match.label
 }
 
 function levelSummary(value: BookLevel | null) {

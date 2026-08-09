@@ -29,6 +29,12 @@ pub(crate) async fn dashboard_query(
         }
         DashboardQueryCommand::MarketSnapshot => ("Market.GetSnapshot", Map::new()),
         DashboardQueryCommand::MarketQuality => ("Market.GetQuality", Map::new()),
+        DashboardQueryCommand::MarketUnifiedFeed => ("Market.GetUnifiedFeed", Map::new()),
+        DashboardQueryCommand::MarketUniverse { text } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "query", text);
+            ("Market.SearchUniverse", arguments)
+        }
         DashboardQueryCommand::MarketTrades { instrument_id } => {
             ("Market.GetTrades", instrument_arguments(instrument_id))
         }

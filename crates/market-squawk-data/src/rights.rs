@@ -33,12 +33,18 @@ impl fmt::Debug for RightsRegistrar {
 pub struct RegisteredRightsGrant {
     pub(crate) catalog_id: Uuid,
     pub(crate) rights_id: [u8; 32],
+    pub(crate) payload_digest: EvidenceDigest,
 }
 
 impl RegisteredRightsGrant {
     /// Returns the durable grant identity for local control-plane persistence.
     pub const fn rights_id(&self) -> [u8; 32] {
         self.rights_id
+    }
+
+    /// Returns the exact retrieved payload covered by this sealed grant.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
     }
 }
 

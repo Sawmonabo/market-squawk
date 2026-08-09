@@ -1,7 +1,14 @@
 //! Lease-gated construction of production live and research adapters.
 
+mod account;
+mod alpaca;
+pub(crate) mod credentials;
 mod direct;
+mod kraken_l3;
+mod market_config;
+pub(crate) mod nasdaq_reference;
 mod specs;
+mod tradier;
 
 use std::{
     fmt,
@@ -41,13 +48,31 @@ use market_squawk_sources::{
 };
 use specs::BlsAdapterConfiguration;
 
+pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
+pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
+pub use kraken_l3::{
+    KrakenL3AccountActivation, KrakenL3ActivationError, KrakenL3WebSocketTokenMaterial,
+};
+pub use market_config::{
+    AlpacaBasicMarketConfigurationInput, BoundedMarketInstrumentSet,
+    KrakenL3MarketConfigurationInput, MarketConfigAuthorityRequirement, MarketInstrumentBinding,
+    MarketInstrumentReferenceBinding, MarketProviderConfigurationError, MarketSourceEvidence,
+    MarketSubscriptionPriority, PreparedAlpacaBasicMarketConfiguration,
+    PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,
+    PreparedTradierMarketConfiguration, ProviderMarketConfigurationRequest,
+    TradierMarketConfigurationInput,
+};
 pub use specs::{
     BlsAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
     CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
     ControlledLocalFileAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
     PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
     SecAdapterActivation, TreasuryAdapterActivation,
+};
+pub use tradier::{
+    TradierMarketDataAccountActivation, TradierMarketDataActivationError,
+    TradierStreamingActivation,
 };
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";

@@ -3,6 +3,7 @@
 mod config;
 mod decoder;
 mod messages;
+mod normalized;
 
 pub use config::{
     KRAKEN_L3_CHECKSUM_CANONICALIZATION_ID, KRAKEN_L3_CHECKSUM_SCOPE_ID,
@@ -16,3 +17,4 @@ pub use decoder::{
     KrakenL3DecodeOutcome, KrakenL3Decoder, KrakenL3DecoderState, KrakenL3Order,
     KrakenL3OrderEvent, KrakenL3OrderEventKind,
 };
+pub use normalized::{KrakenL3ScaleError, KrakenL3ScaledOrder, KrakenL3ScaledOrderEvent};

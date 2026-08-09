@@ -96,12 +96,12 @@ use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
     FairValueInputAuthorityError, FairValueInputAuthorityLimits,
     FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
-    LiveFairValueObservationBufferError, MarketRuntimeRegistry, PaperApplicationServices,
-    PaperRuntimeActivityAuthority, PrepublishedResearchSourceRegistration,
-    ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
-    ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
-    ResearchSourceDiscoveryCoordinator, SourceDomainService, SourceLifecycleAuthority,
-    backup::ProductBackupError,
+    LiveFairValueObservationBufferError, MarketReferenceSearchAuthority, MarketRuntimeRegistry,
+    PaperApplicationServices, PaperRuntimeActivityAuthority,
+    PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
+    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
+    ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
+    SourceLifecycleAuthority, backup::ProductBackupError,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
@@ -109,6 +109,7 @@ use crate::backtest_strategy::{
     BacktestStrategyCompositionError, production_backtest_strategy_registry,
 };
 use crate::local_product::operations::{SettingsLifecycleAuthority, WorkspaceRestorePolicy};
+use crate::provider_activation::nasdaq_reference::NasdaqReferenceUniverseService;
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
@@ -402,10 +403,18 @@ impl LocalProduct {
             Arc::clone(&provider_activation),
             Arc::clone(&live_fair_value),
         )?;
+        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = Arc::new(
+            NasdaqReferenceUniverseService::try_new(provider_rate.clone()).map_err(|error| {
+                tracing::error!(%error, "Nasdaq reference-universe startup failed");
+                LocalProductError::NasdaqReference
+            })?,
+        );
         let paper = PaperApplicationServices::new(
             config.clone(),
             Arc::clone(&decisions),
             Arc::clone(&market_runtime),
+            research.instrument_definitions(),
+            reference_search,
         );
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
             paths.clone(),
@@ -1155,6 +1164,9 @@ pub enum LocalProductError {
     /// Multi-provider market runtime construction failed.
     #[error(transparent)]
     MarketRuntime(#[from] market_squawk_services::ServiceError),
+    /// Session-only official U.S. listing-reference composition failed.
+    #[error("session-only official U.S. listing-reference composition failed")]
+    NasdaqReference,
     /// Fair-value catalog, limits, or ruleset construction failed.
     #[error(transparent)]
     FairValue(#[from] market_squawk_valuation::FairValueError),

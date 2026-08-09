@@ -201,6 +201,10 @@ pub(crate) enum DashboardQueryCommand {
     },
     MarketSnapshot,
     MarketQuality,
+    MarketUnifiedFeed,
+    MarketUniverse {
+        text: Option<String>,
+    },
     MarketTrades {
         instrument_id: Uuid,
     },

@@ -19,6 +19,7 @@ use market_squawk_adapter_paper::{
     PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionSnapshot, PaperFillSnapshot,
     PaperOrderSnapshot, PaperPosition,
 };
+use market_squawk_data::InstrumentDefinitionReadCapability;
 use market_squawk_decisions::{InvestmentTargetSetId, TargetState, TargetStatus};
 use market_squawk_domain::{
     BasisPoints, DigestAlgorithm, Money, OrderId, OrderSide, OrderType, PriceTicks, QuantityLots,
@@ -75,7 +76,14 @@ const MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES: usize = 4_096;
 pub struct PaperApplicationServices {
     controller: Arc<PaperController>,
     market_runtime: Arc<MarketRuntimeRegistry>,
+    instrument_definitions: InstrumentDefinitionReadCapability,
+    reference_search: Arc<dyn market::MarketReferenceSearchAuthority>,
 }
+
+pub(crate) use market::{
+    MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
+    MarketReferenceSearchPage,
+};
 
 /// Exact synchronous paper/execution facts accepted by lifecycle preflight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +147,8 @@ impl PaperApplicationServices {
         config: AppConfig,
         decisions: Arc<DecisionApplication>,
         market_runtime: Arc<MarketRuntimeRegistry>,
+        instrument_definitions: InstrumentDefinitionReadCapability,
+        reference_search: Arc<dyn MarketReferenceSearchAuthority>,
     ) -> Self {
         Self {
             controller: Arc::new(PaperController::new(
@@ -147,6 +157,8 @@ impl PaperApplicationServices {
                 Arc::clone(&market_runtime),
             )),
             market_runtime,
+            instrument_definitions,
+            reference_search,
         }
     }
 
@@ -166,9 +178,11 @@ impl PaperApplicationServices {
 
     /// Returns the Market-domain implementation sharing this sole runtime owner.
     pub fn market(&self) -> Arc<dyn ApplicationDomainService> {
-        Arc::new(market::MarketDomainService::new(Arc::clone(
-            &self.market_runtime,
-        )))
+        Arc::new(market::MarketDomainService::new(
+            Arc::clone(&self.market_runtime),
+            self.instrument_definitions.clone(),
+            Arc::clone(&self.reference_search),
+        ))
     }
 
     /// Returns an authority-free Source-domain view sharing this sole live-runtime owner.
@@ -192,6 +206,11 @@ impl fmt::Debug for PaperApplicationServices {
             .debug_struct("PaperApplicationServices")
             .field("controller", &self.controller)
             .field("market_runtime", &self.market_runtime)
+            .field(
+                "instrument_definitions",
+                &"[SEALED INSTRUMENT-DEFINITION READ AUTHORITY]",
+            )
+            .field("reference_search", &self.reference_search)
             .finish()
     }
 }

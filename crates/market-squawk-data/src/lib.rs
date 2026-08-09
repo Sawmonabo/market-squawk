@@ -62,10 +62,19 @@ pub use catalog::{
     FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
     FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind, IngestReservation,
     IngestRunRecord, IngestRunState, InstrumentSearchMatch, InstrumentSearchPage,
-    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
-    PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic, PublishedIngest,
-    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
-    ResumedIngest, ResumedProviderOnboarding, SourceCursor, StoredObservedRevision,
+    ListingReferenceDirectoryPresence, ListingReferenceError, ListingReferenceExchangeCode,
+    ListingReferenceFileEvidence, ListingReferenceFileKind, ListingReferenceFinancialStatus,
+    ListingReferenceGenerationInput, ListingReferenceGenerationReceipt,
+    ListingReferenceMarketCategory, ListingReferenceMatchKind,
+    ListingReferencePublicationCapability, ListingReferencePublicationDisposition,
+    ListingReferencePublicationReceipt, ListingReferenceReadCapability, ListingReferenceRecord,
+    ListingReferenceRecordInput, ListingReferenceRightsState, ListingReferenceSearchMatch,
+    ListingReferenceSearchPage, ListingReferenceSourceFileInput, MAX_LISTING_REFERENCE_RECORDS,
+    MAX_LISTING_REFERENCE_SEARCH_ROWS, OnboardingAppendOutcome, OnboardingReservation,
+    OnboardingReservationRequest, PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic,
+    PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
+    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
+    StoredObservedRevision,
 };
 pub use catalog_capabilities::{
     CompanyIdentityReadCapability, FairValueCatalogCapability, InstrumentCatalogCapability,
@@ -88,8 +97,9 @@ pub use dataset_builder::{
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    IngestPrecommitAuthority, PinnedArtifactQueryRequest, QueryArtifactPublication,
-    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
+    IngestPrecommitAuthority, ListingReferenceAdmissionCapability, PinnedArtifactQueryRequest,
+    QueryArtifactPublication, ResearchIngestService, extraction_batch_digest,
+    extraction_provider_payload_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,

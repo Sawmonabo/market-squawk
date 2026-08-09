@@ -13,7 +13,9 @@ use market_squawk_domain::{ConnectionGeneration, IdentityError, MetadataRevision
 use market_squawk_sources::{ControlFrameKind, IgnoredFrameReason, SessionId};
 use thiserror::Error;
 
-const MAX_PRODUCTS: usize = 100;
+// Covers the largest admitted free-provider live selection (Tradier: 256) without permitting an
+// unbounded provider-controlled product set.
+const MAX_PRODUCTS: usize = 256;
 const MAX_PRODUCT_BYTES: usize = 64;
 const MAX_CONTROL_MESSAGES: usize = 4_096;
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
@@ -109,6 +111,16 @@ pub(super) enum SubscriptionPhase {
     Invalid,
 }
 
+/// Provider-specific proof required before a configured subscription may publish market data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SubscriptionAcknowledgementPolicy {
+    /// A provider control frame must acknowledge the exact configured product set.
+    ExplicitProviderFrame,
+    /// The first captured, decoded, registry-validated event for a configured route proves the
+    /// provider accepted a transport whose protocol defines no separate acknowledgement frame.
+    FirstValidatedData,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuditRecordKind {
     Control(ControlFrameKind),
@@ -127,6 +139,7 @@ pub(super) struct SubscriptionStateMachine {
     generation: GenerationIdentity,
     expected_products: Vec<String>,
     acknowledgement_deadline: Instant,
+    acknowledgement_policy: SubscriptionAcknowledgementPolicy,
     phase: SubscriptionPhase,
     transition: u64,
     rejected_pre_acknowledgement_data: u64,
@@ -144,6 +157,24 @@ impl SubscriptionStateMachine {
         acknowledgement_timeout: Duration,
         started_at: Instant,
         limits: SubscriptionLimits,
+    ) -> Result<Self, SubscriptionConstructionError> {
+        Self::try_new_with_policy(
+            generation,
+            products,
+            acknowledgement_timeout,
+            started_at,
+            limits,
+            SubscriptionAcknowledgementPolicy::ExplicitProviderFrame,
+        )
+    }
+
+    pub(super) fn try_new_with_policy<'a>(
+        generation: GenerationIdentity,
+        products: impl IntoIterator<Item = &'a str>,
+        acknowledgement_timeout: Duration,
+        started_at: Instant,
+        limits: SubscriptionLimits,
+        acknowledgement_policy: SubscriptionAcknowledgementPolicy,
     ) -> Result<Self, SubscriptionConstructionError> {
         if acknowledgement_timeout.is_zero() {
             return Err(SubscriptionConstructionError::InvalidAcknowledgementTimeout);
@@ -193,6 +224,7 @@ impl SubscriptionStateMachine {
             generation,
             expected_products,
             acknowledgement_deadline,
+            acknowledgement_policy,
             phase: SubscriptionPhase::AwaitingAcknowledgement,
             transition: 0,
             rejected_pre_acknowledgement_data: 0,
@@ -206,6 +238,13 @@ impl SubscriptionStateMachine {
 
     pub(super) const fn phase(&self) -> SubscriptionPhase {
         self.phase
+    }
+
+    pub(super) const fn accepts_first_validated_data(&self) -> bool {
+        matches!(
+            self.acknowledgement_policy,
+            SubscriptionAcknowledgementPolicy::FirstValidatedData
+        )
     }
 
     pub(super) const fn pre_acknowledgement_data_limits(&self) -> (usize, usize) {

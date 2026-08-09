@@ -38,7 +38,8 @@ export type SetupPlanSelection = {
 export type DashboardQuery =
   | { query: "overview" }
   | { query: "lookup"; text: string; categories?: string[] }
-  | { query: "marketSnapshot" | "marketQuality" }
+  | { query: "marketSnapshot" | "marketQuality" | "marketUnifiedFeed" }
+  | { query: "marketUniverse"; text?: string }
   | {
       query:
         | "marketTrades"

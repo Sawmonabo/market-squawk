@@ -29,6 +29,7 @@ pub mod lifecycle;
 mod live_fair_value;
 pub mod logs;
 mod market_runtime;
+pub(crate) mod market_selection;
 pub mod model;
 pub mod operations;
 mod paper;
@@ -52,7 +53,10 @@ pub use fair_value::{
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub(crate) use market_runtime::MarketRuntimeRegistry;
 pub use paper::PaperApplicationServices;
-pub(crate) use paper::PaperRuntimeActivityAuthority;
+pub(crate) use paper::{
+    MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
+    MarketReferenceSearchPage, PaperRuntimeActivityAuthority,
+};
 pub(crate) use research::{
     AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,

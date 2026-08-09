@@ -145,7 +145,11 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM analytical_generations)
                  + (SELECT COUNT(*) FROM analytical_generation_objects)
                  + (SELECT COUNT(*) FROM query_artifact_results)
-                 + (SELECT COUNT(*) FROM company_identity_observations)",
+                 + (SELECT COUNT(*) FROM company_identity_observations)
+                 + (SELECT COUNT(*) FROM listing_reference_generations)
+                 + (SELECT COUNT(*) FROM listing_reference_files)
+                 + (SELECT COUNT(*) FROM listing_reference_values)
+                 + (SELECT COUNT(*) FROM listing_reference_memberships)",
             [],
             |row| row.get(0),
         )?;

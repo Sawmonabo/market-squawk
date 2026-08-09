@@ -36,5 +36,5 @@ pub use rest::{
 };
 pub use source::{
     TradierAccountMarketData, TradierAccountMarketDataError, TradierStreamingSource,
-    TradierSubscriptionController, TradierSubscriptionError,
+    TradierSubscriptionAuthority, TradierSubscriptionController, TradierSubscriptionError,
 };

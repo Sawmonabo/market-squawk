@@ -4,6 +4,7 @@ mod composition;
 mod direct;
 mod instruments;
 mod kraken;
+pub(crate) mod order_level;
 mod provider;
 #[cfg(feature = "release-evidence")]
 mod release_support;

@@ -96,6 +96,8 @@ const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("query", ArgumentKind::Text),
     ArgumentSpec::optional("categories", ArgumentKind::Array),
 ];
+const MARKET_UNIVERSE_SEARCH_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::optional("query", ArgumentKind::Text)];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
@@ -882,6 +884,18 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     read_data(
         "Market.GetComparisons",
         "Compare bounded observations across requested sources.",
+    ),
+    read_data(
+        "Market.GetUnifiedFeed",
+        "Return one source-preserving market view per exact instrument.",
+    ),
+    read(
+        "Market.SearchUniverse",
+        "Search the bounded admitted market reference universe without creating tradable instruments.",
+        ServiceDomain::Market,
+        DATA_SCOPE,
+        MARKET_UNIVERSE_SEARCH_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read(
         "Research.ListDatasets",

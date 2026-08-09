@@ -33,11 +33,12 @@ use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
     CatalogError, ContractCompletion, DatasetArrowBatch, DatasetId, DatasetManifestRecord,
     DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestIdentity, IngestReservation,
-    IngestRunState, ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError,
-    ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset,
-    PinnedQueryOutput, PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput,
-    QueryError, QueryLimits, QueryRequest, ResearchArrowBatch, ResearchQueryEngine,
-    RightsDecisionInput, Sha256Digest, SourceOperation,
+    IngestRunState, ListingReferenceError, ListingReferencePublicationCapability,
+    ListingReferenceReadCapability, ManifestCatalogError, ManifestObject, ManifestPlan,
+    ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
+    ParquetStoreError, PinnedDataset, PinnedQueryOutput, PublishedObject, QueryArtifactReservation,
+    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, ResearchArrowBatch,
+    ResearchQueryEngine, RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -160,6 +161,83 @@ pub struct AnalyticalDataService {
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     operation_gate: AnalyticalOperationGate,
+}
+
+/// Least-authority factory for one exact listing-reference source.
+#[derive(Clone)]
+pub struct ListingReferenceAdmissionCapability {
+    authority: Arc<Mutex<CatalogAuthority>>,
+    dataset: SourceIdentifier,
+    source: SourceMetadata,
+    registered_at: Timestamp,
+}
+
+impl fmt::Debug for ListingReferenceAdmissionCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ListingReferenceAdmissionCapability")
+            .field("dataset", &self.dataset)
+            .field("source_id", self.source.source_id())
+            .field(
+                "authority",
+                &"[SEALED LISTING-REFERENCE ADMISSION AUTHORITY]",
+            )
+            .finish()
+    }
+}
+
+impl ListingReferenceAdmissionCapability {
+    /// Returns the exact dataset namespace bound to this capability.
+    pub const fn dataset(&self) -> &SourceIdentifier {
+        &self.dataset
+    }
+
+    /// Returns the exact source namespace bound to this capability.
+    pub const fn source_id(&self) -> &market_squawk_domain::SourceId {
+        self.source.source_id()
+    }
+
+    /// Returns a source-bound reader that cannot register rights or publish a generation.
+    pub fn reader(&self) -> ListingReferenceReadCapability {
+        ListingReferenceReadCapability::new(
+            Arc::clone(&self.authority),
+            self.dataset.clone(),
+            self.source.source_id().clone(),
+        )
+    }
+
+    /// Registers the exact source revision and binds a payload-specific rights decision into one
+    /// publication capability.
+    pub fn admit(
+        &self,
+        rights: RightsDecisionInput,
+    ) -> Result<ListingReferencePublicationCapability, IngestError> {
+        if self.source.source_id() != &rights.source_id {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let source_id = self.source.source_id().clone();
+        let grant = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_| IngestError::AuthorityLockPoisoned)?;
+            if authority
+                .source(&source_id)?
+                .as_ref()
+                .is_none_or(|registered| registered != &self.source)
+            {
+                authority.register_source(&self.source, self.registered_at)?;
+            }
+            authority.admit_source_rights(rights)?
+        };
+        ListingReferencePublicationCapability::try_new(
+            Arc::clone(&self.authority),
+            self.dataset.clone(),
+            source_id,
+            grant,
+        )
+        .map_err(Into::into)
+    }
 }
 
 /// Complete immutable operation input for one bounded pinned query with durable overflow.
@@ -753,6 +831,21 @@ impl AnalyticalDataService {
     /// Returns bounded canonical-instrument publication authority over the sole catalog writer.
     pub fn instrument_catalog(&self) -> crate::InstrumentCatalogCapability {
         crate::InstrumentCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Returns a sealed admission factory for one exact listing-reference source.
+    pub fn listing_reference_admission(
+        &self,
+        source: SourceMetadata,
+        registered_at: Timestamp,
+        dataset: SourceIdentifier,
+    ) -> ListingReferenceAdmissionCapability {
+        ListingReferenceAdmissionCapability {
+            authority: Arc::clone(&self.authority),
+            dataset,
+            source,
+            registered_at,
+        }
     }
 
     /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
@@ -1515,6 +1608,9 @@ pub enum IngestError {
     /// Task 3 rejected a reservation, publication, or transition.
     #[error("analytical catalog authority rejected the operation")]
     Catalog(#[from] CatalogError),
+    /// Reference-source registration, publication authority, or bounded read setup failed.
+    #[error("listing-reference authority rejected the operation")]
+    ListingReference(#[from] ListingReferenceError),
     /// Catalog and manifest capabilities do not identify the same prepared catalog path.
     #[error("analytical service capabilities name different catalogs")]
     CatalogCompositionMismatch,

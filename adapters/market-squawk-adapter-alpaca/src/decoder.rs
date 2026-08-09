@@ -41,7 +41,7 @@ impl AlpacaIexDecoder {
             symbols,
             VenueId::try_from(IEX_VENUE)?,
             DecoderSurface::Iex,
-            config.limits().max_frame_bytes(),
+            config.transport_limits().max_frame_bytes(),
         )?))
     }
 }
@@ -79,7 +79,7 @@ impl AlpacaOptionsDecoder {
             symbols,
             VenueId::try_from(INDICATIVE_OPTIONS_VENUE)?,
             DecoderSurface::IndicativeOptions,
-            config.limits().max_frame_bytes(),
+            config.transport_limits().max_frame_bytes(),
         )?))
     }
 }

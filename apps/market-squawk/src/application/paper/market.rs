@@ -2,28 +2,39 @@
 
 mod results;
 mod serialization;
+mod unified;
 
-use std::{cmp::Ordering, fmt, sync::Arc, time::Instant};
+use std::{cmp::Ordering, fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use market_squawk_domain::{InstrumentId, SourceIdentifier, Timestamp};
+use market_squawk_data::InstrumentDefinitionReadCapability;
+use market_squawk_domain::{
+    AssetClass, CoverageDelay, DataQuality, EvidenceDigest, InstrumentDefinition, InstrumentId,
+    LiveEventClass, MarketDepth, SourceId, SourceIdentifier, Timestamp, VenueId,
+};
 use market_squawk_live::{
     RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
 };
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, TypedToolRequest, TypedToolResult,
 };
+use market_squawk_sources::SourceMetadata;
 use serde_json::Value;
 
 use super::ensure_live;
-use crate::application::market_runtime::{MarketRuntimeRegistry, MarketRuntimeSnapshotBatch};
+use crate::application::market_runtime::{
+    MarketOrderLevelSnapshot, MarketRuntimeRegistry, MarketRuntimeSnapshotBatch,
+};
 use crate::application::{ApplicationDomainService, effective_service_limits};
 use results::{
     build_book_result, build_comparison_result, build_quality_result, build_quote_result,
     build_snapshot_result, build_trade_result,
 };
-use serialization::source_coverage_value;
+use serialization::{source_coverage_value, timestamp_value};
+use unified::{
+    MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_unified_market_result,
+};
 
 const MARKET_GET_SNAPSHOT: &str = "Market.GetSnapshot";
 const MARKET_GET_TRADES: &str = "Market.GetTrades";
@@ -31,15 +42,169 @@ const MARKET_GET_QUOTES: &str = "Market.GetQuotes";
 const MARKET_GET_BOOKS: &str = "Market.GetBooks";
 const MARKET_GET_QUALITY: &str = "Market.GetQuality";
 const MARKET_GET_COMPARISONS: &str = "Market.GetComparisons";
+const MARKET_GET_UNIFIED_FEED: &str = "Market.GetUnifiedFeed";
+const MARKET_SEARCH_UNIVERSE: &str = "Market.SearchUniverse";
+const MAXIMUM_UNIFIED_MARKET_INSTRUMENTS: usize = 4_096;
+const MAXIMUM_UNIFIED_ORDER_SAMPLE: usize = 64;
+const MAXIMUM_REFERENCE_SEARCH_ROWS: usize = 100;
+
+/// Why one official reference record matched the user's bounded search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MarketReferenceMatchKind {
+    DefaultOverview,
+    ExactSymbol,
+    SymbolPrefix,
+    SymbolContains,
+    SecurityNamePrefix,
+    SecurityNameContains,
+}
+
+impl MarketReferenceMatchKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultOverview => "default_overview",
+            Self::ExactSymbol => "exact_symbol",
+            Self::SymbolPrefix => "symbol_prefix",
+            Self::SymbolContains => "symbol_contains",
+            Self::SecurityNamePrefix => "security_name_prefix",
+            Self::SecurityNameContains => "security_name_contains",
+        }
+    }
+}
+
+/// One non-tradable current-directory identity with exact provider provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MarketReferenceRecord {
+    reference_id: SourceIdentifier,
+    symbol: String,
+    security_name: String,
+    venue_id: VenueId,
+    asset_class: AssetClass,
+    is_etf: bool,
+    round_lot_size: u32,
+    quality: DataQuality,
+    effective_at: Timestamp,
+    available_at: Timestamp,
+    source_id: SourceId,
+    provider_id: SourceIdentifier,
+    source_payload_digest: EvidenceDigest,
+    match_kind: MarketReferenceMatchKind,
+}
+
+impl MarketReferenceRecord {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reference identity, classification, time, source, and evidence remain explicit"
+    )]
+    pub(crate) fn try_new(
+        reference_id: SourceIdentifier,
+        symbol: String,
+        security_name: String,
+        venue_id: VenueId,
+        asset_class: AssetClass,
+        is_etf: bool,
+        round_lot_size: u32,
+        quality: DataQuality,
+        effective_at: Timestamp,
+        available_at: Timestamp,
+        source_id: SourceId,
+        provider_id: SourceIdentifier,
+        source_payload_digest: EvidenceDigest,
+        match_kind: MarketReferenceMatchKind,
+    ) -> Result<Self, ServiceError> {
+        if symbol.is_empty()
+            || symbol.len() > 64
+            || security_name.trim().is_empty()
+            || security_name.len() > 512
+            || !matches!(asset_class, AssetClass::Equity | AssetClass::Fund)
+            || effective_at > available_at
+            || source_payload_digest.bytes() == [0; 32]
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(Self {
+            reference_id,
+            symbol,
+            security_name,
+            venue_id,
+            asset_class,
+            is_etf,
+            round_lot_size,
+            quality,
+            effective_at,
+            available_at,
+            source_id,
+            provider_id,
+            source_payload_digest,
+            match_kind,
+        })
+    }
+
+    pub(crate) fn with_match_kind(mut self, match_kind: MarketReferenceMatchKind) -> Self {
+        self.match_kind = match_kind;
+        self
+    }
+}
+
+/// One bounded current reference-universe page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MarketReferenceSearchPage {
+    records: Box<[MarketReferenceRecord]>,
+    available: usize,
+    has_more: bool,
+}
+
+impl MarketReferenceSearchPage {
+    pub(crate) fn try_new(
+        records: Vec<MarketReferenceRecord>,
+        available: usize,
+        has_more: bool,
+    ) -> Result<Self, ServiceError> {
+        if records.len() > available || has_more != (available > records.len()) {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(Self {
+            records: records.into_boxed_slice(),
+            available,
+            has_more,
+        })
+    }
+}
+
+/// Session-owned, non-persistent reference lookup shared by every Market presentation.
+#[async_trait]
+pub(crate) trait MarketReferenceSearchAuthority: fmt::Debug + Send + Sync + 'static {
+    async fn search(
+        &self,
+        query: &str,
+        maximum_rows: usize,
+        deadline: Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<MarketReferenceSearchPage, ServiceError>;
+
+    fn begin_shutdown(&self);
+
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
+}
 
 /// Current-state Market service over every healthy provider runtime.
 pub(super) struct MarketDomainService {
     registry: Arc<MarketRuntimeRegistry>,
+    instrument_definitions: InstrumentDefinitionReadCapability,
+    reference_search: Arc<dyn MarketReferenceSearchAuthority>,
 }
 
 impl MarketDomainService {
-    pub(super) const fn new(registry: Arc<MarketRuntimeRegistry>) -> Self {
-        Self { registry }
+    pub(super) fn new(
+        registry: Arc<MarketRuntimeRegistry>,
+        instrument_definitions: InstrumentDefinitionReadCapability,
+        reference_search: Arc<dyn MarketReferenceSearchAuthority>,
+    ) -> Self {
+        Self {
+            registry,
+            instrument_definitions,
+            reference_search,
+        }
     }
 }
 
@@ -68,6 +233,26 @@ impl ApplicationDomainService for MarketDomainService {
             return Err(ServiceError::Unavailable);
         }
         let limits = effective_service_limits(&request, &context)?;
+        if request.name() == MARKET_SEARCH_UNIVERSE {
+            let query = request
+                .arguments()
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let maximum_rows = limits
+                .maximum_result_items()
+                .min(MAXIMUM_REFERENCE_SEARCH_ROWS);
+            let page = self
+                .reference_search
+                .search(
+                    query,
+                    maximum_rows,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?;
+            return build_reference_search_result(page, limits, &context);
+        }
         let filters = MarketFilters::parse(&request)?;
         let reference_at = system_timestamp()?;
         let snapshots = self
@@ -76,7 +261,7 @@ impl ApplicationDomainService for MarketDomainService {
             .await?;
         let streams = collect_streams(&snapshots, &filters, &context)?;
 
-        let source_coverage = source_coverage_value(&streams, &filters);
+        let source_coverage = source_coverage_value(&streams, snapshots.failures(), &filters);
         let output = match request.name() {
             MARKET_GET_SNAPSHOT => build_snapshot_result(
                 &streams,
@@ -126,6 +311,24 @@ impl ApplicationDomainService for MarketDomainService {
                 limits,
                 &context,
             ),
+            MARKET_GET_UNIFIED_FEED => {
+                let definitions =
+                    load_instrument_definitions(&self.instrument_definitions, &streams, &context)?;
+                let order_level =
+                    load_order_level_snapshots(self.registry.as_ref(), &streams, &context).await?;
+                let surface_policies = build_surface_policies(&snapshots, reference_at)?;
+                build_unified_market_result(
+                    &streams,
+                    &filters,
+                    &definitions,
+                    &surface_policies,
+                    &order_level,
+                    reference_at,
+                    source_coverage,
+                    limits,
+                    &context,
+                )
+            }
             _ => Err(ServiceError::NotFound),
         }?;
         ensure_live(&context)?;
@@ -133,11 +336,311 @@ impl ApplicationDomainService for MarketDomainService {
     }
 
     fn begin_shutdown(&self) {
+        self.reference_search.begin_shutdown();
         self.registry.begin_shutdown();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
-        self.registry.finish_shutdown(deadline).await
+        let market = self.registry.finish_shutdown(deadline).await;
+        let reference = self.reference_search.finish_shutdown(deadline).await;
+        market.and(reference)
+    }
+}
+
+fn build_reference_search_result(
+    page: MarketReferenceSearchPage,
+    limits: market_squawk_services::ServiceLimits,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
+    use crate::application::domain_support::encode_hex;
+
+    let MarketReferenceSearchPage {
+        records,
+        available,
+        has_more,
+    } = page;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(records.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for record in records {
+        ensure_live(context)?;
+        let quality = match record.quality {
+            DataQuality::OfficialDelayed => "official_delayed",
+            _ => return Err(ServiceError::InvalidResult),
+        };
+        values.push(serde_json::json!({
+            "referenceId": record.reference_id.as_str(),
+            "symbol": record.symbol,
+            "name": record.security_name.trim(),
+            "venueId": record.venue_id.as_str(),
+            "assetClass": match record.asset_class {
+                AssetClass::Equity => "equity",
+                AssetClass::Fund => "fund",
+                _ => return Err(ServiceError::InvalidResult),
+            },
+            "referenceOnly": true,
+            "isEtf": record.is_etf,
+            "roundLotSize": record.round_lot_size,
+            "directoryPresence": "current_directory",
+            "quality": quality,
+            "effectiveAt": timestamp_value(record.effective_at),
+            "availableAt": timestamp_value(record.available_at),
+            "sourceId": record.source_id.as_str(),
+            "providerId": record.provider_id.as_str(),
+            "sourcePayloadSha256": encode_hex(record.source_payload_digest.bytes()),
+            "matchKind": record.match_kind.as_str(),
+            "quoteAvailability": "account_required",
+        }));
+    }
+    results::bounded_result(
+        &values,
+        available,
+        serde_json::json!({
+            "complete": !has_more,
+            "referenceOnly": true,
+            "provider": "nasdaq-trader-symbol-directory",
+        }),
+        serde_json::json!({
+            "quality": "official_delayed",
+            "executionEligible": false,
+        }),
+        limits,
+        context,
+    )
+}
+
+fn load_instrument_definitions(
+    reader: &InstrumentDefinitionReadCapability,
+    streams: &[StreamView<'_>],
+    context: &RequestContext,
+) -> Result<Vec<InstrumentDefinition>, ServiceError> {
+    let mut instrument_ids = Vec::new();
+    instrument_ids
+        .try_reserve_exact(streams.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    instrument_ids.extend(streams.iter().map(|view| view.route.route().instrument()));
+    instrument_ids.sort_unstable();
+    instrument_ids.dedup();
+    if instrument_ids.len() > MAXIMUM_UNIFIED_MARKET_INSTRUMENTS {
+        return Err(ServiceError::ResourceExhausted);
+    }
+    if instrument_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let definitions = reader
+        .latest(
+            &instrument_ids,
+            MAXIMUM_UNIFIED_MARKET_INSTRUMENTS,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "unified Markets instrument-definition read failed");
+            ServiceError::Unavailable
+        })?;
+    if definitions.len() != instrument_ids.len() {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(definitions)
+}
+
+async fn load_order_level_snapshots(
+    registry: &MarketRuntimeRegistry,
+    streams: &[StreamView<'_>],
+    context: &RequestContext,
+) -> Result<Vec<MarketOrderLevelSnapshot>, ServiceError> {
+    let maximum_orders =
+        NonZeroUsize::new(MAXIMUM_UNIFIED_ORDER_SAMPLE).ok_or(ServiceError::Internal)?;
+    let mut snapshots = Vec::new();
+    snapshots
+        .try_reserve_exact(streams.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for view in streams {
+        ensure_live(context)?;
+        if !supports_order_level(view.metadata) {
+            continue;
+        }
+        if snapshots
+            .iter()
+            .any(|existing| exact_order_level_identity(existing, view))
+        {
+            continue;
+        }
+        if let Some(snapshot) = registry
+            .order_level_snapshot(
+                view.stream.source(),
+                view.route.route().venue(),
+                view.route.route().instrument(),
+                view.stream.connection_generation(),
+                maximum_orders,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?
+        {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
+fn exact_order_level_identity(snapshot: &MarketOrderLevelSnapshot, view: &StreamView<'_>) -> bool {
+    snapshot.source_id() == view.stream.source()
+        && snapshot.venue_id() == view.route.route().venue()
+        && snapshot.instrument_id() == view.route.route().instrument()
+        && snapshot.generation() == view.stream.connection_generation()
+}
+
+fn supports_order_level(metadata: &SourceMetadata) -> bool {
+    metadata.coverage().live().is_some_and(|coverage| {
+        coverage
+            .rules()
+            .iter()
+            .any(|rule| rule.depth() == Some(MarketDepth::OrderLevel))
+    })
+}
+
+fn build_surface_policies(
+    snapshots: &MarketRuntimeSnapshotBatch,
+    reference_at: Timestamp,
+) -> Result<Vec<MarketSurfaceSelectionPolicy>, ServiceError> {
+    let policy_count = snapshots
+        .sources()
+        .iter()
+        .try_fold(0_usize, |count, source| {
+            source.metadata().iter().try_fold(count, |count, metadata| {
+                count.checked_add(metadata.coverage().asset_classes().len())
+            })
+        });
+    let policy_count = policy_count.ok_or(ServiceError::ResourceExhausted)?;
+    let operations = crate::application::market_selection::MarketOperationSet::try_new(&[
+        crate::application::market_selection::MarketOperation::SnapshotDisplay,
+        crate::application::market_selection::MarketOperation::StreamDisplay,
+    ])
+    .map_err(|_error| ServiceError::Internal)?;
+    let mut policies = Vec::new();
+    policies
+        .try_reserve_exact(policy_count)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for source in snapshots.sources() {
+        for metadata in source.metadata().iter() {
+            for asset_class in metadata.coverage().asset_classes() {
+                let rights = surface_rights(metadata, operations, reference_at)?;
+                policies.push(MarketSurfaceSelectionPolicy::try_new(
+                    source.surface_id().clone(),
+                    metadata.source_id().clone(),
+                    metadata.provider().clone(),
+                    *asset_class,
+                    operations,
+                    observation_timing(metadata),
+                    presentation_depth(metadata, *asset_class),
+                    market_coverage(metadata, *asset_class),
+                    rights,
+                )?);
+            }
+        }
+    }
+    Ok(policies)
+}
+
+fn surface_rights(
+    metadata: &SourceMetadata,
+    operations: crate::application::market_selection::MarketOperationSet,
+    reference_at: Timestamp,
+) -> Result<MarketSurfaceRightsPolicy, ServiceError> {
+    let decision_id = metadata.revision().as_source_identifier().clone();
+    if !metadata.is_effective_at(reference_at) {
+        return MarketSurfaceRightsPolicy::unavailable(
+            decision_id,
+            crate::application::market_selection::RightsState::Unknown,
+            reference_at,
+        )
+        .map_err(|_error| ServiceError::InvalidResult);
+    }
+    let authorization = metadata.authorization().effective_interval();
+    let coverage = metadata.coverage().effective_interval();
+    let effective_from = authorization.starts_at().max(coverage.starts_at());
+    let effective_until = minimum_optional_timestamp(
+        metadata.authorization().inclusive_authorization_deadline(),
+        metadata.coverage().inclusive_coverage_deadline(),
+    );
+    MarketSurfaceRightsPolicy::try_admitted(
+        decision_id,
+        operations,
+        effective_from,
+        effective_from,
+        effective_until,
+    )
+    .map_err(|_error| ServiceError::InvalidResult)
+}
+
+const fn minimum_optional_timestamp(
+    left: Option<Timestamp>,
+    right: Option<Timestamp>,
+) -> Option<Timestamp> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left.unix_nanos() <= right.unix_nanos() {
+            left
+        } else {
+            right
+        }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+const fn observation_timing(
+    metadata: &SourceMetadata,
+) -> crate::application::market_selection::ObservationTiming {
+    match metadata.coverage().delay() {
+        CoverageDelay::RealTime => {
+            crate::application::market_selection::ObservationTiming::RealTime
+        }
+        CoverageDelay::Delayed(_) => {
+            crate::application::market_selection::ObservationTiming::Delayed
+        }
+    }
+}
+
+fn presentation_depth(metadata: &SourceMetadata, asset_class: AssetClass) -> Option<MarketDepth> {
+    if matches!(asset_class, AssetClass::Index | AssetClass::Cash) {
+        return None;
+    }
+    let Some(live) = metadata.coverage().live() else {
+        return None;
+    };
+    let mut top_of_book = false;
+    for rule in live.rules() {
+        match rule.depth() {
+            Some(MarketDepth::OrderLevel | MarketDepth::PriceLevel) => {
+                // The joined `StreamSnapshot` is aggregated. The exact order-level directory is
+                // exposed separately and must not be inferred from this representation.
+                return Some(MarketDepth::PriceLevel);
+            }
+            Some(MarketDepth::TopOfBook) => top_of_book = true,
+            None if rule.event_class() == LiveEventClass::Quote => top_of_book = true,
+            None => {}
+        }
+    }
+    top_of_book.then_some(MarketDepth::TopOfBook)
+}
+
+fn market_coverage(
+    metadata: &SourceMetadata,
+    asset_class: AssetClass,
+) -> crate::application::market_selection::MarketCoverage {
+    use crate::application::market_selection::MarketCoverage;
+    if asset_class == AssetClass::Index {
+        return MarketCoverage::Benchmark;
+    }
+    let topology = metadata.coverage().topology();
+    if topology.is_consolidated() {
+        MarketCoverage::Consolidated
+    } else if topology.is_partial() {
+        MarketCoverage::MultiVenuePartial
+    } else {
+        MarketCoverage::SingleVenue
     }
 }
 
@@ -243,6 +746,7 @@ fn parse_time_range(value: &Value) -> Result<(Timestamp, Timestamp), ServiceErro
 #[derive(Clone, Copy)]
 struct StreamView<'snapshot> {
     surface_id: &'snapshot SourceIdentifier,
+    metadata: &'snapshot SourceMetadata,
     shard: &'snapshot ShardSnapshot,
     route: &'snapshot RouteSnapshot,
     stream: &'snapshot StreamSnapshot,
@@ -274,8 +778,10 @@ fn collect_streams<'snapshot>(
             ensure_live(context)?;
             for route in shard.routes() {
                 for stream in route.streams() {
+                    let metadata = exact_stream_metadata(source.metadata(), stream.source())?;
                     let view = StreamView {
                         surface_id: source.surface_id(),
+                        metadata,
                         shard,
                         route,
                         stream,
@@ -289,6 +795,20 @@ fn collect_streams<'snapshot>(
     }
     streams.sort_unstable_by(compare_streams);
     Ok(streams)
+}
+
+fn exact_stream_metadata<'metadata>(
+    metadata: &'metadata [SourceMetadata],
+    source_id: &SourceId,
+) -> Result<&'metadata SourceMetadata, ServiceError> {
+    let mut matches = metadata
+        .iter()
+        .filter(|candidate| candidate.source_id() == source_id);
+    let selected = matches.next().ok_or(ServiceError::Unavailable)?;
+    if matches.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(selected)
 }
 
 fn require_complete(dimension: &SnapshotDimension) -> Result<(), ServiceError> {

@@ -1,29 +1,36 @@
 use std::error::Error;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
     CatalogLimit, CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestIdentity,
-    IngestRunState, OnboardingAppendOutcome, OnboardingReservationRequest, RightsBasis,
-    RightsDecisionInput, RightsError, SourceCursor, SourceOperation,
+    IngestRunState, ListingReferenceExchangeCode, ListingReferenceFileKind,
+    ListingReferenceFinancialStatus, ListingReferenceGenerationInput,
+    ListingReferenceMarketCategory, ListingReferencePublicationCapability,
+    ListingReferencePublicationDisposition, ListingReferenceReadCapability,
+    ListingReferenceRecordInput, ListingReferenceSourceFileInput, OnboardingAppendOutcome,
+    OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
+    SourceOperation,
 };
 use market_squawk_domain::{
-    AuthorizationBasis, ChecksumCapability, ContractRollMapping, CoverageDelay, DataQuality,
-    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    InstrumentDefinition, LifecycleTransition, LifecycleTransitionKind, MetadataRevision,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
-    SymbolIdentityRecord, Timestamp, VenueId, VenueSymbol,
+    AssetClass, AuthorizationBasis, ChecksumCapability, ContractRollMapping, CoverageDelay,
+    DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, InstrumentDefinition, LifecycleTransition, LifecycleTransitionKind,
+    MetadataRevision, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    SourceIdentifier, SymbolIdentityRecord, Timestamp, VenueId, VenueSymbol,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
     AuthorityBindings, AuthoritySet, AuthorityVerification, AuthorityVerificationInput,
     AuthorizationGrant, AuthorizationMode, CapabilityRegistrationOutcome, CoverageDomain,
-    CredentialKind, EvidenceBinding, FreshnessPolicy, HistoricalCapability, HumanBoundary,
-    LifecycleSupport, NetworkAccessPolicy, OnboardingEvent, OnboardingState, ProviderCapability,
-    ProviderCapabilityInput, ProviderCapabilityRevision, ProviderPublicConfiguration,
-    RatePolicyDescriptor, RightsAdmissionState, SetupMode, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    CoverageTopology, CredentialKind, EvidenceBinding, FreshnessPolicy, HistoricalCapability,
+    HumanBoundary, InstrumentCoverage, LifecycleSupport, NetworkAccessPolicy, OnboardingEvent,
+    OnboardingState, ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision,
+    ProviderPublicConfiguration, RatePolicyDescriptor, RightsAdmissionState, SetupMode,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceProtocolProfile,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -67,7 +74,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 18);
+    assert_eq!(health.applied_migrations(), 20);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -86,7 +93,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 18);
+    assert_eq!(catalog.health()?.applied_migrations(), 20);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;
@@ -578,6 +585,307 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     );
     assert_eq!(resumed.next_sequence(), 7);
     Ok(())
+}
+
+#[test]
+fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("listing-reference"))?;
+    let config = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let source = listing_reference_source()?;
+    let dataset = SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?;
+    let source_id = source.source_id().clone();
+    let initial_generation = listing_reference_generation(source.clone(), None, 20, 91)?;
+    let source_payload_set_digest = initial_generation.source_payload_set_digest();
+
+    let catalog = CatalogAuthority::open(config.clone())?;
+    catalog.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    let mismatched =
+        catalog.admit_source_rights(listing_reference_rights(source_id.clone(), digest(74))?)?;
+    let authority = Arc::new(Mutex::new(catalog));
+    let mismatched_publisher = ListingReferencePublicationCapability::try_new(
+        Arc::clone(&authority),
+        dataset.clone(),
+        source_id.clone(),
+        mismatched,
+    )?;
+    assert!(matches!(
+        mismatched_publisher.publish(
+            initial_generation.clone(),
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+        ),
+        Err(ListingReferenceError::RightsUnavailable)
+    ));
+    let catalog = authority
+        .try_lock()
+        .map_err(|_| CatalogError::AuthorityLockPoisoned)?;
+    let rights = catalog.admit_source_rights(listing_reference_rights(
+        source_id.clone(),
+        source_payload_set_digest,
+    )?)?;
+    drop(catalog);
+    let publisher = ListingReferencePublicationCapability::try_new(
+        Arc::clone(&authority),
+        dataset.clone(),
+        source_id.clone(),
+        rights,
+    )?;
+    let reader = ListingReferenceReadCapability::new(
+        Arc::clone(&authority),
+        dataset.clone(),
+        source_id.clone(),
+    );
+    let cancellation = CancellationToken::new();
+    let deadline = || Instant::now() + Duration::from_secs(2);
+
+    let inserted = publisher.publish(initial_generation, deadline(), &cancellation)?;
+    assert_eq!(
+        inserted.disposition(),
+        ListingReferencePublicationDisposition::Inserted
+    );
+    assert_eq!(inserted.generation().generation_sequence(), 1);
+    assert_eq!(inserted.generation().record_count(), 2);
+
+    let page = reader.search("p", 1, deadline(), &cancellation)?;
+    assert_eq!(page.matches().len(), 1);
+    assert!(page.has_more());
+    let exact = reader.search("SPY", 1, deadline(), &cancellation)?;
+    assert_eq!(exact.matches().len(), 1);
+    assert_eq!(exact.matches()[0].record().provider_symbol(), "SPY");
+    assert!(exact.matches()[0].record().is_etf());
+
+    let replay = publisher.publish(
+        listing_reference_generation(source.clone(), None, 30, 101)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        replay.disposition(),
+        ListingReferencePublicationDisposition::Replay
+    );
+    assert_eq!(
+        replay.generation().generation_digest(),
+        inserted.generation().generation_digest()
+    );
+    drop(reader);
+    drop(publisher);
+    drop(authority);
+
+    let reopened = CatalogAuthority::open(config)?;
+    let rights = reopened.admit_source_rights(listing_reference_rights(
+        source_id.clone(),
+        source_payload_set_digest,
+    )?)?;
+    let authority = Arc::new(Mutex::new(reopened));
+    let reader = ListingReferenceReadCapability::new(
+        Arc::clone(&authority),
+        dataset.clone(),
+        source_id.clone(),
+    );
+    let current = reader
+        .current(deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    assert_eq!(
+        current.generation_digest(),
+        inserted.generation().generation_digest()
+    );
+    assert_eq!(current.generation_sequence(), 1);
+    assert_eq!(current.record_count(), 2);
+    let exact = reader.search("AAPL", 2, deadline(), &cancellation)?;
+    assert_eq!(exact.matches().len(), 1);
+    let retained = exact.matches()[0].record();
+    assert_eq!(retained.provider_symbol(), "AAPL");
+    assert_eq!(
+        retained.source_file().received_at(),
+        Timestamp::from_unix_nanos(20)
+    );
+    assert_eq!(
+        retained.record_payload_evidence().content_digest(),
+        digest(91)
+    );
+
+    let publisher = ListingReferencePublicationCapability::try_new(
+        Arc::clone(&authority),
+        dataset,
+        source_id,
+        rights,
+    )?;
+    let replay = publisher.publish(
+        listing_reference_generation(source, None, 40, 111)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        replay.disposition(),
+        ListingReferencePublicationDisposition::Replay
+    );
+    assert_eq!(replay.generation().generation_sequence(), 1);
+    Ok(())
+}
+
+fn listing_reference_generation(
+    source: SourceMetadata,
+    expected_previous: Option<EvidenceDigest>,
+    observed_at: i64,
+    record_evidence: u8,
+) -> TestResult<ListingReferenceGenerationInput> {
+    let creation = "0808202621:31";
+    let last_modified = Timestamp::from_unix_nanos(19);
+    let observed_at = Timestamp::from_unix_nanos(observed_at);
+    let nasdaq_payload = ExactPayloadEvidence::from_content_digest(digest(81));
+    let other_payload = ExactPayloadEvidence::from_content_digest(digest(82));
+    let files = vec![
+        ListingReferenceSourceFileInput::try_new(
+            ListingReferenceFileKind::NasdaqListed,
+            SourceIdentifier::try_from("nasdaq-symbols:nasdaq-listed:fixture")?,
+            SourceIdentifier::try_from(
+                "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+            )?,
+            creation,
+            nasdaq_payload.clone(),
+            last_modified,
+            observed_at,
+            observed_at,
+        )?,
+        ListingReferenceSourceFileInput::try_new(
+            ListingReferenceFileKind::OtherListed,
+            SourceIdentifier::try_from("nasdaq-symbols:other-listed:fixture")?,
+            SourceIdentifier::try_from(
+                "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+            )?,
+            creation,
+            other_payload.clone(),
+            last_modified,
+            observed_at,
+            observed_at,
+        )?,
+    ];
+    let records = vec![
+        (
+            ListingReferenceFileKind::NasdaqListed,
+            ListingReferenceRecordInput::try_nasdaq_listed(
+                2,
+                "AAPL",
+                "Apple Inc. - Common Stock",
+                VenueId::try_from("XNAS")?,
+                ListingReferenceMarketCategory::GlobalSelect,
+                ListingReferenceFinancialStatus::Normal,
+                false,
+                false,
+                100,
+                false,
+                SourceIdentifier::try_from("nasdaq-symbols:nasdaq-listed:row-2:fixture")?,
+                ExactPayloadEvidence::from_content_digest(digest(record_evidence)),
+                creation,
+                last_modified,
+                observed_at,
+                nasdaq_payload,
+            )?,
+        ),
+        (
+            ListingReferenceFileKind::OtherListed,
+            ListingReferenceRecordInput::try_other_listed(
+                2,
+                "SPY",
+                "SPDR S&P 500 ETF Trust",
+                VenueId::try_from("ARCX")?,
+                ListingReferenceExchangeCode::NyseArca,
+                "SPY",
+                "SPY",
+                true,
+                false,
+                100,
+                SourceIdentifier::try_from("nasdaq-symbols:other-listed:row-2:fixture")?,
+                ExactPayloadEvidence::from_content_digest(digest(record_evidence + 1)),
+                creation,
+                last_modified,
+                observed_at,
+                other_payload,
+            )?,
+        ),
+    ];
+    Ok(ListingReferenceGenerationInput::try_new(
+        source,
+        expected_previous,
+        files,
+        records,
+    )?)
+}
+
+fn listing_reference_source() -> TestResult<SourceMetadata> {
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let evidence = |byte| ExactPayloadEvidence::from_content_digest(digest(byte));
+    Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        SourceId::try_from("nasdaq-symbol-directory-fixture")?,
+        RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(SourceIdentifier::try_from("nasdaq-symbols-catalog-v1")?),
+            evidence(71),
+        ),
+        SourceClass::LocalFile,
+        SourceIdentifier::try_from("local-nasdaq-symbol-fixture")?,
+        AuthorizationGrant::new(
+            AuthorizationMode::UserOwnedLocal,
+            AuthorizationBasis::new(SourceIdentifier::try_from("test-owned-fixture")?),
+            evidence(72),
+            effective,
+        ),
+        SourceCoverage::try_instrument(
+            evidence(73),
+            effective,
+            vec![AssetClass::Equity, AssetClass::Fund],
+            CoverageTopology::partial_venues(vec![
+                VenueId::try_from("XNAS")?,
+                VenueId::try_from("XNYS")?,
+                VenueId::try_from("ARCX")?,
+            ])?,
+            InstrumentCoverage::all_declared(),
+            None,
+            CoverageDelay::Delayed(1),
+            DeliveryEvidence::Unknown,
+        )?,
+        DataQuality::OfficialDelayed,
+        NetworkAccessPolicy::Denied,
+        FreshnessPolicy::try_new(1, 1, 1, 1, 0)?,
+        None,
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::None,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))?)
+}
+
+fn listing_reference_rights(
+    source_id: SourceId,
+    payload_digest: EvidenceDigest,
+) -> TestResult<RightsDecisionInput> {
+    Ok(RightsDecisionInput {
+        source_id,
+        payload_digest,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        basis: RightsBasis::reviewed_terms(
+            "https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs",
+            digest(75),
+        )?,
+        authorization_evidence: digest(76),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![
+            SourceOperation::Retrieve,
+            SourceOperation::Display,
+            SourceOperation::Persist,
+        ],
+    })
 }
 
 fn onboarding_capability() -> TestResult<ProviderCapability> {

@@ -133,6 +133,11 @@ pub struct ResearchRightsAuthority {
 }
 
 impl ResearchRightsAuthority {
+    /// Returns the exact source namespace this authority may bind.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
     /// Binds non-zero terms or ownership evidence to one source namespace.
     ///
     /// # Errors
@@ -203,7 +208,7 @@ impl ResearchRightsAuthority {
         })
     }
 
-    fn decision(
+    pub(crate) fn decision(
         &self,
         payload_digest: EvidenceDigest,
         retrieved_at: Timestamp,
@@ -1709,6 +1714,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::Arrow(_)
         | IngestError::Manifest(_)
         | IngestError::Catalog(_)
+        | IngestError::ListingReference(_)
         | IngestError::Serialization(_)
         | IngestError::RevisionAuthority(_)
         | IngestError::AuthorityTransitionRejected

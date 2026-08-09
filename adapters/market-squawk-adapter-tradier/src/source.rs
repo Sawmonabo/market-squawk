@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
-use market_squawk_domain::SourceIdentifier;
+use market_squawk_domain::{InstrumentId, MetadataRevision, SourceId, SourceIdentifier};
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
     LiveSourceGeneration, RawMarketSink, RetryAfter, SharedProviderBudget, SourceError,
@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{
     MAX_STREAM_SYMBOLS, TRADIER_MARKET_SESSION_ENDPOINT, TRADIER_WEBSOCKET_ENDPOINT,
-    TradierAccessSurface, TradierSourceConfig, TradierTransportLimits,
+    TradierAccessSurface, TradierInstrumentKind, TradierSourceConfig, TradierTransportLimits,
 };
 use crate::{TradierAccessToken, TradierConfigError, TradierRateLimitEvidence};
 
@@ -115,7 +115,75 @@ impl TradierAccountMarketData {
         })
     }
 
-    /// Creates one exact-generation WebSocket source and latest-value subscription controller.
+    /// Creates an account-owned subscription authority that survives connection generations.
+    ///
+    /// `initial_symbols` must be a nonempty subset of the configured streaming mappings. The
+    /// authority retains only the latest complete selection even while no generation is running.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-streaming profiles, mismatched account bounds, and an invalid initial subset.
+    pub fn subscription_authority(
+        &self,
+        config: &TradierSourceConfig,
+        initial_symbols: Vec<SourceIdentifier>,
+    ) -> Result<TradierSubscriptionAuthority, TradierAccountMarketDataError> {
+        validate_streaming_config(config)?;
+        self.ensure_limits(config)?;
+        let binding = Arc::new(SubscriptionBinding::from_config(config));
+        let initial = SubscriptionSet::try_new(
+            binding.mappings.as_ref(),
+            initial_symbols
+                .into_iter()
+                .map(|symbol| symbol.as_str().to_owned())
+                .collect(),
+        )?;
+        let (sender, _receiver) = watch::channel(Arc::new(initial));
+        Ok(TradierSubscriptionAuthority {
+            owner: Arc::downgrade(&self.inner),
+            binding,
+            sender,
+        })
+    }
+
+    /// Creates one exact-generation WebSocket source from a stable subscription authority.
+    ///
+    /// Central supervision retains `subscriptions` across failures and calls this method with each
+    /// freshly minted generation. The source immediately observes the latest retained subset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a different account owner, source/revision/mapping set, transport limits, budget
+    /// allocation, non-streaming profile, or stale generation authority.
+    pub fn streaming_source_with_authority(
+        &self,
+        config: TradierSourceConfig,
+        generation: LiveSourceGeneration,
+        subscriptions: &TradierSubscriptionAuthority,
+    ) -> Result<TradierStreamingSource, TradierAccountMarketDataError> {
+        validate_streaming_config(&config)?;
+        self.ensure_limits(&config)?;
+        let receiver = subscriptions.subscribe(self, &config)?;
+        let authority = generation.try_start(config.metadata())?;
+        let budget = authority
+            .budget()?
+            .cloned()
+            .ok_or(TradierAccountMarketDataError::MissingBudget)?;
+        self.bind_budget(&budget)?;
+        Ok(TradierStreamingSource {
+            config,
+            authority,
+            account: Arc::clone(&self.inner),
+            budget,
+            subscriptions: receiver,
+            generation_started: false,
+        })
+    }
+
+    /// Creates one exact-generation source and a new all-symbol subscription authority.
+    ///
+    /// This compatibility wrapper is suitable for one generation. Supervisors that reconnect must
+    /// retain [`TradierSubscriptionAuthority`] and use [`Self::streaming_source_with_authority`].
     ///
     /// # Errors
     ///
@@ -129,38 +197,14 @@ impl TradierAccountMarketData {
         (TradierStreamingSource, TradierSubscriptionController),
         TradierAccountMarketDataError,
     > {
-        if !config.profile().supports_streaming()
-            || config.access_surface() != TradierAccessSurface::Streaming
-        {
-            return Err(TradierAccountMarketDataError::StreamingUnsupported);
-        }
-        self.ensure_limits(&config)?;
-        let authority = generation.try_start(config.metadata())?;
-        let budget = authority
-            .budget()?
-            .cloned()
-            .ok_or(TradierAccountMarketDataError::MissingBudget)?;
-        self.bind_budget(&budget)?;
-        let allowed = config
+        let initial = config
             .mappings()
             .iter()
-            .map(|mapping| mapping.symbol().as_str().to_owned())
+            .map(|mapping| mapping.symbol().clone())
             .collect::<Vec<_>>();
-        let initial = SubscriptionSet::try_new(&allowed, allowed.clone())?;
-        let allowed: Arc<[String]> = allowed.into();
-        let (sender, receiver) = watch::channel(Arc::new(initial));
-        let controller = TradierSubscriptionController { allowed, sender };
-        Ok((
-            TradierStreamingSource {
-                config,
-                authority,
-                account: Arc::clone(&self.inner),
-                budget,
-                subscriptions: receiver,
-                generation_started: false,
-            },
-            controller,
-        ))
+        let subscriptions = self.subscription_authority(&config, initial)?;
+        let source = self.streaming_source_with_authority(config, generation, &subscriptions)?;
+        Ok((source, subscriptions))
     }
 
     pub(crate) fn ensure_limits(
@@ -230,37 +274,157 @@ impl TradierAccountInner {
     }
 }
 
-/// Latest-value controller for the bounded active symbol subset.
-#[derive(Clone, Debug)]
-pub struct TradierSubscriptionController {
-    allowed: Arc<[String]>,
+fn validate_streaming_config(
+    config: &TradierSourceConfig,
+) -> Result<(), TradierAccountMarketDataError> {
+    if !config.profile().supports_streaming()
+        || config.access_surface() != TradierAccessSurface::Streaming
+    {
+        Err(TradierAccountMarketDataError::StreamingUnsupported)
+    } else {
+        Ok(())
+    }
+}
+
+/// Account-owned latest-value subscription intent retained across connection generations.
+#[derive(Clone)]
+pub struct TradierSubscriptionAuthority {
+    owner: Weak<TradierAccountInner>,
+    binding: Arc<SubscriptionBinding>,
     sender: watch::Sender<Arc<SubscriptionSet>>,
 }
 
-impl TradierSubscriptionController {
+impl std::fmt::Debug for TradierSubscriptionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TradierSubscriptionAuthority")
+            .field("source_id", &self.binding.source_id)
+            .field("metadata_revision", &self.binding.metadata_revision)
+            .field("allowed_symbols", &self.binding.mappings.len())
+            .field("active_symbols", &self.active_symbol_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TradierSubscriptionAuthority {
     /// Replaces the active symbols with a nonempty, duplicate-free configured subset.
     ///
     /// The watch channel retains only the newest complete selection, so rapid UI/client updates
-    /// cannot create an unbounded queue.
+    /// cannot create an unbounded queue. The latest value is retained when no generation is
+    /// connected and becomes the initial value for the next generation.
     ///
     /// # Errors
     ///
-    /// Rejects unknown, duplicate, empty, or oversized selections and a stopped source.
+    /// Rejects unknown, duplicate, empty, or oversized selections.
     pub fn replace(&self, symbols: Vec<SourceIdentifier>) -> Result<(), TradierSubscriptionError> {
         let symbols = symbols
             .into_iter()
             .map(|symbol| symbol.as_str().to_owned())
             .collect::<Vec<_>>();
-        let selection = SubscriptionSet::try_new(&self.allowed, symbols)?;
-        self.sender
-            .send(Arc::new(selection))
-            .map_err(|_| TradierSubscriptionError::SourceStopped)
+        let selection = SubscriptionSet::try_new(self.binding.mappings.as_ref(), symbols)?;
+        let _previous = self.sender.send_replace(Arc::new(selection));
+        Ok(())
     }
 
     /// Returns the active symbol count most recently accepted by the controller.
     pub fn active_symbol_count(&self) -> usize {
         self.sender.borrow().symbols.len()
     }
+
+    /// Returns an owned, internally consistent snapshot of the exact active provider symbols.
+    ///
+    /// The snapshot reads one retained watch value and therefore cannot mix selections across a
+    /// concurrent replacement. Its size cannot exceed the configured 256-symbol streaming bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TradierSubscriptionError::SnapshotAllocation`] if bounded vector or identifier
+    /// storage cannot be reserved, or [`TradierSubscriptionError::InvalidRetainedState`] if an
+    /// internal retained symbol no longer satisfies the domain identity invariant.
+    pub fn current_symbols(&self) -> Result<Vec<SourceIdentifier>, TradierSubscriptionError> {
+        let current = self.sender.borrow();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(current.symbols.len())
+            .map_err(|_| TradierSubscriptionError::SnapshotAllocation)?;
+        for symbol in &current.symbols {
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(symbol.len())
+                .map_err(|_| TradierSubscriptionError::SnapshotAllocation)?;
+            owned.push_str(symbol);
+            snapshot.push(
+                SourceIdentifier::try_from(owned)
+                    .map_err(|_| TradierSubscriptionError::InvalidRetainedState)?,
+            );
+        }
+        Ok(snapshot)
+    }
+
+    fn subscribe(
+        &self,
+        account: &TradierAccountMarketData,
+        config: &TradierSourceConfig,
+    ) -> Result<watch::Receiver<Arc<SubscriptionSet>>, TradierAccountMarketDataError> {
+        let same_owner = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &account.inner));
+        if !same_owner || !self.binding.matches(config) {
+            return Err(TradierAccountMarketDataError::SubscriptionAuthorityMismatch);
+        }
+        Ok(self.sender.subscribe())
+    }
+}
+
+/// Compatibility name for the stable account-owned subscription authority.
+pub type TradierSubscriptionController = TradierSubscriptionAuthority;
+
+#[derive(Debug)]
+struct SubscriptionBinding {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    mappings: Arc<[SubscriptionMapping]>,
+}
+
+impl SubscriptionBinding {
+    fn from_config(config: &TradierSourceConfig) -> Self {
+        let mut mappings = config
+            .mappings()
+            .iter()
+            .map(|mapping| SubscriptionMapping {
+                symbol: mapping.symbol().as_str().to_owned(),
+                instrument: mapping.instrument(),
+                kind: mapping.kind(),
+            })
+            .collect::<Vec<_>>();
+        mappings.sort_unstable_by(|left, right| left.symbol.cmp(&right.symbol));
+        Self {
+            source_id: config.metadata().source_id().clone(),
+            metadata_revision: config.metadata().revision().clone(),
+            mappings: mappings.into(),
+        }
+    }
+
+    fn matches(&self, config: &TradierSourceConfig) -> bool {
+        &self.source_id == config.metadata().source_id()
+            && &self.metadata_revision == config.metadata().revision()
+            && self.mappings.len() == config.mappings().len()
+            && self.mappings.iter().all(|expected| {
+                config.mappings().iter().any(|mapping| {
+                    expected.symbol.as_str() == mapping.symbol().as_str()
+                        && expected.instrument == mapping.instrument()
+                        && expected.kind == mapping.kind()
+                })
+            })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SubscriptionMapping {
+    symbol: String,
+    instrument: InstrumentId,
+    kind: TradierInstrumentKind,
 }
 
 #[derive(Debug)]
@@ -270,7 +434,7 @@ struct SubscriptionSet {
 
 impl SubscriptionSet {
     fn try_new(
-        allowed: &[String],
+        allowed: &[SubscriptionMapping],
         mut symbols: Vec<String>,
     ) -> Result<Self, TradierSubscriptionError> {
         if symbols.is_empty() || symbols.len() > MAX_STREAM_SYMBOLS {
@@ -280,10 +444,11 @@ impl SubscriptionSet {
         if symbols.windows(2).any(|window| window[0] == window[1]) {
             return Err(TradierSubscriptionError::DuplicateSymbol);
         }
-        if symbols
-            .iter()
-            .any(|symbol| !allowed.iter().any(|allowed| allowed == symbol))
-        {
+        if symbols.iter().any(|symbol| {
+            !allowed
+                .iter()
+                .any(|allowed| allowed.symbol.as_str() == symbol.as_str())
+        }) {
             return Err(TradierSubscriptionError::UnknownSymbol);
         }
         Ok(Self {
@@ -901,6 +1066,9 @@ pub enum TradierAccountMarketDataError {
     /// The process-local provider rate-evidence lock was unavailable.
     #[error("Tradier rate-limit evidence is unavailable")]
     RateEvidenceUnavailable,
+    /// A subscription authority belonged to a different account or source mapping revision.
+    #[error("Tradier subscription authority does not match the account and source generation")]
+    SubscriptionAuthorityMismatch,
     /// Registry-minted generation authority was invalid or stale.
     #[error("Tradier source generation is invalid: {0}")]
     Source(#[from] SourceError),
@@ -924,7 +1092,10 @@ pub enum TradierSubscriptionError {
     /// Selection names a symbol outside this source's metadata.
     #[error("Tradier subscription contains an unknown symbol")]
     UnknownSymbol,
-    /// The source has stopped and cannot accept another update.
-    #[error("Tradier source is stopped")]
-    SourceStopped,
+    /// An owned subscription snapshot could not reserve its bounded storage.
+    #[error("Tradier subscription snapshot allocation failed")]
+    SnapshotAllocation,
+    /// Retained authority state violated an identifier invariant.
+    #[error("Tradier subscription authority retained invalid state")]
+    InvalidRetainedState,
 }

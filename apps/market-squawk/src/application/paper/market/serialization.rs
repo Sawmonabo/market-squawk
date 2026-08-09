@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 
 use super::{MarketFilters, StreamView};
 use crate::application::domain_support::encode_hex;
+use crate::application::market_runtime::{
+    MarketSourceSnapshotFailure, MarketSourceSnapshotFailureKind,
+};
 
 const MAXIMUM_LISTED_EVIDENCE_IDENTITIES: usize = 8;
 
@@ -273,6 +276,7 @@ fn level_value(level: market_squawk_live::BookLevelSnapshot) -> Value {
 
 pub(super) fn source_coverage_value(
     streams: &[StreamView<'_>],
+    failures: &[MarketSourceSnapshotFailure],
     filters: &MarketFilters<'_>,
 ) -> Value {
     let mut sources = streams
@@ -293,9 +297,28 @@ pub(super) fn source_coverage_value(
     let venue_count = venues.len();
     venues.truncate(MAXIMUM_LISTED_EVIDENCE_IDENTITIES);
 
+    let failed_source_count = failures.len();
+    let failed_sources = failures
+        .iter()
+        .take(MAXIMUM_LISTED_EVIDENCE_IDENTITIES)
+        .map(|failure| {
+            json!({
+                "surfaceId": failure.surface_id().as_str(),
+                "reason": match failure.kind() {
+                    MarketSourceSnapshotFailureKind::ResourceExhausted => "resource_exhausted",
+                    MarketSourceSnapshotFailureKind::Unavailable => "unavailable",
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
     json!({
         "mode": "current_live_runtime",
-        "consistency": "per_shard_current_non_atomic",
+        "consistency": if failed_source_count == 0 {
+            "per_shard_current_non_atomic"
+        } else {
+            "partial_provider_set"
+        },
         "historicalDataset": Value::Null,
         "requestedSourceCount": filters.sources.len(),
         "listedRequestedSources": filters
@@ -312,6 +335,10 @@ pub(super) fn source_coverage_value(
         "observedVenueCount": venue_count,
         "listedVenues": venues,
         "listedVenuesComplete": venue_count <= MAXIMUM_LISTED_EVIDENCE_IDENTITIES,
+        "failedSourceCount": failed_source_count,
+        "failedSources": failed_sources,
+        "listedFailedSourcesComplete":
+            failed_source_count <= MAXIMUM_LISTED_EVIDENCE_IDENTITIES,
         "streamIdentityScope": "complete",
         "bookDepthScope": "per_record_explicit"
     })

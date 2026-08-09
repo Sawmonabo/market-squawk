@@ -2,12 +2,20 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use market_squawk_adapter_alpaca::{
+    AlpacaCredentials, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig,
+};
 use market_squawk_adapter_coinbase::{
     CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig, CoinbaseExchangeDecoder,
     CoinbaseExchangeSource, CoinbaseTransportLimits,
+};
+use market_squawk_adapter_tradier::{
+    TradierAccountMarketData, TradierInstrumentKind, TradierSourceConfig,
+    TradierSubscriptionAuthority,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, InstrumentDefinition,
@@ -135,6 +143,75 @@ impl ProductionLiveSourceComposition {
             routes,
             provider_rate,
         })
+    }
+
+    /// Seals one authenticated Alpaca Basic IEX source into the production runtime.
+    ///
+    /// The adapter configuration already binds authorization, coverage, provider budget, symbol
+    /// mappings, and transport limits. Composition additionally proves that every admitted mapping
+    /// has one exact live-runtime route before credentials can reach a network connector.
+    pub(crate) fn try_alpaca_iex_with_rate_authority(
+        config: AppConfig,
+        routes: Vec<LiveRouteConfig>,
+        source: AlpacaIexLiveConfig,
+        credentials: Arc<AlpacaCredentials>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        validate_alpaca_iex_routes(&source, &routes)?;
+        Ok(Self {
+            config,
+            profile: ProductionSourceProfile::alpaca_iex(source, credentials)?,
+            routes,
+            provider_rate,
+        })
+    }
+
+    /// Seals one authenticated Alpaca Basic indicative-options source into the production runtime.
+    ///
+    /// This remains a distinct logical source with an `Indicative` ceiling. It cannot inherit the
+    /// IEX equity surface's venue or quality declaration merely because both use one account.
+    pub(crate) fn try_alpaca_options_with_rate_authority(
+        config: AppConfig,
+        routes: Vec<LiveRouteConfig>,
+        source: AlpacaOptionsLiveConfig,
+        credentials: Arc<AlpacaCredentials>,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        validate_alpaca_options_routes(&source, &routes)?;
+        Ok(Self {
+            config,
+            profile: ProductionSourceProfile::alpaca_options(source, credentials)?,
+            routes,
+            provider_rate,
+        })
+    }
+
+    /// Seals one account-owned consolidated Tradier stream into the production runtime.
+    ///
+    /// The full configured mapping catalog is route-validated so later bounded priority updates
+    /// cannot introduce an unowned route. The subscription authority itself retains only the
+    /// current active subset and survives supervisor reconnect generations.
+    pub(crate) fn try_tradier_streaming_with_rate_authority(
+        config: AppConfig,
+        routes: Vec<LiveRouteConfig>,
+        source: TradierSourceConfig,
+        account: Arc<TradierAccountMarketData>,
+        subscriptions: TradierSubscriptionAuthority,
+        provider_rate: ProviderRateAuthority,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        validate_tradier_routes(&source, &routes)?;
+        Ok(Self {
+            config,
+            profile: ProductionSourceProfile::tradier_streaming(source, account, subscriptions)?,
+            routes,
+            provider_rate,
+        })
+    }
+
+    /// Returns the bounded account-owned Tradier subscription authority when this composition is
+    /// the consolidated streaming surface.
+    pub(crate) fn tradier_subscription_authority(&self) -> Option<TradierSubscriptionAuthority> {
+        self.profile.tradier_subscription_authority()
     }
 
     /// Returns the only provider endpoint accepted by the sealed production adapter.
@@ -611,6 +688,126 @@ fn validate_kraken_routes(
     Ok(())
 }
 
+fn validate_alpaca_iex_routes(
+    config: &AlpacaIexLiveConfig,
+    routes: &[LiveRouteConfig],
+) -> Result<(), ProductionLiveSourceCompositionError> {
+    validate_alpaca_route_set(routes, config.mappings().len())?;
+    let venue = single_venue(config.metadata())?;
+    for mapping in config.mappings() {
+        let route = routes
+            .iter()
+            .find(|route| {
+                route.route().venue() == venue && route.route().instrument() == mapping.instrument()
+            })
+            .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+        if route.definition().asset_class() != mapping.asset_class()
+            || !route.definition().venue_mappings().iter().any(|candidate| {
+                candidate.venue_id() == venue
+                    && candidate.venue_symbol().as_str() == mapping.symbol()
+            })
+        {
+            return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_alpaca_options_routes(
+    config: &AlpacaOptionsLiveConfig,
+    routes: &[LiveRouteConfig],
+) -> Result<(), ProductionLiveSourceCompositionError> {
+    validate_alpaca_route_set(routes, config.mappings().len())?;
+    let venue = single_venue(config.metadata())?;
+    for mapping in config.mappings() {
+        let route = routes
+            .iter()
+            .find(|route| {
+                route.route().venue() == venue && route.route().instrument() == mapping.instrument()
+            })
+            .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+        if route.definition().asset_class() != market_squawk_domain::AssetClass::Option
+            || !route.definition().venue_mappings().iter().any(|candidate| {
+                candidate.venue_id() == venue
+                    && candidate.venue_symbol().as_str() == mapping.symbol()
+            })
+        {
+            return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_alpaca_route_set(
+    routes: &[LiveRouteConfig],
+    expected: usize,
+) -> Result<(), ProductionLiveSourceCompositionError> {
+    if routes.len() != expected {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    }
+    for (index, route) in routes.iter().enumerate() {
+        if routes[index.saturating_add(1)..]
+            .iter()
+            .any(|other| other.route() == route.route())
+        {
+            return Err(ProductionLiveSourceCompositionError::DuplicateRoute);
+        }
+    }
+    Ok(())
+}
+
+fn validate_tradier_routes(
+    config: &TradierSourceConfig,
+    routes: &[LiveRouteConfig],
+) -> Result<(), ProductionLiveSourceCompositionError> {
+    validate_alpaca_route_set(routes, config.mappings().len())?;
+    let topology = config.metadata().coverage().topology();
+    let [venue] = topology.venues() else {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    };
+    if !topology.is_consolidated() {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    }
+    for mapping in config.mappings() {
+        let route = routes
+            .iter()
+            .find(|route| {
+                route.route().venue() == venue && route.route().instrument() == mapping.instrument()
+            })
+            .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+        let expected_asset_class = match mapping.kind() {
+            TradierInstrumentKind::Equity => market_squawk_domain::AssetClass::Equity,
+            TradierInstrumentKind::Etf => market_squawk_domain::AssetClass::Fund,
+            TradierInstrumentKind::Option => market_squawk_domain::AssetClass::Option,
+            TradierInstrumentKind::DerivedIndex => {
+                return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+            }
+        };
+        if route.definition().asset_class() != expected_asset_class
+            || !route.definition().venue_mappings().iter().any(|candidate| {
+                candidate.venue_id() == venue
+                    && candidate.venue_symbol().as_str() == mapping.symbol().as_str()
+            })
+        {
+            return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn single_venue(
+    metadata: &SourceMetadata,
+) -> Result<&market_squawk_domain::VenueId, ProductionLiveSourceCompositionError> {
+    let topology = metadata.coverage().topology();
+    let [venue] = topology.venues() else {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    };
+    if !topology.is_single_venue() {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    }
+    Ok(venue)
+}
+
 /// Complete immutable Coinbase provider profile derived from validated local configuration.
 #[derive(Debug)]
 pub(super) struct ProductionCoinbaseProfile {
@@ -943,11 +1140,11 @@ pub enum ProductionLiveSourceCompositionError {
     MissingCoinbaseConfiguration,
     #[error("production Kraken configuration is required")]
     MissingKrakenConfiguration,
-    #[error("production Coinbase route set does not exactly cover configured instruments")]
+    #[error("production source route set does not exactly cover configured instruments")]
     RouteSetMismatch,
-    #[error("production Coinbase route set contains a duplicate route")]
+    #[error("production source route set contains a duplicate route")]
     DuplicateRoute,
-    #[error("production Coinbase route definition differs from validated source configuration")]
+    #[error("production source route definition differs from validated source configuration")]
     RouteDefinitionMismatch,
     #[error(transparent)]
     Profile(#[from] ProductionCoinbaseProfileError),

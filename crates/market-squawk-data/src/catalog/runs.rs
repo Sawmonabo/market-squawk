@@ -283,6 +283,7 @@ impl Catalog {
         Ok(RegisteredRightsGrant {
             catalog_id: self.catalog_id,
             rights_id: rights.fingerprint(),
+            payload_digest: rights.payload_digest(),
         })
     }
 

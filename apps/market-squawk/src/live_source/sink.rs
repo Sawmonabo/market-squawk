@@ -318,6 +318,16 @@ impl<'a> ProductionRawMarketSink<'a> {
         received_at: Timestamp,
     ) -> Result<(), ProductionSinkFailure> {
         if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
+            && self.subscription.accepts_first_validated_data()
+        {
+            self.subscription
+                .observe_validated_acknowledgement(&self.generation, Instant::now())
+                .map_err(ProductionSinkFailure::Subscription)?;
+            self.acknowledgement_evidence = Some(ExactPayloadEvidence::from_content_digest(
+                data.evidence().payload_digest(),
+            ));
+        }
+        if self.subscription.phase() == SubscriptionPhase::AwaitingAcknowledgement
             && self.pending_data.is_enabled()
         {
             return self

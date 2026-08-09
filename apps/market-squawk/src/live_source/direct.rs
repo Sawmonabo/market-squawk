@@ -22,6 +22,7 @@ use market_squawk_platform::{
     CaptureProcessInfrastructureLimits, DestinationFenceRegistryInitializationError,
     initialize_capture_process_infrastructure,
 };
+use market_squawk_sources::SourceMetadata;
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -30,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ProviderOnboardingError,
     live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError},
+    live_source::order_level::OrderLevelDirectory,
     provider_activation::CoinbaseDirectAccountActivation,
 };
 
@@ -50,6 +52,7 @@ pub struct CoinbaseDirectLiveRuntime {
     supervisor_cancellation: SupervisorDropCancellation,
     supervisor_live: Arc<AtomicBool>,
     live: LiveRuntimeComposition,
+    metadata: Arc<[SourceMetadata]>,
     supervisor: tokio::task::JoinHandle<Result<(), CoinbaseDirectSupervisorError>>,
     shutdown_deadline: Duration,
 }
@@ -63,6 +66,11 @@ impl CoinbaseDirectLiveRuntime {
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
+    }
+
+    /// Returns every exact source-metadata record retained by this account runtime.
+    pub(crate) fn metadata(&self) -> Arc<[SourceMetadata]> {
+        Arc::clone(&self.metadata)
     }
 
     /// Installs one complete disabled action-hook group without reconnecting the account source.
@@ -133,7 +141,17 @@ impl CoinbaseDirectAccountActivation {
         runtime_config: LiveRuntimeConfig,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, cancellation).await
+        start_account(self, runtime_config, None, None, cancellation).await
+    }
+
+    /// Starts Direct products with one shared generation-owned order-level read directory.
+    pub(crate) async fn start_live_with_order_level(
+        self,
+        runtime_config: LiveRuntimeConfig,
+        order_level: OrderLevelDirectory,
+        cancellation: CancellationToken,
+    ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
+        start_account(self, runtime_config, None, Some(order_level), cancellation).await
     }
 
     /// Starts Direct products only after exact execution action hooks are installed per route.
@@ -151,7 +169,7 @@ impl CoinbaseDirectAccountActivation {
         action_hooks: Vec<RouteActionHook>,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, Some(action_hooks), cancellation).await
+        start_account(self, runtime_config, Some(action_hooks), None, cancellation).await
     }
 }
 
@@ -159,6 +177,7 @@ async fn start_account(
     mut activation: CoinbaseDirectAccountActivation,
     runtime_config: LiveRuntimeConfig,
     action_hooks: Option<Vec<RouteActionHook>>,
+    order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     activation.require_current().await?;
@@ -173,12 +192,23 @@ async fn start_account(
         .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
     for (slot, product) in products.into_iter().enumerate() {
         if let Some(product) = product {
-            specs.push(try_build_product_spec(slot, activation.lease(), product)?);
+            specs.push(try_build_product_spec(
+                slot,
+                activation.lease(),
+                product,
+                order_level.is_some(),
+            )?);
         }
     }
     if specs.len() != product_count {
         return Err(CoinbaseDirectSupervisorError::ActivationTopology);
     }
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    metadata.extend(specs.iter().map(|spec| spec.metadata().clone()));
+    let metadata: Arc<[SourceMetadata]> = metadata.into();
     let routes = specs.iter().map(|spec| spec.route().clone()).collect();
 
     let secret = activation
@@ -210,12 +240,14 @@ async fn start_account(
     start_on_live_runtime(
         activation,
         specs,
+        metadata,
         signer,
         app_config,
         admission,
         capture_process,
         route_buffer_limits,
         live,
+        order_level,
         cancellation,
     )
     .await
@@ -228,12 +260,14 @@ async fn start_account(
 async fn start_on_live_runtime(
     activation: CoinbaseDirectAccountActivation,
     specs: Vec<ProductRuntimeSpec>,
+    metadata: Arc<[SourceMetadata]>,
     signer: Arc<CoinbaseDirectHmacSigner>,
     app_config: market_squawk_platform::AppConfig,
     admission: crate::provider_activation::CoinbaseDirectRuntimeAdmission,
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
     live: LiveRuntimeComposition,
+    order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     let live_ingress = live.production_ingress();
@@ -254,6 +288,7 @@ async fn start_on_live_runtime(
             capture_process,
             route_buffer_limits,
             live_ingress,
+            order_level,
             supervisor_cancellation,
             startup_sender,
         )
@@ -267,6 +302,7 @@ async fn start_on_live_runtime(
                 supervisor_cancellation: SupervisorDropCancellation::new(cancellation),
                 supervisor_live,
                 live,
+                metadata,
                 supervisor,
                 shutdown_deadline,
             }),
@@ -311,6 +347,7 @@ async fn run_account(
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
     live_ingress: market_squawk_live::LiveRuntimeIngress,
+    order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
     startup: oneshot::Sender<()>,
 ) -> Result<(), CoinbaseDirectSupervisorError> {
@@ -340,6 +377,7 @@ async fn run_account(
         let task_start = start_receiver.clone();
         let task_cancellation = cancellation.child_token();
         let task_ingress = live_ingress.clone();
+        let task_order_level = order_level.clone();
         let task_bootstrap_slots = Arc::clone(&bootstrap_slots);
         products.spawn(async move {
             (
@@ -352,6 +390,7 @@ async fn run_account(
                     admission,
                     capture_process,
                     task_ingress,
+                    task_order_level,
                     route_buffer_limits,
                     task_signer,
                     task_ready,

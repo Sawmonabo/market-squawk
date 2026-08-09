@@ -6,6 +6,7 @@ mod company_identity;
 mod diagnostics;
 mod evidence;
 mod fair_value;
+mod listing_reference;
 mod migration_preflight;
 mod observed_revisions;
 mod onboarding;
@@ -37,6 +38,17 @@ pub use self::fair_value::{
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogRecord,
     FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
     FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
+};
+pub use self::listing_reference::{
+    ListingReferenceDirectoryPresence, ListingReferenceError, ListingReferenceExchangeCode,
+    ListingReferenceFileEvidence, ListingReferenceFileKind, ListingReferenceFinancialStatus,
+    ListingReferenceGenerationInput, ListingReferenceGenerationReceipt,
+    ListingReferenceMarketCategory, ListingReferenceMatchKind,
+    ListingReferencePublicationCapability, ListingReferencePublicationDisposition,
+    ListingReferencePublicationReceipt, ListingReferenceReadCapability, ListingReferenceRecord,
+    ListingReferenceRecordInput, ListingReferenceRightsState, ListingReferenceSearchMatch,
+    ListingReferenceSearchPage, ListingReferenceSourceFileInput, MAX_LISTING_REFERENCE_RECORDS,
+    MAX_LISTING_REFERENCE_SEARCH_ROWS,
 };
 pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,

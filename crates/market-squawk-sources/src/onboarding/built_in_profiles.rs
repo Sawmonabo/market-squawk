@@ -100,6 +100,9 @@ const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
 const SEC_PROFILE: &str = "sec.edgar-public";
 const BLS_PUBLIC_V1_PROFILE: &str = "bls.v1-unregistered";
 const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
+const ALPACA_BASIC_PROFILE: &str = "alpaca.basic-market-data";
+const TRADIER_MARKET_DATA_PROFILE: &str = "tradier.brokerage-market-data";
+const KRAKEN_L3_PROFILE: &str = "kraken.spot-authenticated-level3-market-data";
 const TREASURY_DAILY_RATES_PROFILE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_PROFILE: &str = "treasury.fiscal-data";
 const SEC_PUBLIC_API_AUTHORITY_SOURCE: &str = "MSQ-SEC-EDGAR-PUBLIC-API-AUTHORITY-2026-07-26";
@@ -282,6 +285,103 @@ const KRAKEN_EVIDENCE: &[ProfileEvidence] = &[
         REVIEW_DATE,
         None,
         false,
+    ),
+];
+const ALPACA_BASIC_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        "ALPACA-BASIC-COVERAGE",
+        "https://docs.alpaca.markets/us/docs/about-market-data-api",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "ALPACA-IEX-LATEST-QUOTE",
+        "https://docs.alpaca.markets/us/v1.4.2/reference/stocklatestquotesingle-1",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "ALPACA-MARKET-DATA-STREAMING",
+        "https://docs.alpaca.markets/us/v1.1/docs/streaming-market-data",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "ALPACA-REDISTRIBUTION-GUIDANCE",
+        "https://alpaca.markets/support/redistribute-alpaca-api",
+        "2026-08-09",
+        None,
+        true,
+    ),
+];
+const TRADIER_MARKET_DATA_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        "TRADIER-MARKET-DATA",
+        "https://docs.tradier.com/docs/market-data",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TRADIER-RATE-LIMITS",
+        "https://docs.tradier.com/docs/rate-limiting",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TRADIER-ENDPOINTS",
+        "https://docs.tradier.com/docs/endpoints",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "TRADIER-STANDARD-PRICING",
+        "https://join.tradier.com/partner",
+        "2026-08-09",
+        None,
+        true,
+    ),
+];
+const KRAKEN_L3_EVIDENCE: &[ProfileEvidence] = &[
+    ProfileEvidence::new(
+        "KRAKEN-L3-CHANNEL",
+        "https://docs.kraken.com/api/docs/websocket-v2/level3/",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "KRAKEN-API-KEY-INFO",
+        "https://docs.kraken.com/api/docs/rest-api/get-api-key-info",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "KRAKEN-SPOT-REST-AUTH",
+        "https://docs.kraken.com/api/docs/guides/spot-rest-auth/",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "KRAKEN-WEBSOCKET-TOKEN",
+        "https://docs.kraken.com/api/docs/rest-api/get-websockets-token/",
+        "2026-08-09",
+        None,
+        false,
+    ),
+    ProfileEvidence::new(
+        "KRAKEN-GLOBAL-TERMS",
+        "https://www.kraken.com/legal/global-terms",
+        "2026-08-09",
+        None,
+        true,
     ),
 ];
 const SEC_EVIDENCE: &[ProfileEvidence] = &[
@@ -544,7 +644,10 @@ pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderP
     ProviderProfileRegistry::try_new(vec![
         build(coinbase()?)?,
         build(coinbase_direct()?)?,
+        build(alpaca_basic()?)?,
+        build(tradier_market_data()?)?,
         build(kraken()?)?,
+        build(kraken_l3()?)?,
         build(sec()?)?,
         build(fred()?)?,
         build(bls_v1()?)?,
@@ -559,11 +662,7 @@ pub fn built_in_provider_profiles() -> Result<ProviderProfileRegistry, ProviderP
 
 fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfileError> {
     let credentialed = spec.setup == ProfileActivationMode::ManualSecretImport;
-    let prior_credential_kind = if credentialed {
-        CredentialKind::ApiKey
-    } else {
-        CredentialKind::None
-    };
+    let prior_credential_kind = initial_credential_kind(spec.id, credentialed);
     let historical_rights_state = if spec.id == FRED_PROFILE {
         RightsAdmissionState::Blocked
     } else {
@@ -848,7 +947,11 @@ fn build_capability_with_rights_state(
         rights_state,
         lifecycle_support: if matches!(
             spec.id,
-            "bls.v2-registered" | "coinbase.exchange-direct-market-data"
+            "bls.v2-registered"
+                | "coinbase.exchange-direct-market-data"
+                | ALPACA_BASIC_PROFILE
+                | TRADIER_MARKET_DATA_PROFILE
+                | KRAKEN_L3_PROFILE
         ) {
             LifecycleSupport::new(true, false, true)
         } else {
@@ -869,6 +972,16 @@ fn build_capability_with_rights_state(
             },
         )?,
     })?)
+}
+
+fn initial_credential_kind(profile_id: &str, credentialed: bool) -> CredentialKind {
+    if !credentialed {
+        CredentialKind::None
+    } else if matches!(profile_id, ALPACA_BASIC_PROFILE | KRAKEN_L3_PROFILE) {
+        CredentialKind::ApiKeyPair
+    } else {
+        CredentialKind::ApiKey
+    }
 }
 
 fn capability_evidence(
@@ -990,9 +1103,33 @@ fn built_in_budget(
             2,
             backoff,
         ),
+        ALPACA_BASIC_PROFILE => simple_budget(
+            "alpaca-market-data",
+            Some("alpaca.basic.account-template"),
+            200,
+            MINUTE_NANOS,
+            1,
+            backoff,
+        ),
+        TRADIER_MARKET_DATA_PROFILE => simple_budget(
+            "tradier-brokerage",
+            Some("tradier.brokerage.account-template"),
+            120,
+            MINUTE_NANOS,
+            2,
+            backoff,
+        ),
         "kraken.spot-public-market-data" => {
             simple_budget("kraken", None, 1, MINUTE_NANOS, 1, backoff)
         }
+        KRAKEN_L3_PROFILE => simple_budget(
+            "kraken",
+            Some("kraken.level3.account-template"),
+            1,
+            SECOND_NANOS,
+            1,
+            backoff,
+        ),
         "local.files" | "local.portfolio-imports" | "local.paper-execution" => {
             simple_budget("market-squawk-local", None, 1, SECOND_NANOS, 1, backoff)
         }
@@ -1163,6 +1300,83 @@ fn coinbase_direct() -> Result<BuiltInSpec, ProviderProfileError> {
     })
 }
 
+fn alpaca_basic() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: ALPACA_BASIC_PROFILE,
+        display_name: "Alpaca Basic market data",
+        official_entry: "https://app.alpaca.markets/signup",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::Confirmed,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("alpaca.market-data.read"),
+        permissions: &["market-data.read"],
+        coverage: "One user-authorized Alpaca Basic account: real-time US equities and ETFs from IEX only with at most 30 streamed symbols at DirectUnverified quality; indicative US options with at most 200 quote subscriptions at Indicative quality; delayed IEX history at Aggregated quality; top-of-book only and never consolidated SIP or OPRA coverage",
+        quality: DataQuality::DirectUnverified,
+        probe: VerificationProbe::network_exact_public_query(
+            ProbeTransport::HttpGet,
+            "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest",
+            "https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest?feed=iex",
+            &[("feed", "iex")],
+        )?,
+        rights: RIGHTS_LIMITED,
+        duties: &[
+            "retain the exact IEX-only or indicative-options source label on every observation",
+            "enforce one shared account budget and the Basic-plan stream and symbol ceilings",
+            "use this credential only with code-owned market-data endpoints and never for order submission",
+            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
+        ],
+        persistence_evidence_source_id: None,
+        rotation: "create a replacement Trading API key pair and import one complete version-1 envelope as a higher generation",
+        revocation: "delete the exact Alpaca key remotely, then delete the exact local generation",
+        recovery: COMMON_RECOVERY,
+        evidence: ALPACA_BASIC_EVIDENCE,
+        rate_policy: "alpaca.basic-market-data.account-rate-policy.v1",
+        refresh_trigger: "ALPACA-BASIC-MARKET-DATA",
+        handoff_instruction: "Create a zero-monthly-fee Alpaca Trading API account, then import one version-1 envelope containing key_id and secret_key. Market Squawk admits only the Basic IEX and indicative-options market-data surfaces.",
+    })
+}
+
+fn tradier_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: TRADIER_MARKET_DATA_PROFILE,
+        display_name: "Tradier Brokerage market data",
+        official_entry: "https://join.tradier.com/partner",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::Confirmed,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("tradier.market-data.read"),
+        permissions: &["market-data.read"],
+        coverage: "One user-authorized Tradier production brokerage account: consolidated real-time US equity, ETF, and option trades and top-of-book quotes at Aggregated quality; NDX, RUT, and COMP derived index values at Modeled quality with no market book; no execution authority",
+        quality: DataQuality::Aggregated,
+        probe: VerificationProbe::network(
+            ProbeTransport::HttpGet,
+            "https://api.tradier.com/v1/user/profile",
+            None,
+        )?,
+        rights: RIGHTS_LIMITED,
+        duties: &[
+            "retain consolidated-securities and derived-index observations as separate logical surfaces",
+            "enforce one physical market stream and one shared account budget across every logical surface",
+            "use this credential only with code-owned market-data and read-only profile endpoints and never for order submission",
+            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
+        ],
+        persistence_evidence_source_id: None,
+        rotation: "create a replacement production API access token and import it as a higher generation",
+        revocation: "revoke or replace the exact Tradier token remotely, then delete the exact local generation",
+        recovery: COMMON_RECOVERY,
+        evidence: TRADIER_MARKET_DATA_EVIDENCE,
+        rate_policy: "tradier.brokerage-market-data.account-rate-policy.v1",
+        refresh_trigger: "TRADIER-BROKERAGE-MARKET-DATA",
+        handoff_instruction: "Open a zero-monthly-fee Tradier Brokerage account, retrieve the production API token from the official API settings page, and import it write-only. Sandbox tokens are not admitted for this real-time profile.",
+    })
+}
+
 fn kraken() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
         id: "kraken.spot-public-market-data",
@@ -1193,6 +1407,46 @@ fn kraken() -> Result<BuiltInSpec, ProviderProfileError> {
         rate_policy: "kraken.spot-public-market-data.rate-policy.v1",
         refresh_trigger: "KR-PUBLIC",
         handoff_instruction: "No account or key is requested; continue with the bounded public probe.",
+    })
+}
+
+fn kraken_l3() -> Result<BuiltInSpec, ProviderProfileError> {
+    Ok(BuiltInSpec {
+        id: KRAKEN_L3_PROFILE,
+        display_name: "Kraken Spot authenticated order-level market data",
+        official_entry: "https://support.kraken.com/articles/360000919966-how-to-create-an-api-key",
+        setup: ProfileActivationMode::ManualSecretImport,
+        zero_fee: ZeroFeeStatus::Confirmed,
+        account: Requirement::RequiredProviderControlled,
+        contact: Requirement::NotRequired,
+        release: ProfileReleaseState::RightsLimited,
+        rights_state: RightsAdmissionState::AdmittedScoped,
+        authority: Some("kraken.websocket-token.create"),
+        permissions: &["create-ws-token"],
+        coverage: "One user-authorized Kraken Spot account on WebSocket v2 level3: individual visible orders for up to 200 configured crypto pairs per connection at OrderLevel depth and DirectUnverified quality; CRC32 checksum over the top ten price levels; no provider sequence and no execution authority",
+        quality: DataQuality::DirectUnverified,
+        probe: VerificationProbe::network(
+            ProbeTransport::HttpPostJson,
+            "https://api.kraken.com/0/private/GetApiKeyInfo",
+            Some(r#"{"nonce":"runtime-generated-monotonic"}"#),
+        )?,
+        rights: RIGHTS_LIMITED,
+        duties: &[
+            "admit only a key whose exact permission set is create-ws-token",
+            "retain OrderLevel depth separately from DirectUnverified data quality",
+            "treat the provider sequence as unsupported and validate every supplied checksum",
+            "enforce the documented depth-weighted subscription counter through the account runtime",
+            "use the credential only for API-key inspection and WebSocket-token creation and never for trading",
+            "do not admit persistence, modeling, export, or redistribution without a later rights decision",
+        ],
+        persistence_evidence_source_id: None,
+        rotation: "create a replacement Kraken key with only WebSocket interface permission and import one complete version-1 envelope as a higher generation",
+        revocation: "delete the exact Kraken key remotely, then delete the exact local generation",
+        recovery: COMMON_RECOVERY,
+        evidence: KRAKEN_L3_EVIDENCE,
+        rate_policy: "kraken.spot-authenticated-level3.account-rate-policy.v1",
+        refresh_trigger: "KRAKEN-AUTHENTICATED-L3",
+        handoff_instruction: "Create a Kraken Spot API key with WebSocket interface permission only and no funds, trading, ledger, export, or withdrawal permissions. Import one version-1 envelope containing api_key and api_secret.",
     })
 }
 

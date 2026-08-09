@@ -153,15 +153,22 @@ impl AlpacaTransportLimits {
         })
     }
 
-    pub(crate) const fn max_frame_bytes(self) -> usize {
+    /// Returns the maximum accepted decompressed WebSocket message size in bytes.
+    pub const fn max_frame_bytes(self) -> usize {
         self.max_frame_bytes
     }
 
-    pub(crate) const fn connect_timeout(self) -> Duration {
+    /// Returns the exact WebSocket connection-handshake deadline.
+    pub const fn connect_timeout(self) -> Duration {
         self.connect_timeout
     }
 
-    pub(crate) const fn io_timeout(self) -> Duration {
+    /// Returns the exact deadline for each WebSocket write or read.
+    ///
+    /// This is also the subscription-acknowledgement wait bound: the transport sends the bounded
+    /// subscription and each subsequent provider read, including the acknowledgement, must finish
+    /// within this duration. Alpaca does not define a separate acknowledgement deadline.
+    pub const fn io_timeout(self) -> Duration {
         self.io_timeout
     }
 }
@@ -230,7 +237,8 @@ impl AlpacaIexLiveConfig {
         &self.mappings
     }
 
-    pub(crate) const fn limits(&self) -> AlpacaTransportLimits {
+    /// Returns the immutable frame and deadline policy used by this source.
+    pub const fn transport_limits(&self) -> AlpacaTransportLimits {
         self.limits
     }
 
@@ -306,7 +314,8 @@ impl AlpacaOptionsLiveConfig {
         &self.mappings
     }
 
-    pub(crate) const fn limits(&self) -> AlpacaTransportLimits {
+    /// Returns the immutable frame and deadline policy used by this source.
+    pub const fn transport_limits(&self) -> AlpacaTransportLimits {
         self.limits
     }
 

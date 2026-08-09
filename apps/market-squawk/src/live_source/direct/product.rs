@@ -1,6 +1,6 @@
 //! One-product Direct registry, capture, synchronization, and reconnect owner.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,10 @@ use market_squawk_adapter_coinbase::{
     CoinbaseDirectSessionError,
 };
 use market_squawk_domain::{IdentityError, InstrumentError, SourceIdentifier};
-use market_squawk_live::{LiveIngressBindError, LiveRouteConfig, LiveRuntimeIngress};
+use market_squawk_live::{
+    BookError, DepthLimit, LiveIngressBindError, LiveRouteConfig, LiveRuntimeIngress,
+    OrderLevelLimitError, OrderLevelLimits, OrderLevelRoute,
+};
 use market_squawk_platform::{
     AppConfig, CaptureChannelError, CaptureChannelLimits, CaptureGenerationError,
     CaptureProcessInfrastructure, CaptureShutdownStatus, CaptureWorkerReapError,
@@ -22,7 +25,7 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, BudgetUnavailableReason,
     CaptureGenerationCapabilities, ProviderBackoffAuthority, ProviderBackoffDecision,
     ProviderBackoffError, ProviderRateAuthority, RegisteredSource, RegistryError, SessionId,
-    SourceError, TlsProviderError, install_ring_tls_provider,
+    SourceError, SourceMetadata, TlsProviderError, install_ring_tls_provider,
 };
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -32,6 +35,10 @@ use crate::provider_activation::CoinbaseDirectRuntimeAdmission;
 
 use super::super::composition::ProductionCoinbaseProfileError;
 use super::super::composition::system_timestamp;
+use super::super::order_level::{
+    MAX_ORDER_LEVEL_INGRESS_COMMANDS, OrderLevelActorLimits, OrderLevelActorShutdown,
+    OrderLevelBookKey, OrderLevelDirectory, OrderLevelMonitorError, OrderLevelRegistration,
+};
 use super::super::route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation};
 use super::super::sink::{
     ProductionPredecodedMarketSinkInput, ProductionRawMarketSink, ProductionSinkConstructionError,
@@ -49,6 +56,7 @@ const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
 const SOURCE_AUTHORITY_ROOT: &str = "coinbase-direct-account-authority";
 const SOURCE_AUTHORITY_CHILD: &str = "sources";
 const LOCAL_CONCURRENCY_RETRY: Duration = Duration::from_millis(25);
+const ORDER_LEVEL_OUTSTANDING_READS: usize = 64;
 
 /// One preflight-complete product notification retained by the account startup barrier.
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +92,10 @@ impl ProductRuntimeSpec {
     pub(super) const fn route(&self) -> &LiveRouteConfig {
         &self.route
     }
+
+    pub(super) const fn metadata(&self) -> &SourceMetadata {
+        self.config.metadata()
+    }
 }
 
 /// Runs one product until account cancellation or a terminal product defect.
@@ -99,6 +111,7 @@ pub(super) async fn run_product(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    order_level: Option<OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: Arc<CoinbaseDirectHmacSigner>,
     ready: mpsc::Sender<ProductReady>,
@@ -132,6 +145,7 @@ pub(super) async fn run_product(
         admission,
         capture_process,
         live_ingress,
+        order_level.as_ref(),
         route_buffer_limits,
         signer.as_ref(),
         &ready,
@@ -167,6 +181,7 @@ async fn run_product_loop(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
     ready: &mpsc::Sender<ProductReady>,
@@ -189,6 +204,7 @@ async fn run_product_loop(
             admission,
             capture_process,
             live_ingress.clone(),
+            order_level,
             route_buffer_limits,
             signer,
             registry,
@@ -226,6 +242,92 @@ struct GenerationOutcome {
     result: Result<(), CoinbaseDirectProductRuntimeError>,
 }
 
+async fn register_order_level_generation(
+    directory: Option<&OrderLevelDirectory>,
+    spec: &ProductRuntimeSpec,
+    generation: market_squawk_domain::ConnectionGeneration,
+    cancellation: &CancellationToken,
+) -> Result<Option<OrderLevelRegistration>, CoinbaseDirectProductRuntimeError> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let book = spec.config.limits().book();
+    let retained_bytes = u32::try_from(spec.config.checked_maximum_retained_bytes()?)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?;
+    let order_units = book
+        .max_orders()
+        .checked_add(book.max_queue_events())
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(NonZeroU32::new)
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?;
+    let read_order_units = u32::try_from(book.max_orders())
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?;
+    let actor_limits = OrderLevelActorLimits::try_new(
+        NonZeroUsize::new(
+            book.max_queue_events()
+                .min(MAX_ORDER_LEVEL_INGRESS_COMMANDS),
+        )
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?,
+        retained_bytes,
+        order_units,
+        NonZeroUsize::new(ORDER_LEVEL_OUTSTANDING_READS)
+            .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?,
+        retained_bytes,
+        read_order_units,
+    )
+    .map_err(|error| {
+        tracing::error!(%error, "Coinbase Direct order-level actor configuration failed");
+        CoinbaseDirectProductRuntimeError::OrderLevelConfiguration
+    })?;
+    let route = OrderLevelRoute::new(
+        spec.config.metadata().source_id().clone(),
+        spec.config.venue().clone(),
+        spec.config.instrument(),
+        spec.config.product().as_source_identifier().clone(),
+        generation,
+    );
+    let limits =
+        OrderLevelLimits::new(book.max_orders(), DepthLimit::new(book.published_depth())?)?;
+    let deadline = Instant::now()
+        .checked_add(spec.config.limits().websocket().connect_timeout())
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?;
+    directory
+        .register(route, limits, actor_limits, cancellation, deadline)
+        .await
+        .map(Some)
+        .map_err(|error| {
+            tracing::error!(%error, "Coinbase Direct order-level generation registration failed");
+            CoinbaseDirectProductRuntimeError::OrderLevelDirectory
+        })
+}
+
+async fn unregister_order_level_generation(
+    directory: &OrderLevelDirectory,
+    key: &OrderLevelBookKey,
+    app_config: &AppConfig,
+) -> Result<(), CoinbaseDirectProductRuntimeError> {
+    let deadline = Instant::now()
+        .checked_add(app_config.source_shutdown())
+        .ok_or(CoinbaseDirectProductRuntimeError::OrderLevelAccounting)?;
+    let cleanup = CancellationToken::new();
+    let result = directory
+        .unregister(key, &cleanup, deadline)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Coinbase Direct order-level generation cleanup failed");
+            CoinbaseDirectProductRuntimeError::OrderLevelDirectory
+        })?;
+    if result == OrderLevelActorShutdown::Graceful {
+        Ok(())
+    } else {
+        Err(CoinbaseDirectProductRuntimeError::OrderLevelShutdownIncomplete)
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "generation construction keeps every authority and cleanup owner explicit"
@@ -236,6 +338,7 @@ async fn run_generation(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
     registry: &mut AuthoritativeSourceRegistry,
@@ -279,6 +382,7 @@ async fn run_generation(
     let mut capture_control: Option<RawCaptureControl<CaptureGenerationCapabilities>> = None;
     let mut capture_writer = None;
     let mut route_worker: Option<RouteActorWorker> = None;
+    let mut order_level_key: Option<OrderLevelBookKey> = None;
     let mut ready_sent = false;
 
     let run = async {
@@ -314,6 +418,21 @@ async fn run_generation(
             .activate_initial()?;
 
         let source_generation = registry.take_live_source_generation(&session)?;
+        let order_level_registration = register_order_level_generation(
+            order_level,
+            spec,
+            session.generation(),
+            &cancellation,
+        )
+        .await?;
+        let (order_level_ingress, mut order_level_monitor) = match order_level_registration {
+            Some(registration) => {
+                order_level_key = Some(registration.key().clone());
+                let (ingress, monitor) = registration.into_parts();
+                (Some(ingress), Some(monitor))
+            }
+            None => (None, None),
+        };
         let dormant = live_ingress.reserve_route(spec.route.route().clone())?;
         let (route, worker) =
             spawn_route_activation(dormant, route_buffer_limits, route_cancellation.clone());
@@ -360,12 +479,41 @@ async fn run_generation(
                 )?
             }
         };
+        let order_level_publish_timeout = order_level_ingress
+            .as_ref()
+            .map(|_| spec.config.limits().websocket().io_timeout());
         let mut output = CoinbaseDirectProductOutput::new(
             &mut sink,
             spec.config.product().clone(),
             bootstrap_permit,
+            order_level_ingress,
+            order_level_publish_timeout,
         );
-        let session_result = source.run(signer, &mut output, cancellation).await;
+        let session_result = match order_level_monitor.as_mut() {
+            Some(monitor) => tokio::select! {
+                biased;
+                terminal = monitor.wait_until_terminal(&cancellation) => match terminal {
+                    Ok(failure) => {
+                        tracing::error!(%failure, "Coinbase Direct order-level actor failed terminally");
+                        Err(CoinbaseDirectProductRuntimeError::OrderLevelTerminal)
+                    }
+                    Err(OrderLevelMonitorError::Cancelled) if cancellation.is_cancelled() => {
+                        Err(CoinbaseDirectSessionError::Source(SourceError::Cancelled).into())
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Coinbase Direct order-level monitor failed");
+                        Err(CoinbaseDirectProductRuntimeError::OrderLevelMonitor)
+                    }
+                },
+                result = source.run(signer, &mut output, cancellation.clone()) => {
+                    result.map_err(Into::into)
+                }
+            },
+            None => source
+                .run(signer, &mut output, cancellation.clone())
+                .await
+                .map_err(Into::into),
+        };
         let output_failure = output.terminal_failure();
         drop(output);
         let sink_failure = sink.terminal_failure();
@@ -376,12 +524,16 @@ async fn run_generation(
         if let Some(failure) = sink_failure {
             return Err(failure.into());
         }
-        session_result.map_err(Into::into)
+        session_result
     }
     .await;
 
     route_cancellation.cancel();
     let mut cleanup = None;
+    if let (Some(directory), Some(key)) = (order_level, order_level_key.as_ref()) {
+        let result = unregister_order_level_generation(directory, key, app_config).await;
+        retain_first_error(&mut cleanup, result);
+    }
     if let Some(worker) = route_worker {
         let result = cleanup_route_worker(worker).await;
         retain_first_error(&mut cleanup, result);
@@ -532,6 +684,15 @@ pub enum CoinbaseDirectProductRuntimeError {
     /// Canonical metadata evidence could not be represented.
     #[error("Coinbase Direct metadata evidence encoding failed")]
     EvidenceEncoding,
+    /// Checked order-level resource accounting could not be represented.
+    #[error("Coinbase Direct order-level accounting is invalid")]
+    OrderLevelAccounting,
+    /// The exact generation-owned order-level actor did not shut down cleanly.
+    #[error("Coinbase Direct order-level actor shutdown was incomplete")]
+    OrderLevelShutdownIncomplete,
+    /// The exact generation-owned order-level actor entered a terminal fail-closed state.
+    #[error("Coinbase Direct order-level actor failed terminally")]
+    OrderLevelTerminal,
     /// A static bounded policy unexpectedly produced zero.
     #[error("Coinbase Direct static runtime policy is invalid")]
     InvalidStaticPolicy,
@@ -581,6 +742,21 @@ pub enum CoinbaseDirectProductRuntimeError {
     /// Stable financial identity construction failed.
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    /// Price-level projection depth could not be represented.
+    #[error(transparent)]
+    OrderLevelBook(#[from] BookError),
+    /// Canonical order-level retained-state limits were invalid.
+    #[error(transparent)]
+    OrderLevelLimit(#[from] OrderLevelLimitError),
+    /// Application actor limits were invalid.
+    #[error("Coinbase Direct order-level actor configuration failed")]
+    OrderLevelConfiguration,
+    /// The process-wide order-level directory rejected this generation.
+    #[error("Coinbase Direct order-level directory operation failed")]
+    OrderLevelDirectory,
+    /// The order-level supervisor monitor failed before the source exited.
+    #[error("Coinbase Direct order-level supervisor monitor failed")]
+    OrderLevelMonitor,
     /// Authorization or coverage interval construction failed.
     #[error(transparent)]
     Interval(#[from] InstrumentError),
@@ -645,6 +821,9 @@ impl CoinbaseDirectProductRuntimeError {
         match self {
             Self::Sink(failure) => failure.requires_generation_resynchronization(),
             Self::Output(CoinbaseDirectOutputFailure::ProductUnavailable) => true,
+            Self::Output(CoinbaseDirectOutputFailure::OrderLevelPublication)
+            | Self::OrderLevelTerminal
+            | Self::OrderLevelMonitor => true,
             Self::Session(CoinbaseDirectSessionError::Source(source)) => matches!(
                 source,
                 SourceError::Network

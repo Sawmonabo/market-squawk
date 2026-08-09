@@ -167,6 +167,42 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             "comparable",
             "observations",
         ]),
+        "Market.GetUnifiedFeed" => market_rows(&[
+            "instrumentId",
+            "symbol",
+            "symbolVenueId",
+            "assetClass",
+            "quoteCurrency",
+            "definitionRevision",
+            "tickSize",
+            "lotSize",
+            "availability",
+            "confidence",
+            "quote",
+            "orderBook",
+            "selectedSource",
+            "alternatives",
+            "selectionReceipt",
+        ]),
+        "Market.SearchUniverse" => market_rows(&[
+            "referenceId",
+            "symbol",
+            "name",
+            "venueId",
+            "assetClass",
+            "referenceOnly",
+            "isEtf",
+            "roundLotSize",
+            "directoryPresence",
+            "quality",
+            "effectiveAt",
+            "availableAt",
+            "sourceId",
+            "providerId",
+            "sourcePayloadSha256",
+            "matchKind",
+            "quoteAvailability",
+        ]),
         "Research.ListDatasets" => nullable(page(generation())),
         "Research.GetManifest" => generation(),
         "Research.GetHistory"
@@ -1146,16 +1182,37 @@ fn market_rows(required: &[&str]) -> Value {
 
 fn market_field(name: &str) -> Value {
     match name {
-        "phase" | "sourceId" | "instrumentId" | "stableTradeId" | "asOf" | "stateEvaluatedAt" => {
-            text()
-        }
-        "book" => record(),
-        "bid" | "ask" => nullable(record()),
-        "observations" => array(record()),
-        "comparable" => boolean(),
-        "observationCount" | "stateBidDepth" | "stateAskDepth" | "priceTicks" | "quantityLots" => {
-            integer()
-        }
+        "phase"
+        | "sourceId"
+        | "instrumentId"
+        | "stableTradeId"
+        | "asOf"
+        | "stateEvaluatedAt"
+        | "referenceId"
+        | "symbol"
+        | "name"
+        | "venueId"
+        | "symbolVenueId"
+        | "assetClass"
+        | "quoteCurrency"
+        | "tickSize"
+        | "lotSize"
+        | "availability"
+        | "confidence"
+        | "directoryPresence"
+        | "quality"
+        | "effectiveAt"
+        | "availableAt"
+        | "providerId"
+        | "sourcePayloadSha256"
+        | "matchKind"
+        | "quoteAvailability" => text(),
+        "book" | "quote" | "selectionReceipt" => record(),
+        "bid" | "ask" | "selectedSource" | "orderBook" => nullable(record()),
+        "observations" | "alternatives" => array(record()),
+        "comparable" | "referenceOnly" | "isEtf" => boolean(),
+        "observationCount" | "stateBidDepth" | "stateAskDepth" | "priceTicks" | "quantityLots"
+        | "definitionRevision" | "roundLotSize" => integer(),
         "referenceAt" => text(),
         _ => record(),
     }
