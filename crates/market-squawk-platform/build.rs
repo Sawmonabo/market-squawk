@@ -15,8 +15,6 @@ const MAX_SOURCE_ENTRIES: usize = 20_000;
 const MAX_SOURCE_DEPTH: usize = 32;
 const MAX_SOURCE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SOURCE_INVENTORY_BYTES: u64 = 64 * 1024 * 1024;
-const UNVERIFIED_GIT_HEAD: &str = "0000000000000000000000000000000000000000";
-
 const IMMUTABLE_MODULES: [(&str, &str); 8] = [
     ("benchmark_identity", "benchmark_identity.rs"),
     ("collector", "collector.rs"),
@@ -34,6 +32,7 @@ const BUILD_SUPPORT_TREE: [&str; 3] = [
     "build_support/reader.rs",
 ];
 const BUILD_SUPPORT_TREE_DOMAIN: &[u8] = b"market-squawk/capture-build-support-tree/v1\0";
+const MEASURED_SOURCE_CLOSURE_DOMAIN: &[u8] = b"market-squawk/capture-measured-source-closure/v1\0";
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!(
@@ -169,35 +168,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let cargo_lock = repository.join("Cargo.lock");
     let workspace_manifest = repository.join("Cargo.toml");
+    let rust_toolchain = repository.join("rust-toolchain.toml");
     let package_manifest = manifest.join("Cargo.toml");
+    let domain_manifest = repository.join("crates/market-squawk-domain/Cargo.toml");
     let build_script = manifest.join("build.rs");
     let build_support_paths = BUILD_SUPPORT_TREE.map(|relative| manifest.join(relative));
-    let host_gate_shell = repository.join("scripts/capture_benchmark_host_gate.sh");
-    let host_gate_python = repository.join("scripts/capture_benchmark_host_gate.py");
-    let host_gate_process = repository.join("scripts/capture_benchmark_process.py");
-    let host_gate_evidence_io = repository.join("scripts/capture_benchmark_evidence_io.py");
-    let host_gate_cli = repository.join("scripts/capture_benchmark_host_cli.py");
-    let host_gate_schema = repository.join("scripts/capture_benchmark_host_schema.py");
-    let host_gate_execution = repository.join("scripts/capture_benchmark_host_execution.py");
-    let host_gate_observation = repository.join("scripts/capture_benchmark_host_observation.py");
-    let host_gate_measured = repository.join("scripts/capture_benchmark_host_measured.py");
-    let build_evidence_python =
-        repository.join("scripts/capture_benchmark_prepare_build_evidence.py");
     for path in [
         &cargo_lock,
         &workspace_manifest,
+        &rust_toolchain,
         &package_manifest,
+        &domain_manifest,
         &build_script,
-        &host_gate_shell,
-        &host_gate_python,
-        &host_gate_process,
-        &host_gate_evidence_io,
-        &host_gate_cli,
-        &host_gate_schema,
-        &host_gate_execution,
-        &host_gate_observation,
-        &host_gate_measured,
-        &build_evidence_python,
     ] {
         rerun(path);
     }
@@ -221,15 +203,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(std::env::VarError::NotPresent) => false,
         Err(error) => return Err(error.into()),
     };
-    let git_head = if clean_build_enforced {
-        let head = command(&git_executable, repository, &["rev-parse", "HEAD"])?;
-        if !is_lower_git_head(&head) {
-            return Err("Git HEAD is not a full hexadecimal object ID".into());
-        }
-        head
-    } else {
-        UNVERIFIED_GIT_HEAD.to_owned()
-    };
+    // Repository commit/tree identity belongs to the external evidence envelope. Keeping Git refs
+    // out of this compilation preserves the content-addressed source bindings below across commits
+    // that change only documentation or unrelated verification scripts.
     let build_environment = if clean_build_enforced {
         validate_authoritative_build_environment()?
     } else {
@@ -246,22 +222,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if build_environment.evidence_backend != selected_backend.as_str() {
         return Err("compiled backend differs from its build-environment identity".into());
     }
-    if clean_build_enforced {
-        let head_path = git_metadata_path(&git_executable, repository, "HEAD")?
-            .ok_or("Git HEAD metadata path is unavailable")?;
-        rerun(&head_path);
-        if let Ok(reference) = command(
-            &git_executable,
-            repository,
-            &["symbolic-ref", "--quiet", "HEAD"],
-        ) && let Some(path) = git_metadata_path(&git_executable, repository, &reference)?
-        {
-            rerun(&path);
-        }
-        if let Some(path) = git_metadata_path(&git_executable, repository, "packed-refs")? {
-            rerun(&path);
-        }
-    }
     let source_inventory =
         inventory_hash(repository, platform_sources.iter().chain(&domain_sources))?;
     let baseline_lock_path = repository
@@ -272,8 +232,108 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("tracked baseline lock differs from its build binding".into());
         }
     }
+    let entrypoint_sha256 = hash_file(&entrypoint)?;
+    let criterion_sha256 = hash_file(&criterion)?;
+    let observer_sha256 = hash_file(&observer)?;
+    let platform_source_sha256 = tree_hash(repository, &platform_sources)?;
+    let domain_source_sha256 = tree_hash(repository, &domain_sources)?;
+    let cargo_lock_sha256 = hash_file(&cargo_lock)?;
+    let workspace_manifest_sha256 = hash_file(&workspace_manifest)?;
+    let rust_toolchain_sha256 = hash_file(&rust_toolchain)?;
+    let package_manifest_sha256 = hash_file(&package_manifest)?;
+    let domain_manifest_sha256 = hash_file(&domain_manifest)?;
+    let build_script_sha256 = hash_file(&build_script)?;
+    let build_support_tree_sha256 = build_support_tree_hash(&manifest, &build_support_paths)?;
+    let mut measured_source_components = vec![
+        ("Cargo.lock".to_owned(), cargo_lock_sha256.clone()),
+        ("Cargo.toml".to_owned(), workspace_manifest_sha256.clone()),
+        (
+            "rust-toolchain.toml".to_owned(),
+            rust_toolchain_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/Cargo.toml".to_owned(),
+            package_manifest_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-domain/Cargo.toml".to_owned(),
+            domain_manifest_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/build.rs".to_owned(),
+            build_script_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/build-support-tree-v1".to_owned(),
+            build_support_tree_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/src/**/*.rs".to_owned(),
+            platform_source_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-domain/src/**/*.rs".to_owned(),
+            domain_source_sha256.clone(),
+        ),
+        ("rust-source-inventory".to_owned(), source_inventory.clone()),
+        (
+            "crates/market-squawk-platform/benches/capture_admission.rs".to_owned(),
+            entrypoint_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend.rs".to_owned(),
+            backend_binding.dispatcher_sha256().to_owned(),
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend/standard.rs"
+                .to_owned(),
+            backend_binding.standard_source_sha256().to_owned(),
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend/candidate.rs"
+                .to_owned(),
+            backend_binding.candidate_source_sha256().to_owned(),
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission_criterion.rs".to_owned(),
+            criterion_sha256.clone(),
+        ),
+        (
+            "crates/market-squawk-platform/src/capture/benchmark_support/observer.rs".to_owned(),
+            observer_sha256.clone(),
+        ),
+        (
+            "capture-benchmark-backend".to_owned(),
+            selected_backend.as_str().to_owned(),
+        ),
+    ];
+    for ((_, file), (_, digest)) in IMMUTABLE_MODULES.iter().zip(&module_hashes) {
+        measured_source_components.push((
+            format!("crates/market-squawk-platform/benches/capture_admission/{file}"),
+            digest.clone(),
+        ));
+    }
+    for (name, value) in [
+        (
+            "baseline-lock-sha256",
+            build_environment.baseline_lock_sha256.as_deref(),
+        ),
+        (
+            "baseline-manifest-sha256",
+            build_environment.baseline_manifest_sha256.as_deref(),
+        ),
+        (
+            "baseline-measured-code-head",
+            build_environment.baseline_measured_code_head.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            measured_source_components.push((name.to_owned(), value.to_owned()));
+        }
+    }
+    let measured_source_closure_sha256 =
+        measured_source_closure_hash(&mut measured_source_components)?;
     let generated = render(GeneratedBindings {
-        git_head: &git_head,
         clean_build_enforced,
         build_environment_policy: &build_environment.policy,
         build_command_sha256: &build_environment.command_sha256,
@@ -282,35 +342,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         baseline_lock_sha256: build_environment.baseline_lock_sha256.as_deref(),
         baseline_manifest_sha256: build_environment.baseline_manifest_sha256.as_deref(),
         baseline_measured_code_head: build_environment.baseline_measured_code_head.as_deref(),
+        measured_source_closure_sha256: &measured_source_closure_sha256,
         module_hashes: &module_hashes,
-        entrypoint_sha256: &hash_file(&entrypoint)?,
+        entrypoint_sha256: &entrypoint_sha256,
         backend_dispatcher_sha256: backend_binding.dispatcher_sha256(),
         selected_backend_source_path: &selected_backend_source_path,
         selected_backend_source_sha256: backend_binding.selected_source_sha256(),
         backend_sha256: backend_binding.backend_sha256(),
-        criterion_sha256: &hash_file(&criterion)?,
-        observer_sha256: &hash_file(&observer)?,
-        platform_source_sha256: &tree_hash(repository, &platform_sources)?,
-        domain_source_sha256: &tree_hash(repository, &domain_sources)?,
+        criterion_sha256: &criterion_sha256,
+        observer_sha256: &observer_sha256,
+        platform_source_sha256: &platform_source_sha256,
+        domain_source_sha256: &domain_source_sha256,
         source_inventory_sha256: &source_inventory,
-        cargo_lock_sha256: &hash_file(&cargo_lock)?,
-        workspace_manifest_sha256: &hash_file(&workspace_manifest)?,
-        package_manifest_sha256: &hash_file(&package_manifest)?,
-        build_script_sha256: &hash_file(&build_script)?,
-        build_support_tree_sha256: &build_support_tree_hash(&manifest, &build_support_paths)?,
+        cargo_lock_sha256: &cargo_lock_sha256,
+        workspace_manifest_sha256: &workspace_manifest_sha256,
+        package_manifest_sha256: &package_manifest_sha256,
+        build_script_sha256: &build_script_sha256,
+        build_support_tree_sha256: &build_support_tree_sha256,
         cargo_executable_sha256: &cargo_executable_sha256,
         git_executable_sha256: &git_executable_sha256,
         rustc_executable_sha256: &rustc_executable_sha256,
-        host_gate_shell_sha256: &hash_file(&host_gate_shell)?,
-        host_gate_python_sha256: &hash_file(&host_gate_python)?,
-        host_gate_process_sha256: &hash_file(&host_gate_process)?,
-        host_gate_evidence_io_sha256: &hash_file(&host_gate_evidence_io)?,
-        host_gate_cli_sha256: &hash_file(&host_gate_cli)?,
-        host_gate_schema_sha256: &hash_file(&host_gate_schema)?,
-        host_gate_execution_sha256: &hash_file(&host_gate_execution)?,
-        host_gate_observation_sha256: &hash_file(&host_gate_observation)?,
-        host_gate_measured_sha256: &hash_file(&host_gate_measured)?,
-        build_evidence_python_sha256: &hash_file(&build_evidence_python)?,
     })?;
     let output = PathBuf::from(std::env::var("OUT_DIR")?).join("capture_benchmark_bindings.rs");
     fs::write(output, generated)?;
@@ -422,7 +473,6 @@ fn is_lower_git_head(value: &str) -> bool {
 }
 
 struct GeneratedBindings<'a> {
-    git_head: &'a str,
     clean_build_enforced: bool,
     build_environment_policy: &'a str,
     build_command_sha256: &'a str,
@@ -431,6 +481,7 @@ struct GeneratedBindings<'a> {
     baseline_lock_sha256: Option<&'a str>,
     baseline_manifest_sha256: Option<&'a str>,
     baseline_measured_code_head: Option<&'a str>,
+    measured_source_closure_sha256: &'a str,
     module_hashes: &'a [(&'a str, String)],
     entrypoint_sha256: &'a str,
     backend_dispatcher_sha256: &'a str,
@@ -450,25 +501,10 @@ struct GeneratedBindings<'a> {
     cargo_executable_sha256: &'a str,
     git_executable_sha256: &'a str,
     rustc_executable_sha256: &'a str,
-    host_gate_shell_sha256: &'a str,
-    host_gate_python_sha256: &'a str,
-    host_gate_process_sha256: &'a str,
-    host_gate_evidence_io_sha256: &'a str,
-    host_gate_cli_sha256: &'a str,
-    host_gate_schema_sha256: &'a str,
-    host_gate_execution_sha256: &'a str,
-    host_gate_observation_sha256: &'a str,
-    host_gate_measured_sha256: &'a str,
-    build_evidence_python_sha256: &'a str,
 }
 
 fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
     let mut output = String::new();
-    writeln!(
-        output,
-        "pub(crate) const BUILD_GIT_HEAD: &str = {:?};",
-        bindings.git_head
-    )?;
     writeln!(
         output,
         "pub(crate) const CLEAN_BUILD_ENFORCED: bool = {};",
@@ -536,6 +572,10 @@ fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
     }
     writeln!(output, "];")?;
     for (name, value) in [
+        (
+            "MEASURED_SOURCE_CLOSURE_SHA256",
+            bindings.measured_source_closure_sha256,
+        ),
         ("ENTRYPOINT_SHA256", bindings.entrypoint_sha256),
         (
             "BACKEND_DISPATCHER_SHA256",
@@ -569,34 +609,6 @@ fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
         ("CARGO_EXECUTABLE_SHA256", bindings.cargo_executable_sha256),
         ("GIT_EXECUTABLE_SHA256", bindings.git_executable_sha256),
         ("RUSTC_EXECUTABLE_SHA256", bindings.rustc_executable_sha256),
-        ("HOST_GATE_SHELL_SHA256", bindings.host_gate_shell_sha256),
-        ("HOST_GATE_PYTHON_SHA256", bindings.host_gate_python_sha256),
-        (
-            "HOST_GATE_PROCESS_SHA256",
-            bindings.host_gate_process_sha256,
-        ),
-        (
-            "HOST_GATE_EVIDENCE_IO_SHA256",
-            bindings.host_gate_evidence_io_sha256,
-        ),
-        ("HOST_GATE_CLI_SHA256", bindings.host_gate_cli_sha256),
-        ("HOST_GATE_SCHEMA_SHA256", bindings.host_gate_schema_sha256),
-        (
-            "HOST_GATE_EXECUTION_SHA256",
-            bindings.host_gate_execution_sha256,
-        ),
-        (
-            "HOST_GATE_OBSERVATION_SHA256",
-            bindings.host_gate_observation_sha256,
-        ),
-        (
-            "HOST_GATE_MEASURED_SHA256",
-            bindings.host_gate_measured_sha256,
-        ),
-        (
-            "BUILD_EVIDENCE_PYTHON_SHA256",
-            bindings.build_evidence_python_sha256,
-        ),
     ] {
         writeln!(output, "pub(crate) const {name}: &str = {value:?};")?;
     }
@@ -647,6 +659,24 @@ fn build_support_tree_hash(
         digest.update(length.to_be_bytes());
         digest.update(relative.as_bytes());
         digest.update(hash_file(path)?.as_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn measured_source_closure_hash(
+    components: &mut [(String, String)],
+) -> Result<String, Box<dyn Error>> {
+    components.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if components.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("measured source closure contains a duplicate identity".into());
+    }
+    let mut digest = Sha256::new();
+    digest.update(MEASURED_SOURCE_CLOSURE_DOMAIN);
+    for (identity, value) in components {
+        for component in [identity.as_bytes(), value.as_bytes()] {
+            digest.update(u64::try_from(component.len())?.to_be_bytes());
+            digest.update(component);
+        }
     }
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -718,27 +748,6 @@ fn absolute_bound_tool(
         return Err("authoritative benchmark executable binding is invalid".into());
     }
     Ok((path, digest))
-}
-
-fn git_metadata_path(
-    git_executable: &Path,
-    repository: &Path,
-    name: &str,
-) -> Result<Option<PathBuf>, Box<dyn Error>> {
-    let path = PathBuf::from(command(
-        git_executable,
-        repository,
-        &["rev-parse", "--path-format=absolute", "--git-path", name],
-    )?);
-    if !path.is_absolute() {
-        return Err("Git metadata path is not absolute".into());
-    }
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(Some(path)),
-        Ok(_) => Err("Git metadata path is not one regular file".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn rerun(path: &Path) {
